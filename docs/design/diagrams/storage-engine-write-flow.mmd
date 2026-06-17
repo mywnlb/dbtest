@@ -1,0 +1,18 @@
+flowchart TD
+    start["Session starts insert/update/delete"] --> trx["TransactionManager active transaction"]
+    trx --> search["B+Tree current-read search"]
+    search --> ref["Capture record/gap/next-key target"]
+    ref --> release["Release page latch before lock wait"]
+    release --> lock["LockManager wait/grant or victim"]
+    lock --> relocate["B+Tree relocates target"]
+    relocate --> mtr["Begin MTR"]
+    mtr --> undo["UndoLogManager writes insert/update undo"]
+    undo --> rec["Record operation modifies page body and hidden columns"]
+    rec --> maybeSplit{"page structure change?"}
+    maybeSplit -->|"yes"| alloc["DiskSpaceManager reserve/allocate/free page"]
+    alloc --> btree["B+Tree updates sibling/parent/root"]
+    maybeSplit -->|"no"| redo
+    btree --> redo["MTR collects redo payload"]
+    redo --> commit["Redo assigns LSN and MTR commits"]
+    commit --> dirty["BufferPool DirtyPageMarker publishes dirty frame"]
+    dirty --> releaseAll["Release page latch, buffer fix, statement locks if applicable"]

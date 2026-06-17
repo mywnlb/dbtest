@@ -1,0 +1,94 @@
+flowchart TB
+  subgraph RecordAccess["数据流 A：增删改查记录链路"]
+    Q1["查找：定位聚簇索引 root page"]
+    Q2["跨 non-leaf segment 下降"]
+    Q3["到达 PAGE_LEVEL=0 的 leaf page"]
+    Q4["页内二分 Page Directory"]
+    Q5["沿 next_record 扫描 group"]
+    Q6["命中记录或确认不存在"]
+
+    I1["插入：定位 leaf page 和插入点"]
+    I2["优先复用 PAGE_FREE"]
+    I3["否则从 PAGE_HEAP_TOP append"]
+    I4["更新 next_record / n_owned / Page Header"]
+    I5{"空间不足?"}
+    I6["页内 reorganize 清理 PAGE_GARBAGE"]
+    I7{"仍不足?"}
+
+    D1["删除：delete-mark 记录"]
+    D2["写 undo 供 MVCC / rollback"]
+    D3["purge 后台真正摘链"]
+    D4["空间挂 PAGE_FREE，必要时释放空页"]
+
+    U1["修改：判断主键和长度变化"]
+    U2["in-place update：覆盖列值并写 undo"]
+    U3["delete-mark + insert"]
+  end
+
+  subgraph Allocate["数据流 B：为 B+Tree split 分配新页"]
+    A1["B+Tree 请求分配 leaf page"]
+    A2["MiniTransactionManager.begin"]
+    A3["SpaceReservationService.reserve"]
+    A4["SegmentPageAllocator.allocate"]
+    A5["读取并 latch SpaceHeader / XDES / SegmentInode"]
+    A6{"Segment fragment pages < 32?"}
+    A7["从 FSP_FREE_FRAG 分配单页"]
+    A8["从 SEG_NOT_FULL 或新 extent 分配页"]
+    A9{"Tablespace 空间不足?"}
+    A10["AutoExtendPolicy 计算扩展页数"]
+    A11["PageStore 扩展 data file"]
+    A12["初始化 FilePageHeader"]
+    A13["追加 ALLOCATE_PAGE / UPDATE_XDES / UPDATE_SEGMENT_INODE / INIT_FILE_PAGE redo"]
+    A14["PageCursor 写入索引页内容并追加 WRITE_PAGE_BYTES redo"]
+    A15["MTR commit：写 redo、标 dirty、释放 memo"]
+  end
+
+  subgraph Flush["数据流 C：刷脏与 checkpoint"]
+    F1["DirtyPageQueue 选择 dirty page"]
+    F2["确认 pageLSN 对应 redo 已刷盘"]
+    F3["DoublewriteStrategy.beforeWrite"]
+    F4["PageStore.write tablespace page"]
+    F5["DoublewriteStrategy.afterWrite"]
+    F6["CheckpointCoordinator 推进 checkpoint LSN"]
+  end
+
+  subgraph Recover["数据流 D：崩溃恢复"]
+    R1["读取 checkpoint label"]
+    R2["扫描 checkpoint LSN 之后的 redo"]
+    R3["RedoRecordApplier 按 type 分发"]
+    R4["读取目标 page 或 metadata page"]
+    R5{"pageLSN >= redo LSN?"}
+    R6["跳过，保证幂等"]
+    R7["应用 redo：page init / xdes / inode / bytes"]
+    R8["检测 partial write"]
+    R9["必要时使用 doublewrite 副本修复"]
+    R10["重建 free list cache 与 tablespace state"]
+  end
+
+  Q1 --> Q2 --> Q3 --> Q4 --> Q5 --> Q6
+  I1 --> I2 --> I3 --> I4 --> I5
+  I5 -- "否" --> A15
+  I5 -- "是" --> I6 --> I7
+  I7 -- "否" --> I4
+  I7 -- "是" --> A1
+  D1 --> D2 --> D3 --> D4
+  D4 --> A15
+  U1 -- "主键不变且可原地放下" --> U2 --> A15
+  U1 -- "主键变化或原位放不下" --> U3 --> D1
+  U3 --> I1
+
+  A1 --> A2 --> A3 --> A4 --> A5 --> A6
+  A6 -- "是" --> A7
+  A6 -- "否" --> A8
+  A7 --> A9
+  A8 --> A9
+  A9 -- "是" --> A10 --> A11 --> A4
+  A9 -- "否" --> A12 --> A13 --> A14 --> A15
+
+  A15 --> F1
+  F1 --> F2 --> F3 --> F4 --> F5 --> F6
+
+  R1 --> R2 --> R3 --> R4 --> R5
+  R5 -- "是" --> R6 --> R10
+  R5 -- "否" --> R7 --> R8
+  R8 --> R9 --> R10

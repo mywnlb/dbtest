@@ -1,0 +1,27 @@
+flowchart TB
+  Session["SQL Session"]
+  Analyze["AnalyzeTableExecutor"]
+  Collector["StatsCollector"]
+  Histogram["HistogramBuilder"]
+  Store["PersistentStatsStore"]
+  Cache["StatsCache"]
+  Snapshot["OptimizerStatsSnapshot"]
+  DD["DataDictionaryService + MDL"]
+  Storage["StorageEngine Estimator"]
+  BTree["B+Tree metadata"]
+  Optimizer["QueryOptimizer"]
+  PlanCache["PlanCache invalidation"]
+
+  Session --> Analyze
+  Analyze --> DD
+  Analyze --> Collector
+  Collector --> Storage
+  Collector --> BTree
+  Collector --> Histogram
+  Histogram --> Store
+  Collector --> Store
+  Store --> Cache
+  Cache --> Snapshot
+  Optimizer --> Snapshot
+  DD --> Cache
+  Cache --> PlanCache

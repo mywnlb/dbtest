@@ -1,0 +1,33 @@
+flowchart TD
+    start["Flush request"]
+    chooseType{"Flush type"}
+    flushList["Select dirty pages by oldestModificationLsn"]
+    lru["Select dirty LRU victims"]
+    single["Select single page"]
+    durable["Check redo durable: pageLsn <= flushedToDiskLsn"]
+    waitRedo["Wait redo flushed or skip by policy"]
+    fix["Fix frame or capture page image"]
+    checksum["Set checksum and pageLSN"]
+    doublewrite["Write doublewrite copy"]
+    datafile["Write tablespace data file"]
+    fsync["Fsync by policy"]
+    validate["Validate frame not modified past snapshot"]
+    clean["Mark clean or advance flushed page LSN"]
+    keepDirty["Keep dirty if modified again"]
+    notify["Notify checkpoint coordinator"]
+    done["Flush result"]
+
+    start --> chooseType
+    chooseType --> flushList
+    chooseType --> lru
+    chooseType --> single
+    flushList --> durable
+    lru --> durable
+    single --> durable
+    durable --> waitRedo
+    waitRedo --> fix --> checksum --> doublewrite --> datafile --> fsync --> validate
+    validate --> clean
+    validate --> keepDirty
+    clean --> notify --> done
+    keepDirty --> notify
+

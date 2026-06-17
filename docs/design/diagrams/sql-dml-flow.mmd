@@ -1,0 +1,38 @@
+flowchart TD
+    start["INSERT / UPDATE / DELETE"]
+    parse["Parse AST"]
+    bind["Bind table, columns, indexes"]
+    mdl["Acquire MDL_SHARED_WRITE"]
+    trx["Begin or reuse transaction"]
+    plan["Build DmlPlan"]
+    kind{"DML type"}
+
+    insert["INSERT: build LogicalRow and defaults"]
+    dup["Check unique indexes / duplicate policy"]
+    insLock["Acquire insert intention / gap lock"]
+    insWrite["StorageEngine.insertRow"]
+
+    search["UPDATE/DELETE: current read scan"]
+    rowLock["Acquire record or next-key X lock"]
+    eval["Evaluate WHERE with latest committed/current row"]
+    update["UPDATE: build UpdatePatch"]
+    delete["DELETE: delete-mark row"]
+
+    mtr["B+Tree/Record modify page in MTR"]
+    undo["Write undo and hidden columns"]
+    redo["Collect redo and commit MTR"]
+    stmtEnd["Statement cleanup"]
+    commit{"Autocommit?"}
+    commitTxn["Commit transaction and release row locks"]
+    keepTxn["Keep transaction open"]
+    releaseMdl["Release statement MDL if duration allows"]
+
+    start --> parse --> bind --> mdl --> trx --> plan --> kind
+    kind --> insert --> dup --> insLock --> insWrite --> mtr
+    kind --> search --> rowLock --> eval
+    eval --> update --> mtr
+    eval --> delete --> mtr
+    mtr --> undo --> redo --> stmtEnd --> commit
+    commit --> commitTxn --> releaseMdl
+    commit --> keepTxn --> releaseMdl
+

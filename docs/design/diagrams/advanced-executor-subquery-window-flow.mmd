@@ -1,0 +1,24 @@
+flowchart TB
+  subgraph Subquery["Subquery execution"]
+    S1["Open SubqueryNode"]
+    S2{"Subquery kind"}
+    S3["Scalar: execute once or per outer row"]
+    S4["IN/EXISTS: materialize or semi-join probe"]
+    S5["Correlated: bind outer references"]
+    S6["Return value, row set or boolean"]
+  end
+
+  subgraph Window["Window execution"]
+    W1["Open WindowNode"]
+    W2["Partition input by PARTITION BY"]
+    W3["Order each partition"]
+    W4["Maintain frame state"]
+    W5["Evaluate window functions"]
+    W6["Emit row with window columns"]
+  end
+
+  S1 --> S2
+  S2 -->|"scalar"| S3 --> S6
+  S2 -->|"IN/EXISTS"| S4 --> S6
+  S2 -->|"correlated"| S5 --> S6
+  W1 --> W2 --> W3 --> W4 --> W5 --> W6

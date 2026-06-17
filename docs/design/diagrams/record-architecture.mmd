@@ -1,0 +1,42 @@
+flowchart LR
+    subgraph callers["调用方"]
+        btree["storage.btree"]
+        trx["storage.trx"]
+        sql["SQL/Executor"]
+    end
+
+    subgraph record["storage.record"]
+        api["api\nRecordPageAccessor"]
+        schema["schema\nTableSchema / IndexKeyDef"]
+        type["type\nTypeCodec / Comparator"]
+        format["format\nRecordHeader / FieldLayout"]
+        page["page\nHeap / PageDirectory"]
+        cursor["cursor\nRecordCursor"]
+        op["op\nRecordPageOperation"]
+        mvcc["mvcc\nHiddenColumnAccessor"]
+        metric["metric"]
+    end
+
+    subgraph storage["存储协作模块"]
+        buf["storage.buf\nPageHandle / PageCursor"]
+        mtr["storage.mtr"]
+        redo["storage.redo"]
+        undo["storage.trx.undo"]
+    end
+
+    sql --> btree
+    btree --> api
+    trx --> mvcc
+    api --> page
+    api --> cursor
+    op --> cursor
+    op --> mtr
+    cursor --> page
+    page --> format
+    format --> type
+    schema --> type
+    page --> buf
+    mvcc --> cursor
+    mvcc --> undo
+    mtr --> redo
+    metric -. observes .-> api

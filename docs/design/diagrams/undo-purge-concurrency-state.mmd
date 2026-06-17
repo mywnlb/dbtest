@@ -1,0 +1,35 @@
+stateDiagram-v2
+    [*] --> FREE
+
+    FREE --> GRANTED: acquire S/X or mutex owner set
+    GRANTED --> RELEASED: release owner cleared
+    RELEASED --> FREE: no waiter
+
+    GRANTED --> WAITING: conflict and caller may wait
+    WAITING --> GRANTED: grant after owner release
+    WAITING --> TIMEOUT: wait budget exhausted
+    WAITING --> VICTIM: row lock deadlock victim only
+
+    GRANTED --> CONVERTING: lifecycle S requests X
+    CONVERTING --> GRANTED: conversion granted
+    CONVERTING --> TIMEOUT: conversion timeout
+
+    TIMEOUT --> RELEASED: cleanup pins and wait slots
+    VICTIM --> RELEASED: rollback releases transaction locks
+    RELEASED --> [*]
+
+    note right of WAITING
+        Row locks enter Wait-For Graph.
+        Undo page latch, history mutex, rseg mutex,
+        and tablespace lifecycle waits use ordered short waits or timeout.
+    end note
+
+    note right of CONVERTING
+        Undo tablespace truncation must not convert while holding
+        record locks, page latches, or history list mutex.
+    end note
+
+    note right of VICTIM
+        Only transaction row/gap/next-key waits can become VICTIM.
+        Purge workers back off instead of joining transaction deadlock detection.
+    end note

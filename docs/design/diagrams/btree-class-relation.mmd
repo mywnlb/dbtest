@@ -1,0 +1,53 @@
+classDiagram
+    class BTreeIndex {
+        +IndexId indexId
+        +TableId tableId
+        +PageId rootPageId
+        +int rootLevel
+        +SegmentId leafSegment
+        +SegmentId nonLeafSegment
+        +IndexKeyDef keyDef
+    }
+
+    class BTreePage {
+        +PageHandle handle
+        +int level()
+        +boolean isLeaf()
+        +PageId prev()
+        +PageId next()
+        +RecordPageAccessor records()
+    }
+
+    class BTreeCursor {
+        +SearchKey stableKey
+        +CursorPosition position
+        +relocate()
+        +release()
+    }
+
+    class SearchKey
+    class SearchBound
+    class TreePath
+    class ChildPointer
+    class CursorPosition
+    class PageSplitPlan
+    class PageMergePlan
+    class LatchCouplingContext
+    class BTreeOperationContext
+    class IndexRecordRef
+    class IndexGapRef
+
+    BTreeIndex *-- SearchKey
+    BTreeIndex --> BTreePage
+    BTreePage --> ChildPointer
+    BTreePage --> IndexRecordRef
+    BTreeCursor --> CursorPosition
+    BTreeCursor --> SearchKey
+    TreePath *-- BTreePage
+    PageSplitPlan --> BTreePage
+    PageSplitPlan --> SearchKey
+    PageMergePlan --> BTreePage
+    LatchCouplingContext --> TreePath
+    BTreeOperationContext --> LatchCouplingContext
+    CursorPosition --> IndexRecordRef
+    CursorPosition --> IndexGapRef

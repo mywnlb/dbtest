@@ -1,0 +1,32 @@
+stateDiagram-v2
+  [*] --> CREATED
+  CREATED --> INITIALIZING: create or discover redo files
+  INITIALIZING --> RECOVERING: dirty shutdown detected
+  INITIALIZING --> RUNNING: clean shutdown
+  RECOVERING --> RUNNING: redo replay complete
+  RUNNING --> CHECKPOINTING: checkpoint requested
+  CHECKPOINTING --> RUNNING: checkpoint label persisted
+  RUNNING --> RESIZING: capacity change
+  RESIZING --> RUNNING: files adjusted
+  RUNNING --> SHUTTING_DOWN: shutdown requested
+  CHECKPOINTING --> SHUTTING_DOWN: shutdown requested
+  RESIZING --> SHUTTING_DOWN: shutdown requested
+  SHUTTING_DOWN --> CLOSED: final flush and checkpoint
+
+  INITIALIZING --> FAILED: file or format error
+  RECOVERING --> FAILED: unrecoverable redo corruption
+  RUNNING --> FAILED: write or fsync failure
+  CHECKPOINTING --> FAILED: checkpoint failure under hard pressure
+  RESIZING --> FAILED: resize failed
+  SHUTTING_DOWN --> FAILED: final flush failed
+  FAILED --> [*]
+  CLOSED --> [*]
+
+  state RUNNING {
+    [*] --> ACCEPTING_MTR
+    ACCEPTING_MTR --> WRITING_BUFFER: append batch
+    WRITING_BUFFER --> PUBLISHING_DIRTY: readyForWrite advanced
+    PUBLISHING_DIRTY --> ACCEPTING_MTR: closed range
+    ACCEPTING_MTR --> WAITING_SPACE: checkpoint age high
+    WAITING_SPACE --> ACCEPTING_MTR: checkpoint advanced
+  }

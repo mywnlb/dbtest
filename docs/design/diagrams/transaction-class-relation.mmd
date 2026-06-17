@@ -1,0 +1,164 @@
+classDiagram
+  direction LR
+
+  class TransactionManager {
+    <<facade>>
+    begin(TransactionOptions)
+    current()
+    commit(Transaction)
+    rollback(Transaction)
+    setSavepoint(String)
+    rollbackToSavepoint(String)
+  }
+
+  class Transaction {
+    TransactionId transactionId
+    TransactionNo transactionNo
+    TransactionState state
+    IsolationLevel isolationLevel
+    boolean readOnly
+    boolean rollbackOnly
+  }
+
+  class TransactionStateMachine {
+    begin()
+    markCommitting()
+    markCommitted()
+    markRollingBack()
+    markRolledBack()
+    markPrepared()
+  }
+
+  class TransactionSystem {
+    nextTransactionId()
+    nextTransactionNo()
+    activeTransactions()
+    oldestReadView()
+  }
+
+  class ActiveTransactionTable {
+    add(Transaction)
+    remove(Transaction)
+    rwTransactionIds()
+    find(TransactionId)
+  }
+
+  class ReadViewManager {
+    openReadView(Transaction, ReadType)
+    closeReadView(Transaction)
+    oldestView()
+  }
+
+  class ReadView {
+    TransactionId creatorTransactionId
+    TransactionId upLimitId
+    TransactionId lowLimitId
+    Set activeTransactionIds
+    TransactionNo lowLimitNo
+    changesVisible(TransactionId)
+  }
+
+  class MvccVisibilityService {
+    visibleVersion(RecordRef, Transaction, ReadType)
+    isCurrentVisible(RecordHeader, Transaction, ReadView)
+  }
+
+  class VersionChainBuilder {
+    buildPreviousVersion(RecordVersion, RollPointer, ReadView)
+  }
+
+  class RecordVersion {
+    TransactionId dbTrxId
+    RollPointer dbRollPtr
+    boolean deletedFlag
+    RecordImage payload
+  }
+
+  class UndoLogManager {
+    assignUndoLog(Transaction, UndoKind)
+    beforeInsert(Transaction, RecordRef, RecordImage, MiniTransaction)
+    beforeUpdate(Transaction, RecordRef, RecordImage, ChangedColumns, MiniTransaction)
+    rollback(Transaction)
+  }
+
+  class UndoRecord {
+    <<command>>
+    UndoRecordType type
+    TransactionId transactionId
+    UndoNo undoNo
+    RollPointer prevRollPointer
+    applyRollback(RollbackContext)
+    buildPreviousVersion(VersionBuildContext)
+  }
+
+  class RollbackSegment {
+    RollbackSegmentId id
+    SpaceId spaceId
+    assignSlot(Transaction)
+  }
+
+  class HistoryList {
+    append(UndoLogHeader)
+    nextPurgeCandidate()
+    length()
+  }
+
+  class LockManager {
+    lockTable(Transaction, TableId, TableLockMode)
+    lockRecord(Transaction, IndexRecordRef, RecordLockMode)
+    lockNextKey(Transaction, IndexRecordRef, NextKeyLockMode)
+    releaseTransactionLocks(Transaction)
+  }
+
+  class WaitForGraph {
+    addWait(Transaction, Transaction)
+    remove(Transaction)
+    detectCycle()
+  }
+
+  class PurgeCoordinator {
+    runBatch()
+    computePurgeLimit()
+    purgeUndo(UndoRecord)
+  }
+
+  class TransactionRecoveryService {
+    recover()
+    rollbackRecoveredActive()
+  }
+
+  TransactionManager --> Transaction
+  TransactionManager --> ReadViewManager
+  TransactionManager --> UndoLogManager
+  TransactionManager --> LockManager
+
+  Transaction --> TransactionStateMachine
+  TransactionSystem --> ActiveTransactionTable
+  TransactionSystem --> Transaction
+  ActiveTransactionTable --> Transaction
+
+  ReadViewManager --> TransactionSystem
+  ReadViewManager --> ReadView
+  ReadView --> Transaction
+
+  MvccVisibilityService --> ReadViewManager
+  MvccVisibilityService --> VersionChainBuilder
+  MvccVisibilityService --> RecordVersion
+  VersionChainBuilder --> UndoLogManager
+  VersionChainBuilder --> UndoRecord
+  RecordVersion --> UndoRecord
+
+  UndoLogManager --> UndoRecord
+  UndoLogManager --> RollbackSegment
+  UndoLogManager --> HistoryList
+  UndoRecord --> RecordVersion
+
+  LockManager --> Transaction
+  LockManager --> WaitForGraph
+
+  PurgeCoordinator --> ReadViewManager
+  PurgeCoordinator --> HistoryList
+  PurgeCoordinator --> UndoLogManager
+
+  TransactionRecoveryService --> TransactionSystem
+  TransactionRecoveryService --> UndoLogManager

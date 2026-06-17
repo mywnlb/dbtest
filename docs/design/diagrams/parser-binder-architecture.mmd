@@ -1,0 +1,27 @@
+flowchart TB
+  Session["SQL Session"]
+  Lexer["sql.parser.lexer Lexer"]
+  Parser["sql.parser.core Parser"]
+  Ast["sql.parser.ast StatementAst"]
+  Binder["sql.binder.api StatementBinder"]
+  NameResolver["NameResolver"]
+  TypeResolver["TypeResolver"]
+  ParamBinder["ParameterBinder"]
+  PrivHook["PrivilegeHook"]
+  DD["DataDictionary + MDL"]
+  Bound["BoundStatement"]
+  Optimizer["Query Optimizer"]
+  Executor["SQL Executor"]
+  DDL["DDL Coordinator"]
+
+  Session --> Lexer --> Parser --> Ast --> Binder
+  Binder --> NameResolver
+  Binder --> TypeResolver
+  Binder --> ParamBinder
+  Binder --> PrivHook
+  NameResolver --> DD
+  PrivHook --> DD
+  Binder --> Bound
+  Bound --> Optimizer
+  Bound --> Executor
+  Bound --> DDL

@@ -1,0 +1,72 @@
+classDiagram
+    class SqlExecutor {
+        +execute(StatementAst, SessionContext)
+        +openCursor(QueryPlan, ExecutionContext)
+        +executeDml(DmlPlan, ExecutionContext)
+    }
+
+    class ExecutionContext {
+        +SessionContext session
+        +TransactionContext transaction
+        +DictionaryReadView dictionaryReadView
+        +List~MdlTicket~ mdlTickets
+    }
+
+    class QueryPlan {
+        +PlanNode root
+        +ResultSchema resultSchema
+    }
+
+    class PlanNode {
+        <<interface>>
+        +open()
+        +next()
+        +close()
+    }
+
+    class TableScanNode
+    class IndexLookupNode
+    class FilterNode
+    class ProjectionNode
+    class LimitNode
+    class SortNode
+    class DmlNode
+
+    class StorageEngine {
+        <<interface>>
+        +openTable(TableDefinition, AccessMode, TransactionContext)
+        +indexScan(StorageTableHandle, IndexAccessPlan)
+        +insertRow(StorageTableHandle, LogicalRow)
+        +updateRow(StorageRowHandle, UpdatePatch)
+        +deleteRow(StorageRowHandle)
+    }
+
+    class StorageCursor {
+        +next()
+        +currentRow()
+        +currentHandle()
+        +close()
+    }
+
+    class ExpressionEvaluator {
+        +evalPredicate(RowView, Expression)
+        +evalProjection(RowView, ProjectionList)
+        +evalUpdate(RowView, AssignmentList)
+    }
+
+    SqlExecutor --> ExecutionContext
+    SqlExecutor --> QueryPlan
+    QueryPlan --> PlanNode
+    TableScanNode ..|> PlanNode
+    IndexLookupNode ..|> PlanNode
+    FilterNode ..|> PlanNode
+    ProjectionNode ..|> PlanNode
+    LimitNode ..|> PlanNode
+    SortNode ..|> PlanNode
+    DmlNode ..|> PlanNode
+    PlanNode --> StorageEngine
+    StorageEngine --> StorageCursor
+    FilterNode --> ExpressionEvaluator
+    ProjectionNode --> ExpressionEvaluator
+    DmlNode --> ExpressionEvaluator
+

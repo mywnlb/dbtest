@@ -1,0 +1,79 @@
+flowchart TB
+  subgraph Hit["数据流 A：读命中"]
+    H1["调用 getPage(pageId, S/X, mtr)"]
+    H2["Router 选择 BufferPoolInstance"]
+    H3["PageHashTable 命中 frame"]
+    H4["bufFixCount + 1"]
+    H5["获取 PageLatch"]
+    H6["MTR memo 记录 latch 和 fix"]
+    H7["OldBlockPromotionPolicy 更新 LRU"]
+    H8["返回 PageHandle"]
+  end
+
+  subgraph Miss["数据流 B：读 miss"]
+    M1["PageHashTable 未命中"]
+    M2["FrameAllocator 从 FreeList 取 frame"]
+    M3{"FreeList 为空?"}
+    M4["EvictionCandidateSelector 扫描 LRU 尾部"]
+    M5{"候选 dirty?"}
+    M6["触发 LRU flush 或等待 clean frame"]
+    M7["注册 PageLoadFuture"]
+    M8["PageReadService 读取 PageStore"]
+    M9["PageVerifier 校验 checksum/pageId/pageType"]
+    M10["发布 frame 为 CLEAN"]
+    M11["插入 LRU old head"]
+    M12["获取 latch/fix 并返回 handle"]
+  end
+
+  subgraph Write["数据流 C：写页与标脏"]
+    W1["以 X latch 获取 PageHandle"]
+    W2["PageCursor 修改 PageImage"]
+    W3["MTR 收集 redo record"]
+    W4["MTR commit 分配 LSN"]
+    W5["RedoLogWriter 写 redo"]
+    W6["DirtyPageMarker 接收 commit 事件"]
+    W7{"frame 原来 clean?"}
+    W8["设置 oldest/newest LSN 并加入 FlushList"]
+    W9["更新 newest LSN，保留 oldest LSN"]
+    W10["释放 latch/fix"]
+  end
+
+  subgraph Flush["数据流 D：刷脏"]
+    F1["FlushCoordinator 从 FlushList 取候选"]
+    F2["确认 redo durable LSN 足够"]
+    F3["固定 frame，设置 ioState=FLUSH"]
+    F4["复制稳定 PageImage 并计算 checksum"]
+    F5["DoublewriteStrategy 写副本"]
+    F6["PageStore 写 tablespace page"]
+    F7{"写出期间又被修改?"}
+    F8["移出 FlushList，frame 转 CLEAN"]
+    F9["保留 DIRTY，推进已刷 LSN"]
+  end
+
+  subgraph Warmup["数据流 E：dump/load"]
+    D1["DumpService 扫描 LRU 热端快照"]
+    D2["只写 SpaceId + PageNo"]
+    D3["LoadService 后台读取 dump"]
+    D4["跳过 stale 或不存在 page"]
+    D5["复用 prefetch/read path"]
+    D6["加载页插入 old 子链"]
+  end
+
+  H1 --> H2 --> H3 --> H4 --> H5 --> H6 --> H7 --> H8
+
+  M1 --> M2 --> M3
+  M3 -- "否" --> M7
+  M3 -- "是" --> M4 --> M5
+  M5 -- "是" --> M6 --> M4
+  M5 -- "否" --> M7
+  M7 --> M8 --> M9 --> M10 --> M11 --> M12
+
+  W1 --> W2 --> W3 --> W4 --> W5 --> W6 --> W7
+  W7 -- "是" --> W8 --> W10
+  W7 -- "否" --> W9 --> W10
+
+  F1 --> F2 --> F3 --> F4 --> F5 --> F6 --> F7
+  F7 -- "否" --> F8
+  F7 -- "是" --> F9
+
+  D1 --> D2 --> D3 --> D4 --> D5 --> D6

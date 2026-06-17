@@ -1,0 +1,16 @@
+flowchart TD
+    start["Leaf page has no safe space"] --> reserve["SpaceReservationService.reserve"]
+    reserve --> allocate["DiskSpaceManager.allocatePage in leaf/non-leaf segment"]
+    allocate --> create["BufferPool.createPage(newPageId, INDEX, mtr)"]
+    create --> move["Record moves records and rebuilds PageDirectory"]
+    move --> link["B+Tree updates FIL_PAGE_PREV/NEXT sibling links"]
+    link --> sep["Build separator key"]
+    sep --> parent{"Parent has space?"}
+    parent -->|"yes"| parentInsert["Insert separator into parent"]
+    parent -->|"no"| parentSplit["Split parent recursively"]
+    parentSplit --> root{"Root split needed?"}
+    root -->|"yes"| rootSplit["Copy old root to child and rebuild stable root page"]
+    root -->|"no"| redo
+    parentInsert --> redo["MTR redo: allocation + page bytes + parent changes"]
+    rootSplit --> redo
+    redo --> commit["MTR commit publishes dirty pages"]

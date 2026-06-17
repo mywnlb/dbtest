@@ -1,0 +1,41 @@
+flowchart TB
+    subgraph btree["storage.btree"]
+        api["api\nBTreeIndexService"]
+        domain["domain\nBTreeIndex / SearchKey"]
+        page["page\nBTreePage"]
+        search["search\nroot-to-leaf descent"]
+        cursor["cursor\nBTreeCursor"]
+        scan["scan\nrange scan"]
+        split["split\nPageSplitPlan"]
+        merge["merge\nPageMergePlan"]
+        latch["latch\nLatchCouplingContext"]
+        lockref["lockref\nIndexRecordRef / GapRef"]
+        recovery["recovery\nBtreePageRedoHandler"]
+        metric["metric"]
+    end
+
+    record["storage.record"]
+    buf["storage.buf"]
+    fsp["storage.fsp"]
+    trx["storage.trx"]
+    mtr["storage.mtr"]
+    redo["storage.redo"]
+
+    api --> search
+    api --> scan
+    api --> split
+    api --> merge
+    search --> page
+    scan --> cursor
+    split --> page
+    merge --> page
+    page --> record
+    page --> buf
+    split --> fsp
+    merge --> fsp
+    latch --> buf
+    lockref --> trx
+    api --> mtr
+    mtr --> redo
+    recovery --> redo
+    metric -. observes .-> api

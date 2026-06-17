@@ -1,0 +1,74 @@
+classDiagram
+    class QueryOptimizer {
+        +optimize(BoundStatement, OptimizerContext)
+        +explain(BoundStatement, ExplainMode)
+    }
+
+    class OptimizerContext {
+        +SessionVariables sessionVariables
+        +DictionaryReadView dictionaryReadView
+        +StatisticsSnapshot statisticsSnapshot
+        +OptimizerTraceRecorder trace
+    }
+
+    class LogicalPlan
+    class PhysicalPlan
+    class RelNode
+    class AccessPath
+    class RangeInterval
+    class JoinGraph
+    class JoinOrderPlan
+    class CostEstimate
+    class CardinalityEstimate
+
+    class RuleRewriteEngine {
+        +rewrite(LogicalPlan, OptimizerContext)
+    }
+
+    class AccessPathEnumerator {
+        +enumerate(TableBinding, PredicateSet)
+    }
+
+    class RangeOptimizer {
+        +extractRanges(PredicateSet, IndexDefinition)
+    }
+
+    class JoinOrderOptimizer {
+        +chooseJoinOrder(JoinGraph, AccessPathSet)
+    }
+
+    class CostModel {
+        +estimateAccess(AccessPath, StatisticsSnapshot)
+        +estimateJoin(JoinOrderPlan, StatisticsSnapshot)
+    }
+
+    class StatisticsProvider {
+        +snapshot(DictionaryReadView)
+        +tableStats(TableId)
+        +indexStats(IndexId)
+        +histogram(ColumnId)
+    }
+
+    class OptimizerTraceRecorder {
+        +beginPhase(String)
+        +recordChoice(String, CostEstimate)
+        +endPhase()
+    }
+
+    QueryOptimizer --> RuleRewriteEngine
+    QueryOptimizer --> AccessPathEnumerator
+    QueryOptimizer --> JoinOrderOptimizer
+    QueryOptimizer --> CostModel
+    QueryOptimizer --> PhysicalPlan
+    QueryOptimizer --> OptimizerContext
+    OptimizerContext --> StatisticsProvider
+    OptimizerContext --> OptimizerTraceRecorder
+    RuleRewriteEngine --> LogicalPlan
+    AccessPathEnumerator --> AccessPath
+    AccessPathEnumerator --> RangeOptimizer
+    RangeOptimizer --> RangeInterval
+    JoinOrderOptimizer --> JoinGraph
+    JoinOrderOptimizer --> JoinOrderPlan
+    CostModel --> CostEstimate
+    CostModel --> CardinalityEstimate
+

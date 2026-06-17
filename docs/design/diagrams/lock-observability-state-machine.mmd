@@ -1,0 +1,42 @@
+stateDiagram-v2
+    [*] --> FREE
+    FREE --> REQUESTED: build request
+    REQUESTED --> GRANTED: compatible acquire
+    REQUESTED --> WAITING: row lock conflict
+    REQUESTED --> PENDING: MDL conflict
+
+    GRANTED --> CONVERTING: upgrade request
+    CONVERTING --> GRANTED: upgrade granted
+    CONVERTING --> WAITING: row upgrade conflict
+    CONVERTING --> PENDING: MDL upgrade conflict
+
+    WAITING --> GRANTED: blocker released
+    PENDING --> GRANTED: blocker released
+    WAITING --> TIMEOUT: deadline reached
+    PENDING --> TIMEOUT: deadline reached
+    WAITING --> VICTIM: row deadlock detector
+    PENDING --> VICTIM: MDL deadlock detector
+    WAITING --> KILLED: kill query or session
+    PENDING --> KILLED: kill query or session
+
+    GRANTED --> RELEASED: normal release
+    TIMEOUT --> CLEANUP_RELEASED: remove pending request
+    KILLED --> CLEANUP_RELEASED: cancel wait
+    VICTIM --> ROLLBACK_RELEASED: rollback or statement abort
+
+    RELEASED --> FREE
+    CLEANUP_RELEASED --> FREE
+    ROLLBACK_RELEASED --> FREE
+    FREE --> [*]
+
+    note right of WAITING
+        Row transaction locks enter ROW_LOCK_GRAPH.
+        Caller has released page latch, cursor, buffer fix,
+        file latch, and MTR latch before blocking.
+    end note
+
+    note right of PENDING
+        MDL requests enter MDL_GRAPH.
+        Physical latch, mutex, condition, and wait slot
+        are diagnostic events only.
+    end note

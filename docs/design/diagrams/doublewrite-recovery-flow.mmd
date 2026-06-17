@@ -1,0 +1,24 @@
+flowchart TD
+    start["Crash recovery starts"]
+    discover["Discover tablespaces and doublewrite files"]
+    scanDblwr["Scan doublewrite slots"]
+    scanPages["Read data file pages needed by recovery"]
+    torn{"Page checksum or torn write detected?"}
+    hasCopy{"Full copy exists and newer/equal LSN?"}
+    repair["Restore page from doublewrite copy"]
+    detectOnly["Mark page suspicious; rely on redo or fail"]
+    redo["Redo replay from checkpoint LSN"]
+    pageLsn{"pageLSN >= redo record endLsn?"}
+    skip["Skip redo record"]
+    apply["Apply redo record"]
+    done["Physical page recovery complete"]
+
+    start --> discover --> scanDblwr --> scanPages --> torn
+    torn --> hasCopy
+    torn --> redo
+    hasCopy --> repair --> redo
+    hasCopy --> detectOnly --> redo
+    redo --> pageLsn
+    pageLsn --> skip --> done
+    pageLsn --> apply --> done
+

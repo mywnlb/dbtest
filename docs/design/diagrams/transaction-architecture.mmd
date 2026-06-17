@@ -1,0 +1,105 @@
+flowchart TB
+  subgraph Upper["上层模块"]
+    SQL["SQL Executor / Session"]
+    BTree["B+Tree / Index Manager"]
+    Record["Record Manager"]
+  end
+
+  subgraph Api["storage.trx.api"]
+    TM["TransactionManager\nFacade"]
+    TC["TransactionContext"]
+  end
+
+  subgraph Core["storage.trx.core"]
+    Trx["Transaction"]
+    TrxSys["TransactionSystem"]
+    Active["ActiveTransactionTable"]
+    State["TransactionStateMachine"]
+  end
+
+  subgraph ReadViewPkg["storage.trx.readview"]
+    RVM["ReadViewManager"]
+    RV["ReadView\nSnapshot"]
+  end
+
+  subgraph Mvcc["storage.trx.mvcc"]
+    Visibility["MvccVisibilityService"]
+    VersionBuilder["VersionChainBuilder"]
+    Isolation["IsolationLevelStrategy"]
+  end
+
+  subgraph Undo["storage.trx.undo"]
+    UndoMgr["UndoLogManager"]
+    UndoRec["UndoRecord\nCommand"]
+    Rseg["RollbackSegment"]
+    History["HistoryList"]
+  end
+
+  subgraph Lock["storage.trx.lock"]
+    LockMgr["LockManager"]
+    WaitGraph["WaitForGraph"]
+    Deadlock["DeadlockDetector"]
+  end
+
+  subgraph Purge["storage.trx.purge"]
+    PurgeCoord["PurgeCoordinator"]
+    PurgeView["Oldest ReadView"]
+  end
+
+  subgraph Recovery["storage.trx.recovery"]
+    TrxRecovery["TransactionRecoveryService"]
+  end
+
+  subgraph Storage["已有存储模块"]
+    MTR["MiniTransaction"]
+    BufferPool["BufferPool"]
+    Fsp["DiskSpaceManager"]
+    Redo["RedoLogWriter"]
+  end
+
+  SQL --> TM
+  TM --> TC
+  TM --> Trx
+  TM --> RVM
+  TM --> UndoMgr
+  TM --> LockMgr
+
+  Trx --> State
+  TrxSys --> Active
+  TrxSys --> Trx
+  RVM --> TrxSys
+  RVM --> RV
+
+  BTree --> Visibility
+  Record --> Visibility
+  Record --> UndoMgr
+  BTree --> LockMgr
+
+  Visibility --> RVM
+  Visibility --> VersionBuilder
+  Visibility --> Isolation
+  VersionBuilder --> UndoMgr
+
+  UndoMgr --> UndoRec
+  UndoMgr --> Rseg
+  UndoMgr --> History
+  UndoMgr --> MTR
+  UndoMgr --> BufferPool
+  UndoMgr --> Fsp
+  UndoMgr --> Redo
+
+  LockMgr --> WaitGraph
+  WaitGraph --> Deadlock
+  LockMgr --> Trx
+
+  PurgeCoord --> PurgeView
+  PurgeCoord --> RVM
+  PurgeCoord --> History
+  PurgeCoord --> UndoMgr
+  PurgeCoord --> BTree
+  PurgeCoord --> MTR
+
+  TrxRecovery --> TrxSys
+  TrxRecovery --> UndoMgr
+  TrxRecovery --> Redo
+  TrxRecovery --> PurgeCoord

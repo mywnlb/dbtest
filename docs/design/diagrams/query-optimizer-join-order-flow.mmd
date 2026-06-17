@@ -1,0 +1,29 @@
+flowchart TD
+    joinGraph["JoinGraph"]
+    classify["Classify inner / outer / semijoin constraints"]
+    count{"Table count <= DP limit?"}
+    dp["Dynamic programming left-deep enumeration"]
+    greedy["Greedy search with pruning"]
+    access["Attach best access path per prefix"]
+    predicate["Apply join predicates and selectivity"]
+    alg{"Join algorithm"}
+    nlj["Nested loop join"]
+    hash["Hash join candidate"]
+    bka["Batched key access extension point"]
+    cost["Estimate join cost"]
+    choose["Choose best JoinOrderPlan"]
+    output["Physical join tree"]
+
+    joinGraph --> classify --> count
+    count --> dp
+    count --> greedy
+    dp --> access
+    greedy --> access
+    access --> predicate --> alg
+    alg --> nlj
+    alg --> hash
+    alg --> bka
+    nlj --> cost
+    hash --> cost
+    bka --> cost
+    cost --> choose --> output

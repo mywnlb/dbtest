@@ -1,0 +1,41 @@
+stateDiagram-v2
+    [*] --> IDLE
+    IDLE --> PARSING: statement received
+    PARSING --> BINDING: AST created
+    BINDING --> MDL_REQUESTED: need table metadata
+    MDL_REQUESTED --> MDL_GRANTED: compatible metadata lock
+    MDL_REQUESTED --> MDL_WAITING: DDL or conflicting statement
+    MDL_WAITING --> MDL_GRANTED: grant
+    MDL_WAITING --> FAILED: timeout, killed, or victim
+
+    MDL_GRANTED --> DICT_PINNED: pin TableDefinition
+    DICT_PINNED --> PLAN_OPEN: build and open PlanNode tree
+    PLAN_OPEN --> STORAGE_CURSOR_OPEN: open StorageCursor
+    STORAGE_CURSOR_OPEN --> ROW_LOCK_WAIT: locking read or DML conflict
+    STORAGE_CURSOR_OPEN --> ROW_AVAILABLE: nonlocking read or lock granted
+    ROW_LOCK_WAIT --> ROW_LOCK_GRANTED: LockManager grant
+    ROW_LOCK_WAIT --> FAILED: deadlock victim or lock timeout
+    ROW_LOCK_GRANTED --> RELOCATING: storage re-enters B+Tree
+    RELOCATING --> ROW_AVAILABLE: row validated
+    ROW_AVAILABLE --> PRODUCING_ROWS: filter and projection
+    ROW_AVAILABLE --> MODIFYING: DML current row
+    MODIFYING --> MTR_COMMITTING: storage page changes
+    MTR_COMMITTING --> STATEMENT_CLEANUP: redo and memo release
+    PRODUCING_ROWS --> STATEMENT_CLEANUP: result exhausted
+    STATEMENT_CLEANUP --> TRANSACTION_END: autocommit or explicit commit
+    STATEMENT_CLEANUP --> IDLE: transaction remains active
+    TRANSACTION_END --> IDLE: release row locks and transaction MDL
+    FAILED --> STATEMENT_CLEANUP: cleanup cursor and locks
+    IDLE --> [*]
+
+    note right of MDL_WAITING
+        Executor holds only MDL wait slot.
+        It must not hold page latch, row lock shard,
+        file latch, MTR latch, or RecordCursor.
+    end note
+
+    note right of ROW_LOCK_WAIT
+        Storage layer releases page latch and buffer fix
+        before entering LockManager wait.
+    end note
+

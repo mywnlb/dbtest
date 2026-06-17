@@ -1,0 +1,109 @@
+flowchart TB
+  subgraph Upper["上层存储引擎"]
+    BTree["B+Tree / Index Manager"]
+    Record["Record Manager"]
+    DDL["DDL / Data Dictionary Gateway"]
+  end
+
+  subgraph Api["storage.api"]
+    DSM["DiskSpaceManager\nFacade"]
+    PCM["PageCursorFactory"]
+  end
+
+  subgraph Mtr["storage.mtr"]
+    MTM["MiniTransactionManager"]
+    MTR["MiniTransaction\nUnit of Work"]
+    Memo["MtrMemoStack"]
+    RedoCollector["RedoRecordCollector"]
+  end
+
+  subgraph Fsp["storage.fsp"]
+    Alloc["SegmentPageAllocator"]
+    Reserve["SpaceReservationService"]
+    SpaceRepo["SpaceHeaderRepository"]
+    XdesRepo["ExtentDescriptorRepository"]
+    InodeRepo["SegmentInodeRepository"]
+    ExtPolicy["ExtentAllocationPolicy"]
+  end
+
+  subgraph Buf["storage.buf"]
+    BufferPool["BufferPool"]
+    Frame["BufferFrame"]
+    Latch["PageLatch"]
+    Dirty["DirtyPageQueue"]
+  end
+
+  subgraph Fil["storage.fil"]
+    Registry["TablespaceRegistry"]
+    PageStore["PageStore"]
+    AutoExtend["AutoExtendPolicy"]
+    DataFile["DataFileGateway"]
+  end
+
+  subgraph Redo["storage.redo"]
+    RedoWriter["RedoLogWriter"]
+    Lsn["LsnAllocator"]
+    Checkpoint["CheckpointCoordinator"]
+  end
+
+  subgraph Flush["storage.flush"]
+    FlushCoord["FlushCoordinator"]
+    Doublewrite["DoublewriteStrategy"]
+  end
+
+  subgraph Recovery["storage.recovery"]
+    RecoverySvc["RecoveryService"]
+    RedoApplier["RedoRecordApplier"]
+  end
+
+  Storage["File System\n.ibd / undo / temp / redo / doublewrite"]
+
+  BTree --> DSM
+  Record --> PCM
+  DDL --> DSM
+
+  DSM --> MTM
+  DSM --> Alloc
+  DSM --> Reserve
+  PCM --> BufferPool
+
+  MTM --> MTR
+  MTR --> Memo
+  MTR --> RedoCollector
+  RedoCollector --> RedoWriter
+  RedoWriter --> Lsn
+
+  Alloc --> SpaceRepo
+  Alloc --> XdesRepo
+  Alloc --> InodeRepo
+  Alloc --> ExtPolicy
+  Alloc --> BufferPool
+  Reserve --> SpaceRepo
+
+  BufferPool --> Frame
+  Frame --> Latch
+  BufferPool --> PageStore
+  BufferPool --> Dirty
+
+  SpaceRepo --> BufferPool
+  XdesRepo --> BufferPool
+  InodeRepo --> BufferPool
+
+  PageStore --> Registry
+  PageStore --> DataFile
+  DataFile --> AutoExtend
+  DataFile --> Storage
+
+  FlushCoord --> Dirty
+  FlushCoord --> Doublewrite
+  FlushCoord --> PageStore
+  FlushCoord --> Checkpoint
+  Doublewrite --> Storage
+
+  RecoverySvc --> RedoApplier
+  RedoApplier --> PageStore
+  RedoApplier --> SpaceRepo
+  RedoApplier --> XdesRepo
+  RedoApplier --> InodeRepo
+  RecoverySvc --> Checkpoint
+  RedoWriter --> Storage

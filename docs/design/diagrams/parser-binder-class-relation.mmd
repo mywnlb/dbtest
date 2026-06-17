@@ -1,0 +1,51 @@
+classDiagram
+  class SqlParserBinder {
+    +parse(String)
+    +bind(StatementAst, BindingRequest)
+  }
+
+  class TokenStream
+  class StatementAst
+  class AstVisitor
+  class BindingContext {
+    +session
+    +dictionaryReadView
+    +mdlTickets
+    +scopeStack
+  }
+
+  class StatementBinder {
+    <<interface>>
+    +bind(StatementAst, BindingContext)
+  }
+
+  class QueryBinder
+  class DmlBinder
+  class DdlBinder
+  class BoundStatement
+  class BoundQuery
+  class BoundDmlStatement
+  class DdlRequest
+  class QueryBlock
+  class BoundExpression
+  class TableBinding
+  class ColumnBinding
+  class ParameterMetadata
+
+  SqlParserBinder --> TokenStream
+  SqlParserBinder --> StatementAst
+  SqlParserBinder --> StatementBinder
+  StatementAst --> AstVisitor
+  StatementBinder <|.. QueryBinder
+  StatementBinder <|.. DmlBinder
+  StatementBinder <|.. DdlBinder
+  StatementBinder --> BindingContext
+  StatementBinder --> BoundStatement
+  BoundStatement <|-- BoundQuery
+  BoundStatement <|-- BoundDmlStatement
+  BoundStatement <|-- DdlRequest
+  BoundQuery --> QueryBlock
+  QueryBlock --> TableBinding
+  QueryBlock --> ColumnBinding
+  QueryBlock --> BoundExpression
+  BoundStatement --> ParameterMetadata

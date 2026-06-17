@@ -1,0 +1,28 @@
+stateDiagram-v2
+    [*] --> IDLE
+    IDLE --> CONTEXT_CREATED: optimize request
+    CONTEXT_CREATED --> MDL_HELD: binder already owns MDL tickets
+    MDL_HELD --> DICT_PINNED: pin table definitions
+    DICT_PINNED --> STATS_SNAPSHOT: open immutable statistics snapshot
+    STATS_SNAPSHOT --> OPTIMIZING: enumerate plans
+    OPTIMIZING --> TRACE_WRITING: record optimizer trace
+    TRACE_WRITING --> PLAN_READY: physical plan selected
+    PLAN_READY --> RELEASE_SNAPSHOT: close stats snapshot
+    RELEASE_SNAPSHOT --> RETURNED: return plan to executor
+    RETURNED --> IDLE
+
+    OPTIMIZING --> ABORTED: timeout, killed, unsupported feature
+    ABORTED --> RELEASE_SNAPSHOT: cleanup
+    IDLE --> [*]
+
+    note right of OPTIMIZING
+        Optimizer holds metadata pins and immutable statistics only.
+        It must not hold row locks, page latches, MTR latches,
+        redo wait slots, or physical file locks.
+    end note
+
+    note right of TRACE_WRITING
+        Trace buffer is session scoped.
+        Trace writes do not call storage engine or DD repository.
+    end note
+

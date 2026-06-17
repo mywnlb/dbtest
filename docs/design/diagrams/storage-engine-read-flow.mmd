@@ -1,0 +1,20 @@
+flowchart TD
+    start["Session starts read"] --> trx["TransactionManager opens transaction"]
+    trx --> readtype{"Read type"}
+    readtype -->|"consistent read"| rv["ReadViewManager opens or reuses ReadView"]
+    readtype -->|"current read"| cr["B+Tree will request logical locks"]
+    rv --> search["B+Tree root-to-leaf search"]
+    cr --> search
+    search --> bp["BufferPool.getPage(pageId, S, mtr)"]
+    bp --> rec["RecordPageAccessor finds key by PageDirectory + next_record"]
+    rec --> current{"current read?"}
+    current -->|"no"| mvcc["MvccVisibilityService checks DB_TRX_ID and delete flag"]
+    mvcc --> visible{"visible?"}
+    visible -->|"yes"| row["Return current LogicalRecord"]
+    visible -->|"no"| undo["Follow DB_ROLL_PTR and build old RecordVersion"]
+    undo --> row
+    current -->|"yes"| ref["Capture IndexRecordRef or IndexGapRef"]
+    ref --> release["Release RecordCursor, page latch, buffer fix"]
+    release --> lock["LockManager grants record/gap/next-key lock"]
+    lock --> relocate["Re-enter B+Tree and relocate"]
+    relocate --> rec

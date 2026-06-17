@@ -1,0 +1,18 @@
+stateDiagram-v2
+  [*] --> BOOT_BLOCKED
+  BOOT_BLOCKED --> DISCOVERING_FILES: acquire recovery gate
+  DISCOVERING_FILES --> DOUBLEWRITE_REPAIRING: lifecycle S latch per tablespace
+  DOUBLEWRITE_REPAIRING --> REDO_REPLAYING: release doublewrite file locks
+  REDO_REPLAYING --> DDL_RECOVERING: redo complete
+  DDL_RECOVERING --> TRX_ROLLBACKING: dictionary stable
+  TRX_ROLLBACKING --> PURGE_RESUMING: active rollback complete
+  PURGE_RESUMING --> WORKERS_STARTING: purge view initialized
+  WORKERS_STARTING --> USER_TRAFFIC_OPEN: page cleaner and checkpoint workers ready
+  USER_TRAFFIC_OPEN --> [*]
+
+  DISCOVERING_FILES --> FAILED: file header or redo control error
+  DOUBLEWRITE_REPAIRING --> FAILED: unrecoverable torn page
+  REDO_REPLAYING --> FAILED: corrupt required redo
+  DDL_RECOVERING --> FAILED: unrecoverable DDL log
+  TRX_ROLLBACKING --> FAILED: rollback failure
+  FAILED --> [*]

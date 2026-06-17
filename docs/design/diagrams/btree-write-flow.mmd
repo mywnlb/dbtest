@@ -1,0 +1,22 @@
+flowchart TD
+    start["Insert or update-key request"] --> ctx["Build BTreeOperationContext"]
+    ctx --> unique["Current-read unique/range check"]
+    unique --> ref["Build lock target"]
+    ref --> release["Release page latch before row-lock wait"]
+    release --> lock["Acquire insert intention / record / next-key lock"]
+    lock --> relocate["Relocate target leaf"]
+    relocate --> space{"leaf has enough space?"}
+    space -->|"yes"| record["RecordPageAccessor insert/delete-mark/update"]
+    space -->|"no"| reserve["Reserve and allocate new page"]
+    reserve --> split["PageSplitPlan chooses right or median split"]
+    split --> move["Move records and update sibling links"]
+    move --> parent["Insert separator into parent"]
+    parent --> cascade{"parent split needed?"}
+    cascade -->|"yes"| splitParent["Split parent recursively"]
+    splitParent --> root{"root split?"}
+    root -->|"yes"| rootSplit["Rebuild stable root page"]
+    root -->|"no"| redo
+    cascade -->|"no"| redo
+    record --> redo["MTR collects redo payload"]
+    rootSplit --> redo
+    redo --> commit["MTR commit, dirty pages published"]

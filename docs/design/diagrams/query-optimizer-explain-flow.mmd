@@ -1,0 +1,24 @@
+flowchart TD
+    stmt["EXPLAIN / EXPLAIN ANALYZE request"]
+    optimize["Run optimizer or reuse running plan"]
+    plan["PhysicalPlan tree"]
+    estimate["Estimated rows and cost"]
+    access["Access type, key, key_len, filtered"]
+    trace["OptimizerTrace events"]
+    analyze{"ANALYZE?"}
+    execute["Execute plan and collect actual rows/time"]
+    format{"Format"}
+    traditional["TRADITIONAL rows"]
+    json["JSON document"]
+    tree["TREE iterators"]
+    result["Return explain result"]
+
+    stmt --> optimize --> plan
+    plan --> estimate --> access --> trace --> analyze
+    analyze --> execute
+    analyze --> format
+    execute --> format
+    format --> traditional --> result
+    format --> json --> result
+    format --> tree --> result
+

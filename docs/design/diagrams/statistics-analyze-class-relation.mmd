@@ -1,0 +1,51 @@
+classDiagram
+  class AnalyzeTableExecutor {
+    +execute(AnalyzeRequest)
+  }
+
+  class AnalyzeRequest {
+    +tableId
+    +columns
+    +histogramOptions
+  }
+
+  class StatsCollector {
+    +collectTableStats()
+    +collectIndexStats()
+  }
+
+  class IndexSamplingPlan
+  class PersistentStatsStore {
+    +loadSnapshot()
+    +persist()
+  }
+
+  class StatsCache {
+    +getSnapshot()
+    +publish()
+    +invalidate()
+  }
+
+  class OptimizerStatsSnapshot
+  class TableStats
+  class IndexStats
+  class ColumnHistogram
+  class HistogramBuilder
+  class StatsVersion
+
+  AnalyzeTableExecutor --> AnalyzeRequest
+  AnalyzeTableExecutor --> StatsCollector
+  AnalyzeTableExecutor --> PersistentStatsStore
+  AnalyzeTableExecutor --> StatsCache
+  StatsCollector --> IndexSamplingPlan
+  StatsCollector --> TableStats
+  StatsCollector --> IndexStats
+  HistogramBuilder --> ColumnHistogram
+  PersistentStatsStore --> TableStats
+  PersistentStatsStore --> IndexStats
+  PersistentStatsStore --> ColumnHistogram
+  StatsCache --> OptimizerStatsSnapshot
+  OptimizerStatsSnapshot --> TableStats
+  OptimizerStatsSnapshot --> IndexStats
+  OptimizerStatsSnapshot --> ColumnHistogram
+  OptimizerStatsSnapshot --> StatsVersion

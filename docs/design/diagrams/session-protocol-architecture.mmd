@@ -1,0 +1,57 @@
+flowchart TB
+  Client["MySQL Client"]
+  Acceptor["ConnectionAcceptor"]
+  Conn["ProtocolConnection"]
+  Codec["ProtocolAdapter / PacketCodec"]
+  Handshake["HandshakeService"]
+  Auth["AuthenticationProvider"]
+  SessionManager["SessionManager"]
+  Session["Session"]
+  Dispatcher["CommandDispatcher"]
+  Variables["SessionVariables"]
+  TxPolicy["SessionTransactionPolicy"]
+  Prepared["PreparedStatementManager"]
+  ParserBinder["Parser / Binder"]
+  Executor["SQL Executor"]
+  ResultStreamer["ResultStreamer"]
+  Writer["PacketWriter"]
+  Kill["KillService"]
+  Registry["ConnectionRegistry"]
+
+  Client --> Acceptor --> Conn --> Codec
+  Codec --> Handshake --> Auth --> SessionManager --> Session
+  Session --> Variables
+  Session --> TxPolicy
+  Session --> Dispatcher
+  Dispatcher --> ParserBinder
+  Dispatcher --> Prepared
+  ParserBinder --> Executor
+  Prepared --> Executor
+  Executor --> ResultStreamer --> Writer --> Client
+  Kill --> Registry
+  Registry --> Session
+  Kill --> Session
+
+  subgraph Physical["Physical protocol boundary"]
+    Acceptor
+    Conn
+    Codec
+    Writer
+  end
+
+  subgraph Logical["Logical session boundary"]
+    SessionManager
+    Session
+    Variables
+    TxPolicy
+    Dispatcher
+    Kill
+    Registry
+  end
+
+  subgraph SQL["SQL execution boundary"]
+    ParserBinder
+    Prepared
+    Executor
+    ResultStreamer
+  end

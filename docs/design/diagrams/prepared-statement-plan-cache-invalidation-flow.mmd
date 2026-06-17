@@ -1,0 +1,19 @@
+flowchart TD
+  event{"Event"}
+  ddl["DDL publishes DictionaryVersion"]
+  stats["ANALYZE publishes StatsVersion"]
+  listener["InvalidationListener receives event"]
+  deps["Match DependencySet by table, index or column"]
+  stale["Mark PlanCacheEntry STALE"]
+  handle["Mark session PreparedStatementHandle STALE"]
+  running{"entry has active PlanUseGuard?"}
+  keep["Keep old template until refCount reaches zero"]
+  reprepare["Next EXECUTE runs reprepare"]
+  retire["Retire stale template"]
+
+  event --> ddl --> listener
+  event --> stats --> listener
+  listener --> deps --> stale --> handle --> running
+  running -->|"yes"| keep --> reprepare
+  running -->|"no"| reprepare
+  reprepare --> retire

@@ -1,0 +1,25 @@
+flowchart TD
+  start["Server process starts"]
+  gate["RecoveryTrafficGate blocks SQL sessions"]
+  discover["Discover tablespaces and redo checkpoint label"]
+  validate["Validate file headers, space versions, redo control"]
+  dblwr["Repair torn data pages from doublewrite"]
+  scan["Scan redo from checkpoint LSN"]
+  parse{"Complete redo record?"}
+  dispatch["Dispatch redo by record type"]
+  page["Load target page through recovery-safe PageStore or BufferPool"]
+  lsn{"pageLSN >= record.endLsn?"}
+  skip["Skip idempotently"]
+  apply["Apply physical redo and update pageLSN"]
+  ddl["Run DDL log recovery and dictionary cache rebuild"]
+  trx["Rebuild transaction system and rollback recovered active transactions"]
+  prepared["Expose prepared transactions to coordinator"]
+  purge["Resume purge from recovered history list"]
+  workers["Start page cleaner, checkpoint worker and warmup"]
+  open["Open gate for user traffic"]
+
+  start --> gate --> discover --> validate --> dblwr --> scan --> parse
+  parse -->|"yes"| dispatch --> page --> lsn
+  lsn -->|"yes"| skip --> parse
+  lsn -->|"no"| apply --> parse
+  parse -->|"no"| ddl --> trx --> prepared --> purge --> workers --> open

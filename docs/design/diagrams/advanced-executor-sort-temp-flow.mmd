@@ -1,0 +1,19 @@
+flowchart TD
+  start["Open SortNode or TempTableNode"]
+  quota["Acquire memory quota"]
+  read["Read child rows"]
+  buffer["Append row to sort buffer or temp table"]
+  full{"quota exceeded?"}
+  sortMem["Sort in memory"]
+  spill["Write sorted run to spill file"]
+  more{"More child rows?"}
+  merge["K-way merge spill runs"]
+  temp["Materialize rows in temp table"]
+  result["Return sorted/materialized cursor"]
+  cleanup["Release memory, spill handles and temp table"]
+
+  start --> quota --> read --> buffer --> full
+  full -->|"no"| more
+  full -->|"yes"| sortMem --> spill --> more
+  more -->|"yes"| read
+  more -->|"no"| merge --> temp --> result --> cleanup

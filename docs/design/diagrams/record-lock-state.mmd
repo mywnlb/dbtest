@@ -1,0 +1,20 @@
+stateDiagram-v2
+    [*] --> NO_HANDLE
+    NO_HANDLE --> PAGE_LATCHED_S: acquire pageLatch(S)
+    NO_HANDLE --> PAGE_LATCHED_X: acquire pageLatch(X)
+    PAGE_LATCHED_S --> CURSOR_ACTIVE: create RecordCursor for read
+    PAGE_LATCHED_X --> CURSOR_ACTIVE: create RecordCursor for write
+    CURSOR_ACTIVE --> REF_CAPTURED: build IndexRecordRef or IndexGapRef
+    REF_CAPTURED --> PAGE_RELEASED: release cursor and page latch before row-lock wait
+    PAGE_RELEASED --> WAITING_ROW_LOCK: LockManager wait
+    WAITING_ROW_LOCK --> ROW_LOCK_GRANTED: grant
+    WAITING_ROW_LOCK --> DEADLOCK_VICTIM: victim
+    WAITING_ROW_LOCK --> LOCK_TIMEOUT: timeout
+    ROW_LOCK_GRANTED --> RELOCATING: re-enter B+Tree
+    RELOCATING --> PAGE_LATCHED_X: reacquire pageLatch(X)
+    PAGE_LATCHED_X --> MODIFYING_RECORD: validate ref and modify page body
+    MODIFYING_RECORD --> MTR_COMMITTING: collect redo and commit
+    MTR_COMMITTING --> RELEASED: release page latch and buffer fix
+    DEADLOCK_VICTIM --> RELEASED: rollback releases row locks
+    LOCK_TIMEOUT --> RELEASED: statement retry or rollback
+    RELEASED --> [*]

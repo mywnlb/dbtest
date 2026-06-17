@@ -1,0 +1,38 @@
+flowchart TB
+  subgraph Prepare["COM_STMT_PREPARE"]
+    P1["Decode SQL text"]
+    P2["Snapshot session variables"]
+    P3["PreparedStatementManager.prepare"]
+    P4["Allocate protocol statement id"]
+    P5["Store PreparedStatementProtocolHandle"]
+    P6["Send PREPARE_OK"]
+    P7["Send parameter and column metadata if required"]
+  end
+
+  subgraph Execute["COM_STMT_EXECUTE"]
+    E1["Decode statement id"]
+    E2["Lookup protocol handle"]
+    E3["Decode binary parameters"]
+    E4["Validate parameter metadata"]
+    E5["PreparedStatementManager.execute"]
+    E6{"Template stale?"}
+    E7["Reprepare through prepared module"]
+    E8["Execute with fresh StatementContext"]
+    E9["Stream binary resultset or OK"]
+    E10["Release statement guard"]
+  end
+
+  subgraph Close["COM_STMT_CLOSE"]
+    C1["Decode statement id"]
+    C2["Mark handle DEALLOCATING"]
+    C3["Remove session mapping"]
+    C4["Release template reference"]
+    C5["No response packet"]
+  end
+
+  P1 --> P2 --> P3 --> P4 --> P5 --> P6 --> P7
+  E1 --> E2 --> E3 --> E4 --> E5 --> E6
+  E6 -->|"yes"| E7 --> E8
+  E6 -->|"no"| E8
+  E8 --> E9 --> E10
+  C1 --> C2 --> C3 --> C4 --> C5

@@ -1,0 +1,37 @@
+stateDiagram-v2
+  [*] --> NOT_STARTED
+
+  NOT_STARTED --> ACTIVE: begin
+  ACTIVE --> COMMITTING: commit requested
+  COMMITTING --> COMMITTED: commit redo durable and locks released
+
+  ACTIVE --> ROLLING_BACK: rollback requested
+  ACTIVE --> ROLLING_BACK: deadlock victim / rollback-only
+  ROLLING_BACK --> ROLLED_BACK: undo applied and locks released
+
+  ACTIVE --> PREPARED: xa prepare
+  PREPARED --> COMMITTING: xa commit
+  PREPARED --> ROLLING_BACK: xa rollback
+
+  ACTIVE --> RECOVERED_ACTIVE: crash recovery finds active undo
+  RECOVERED_ACTIVE --> ROLLING_BACK: recovery rollback
+
+  COMMITTED --> [*]
+  ROLLED_BACK --> [*]
+
+  note right of ACTIVE
+    May own ReadView
+    May own row locks
+    May own undo slots
+  end note
+
+  note right of COMMITTING
+    No new locks
+    No new undo
+    Update undo enters history list
+  end note
+
+  note right of ROLLING_BACK
+    Undo records are applied newest to oldest
+    Each physical change uses MTR
+  end note

@@ -1,0 +1,28 @@
+flowchart TD
+    start["SELECT statement"]
+    parse["Parse AST"]
+    bind["Resolve names and pin TableDefinition"]
+    mdl["Acquire MDL_SHARED_READ"]
+    trx["Ensure transaction and ReadView policy"]
+    plan["Build simple QueryPlan"]
+    open["Open PlanNode tree"]
+    access["StorageCursor index/table scan"]
+    readType{"Read type"}
+    consistent["Consistent read: MVCC ReadView"]
+    locking["Locking read: LockManager row/gap/next-key lock"]
+    filter["Evaluate WHERE predicate"]
+    project["Project columns"]
+    sortLimit["Apply ORDER BY / LIMIT if needed"]
+    returnRows["Return ResultSet"]
+    close["Close cursor, release statement resources"]
+
+    start --> parse --> bind --> mdl --> trx --> plan --> open --> access --> readType
+    readType --> consistent
+    readType --> locking
+    consistent --> filter
+    locking --> filter
+    filter --> project --> sortLimit --> returnRows --> close
+
+    locking --> releasePage["Storage layer releases page latch before row-lock wait"]
+    releasePage --> filter
+

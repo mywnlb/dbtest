@@ -1,0 +1,11 @@
+package cn.zhangyis.db.storage.record.type;
+
+/**
+ * 排序规则策略（innodb-record-design §8.3）。字符/二进制比较必须经此，不直接用 String.compareTo。
+ * 首版仅 {@link BinaryCollation}（编码字节序）；ci/weight collation 留扩展。
+ */
+public interface CollationStrategy {
+
+    /** 比较两段字节，返回 <0/0/>0。 */
+    int compare(byte[] a, int aOffset, int aLength, byte[] b, int bOffset, int bLength);
+}

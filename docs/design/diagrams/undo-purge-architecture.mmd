@@ -1,0 +1,111 @@
+flowchart TB
+  subgraph Upper["上层调用方"]
+    SQL["SQL Executor / Session"]
+    TrxApi["TransactionManager"]
+    MVCC["MvccVisibilityService"]
+    BTree["B+Tree / Index Manager"]
+    Record["Record Manager"]
+  end
+
+  subgraph UndoApi["storage.trx.undo.api"]
+    ULM["UndoLogManager\nFacade"]
+    RollbackApi["RollbackService"]
+    SavepointApi["SavepointService"]
+  end
+
+  subgraph UndoCore["storage.trx.undo.core"]
+    UndoCtx["UndoContext"]
+    UndoState["UndoLogStateMachine"]
+    RsegDir["RollbackSegmentDirectory"]
+    SlotMgr["RollbackSegmentSlotManager"]
+  end
+
+  subgraph UndoStorage["storage.trx.undo.storage"]
+    UtsRepo["UndoTablespaceRepository"]
+    Rseg["RollbackSegment"]
+    USeg["UndoSegment"]
+    UPage["UndoPage"]
+    URec["UndoRecord"]
+  end
+
+  subgraph HistoryPkg["storage.trx.undo.history"]
+    History["HistoryList"]
+    HistoryCursor["HistoryCursor"]
+    PurgeBoundary["PurgeBoundary"]
+  end
+
+  subgraph PurgePkg["storage.trx.purge"]
+    PurgeCoord["PurgeCoordinator"]
+    PurgeView["PurgeViewProvider"]
+    PurgeWorker["PurgeWorker"]
+    Truncation["UndoTruncationService"]
+  end
+
+  subgraph RecoveryPkg["storage.trx.undo.recovery"]
+    UndoRecovery["UndoRecoveryService"]
+    RsegScanner["RollbackSegmentScanner"]
+  end
+
+  subgraph Storage["已有存储模块"]
+    MTR["MiniTransaction"]
+    BufferPool["BufferPool"]
+    Disk["DiskSpaceManager / FSP"]
+    Redo["RedoLogManager"]
+    LockMgr["LockManager"]
+    ReadViewMgr["ReadViewManager"]
+    Dictionary["DataDictionary"]
+  end
+
+  SQL --> TrxApi
+  TrxApi --> ULM
+  TrxApi --> RollbackApi
+  TrxApi --> SavepointApi
+  MVCC --> ULM
+  BTree --> ULM
+  Record --> ULM
+
+  ULM --> UndoCtx
+  ULM --> UndoState
+  ULM --> RsegDir
+  ULM --> UtsRepo
+  ULM --> History
+
+  RollbackApi --> ULM
+  RollbackApi --> BTree
+  SavepointApi --> UndoCtx
+
+  RsegDir --> SlotMgr
+  RsegDir --> Rseg
+  UtsRepo --> Disk
+  Rseg --> USeg
+  USeg --> UPage
+  UPage --> URec
+  URec --> History
+  History --> HistoryCursor
+  History --> PurgeBoundary
+
+  PurgeCoord --> PurgeView
+  PurgeCoord --> History
+  PurgeCoord --> PurgeWorker
+  PurgeCoord --> ULM
+  PurgeWorker --> BTree
+  PurgeWorker --> Record
+  Truncation --> UtsRepo
+  Truncation --> RsegDir
+  Truncation --> History
+
+  UndoRecovery --> RsegScanner
+  UndoRecovery --> RsegDir
+  UndoRecovery --> History
+  UndoRecovery --> PurgeCoord
+
+  ULM --> MTR
+  ULM --> BufferPool
+  ULM --> Redo
+  ULM --> Disk
+  PurgeView --> ReadViewMgr
+  PurgeWorker --> MTR
+  PurgeWorker --> BufferPool
+  RollbackApi --> LockMgr
+  UndoRecovery --> Redo
+  ULM --> Dictionary

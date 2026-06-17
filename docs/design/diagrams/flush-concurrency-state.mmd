@@ -1,0 +1,30 @@
+stateDiagram-v2
+    [*] --> IDLE
+    IDLE --> SELECTING: flush request or checkpoint pressure
+    SELECTING --> REDO_WAIT: pageLSN greater than redo flushed
+    SELECTING --> SNAPSHOTTING: redo durable
+    REDO_WAIT --> SNAPSHOTTING: redo flushed
+    REDO_WAIT --> SKIPPED: timeout or policy skip
+    SNAPSHOTTING --> DOUBLEWRITE_WRITING: frame fixed or page image copied
+    DOUBLEWRITE_WRITING --> DATAFILE_WRITING: doublewrite durable
+    DATAFILE_WRITING --> VALIDATING: data page write complete
+    VALIDATING --> MARK_CLEAN: frame unchanged since snapshot
+    VALIDATING --> KEEP_DIRTY: newer modification exists
+    MARK_CLEAN --> CHECKPOINT_NOTIFY: remove from flush list
+    KEEP_DIRTY --> CHECKPOINT_NOTIFY: advance flushed page LSN only
+    CHECKPOINT_NOTIFY --> RELEASED: notify redo checkpoint
+    SKIPPED --> RELEASED
+    RELEASED --> IDLE
+    IDLE --> [*]
+
+    note right of REDO_WAIT
+        Flush wait holds only redo wait slot.
+        It must not hold Buffer Pool list locks,
+        page latch, file lock, or transaction lock.
+    end note
+
+    note right of DATAFILE_WRITING
+        PageStore owns physical file locks.
+        FlushCoordinator does not enter row-lock or MDL wait.
+    end note
+

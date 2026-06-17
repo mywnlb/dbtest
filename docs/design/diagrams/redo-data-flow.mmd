@@ -1,0 +1,67 @@
+flowchart TB
+  subgraph WriteFlow["数据流 A：MTR 写入 redo"]
+    W1["页操作在 MTR 中修改 page"]
+    W2["RedoRecordCollector 收集 record"]
+    W3["MTR commit 冻结 MtrRedoBatch"]
+    W4["RedoLogManager 预留连续 LSN"]
+    W5["RedoRecordEncoder 编码 record"]
+    W6["写入 RedoLogBuffer"]
+    W7["RecentWritten 推进 readyForWriteLsn"]
+    W8["Buffer Pool 发布 dirty page 和 pageLSN"]
+    W9["RecentClosed 推进 closedLsn"]
+    W10["LogWriter 写 redo file"]
+    W11["LogFlusher fsync redo file"]
+    W12["Notifier 唤醒等待者"]
+  end
+
+  subgraph FlushFlow["数据流 B：刷脏页"]
+    F1["FlushCoordinator 选择 dirty page"]
+    F2["读取 pageLSN"]
+    F3{"redo flushed >= pageLSN?"}
+    F4["等待 redo.waitFlushed(pageLSN)"]
+    F5["Doublewrite 写副本"]
+    F6["写 tablespace data file"]
+    F7["Buffer Pool 标记 clean"]
+  end
+
+  subgraph CheckpointFlow["数据流 C：fuzzy checkpoint"]
+    C1["CheckpointWorker 周期或压力触发"]
+    C2["读取 current/flushed/closed LSN"]
+    C3["读取 oldestDirtyLsn"]
+    C4["计算 safe checkpoint LSN"]
+    C5["写 checkpoint label"]
+    C6["RedoFileRepository 回收旧区间"]
+    C7{"checkpoint age 仍过大?"}
+    C8["请求 FlushCoordinator flushList"]
+  end
+
+  subgraph RecoveryFlow["数据流 D：crash recovery"]
+    R1["读取 redo control 和 checkpoint label"]
+    R2["从 checkpoint LSN 扫描 log block"]
+    R3["校验 block 和 record checksum"]
+    R4["解析完整 RedoRecord"]
+    R5["RedoApplyDispatcher 按 type 分发"]
+    R6["读取目标 page"]
+    R7{"pageLSN >= record.endLsn?"}
+    R8["跳过"]
+    R9["应用 payload 并更新 pageLSN"]
+    R10["交给事务恢复 rollback active"]
+  end
+
+  W1 --> W2 --> W3 --> W4 --> W5 --> W6 --> W7 --> W8 --> W9 --> W10 --> W11 --> W12
+  F1 --> F2 --> F3
+  F3 -- "否" --> F4 --> F5
+  F3 -- "是" --> F5
+  F5 --> F6 --> F7
+  C1 --> C2 --> C3 --> C4 --> C5 --> C6 --> C7
+  C7 -- "是" --> C8
+  C7 -- "否" --> C1
+  R1 --> R2 --> R3 --> R4 --> R5 --> R6 --> R7
+  R7 -- "是" --> R8 --> R4
+  R7 -- "否" --> R9 --> R4
+  R4 --> R10
+
+  W11 -. "durable LSN" .-> F3
+  F7 -. "oldestDirtyLsn 推进" .-> C3
+  C8 -. "flush pressure" .-> F1
+  C5 -. "recovery start" .-> R1

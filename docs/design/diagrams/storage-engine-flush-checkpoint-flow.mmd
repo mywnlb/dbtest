@@ -1,0 +1,16 @@
+flowchart TD
+    start["Page cleaner wakes"] --> pick["Pick dirty page from flush list or LRU"]
+    pick --> durable{"page newest LSN <= redo durable LSN?"}
+    durable -->|"no"| waitRedo["waitFlushed(pageLsn) without holding page latch"]
+    waitRedo --> durable
+    durable -->|"yes"| snapshot["Fix frame and copy stable page image"]
+    snapshot --> checksum["Set pageLSN and checksum"]
+    checksum --> dw["DoublewriteStrategy.beforeWrite"]
+    dw --> file["PageStore writes tablespace data file"]
+    file --> done["DoublewriteStrategy.afterWrite"]
+    done --> clean{"page modified during flush?"}
+    clean -->|"no"| markClean["Remove from flush list and mark clean"]
+    clean -->|"yes"| keepDirty["Keep dirty with newer LSN"]
+    markClean --> ckpt["CheckpointCoordinator computes safe checkpoint LSN"]
+    keepDirty --> ckpt
+    ckpt --> label["Write checkpoint label when safe"]

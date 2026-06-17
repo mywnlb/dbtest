@@ -1,0 +1,61 @@
+classDiagram
+    class FlushService {
+        +requestFlush(FlushRequest)
+        +flushList(Lsn targetLsn)
+        +flushLru(int maxPages)
+        +singlePageFlush(PageId)
+        +shutdownFlush()
+    }
+
+    class FlushCoordinator {
+        +schedule(FlushRequest)
+        +dispatchBatch(FlushBatch)
+        +handleResult(FlushResult)
+    }
+
+    class PageCleanerWorker {
+        +runLoop()
+        +flushBatch(FlushBatch)
+        +stop()
+    }
+
+    class DirtyPageSelector {
+        +selectFlushList(Lsn, int)
+        +selectLru(int)
+        +selectSingle(PageId)
+    }
+
+    class FlushSnapshotService {
+        +capture(BufferFrame)
+        +validateAfterWrite(FlushSnapshot)
+    }
+
+    class DoublewriteService {
+        +writeBeforeDataFile(FlushSnapshot)
+        +markDataFileWriteDone(FlushSnapshot)
+        +recoverTornPage(PageId)
+    }
+
+    class CheckpointCoordinator {
+        +computeSafeCheckpoint()
+        +requestPressureFlush()
+        +persistCheckpointLabel()
+    }
+
+    class FlushBatch
+    class FlushSnapshot
+    class FlushResult
+    class CheckpointState
+
+    FlushService --> FlushCoordinator
+    FlushCoordinator --> PageCleanerWorker
+    FlushCoordinator --> DirtyPageSelector
+    PageCleanerWorker --> FlushSnapshotService
+    PageCleanerWorker --> DoublewriteService
+    PageCleanerWorker --> FlushResult
+    DirtyPageSelector --> FlushBatch
+    FlushSnapshotService --> FlushSnapshot
+    DoublewriteService --> FlushSnapshot
+    CheckpointCoordinator --> FlushCoordinator
+    CheckpointCoordinator --> CheckpointState
+

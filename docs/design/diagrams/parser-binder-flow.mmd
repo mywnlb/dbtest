@@ -1,0 +1,27 @@
+flowchart TD
+  sql["SQL text"]
+  key["Build parse cache key: sql_mode + charset + SQL text"]
+  hit{"AST cache hit?"}
+  lex["Lexer tokenizes"]
+  parse["Parser builds immutable StatementAst"]
+  ast["StatementAst"]
+  mdl["Acquire required MDL"]
+  ddview["Open DictionaryReadView and pin objects"]
+  names["NameResolver resolves schema, table, alias and columns"]
+  types["TypeResolver infers expression types and coercion"]
+  params["ParameterBinder records parameter metadata"]
+  priv["PrivilegeHook checks required privileges"]
+  bound["Build BoundStatement with DictionaryVersion"]
+  route{"Statement kind"}
+  opt["Optimizer builds LogicalPlan"]
+  exec["Executor receives BoundStatement or plan"]
+  ddl["DDL Coordinator receives DdlRequest"]
+  release["StatementResourceGuard releases MDL and DD pins"]
+
+  sql --> key --> hit
+  hit -->|"yes"| ast
+  hit -->|"no"| lex --> parse --> ast
+  ast --> mdl --> ddview --> names --> types --> params --> priv --> bound --> route
+  route -->|"query"| opt --> exec --> release
+  route -->|"dml"| opt --> exec --> release
+  route -->|"ddl"| ddl --> release

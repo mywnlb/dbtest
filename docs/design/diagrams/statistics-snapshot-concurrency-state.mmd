@@ -1,0 +1,13 @@
+stateDiagram-v2
+  [*] --> ABSENT
+  ABSENT --> LOADING: cache miss
+  LOADING --> READY: load from store
+  READY --> PINNED: optimizer acquires snapshot
+  PINNED --> READY: optimizer releases
+  READY --> REPLACED: ANALYZE publishes new snapshot
+  PINNED --> REPLACED: new snapshot published while old is in use
+  REPLACED --> EVICTED: no pins remain
+  READY --> STALE: DDL changes dictionary version
+  PINNED --> STALE: DDL marks version stale
+  STALE --> EVICTED: no pins remain
+  EVICTED --> [*]

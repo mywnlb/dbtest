@@ -1,0 +1,33 @@
+flowchart TB
+  Start["PurgeCoordinator 周期触发或提交唤醒"]
+  View["从 ReadViewManager 读取最老 ReadView"]
+  Boundary["计算 PurgeBoundary\nlowLimitTransactionNo / oldestActiveTransactionId"]
+  Peek["HistoryList.peek(boundary)"]
+  Candidate{"存在可清理 undo log?"}
+  Stop["停止本批次\n记录 purge lag"]
+  Parse["解析 undo log header 和 undo record 链"]
+  NeedKeep{"仍被 ReadView 或活跃事务需要?"}
+  Build["构造 PurgeTask\n按 table/index/page 分片"]
+  Dispatch["派发给 PurgeWorker"]
+  Locate["B+Tree 重新定位 delete-mark 聚簇记录"]
+  Recheck{"记录仍为 delete-mark\n且 DB_TRX_ID 已过边界?"}
+  Skip["跳过并保留诊断事件"]
+  Sec["清理二级索引项"]
+  Clu["物理移除聚簇记录或合并页空洞"]
+  UndoFree["回收 undo record/page/segment"]
+  HistoryAdvance["推进 HistoryList cursor"]
+  TruncateCheck{"undo tablespace 可截断?"}
+  Truncate["UndoTruncationService 执行截断"]
+  Next["继续下一候选"]
+
+  Start --> View --> Boundary --> Peek --> Candidate
+  Candidate -- "否" --> Stop
+  Candidate -- "是" --> Parse --> NeedKeep
+  NeedKeep -- "是" --> Stop
+  NeedKeep -- "否" --> Build --> Dispatch --> Locate --> Recheck
+  Recheck -- "否" --> Skip --> HistoryAdvance
+  Recheck -- "是" --> Sec --> Clu --> UndoFree --> HistoryAdvance
+  HistoryAdvance --> TruncateCheck
+  TruncateCheck -- "是" --> Truncate --> Next
+  TruncateCheck -- "否" --> Next
+  Next --> Peek

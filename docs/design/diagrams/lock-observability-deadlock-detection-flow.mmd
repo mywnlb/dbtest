@@ -1,0 +1,21 @@
+flowchart TD
+    Edge["New wait edge A to B"] --> Domain{"Graph domain"}
+    Domain -->|ROW_LOCK_GRAPH| RowBudget["Use row lock detection budget"]
+    Domain -->|MDL_GRAPH| MdlBudget["Use MDL detection budget"]
+    RowBudget --> Copy["Copy graph shard adjacency"]
+    MdlBudget --> Copy
+    Copy --> Search["Bounded DFS from blocker toward waiter"]
+    Search --> Limit{"Budget exceeded?"}
+    Limit -->|Yes| Conservative["Treat checker as victim candidate"]
+    Limit -->|No| Cycle{"Cycle reaches waiter?"}
+    Cycle -->|No| NoDeadlock["Keep request waiting"]
+    Cycle -->|Yes| BuildCycle["Build cycle with lock ids and actors"]
+    Conservative --> BuildCycle
+    BuildCycle --> Cost["Read victim cost hints from events"]
+    Cost --> Select["VictimSelectionPolicy chooses victim"]
+    Select --> Report["Append deadlock report"]
+    Report --> Kind{"Victim domain"}
+    Kind -->|Row lock| RowVictim["Mark transaction rollbackOnly and wake"]
+    Kind -->|MDL| MdlVictim["Mark MDL request VICTIM and wake"]
+    RowVictim --> Cleanup["Cleanup request, wait slot, and graph edges"]
+    MdlVictim --> Cleanup

@@ -1,0 +1,43 @@
+flowchart TB
+    binder["Bound SQL / QueryBlock"]
+    opt["QueryOptimizer"]
+    rewrite["RuleRewriteEngine"]
+    stats["StatisticsProvider"]
+    range["RangeOptimizer"]
+    access["AccessPathEnumerator"]
+    join["JoinOrderOptimizer"]
+    cost["CostModel"]
+    physical["PhysicalPlanBuilder"]
+    trace["OptimizerTraceRecorder"]
+    explain["ExplainFormatter"]
+
+    dd["DataDictionaryService"]
+    executor["SQL Executor"]
+    storage["StorageEngine Estimator"]
+    btree["B+Tree metadata"]
+
+    binder --> opt
+    opt --> rewrite
+    opt --> stats
+    opt --> range
+    opt --> access
+    opt --> join
+    opt --> cost
+    opt --> physical
+    opt --> trace
+    physical --> executor
+    explain --> trace
+    explain --> physical
+    stats --> dd
+    stats --> storage
+    access --> btree
+    cost --> stats
+
+    classDef optimizer fill:#eef6ff,stroke:#5a86b5,color:#111
+    classDef metadata fill:#eefaf1,stroke:#5d9a70,color:#111
+    classDef consumer fill:#fff6e6,stroke:#b9852d,color:#111
+
+    class opt,rewrite,stats,range,access,join,cost,physical,trace,explain optimizer
+    class dd,storage,btree metadata
+    class binder,executor consumer
+

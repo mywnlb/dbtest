@@ -1,0 +1,42 @@
+classDiagram
+  class AdvancedSqlExecutor {
+    +execute(PhysicalPlan, ExecutionContext)
+  }
+
+  class PlanNode {
+    <<interface>>
+    +open()
+    +next()
+    +close()
+  }
+
+  class JoinNode
+  class AggregateNode
+  class SortNode
+  class TempTableNode
+  class SubqueryNode
+  class WindowNode
+  class MaterializeNode
+  class ExecutionContext
+  class OperatorResourceGuard
+  class MemoryQuota
+  class SpillRun
+  class TempTableHandle
+  class RuntimeMetrics
+
+  AdvancedSqlExecutor --> PlanNode
+  AdvancedSqlExecutor --> ExecutionContext
+  PlanNode <|.. JoinNode
+  PlanNode <|.. AggregateNode
+  PlanNode <|.. SortNode
+  PlanNode <|.. TempTableNode
+  PlanNode <|.. SubqueryNode
+  PlanNode <|.. WindowNode
+  PlanNode <|.. MaterializeNode
+  PlanNode --> OperatorResourceGuard
+  SortNode --> MemoryQuota
+  SortNode --> SpillRun
+  TempTableNode --> TempTableHandle
+  AggregateNode --> MemoryQuota
+  WindowNode --> TempTableHandle
+  PlanNode --> RuntimeMetrics

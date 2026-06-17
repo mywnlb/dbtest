@@ -1,0 +1,188 @@
+classDiagram
+  direction LR
+
+  class RedoLogManager {
+    append(MtrRedoBatch, DurabilityPolicy)
+    close(LogRange)
+    waitWritten(Lsn)
+    waitFlushed(Lsn)
+    currentLsn()
+    flushedToDiskLsn()
+    requestCheckpoint(CheckpointReason)
+    openRecoveryReader()
+  }
+
+  class MtrRedoBatch {
+    MtrId mtrId
+    List~RedoRecord~ records
+    Set~PageId~ modifiedPages
+    RedoLogMode logMode
+    boolean requiresFlushAtCommit
+  }
+
+  class CommitLogResult {
+    LogRange range
+    Lsn endLsn
+    DurabilityPolicy policy
+    boolean empty
+  }
+
+  class Lsn {
+    long value
+    compareTo(Lsn)
+    distanceTo(Lsn)
+  }
+
+  class LogRange {
+    Lsn start
+    Lsn end
+    length()
+    contains(Lsn)
+  }
+
+  class RedoRecord {
+    RedoRecordType type
+    PageId pageId
+    PageType pageType
+    RedoPayload payload
+    encode(RedoRecordEncoder)
+    apply(RedoApplyContext)
+  }
+
+  class RedoRecordEncoder {
+    encode(RedoRecord)
+    decode(ByteBuffer)
+    checksum(bytes)
+  }
+
+  class RedoRecordFactory {
+    pageInit(PageId, PageType, PageHeaderImage)
+    pageBytes(PageId, PageType, PageDelta)
+    undoRecordInsert(PageId, UndoRecordBytes)
+    trxStateUpdate(PageId, TrxStateDelta)
+  }
+
+  class RedoLogBuffer {
+    reserve(int)
+    write(RedoReservation, bytes)
+    markWritten(LogRange)
+    markClosed(LogRange)
+    readyForWriteLsn()
+    closedLsn()
+  }
+
+  class RedoReservation {
+    LogRange range
+    int bufferOffset
+    int length
+    cancel()
+  }
+
+  class RecentWrittenTracker {
+    add(LogRange)
+    contiguousTail()
+  }
+
+  class RecentClosedTracker {
+    add(LogRange)
+    contiguousTail()
+  }
+
+  class LogWriter {
+    run()
+    writeUpTo(Lsn)
+    writtenLsn()
+  }
+
+  class LogFlusher {
+    run()
+    flushUpTo(Lsn)
+    flushedLsn()
+  }
+
+  class DurabilityWaiter {
+    waitWritten(Lsn)
+    waitFlushed(Lsn)
+    signalWritten(Lsn)
+    signalFlushed(Lsn)
+  }
+
+  class RedoFileRepository {
+    findOrCreateFiles()
+    write(LogRange, bytes)
+    fsyncUpTo(Lsn)
+    locate(Lsn)
+    recycleBefore(Lsn)
+  }
+
+  class CheckpointCoordinator {
+    request(CheckpointReason)
+    computeAvailableLsn()
+    writeCheckpointLabel(Lsn)
+    checkpointAge()
+  }
+
+  class CheckpointLabel {
+    Lsn checkpointLsn
+    Lsn currentLsn
+    int formatVersion
+    long checksum
+  }
+
+  class RedoRecoveryReader {
+    findLatestCheckpoint()
+    scanFrom(Lsn)
+    nextRecord()
+    recoveredToLsn()
+  }
+
+  class RedoApplyDispatcher {
+    register(RedoRecordType, RedoApplyHandler)
+    apply(RedoRecord)
+  }
+
+  class RedoApplyHandler {
+    supports(RedoRecordType)
+    apply(RedoRecord, RedoApplyContext)
+  }
+
+  class RedoLogSystemState {
+    CREATED
+    INITIALIZING
+    RECOVERING
+    RUNNING
+    CHECKPOINTING
+    RESIZING
+    SHUTTING_DOWN
+    CLOSED
+    FAILED
+  }
+
+  RedoLogManager --> MtrRedoBatch
+  RedoLogManager --> CommitLogResult
+  RedoLogManager --> RedoLogBuffer
+  RedoLogManager --> DurabilityWaiter
+  RedoLogManager --> CheckpointCoordinator
+  RedoLogManager --> RedoRecoveryReader
+  MtrRedoBatch --> RedoRecord
+  CommitLogResult --> LogRange
+  LogRange --> Lsn
+  RedoRecord --> RedoRecordEncoder
+  RedoRecordFactory --> RedoRecord
+  RedoLogBuffer --> RedoReservation
+  RedoLogBuffer --> RecentWrittenTracker
+  RedoLogBuffer --> RecentClosedTracker
+  RedoReservation --> LogRange
+  LogWriter --> RedoLogBuffer
+  LogWriter --> RedoFileRepository
+  LogFlusher --> RedoFileRepository
+  DurabilityWaiter --> LogWriter
+  DurabilityWaiter --> LogFlusher
+  CheckpointCoordinator --> CheckpointLabel
+  CheckpointCoordinator --> RecentClosedTracker
+  CheckpointCoordinator --> RedoFileRepository
+  RedoRecoveryReader --> RedoFileRepository
+  RedoRecoveryReader --> RedoRecordEncoder
+  RedoRecoveryReader --> RedoApplyDispatcher
+  RedoApplyDispatcher --> RedoApplyHandler
+  RedoLogManager --> RedoLogSystemState

@@ -1,0 +1,249 @@
+classDiagram
+  direction LR
+
+  class DiskSpaceManager {
+    <<facade>>
+    openTablespace(SpaceId)
+    createSegment(SpaceId, SegmentPurpose)
+    allocatePage(SegmentId, PageAllocationHint, MiniTransaction)
+    freePage(PageId, MiniTransaction)
+  }
+
+  class MiniTransactionManager {
+    begin()
+    beginReadOnly()
+    beginSync()
+    commit(MiniTransaction)
+  }
+
+  class MiniTransaction {
+    MiniTransactionState state
+    MtrMemoStack memo
+    RedoRecordCollector redo
+    getSavepoint()
+    commit()
+  }
+
+  class MtrMemoStack {
+    push(MtrMemoSlot)
+    releaseTo(Savepoint)
+    releaseAll()
+  }
+
+  class MtrMemoSlot {
+    MemoType type
+    Object resource
+  }
+
+  class RedoRecordCollector {
+    append(RedoRecord)
+    assignLsn(LsnAllocator)
+    records()
+  }
+
+  class RedoRecord {
+    <<command>>
+    RedoType type
+    Lsn lsn
+    encode()
+    apply(RecoveryContext)
+  }
+
+  class Tablespace {
+    SpaceId spaceId
+    TablespaceType type
+    PageSize pageSize
+    TablespaceState state
+  }
+
+  class TablespaceRegistry {
+    find(SpaceId)
+    register(Tablespace)
+    markCorrupted(SpaceId)
+  }
+
+  class PageStore {
+    <<interface>>
+    read(PageId)
+    write(PageId, PageImage)
+    extend(SpaceId, long)
+  }
+
+  class FileChannelPageStore {
+    read(PageId)
+    write(PageId, PageImage)
+    extend(SpaceId, long)
+  }
+
+  class AutoExtendPolicy {
+    <<strategy>>
+    pagesToExtend(Tablespace)
+  }
+
+  class SegmentPageAllocator {
+    allocate(SegmentId, PageAllocationHint, MiniTransaction)
+    free(PageId, MiniTransaction)
+  }
+
+  class SpaceReservationService {
+    reserve(SpaceId, ReservationType, int, MiniTransaction)
+    release(SpaceReservation)
+  }
+
+  class ExtentAllocationPolicy {
+    <<strategy>>
+    chooseExtent(Segment, PageAllocationHint)
+  }
+
+  class SegmentReservePolicy {
+    <<policy>>
+    reservePercent(Tablespace)
+    effectiveUsablePages(Segment)
+  }
+
+  class SpaceHeaderRepository {
+    load(SpaceId, MiniTransaction)
+    update(SpaceHeaderPage, MiniTransaction)
+  }
+
+  class ExtentDescriptorRepository {
+    find(ExtentId, MiniTransaction)
+    update(ExtentDescriptor, MiniTransaction)
+  }
+
+  class SegmentInodeRepository {
+    find(SegmentId, MiniTransaction)
+    create(SpaceId, SegmentPurpose, MiniTransaction)
+    update(SegmentInode, MiniTransaction)
+  }
+
+  class BufferPool {
+    getPage(PageId, LatchMode, MiniTransaction)
+    createPage(PageId, PageType, MiniTransaction)
+    markDirty(BufferFrame, Lsn)
+  }
+
+  class BufferFrame {
+    PageId pageId
+    PageImage image
+    PageLatch latch
+    Lsn pageLsn
+  }
+
+  class PageCursor {
+    readInt(int)
+    writeInt(int, int)
+    writeBytes(int, byte[])
+  }
+
+  class IndexPage {
+    PageId pageId
+    int pageLevel
+    PageDirectory directory
+    RecordChain records
+  }
+
+  class PageDirectory {
+    int slotCount
+    binarySearch(Key)
+    splitGroup()
+    mergeGroup()
+  }
+
+  class RecordChain {
+    findFromSlot(Key)
+    insertAfter(RecordHeader)
+    unlinkDeleted(RecordHeader)
+  }
+
+  class RecordHeader {
+    int heapNo
+    int nOwned
+    boolean deletedFlag
+    int nextRecordOffset
+  }
+
+  class Segment {
+    SegmentId segmentId
+    SegmentPurpose purpose
+    List fragmentPages
+    List freeExtents
+    List notFullExtents
+    List fullExtents
+  }
+
+  class ExtentDescriptor {
+    ExtentId extentId
+    ExtentState state
+    SegmentId ownerSegmentId
+    Bitmap pageBitmap
+  }
+
+  class FlushCoordinator {
+    flushBatch()
+  }
+
+  class DoublewriteStrategy {
+    <<strategy>>
+    beforeWrite(PageImage)
+    afterWrite(PageId)
+    recover(PageId)
+  }
+
+  class RecoveryService {
+    recover()
+  }
+
+  class RedoRecordApplier {
+    apply(RedoRecord)
+  }
+
+  DiskSpaceManager --> MiniTransactionManager
+  DiskSpaceManager --> SegmentPageAllocator
+  DiskSpaceManager --> TablespaceRegistry
+  DiskSpaceManager --> PageCursor
+
+  MiniTransactionManager --> MiniTransaction
+  MiniTransaction --> MtrMemoStack
+  MiniTransaction --> RedoRecordCollector
+  MtrMemoStack --> MtrMemoSlot
+  RedoRecordCollector --> RedoRecord
+
+  SegmentPageAllocator --> SpaceReservationService
+  SegmentPageAllocator --> ExtentAllocationPolicy
+  SegmentPageAllocator --> SegmentReservePolicy
+  SegmentPageAllocator --> SpaceHeaderRepository
+  SegmentPageAllocator --> ExtentDescriptorRepository
+  SegmentPageAllocator --> SegmentInodeRepository
+  SegmentPageAllocator --> BufferPool
+
+  TablespaceRegistry --> Tablespace
+  PageStore <|.. FileChannelPageStore
+  FileChannelPageStore --> TablespaceRegistry
+  FileChannelPageStore --> AutoExtendPolicy
+
+  BufferPool --> PageStore
+  BufferPool --> BufferFrame
+  PageCursor --> BufferFrame
+  PageCursor --> IndexPage
+  IndexPage --> PageDirectory
+  IndexPage --> RecordChain
+  RecordChain --> RecordHeader
+
+  SegmentInodeRepository --> Segment
+  ExtentDescriptorRepository --> ExtentDescriptor
+
+  Tablespace "1" *-- "*" Segment : owns
+  Tablespace "1" *-- "*" ExtentDescriptor : XDES
+  Segment "1" o-- "*" ExtentDescriptor : extents
+
+  FlushCoordinator --> BufferPool
+  FlushCoordinator --> PageStore
+  FlushCoordinator --> DoublewriteStrategy
+
+  RecoveryService --> RedoRecordApplier
+  RedoRecordApplier --> RedoRecord
+  RedoRecordApplier --> PageStore
+  RedoRecordApplier --> SpaceHeaderRepository
+  RedoRecordApplier --> ExtentDescriptorRepository
+  RedoRecordApplier --> SegmentInodeRepository

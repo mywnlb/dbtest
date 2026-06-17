@@ -1,0 +1,42 @@
+stateDiagram-v2
+    [*] --> READY
+    READY --> RUNNING: command starts
+    RUNNING --> MDL_WAITING: metadata conflict
+    RUNNING --> ROW_LOCK_WAITING: storage row lock conflict
+    RUNNING --> STREAMING: result metadata sent
+    RUNNING --> CLEANING: normal completion
+    MDL_WAITING --> RUNNING: grant
+    ROW_LOCK_WAITING --> RUNNING: grant and relocate
+    STREAMING --> CLEANING: result exhausted
+
+    READY --> CLOSING: COM_QUIT or disconnect
+    RUNNING --> KILL_QUERY_MARKED: KILL QUERY flag set
+    MDL_WAITING --> KILL_QUERY_MARKED: kill checkpoint
+    ROW_LOCK_WAITING --> KILL_QUERY_MARKED: kill checkpoint
+    STREAMING --> KILL_QUERY_MARKED: kill checkpoint
+    KILL_QUERY_MARKED --> STATEMENT_ROLLBACK: abort current statement
+    STATEMENT_ROLLBACK --> CLEANING: release statement resources
+    CLEANING --> READY: query killed, connection remains
+
+    READY --> KILL_CONNECTION_MARKED: KILL CONNECTION flag set
+    RUNNING --> KILL_CONNECTION_MARKED: KILL CONNECTION flag set
+    STREAMING --> KILL_CONNECTION_MARKED: KILL CONNECTION flag set
+    KILL_CONNECTION_MARKED --> STATEMENT_ROLLBACK: abort current statement
+    CLEANING --> SESSION_CLEANUP: connection close requested
+    CLOSING --> SESSION_CLEANUP: no active statement
+    SESSION_CLEANUP --> ROLLBACK_OPEN_TX: open transaction exists
+    SESSION_CLEANUP --> CLOSE_PREPARED: no open transaction
+    ROLLBACK_OPEN_TX --> CLOSE_PREPARED
+    CLOSE_PREPARED --> RELEASE_SESSION_RESOURCES
+    RELEASE_SESSION_RESOURCES --> CLOSED
+    CLOSED --> [*]
+
+    note right of KILL_QUERY_MARKED
+      KILL QUERY keeps the session.
+      Prepared handles remain but execution resources are released.
+    end note
+
+    note right of SESSION_CLEANUP
+      Cleanup is idempotent for kill,
+      disconnect, timeout, and command failure.
+    end note

@@ -1,0 +1,52 @@
+flowchart LR
+    subgraph SQL["SQL / Session Layer"]
+        Session["SessionContext"]
+        Executor["SqlExecutor"]
+        PfsViews["Performance Schema Views"]
+        InfoViews["Information Schema Views"]
+    end
+
+    subgraph DD["Data Dictionary / MDL"]
+        Mdl["MetadataLockManager"]
+    end
+
+    subgraph InnoDB["InnoDB Storage Modules"]
+        TrxLock["Transaction LockManager"]
+        BufferPool["Buffer Pool Latch Events"]
+        DiskManager["Disk Manager File Lock Events"]
+    end
+
+    subgraph OBS["server.lockobs"]
+        Api["LockObservationService"]
+        WaitSlot["WaitSlotRegistry"]
+        Registry["LockEventRegistry"]
+        Graph["WaitForGraph"]
+        Detector["DeadlockDetector"]
+        Snapshot["LockSnapshotService"]
+        Report["DeadlockReportRepository"]
+        Policy["InstrumentationPolicy"]
+    end
+
+    Session --> Executor
+    Executor --> Api
+    Mdl --> Api
+    TrxLock --> Api
+    BufferPool --> Api
+    DiskManager --> Api
+
+    Api --> WaitSlot
+    Api --> Registry
+    Registry --> Graph
+    Graph --> Detector
+    Detector --> Report
+    Snapshot --> WaitSlot
+    Snapshot --> Registry
+    Snapshot --> Graph
+    Snapshot --> Report
+    Snapshot --> Policy
+
+    PfsViews --> Snapshot
+    InfoViews --> Snapshot
+
+    Detector -. "victim callback" .-> TrxLock
+    Detector -. "victim callback" .-> Mdl

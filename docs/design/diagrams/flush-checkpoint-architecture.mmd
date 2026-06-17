@@ -1,0 +1,41 @@
+flowchart TB
+    flushApi["FlushService API"]
+    coordinator["FlushCoordinator"]
+    cleaner["PageCleanerWorker"]
+    scheduler["FlushScheduler"]
+    selector["DirtyPageSelector"]
+    snapshot["FlushSnapshotService"]
+    dblwr["DoublewriteService"]
+    checkpoint["CheckpointCoordinator"]
+    metrics["FlushMetrics"]
+
+    buf["BufferPool DirtyView"]
+    redo["RedoLogManager / CheckpointService"]
+    fil["PageStore / Physical File Locks"]
+    recovery["RecoveryService"]
+
+    flushApi --> coordinator
+    coordinator --> scheduler
+    coordinator --> cleaner
+    cleaner --> selector
+    cleaner --> snapshot
+    cleaner --> dblwr
+    cleaner --> fil
+    checkpoint --> scheduler
+    checkpoint --> redo
+    checkpoint --> buf
+    coordinator --> metrics
+    selector --> buf
+    snapshot --> buf
+    dblwr --> fil
+    recovery --> dblwr
+    recovery --> fil
+
+    classDef flush fill:#eef6ff,stroke:#5a86b5,color:#111
+    classDef storage fill:#fff6e6,stroke:#b9852d,color:#111
+    classDef recoveryCls fill:#eefaf1,stroke:#5d9a70,color:#111
+
+    class flushApi,coordinator,cleaner,scheduler,selector,snapshot,dblwr,checkpoint,metrics flush
+    class buf,redo,fil storage
+    class recovery recoveryCls
+

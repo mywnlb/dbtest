@@ -1,0 +1,21 @@
+flowchart TD
+  start["ANALYZE TABLE statement"]
+  bind["Parser/Binder creates AnalyzeRequest"]
+  mdl["Acquire table MDL_SHARED_NO_WRITE"]
+  pin["Pin TableDefinition and DictionaryVersion"]
+  updateLock["Acquire StatsUpdateLock(X)"]
+  plan["Build sampling plan"]
+  collectTable["Collect table stats"]
+  collectIndex["Collect index cardinality and leaf pages"]
+  hist{"Histogram requested?"}
+  buildHist["Build column histograms"]
+  persist["Persist stats in dictionary transaction"]
+  publish["Publish StatsCache snapshot"]
+  invalidate["Invalidate dependent plan cache entries"]
+  result["Return ANALYZE result set"]
+  cleanup["Release stats lock, DD pin and MDL"]
+
+  start --> bind --> mdl --> pin --> updateLock --> plan --> collectTable --> collectIndex --> hist
+  hist -->|"yes"| buildHist --> persist
+  hist -->|"no"| persist
+  persist --> publish --> invalidate --> result --> cleanup

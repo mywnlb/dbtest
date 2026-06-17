@@ -1,0 +1,21 @@
+flowchart TD
+    trigger["Periodic / pressure / shutdown trigger"]
+    readRedo["Read redo current, flushed, closed LSN"]
+    readDirty["Read BufferPool oldestDirtyLsn"]
+    safe["safeLsn = min(oldestDirtyLsnOrCurrent, closedLsn, flushedLsn)"]
+    compare{"safeLsn > lastCheckpointLsn?"}
+    pressure{"checkpoint age high?"}
+    requestFlush["Request flush list to target LSN"]
+    writeLabel["Write checkpoint label"]
+    recycle["Release old redo range"]
+    publish["Publish checkpoint metrics"]
+    wait["Wait next trigger"]
+
+    trigger --> readRedo --> readDirty --> safe --> compare
+    compare --> writeLabel
+    compare --> pressure
+    pressure --> requestFlush
+    pressure --> wait
+    requestFlush --> readRedo
+    writeLabel --> recycle --> publish --> wait
+

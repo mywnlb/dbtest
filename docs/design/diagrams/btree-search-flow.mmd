@@ -1,0 +1,17 @@
+flowchart TD
+    start["BTreeIndexService.lookup or scan"] --> root["Read root page with S latch"]
+    root --> level{"leaf page?"}
+    level -->|"no"| child["RecordPageAccessor finds child pointer"]
+    child --> latchChild["Acquire child page latch"]
+    latchChild --> safe["Release parent when child is safe"]
+    safe --> level
+    level -->|"yes"| leaf["Leaf page reached"]
+    leaf --> rec["RecordPageAccessor finds key or lower bound"]
+    rec --> readtype{"read type"}
+    readtype -->|"consistent read"| mvcc["MvccVisibilityService checks current or undo version"]
+    mvcc --> result["Return visible row or not found"]
+    readtype -->|"locking read"| ref["Build IndexRecordRef or IndexGapRef"]
+    ref --> release["Release page latch, cursor, buffer fix"]
+    release --> lock["LockManager grants record/gap/next-key lock"]
+    lock --> relocate["Relocate from root or safe coupling point"]
+    relocate --> leaf

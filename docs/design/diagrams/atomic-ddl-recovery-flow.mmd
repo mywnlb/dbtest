@@ -1,0 +1,23 @@
+flowchart TD
+    start["Server startup"]
+    redo["Redo replay restores DD pages and DDL log pages"]
+    scan["Scan DDL log records"]
+    classify{"DDL record state"}
+    committed["COMMITTED: ensure dictionary cache invalidation"]
+    prepared["PREPARED / ENGINE_DONE: finish or rollback by operation policy"]
+    rollback["ROLLBACK_REQUIRED: undo engine changes"]
+    orphan["Orphan storage object: quarantine and drop"]
+    publish["Rebuild dictionary object cache"]
+    sdi["Validate SDI against dictionary version"]
+    ready["Accept SQL sessions"]
+
+    start --> redo --> scan --> classify
+    classify --> committed
+    classify --> prepared
+    classify --> rollback
+    prepared --> orphan
+    rollback --> orphan
+    committed --> publish
+    orphan --> publish
+    publish --> sdi --> ready
+

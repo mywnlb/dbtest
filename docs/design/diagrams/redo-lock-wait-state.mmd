@@ -1,0 +1,42 @@
+stateDiagram-v2
+    [*] --> IDLE
+
+    IDLE --> RESERVING: reserve LSN range
+    RESERVING --> RESERVED: LogRange assigned
+    RESERVED --> WRITING_BUFFER: encode redo into buffer segment
+    WRITING_BUFFER --> RECENT_WRITTEN_PENDING: buffer bytes published
+    RECENT_WRITTEN_PENDING --> READY_FOR_WRITE: contiguous range closed
+
+    READY_FOR_WRITE --> FILE_WRITING: log writer owns file write lock
+    FILE_WRITING --> WRITTEN: writeLsn advanced
+    WRITTEN --> FILE_FLUSHING: flush policy requires fsync
+    FILE_FLUSHING --> FLUSHED: flushedLsn advanced
+
+    RECENT_WRITTEN_PENDING --> RECENT_CLOSED_PENDING: MTR dirty publish done
+    RECENT_CLOSED_PENDING --> WAITING_WRITTEN: caller waits for write
+    RECENT_CLOSED_PENDING --> WAITING_FLUSHED: caller waits for fsync
+    RECENT_CLOSED_PENDING --> RELEASED: no durability wait
+
+    WAITING_WRITTEN --> RELEASED: writeLsn reaches target
+    WAITING_FLUSHED --> RELEASED: flushedLsn reaches target
+
+    IDLE --> WAITING_SPACE: checkpoint age too high
+    WAITING_SPACE --> RESERVING: checkpoint advances
+
+    FILE_WRITING --> ERROR_BROADCAST: write failed
+    FILE_FLUSHING --> ERROR_BROADCAST: fsync failed
+    ERROR_BROADCAST --> RELEASED: wake all waiters with exception
+
+    RELEASED --> IDLE
+    FLUSHED --> RELEASED
+    IDLE --> [*]
+
+    note right of WAITING_WRITTEN
+        Waiter holds only wait slot.
+        It must not hold redo file lock, Buffer Pool list lock, or page latch.
+    end note
+
+    note right of FILE_WRITING
+        Writer does not call back into MTR, Buffer Pool, or LockManager.
+    end note
+

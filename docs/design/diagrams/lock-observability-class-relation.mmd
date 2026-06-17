@@ -1,0 +1,114 @@
+classDiagram
+    class LockObservationService {
+        <<Facade>>
+        publish(event)
+        openWaitSlot(request)
+        captureSnapshot(request)
+        latestDeadlocks(filter)
+    }
+
+    class LockEventRegistry {
+        <<Repository>>
+        onGranted(event)
+        onWaiting(event, blockers)
+        onReleased(event, reason)
+        snapshotLocks(epoch, filter)
+    }
+
+    class WaitSlotRegistry {
+        <<Repository>>
+        open(request)
+        complete(eventId, completion)
+        currentSnapshot(epoch)
+    }
+
+    class WaitForGraph {
+        <<Graph Repository>>
+        addEdge(domain, edge)
+        removeWaitingActor(domain, actor)
+        findCycleFrom(domain, actor, budget)
+        snapshotEdges(domain, epoch)
+    }
+
+    class DeadlockDetector {
+        <<Service>>
+        onEdgeAdded(domain, edge)
+        scan(domain, budget)
+        selectVictim(cycle, context)
+        buildReport(cycle, victim)
+    }
+
+    class LockSnapshotService {
+        <<Snapshot>>
+        captureCurrent(request)
+        dataLocks(snapshot)
+        dataLockWaits(snapshot)
+        metadataLocks(snapshot)
+    }
+
+    class LockEvent {
+        <<Value Object>>
+        eventId
+        lockId
+        resourceKey
+        category
+        mode
+        status
+        ownerToken
+    }
+
+    class WaitSlot {
+        <<State Object>>
+        threadId
+        eventId
+        sessionId
+        transactionId
+        waitState
+        deadline
+    }
+
+    class WaitEdge {
+        <<Value Object>>
+        waitingActor
+        blockingActor
+        lockId
+        resourceKey
+        domain
+        waitStartTime
+    }
+
+    class LockDiagnosticSnapshot {
+        <<Immutable Snapshot>>
+        epoch
+        lockRows
+        waitEdges
+        waitSlots
+        partial
+        truncated
+    }
+
+    class VictimSelectionPolicy {
+        <<Strategy>>
+        choose(cycle, costHints)
+    }
+
+    class DeadlockReportRepository {
+        <<Repository>>
+        append(report)
+        latest(filter)
+    }
+
+    LockObservationService --> LockEventRegistry
+    LockObservationService --> WaitSlotRegistry
+    LockObservationService --> LockSnapshotService
+    LockEventRegistry --> LockEvent
+    LockEventRegistry --> WaitForGraph
+    WaitSlotRegistry --> WaitSlot
+    WaitForGraph --> WaitEdge
+    DeadlockDetector --> WaitForGraph
+    DeadlockDetector --> VictimSelectionPolicy
+    DeadlockDetector --> DeadlockReportRepository
+    LockSnapshotService --> LockEventRegistry
+    LockSnapshotService --> WaitSlotRegistry
+    LockSnapshotService --> WaitForGraph
+    LockSnapshotService --> LockDiagnosticSnapshot

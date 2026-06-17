@@ -1,0 +1,39 @@
+flowchart TB
+  Session["SQL Session"]
+  Bound["BoundStatement"]
+  Optimizer["QueryOptimizer"]
+  Plan["PhysicalPlan"]
+  Advanced["AdvancedSqlExecutor"]
+
+  subgraph Operators["sql.exec.advanced"]
+    Join["JoinExecutor"]
+    Aggregate["AggregateExecutor"]
+    Sort["FilesortExecutor"]
+    Temp["TempTableService"]
+    Subquery["SubqueryExecutor"]
+    Window["WindowExecutor"]
+    Materialize["MaterializationExecutor"]
+  end
+
+  Runtime["ExecutionContext + ResourceGuard"]
+  Expr["ExpressionEvaluator"]
+  Storage["StorageEngine API"]
+  Stats["RuntimeMetrics"]
+  Spill["Temp tablespace / spill files"]
+
+  Session --> Bound --> Optimizer --> Plan --> Advanced
+  Advanced --> Runtime
+  Advanced --> Join
+  Advanced --> Aggregate
+  Advanced --> Sort
+  Advanced --> Temp
+  Advanced --> Subquery
+  Advanced --> Window
+  Advanced --> Materialize
+  Join --> Storage
+  Aggregate --> Expr
+  Sort --> Spill
+  Temp --> Spill
+  Subquery --> Storage
+  Window --> Temp
+  Advanced --> Stats

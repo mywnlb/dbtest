@@ -1,0 +1,26 @@
+flowchart TB
+  Session["SQL Session"]
+  Manager["PreparedStatementManager"]
+  Registry["SessionStatementRegistry"]
+  ParseCache["ParseCache"]
+  Binder["Parser/Binder"]
+  PlanCache["PlanCache"]
+  DD["DataDictionary + MDL"]
+  Stats["Statistics Snapshot"]
+  Optimizer["QueryOptimizer"]
+  Executor["SQL Executor"]
+  Listener["InvalidationListener"]
+
+  Session --> Manager
+  Manager --> Registry
+  Manager --> ParseCache
+  Manager --> Binder
+  Binder --> DD
+  Manager --> PlanCache
+  PlanCache --> Stats
+  PlanCache --> Optimizer
+  Manager --> Executor
+  DD --> Listener
+  Stats --> Listener
+  Listener --> PlanCache
+  Listener --> Registry

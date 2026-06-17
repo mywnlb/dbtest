@@ -1,0 +1,27 @@
+flowchart TD
+    start["DDL statement"]
+    parse["Parse AST and normalize object names"]
+    precommit["Implicitly commit active user transaction"]
+    acquire["Acquire MDL locks"]
+    validate["Validate dictionary rules"]
+    plan["Build DdlPlan"]
+    logPrepare["Append DDL log PREPARE"]
+    enginePrepare["Prepare InnoDB storage changes"]
+    ddStage["Stage dictionary mutations"]
+    sdi["Write SDI / storage binding metadata"]
+    commit["Commit dictionary transaction"]
+    logCommit["Mark DDL log COMMITTED"]
+    cache["Publish cache invalidation or new version"]
+    release["Release MDL locks"]
+    done["DDL visible atomically"]
+
+    start --> parse --> precommit --> acquire --> validate --> plan
+    plan --> logPrepare --> enginePrepare --> ddStage --> sdi --> commit
+    commit --> logCommit --> cache --> release --> done
+
+    enginePrepare --> rollback["Rollback engine changes on error"]
+    ddStage --> rollback
+    sdi --> rollback
+    rollback --> logRollback["Mark DDL log ROLLED_BACK"]
+    logRollback --> release
+

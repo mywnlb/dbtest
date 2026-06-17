@@ -1,0 +1,76 @@
+classDiagram
+    class DataDictionaryService {
+        +lookupTable(ObjectName)
+        +lookupIndex(ObjectId)
+        +beginDictionaryTransaction()
+        +publish(DictionaryMutation)
+        +invalidate(DictionaryObjectId)
+    }
+
+    class DictionaryObjectCache {
+        +get(ObjectKey)
+        +put(DictionaryObject)
+        +evict(ObjectKey)
+        +pin(ObjectKey)
+    }
+
+    class DictionaryRepository {
+        +readSchema(SchemaId)
+        +readTable(TableId)
+        +writeMutation(DictionaryMutation)
+        +scanByName(ObjectName)
+    }
+
+    class DictionaryTransaction {
+        +stage(DictionaryMutation)
+        +prepare()
+        +commit()
+        +rollback()
+    }
+
+    class DdlCoordinator {
+        +execute(DdlPlan)
+        +prepareEngine()
+        +commitAtomic()
+        +rollbackAtomic()
+    }
+
+    class MetadataLockManager {
+        +acquire(MdlRequest)
+        +release(SessionId)
+        +detectDeadlock()
+    }
+
+    class DdlLog {
+        +append(DdlLogRecord)
+        +markCommitted(DdlId)
+        +recover()
+    }
+
+    class InnoDBDictionaryBridge {
+        +createTableStorage(TableDefinition)
+        +dropTableStorage(TableId)
+        +createIndexStorage(IndexDefinition)
+        +bindRootPage(IndexId, PageId)
+    }
+
+    class TableDefinition
+    class ColumnDefinition
+    class IndexDefinition
+    class ConstraintDefinition
+    class TablespaceDefinition
+    class StorageBinding
+
+    DataDictionaryService --> DictionaryObjectCache
+    DataDictionaryService --> DictionaryRepository
+    DataDictionaryService --> DictionaryTransaction
+    DdlCoordinator --> MetadataLockManager
+    DdlCoordinator --> DataDictionaryService
+    DdlCoordinator --> DdlLog
+    DdlCoordinator --> InnoDBDictionaryBridge
+    TableDefinition "1" o-- "*" ColumnDefinition
+    TableDefinition "1" o-- "*" IndexDefinition
+    TableDefinition "1" o-- "*" ConstraintDefinition
+    TableDefinition "1" --> StorageBinding
+    TablespaceDefinition "1" --> "*" StorageBinding
+

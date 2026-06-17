@@ -1,0 +1,46 @@
+classDiagram
+  class PreparedStatementManager {
+    +prepare()
+    +execute()
+    +deallocate()
+    +closeSession()
+  }
+
+  class SessionStatementRegistry {
+    +put()
+    +lookup()
+    +remove()
+  }
+
+  class PreparedStatementHandle {
+    +state
+    +refCount
+    +schemaVersion
+  }
+
+  class ParsedStatementTemplate
+  class ParameterMetadata
+  class ParameterBindingSet
+  class BoundPlanTemplate
+  class PhysicalPlanTemplate
+  class PlanCache
+  class PlanCacheKey
+  class DependencySet
+  class InvalidationListener
+  class PlanUseGuard
+  class RepreparePolicy
+
+  PreparedStatementManager --> SessionStatementRegistry
+  SessionStatementRegistry --> PreparedStatementHandle
+  PreparedStatementHandle --> ParsedStatementTemplate
+  PreparedStatementHandle --> ParameterMetadata
+  PreparedStatementHandle --> BoundPlanTemplate
+  PreparedStatementManager --> ParameterBindingSet
+  PreparedStatementManager --> PlanCache
+  PlanCache --> PlanCacheKey
+  PlanCache --> PhysicalPlanTemplate
+  BoundPlanTemplate --> DependencySet
+  PhysicalPlanTemplate --> DependencySet
+  InvalidationListener --> PlanCache
+  PlanUseGuard --> PreparedStatementHandle
+  PreparedStatementManager --> RepreparePolicy

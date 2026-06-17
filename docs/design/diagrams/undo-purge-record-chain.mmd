@@ -1,0 +1,48 @@
+flowchart LR
+  subgraph Clustered["聚簇索引当前记录"]
+    Current["Record v3\nDB_TRX_ID=120\nDB_ROLL_PTR=rp3\ndelete_mark=false"]
+  end
+
+  subgraph UndoPageA["Undo Page 42"]
+    U3["Update Undo rp3\ntrx=120 undoNo=9\nold changed columns\nprev=rp2"]
+    U2["Update Undo rp2\ntrx=117 undoNo=6\nold changed columns\nprev=rp1"]
+  end
+
+  subgraph UndoPageB["Undo Page 37"]
+    U1["Insert Undo rp1\ntrx=101 undoNo=1\ncluster key image\nprev=null"]
+  end
+
+  subgraph ReadViewA["ReadView A"]
+    RVA["lowLimitId=130\nupLimitId=110\nactive={117,120}"]
+    VisibleA["返回 v1 或不存在\n取决于 insert 事务是否可见"]
+  end
+
+  subgraph ReadViewB["ReadView B"]
+    RVB["lowLimitId=130\nupLimitId=110\nactive={120}"]
+    VisibleB["返回 v2\n跳过 trx 120"]
+  end
+
+  subgraph PurgeBoundary["Purge 边界"]
+    PB["oldest ReadView low limit no"]
+    Keep["保留 rp2/rp3"]
+    Free["rp1 可在不被旧视图需要时释放"]
+  end
+
+  Current -->|"DB_ROLL_PTR"| U3
+  U3 -->|"prevRollPointer"| U2
+  U2 -->|"prevRollPointer"| U1
+
+  RVA --> U3
+  U3 -->|"trx 120 不可见"| U2
+  U2 -->|"trx 117 不可见"| U1
+  U1 --> VisibleA
+
+  RVB --> U3
+  U3 -->|"trx 120 不可见"| U2
+  U2 -->|"trx 117 可见"| VisibleB
+
+  PB --> Keep
+  PB --> Free
+  Keep --> U3
+  Keep --> U2
+  Free --> U1

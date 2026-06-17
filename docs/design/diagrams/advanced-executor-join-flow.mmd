@@ -1,0 +1,26 @@
+flowchart TD
+  start["Open JoinNode"]
+  algo{"Join algorithm"}
+  outer["Open outer child"]
+  inner["Open inner child or index probe"]
+  nl["Nested Loop: read outer row"]
+  probe["Index Nested Loop: bind join key and probe inner index"]
+  build["Hash Join: build hash table from build side"]
+  spill{"memory quota exceeded?"}
+  spillBuild["Spill hash partitions to temp files"]
+  match["Evaluate join predicate"]
+  output["Emit joined row"]
+  next{"More rows?"}
+  cleanup["Close children and guards"]
+
+  start --> algo
+  algo -->|"nested loop"| outer --> inner --> nl
+  algo -->|"index nested loop"| outer --> probe
+  algo -->|"hash join"| build --> spill
+  spill -->|"yes"| spillBuild --> match
+  spill -->|"no"| match
+  nl --> match
+  probe --> match
+  match --> output --> next
+  next -->|"yes"| algo
+  next -->|"no"| cleanup

@@ -1,0 +1,22 @@
+flowchart TB
+  Start["CrashRecoveryService 进入事务恢复阶段"]
+  RedoDone["Redo 已把 undo page、rseg header、trx sys page 恢复到 pageLSN"]
+  Scan["UndoRecoveryService 扫描 rollback segment directory"]
+  Slots["恢复 rseg slot 与 UndoLogHeader"]
+  Classify{"事务状态"}
+  Committed["已提交 update undo"]
+  Active["未提交 active/recovered active"]
+  Prepared["prepared transaction"]
+  History["重建 HistoryList 和 history cursor"]
+  Rollback["RollbackService 回滚 recovered active"]
+  KeepPrepared["保留 prepared\n等待上层决定 commit 或 rollback"]
+  PurgeBoundary["启动时计算 purge boundary\n无用户 ReadView"]
+  Resume["PurgeCoordinator resume\n继续清理 history list"]
+  Truncate["恢复未完成 undo truncation\n校验状态后继续或回退为 active"]
+  Ready["事务恢复完成\n交还恢复总控"]
+
+  Start --> RedoDone --> Scan --> Slots --> Classify
+  Classify -- "COMMITTED" --> Committed --> History
+  Classify -- "ACTIVE" --> Active --> Rollback --> History
+  Classify -- "PREPARED" --> Prepared --> KeepPrepared --> History
+  History --> PurgeBoundary --> Resume --> Truncate --> Ready

@@ -1,0 +1,29 @@
+flowchart TD
+    Start(["Lock request starts"]) --> Compatible{"Compatible now?"}
+    Compatible -->|Yes| Grant["Business lock module grants lock"]
+    Grant --> PublishGrant["Publish GRANTED event"]
+    PublishGrant --> ViewGrant["Lock row appears in current snapshot"]
+
+    Compatible -->|No| ReleasePhysical["Release page latch, file latch, MTR latch, cursor, buffer fix"]
+    ReleasePhysical --> Enqueue["Enqueue request in business wait queue"]
+    Enqueue --> Blockers["Collect blocking actors"]
+    Blockers --> WaitSlot["Open wait slot with thread and event id"]
+    WaitSlot --> PublishWait["Publish WAITING or PENDING event"]
+    PublishWait --> AddEdge["Add wait edges to domain graph"]
+    AddEdge --> Detect["Run bounded immediate deadlock detection"]
+    Detect --> Deadlock{"Cycle found?"}
+
+    Deadlock -->|Yes| Victim["Select victim and write report"]
+    Victim --> Mark["Mark request VICTIM and wake waiter"]
+    Mark --> CleanupVictim["Remove graph edges and cleanup wait slot"]
+
+    Deadlock -->|No| Park["Thread waits on lock condition"]
+    Park --> Outcome{"Wait outcome"}
+    Outcome -->|Grant| RemoveEdge["Remove wait edges"]
+    RemoveEdge --> PublishGranted["Publish GRANTED event"]
+    PublishGranted --> Relocate["Caller relocates record or revalidates MDL"]
+    Outcome -->|Timeout| Timeout["Publish TIMEOUT and remove pending request"]
+    Outcome -->|Killed| Killed["Publish KILLED and cleanup request"]
+
+    Timeout --> Cleanup["Remove graph edges and cleanup wait slot"]
+    Killed --> Cleanup

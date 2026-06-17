@@ -1,0 +1,21 @@
+flowchart TD
+    start["B+Tree 定位目标 leaf page"] --> handle["BufferPool.getPage(pageId, latchMode, mtr)"]
+    handle --> cursor["RecordPageAccessor 创建 RecordCursor"]
+    cursor --> dir["PageDirectory 二分"]
+    dir --> scan["沿 next_record 组内扫描"]
+    scan --> compare["RecordComparator 比较 key"]
+    compare --> found{"命中或插入位置?"}
+
+    found -->|"读命中"| decode["RecordDecoder 解码 PhysicalRecord"]
+    decode --> visible["事务模块读取隐藏列并判断可见性"]
+    visible --> result["返回 LogicalRecord / RecordVersion"]
+
+    found -->|"写入/更新"| lock["生成 IndexRecordRef / IndexGapRef"]
+    lock --> release["释放 page latch 与 RecordCursor"]
+    release --> trxlock["LockManager 获取 record/gap/next-key lock"]
+    trxlock --> relocate["重新进入 B+Tree 定位并校验记录"]
+    relocate --> undo["写 undo record"]
+    undo --> encode["RecordEncoder 编码新 PhysicalRecord"]
+    encode --> modify["修改 heap / next_record / PageDirectory"]
+    modify --> redo["MTR 收集 redo payload"]
+    redo --> commit["MTR commit 后释放 latch/fix"]

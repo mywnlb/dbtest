@@ -1,0 +1,49 @@
+flowchart TB
+    sql["SQL / Session Layer"]
+    parser["DDL Parser / AST"]
+    ddl["DdlCoordinator"]
+    mdl["MetadataLockManager"]
+    ddapi["DataDictionaryService"]
+    cache["DictionaryObjectCache"]
+    repo["DictionaryRepository"]
+    tx["DictionaryTransaction"]
+    sdi["SerializedDictionaryInfoService"]
+    info["InformationSchemaAdapter"]
+    engine["InnoDBDictionaryBridge"]
+
+    disk["Disk / FSP / FIL"]
+    buf["Buffer Pool"]
+    btree["B+Tree"]
+    record["Record"]
+    trx["Transaction / MVCC"]
+    redo["Redo / DDL Log"]
+
+    sql --> parser
+    parser --> ddl
+    sql --> info
+    info --> ddapi
+    ddl --> mdl
+    ddl --> ddapi
+    ddl --> engine
+    ddapi --> cache
+    ddapi --> repo
+    repo --> tx
+    tx --> trx
+    tx --> redo
+    ddapi --> sdi
+    sdi --> engine
+    engine --> disk
+    engine --> buf
+    engine --> btree
+    engine --> record
+    engine --> trx
+    engine --> redo
+
+    classDef server fill:#eef6ff,stroke:#5a86b5,color:#111
+    classDef dd fill:#eefaf1,stroke:#5d9a70,color:#111
+    classDef engine fill:#fff6e6,stroke:#b9852d,color:#111
+
+    class sql,parser server
+    class ddl,mdl,ddapi,cache,repo,tx,sdi,info dd
+    class engine,disk,buf,btree,record,trx,redo engine
+

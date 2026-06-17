@@ -1,0 +1,15 @@
+stateDiagram-v2
+  [*] --> IDLE
+  IDLE --> PARSING: statement starts
+  PARSING --> AST_READY: parse complete
+  AST_READY --> MDL_REQUESTED: binding starts
+  MDL_REQUESTED --> MDL_WAITING: lock conflict
+  MDL_REQUESTED --> MDL_GRANTED: compatible
+  MDL_WAITING --> MDL_GRANTED: grant
+  MDL_WAITING --> TIMEOUT: lock wait timeout
+  MDL_GRANTED --> DICT_PINNED: open DictionaryReadView
+  DICT_PINNED --> BINDING: name and type resolution
+  BINDING --> BOUND_READY: BoundStatement built
+  BOUND_READY --> RELEASED: statement guard closes
+  TIMEOUT --> RELEASED: cleanup
+  RELEASED --> [*]

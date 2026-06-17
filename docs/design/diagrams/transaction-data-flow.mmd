@@ -1,0 +1,79 @@
+flowchart TB
+  subgraph Read["数据流 A：一致性读"]
+    R1["普通 SELECT 请求"]
+    R2["TransactionManager.current"]
+    R3["ReadViewManager 创建或复用 ReadView"]
+    R4["B+Tree 定位聚簇记录当前版本"]
+    R5["读取 DB_TRX_ID / DB_ROLL_PTR / deleted_flag"]
+    R6{"当前版本对 ReadView 可见?"}
+    R7{"delete-mark?"}
+    R8["返回当前版本"]
+    R9["沿 DB_ROLL_PTR 读取 UndoRecord"]
+    R10["VersionChainBuilder 构造旧版本"]
+    R11["确认不存在"]
+  end
+
+  subgraph Write["数据流 B：UPDATE/DELETE 当前读"]
+    W1["UPDATE/DELETE 定位候选记录"]
+    W2["LockManager 获取 X 或 next-key X 锁"]
+    W3["等待冲突事务或死锁检测"]
+    W4["重新读取最新版本并判断谓词"]
+    W5["UndoLogManager 写 update undo"]
+    W6["同一 MTR 修改 payload / DB_TRX_ID / DB_ROLL_PTR"]
+    W7["MTR commit 写 redo 并标脏"]
+    W8["数据库事务保持 ACTIVE"]
+  end
+
+  subgraph Commit["数据流 C：提交"]
+    C1["TransactionManager.commit"]
+    C2["禁止新 undo 和新锁"]
+    C3["分配 TransactionNo"]
+    C4["update undo 挂入 HistoryList"]
+    C5["insert undo 标记可释放"]
+    C6["写事务 commit redo"]
+    C7["从 ActiveTransactionTable 移除"]
+    C8["关闭 ReadView，释放锁"]
+    C9["通知 PurgeCoordinator"]
+  end
+
+  subgraph Rollback["数据流 D：回滚"]
+    B1["TransactionManager.rollback"]
+    B2["状态进入 ROLLING_BACK"]
+    B3["从最新 undo record 反向扫描"]
+    B4{"Undo 类型"}
+    B5["INSERT undo：删除未提交插入"]
+    B6["UPDATE undo：恢复旧值和旧隐藏列"]
+    B7["每条 undo 使用独立 MTR 写 redo"]
+    B8["释放锁并关闭 ReadView"]
+  end
+
+  subgraph Purge["数据流 E：Purge"]
+    P1["读取最老 ReadView"]
+    P2["计算 purge low limit"]
+    P3["从 HistoryList 取候选 undo"]
+    P4{"仍被 ReadView 需要?"}
+    P5["停止推进"]
+    P6["清理 delete-mark 记录"]
+    P7["回收 undo record/page/segment"]
+    P8["推进 purge cursor"]
+  end
+
+  R1 --> R2 --> R3 --> R4 --> R5 --> R6
+  R6 -- "是" --> R7
+  R7 -- "否" --> R8
+  R7 -- "是" --> R11
+  R6 -- "否" --> R9 --> R10 --> R5
+
+  W1 --> W2 --> W3 --> W4 --> W5 --> W6 --> W7 --> W8
+
+  C1 --> C2 --> C3 --> C4 --> C5 --> C6 --> C7 --> C8 --> C9
+
+  B1 --> B2 --> B3 --> B4
+  B4 -- "INSERT" --> B5 --> B7
+  B4 -- "UPDATE/DELETE" --> B6 --> B7
+  B7 --> B3
+  B3 --> B8
+
+  P1 --> P2 --> P3 --> P4
+  P4 -- "是" --> P5
+  P4 -- "否" --> P6 --> P7 --> P8 --> P3

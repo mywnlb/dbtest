@@ -1,0 +1,43 @@
+flowchart TB
+  subgraph Server["Server startup"]
+    Bootstrap["RecoveryBootstrap"]
+    Gate["RecoveryTrafficGate"]
+    Orchestrator["CrashRecoveryService"]
+  end
+
+  subgraph Recovery["storage.recovery"]
+    Registry["RecoveryStageRegistry"]
+    Context["RecoveryContext"]
+    Tablespace["TablespaceDiscoveryStage"]
+    Dblwr["DoublewriteRepairStage"]
+    RedoStage["RedoReplayStage"]
+    DdlStage["DdlRecoveryStage"]
+    TrxStage["TransactionRollbackStage"]
+    PurgeStage["PurgeResumeStage"]
+    CleanerStage["BackgroundWorkerResumeStage"]
+  end
+
+  subgraph Storage["InnoDB modules"]
+    Redo["storage.redo.recovery"]
+    Flush["storage.flush.recovery"]
+    Fil["storage.fil PageStore"]
+    Buf["storage.buf recovery access"]
+    Trx["storage.trx.recovery"]
+    DD["sql.dd.recovery"]
+  end
+
+  Bootstrap --> Gate --> Orchestrator
+  Orchestrator --> Registry --> Tablespace --> Dblwr --> RedoStage --> DdlStage --> TrxStage --> PurgeStage --> CleanerStage
+  Orchestrator --> Context
+  Tablespace --> Fil
+  Dblwr --> Flush
+  Dblwr --> Fil
+  RedoStage --> Redo
+  RedoStage --> Buf
+  RedoStage --> Fil
+  DdlStage --> DD
+  TrxStage --> Trx
+  PurgeStage --> Trx
+  CleanerStage --> Buf
+  CleanerStage --> Flush
+  CleanerStage --> Gate

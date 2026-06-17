@@ -1,0 +1,43 @@
+stateDiagram-v2
+    [*] --> IDLE
+
+    IDLE --> HASH_LOCKED: getPage acquires pageHashLock
+    HASH_LOCKED --> HIT_FRAME: frame exists
+    HASH_LOCKED --> LOADING_OWNER: miss registers PageLoadFuture
+    HASH_LOCKED --> WAIT_LOADING: loading exists, release hash/list locks
+
+    HIT_FRAME --> PAGE_LATCHING: release hash/list locks
+    LOADING_OWNER --> FILE_IO: reserve frame and set ioState READ
+    FILE_IO --> PUBLISH_FRAME: read ok
+    FILE_IO --> IO_ERROR: read failed
+    PUBLISH_FRAME --> PAGE_LATCHING: clear ioState and wake waiters
+
+    WAIT_LOADING --> RECHECK_FRAME: PageLoadFuture completed
+    RECHECK_FRAME --> PAGE_LATCHING: validate page id and space version
+    RECHECK_FRAME --> IO_ERROR: future failed
+
+    PAGE_LATCHING --> PAGE_LATCHED: acquire requested S/X latch
+    PAGE_LATCHED --> MTR_MEMO: register latch and buffer fix
+    MTR_MEMO --> RELEASED: MTR LIFO release
+
+    IDLE --> FLUSH_FIXED: page cleaner fixes dirty frame
+    FLUSH_FIXED --> FLUSH_SNAPSHOT: capture page image or pageLSN
+    FLUSH_SNAPSHOT --> PAGESTORE_IO: release LRU/flush list locks
+    PAGESTORE_IO --> FLUSH_DONE: write through PageStore
+    FLUSH_DONE --> RELEASED: unfix or keep dirty if modified again
+
+    IO_ERROR --> ERROR_BROADCAST: remove placeholder
+    ERROR_BROADCAST --> RELEASED: wake waiters with exception
+    RELEASED --> IDLE
+    IDLE --> [*]
+
+    note right of WAIT_LOADING
+        Waiters hold only PageLoadFuture wait slot.
+        They do not hold Buffer Pool list/hash locks.
+    end note
+
+    note right of PAGE_LATCHED
+        Page latch protects page body only.
+        Row-lock wait must release page latch and buffer fix first.
+    end note
+

@@ -1,0 +1,38 @@
+flowchart TB
+    sql["SQL / Session\nfuture"]
+    dict["Data Dictionary\nfuture"]
+    trx["storage.trx\nTransaction / MVCC / Lock / Undo"]
+    btree["storage.btree\nIndex navigation / split / merge"]
+    record["storage.record\nRow format / page directory / codecs"]
+    buf["storage.buf\nBuffer Pool / frame / dirty"]
+    fsp["storage.fsp\nSpace management"]
+    fil["storage.fil\nPageStore / data files"]
+    mtr["storage.mtr\nMiniTransaction"]
+    redo["storage.redo\nWAL / LSN / checkpoint"]
+    flush["storage.flush\npage cleaner / doublewrite"]
+    recovery["storage.recovery\nredo apply / trx rollback"]
+
+    sql --> trx
+    sql --> btree
+    dict --> btree
+    btree --> record
+    btree --> buf
+    btree --> fsp
+    btree --> trx
+    record --> buf
+    record --> trx
+    fsp --> buf
+    buf --> fil
+    trx --> mtr
+    record --> mtr
+    btree --> mtr
+    fsp --> mtr
+    mtr --> redo
+    buf --> redo
+    flush --> buf
+    flush --> redo
+    flush --> fil
+    recovery --> redo
+    recovery --> fil
+    recovery --> buf
+    recovery --> trx

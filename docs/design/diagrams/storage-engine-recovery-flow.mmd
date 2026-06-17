@@ -1,0 +1,18 @@
+flowchart TD
+    start["Server startup"] --> registry["Load tablespace registry"]
+    registry --> ckpt["Read checkpoint label"]
+    ckpt --> dw["Repair torn pages from doublewrite if needed"]
+    dw --> scan["Scan redo from checkpoint LSN"]
+    scan --> parse{"complete redo record?"}
+    parse -->|"yes"| dispatch["RedoApplyDispatcher routes by record type"]
+    dispatch --> page["Fetch target page through recovery-safe PageStore/BufferPool"]
+    page --> lsn{"pageLSN >= record LSN?"}
+    lsn -->|"yes"| skip["Skip idempotently"]
+    lsn -->|"no"| apply["Apply physical redo"]
+    skip --> next["Next record"]
+    apply --> next
+    next --> parse
+    parse -->|"no"| trx["TransactionRecoveryService scans undo and trx system"]
+    trx --> rollback["Rollback recovered active transactions"]
+    rollback --> purge["Resume purge from history list"]
+    purge --> accept["Open engine for user traffic"]

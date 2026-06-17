@@ -1,0 +1,17 @@
+flowchart TD
+    start["Purge finds delete-mark record safe"] --> leaf["Acquire leaf X latch"]
+    leaf --> purge["RecordPageAccessor physically removes record"]
+    purge --> fill{"page below merge threshold?"}
+    fill -->|"no"| commit["MTR commit page changes"]
+    fill -->|"yes"| sibling["Acquire sibling by PageId order"]
+    sibling --> choice{"redistribute possible?"}
+    choice -->|"yes"| redistribute["Move records and update parent separator"]
+    choice -->|"no"| merge["Move all records to sibling"]
+    merge --> unlink["Update FIL_PAGE_PREV/NEXT"]
+    unlink --> parent["Delete parent entry"]
+    parent --> free["DiskSpaceManager.freePage(victim)"]
+    redistribute --> commit
+    free --> root{"root shrink possible?"}
+    root -->|"yes"| shrink["Replace root with only child"]
+    root -->|"no"| commit
+    shrink --> commit

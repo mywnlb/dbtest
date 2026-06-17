@@ -1,0 +1,20 @@
+stateDiagram-v2
+  [*] --> PLAN_READY
+  PLAN_READY --> OPERATOR_OPENING: executor opens root
+  OPERATOR_OPENING --> CHILD_READING: child cursor opened
+  CHILD_READING --> ROW_LOCK_WAIT: storage current read waits
+  ROW_LOCK_WAIT --> CHILD_READING: granted and relocated
+  CHILD_READING --> MEMORY_HELD: operator buffers rows
+  MEMORY_HELD --> SPILLING: memory quota exceeded
+  SPILLING --> TEMP_IO: acquire spill file lock
+  TEMP_IO --> MEMORY_HELD: run written or merged
+  MEMORY_HELD --> RESULT_EMITTING: output row ready
+  RESULT_EMITTING --> CHILD_READING: need more rows
+  RESULT_EMITTING --> CLOSING: no more rows
+  CLOSING --> RELEASED: guards close
+  RELEASED --> [*]
+
+  OPERATOR_OPENING --> FAILED: open error
+  CHILD_READING --> FAILED: child error
+  SPILLING --> FAILED: temp IO error
+  FAILED --> CLOSING: cleanup

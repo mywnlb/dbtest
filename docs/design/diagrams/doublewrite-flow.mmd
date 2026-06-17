@@ -1,0 +1,29 @@
+flowchart TD
+    snapshot["FlushSnapshot"]
+    mode{"Doublewrite mode"}
+    off["OFF: write data file directly"]
+    detect["DETECT_ONLY: write metadata/checksum"]
+    recover["DETECT_AND_RECOVER: write full page copy"]
+    dblwrFile["Doublewrite file slot"]
+    dblwrFsync["Fsync doublewrite batch"]
+    dataWrite["Write tablespace page"]
+    dataFsync["Fsync data file by policy"]
+    markDone["Mark doublewrite slot reusable"]
+    crash{"Crash during data write?"}
+    recovery["Recovery scans doublewrite file"]
+    repair["Repair torn page from full copy"]
+    detectOnly["Report torn page; cannot repair from metadata"]
+    redo["Redo replay uses pageLSN"]
+
+    snapshot --> mode
+    mode --> off --> dataWrite
+    mode --> detect --> dblwrFile
+    mode --> recover --> dblwrFile
+    dblwrFile --> dblwrFsync --> dataWrite --> dataFsync --> markDone
+    dataWrite --> crash
+    crash --> recovery
+    recovery --> repair
+    recovery --> detectOnly
+    repair --> redo
+    detectOnly --> redo
+

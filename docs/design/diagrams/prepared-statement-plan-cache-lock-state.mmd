@@ -1,0 +1,17 @@
+stateDiagram-v2
+  [*] --> ABSENT
+  ABSENT --> BUILDING: prepare or cache miss
+  BUILDING --> READY: template published
+  READY --> EXECUTING: acquire PlanUseGuard
+  EXECUTING --> READY: release guard
+  READY --> STALE: DDL or stats invalidation
+  EXECUTING --> STALE: invalidated while running
+  STALE --> REPREPARING: next execute
+  REPREPARING --> READY: reprepare success
+  REPREPARING --> FAILED: reprepare failure
+  READY --> DEALLOCATING: deallocate requested
+  STALE --> DEALLOCATING: deallocate requested
+  EXECUTING --> DEALLOCATING: deallocate waits for refCount
+  DEALLOCATING --> DEALLOCATED: refCount zero
+  FAILED --> DEALLOCATED: cleanup
+  DEALLOCATED --> [*]

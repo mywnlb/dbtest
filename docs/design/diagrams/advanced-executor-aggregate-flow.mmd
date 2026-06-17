@@ -1,0 +1,22 @@
+flowchart TD
+  start["Open AggregateNode"]
+  mode{"Aggregation mode"}
+  read["Read child rows"]
+  groupKey["Evaluate group key"]
+  hash["Hash aggregate updates group state"]
+  sort["Sort/group aggregate reads ordered groups"]
+  distinct["Distinct aggregate checks dedup state"]
+  spill{"memory quota exceeded?"}
+  spillRun["Spill partial groups to temp table"]
+  merge["Merge partial aggregate state"]
+  having["Evaluate HAVING"]
+  output["Emit aggregate row"]
+  done["Close child and aggregate resources"]
+
+  start --> mode
+  mode -->|"hash"| read --> groupKey --> hash --> spill
+  mode -->|"sort"| read --> groupKey --> sort --> spill
+  mode -->|"distinct"| read --> groupKey --> distinct --> spill
+  spill -->|"yes"| spillRun --> merge
+  spill -->|"no"| merge
+  merge --> having --> output --> done

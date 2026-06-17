@@ -1,0 +1,12 @@
+stateDiagram-v2
+  [*] --> CLOSED
+  CLOSED --> RECOVERY_RUNNING: startup enters recovery
+  RECOVERY_RUNNING --> READ_ONLY_DIAGNOSTIC: force validation mode
+  READ_ONLY_DIAGNOSTIC --> CLOSED: validation complete
+  RECOVERY_RUNNING --> BACKGROUND_STARTING: required recovery stages complete
+  BACKGROUND_STARTING --> OPEN: workers registered
+  OPEN --> DRAINING_FOR_SHUTDOWN: shutdown requested
+  DRAINING_FOR_SHUTDOWN --> CLOSED: sessions drained
+  RECOVERY_RUNNING --> FAILED_CLOSED: recovery error
+  FAILED_CLOSED --> CLOSED: admin restart
+  OPEN --> [*]

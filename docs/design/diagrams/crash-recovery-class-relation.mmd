@@ -1,0 +1,50 @@
+classDiagram
+  class CrashRecoveryService {
+    +recover(RecoveryRequest)
+    +currentState()
+    +metricsSnapshot()
+  }
+
+  class RecoveryContext {
+    +mode
+    +checkpointLsn
+    +recoveredToLsn
+    +tablespaces
+    +errorPolicy
+  }
+
+  class RecoveryStage {
+    <<interface>>
+    +name()
+    +run(RecoveryContext)
+    +rollbackOnFailure(RecoveryContext)
+  }
+
+  class RecoveryStageRegistry {
+    +orderedStages()
+  }
+
+  class TablespaceDiscoveryStage
+  class DoublewriteRepairStage
+  class RedoReplayStage
+  class DdlRecoveryStage
+  class TransactionRollbackStage
+  class PurgeResumeStage
+  class RecoveryTrafficGate
+  class RecoveryLockCoordinator
+  class RecoveryProgressJournal
+  class RecoveryErrorPolicy
+
+  CrashRecoveryService --> RecoveryStageRegistry
+  CrashRecoveryService --> RecoveryContext
+  CrashRecoveryService --> RecoveryTrafficGate
+  CrashRecoveryService --> RecoveryLockCoordinator
+  CrashRecoveryService --> RecoveryProgressJournal
+  RecoveryStageRegistry --> RecoveryStage
+  RecoveryStage <|.. TablespaceDiscoveryStage
+  RecoveryStage <|.. DoublewriteRepairStage
+  RecoveryStage <|.. RedoReplayStage
+  RecoveryStage <|.. DdlRecoveryStage
+  RecoveryStage <|.. TransactionRollbackStage
+  RecoveryStage <|.. PurgeResumeStage
+  RecoveryContext --> RecoveryErrorPolicy

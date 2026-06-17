@@ -1,0 +1,38 @@
+flowchart TB
+  A["Command loop READY"]
+  B["Read command packet"]
+  C["Decode command byte and payload"]
+  D{"Known command?"}
+  E["Create CommandContext"]
+  F["Create StatementContext"]
+  G["Snapshot session variables"]
+  H{"Command type"}
+  Q["COM_QUERY: parse and bind SQL"]
+  P["Prepared command handler"]
+  U["Utility command handler"]
+  X["Unknown command ERR"]
+  T["SessionTransactionPolicy.beforeStatement"]
+  EX["Execute through module boundary"]
+  R{"Result kind"}
+  OK["Send OK packet"]
+  RS["Stream resultset"]
+  ER["Send ERR packet"]
+  CL["StatementResourceGuard cleanup"]
+  K{"Kill or close?"}
+  READY["Return session to READY"]
+  CLOSE["Close session and connection"]
+
+  A --> B --> C --> D
+  D -->|"no"| X --> CL
+  D -->|"yes"| E --> F --> G --> H
+  H -->|"COM_QUERY"| Q --> T
+  H -->|"COM_STMT_*"| P --> T
+  H -->|"PING / INIT_DB / QUIT"| U
+  T --> EX --> R
+  U --> R
+  R -->|"OK"| OK --> CL
+  R -->|"Resultset"| RS --> CL
+  R -->|"ERR"| ER --> CL
+  CL --> K
+  K -->|"none or KILL QUERY handled"| READY
+  K -->|"COM_QUIT / disconnect / KILL CONNECTION"| CLOSE

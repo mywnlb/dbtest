@@ -1,0 +1,110 @@
+flowchart LR
+  subgraph Clients["调用方"]
+    MTR["MiniTransaction"]
+    Trx["TransactionManager"]
+    Flush["FlushCoordinator"]
+    Recovery["RecoveryService"]
+    Buf["BufferPool Dirty"]
+  end
+
+  subgraph RedoApi["storage.redo.api"]
+    RedoMgr["RedoLogManager"]
+    CheckpointSvc["CheckpointService"]
+    Waiter["DurabilityWaiter"]
+  end
+
+  subgraph LsnPkg["storage.redo.lsn"]
+    Lsn["Lsn"]
+    Range["LogRange"]
+    Capacity["CapacityWindow"]
+  end
+
+  subgraph RecordPkg["storage.redo.record"]
+    Record["RedoRecord"]
+    Encoder["RedoRecordEncoder"]
+    Factory["RedoRecordFactory"]
+  end
+
+  subgraph BufferPkg["storage.redo.buffer"]
+    LogBuffer["RedoLogBuffer"]
+    Reservation["RedoReservation"]
+    RecentWritten["RecentWrittenTracker"]
+    RecentClosed["RecentClosedTracker"]
+  end
+
+  subgraph WriterPkg["storage.redo.writer"]
+    Writer["LogWriter"]
+    Flusher["LogFlusher"]
+    WriteNotifier["WriteNotifier"]
+    FlushNotifier["FlushNotifier"]
+  end
+
+  subgraph FilePkg["storage.redo.file"]
+    FileRepo["RedoFileRepository"]
+    BlockIO["RedoBlockIO"]
+    Governor["RedoCapacityGovernor"]
+  end
+
+  subgraph CheckpointPkg["storage.redo.checkpoint"]
+    Checkpoint["CheckpointCoordinator"]
+    Label["CheckpointLabel"]
+    Pressure["CheckpointPressurePolicy"]
+  end
+
+  subgraph RecPkg["storage.redo.recovery"]
+    Reader["RedoRecoveryReader"]
+    Parser["RedoLogParser"]
+    Dispatcher["RedoApplyDispatcher"]
+    Handler["RedoApplyHandler"]
+  end
+
+  Storage["redo files"]
+  DataFiles["tablespace files"]
+
+  MTR --> RedoMgr
+  Trx --> Waiter
+  Flush --> CheckpointSvc
+  Flush --> Waiter
+  Recovery --> Reader
+  Buf --> CheckpointSvc
+
+  RedoMgr --> Factory
+  RedoMgr --> LogBuffer
+  RedoMgr --> Waiter
+  RedoMgr --> Range
+  LogBuffer --> Reservation
+  LogBuffer --> RecentWritten
+  LogBuffer --> RecentClosed
+  LogBuffer --> Encoder
+  Encoder --> Record
+
+  Writer --> LogBuffer
+  Writer --> FileRepo
+  Writer --> WriteNotifier
+  Flusher --> FileRepo
+  Flusher --> FlushNotifier
+  Waiter --> WriteNotifier
+  Waiter --> FlushNotifier
+
+  FileRepo --> BlockIO
+  FileRepo --> Governor
+  BlockIO --> Storage
+
+  CheckpointSvc --> Checkpoint
+  Checkpoint --> Label
+  Checkpoint --> Pressure
+  Checkpoint --> RecentClosed
+  Checkpoint --> Flusher
+  Checkpoint --> Buf
+  Checkpoint --> FileRepo
+
+  Reader --> FileRepo
+  Reader --> Parser
+  Parser --> Record
+  Reader --> Dispatcher
+  Dispatcher --> Handler
+  Handler --> DataFiles
+  Handler --> Buf
+
+  Capacity --> Governor
+  Lsn --> Range

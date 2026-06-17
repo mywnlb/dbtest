@@ -1,0 +1,72 @@
+classDiagram
+    class RecordPageAccessor {
+        +findInsertPosition(PageHandle, SearchKey, IndexKeyDef)
+        +findEqual(PageHandle, SearchKey, IndexKeyDef)
+        +insert(PageHandle, LogicalRecord, InsertContext, MTR)
+        +update(PageHandle, RecordRef, UpdatePatch, UpdateContext, MTR)
+        +deleteMark(PageHandle, RecordRef, DeleteContext, MTR)
+        +purge(PageHandle, RecordRef, PurgeContext, MTR)
+    }
+
+    class RecordCursor {
+        +recordRef()
+        +recordHeader()
+        +readColumn(ColumnId)
+        +readHiddenColumns()
+        +materialize(TableSchema)
+        +release()
+    }
+
+    class RecordRef {
+        +PageId pageId
+        +int heapNo
+        +int pageOffset
+        +long schemaVersion
+        +IndexId indexId
+    }
+
+    class PhysicalRecord {
+        +RecordHeader header
+        +NullBitmap nullBitmap
+        +VarLengthDirectory varLengthDirectory
+        +FieldArea fieldArea
+    }
+
+    class LogicalRecord {
+        +long schemaVersion
+        +ColumnValue[] columnValues
+        +HiddenColumns hiddenColumns
+        +boolean deleted
+    }
+
+    class RecordHeader {
+        +boolean deletedFlag
+        +int heapNo
+        +int nOwned
+        +int nextRecordOffset
+        +RecordType recordType
+    }
+
+    class TableSchema
+    class ColumnDef
+    class ColumnType
+    class TypeCodec
+    class RecordComparator
+    class PageDirectory
+    class RecordPageOperation
+    class HiddenColumnAccessor
+
+    RecordPageAccessor --> RecordCursor
+    RecordPageAccessor --> RecordPageOperation
+    RecordCursor --> RecordRef
+    RecordCursor --> PhysicalRecord
+    PhysicalRecord *-- RecordHeader
+    LogicalRecord *-- ColumnDef
+    LogicalRecord *-- HiddenColumns
+    TableSchema *-- ColumnDef
+    ColumnDef --> ColumnType
+    ColumnType --> TypeCodec
+    RecordComparator --> TypeCodec
+    PageDirectory --> RecordRef
+    HiddenColumnAccessor --> RecordCursor
+    RecordPageOperation --> LogicalRecord

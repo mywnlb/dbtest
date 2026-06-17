@@ -1,0 +1,24 @@
+flowchart LR
+    subgraph allowed["允许依赖方向"]
+        a1["sql/session"] --> a2["trx.api"]
+        a2 --> a3["btree"]
+        a3 --> a4["record.api"]
+        a3 --> a5["buf.api"]
+        a3 --> a6["fsp.api"]
+        a4 --> a5
+        a6 --> a5
+        a5 --> a7["fil.PageStore"]
+        a8["mtr"] --> a9["redo.api"]
+        a10["flush"] --> a5
+        a10 --> a7
+        a10 --> a9
+    end
+
+    subgraph forbidden["禁止反向依赖"]
+        f1["buf must not parse record"]
+        f2["record must not allocate page/extent/segment"]
+        f3["trx must not access BufferFrame or raw file"]
+        f4["redo must not depend on concrete repository"]
+        f5["fil must not import fsp"]
+        f6["flush must not bypass redo durable boundary"]
+    end

@@ -1,0 +1,18 @@
+flowchart TD
+    Query["Diagnostic SQL query"] --> Request["Build SnapshotRequest"]
+    Request --> Epoch["Allocate SnapshotEpoch"]
+    Epoch --> Slots["Snapshot WaitSlotRegistry"]
+    Slots --> Locks["Snapshot LockEventRegistry shards"]
+    Locks --> Graph["Snapshot WaitForGraph edges"]
+    Graph --> Physical["Snapshot mutex, rwlock, condition registries"]
+    Physical --> Reports["Snapshot recent deadlock reports"]
+    Reports --> Join["Join locks, waits, actors, events"]
+    Join --> Missing{"Missing or released blocker?"}
+    Missing -->|Yes| MarkPartial["Mark partial row and keep epoch"]
+    Missing -->|No| Redact["Apply lock data redaction policy"]
+    MarkPartial --> Redact
+    Redact --> Limit{"Row limit exceeded?"}
+    Limit -->|Yes| Truncate["Truncate low priority physical rows"]
+    Limit -->|No| BuildRows["Build immutable view rows"]
+    Truncate --> BuildRows
+    BuildRows --> Return["Return Performance Schema or Information Schema rows"]

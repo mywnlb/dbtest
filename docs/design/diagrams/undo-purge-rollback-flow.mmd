@@ -1,0 +1,39 @@
+flowchart TB
+  subgraph Full["完整事务回滚"]
+    F1["TransactionManager.rollback"]
+    F2["状态 ACTIVE -> ROLLING_BACK"]
+    F3["读取 UndoContext.lastRollPointer"]
+    F4{"还有 undo record?"}
+    F5["UndoLogManager.findUndoRecord"]
+    F6{"UndoRecord 类型"}
+    F7["INSERT undo\n删除未提交插入记录和二级索引"]
+    F8["UPDATE undo\n恢复旧列值、DB_TRX_ID、DB_ROLL_PTR"]
+    F9["DELETE_MARK undo\n撤销 delete mark"]
+    F10["每条撤销使用独立 MTR\n写 redo 并标脏页"]
+    F11["移动到 prevRollPointer"]
+    F12["释放 insert/update undo slot"]
+    F13["释放事务锁并关闭 ReadView"]
+    F14["状态 ROLLING_BACK -> ROLLED_BACK"]
+  end
+
+  subgraph SavepointFlow["保存点回滚"]
+    S1["rollbackToSavepoint(savepoint)"]
+    S2["读取 savepoint.undoNo 和 rollPointer"]
+    S3["从最新 undo 反向撤销"]
+    S4{"undoNo 大于保存点边界?"}
+    S5["应用单条 undo"]
+    S6["保留边界之前 undo 链"]
+    S7["事务保持 ACTIVE"]
+  end
+
+  F1 --> F2 --> F3 --> F4
+  F4 -- "是" --> F5 --> F6
+  F6 -- "INSERT" --> F7 --> F10
+  F6 -- "UPDATE" --> F8 --> F10
+  F6 -- "DELETE_MARK" --> F9 --> F10
+  F10 --> F11 --> F4
+  F4 -- "否" --> F12 --> F13 --> F14
+
+  S1 --> S2 --> S3 --> S4
+  S4 -- "是" --> S5 --> S3
+  S4 -- "否" --> S6 --> S7

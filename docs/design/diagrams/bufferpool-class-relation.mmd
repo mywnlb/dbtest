@@ -1,0 +1,194 @@
+classDiagram
+  direction LR
+
+  class BufferPool {
+    <<facade>>
+    getPage(PageId, LatchMode, MiniTransaction)
+    tryGetPage(PageId, LatchMode, MiniTransaction)
+    createPage(PageId, PageType, MiniTransaction)
+    prefetch(PageRange, ReadAheadReason)
+    onMtrCommit(MtrCommitEvent)
+    markPageFreed(PageId, SpaceVersion)
+  }
+
+  class BufferPoolRouter {
+    instanceFor(PageId)
+  }
+
+  class BufferPoolInstance {
+    int instanceId
+    long capacityInFrames
+    getOrLoad(PageId, LatchMode, MiniTransaction)
+    allocateFrame()
+    evictOne()
+  }
+
+  class PageHashTable {
+    find(PageId)
+    publish(BufferFrame)
+    registerLoading(PageId)
+    remove(PageId)
+  }
+
+  class PageLoadFuture {
+    PageId pageId
+    await()
+    complete(BufferFrame)
+    fail(Throwable)
+  }
+
+  class BufferFrame {
+    FrameId frameId
+    PageId pageId
+    PageType pageType
+    BufferFrameState state
+    int bufFixCount
+    IoState ioState
+    Lsn oldestModificationLsn
+    Lsn newestModificationLsn
+  }
+
+  class PageImage {
+    byte[] bytes
+    checksum()
+    pageLsn()
+  }
+
+  class PageLatch {
+    sLock()
+    xLock()
+    unlock()
+  }
+
+  class FrameStateMachine {
+    toLoading()
+    publishClean()
+    markDirtyPending()
+    publishDirty()
+    markFlushing()
+    markClean()
+    markStale()
+    resetFree()
+  }
+
+  class PageHandle {
+    <<guard>>
+    PageId pageId
+    LatchMode latchMode
+    cursor()
+    release()
+  }
+
+  class PageCursor {
+    readInt(int)
+    writeInt(int, int)
+    readBytes(int, int)
+    writeBytes(int, byte[])
+  }
+
+  class FreeList {
+    take()
+    put(BufferFrame)
+    size()
+  }
+
+  class LruList {
+    addAtOldHead(BufferFrame)
+    makeYoung(BufferFrame)
+    moveToTail(BufferFrame)
+    scanFromTail()
+  }
+
+  class ReplacementPolicy {
+    <<strategy>>
+    chooseVictim(LruList)
+  }
+
+  class OldBlockPromotionPolicy {
+    <<policy>>
+    shouldPromote(BufferFrame, AccessContext)
+  }
+
+  class DirtyPageMarker {
+    onMtrCommit(MiniTransaction)
+    publishDirty(BufferFrame, Lsn)
+  }
+
+  class FlushList {
+    add(BufferFrame)
+    remove(BufferFrame)
+    pagesBefore(Lsn)
+    dirtyPagesOf(SpaceId)
+  }
+
+  class PageReadService {
+    read(PageId)
+    readAsync(PageId)
+  }
+
+  class PageVerifier {
+    verify(PageImage, PageId)
+  }
+
+  class ReadAheadController {
+    recordAccess(PageId, AccessType)
+    maybeScheduleLinear(PageId)
+    maybeScheduleRandom(PageId)
+  }
+
+  class BufferPoolDumpService {
+    dumpHotPages(DumpPolicy)
+  }
+
+  class BufferPoolLoadService {
+    loadHotPages(LoadPolicy)
+    abort()
+  }
+
+  class MiniTransaction {
+    memo
+    commit()
+  }
+
+  class PageStore {
+    <<interface>>
+    read(PageId)
+    write(PageId, PageImage)
+  }
+
+  BufferPool --> BufferPoolRouter
+  BufferPoolRouter --> BufferPoolInstance
+  BufferPool --> PageHandle
+
+  BufferPoolInstance --> PageHashTable
+  BufferPoolInstance --> FreeList
+  BufferPoolInstance --> LruList
+  BufferPoolInstance --> DirtyPageMarker
+  BufferPoolInstance --> PageReadService
+  BufferPoolInstance --> ReadAheadController
+
+  PageHashTable --> BufferFrame
+  PageHashTable --> PageLoadFuture
+  BufferFrame --> PageImage
+  BufferFrame --> PageLatch
+  BufferFrame --> FrameStateMachine
+
+  PageHandle --> BufferFrame
+  PageHandle --> PageCursor
+  PageCursor --> PageImage
+
+  LruList --> ReplacementPolicy
+  LruList --> OldBlockPromotionPolicy
+  LruList --> BufferFrame
+  FreeList --> BufferFrame
+
+  DirtyPageMarker --> FlushList
+  DirtyPageMarker --> MiniTransaction
+  FlushList --> BufferFrame
+
+  PageReadService --> PageVerifier
+  PageReadService --> PageStore
+  ReadAheadController --> PageReadService
+
+  BufferPoolDumpService --> LruList
+  BufferPoolLoadService --> PageReadService

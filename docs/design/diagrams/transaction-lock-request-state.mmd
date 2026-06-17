@@ -1,0 +1,33 @@
+stateDiagram-v2
+    [*] --> FREE
+    FREE --> REQUESTED: caller builds lock request
+    REQUESTED --> SHARD_LOCKED: acquire LockManager shard
+
+    SHARD_LOCKED --> GRANTED: compatible
+    SHARD_LOCKED --> WAITING: conflict, enqueue and add wait edge
+
+    GRANTED --> CONVERTING: upgrade requested
+    CONVERTING --> GRANTED: conversion compatible
+    CONVERTING --> WAITING: conversion conflict
+
+    WAITING --> GRANTED: granted after blocker releases
+    WAITING --> TIMEOUT: wait deadline reached
+    WAITING --> VICTIM: deadlock detector selects transaction
+
+    GRANTED --> RELEASED: statement or transaction release
+    TIMEOUT --> RELEASED: remove waiting request and wait edges
+    VICTIM --> RELEASED: rollback cleanup releases owned locks
+    RELEASED --> FREE
+    FREE --> [*]
+
+    note right of WAITING
+        Only transaction logical locks enter Wait-For Graph.
+        Caller must not hold page latch, file latch, undo page latch,
+        Buffer Pool list lock, or RecordCursor while waiting.
+    end note
+
+    note right of GRANTED
+        Ownership belongs to TransactionLockSet.
+        RecordCursor and PageHandle do not own transaction locks.
+    end note
+

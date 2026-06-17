@@ -1,0 +1,22 @@
+flowchart TD
+    start["Bound statement"]
+    normalize["Normalize query block"]
+    logical["Build logical plan"]
+    rewrite["Rule rewrite"]
+    simplify["Constant folding and predicate simplification"]
+    pushdown["Predicate and projection pushdown"]
+    stats["Open statistics snapshot"]
+    access["Enumerate access paths"]
+    range["Build range intervals"]
+    joins["Optimize join order"]
+    order["Choose order by / filesort strategy"]
+    physical["Build physical plan"]
+    explain["Record EXPLAIN and trace"]
+    done["Return PhysicalPlan"]
+
+    start --> normalize --> logical --> rewrite --> simplify --> pushdown --> stats
+    stats --> access --> range --> joins --> order --> physical --> explain --> done
+
+    access --> reject["Reject invalid or disabled paths"]
+    reject --> joins
+

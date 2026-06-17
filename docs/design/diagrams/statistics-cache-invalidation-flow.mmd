@@ -1,0 +1,17 @@
+flowchart TD
+  event{"Invalidation source"}
+  analyze["ANALYZE commit publishes StatsVersion"]
+  ddl["DDL commit publishes DictionaryVersion"]
+  cache["StatsCache matches TableId and version"]
+  mark["Mark old snapshots STALE or REPLACED"]
+  plan["PlanCache invalidates dependent entries"]
+  opt["Next Optimizer request"]
+  miss{"fresh snapshot exists?"}
+  fresh["Return fresh OptimizerStatsSnapshot"]
+  fallback["Return default low-confidence estimates or load store"]
+
+  event --> analyze --> cache
+  event --> ddl --> cache
+  cache --> mark --> plan --> opt --> miss
+  miss -->|"yes"| fresh
+  miss -->|"no"| fallback

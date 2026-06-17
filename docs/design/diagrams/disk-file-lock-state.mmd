@@ -1,0 +1,35 @@
+stateDiagram-v2
+    [*] --> IDLE
+
+    IDLE --> LIFECYCLE_S: page read/write/recovery
+    IDLE --> LIFECYCLE_X: drop/truncate/discard
+
+    LIFECYCLE_S --> HANDLE_LOCKED: validate file handle
+    HANDLE_LOCKED --> SIZE_CHECKED: read stable file size
+    SIZE_CHECKED --> PAGE_RANGE_LOCKED: optional page range lock
+    PAGE_RANGE_LOCKED --> IO_IN_PROGRESS: positional read/write
+    IO_IN_PROGRESS --> FSYNC_LIMITED: fsync requested
+    IO_IN_PROGRESS --> RELEASED: read/write done
+    FSYNC_LIMITED --> RELEASED: fsync done
+
+    LIFECYCLE_S --> EXTENDING: acquire FileSizeLock X
+    EXTENDING --> SIZE_PUBLISHED: zero fill new range
+    SIZE_PUBLISHED --> RELEASED: publish currentSizeInPages
+
+    LIFECYCLE_X --> DRAINING_IO: block new IO and wait S holders
+    DRAINING_IO --> FILE_MUTATION: close/truncate/drop
+    FILE_MUTATION --> RELEASED: publish space version
+
+    RELEASED --> IDLE
+    IDLE --> [*]
+
+    note right of LIFECYCLE_S
+        Does not enter transaction Wait-For Graph.
+        Timeout or IO error is handled by Disk Manager.
+    end note
+
+    note right of LIFECYCLE_X
+        DDL or cleanup owns lifecycle X latch.
+        Buffer Pool must stop returning ordinary page handles.
+    end note
+

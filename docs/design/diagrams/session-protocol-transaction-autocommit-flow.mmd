@@ -1,0 +1,35 @@
+flowchart TB
+  S["Statement begins"]
+  V["Read SessionVariableSnapshot"]
+  A{"autocommit ON?"}
+  E{"Explicit transaction active?"}
+  T1["Open statement transaction"]
+  T2["Reuse explicit transaction"]
+  T3["Use active autocommit-off transaction"]
+  X["Execute statement"]
+  R{"Statement success?"}
+  C["Commit statement transaction"]
+  RB["Rollback statement changes"]
+  KEEP["Keep transaction active"]
+  SET{"SET autocommit 0 -> 1?"}
+  C2["Commit open transaction before enabling autocommit"]
+  CLOSE{"Session closing?"}
+  CRB["Rollback uncommitted transaction"]
+  DONE["Return status to ResultStreamer"]
+
+  S --> V --> A
+  A -->|"yes"| E
+  E -->|"no"| T1
+  E -->|"yes"| T2
+  A -->|"no"| T3
+  T1 --> X
+  T2 --> X
+  T3 --> X
+  X --> R
+  R -->|"success and statement transaction"| C --> SET
+  R -->|"success and explicit/autocommit-off"| KEEP --> SET
+  R -->|"failure or kill"| RB --> SET
+  SET -->|"yes"| C2 --> CLOSE
+  SET -->|"no"| CLOSE
+  CLOSE -->|"yes and transaction open"| CRB --> DONE
+  CLOSE -->|"no"| DONE

@@ -1,0 +1,94 @@
+package cn.zhangyis.db.storage.buf;
+
+import cn.zhangyis.db.domain.Lsn;
+import cn.zhangyis.db.domain.PageId;
+
+import java.util.List;
+import java.util.Optional;
+
+/**
+ * Buffer Pool 门面：在 fil.PageStore 之上提供受控页访问（fix + S/X page latch + LRU 淘汰 + 脏页写回）。
+ * 消费方（未来 fsp）经它拿受控页，不直接接触 PageStore 或文件。
+ *
+ * <p>简化点：不带 MTR；flush 不做 WAL 门控 / doublewrite；miss/evict/flush 的盘 IO 在内部 poolLock 串行。
+ */
+public interface BufferPool extends AutoCloseable {
+
+    /**
+     * 取得页（命中或读穿），固定并按 mode 取 page latch，返回 RAII 句柄。
+     *
+     * @param pageId 目标页。
+     * @param mode S 或 X。
+     * @return 受控页句柄；用完 close。
+     */
+    PageGuard getPage(PageId pageId, PageLatchMode mode);
+
+    /**
+     * 页创建：为页建立"不读盘"的零帧（页须已被 PageStore.extend 在盘上分配/零填充，由调用方保证）。
+     * **要求 X latch**（创建/重初始化是写操作）；若该页已驻留，则**重初始化**（在取得 X latch 后清零、复用帧，
+     * 对齐 InnoDB buf_page_create）——调用方须确保该页确实在被（重新）分配，不能误覆盖在用页。
+     *
+     * @param pageId 新页（驻留则被重初始化清零）。
+     * @param mode   必须为 EXCLUSIVE，否则抛 DatabaseValidationException。
+     * @return 受控页句柄（X latch）。
+     */
+    PageGuard newPage(PageId pageId, PageLatchMode mode);
+
+    /** 若该页驻留、未 fix 且为脏，则写回 PageStore 并清脏。 */
+    void flush(PageId pageId);
+
+    /** 写回所有未 fix 的脏页。 */
+    void flushAll();
+
+    /**
+     * 返回 flush list 候选快照，按 oldestModificationLsn 升序排列，只包含 oldest <= targetLsn 的脏页。
+     * Flush 模块不能通过该视图持有 frame 或 latch；真正写盘前必须再调用 {@link #snapshotForFlush(PageId)} 重新确认。
+     *
+     * @param targetLsn flush 目标 LSN。
+     * @param maxPages 最多返回页数，0 表示只探测不返回。
+     * @return 不可变候选列表。
+     */
+    List<DirtyPageCandidate> dirtyPageCandidates(Lsn targetLsn, int maxPages);
+
+    /**
+     * 尝试复制一个未 fixed 的脏页镜像。返回 empty 表示页不存在、已 clean、仍被前台 guard fixed 或不适合本轮 flush。
+     *
+     * @param pageId 目标页。
+     * @return 可跨 IO 使用的稳定页副本。
+     */
+    Optional<FlushPageSnapshot> snapshotForFlush(PageId pageId);
+
+    /**
+     * flush 成功后回调 Buffer Pool。只有当 frame 仍是同一页、仍 dirty、未 fixed、dirtyVersion/pageLSN 与 snapshot
+     * 一致时才清脏；若 snapshot 后页面再次变脏，则保持 dirty，避免把新修改误标 clean。
+     *
+     * @param snapshot 已写盘的页副本。
+     * @return true 表示页被标 clean；false 表示仍保留 dirty。
+     */
+    boolean completeFlush(FlushPageSnapshot snapshot);
+
+    /**
+     * flush 失败回调。F1 dirty 状态没有 FLUSHING 中间态，因此当前实现只校验页号并保留 dirty，供后续重试。
+     *
+     * @param pageId 失败页。
+     */
+    void failFlush(PageId pageId);
+
+    /**
+     * 返回当前最老 dirty LSN；如果没有脏页，返回调用方传入的 cleanBoundary。
+     *
+     * @param cleanBoundary 无脏页时的安全边界。
+     * @return oldest dirty LSN 或 cleanBoundary。
+     */
+    Lsn oldestDirtyLsnOr(Lsn cleanBoundary);
+
+    /** 帧总容量。 */
+    int capacity();
+
+    /** 当前驻留帧数。 */
+    int residentCount();
+
+    /** 关闭：flushAll 后释放（假设无活跃句柄）。 */
+    @Override
+    void close();
+}

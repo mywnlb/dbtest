@@ -1,0 +1,164 @@
+classDiagram
+  direction LR
+
+  class UndoLogManager {
+    <<facade>>
+    assignUndoContext(Transaction)
+    beforeInsert(Transaction, RecordRef, RecordImage, MiniTransaction)
+    beforeUpdate(Transaction, RecordRef, RecordImage, ChangedColumns, MiniTransaction)
+    findUndoRecord(RollPointer)
+    appendToHistory(Transaction)
+    releaseInsertUndo(Transaction)
+  }
+
+  class UndoContext {
+    TransactionId transactionId
+    UndoLogId insertUndoLogId
+    UndoLogId updateUndoLogId
+    UndoNo lastUndoNo
+    RollPointer lastRollPointer
+    List savepoints
+  }
+
+  class RollPointer {
+    UndoTablespaceId tablespaceId
+    RollbackSegmentId rollbackSegmentId
+    PageNo pageNo
+    int offset
+    UndoRecordType type
+  }
+
+  class UndoRecord {
+    <<command>>
+    UndoRecordType type
+    TransactionId transactionId
+    UndoNo undoNo
+    RollPointer prevRollPointer
+    TableId tableId
+    ClusterKey clusterKey
+    buildPreviousVersion()
+    applyRollback()
+    buildPurgeTask()
+  }
+
+  class UndoTablespaceRepository {
+    chooseActiveTablespace()
+    readPage(UndoPageId)
+    allocatePage(RollbackSegmentId)
+    markInactive(UndoTablespaceId)
+    truncateIfFree(UndoTablespaceId)
+  }
+
+  class RollbackSegmentDirectory {
+    load()
+    chooseRollbackSegment(Transaction)
+    find(RollbackSegmentId)
+    recoverSlots()
+  }
+
+  class RollbackSegment {
+    RollbackSegmentId id
+    UndoTablespaceId tablespaceId
+    List activeSlots
+    HistoryList historyList
+    assignSlot(Transaction)
+    releaseSlot(Transaction)
+  }
+
+  class UndoSegment {
+    UndoSegmentId id
+    UndoSegmentKind kind
+    UndoSegmentState state
+    List undoPages
+    append(UndoRecord)
+    markCommitted(TransactionNo)
+    markReusable()
+  }
+
+  class UndoPage {
+    UndoPageId id
+    UndoPageState state
+    PageLsn pageLsn
+    appendRecord(UndoRecord)
+    readRecord(offset)
+    freeIfEmpty()
+  }
+
+  class HistoryList {
+    append(UndoLogHeader)
+    peek(PurgeBoundary)
+    removePurged(UndoLogHeader)
+    length()
+  }
+
+  class PurgeCoordinator {
+    computeBoundary()
+    scheduleBatch()
+    advanceHistoryCursor()
+    requestTruncation()
+  }
+
+  class PurgeWorker {
+    claimTask()
+    purgeDeleteMarkedRecord()
+    purgeUndoLog()
+    publishResult()
+  }
+
+  class PurgeViewProvider {
+    oldestReadView()
+    oldestActiveTransactionId()
+    lowLimitTransactionNo()
+  }
+
+  class RollbackService {
+    rollback(Transaction)
+    rollbackToSavepoint(Transaction, Savepoint)
+    applyUndoRecord(UndoRecord)
+  }
+
+  class Savepoint {
+    SavepointId id
+    UndoNo undoNo
+    RollPointer rollPointer
+    StatementId statementId
+  }
+
+  class UndoRecoveryService {
+    scanRollbackSegments()
+    rebuildHistoryList()
+    rollbackRecoveredActive()
+    resumePurge()
+  }
+
+  UndoLogManager --> UndoContext
+  UndoLogManager --> RollPointer
+  UndoLogManager --> UndoRecord
+  UndoLogManager --> UndoTablespaceRepository
+  UndoLogManager --> RollbackSegmentDirectory
+  UndoLogManager --> HistoryList
+
+  UndoContext --> Savepoint
+  UndoContext --> RollPointer
+  UndoRecord --> RollPointer
+
+  RollbackSegmentDirectory --> RollbackSegment
+  RollbackSegment --> UndoSegment
+  RollbackSegment --> HistoryList
+  UndoSegment --> UndoPage
+  UndoPage --> UndoRecord
+
+  PurgeCoordinator --> PurgeViewProvider
+  PurgeCoordinator --> HistoryList
+  PurgeCoordinator --> PurgeWorker
+  PurgeWorker --> UndoRecord
+  PurgeWorker --> UndoLogManager
+
+  RollbackService --> UndoLogManager
+  RollbackService --> Savepoint
+  RollbackService --> UndoRecord
+
+  UndoRecoveryService --> RollbackSegmentDirectory
+  UndoRecoveryService --> HistoryList
+  UndoRecoveryService --> RollbackService
+  UndoRecoveryService --> PurgeCoordinator

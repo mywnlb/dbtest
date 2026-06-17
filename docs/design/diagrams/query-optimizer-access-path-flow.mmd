@@ -1,0 +1,36 @@
+flowchart TD
+    table["TableBinding + PredicateSet"]
+    indexes["Load candidate indexes"]
+    constCheck{"Primary or unique equality?"}
+    constPath["CONST / EQ_REF path"]
+    rangeExtract["Extract SARGable ranges"]
+    rangePath["RANGE path"]
+    refPath["REF path"]
+    indexScan["INDEX full scan"]
+    tableScan["CLUSTERED full scan"]
+    covering{"Covering index?"}
+    coveringPath["Covering index plan"]
+    icp{"Index condition pushdown possible?"}
+    icpPath["Index condition attached"]
+    cost["Estimate rows and cost"]
+    choose["Choose cheapest valid path"]
+
+    table --> indexes --> constCheck
+    constCheck --> constPath
+    constCheck --> rangeExtract
+    rangeExtract --> rangePath
+    rangeExtract --> refPath
+    indexes --> indexScan
+    table --> tableScan
+    rangePath --> covering
+    refPath --> covering
+    indexScan --> covering
+    covering --> coveringPath
+    covering --> icp
+    icp --> icpPath
+    constPath --> cost
+    coveringPath --> cost
+    icpPath --> cost
+    tableScan --> cost
+    cost --> choose
+

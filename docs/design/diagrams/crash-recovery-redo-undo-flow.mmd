@@ -1,0 +1,33 @@
+flowchart TB
+  subgraph Physical["Physical recovery"]
+    C1["Read checkpoint label"]
+    C2["Doublewrite repairs torn pages"]
+    C3["RedoRecoveryReader scans log blocks"]
+    C4["RedoApplyDispatcher applies page redo"]
+    C5["Undo pages, trx system pages and index pages are physically consistent"]
+  end
+
+  subgraph LogicalTrx["Transaction recovery"]
+    T1["TransactionRecoveryService scans trx system and undo headers"]
+    T2{"Recovered transaction state"}
+    T3["COMMITTED: keep changes and history list"]
+    T4["ACTIVE: rollback by undo commands"]
+    T5["PREPARED: preserve and wait for coordinator"]
+    T6["Rebuild ReadViewManager with no user read views"]
+  end
+
+  subgraph Ddl["DDL recovery"]
+    D1["DdlRecoveryService scans dd_ddl_log"]
+    D2["Finish committed DDL cache publish"]
+    D3["Rollback or cleanup unfinished DDL"]
+    D4["Validate dictionary storage bindings and SDI"]
+  end
+
+  C1 --> C2 --> C3 --> C4 --> C5
+  C5 --> D1 --> D2 --> D4
+  D1 --> D3 --> D4
+  C5 --> T1 --> T2
+  T2 --> T3 --> T6
+  T2 --> T4 --> T6
+  T2 --> T5 --> T6
+  D4 --> T6

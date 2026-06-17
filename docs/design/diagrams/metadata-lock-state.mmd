@@ -1,0 +1,29 @@
+stateDiagram-v2
+    [*] --> FREE
+    FREE --> REQUESTED: build MdlRequest
+    REQUESTED --> PRE_ACQUIRE_NOTIFY: notify storage engine
+    PRE_ACQUIRE_NOTIFY --> GRANTED: compatible
+    PRE_ACQUIRE_NOTIFY --> PENDING: conflict
+    PENDING --> GRANTED: blockers released
+    PENDING --> VICTIM: MDL deadlock detector
+    PENDING --> TIMEOUT: lock wait timeout
+    PENDING --> KILLED: session killed
+    GRANTED --> POST_RELEASE_NOTIFY: release by statement or transaction
+    POST_RELEASE_NOTIFY --> RELEASED: notify complete
+    VICTIM --> RELEASED: cleanup pending request
+    TIMEOUT --> RELEASED: cleanup pending request
+    KILLED --> RELEASED: cleanup pending request
+    RELEASED --> FREE
+    FREE --> [*]
+
+    note right of PENDING
+        MDL waits are metadata waits.
+        They do not hold Buffer Pool page latch,
+        file latch, MTR latch, or row-lock shard lock.
+    end note
+
+    note right of GRANTED
+        Ownership is Session or statement scope.
+        DDL EXCLUSIVE locks normally survive until DDL end.
+    end note
+

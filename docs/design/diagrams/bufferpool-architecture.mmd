@@ -1,0 +1,116 @@
+flowchart TB
+  subgraph Caller["调用方"]
+    BTree["B+Tree / Index Manager"]
+    Record["Record Manager"]
+    Fsp["Disk Space Manager"]
+    Recovery["Recovery Service"]
+  end
+
+  subgraph Api["storage.buf.api"]
+    BufferPool["BufferPool\nFacade"]
+    Handle["PageHandle\nRAII Guard"]
+    CursorFactory["PageCursorFactory"]
+  end
+
+  subgraph Instance["storage.buf.instance"]
+    Router["BufferPoolRouter"]
+    Bpi["BufferPoolInstance"]
+    Metrics["BufferPoolMetrics"]
+  end
+
+  subgraph Frame["storage.buf.frame"]
+    FrameObj["BufferFrame"]
+    Descriptor["FrameDescriptor"]
+    PageImage["PageImage"]
+    Latch["PageLatch"]
+    StateMachine["FrameStateMachine"]
+  end
+
+  subgraph PageTable["storage.buf.page_table"]
+    Hash["PageHashTable"]
+    Loading["PageLoadFuture\nSingle Flight"]
+  end
+
+  subgraph Lru["storage.buf.lru"]
+    FreeList["FreeList"]
+    LruList["LRU List\nnew / old"]
+    Replacement["ReplacementPolicy"]
+    Promotion["OldBlockPromotionPolicy"]
+  end
+
+  subgraph Dirty["storage.buf.dirty"]
+    DirtyMarker["DirtyPageMarker"]
+    FlushList["FlushList"]
+    DirtyStats["DirtyPageStats"]
+  end
+
+  subgraph Io["storage.buf.io"]
+    ReadSvc["PageReadService"]
+    ReadAhead["ReadAheadController"]
+    Verify["PageVerifier"]
+  end
+
+  subgraph Warmup["storage.buf.warmup"]
+    Dump["BufferPoolDumpService"]
+    Load["BufferPoolLoadService"]
+  end
+
+  subgraph External["外部协作模块"]
+    Mtr["MiniTransaction"]
+    Redo["RedoLogWriter"]
+    Flush["FlushCoordinator"]
+    PageStore["PageStore"]
+    Doublewrite["DoublewriteStrategy"]
+  end
+
+  Storage["Tablespace Files\n.ibd / undo / temp"]
+
+  BTree --> BufferPool
+  Record --> BufferPool
+  Fsp --> BufferPool
+  Recovery --> BufferPool
+
+  BufferPool --> Router
+  BufferPool --> Handle
+  BufferPool --> CursorFactory
+  Router --> Bpi
+  Bpi --> Metrics
+
+  Bpi --> Hash
+  Hash --> Loading
+  Hash --> FrameObj
+
+  Bpi --> FreeList
+  Bpi --> LruList
+  LruList --> Replacement
+  LruList --> Promotion
+
+  Bpi --> DirtyMarker
+  DirtyMarker --> FlushList
+  DirtyMarker --> DirtyStats
+
+  Bpi --> ReadSvc
+  ReadSvc --> Verify
+  ReadSvc --> ReadAhead
+
+  Bpi --> Dump
+  Bpi --> Load
+
+  FrameObj --> Descriptor
+  FrameObj --> PageImage
+  FrameObj --> Latch
+  FrameObj --> StateMachine
+
+  Handle --> FrameObj
+  CursorFactory --> Handle
+
+  BufferPool --> Mtr
+  DirtyMarker --> Mtr
+  DirtyMarker --> Redo
+  Flush --> FlushList
+  Flush --> Doublewrite
+  Flush --> PageStore
+  ReadSvc --> PageStore
+  Load --> PageStore
+  PageStore --> Storage
+  Doublewrite --> Storage

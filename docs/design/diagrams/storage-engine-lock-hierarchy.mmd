@@ -1,0 +1,14 @@
+flowchart TB
+    file["Physical file latch\nTablespaceLifecycle -> Handle -> FileSize -> PageRange -> Fsync\nDeadlockDomain: timeout/error"]
+    space["Space management latch\nTablespace -> FSP_HDR -> XDES -> INODE -> data page\nDeadlockDomain: timeout/retry"]
+    buf["Buffer Pool mutex/latch\npageHash -> frameMutex -> list locks -> pageLatch\nDeadlockDomain: timeout/retry"]
+    trx["Transaction locks\nIS/IX/REC/GAP/NEXT_KEY/INSERT_INTENTION\nDeadlockDomain: Wait-For Graph"]
+    redo["Redo internal waits\nreservation -> buffer segment -> recent trackers -> file write/flush -> checkpoint\nDeadlockDomain: wait slot/error broadcast"]
+
+    file --> space
+    space --> buf
+    buf --> trx
+    trx --> redo
+
+    note1["Before row-lock wait:\nrelease RecordCursor, page latch,\nbuffer fix, file/space latches,\nundo page latch"]
+    trx -. requires .-> note1

@@ -1,0 +1,65 @@
+classDiagram
+  class ConnectionAcceptor {
+    +start()
+    +acceptOne()
+    +shutdownGracefully()
+  }
+
+  class ProtocolConnection {
+    +connectionId
+    +state
+    +capabilities
+  }
+
+  class PacketReader
+  class PacketWriter
+  class ProtocolAdapter
+  class HandshakeContext
+  class AuthenticationContext
+
+  class SessionManager {
+    +createSession()
+    +closeSession()
+  }
+
+  class Session {
+    +sessionId
+    +state
+    +currentSchema
+  }
+
+  class SessionVariables
+  class SessionVariableSnapshot
+  class CommandDispatcher
+  class CommandPacket
+  class CommandContext
+  class StatementContext
+  class StatementResourceGuard
+  class PreparedStatementProtocolHandle
+  class ResultStreamer
+  class KillToken
+  class ConnectionRegistry
+  class SessionTransactionPolicy
+
+  ConnectionAcceptor --> ProtocolConnection
+  ProtocolConnection --> PacketReader
+  ProtocolConnection --> PacketWriter
+  ProtocolAdapter --> PacketReader
+  ProtocolAdapter --> PacketWriter
+  ProtocolAdapter --> HandshakeContext
+  HandshakeContext --> AuthenticationContext
+  SessionManager --> Session
+  Session --> SessionVariables
+  SessionVariables --> SessionVariableSnapshot
+  Session --> CommandDispatcher
+  CommandDispatcher --> CommandPacket
+  CommandDispatcher --> CommandContext
+  CommandContext --> StatementContext
+  StatementContext --> StatementResourceGuard
+  Session --> PreparedStatementProtocolHandle
+  Session --> SessionTransactionPolicy
+  ResultStreamer --> ProtocolAdapter
+  ResultStreamer --> StatementContext
+  Session --> KillToken
+  ConnectionRegistry --> ProtocolConnection
+  ConnectionRegistry --> Session

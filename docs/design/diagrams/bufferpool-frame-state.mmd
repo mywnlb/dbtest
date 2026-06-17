@@ -1,0 +1,51 @@
+stateDiagram-v2
+  [*] --> FREE
+
+  FREE --> LOADING: reserve frame / register loading
+  LOADING --> CLEAN: read ok / publish
+  LOADING --> FREE: read failed / cleanup
+
+  FREE --> DIRTY_PENDING: createPage / init new page
+
+  CLEAN --> DIRTY_PENDING: page modified by active MTR
+  DIRTY --> DIRTY_PENDING: dirty page modified again
+
+  DIRTY_PENDING --> DIRTY: MTR commit assigns redo LSN
+  DIRTY_PENDING --> CLEAN: MTR abort restores clean before image
+  DIRTY_PENDING --> DIRTY: MTR abort restores previous dirty image
+  DIRTY --> FLUSHING: flush starts
+  FLUSHING --> CLEAN: write ok and no newer modification
+  FLUSHING --> DIRTY: write ok but modified again
+  FLUSHING --> DIRTY: write failed
+
+  CLEAN --> EVICTING: chosen clean victim
+  EVICTING --> FREE: remove from hash and reset
+  EVICTING --> CLEAN: last check failed
+
+  CLEAN --> STALE: page freed or tablespace dropped
+  DIRTY --> STALE: page freed with cleanup policy
+  STALE --> EVICTING: bufFixCount becomes zero
+
+  CLEAN --> CLEAN: read hit / LRU update
+
+  note right of LOADING
+    ioState=READ or READ_AHEAD
+    concurrent misses wait on PageLoadFuture
+  end note
+
+  note right of DIRTY
+    inFlushList=true
+    oldestModificationLsn is stable until clean
+  end note
+
+  note right of DIRTY_PENDING
+    not in FlushList
+    not flushable
+    protected by active MTR
+  end note
+
+  note right of EVICTING
+    requires bufFixCount=0
+    requires ioState=NONE
+    requires no page latch owner
+  end note

@@ -1,0 +1,31 @@
+flowchart TB
+  A["Executor returns ResultCursor and ResultSchema"]
+  B["Build ResultsetEnvelope"]
+  C["Send column count"]
+  D["Send column definitions"]
+  E{"CLIENT_DEPRECATE_EOF?"}
+  F["Send EOF after metadata"]
+  G["Open row loop"]
+  H{"cursor.next()"}
+  I["Materialize logical row"]
+  J["Encode text or binary protocol row"]
+  K["Acquire PacketWriteLock"]
+  L["Write row packet"]
+  M["Release PacketWriteLock"]
+  N{"Execution or network error?"}
+  O["Send OK or EOF terminator"]
+  P["Close ResultCursor"]
+  Q["Release StatementResourceGuard"]
+  ERR["Send ERR terminator if channel writable"]
+  CLOSE["Close connection if channel failed"]
+
+  A --> B --> C --> D --> E
+  E -->|"no"| F --> G
+  E -->|"yes"| G
+  G --> H
+  H -->|"row"| I --> J --> K --> L --> M --> N
+  N -->|"no"| H
+  N -->|"yes, channel writable"| ERR --> P
+  N -->|"yes, channel failed"| CLOSE --> P
+  H -->|"exhausted"| O --> P --> Q
+  P --> Q

@@ -1,0 +1,44 @@
+flowchart TB
+    client["Client / Session"]
+    parser["Parser and AST"]
+    binder["NameResolver and Binder"]
+    planner["SimplePlanner"]
+    executor["SqlExecutor"]
+    txn["TransactionContext"]
+    ddl["DataDictionaryService"]
+    mdl["MetadataLockManager"]
+    expr["ExpressionEvaluator"]
+    storageApi["StorageEngine API"]
+
+    btree["storage.btree"]
+    record["storage.record"]
+    trx["storage.trx"]
+    buf["storage.buf"]
+    redo["storage.redo"]
+    disk["storage.fsp / storage.fil"]
+
+    client --> parser
+    parser --> binder
+    binder --> ddl
+    binder --> mdl
+    binder --> planner
+    planner --> executor
+    executor --> txn
+    executor --> expr
+    executor --> storageApi
+    txn --> trx
+    storageApi --> btree
+    storageApi --> record
+    storageApi --> trx
+    storageApi --> buf
+    storageApi --> redo
+    storageApi --> disk
+
+    classDef sql fill:#eef6ff,stroke:#5a86b5,color:#111
+    classDef engine fill:#fff6e6,stroke:#b9852d,color:#111
+    classDef dd fill:#eefaf1,stroke:#5d9a70,color:#111
+
+    class client,parser,binder,planner,executor,txn,expr sql
+    class ddl,mdl dd
+    class storageApi,btree,record,trx,buf,redo,disk engine
+

@@ -46,6 +46,12 @@ public final class RecordEncoder {
             throw new RecordFormatException("column count mismatch: record " + record.columnValues().size()
                     + " vs schema " + n);
         }
+        // clustered ⇔ hiddenColumns 在场：聚簇 schema 必须带隐藏列，非聚簇不得带（LogicalRecord 不持 schema，
+        // 故一致性在此校验）。违反则记录会写出/缺失尾部 15B 隐藏区，破坏 decoder 的尾部长度不变量。
+        if (schema.clustered() != (record.hiddenColumns() != null)) {
+            throw new DatabaseValidationException("clustered=" + schema.clustered()
+                    + " but hiddenColumns " + (record.hiddenColumns() == null ? "absent" : "present"));
+        }
 
         int nullableCount = countNullable(schema);
         NullBitmap nullBitmap = new NullBitmap(nullableCount);
@@ -88,6 +94,11 @@ public final class RecordEncoder {
 
         int recordLength = RecordHeaderLayout.SIZE + nullBitmap.byteLength() + dir.byteLength()
                 + fixedAreaLen + varAreaLen;
+        // 聚簇记录在用户字段区之后追加 15B 隐藏区（DB_TRX_ID + DB_ROLL_PTR），计入 recordLength，
+        // 使 header.recordLength 含隐藏区、resolver 的「长度==buffer」校验成立。
+        if (schema.clustered()) {
+            recordLength += HiddenColumnLayout.HIDDEN_BYTES;
+        }
         if (recordLength > MAX_RECORD_LENGTH) {
             throw new RecordTooLargeException("record length " + recordLength + " exceeds " + MAX_RECORD_LENGTH);
         }
@@ -117,6 +128,12 @@ public final class RecordEncoder {
                 codec.encode(v, ct, new FieldWriter(buf, fixedOff));
                 fixedOff += codec.fixedWidth(ct);
             }
+        }
+        // 隐藏区贴在记录尾部（recordLength-15 起），与 RecordFieldResolver 的尾部解析对称。
+        if (schema.clustered()) {
+            HiddenColumns hc = record.hiddenColumns();
+            HiddenColumnLayout.encode(buf, recordLength - HiddenColumnLayout.HIDDEN_BYTES,
+                    hc.dbTrxId(), hc.dbRollPtr());
         }
         return buf;
     }

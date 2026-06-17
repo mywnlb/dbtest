@@ -2,8 +2,12 @@ package cn.zhangyis.db.storage.record.page;
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageId;
+import cn.zhangyis.db.domain.RollPointer;
+import cn.zhangyis.db.domain.TransactionId;
+import cn.zhangyis.db.storage.record.format.HiddenColumns;
 import cn.zhangyis.db.storage.record.format.LogicalRecord;
 import cn.zhangyis.db.storage.record.format.RecordFieldResolver;
+import cn.zhangyis.db.storage.record.format.RecordFormatException;
 import cn.zhangyis.db.storage.record.format.RecordHeader;
 import cn.zhangyis.db.storage.record.format.RecordType;
 import cn.zhangyis.db.storage.record.schema.ColumnId;
@@ -95,9 +99,27 @@ public final class RecordCursor {
         return readColumn(part.columnId());
     }
 
-    /** 物化为完整逻辑记录。 */
+    /** 物化为完整逻辑记录（聚簇记录含隐藏列，隐藏列不混入 columnValues）。 */
     public LogicalRecord materialize() {
         return resolved().materialize();
+    }
+
+    /** 聚簇记录的 DB_TRX_ID；非聚簇记录无隐藏列，调用前应按 schema.clustered() 预判，否则抛 {@link RecordFormatException}。 */
+    public TransactionId dbTrxId() {
+        return requireHidden().dbTrxId();
+    }
+
+    /** 聚簇记录的 DB_ROLL_PTR；非聚簇记录无隐藏列时抛 {@link RecordFormatException}。 */
+    public RollPointer dbRollPtr() {
+        return requireHidden().dbRollPtr();
+    }
+
+    private HiddenColumns requireHidden() {
+        HiddenColumns h = resolved().hiddenColumns();
+        if (h == null) {
+            throw new RecordFormatException("record has no hidden columns (non-clustered)");
+        }
+        return h;
     }
 
     /** 产出稳定定位值（pageOffset 为本游标记录的页内偏移）。 */

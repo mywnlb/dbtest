@@ -168,7 +168,7 @@
 3. 实现时优先最小正确改动，不引入无依据的兼容层。
 4. 修改跨模块 API 时，同步检查调用方、测试和设计文档约束。
 5. 完成后运行相关测试，核心模块改动至少运行 `./gradlew.bat test`。
-6. 每次写完代码并通过验证后，必须在项目根目录运行 `npx gitnexus analyze` 刷新 GitNexus 索引；如命令失败，需记录失败原因，不要假装已索引。
+6. 编辑高扇出符号（被多处引用的类、方法或 record 组件）前，先用 Grep 扫描调用点并向用户报告 blast radius（直接调用方、改动风险）后再动手；改完跑全量回归确认测试数不倒退。
 7. 不要提交 build 输出、IDE 缓存、临时数据文件。
 
 ## 禁止事项
@@ -183,47 +183,3 @@
 - 不要在并发代码中遗漏释放路径。
 - 不要在恢复、事务、redo、flush 代码中留下未经测试的 happy path。
 - 不要用 TODO/TBD 代替明确设计或实现决策。
-
-<!-- gitnexus:start -->
-# GitNexus — Code Intelligence
-
-This project is indexed by GitNexus as **dbtest** (6068 symbols, 17085 relationships, 286 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
-
-> If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
-
-## Always Do
-
-- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `gitnexus_impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
-- **MUST run `gitnexus_detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows.
-- **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
-- When exploring unfamiliar code, use `gitnexus_query({query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
-- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `gitnexus_context({name: "symbolName"})`.
-
-## Never Do
-
-- NEVER edit a function, class, or method without first running `gitnexus_impact` on it.
-- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
-- NEVER rename symbols with find-and-replace — use `gitnexus_rename` which understands the call graph.
-- NEVER commit changes without running `gitnexus_detect_changes()` to check affected scope.
-
-## Resources
-
-| Resource | Use for |
-|----------|---------|
-| `gitnexus://repo/dbtest/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/dbtest/clusters` | All functional areas |
-| `gitnexus://repo/dbtest/processes` | All execution flows |
-| `gitnexus://repo/dbtest/process/{name}` | Step-by-step execution trace |
-
-## CLI
-
-| Task | Read this skill file |
-|------|---------------------|
-| Understand architecture / "How does X work?" | `.claude/skills/gitnexus/gitnexus-exploring/SKILL.md` |
-| Blast radius / "What breaks if I change X?" | `.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md` |
-| Trace bugs / "Why is X failing?" | `.claude/skills/gitnexus/gitnexus-debugging/SKILL.md` |
-| Rename / extract / split / refactor | `.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md` |
-| Tools, resources, schema reference | `.claude/skills/gitnexus/gitnexus-guide/SKILL.md` |
-| Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
-
-<!-- gitnexus:end -->

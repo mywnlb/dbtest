@@ -96,7 +96,23 @@ public final class RecordFieldResolver {
                 fixedOff += w;
             }
         }
-        return new Resolved(schema, header, isNull, slices, registry);
+        // 循环结束后 varOff 指向变长区末尾 = 用户字段区末尾。聚簇记录的 15B 隐藏区紧贴其后；
+        // 校验隐藏区正好在尾部（聚簇恰多 15B、非聚簇不得有尾随），否则判记录损坏，不静默接受错位。
+        int userEnd = varOff;
+        HiddenColumns hidden = null;
+        if (schema.clustered()) {
+            if (header.recordLength() != userEnd + HiddenColumnLayout.HIDDEN_BYTES) {
+                throw new RecordFormatException("clustered record tail mismatch: recordLength="
+                        + header.recordLength() + " userEnd=" + userEnd);
+            }
+            int hOff = header.recordLength() - HiddenColumnLayout.HIDDEN_BYTES;
+            hidden = new HiddenColumns(HiddenColumnLayout.decodeTrxId(recordBytes, hOff),
+                    HiddenColumnLayout.decodeRollPtr(recordBytes, hOff));
+        } else if (header.recordLength() != userEnd) {
+            throw new RecordFormatException("non-clustered record has trailing bytes: recordLength="
+                    + header.recordLength() + " userEnd=" + userEnd);
+        }
+        return new Resolved(schema, header, isNull, slices, registry, hidden);
     }
 
     /**
@@ -109,19 +125,27 @@ public final class RecordFieldResolver {
         private final boolean[] isNull;
         private final FieldSlice[] slices;
         private final TypeCodecRegistry registry;
+        /** 聚簇记录隐藏列（DB_TRX_ID + DB_ROLL_PTR）；非聚簇为 null。 */
+        private final HiddenColumns hidden;
 
         Resolved(TableSchema schema, RecordHeader header, boolean[] isNull, FieldSlice[] slices,
-                 TypeCodecRegistry registry) {
+                 TypeCodecRegistry registry, HiddenColumns hidden) {
             this.schema = schema;
             this.header = header;
             this.isNull = isNull;
             this.slices = slices;
             this.registry = registry;
+            this.hidden = hidden;
         }
 
         /** 记录头。 */
         public RecordHeader header() {
             return header;
+        }
+
+        /** 聚簇记录隐藏列；非聚簇记录返回 null。 */
+        public HiddenColumns hiddenColumns() {
+            return hidden;
         }
 
         /** 第 ordinal 列是否 NULL。 */
@@ -149,13 +173,14 @@ public final class RecordFieldResolver {
             return registry.codecFor(ct).decode(slices[ordinal], ct);
         }
 
-        /** 物化为逻辑记录（全列 + 头的 deleted/recordType；schemaVersion 取 schema）。 */
+        /** 物化为逻辑记录（用户列 + 头的 deleted/recordType + 隐藏列；隐藏列不混入 columnValues）。 */
         public LogicalRecord materialize() {
             List<ColumnValue> values = new ArrayList<>(schema.columnCount());
             for (int i = 0; i < schema.columnCount(); i++) {
                 values.add(value(i));
             }
-            return new LogicalRecord(schema.schemaVersion(), values, header.deletedFlag(), header.recordType());
+            return new LogicalRecord(schema.schemaVersion(), values, header.deletedFlag(),
+                    header.recordType(), hidden);
         }
 
         private void check(int ordinal) {

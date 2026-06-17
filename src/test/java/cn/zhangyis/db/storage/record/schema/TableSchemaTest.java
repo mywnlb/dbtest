@@ -6,7 +6,9 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** TableSchema 有序列、ordinal 连续校验、列查找。 */
 class TableSchemaTest {
@@ -36,5 +38,19 @@ class TableSchemaTest {
     void rejectsEmptyOrNull() {
         assertThrows(DatabaseValidationException.class, () -> new TableSchema(1L, List.of()));
         assertThrows(DatabaseValidationException.class, () -> new TableSchema(1L, null));
+    }
+
+    @Test
+    void compatConstructorDefaultsNonClustered() {
+        TableSchema s = new TableSchema(1L, List.of(
+                col(0, "id", ColumnType.bigint(true, false))));
+        assertFalse(s.clustered(), "two-arg compat constructor is non-clustered");
+    }
+
+    @Test
+    void clusteredConstructorSetsFlag() {
+        TableSchema s = new TableSchema(2L, List.of(
+                col(0, "id", ColumnType.bigint(true, false))), true);
+        assertTrue(s.clustered());
     }
 }

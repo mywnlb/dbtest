@@ -3,12 +3,15 @@ package cn.zhangyis.db.storage.btree;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageNo;
+import cn.zhangyis.db.domain.RollPointer;
+import cn.zhangyis.db.domain.TransactionId;
 import cn.zhangyis.db.storage.api.DiskSpaceManager;
 import cn.zhangyis.db.storage.api.IndexPageAccess;
 import cn.zhangyis.db.storage.api.IndexPageHandle;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.page.FilePageHeader;
+import cn.zhangyis.db.storage.record.format.HiddenColumns;
 import cn.zhangyis.db.storage.record.format.LogicalRecord;
 import cn.zhangyis.db.storage.record.format.RecordEncoder;
 import cn.zhangyis.db.storage.record.page.IndexPageHeader;
@@ -72,6 +75,35 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         this.keyComparator = new SearchKeyComparator(registry);
         this.pointerCodec = new BTreeNodePointerCodec();
         this.recordEncoder = new RecordEncoder(registry);
+    }
+
+    /**
+     * 聚簇 insert：用调用方事务 id 盖戳隐藏列（DB_TRX_ID=transactionId、DB_ROLL_PTR=NULL，本片尚无 undo），
+     * 再走通用 {@link #insert}。
+     *
+     * <p>split 保留不变量：若插入触发 split，{@code materializeLeafRecords} 经 {@code RecordCursor.materialize()}
+     * 重物化既有记录（已带隐藏列），再 {@code RecordPageInserter} 重编码；因 {@code index.schema().clustered()}
+     * 为真，encoder 自动带住隐藏区，故 split 不丢 DB_TRX_ID。
+     *
+     * <p>事务 id 来源：调用方须先 {@code TransactionManager.assignWriteId(txn)}，此处只验非 NONE，
+     * 不依赖 TransactionManager，保持 B+Tree 与事务管理解耦。
+     */
+    public BTreeInsertResult insertClustered(MiniTransaction mtr, BTreeIndex index,
+                                             LogicalRecord record, TransactionId transactionId) {
+        if (record == null || transactionId == null) {
+            throw new DatabaseValidationException("clustered insert record/transactionId must not be null");
+        }
+        if (!index.clustered()) {
+            throw new DatabaseValidationException(
+                    "insertClustered requires a clustered index: " + index.indexId());
+        }
+        if (transactionId.isNone()) {
+            throw new DatabaseValidationException("clustered insert requires a non-NONE transaction id");
+        }
+        LogicalRecord stamped = new LogicalRecord(record.schemaVersion(), record.columnValues(),
+                record.deleted(), record.recordType(),
+                new HiddenColumns(transactionId, RollPointer.NULL));
+        return insert(mtr, index, stamped);
     }
 
     /**

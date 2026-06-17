@@ -56,4 +56,13 @@ public record BTreeIndex(long indexId, PageId rootPageId, int rootLevel,
         return new BTreeIndex(indexId, rootPageId, newRootLevel, keyDef, schema, unique,
                 leafSegment, nonLeafSegment);
     }
+
+    /**
+     * 是否聚簇索引：从 {@link TableSchema#clustered()} 派生。clustered 的单一权威态在 schema，
+     * 避免在 BTreeIndex 另立字段造成双重状态不一致；聚簇 leaf conventional 记录据此携带隐藏列
+     * （DB_TRX_ID/DB_ROLL_PTR）。node-pointer 派生 schema 恒非 clustered，根/非叶页不带隐藏区。
+     */
+    public boolean clustered() {
+        return schema.clustered();
+    }
 }

@@ -16,6 +16,7 @@ import cn.zhangyis.db.storage.record.schema.TableSchema;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
 /**
@@ -183,6 +184,22 @@ public final class UndoLogSegment {
         if (consumer == null) {
             throw new DatabaseValidationException("undo forEachRecord consumer must not be null");
         }
+        forEachRecordWithPointer((rec, rp) -> consumer.accept(rec), keyDef, schema);
+    }
+
+    /**
+     * 正向遍历整条 undo log 页链，并向 consumer 同时给出**每条 record 自身的 {@link RollPointer} 地址**（pageNo+offset，
+     * insert 标志按记录类型）。purge 用它把已提交 undo log 的每条 DELETE_MARK/UPDATE record 与聚簇记录的
+     * {@code DB_ROLL_PTR} 严格比对（记录的 DB_ROLL_PTR 即写入时返回的该 undo record 地址，见 {@link #append}）。
+     *
+     * <p>遍历语义与 {@link #forEachRecord} 一致：每页按 record area {@code [len u16][payload]} 槽顺序解码后沿 FIL NEXT
+     * 继续；页类型/段归属异常经 openUndoPage/requireSameSegment 抛 {@link UndoLogFormatException}。
+     */
+    public void forEachRecordWithPointer(BiConsumer<UndoRecord, RollPointer> consumer,
+                                         IndexKeyDef keyDef, TableSchema schema) {
+        if (consumer == null) {
+            throw new DatabaseValidationException("undo forEachRecordWithPointer consumer must not be null");
+        }
         long pageNoVal = handle.firstPageId().pageNo().value();
         while (true) {
             UndoPage page = resolvePage(PageNo.of(pageNoVal));
@@ -191,7 +208,11 @@ public final class UndoLogSegment {
             int off = UndoPageLayout.RECORD_AREA_START;
             while (off < free) {
                 byte[] payload = page.recordAt(off);
-                consumer.accept(codec.decode(payload, 0, keyDef, schema));
+                UndoRecord rec = codec.decode(payload, 0, keyDef, schema);
+                // 该 record 的地址 = 写入时返回的 RollPointer：insert 标志按类型（INSERT_ROW→true，其余 false），
+                // 与 append/聚簇记录 DB_ROLL_PTR 编码一致，供 purge 严格比对。
+                boolean insert = rec.type() == UndoRecordType.INSERT_ROW;
+                consumer.accept(rec, new RollPointer(insert, PageNo.of(pageNoVal), off));
                 off += 2 + payload.length;
             }
             long next = page.nextPageNo();
@@ -200,6 +221,14 @@ public final class UndoLogSegment {
             }
             pageNoVal = next;
         }
+    }
+
+    /**
+     * 本 undo segment 的定位 handle（spaceId/inodeSlot/segmentId/首尾页）。purge 在 read MTR 内取它（值对象，
+     * MTR 关闭后仍有效）构 SegmentRef 经 {@link UndoSpaceAllocator#dropUndoSegment} 物理回收整段。
+     */
+    public UndoSegmentHandle handle() {
+        return handle;
     }
 
     /** undo log 链首页 id。 */

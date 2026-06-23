@@ -7,10 +7,10 @@ import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.LruBufferPool;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
-import cn.zhangyis.db.storage.fil.FileChannelPageStore;
-import cn.zhangyis.db.storage.fil.PageStore;
-import cn.zhangyis.db.storage.fil.TablespaceAccessController;
-import cn.zhangyis.db.storage.fil.TablespaceAccessLease;
+import cn.zhangyis.db.storage.fil.io.FileChannelPageStore;
+import cn.zhangyis.db.storage.fil.io.PageStore;
+import cn.zhangyis.db.storage.fil.access.TablespaceAccessController;
+import cn.zhangyis.db.storage.fil.access.TablespaceAccessLease;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 

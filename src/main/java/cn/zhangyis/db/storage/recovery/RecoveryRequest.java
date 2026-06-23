@@ -3,7 +3,7 @@ package cn.zhangyis.db.storage.recovery;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.SpaceId;
-import cn.zhangyis.db.storage.flush.DoublewriteRecoveryScanner;
+import cn.zhangyis.db.storage.flush.doublewrite.DoublewriteRecoveryScanner;
 import cn.zhangyis.db.storage.redo.RedoApplyContext;
 import cn.zhangyis.db.storage.redo.RedoApplyDispatcher;
 import cn.zhangyis.db.storage.redo.RedoCheckpointStore;

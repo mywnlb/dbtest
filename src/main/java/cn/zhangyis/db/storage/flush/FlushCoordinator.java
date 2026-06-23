@@ -8,9 +8,10 @@ import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.DirtyPageCandidate;
 import cn.zhangyis.db.storage.buf.FlushPageSnapshot;
-import cn.zhangyis.db.storage.fil.PageStore;
-import cn.zhangyis.db.storage.fil.TablespaceAccessController;
-import cn.zhangyis.db.storage.fil.TablespaceAccessLease;
+import cn.zhangyis.db.storage.fil.io.PageStore;
+import cn.zhangyis.db.storage.fil.access.TablespaceAccessController;
+import cn.zhangyis.db.storage.fil.access.TablespaceAccessLease;
+import cn.zhangyis.db.storage.flush.doublewrite.DoublewriteStrategy;
 import cn.zhangyis.db.storage.page.PageImageChecksum;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
 

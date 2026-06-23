@@ -9,7 +9,7 @@ import java.time.Duration;
 import cn.zhangyis.db.domain.SpaceId;
 
 /**
- * Buffer Pool 门面：在 fil.PageStore 之上提供受控页访问（fix + S/X page latch + LRU 淘汰 + 脏页写回）。
+ * Buffer Pool 门面：在 fil.io.PageStore 之上提供受控页访问（fix + S/X page latch + LRU 淘汰 + 脏页写回）。
  * 消费方（未来 fsp）经它拿受控页，不直接接触 PageStore 或文件。
  *
  * <p>简化点：不带 MTR；flush 不做 WAL 门控 / doublewrite；miss/evict/flush 的盘 IO 在内部 poolLock 串行。

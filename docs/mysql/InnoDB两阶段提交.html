@@ -1,0 +1,779 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>InnoDB 两阶段提交：redo 与 binlog 的一致性</title>
+<style>
+:root{
+  --bg:#0a111f; --bg2:#0c1426; --surface:#111d36;
+  --surface2:#16223d; --surface3:#1d2c4d; --border:#26375c; --border2:#324a78;
+  --text:#e7edfa; --muted:#9aabce; --faint:#6b7da3;
+  --teal:#2dd4bf; --teal-d:#0f766e; --blue:#5b9dff; --blue-d:#1e4fb0;
+  --purple:#b794f6; --purple-d:#6b46c1; --amber:#f5b955; --amber-d:#b45309;
+  --red:#f0697a; --red-d:#9b2c3a; --green:#5fd38a; --green-d:#15803d;
+  --mono:"JetBrains Mono","Cascadia Code","SF Mono",Consolas,"Liberation Mono",monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans SC",sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{
+  font-family:var(--sans); background:var(--bg); color:var(--text);
+  line-height:1.75; font-size:16px; letter-spacing:.01em;
+  background-image:
+    radial-gradient(900px 500px at 12% -8%, rgba(45,212,191,.10), transparent 60%),
+    radial-gradient(900px 600px at 100% 0%, rgba(91,157,255,.10), transparent 55%),
+    radial-gradient(700px 700px at 50% 120%, rgba(183,148,246,.07), transparent 60%);
+  background-attachment:fixed;
+}
+.wrap{max-width:920px;margin:0 auto;padding:0 24px 120px}
+
+/* ---------- header ---------- */
+.hero{padding:88px 0 56px;text-align:center;position:relative}
+.kicker{font-family:var(--mono);font-size:13px;letter-spacing:.32em;text-transform:uppercase;color:var(--teal);margin-bottom:22px}
+.hero h1{
+  font-size:clamp(34px,6vw,56px);line-height:1.1;font-weight:800;letter-spacing:-.01em;
+  background:linear-gradient(120deg,#fff 10%,var(--teal) 55%,var(--blue) 100%);
+  -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;
+}
+.hero .sub{margin-top:20px;color:var(--muted);font-size:18px;max-width:640px;margin-left:auto;margin-right:auto}
+.series{margin-top:34px;display:flex;gap:10px;justify-content:center;flex-wrap:wrap;font-family:var(--mono);font-size:12.5px}
+.series span{padding:7px 13px;border:1px solid var(--border);border-radius:999px;color:var(--faint);background:rgba(255,255,255,.02)}
+.series span.now{border-color:var(--teal);color:var(--teal);background:rgba(45,212,191,.08);box-shadow:0 0 0 1px rgba(45,212,191,.18)}
+
+/* ---------- TOC ---------- */
+.toc{margin:18px 0 60px;background:linear-gradient(180deg,var(--surface),var(--bg2));border:1px solid var(--border);border-radius:18px;padding:26px 30px}
+.toc h2{font-size:13px;letter-spacing:.22em;text-transform:uppercase;color:var(--faint);font-family:var(--mono);margin-bottom:16px;font-weight:600}
+.toc ol{list-style:none;counter-reset:t;display:grid;grid-template-columns:1fr 1fr;gap:4px 34px}
+.toc li{counter-increment:t}
+.toc a{display:flex;gap:12px;align-items:baseline;padding:8px 6px;border-radius:8px;color:var(--muted);text-decoration:none;transition:.18s;border-bottom:1px solid transparent}
+.toc a:hover{color:var(--text);background:rgba(91,157,255,.07)}
+.toc a::before{content:counter(t,decimal-leading-zero);font-family:var(--mono);font-size:12px;color:var(--teal);min-width:24px}
+
+/* ---------- sections ---------- */
+section{margin:0 0 22px;scroll-margin-top:24px}
+.chap{display:flex;align-items:center;gap:16px;margin:64px 0 26px}
+.chap .num{font-family:var(--mono);font-size:13px;font-weight:700;color:var(--bg);background:linear-gradient(135deg,var(--teal),var(--blue));padding:6px 11px;border-radius:8px;letter-spacing:.05em;flex:none}
+.chap h2{font-size:clamp(24px,3.4vw,32px);font-weight:780;letter-spacing:-.01em}
+.chap .rule{flex:1;height:1px;background:linear-gradient(90deg,var(--border2),transparent)}
+
+h3{font-size:20px;font-weight:700;margin:34px 0 12px;color:#f3f6fd}
+h3::before{content:"";display:inline-block;width:9px;height:9px;border-radius:2px;background:var(--teal);margin-right:11px;transform:translateY(-2px)}
+h4{font-size:16px;font-weight:700;margin:22px 0 8px;color:var(--blue)}
+p{margin:13px 0;color:#d7e0f2}
+strong{color:#fff;font-weight:680}
+em{color:var(--teal);font-style:normal;font-weight:600}
+a.in{color:var(--blue);text-decoration:none;border-bottom:1px dashed var(--border2)}
+code{font-family:var(--mono);font-size:.88em;background:rgba(91,157,255,.12);color:#bcd4ff;padding:2px 7px;border-radius:6px;border:1px solid rgba(91,157,255,.16)}
+
+ul.bul{margin:13px 0 13px 4px;list-style:none}
+ul.bul li{position:relative;padding-left:24px;margin:9px 0;color:#d7e0f2}
+ul.bul li::before{content:"▸";position:absolute;left:2px;top:0;color:var(--teal);font-size:14px}
+
+/* ---------- callouts ---------- */
+.note{border-radius:14px;padding:18px 22px;margin:22px 0;border:1px solid;display:flex;gap:14px;align-items:flex-start}
+.note .ic{font-family:var(--mono);font-weight:800;font-size:13px;flex:none;margin-top:2px}
+.note.key{background:linear-gradient(100deg,rgba(45,212,191,.10),rgba(45,212,191,.03));border-color:rgba(45,212,191,.35)}
+.note.key .ic{color:var(--teal)}
+.note.warn{background:linear-gradient(100deg,rgba(245,185,85,.10),rgba(245,185,85,.03));border-color:rgba(245,185,85,.35)}
+.note.warn .ic{color:var(--amber)}
+.note.danger{background:linear-gradient(100deg,rgba(240,105,122,.10),rgba(240,105,122,.03));border-color:rgba(240,105,122,.35)}
+.note.danger .ic{color:var(--red)}
+.note p{margin:4px 0;color:#e3e9f6}
+.note p:first-child{margin-top:0}
+
+/* ---------- figure ---------- */
+figure{margin:30px 0;background:linear-gradient(180deg,var(--bg2),#0a1322);border:1px solid var(--border);border-radius:18px;padding:24px 22px 14px;overflow:hidden}
+figure svg{display:block;width:100%;height:auto}
+figcaption{margin-top:14px;font-size:13.5px;color:var(--faint);font-family:var(--mono);text-align:center;letter-spacing:.02em}
+figcaption b{color:var(--teal);font-weight:600}
+
+/* ---------- table ---------- */
+.tbl{margin:24px 0;border:1px solid var(--border);border-radius:14px;overflow:hidden}
+table{width:100%;border-collapse:collapse;font-size:14.5px}
+thead th{background:linear-gradient(180deg,var(--surface3),var(--surface));color:#eaf0fb;font-weight:700;text-align:left;padding:13px 16px;border-bottom:1px solid var(--border2);font-size:13.5px;letter-spacing:.02em}
+tbody td{padding:12px 16px;border-bottom:1px solid var(--border);color:#d2dcef;vertical-align:top}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:nth-child(even){background:rgba(255,255,255,.015)}
+td code,th code{font-size:.84em}
+.yes{color:var(--green);font-weight:700}
+.no{color:var(--red);font-weight:700}
+.mid{color:var(--amber);font-weight:700}
+
+/* ---------- code block ---------- */
+pre{margin:20px 0;background:#070d18;border:1px solid var(--border);border-radius:14px;padding:18px 20px;overflow-x:auto;font-family:var(--mono);font-size:13.5px;line-height:1.7;position:relative}
+pre code{background:none;border:none;padding:0;color:#cdd9f0}
+.cm{color:#5d7194}    /* comment */
+.kw{color:var(--purple)}  /* keyword */
+.fn{color:var(--blue)}
+.st{color:var(--green)}
+.nm{color:var(--amber)}
+
+/* ---------- footer ---------- */
+.fin{margin-top:80px;padding:34px 30px;border:1px solid var(--border);border-radius:18px;background:linear-gradient(180deg,var(--surface),var(--bg2));text-align:center}
+.fin h3{justify-content:center}
+.fin h3::before{display:none}
+.fin .seq{display:flex;gap:8px;align-items:center;justify-content:center;flex-wrap:wrap;margin:18px 0 6px;font-family:var(--mono);font-size:13px;color:var(--muted)}
+.fin .seq b{color:var(--teal)}
+.fin .arrow{color:var(--faint)}
+.foot{margin-top:40px;text-align:center;color:var(--faint);font-size:13px;font-family:var(--mono)}
+
+@media(max-width:680px){
+  .toc ol{grid-template-columns:1fr}
+  .wrap{padding:0 16px 80px}
+  .chap{flex-wrap:wrap}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <div class="kicker">InnoDB 系列 · 第七篇</div>
+  <h1>两阶段提交</h1>
+  <p class="sub">redo log 与 binlog 的一致性之谜：为什么一次 commit 要分两步、崩溃后凭什么判断该提交还是回滚、组提交又是怎么把性能找回来的——把第三篇的"恢复"与第四篇的"事务"真正连起来。</p>
+  <div class="series">
+    <span>① 存储结构</span>
+    <span>② Buffer Pool</span>
+    <span>③ 故障恢复</span>
+    <span>④ 事务与 MVCC</span>
+    <span>⑤ 锁系统</span>
+    <span>⑥ 索引</span>
+    <span class="now">⑦ 两阶段提交</span>
+  </div>
+</header>
+
+<nav class="toc">
+  <h2>目录</h2>
+  <ol>
+    <li><a href="#c1">总览：两份日志与一致性难题</a></li>
+    <li><a href="#c2">redo log 详解</a></li>
+    <li><a href="#c3">binlog 详解</a></li>
+    <li><a href="#c4">redo vs binlog 全面对比</a></li>
+    <li><a href="#c5">核心动机：不用 2PC 的两种崩溃不一致</a></li>
+    <li><a href="#c6">两阶段提交的流程</a></li>
+    <li><a href="#c7">XID：连接两份日志的纽带</a></li>
+    <li><a href="#c8">崩溃恢复：用 2PC 状态做决断</a></li>
+    <li><a href="#c9">一个完整的提交时序</a></li>
+    <li><a href="#c10">组提交 Group Commit</a></li>
+    <li><a href="#c11">关键参数：双 1 配置</a></li>
+    <li><a href="#c12">与 XA 分布式事务的关系</a></li>
+    <li><a href="#c13">常见疑问与边界</a></li>
+    <li><a href="#c14">系列总结：连接第三、四篇</a></li>
+  </ol>
+</nav>
+
+<!-- ============ 1 ============ -->
+<section id="c1">
+  <div class="chap"><span class="num">01</span><h2>总览：两份日志与一致性难题</h2><div class="rule"></div></div>
+
+  <p>一次 <code>UPDATE</code> 提交时，MySQL 其实要写<strong>两份完全独立的日志</strong>，它们由系统里两个不同的"层"分别管理：</p>
+
+  <ul class="bul">
+    <li><strong>redo log</strong> —— 由 <em>InnoDB 存储引擎层</em>负责。物理日志，保证<em>崩溃后数据不丢</em>（持久性 D），是第三篇《故障恢复》的主角。</li>
+    <li><strong>binlog</strong> —— 由 <em>MySQL Server 层</em>负责。逻辑日志，记录"做了什么操作"，用于<em>主从复制</em>和<em>按时间点恢复</em>。所有存储引擎共用它。</li>
+  </ul>
+
+  <p>问题来了：这两份日志各写各的，<strong>但一个事务的"提交"必须让两者要么都生效、要么都不生效</strong>。否则一旦在"只写了一份"的瞬间崩溃，主库和从库（或本地与备份）就会数据不一致。</p>
+
+  <figure>
+    <svg viewBox="0 0 800 250" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <text x="400" y="26" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">两层、两份日志，同一次提交必须保持一致</text>
+      <!-- server layer -->
+      <rect x="60" y="50" width="680" height="70" rx="12" fill="#0f1830" stroke="#5b9dff" stroke-width="1.5"/>
+      <text x="84" y="76" fill="#5b9dff" font-size="13" font-weight="700">MySQL Server 层</text>
+      <text x="84" y="98" fill="#9aabce" font-size="11">连接 / 解析 / 优化 / 执行</text>
+      <rect x="520" y="62" width="200" height="46" rx="9" fill="#141f3a" stroke="#f5b955" stroke-width="1.8"/>
+      <text x="620" y="82" text-anchor="middle" fill="#f5b955" font-size="12" font-weight="700">binlog（逻辑）</text>
+      <text x="620" y="100" text-anchor="middle" fill="#9aabce" font-size="10">复制 / 时间点恢复</text>
+      <!-- engine layer -->
+      <rect x="60" y="140" width="680" height="70" rx="12" fill="#0f1830" stroke="#2dd4bf" stroke-width="1.5"/>
+      <text x="84" y="166" fill="#2dd4bf" font-size="13" font-weight="700">InnoDB 引擎层</text>
+      <text x="84" y="188" fill="#9aabce" font-size="11">Buffer Pool / B+ 树 / 锁 / MVCC</text>
+      <rect x="520" y="152" width="200" height="46" rx="9" fill="#141f3a" stroke="#2dd4bf" stroke-width="1.8"/>
+      <text x="620" y="172" text-anchor="middle" fill="#2dd4bf" font-size="12" font-weight="700">redo log（物理）</text>
+      <text x="620" y="190" text-anchor="middle" fill="#9aabce" font-size="10">崩溃恢复 / 持久性</text>
+      <!-- consistency link -->
+      <path d="M620,108 L620,150" stroke="#f0697a" stroke-width="2.5" stroke-dasharray="5 4"/>
+      <text x="700" y="134" text-anchor="middle" fill="#f0697a" font-size="11">必须一致！</text>
+    </svg>
+    <figcaption><b>图 1</b> · binlog 在 Server 层、redo 在引擎层，分属两个世界，提交时却要原子地一起生效</figcaption>
+  </figure>
+
+  <div class="note key"><span class="ic">本篇要回答的</span><div>
+    <p><strong>① redo 和 binlog 各是什么、为什么需要两份？</strong>（第 2–4 章，详解与对比）<br>
+    <strong>② 不做特殊处理会出什么乱子？</strong>（第 5 章，两种崩溃不一致——这是 2PC 的动机）<br>
+    <strong>③ 两阶段提交怎么解决、崩溃后怎么判断？</strong>（第 6–9 章，核心机制）<br>
+    <strong>④ 这么做会不会很慢、参数怎么配？</strong>（第 10–11 章，组提交与双 1）。<br>
+    本篇是第三篇（恢复，redo/undo）与第四篇（事务，提交语义）之间缺失的那块拼图。</p>
+  </div></div>
+</section>
+
+<!-- ============ 2 ============ -->
+<section id="c2">
+  <div class="chap"><span class="num">02</span><h2>redo log 详解</h2><div class="rule"></div></div>
+
+  <p>第三篇从"恢复"的角度讲过 redo，这里从"它本身是什么"的角度讲全。</p>
+
+  <h3>本质：物理日志 + WAL</h3>
+  <p>redo log 记录的是<strong>"对某个数据页的某个位置做了什么物理修改"</strong>（如"第 5 号表空间第 12 页偏移 100 处写入值 X"）。它遵循 <em>WAL（Write-Ahead Logging，预写日志）</em>原则：<strong>修改数据页之前，先把 redo 写下来</strong>。这样即使脏页还没刷盘就崩溃，重启后用 redo 把修改"重做"一遍即可，数据不丢。</p>
+
+  <h3>循环写与两个指针</h3>
+  <p>redo log 文件大小固定（由多个文件组成一个环），<strong>循环写入</strong>——写到末尾就回到开头覆盖。靠两个指针管理这个环：</p>
+  <ul class="bul">
+    <li><code>write pos</code> —— 当前写到的位置，随写入向前推进。</li>
+    <li><code>checkpoint</code> —— 已经安全刷盘、可被覆盖的位置。它和 write pos 之间是"已写但对应脏页还没落盘"的 redo，<em>不能覆盖</em>。</li>
+  </ul>
+  <p>两指针之间的空白就是可写空间。一旦 write pos 追上 checkpoint（环写满），就必须<strong>强制推进 checkpoint（刷脏页）</strong>，此时写入会短暂停顿——这是 redo 写满导致抖动的根源。</p>
+
+  <figure>
+    <svg viewBox="0 0 800 230" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <text x="400" y="24" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">redo log 环形缓冲：write pos 与 checkpoint 之间是不可覆盖区</text>
+      <!-- ring -->
+      <circle cx="400" cy="130" r="70" fill="none" stroke="#26375c" stroke-width="22"/>
+      <!-- used arc (write-checkpoint) -->
+      <path d="M 400 60 A 70 70 0 1 1 330 130" fill="none" stroke="#2dd4bf" stroke-width="22" opacity="0.85"/>
+      <text x="400" y="135" text-anchor="middle" fill="#9aabce" font-size="11">固定大小</text>
+      <text x="400" y="152" text-anchor="middle" fill="#6b7da3" font-size="10">循环写</text>
+      <!-- pointers -->
+      <circle cx="400" cy="60" r="6" fill="#f5b955"/><text x="400" y="44" text-anchor="middle" fill="#f5b955" font-size="11">write pos</text>
+      <circle cx="330" cy="130" r="6" fill="#f0697a"/><text x="270" y="134" text-anchor="middle" fill="#f0697a" font-size="11">checkpoint</text>
+      <!-- legend -->
+      <rect x="560" y="70" width="16" height="16" rx="3" fill="#2dd4bf" opacity="0.85"/><text x="584" y="83" fill="#d7e0f2" font-size="11">已写、对应脏页未落盘（不可覆盖）</text>
+      <rect x="560" y="100" width="16" height="16" rx="3" fill="#26375c"/><text x="584" y="113" fill="#d7e0f2" font-size="11">空闲，可写</text>
+      <text x="560" y="150" fill="#f5b955" font-size="11">write 顺时针推进</text>
+      <text x="560" y="172" fill="#f0697a" font-size="11">checkpoint 随刷脏页推进</text>
+      <text x="560" y="194" fill="#9aabce" font-size="10.5">write 追上 checkpoint → 强制刷脏 → 抖动</text>
+    </svg>
+    <figcaption><b>图 2</b> · redo 是固定大小的环：两指针之间是"已写未落盘"区，写满则被迫刷脏页</figcaption>
+  </figure>
+
+  <h3>写入链路：redo log buffer → 文件</h3>
+  <p>写 redo 不是直接落盘。先进内存的 <code>redo log buffer</code>，再在某些时机刷到 OS、再 fsync 到磁盘。刷盘时机由 <code>innodb_flush_log_at_trx_commit</code> 控制，这是<strong>最重要的持久性参数</strong>：</p>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>取值</th><th>提交时行为</th><th>崩溃后果</th></tr></thead>
+      <tbody>
+        <tr><td><strong>0</strong></td><td>只写 redo buffer，由后台线程<em>每秒</em>刷盘一次</td><td class="no">mysqld 崩溃即可能丢最近 1 秒事务</td></tr>
+        <tr><td><strong>1</strong>（默认）</td><td>每次提交都<em>写文件并 fsync</em></td><td class="yes">最安全，提交即落盘，崩溃不丢</td></tr>
+        <tr><td><strong>2</strong></td><td>每次提交<em>写到 OS 缓存</em>，但 fsync 每秒一次</td><td class="mid">mysqld 崩溃不丢（OS 还在），但<em>主机/OS 崩溃</em>可能丢 1 秒</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note key"><span class="ic">LSN：贯穿一切的序号</span><div>
+    <p>承接第三篇：每条 redo 都有一个全局递增的 <strong>LSN（Log Sequence Number）</strong>，相当于"日志的字节偏移时间轴"。数据页头也记着 <code>page_lsn</code>（这页最后被改到哪条 redo）。恢复时比较"redo 的 LSN"和"页的 page_lsn"，<em>只重做 page_lsn 更小的部分</em>——LSN 让 redo 重放天然幂等，重做多少次结果都一样。这个性质在第 8 章崩溃恢复里至关重要。</p>
+  </div></div>
+</section>
+
+<!-- ============ 3 ============ -->
+<section id="c3">
+  <div class="chap"><span class="num">03</span><h2>binlog 详解</h2><div class="rule"></div></div>
+
+  <p>binlog（二进制日志）是 MySQL Server 层的日志，与具体存储引擎无关。它记录的不是"物理页改动"，而是<strong>"逻辑上发生了什么变更"</strong>，主要服务于两件大事：<em>主从复制</em>和<em>按时间点恢复（PITR）</em>。</p>
+
+  <h3>本质：逻辑日志 + 追加写</h3>
+  <p>与 redo 的"循环覆盖"不同，binlog 是<strong>追加写</strong>：写满一个文件就<em>新建下一个</em>（<code>mysql-bin.000001</code>、<code>000002</code>…），<strong>历史永不覆盖</strong>。正因如此它能用来"回放从某个时间点起的所有变更"，做数据恢复和搭建从库。这也意味着 binlog 会持续占用磁盘，需要靠 <code>expire_logs_days</code> / <code>binlog_expire_logs_seconds</code> 定期清理。</p>
+
+  <h3>三种格式（binlog_format）</h3>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>格式</th><th>记录内容</th><th>优点 / 缺点</th></tr></thead>
+      <tbody>
+        <tr><td><strong>STATEMENT</strong></td><td>记录原始 SQL 语句</td><td>日志小；但 <code>NOW()</code>、<code>UUID()</code>、含 LIMIT 无序等<em>不确定语句</em>主从执行结果可能不一致</td></tr>
+        <tr><td><strong>ROW</strong>（8.0 默认）</td><td>记录每一行<em>改动前后的值</em></td><td>精确、复制安全；但批量更新时日志量大</td></tr>
+        <tr><td><strong>MIXED</strong></td><td>一般用 STATEMENT，遇不确定语句自动切 ROW</td><td>折中</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>写入链路：binlog cache → 文件</h3>
+  <p>事务执行过程中，binlog 事件先写进<strong>每个线程私有的 <code>binlog cache</code></strong>（因为一个事务的 binlog 必须连续、完整，不能和别的事务交错）。事务提交时，再把 cache 里的内容一次性 <code>write</code> 到 binlog 文件（OS 缓存），并按 <code>sync_binlog</code> 决定是否 <code>fsync</code> 落盘：</p>
+  <div class="tbl">
+    <table>
+      <thead><tr><th><code>sync_binlog</code></th><th>行为</th><th>后果</th></tr></thead>
+      <tbody>
+        <tr><td><strong>0</strong></td><td>只 write 到 OS，由 OS 决定何时刷盘</td><td class="no">最快，但崩溃可能丢多个事务的 binlog</td></tr>
+        <tr><td><strong>1</strong>（推荐）</td><td>每次提交都 fsync</td><td class="yes">最安全，binlog 提交即落盘</td></tr>
+        <tr><td><strong>N</strong>（&gt;1）</td><td>每 N 次提交 fsync 一次</td><td class="mid">性能与安全折中，崩溃可能丢最近 N 个</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <figure>
+    <svg viewBox="0 0 800 215" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <defs><marker id="ar3b" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#5b9dff"/></marker></defs>
+      <text x="400" y="24" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">binlog 追加写：每个事务一段，文件写满就新建下一个</text>
+      <!-- thread caches -->
+      <rect x="40" y="50" width="150" height="120" rx="10" fill="#0f1830" stroke="#324a78"/>
+      <text x="115" y="72" text-anchor="middle" fill="#9aabce" font-size="11">各线程私有</text>
+      <rect x="56" y="84" width="118" height="24" rx="5" fill="rgba(245,185,85,.12)" stroke="#f5b955"/><text x="115" y="100" text-anchor="middle" fill="#f5b955" font-size="10">txn A 的 cache</text>
+      <rect x="56" y="116" width="118" height="24" rx="5" fill="rgba(245,185,85,.12)" stroke="#f5b955"/><text x="115" y="132" text-anchor="middle" fill="#f5b955" font-size="10">txn B 的 cache</text>
+      <text x="115" y="160" text-anchor="middle" fill="#6b7da3" font-size="10">提交时整段写出</text>
+      <!-- binlog files -->
+      <g font-size="10">
+      <rect x="280" y="70" width="120" height="80" rx="8" fill="#141f3a" stroke="#f5b955" stroke-width="1.5"/>
+      <text x="340" y="88" text-anchor="middle" fill="#f5b955">000001（满）</text>
+      <rect x="294" y="98" width="92" height="18" rx="3" fill="#0a1322" stroke="#26375c"/><text x="340" y="111" text-anchor="middle" fill="#9aabce">txn ...</text>
+      <rect x="294" y="120" width="92" height="18" rx="3" fill="#0a1322" stroke="#26375c"/><text x="340" y="133" text-anchor="middle" fill="#9aabce">txn ...</text>
+      <rect x="430" y="70" width="120" height="80" rx="8" fill="#141f3a" stroke="#f5b955" stroke-width="1.5"/>
+      <text x="490" y="88" text-anchor="middle" fill="#f5b955">000002（满）</text>
+      <rect x="580" y="70" width="120" height="80" rx="8" fill="#141f3a" stroke="#5fd38a" stroke-width="1.8"/>
+      <text x="640" y="88" text-anchor="middle" fill="#5fd38a">000003（当前）</text>
+      <rect x="594" y="98" width="92" height="18" rx="3" fill="rgba(95,211,138,.12)" stroke="#5fd38a"/><text x="640" y="111" text-anchor="middle" fill="#5fd38a">txn A,B...</text>
+      </g>
+      <path d="M190,110 L278,110" stroke="#5b9dff" stroke-width="2" marker-end="url(#ar3b)"/>
+      <path d="M400,110 L428,110" stroke="#324a78" stroke-width="1.5"/>
+      <path d="M550,110 L578,110" stroke="#324a78" stroke-width="1.5"/>
+      <text x="400" y="190" text-anchor="middle" fill="#6b7da3" font-size="11">历史文件永不覆盖 → 可回放任意时间点之后的全部变更（这是 redo 做不到的）</text>
+    </svg>
+    <figcaption><b>图 3</b> · binlog 持续追加、历史保留，因此能做主从复制与时间点恢复</figcaption>
+  </figure>
+
+  <div class="note key"><span class="ic">为什么有了 redo 还要 binlog</span><div>
+    <p>常见疑问：redo 也能恢复，为什么还要 binlog？因为<strong>两者用途根本不同</strong>：<br>
+    <strong>redo 是"循环覆盖"的，只保留"最近未落盘"的那一小段</strong>，只能把崩溃前一刻的数据补齐，<em>无法回放历史</em>，更不是为复制设计的。<br>
+    <strong>binlog 是"全量追加"的逻辑日志</strong>，能把"从上次全量备份到此刻的所有变更"完整回放，所以它才是<em>主从复制</em>和<em>误删数据后恢复到某时刻</em>的依据。<br>
+    一句话：<em>redo 保证"崩溃不丢"，binlog 保证"可复制、可追溯"</em>。两者缺一不可，这也正是要让它们保持一致的原因。</p>
+  </div></div>
+</section>
+
+<!-- ============ 4 ============ -->
+<section id="c4">
+  <div class="chap"><span class="num">04</span><h2>redo vs binlog 全面对比</h2><div class="rule"></div></div>
+
+  <p>把两份日志并排对照，差异一目了然——正是这些差异决定了它们各自的用途，也决定了为什么提交时要协调两者：</p>
+
+  <div class="tbl">
+    <table>
+      <thead><tr><th>维度</th><th>redo log</th><th>binlog</th></tr></thead>
+      <tbody>
+        <tr><td><strong>所属层</strong></td><td>InnoDB 引擎层（引擎专属）</td><td>Server 层（所有引擎共用）</td></tr>
+        <tr><td><strong>日志类型</strong></td><td>物理日志：页的物理改动</td><td>逻辑日志：行变更 / SQL</td></tr>
+        <tr><td><strong>写入方式</strong></td><td class="mid">循环写，覆盖旧内容</td><td class="yes">追加写，历史永久保留</td></tr>
+        <tr><td><strong>核心用途</strong></td><td>崩溃恢复，保证持久性</td><td>主从复制、时间点恢复、归档</td></tr>
+        <tr><td><strong>记录范围</strong></td><td>只记"已写未落盘"的近期改动</td><td>记录全部已提交事务的变更</td></tr>
+        <tr><td><strong>幂等性</strong></td><td>靠 LSN 天然幂等</td><td>靠事务/GTID 保证不重复执行</td></tr>
+        <tr><td><strong>关键参数</strong></td><td><code>innodb_flush_log_at_trx_commit</code></td><td><code>sync_binlog</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn"><span class="ic">一个易错认知</span><div>
+    <p><strong>不要以为"binlog 记了，数据就一定改了"，也不要以为"redo 记了，复制就一定能跟上"。</strong>binlog 管的是"对外可见的逻辑变更（给从库和恢复用）"，redo 管的是"对内的物理持久化（给本机崩溃恢复用）"。它们是两条独立的链路，各自有各自的"提交"。如果不强制协调，完全可能出现"一份记了、另一份没记"的撕裂——下一章就专门看这种撕裂有多致命。</p>
+  </div></div>
+</section>
+
+<!-- ============ 5 ============ -->
+<section id="c5">
+  <div class="chap"><span class="num">05</span><h2>核心动机：不用 2PC 的两种崩溃不一致</h2><div class="rule"></div></div>
+
+  <p>这是理解两阶段提交的<strong>关键</strong>。假设提交时<em>不做任何协调</em>，只是简单地"先写一份、再写另一份"。无论哪个先写，都存在一个"写完第一份、还没写第二份"的瞬间窗口——若<strong>恰好在这个窗口崩溃</strong>，两份日志就会撕裂。我们分两种顺序看后果。</p>
+
+  <p>背景：执行 <code>UPDATE t SET c=2 WHERE id=1</code>（原值 c=1）。崩溃恢复时，<strong>本机用 redo 恢复数据，从库用 binlog 同步</strong>——这两个动作的依据不同，撕裂就会让它们对不上。</p>
+
+  <h3>顺序一：先写 redo，后写 binlog</h3>
+  <p>redo 写完并落盘 → <strong>崩溃</strong> → binlog 没来得及写。</p>
+
+  <figure>
+    <svg viewBox="0 0 800 200" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <text x="400" y="22" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">先 redo 后 binlog，写完 redo 即崩溃</text>
+      <line x1="60" y1="70" x2="740" y2="70" stroke="#324a78" stroke-width="1.5"/>
+      <rect x="90" y="58" width="120" height="24" rx="6" fill="rgba(45,212,191,.16)" stroke="#2dd4bf"/><text x="150" y="75" text-anchor="middle" fill="#2dd4bf" font-size="10">redo 写入 c=2 ✓</text>
+      <line x1="320" y1="50" x2="320" y2="90" stroke="#f0697a" stroke-width="2.5"/><text x="320" y="44" text-anchor="middle" fill="#f0697a" font-size="11">💥 崩溃</text>
+      <rect x="420" y="58" width="140" height="24" rx="6" fill="#0a1322" stroke="#9b2c3a" stroke-dasharray="4 3"/><text x="490" y="75" text-anchor="middle" fill="#f0697a" font-size="10">binlog 未写 ✗</text>
+      <!-- result -->
+      <rect x="60" y="110" width="330" height="64" rx="10" fill="#0f1830" stroke="#2dd4bf" stroke-width="1.5"/>
+      <text x="225" y="132" text-anchor="middle" fill="#2dd4bf" font-size="12" font-weight="700">本机（redo 恢复）</text>
+      <text x="225" y="156" text-anchor="middle" fill="#5fd38a" font-size="12">c = 2（改动生效）</text>
+      <rect x="410" y="110" width="330" height="64" rx="10" fill="#141f3a" stroke="#9b2c3a" stroke-width="1.5"/>
+      <text x="575" y="132" text-anchor="middle" fill="#f0697a" font-size="12" font-weight="700">从库（binlog 同步）</text>
+      <text x="575" y="156" text-anchor="middle" fill="#f0697a" font-size="12">c = 1（没收到这次变更）</text>
+    </svg>
+    <figcaption><b>图 4</b> · 顺序一：本机有、从库无 → <b>主从不一致</b>（主库多了一笔从库没有的改动）</figcaption>
+  </figure>
+
+  <h3>顺序二：先写 binlog，后写 redo</h3>
+  <p>binlog 写完并落盘 → <strong>崩溃</strong> → redo 没来得及写。</p>
+
+  <figure>
+    <svg viewBox="0 0 800 200" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <text x="400" y="22" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">先 binlog 后 redo，写完 binlog 即崩溃</text>
+      <line x1="60" y1="70" x2="740" y2="70" stroke="#324a78" stroke-width="1.5"/>
+      <rect x="90" y="58" width="140" height="24" rx="6" fill="rgba(245,185,85,.16)" stroke="#f5b955"/><text x="160" y="75" text-anchor="middle" fill="#f5b955" font-size="10">binlog 写入 c=2 ✓</text>
+      <line x1="340" y1="50" x2="340" y2="90" stroke="#f0697a" stroke-width="2.5"/><text x="340" y="44" text-anchor="middle" fill="#f0697a" font-size="11">💥 崩溃</text>
+      <rect x="440" y="58" width="130" height="24" rx="6" fill="#0a1322" stroke="#9b2c3a" stroke-dasharray="4 3"/><text x="505" y="75" text-anchor="middle" fill="#f0697a" font-size="10">redo 未写 ✗</text>
+      <rect x="60" y="110" width="330" height="64" rx="10" fill="#141f3a" stroke="#9b2c3a" stroke-width="1.5"/>
+      <text x="225" y="132" text-anchor="middle" fill="#f0697a" font-size="12" font-weight="700">本机（redo 恢复）</text>
+      <text x="225" y="156" text-anchor="middle" fill="#f0697a" font-size="12">c = 1（事务被丢弃）</text>
+      <rect x="410" y="110" width="330" height="64" rx="10" fill="#0f1830" stroke="#f5b955" stroke-width="1.5"/>
+      <text x="575" y="132" text-anchor="middle" fill="#f5b955" font-size="12" font-weight="700">从库（binlog 同步）</text>
+      <text x="575" y="156" text-anchor="middle" fill="#5fd38a" font-size="12">c = 2（执行了这次变更）</text>
+    </svg>
+    <figcaption><b>图 5</b> · 顺序二：本机无、从库有 → <b>主从不一致</b>（从库多了一笔主库没有的改动）</figcaption>
+  </figure>
+
+  <div class="note danger"><span class="ic">结论：单纯定顺序救不了</span><div>
+    <p>两种顺序都会在崩溃窗口里产生不一致，只是<em>方向相反</em>。问题的根本在于：<strong>"写 redo"和"写 binlog"是两个独立动作，中间存在一个无法消除的时间窗口，崩溃可能落在其中。</strong>无论谁先谁后，都没法保证"要么都成、要么都不成"。<br>
+    解决思路只能是引入一个<strong>能在崩溃后判断"这个事务到底算不算提交成功"的协调协议</strong>——让恢复时有据可依地把撕裂的事务<em>统一裁决</em>为"提交"或"回滚"。这就是两阶段提交。</p>
+  </div></div>
+</section>
+
+<!-- ============ 6 ============ -->
+<section id="c6">
+  <div class="chap"><span class="num">06</span><h2>两阶段提交的流程</h2><div class="rule"></div></div>
+
+  <p>两阶段提交（Two-Phase Commit, 2PC）把"提交"这一个动作，拆成 <strong>prepare（准备）</strong> 和 <strong>commit（提交）</strong> 两个阶段，中间夹着 binlog 的写入。核心思想：<strong>用 binlog 是否写成功，作为整个事务"最终是否提交"的唯一裁判。</strong></p>
+
+  <h3>三步走</h3>
+  <ol style="counter-reset:s;list-style:none;margin:16px 0 16px 4px">
+    <li style="counter-increment:s;position:relative;padding-left:34px;margin:12px 0;color:#d7e0f2"><span style="position:absolute;left:0;top:0;font-family:var(--mono);background:linear-gradient(135deg,#2dd4bf,#5b9dff);color:#0a1322;width:24px;height:24px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700">1</span><strong>Prepare 阶段（写 redo，标记 prepare）</strong>：InnoDB 把事务的 redo log 写入，并将其状态标记为 <code>PREPARE</code>，同时记下事务的 <code>XID</code>，然后<em>把这部分 redo 刷盘</em>。此刻 redo 已持久，但事务尚未"正式提交"。</li>
+    <li style="counter-increment:s;position:relative;padding-left:34px;margin:12px 0;color:#d7e0f2"><span style="position:absolute;left:0;top:0;font-family:var(--mono);background:linear-gradient(135deg,#2dd4bf,#5b9dff);color:#0a1322;width:24px;height:24px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700">2</span><strong>写 binlog 并刷盘</strong>：把事务的 binlog 事件（同样带上那个 <code>XID</code>）写入 binlog 文件并 fsync。<strong>这一步成功，是整个提交的"分水岭"</strong>——一旦 binlog 落盘，事务就被认定为"该提交"。</li>
+    <li style="counter-increment:s;position:relative;padding-left:34px;margin:12px 0;color:#d7e0f2"><span style="position:absolute;left:0;top:0;font-family:var(--mono);background:linear-gradient(135deg,#2dd4bf,#5b9dff);color:#0a1322;width:24px;height:24px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700">3</span><strong>Commit 阶段（redo 写 commit 标记）</strong>：InnoDB 在 redo log 里把该事务标记为 <code>COMMIT</code>。这一步即使不立刻 fsync 也不影响正确性——因为 binlog 已落盘，崩溃恢复时能据此把事务补提交。</li>
+  </ol>
+
+  <figure>
+    <svg viewBox="0 0 800 235" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <defs><marker id="ar6t" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#5b9dff"/></marker></defs>
+      <text x="400" y="24" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">两阶段提交：redo(prepare) → binlog → redo(commit)</text>
+      <!-- step1 -->
+      <rect x="30" y="60" width="220" height="100" rx="12" fill="#0f1830" stroke="#2dd4bf" stroke-width="2"/>
+      <text x="140" y="84" text-anchor="middle" fill="#2dd4bf" font-size="12" font-weight="700">① Prepare</text>
+      <text x="48" y="108" fill="#d7e0f2" font-size="11">redo 写入 + 标 PREPARE</text>
+      <text x="48" y="128" fill="#d7e0f2" font-size="11">记录 XID，刷盘</text>
+      <text x="48" y="148" fill="#9aabce" font-size="10">引擎层 · redo 已持久</text>
+      <!-- step2 -->
+      <rect x="290" y="60" width="220" height="100" rx="12" fill="#141f3a" stroke="#f5b955" stroke-width="2"/>
+      <text x="400" y="84" text-anchor="middle" fill="#f5b955" font-size="12" font-weight="700">② 写 binlog</text>
+      <text x="308" y="108" fill="#d7e0f2" font-size="11">binlog 事件 + XID</text>
+      <text x="308" y="128" fill="#d7e0f2" font-size="11">write + fsync 落盘</text>
+      <text x="308" y="148" fill="#f0697a" font-size="10">★ 提交的分水岭</text>
+      <!-- step3 -->
+      <rect x="550" y="60" width="220" height="100" rx="12" fill="#0f1830" stroke="#5fd38a" stroke-width="2"/>
+      <text x="660" y="84" text-anchor="middle" fill="#5fd38a" font-size="12" font-weight="700">③ Commit</text>
+      <text x="568" y="108" fill="#d7e0f2" font-size="11">redo 写 COMMIT 标记</text>
+      <text x="568" y="128" fill="#d7e0f2" font-size="11">无需立即 fsync</text>
+      <text x="568" y="148" fill="#9aabce" font-size="10">事务正式完成</text>
+      <path d="M250,110 L288,110" stroke="#5b9dff" stroke-width="2.5" marker-end="url(#ar6t)"/>
+      <path d="M510,110 L548,110" stroke="#5b9dff" stroke-width="2.5" marker-end="url(#ar6t)"/>
+      <text x="400" y="200" text-anchor="middle" fill="#6b7da3" font-size="11">XID 像一根线，把 ① 的 redo prepare 和 ② 的 binlog 记录绑在一起</text>
+      <text x="400" y="220" text-anchor="middle" fill="#6b7da3" font-size="11">崩溃落在任意一步，恢复时都能据 XID + binlog 唯一裁决（第 8 章）</text>
+    </svg>
+    <figcaption><b>图 6</b> · 2PC 三步：prepare 让 redo 先持久但不算数，binlog 落盘才算数，commit 收尾</figcaption>
+  </figure>
+
+  <div class="note key"><span class="ic">为什么这样拆就对了</span><div>
+    <p>关键在于<strong>把"事务是否提交"的判定权，唯一地交给 binlog</strong>。redo 的 prepare 状态相当于"我准备好了、随时能提交，但还没拍板"。真正拍板的信号是 binlog 落盘。这样无论崩溃发生在哪一步，恢复时都只需问一句：<em>"这个 prepared 的事务，它的 XID 在 binlog 里吗？"</em>——在，就提交；不在，就回滚。一个简单的问题，消除了第 5 章那两种撕裂。下一章先讲清这根把两者绑起来的"线"——XID。</p>
+  </div></div>
+</section>
+
+<!-- ============ 7 ============ -->
+<section id="c7">
+  <div class="chap"><span class="num">07</span><h2>XID：连接两份日志的纽带</h2><div class="rule"></div></div>
+
+  <p>2PC 能成立，靠的是一个把 redo 和 binlog "绑在一起"的共同标识——<strong>XID（事务标识）</strong>。它同时被写进 redo 的 prepare 记录和 binlog 的事件里，使恢复时能把"同一个事务在两份日志里的痕迹"对应起来。</p>
+
+  <h3>XID 出现在两个地方</h3>
+  <ul class="bul">
+    <li><strong>redo log 的 prepare 记录里</strong>：标记"这个 prepared 事务的身份是 XID"。</li>
+    <li><strong>binlog 里的 <code>XID_EVENT</code></strong>：每个事务在 binlog 中以一个特殊的 XID 事件收尾，记录同一个 XID，表示"这个事务在 binlog 中已完整落地"。</li>
+  </ul>
+
+  <figure>
+    <svg viewBox="0 0 800 200" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <text x="400" y="24" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">同一个 XID=520，分别落在 redo 与 binlog</text>
+      <!-- redo -->
+      <rect x="60" y="55" width="300" height="80" rx="10" fill="#0f1830" stroke="#2dd4bf" stroke-width="1.5"/>
+      <text x="210" y="78" text-anchor="middle" fill="#2dd4bf" font-size="12" font-weight="700">redo log（引擎层）</text>
+      <rect x="80" y="92" width="260" height="30" rx="6" fill="#0a1322" stroke="#26375c"/>
+      <text x="92" y="112" fill="#d7e0f2" font-size="11">[页改动...] | PREPARE | XID=<tspan fill="#f5b955">520</tspan></text>
+      <!-- binlog -->
+      <rect x="440" y="55" width="300" height="80" rx="10" fill="#141f3a" stroke="#f5b955" stroke-width="1.5"/>
+      <text x="590" y="78" text-anchor="middle" fill="#f5b955" font-size="12" font-weight="700">binlog（Server 层）</text>
+      <rect x="460" y="92" width="260" height="30" rx="6" fill="#0a1322" stroke="#26375c"/>
+      <text x="472" y="112" fill="#d7e0f2" font-size="11">[行变更事件...] | XID_EVENT=<tspan fill="#f5b955">520</tspan></text>
+      <!-- link -->
+      <path d="M210,135 C210,170 590,170 590,135" stroke="#f0697a" stroke-width="2.5" stroke-dasharray="5 4" fill="none"/>
+      <text x="400" y="190" text-anchor="middle" fill="#f0697a" font-size="11">XID=520 把两处记录认作"同一个事务"</text>
+    </svg>
+    <figcaption><b>图 7</b> · XID 是跨越两层的"身份证"，让恢复程序能在两份日志里认出同一个事务</figcaption>
+  </figure>
+
+  <div class="note key"><span class="ic">有了 XID 才能裁决</span><div>
+    <p>恢复时，InnoDB 从 redo 里找出所有处于 <code>PREPARE</code> 状态的事务，得到它们的 XID 列表；再去 binlog 里看这些 XID 在不在。<strong>"在不在 binlog"这个判断，全靠 XID 作为对应键。</strong>没有这根线，redo 里一个孤零零的 prepare 事务，根本没法知道它在 binlog 那边是否也写成了。下一章就是这套裁决逻辑的完整展开。</p>
+  </div></div>
+</section>
+
+<!-- ============ 8 ============ -->
+<section id="c8">
+  <div class="chap"><span class="num">08</span><h2>崩溃恢复：用 2PC 状态做决断</h2><div class="rule"></div></div>
+
+  <p>这是 2PC 的"兑现"环节，也是它全部意义所在。重启后，InnoDB 扫描 redo log，对每个事务根据它在两份日志里的状态<strong>统一裁决</strong>。一共三种情况：</p>
+
+  <figure>
+    <svg viewBox="0 0 800 380" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <defs><marker id="ar8t" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#5b9dff"/></marker></defs>
+      <text x="400" y="26" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">崩溃恢复裁决树：看 redo 状态，必要时查 binlog</text>
+      <!-- root -->
+      <rect x="300" y="46" width="200" height="42" rx="10" fill="#141f3a" stroke="#5b9dff" stroke-width="2"/>
+      <text x="400" y="64" text-anchor="middle" fill="#5b9dff" font-size="12" font-weight="700">扫描 redo，看事务状态</text>
+      <text x="400" y="80" text-anchor="middle" fill="#9aabce" font-size="10">逐个 prepared / committed 事务</text>
+      <!-- branch A: redo COMMIT -->
+      <rect x="40" y="140" width="220" height="44" rx="10" fill="#0f1830" stroke="#5fd38a" stroke-width="1.5"/>
+      <text x="150" y="160" text-anchor="middle" fill="#5fd38a" font-size="11">A · redo 已是 COMMIT</text>
+      <text x="150" y="177" text-anchor="middle" fill="#9aabce" font-size="10">第 ③ 步已完成</text>
+      <rect x="40" y="210" width="220" height="56" rx="10" fill="rgba(95,211,138,.12)" stroke="#5fd38a"/>
+      <text x="150" y="232" text-anchor="middle" fill="#5fd38a" font-size="12" font-weight="700">→ 已提交</text>
+      <text x="150" y="252" text-anchor="middle" fill="#9aabce" font-size="10">无需处理（必要时重放）</text>
+      <path d="M340,88 L180,138" stroke="#5b9dff" stroke-width="1.6" marker-end="url(#ar8t)"/>
+      <!-- branch B/C: redo PREPARE -->
+      <rect x="300" y="140" width="200" height="44" rx="10" fill="#0f1830" stroke="#f5b955" stroke-width="1.8"/>
+      <text x="400" y="160" text-anchor="middle" fill="#f5b955" font-size="11">redo 是 PREPARE</text>
+      <text x="400" y="177" text-anchor="middle" fill="#9aabce" font-size="10">崩在 ① 之后 ③ 之前，查 binlog</text>
+      <path d="M400,88 L400,138" stroke="#5b9dff" stroke-width="1.6" marker-end="url(#ar8t)"/>
+      <!-- B: XID in binlog -->
+      <rect x="280" y="222" width="230" height="44" rx="10" fill="#0f1830" stroke="#5fd38a" stroke-width="1.5"/>
+      <text x="395" y="242" text-anchor="middle" fill="#5fd38a" font-size="11">B · XID 在 binlog 里</text>
+      <text x="395" y="259" text-anchor="middle" fill="#9aabce" font-size="10">说明 ② 已成功</text>
+      <rect x="280" y="296" width="230" height="50" rx="10" fill="rgba(95,211,138,.12)" stroke="#5fd38a"/>
+      <text x="395" y="318" text-anchor="middle" fill="#5fd38a" font-size="12" font-weight="700">→ 提交（补做 commit）</text>
+      <text x="395" y="337" text-anchor="middle" fill="#9aabce" font-size="10">binlog 已落盘，必须算提交</text>
+      <path d="M390,184 L393,220" stroke="#324a78" stroke-width="1.4" marker-end="url(#ar8t)"/>
+      <!-- C: XID NOT in binlog -->
+      <rect x="550" y="222" width="220" height="44" rx="10" fill="#0f1830" stroke="#f0697a" stroke-width="1.5"/>
+      <text x="660" y="242" text-anchor="middle" fill="#f0697a" font-size="11">C · XID 不在 binlog</text>
+      <text x="660" y="259" text-anchor="middle" fill="#9aabce" font-size="10">说明 ② 没成功</text>
+      <rect x="550" y="296" width="220" height="50" rx="10" fill="rgba(240,105,122,.12)" stroke="#f0697a"/>
+      <text x="660" y="318" text-anchor="middle" fill="#f0697a" font-size="12" font-weight="700">→ 回滚</text>
+      <text x="660" y="337" text-anchor="middle" fill="#9aabce" font-size="10">对外从未发生，撤销之</text>
+      <path d="M470,184 L600,220" stroke="#324a78" stroke-width="1.4" marker-end="url(#ar8t)"/>
+    </svg>
+    <figcaption><b>图 8</b> · 裁决核心：redo 已 commit → 提交；redo 仅 prepare → 由 binlog 是否含该 XID 决定提交或回滚</figcaption>
+  </figure>
+
+  <h3>逐种情况对照第 5 章的两个撕裂</h3>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>崩溃时机</th><th>redo 状态</th><th>binlog 有无 XID</th><th>裁决</th><th>结果</th></tr></thead>
+      <tbody>
+        <tr><td>prepare 之前</td><td>无 / 不完整</td><td class="no">无</td><td class="no">回滚</td><td>事务等于没发生，一致</td></tr>
+        <tr><td>prepare 后、写 binlog 前</td><td>PREPARE</td><td class="no">无</td><td class="no">回滚</td><td>对应第 5 章顺序一：本机也不提交 → 和从库都没有，<strong>一致</strong></td></tr>
+        <tr><td>写 binlog 后、commit 前</td><td>PREPARE</td><td class="yes">有</td><td class="yes">提交</td><td>对应第 5 章顺序二：本机补提交 → 和从库都有，<strong>一致</strong></td></tr>
+        <tr><td>commit 已写</td><td>COMMIT</td><td class="yes">有</td><td class="yes">已提交</td><td>正常完成</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note key"><span class="ic">撕裂被消除的根本原因</span><div>
+    <p>对比第 5 章：那时"先 redo 后 binlog 崩溃"会让本机有、从库无。<strong>现在同样的崩溃时机（prepare 后、binlog 前），裁决是"回滚"——本机主动把这个 prepared 事务撤掉</strong>，于是本机和从库都没有它，一致。反过来，"binlog 已落盘后崩溃"则裁决"提交"，两边都有它，也一致。<br>
+    <strong>binlog 成了那把唯一的尺子：以 binlog 是否记录为准，本机向 binlog 看齐。</strong>这正是把"判定权唯一交给 binlog"的威力——它让两份日志在任何崩溃点都能收敛到同一个结论。</p>
+  </div></div>
+</section>
+
+<!-- ============ 9 ============ -->
+<section id="c9">
+  <div class="chap"><span class="num">09</span><h2>一个完整的提交时序</h2><div class="rule"></div></div>
+
+  <p>把前面所有环节连成一条完整时间线，看一次 <code>COMMIT</code> 从头到尾发生了什么（默认双 1 配置）：</p>
+
+  <figure>
+    <svg viewBox="0 0 800 330" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="11">
+      <defs><marker id="ar9t" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#6b7da3"/></marker></defs>
+      <text x="400" y="22" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">一次 COMMIT 的完整时序（自上而下）</text>
+      <!-- vertical timeline -->
+      <line x1="120" y1="44" x2="120" y2="306" stroke="#324a78" stroke-width="1.5" marker-end="url(#ar9t)"/>
+      <!-- steps -->
+      <g>
+        <circle cx="120" cy="60" r="5" fill="#5b9dff"/><text x="140" y="64" fill="#d7e0f2">事务执行：改 Buffer Pool 中的页，redo 进 redo log buffer</text>
+        <circle cx="120" cy="98" r="5" fill="#2dd4bf"/><text x="140" y="92" fill="#2dd4bf" font-weight="700">① Prepare</text><text x="140" y="108" fill="#9aabce">InnoDB：redo 标 PREPARE + 写 XID，刷盘（flush_log=1）</text>
+        <circle cx="120" cy="146" r="5" fill="#f5b955"/><text x="140" y="140" fill="#f5b955" font-weight="700">② 写 binlog</text><text x="140" y="156" fill="#9aabce">Server：binlog cache → 文件，fsync 落盘（sync_binlog=1）</text>
+        <line x1="80" y1="170" x2="720" y2="170" stroke="#f0697a" stroke-width="1.5" stroke-dasharray="4 3"/>
+        <text x="400" y="184" text-anchor="middle" fill="#f0697a" font-size="10">━━ 分水岭：过了这条线，崩溃也会被裁决为"提交" ━━</text>
+        <circle cx="120" cy="206" r="5" fill="#5fd38a"/><text x="140" y="200" fill="#5fd38a" font-weight="700">③ Commit</text><text x="140" y="216" fill="#9aabce">InnoDB：redo 写 COMMIT 标记（无需立即 fsync）</text>
+        <circle cx="120" cy="244" r="5" fill="#5b9dff"/><text x="140" y="248" fill="#d7e0f2">向客户端返回"提交成功"；释放锁（第五篇）</text>
+        <circle cx="120" cy="282" r="5" fill="#6b7da3"/><text x="140" y="276" fill="#9aabce">稍后：脏页由后台异步刷盘；从库拉取 binlog 重放（异步/半同步）</text>
+        <text x="140" y="292" fill="#6b7da3" font-size="10">undo 待 purge 回收（第四篇）</text>
+      </g>
+    </svg>
+    <figcaption><b>图 9</b> · 完整时序：prepare(redo 刷盘) → binlog 刷盘(分水岭) → commit(redo 标记) → 返回</figcaption>
+  </figure>
+
+  <div class="note key"><span class="ic">两个值得注意的细节</span><div>
+    <p><strong>① 三次"刷盘"里，前两次是关键。</strong>prepare 的 redo 刷盘 + binlog 刷盘，是双 1 配置下每次提交的两次 fsync，也是性能开销的大头——这正是下一章组提交要优化的对象。第三步 commit 标记可以不立即 fsync，因为它不影响崩溃裁决。<br>
+    <strong>② 提交返回成功 ≠ 数据页已落盘。</strong>返回成功只代表 redo + binlog 已持久（崩溃能恢复），数据页本身可能还是脏页，留待后台慢慢刷——这就是第三篇"WAL：日志先行，数据页后行"的体现。崩了也不怕，redo 能重做。</p>
+  </div></div>
+</section>
+
+<!-- ============ 10 ============ -->
+<section id="c10">
+  <div class="chap"><span class="num">10</span><h2>组提交 Group Commit</h2><div class="rule"></div></div>
+
+  <p>两阶段提交带来了正确性，但也带来了开销：双 1 配置下，<strong>每个事务提交都要做两次 fsync</strong>（prepare 的 redo 一次、binlog 一次）。fsync 是昂贵的磁盘同步操作，高并发下成千上万个事务各自 fsync，磁盘根本扛不住。<strong>组提交（Group Commit）</strong>就是把多个事务的 fsync"凑成一次"，找回性能。</p>
+
+  <h3>核心思想：攒一批，刷一次</h3>
+  <p>既然 fsync 一次可以把"当前文件里所有待落盘的内容"一起刷下去，那就<strong>不急着提交，稍微等一等，把同一时刻涌进来的多个事务凑成一组，一次 fsync 全部落盘</strong>。这样 N 个事务只付 1 次 fsync 的代价。</p>
+
+  <h3>binlog 组提交的三个阶段</h3>
+  <p>MySQL 把提交流程组织成<strong>三个串行的阶段队列</strong>，每个阶段同一时刻只有一个"组长（leader）"在干活，它替整组完成操作：</p>
+
+  <figure>
+    <svg viewBox="0 0 800 300" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <defs><marker id="ar10t" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#5b9dff"/></marker></defs>
+      <text x="400" y="24" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">三阶段组提交：每阶段一个组长，替整组操作</text>
+      <!-- incoming txns -->
+      <g font-size="10">
+      <rect x="30" y="50" width="50" height="22" rx="5" fill="#0a1322" stroke="#5b9dff"/><text x="55" y="65" text-anchor="middle" fill="#5b9dff">T1</text>
+      <rect x="30" y="78" width="50" height="22" rx="5" fill="#0a1322" stroke="#5b9dff"/><text x="55" y="93" text-anchor="middle" fill="#5b9dff">T2</text>
+      <rect x="30" y="106" width="50" height="22" rx="5" fill="#0a1322" stroke="#5b9dff"/><text x="55" y="121" text-anchor="middle" fill="#5b9dff">T3</text>
+      </g>
+      <text x="55" y="148" text-anchor="middle" fill="#9aabce" font-size="10">并发到达</text>
+      <!-- stage flush -->
+      <rect x="130" y="60" width="180" height="180" rx="12" fill="#0f1830" stroke="#2dd4bf" stroke-width="1.5"/>
+      <text x="220" y="84" text-anchor="middle" fill="#2dd4bf" font-size="12" font-weight="700">① Flush 阶段</text>
+      <text x="148" y="108" fill="#d7e0f2" font-size="10.5">组长收集排队的事务</text>
+      <text x="148" y="128" fill="#d7e0f2" font-size="10.5">写各自 redo(prepare)</text>
+      <text x="148" y="148" fill="#d7e0f2" font-size="10.5">binlog 事件 write 到</text>
+      <text x="148" y="166" fill="#d7e0f2" font-size="10.5">文件（OS 缓存）</text>
+      <text x="148" y="194" fill="#9aabce" font-size="10">[T1,T2,T3] 成一组</text>
+      <text x="148" y="214" fill="#6b7da3" font-size="10">尚未 fsync</text>
+      <!-- stage sync -->
+      <rect x="330" y="60" width="180" height="180" rx="12" fill="#141f3a" stroke="#f5b955" stroke-width="2"/>
+      <text x="420" y="84" text-anchor="middle" fill="#f5b955" font-size="12" font-weight="700">② Sync 阶段</text>
+      <text x="348" y="112" fill="#f5b955" font-size="11" font-weight="700">一次 fsync</text>
+      <text x="348" y="132" fill="#d7e0f2" font-size="10.5">把整组 binlog 一起</text>
+      <text x="348" y="150" fill="#d7e0f2" font-size="10.5">刷到磁盘</text>
+      <text x="348" y="178" fill="#5fd38a" font-size="10.5">3 个事务 → 1 次 fsync</text>
+      <text x="348" y="200" fill="#9aabce" font-size="10">越多事务攒一组</text>
+      <text x="348" y="216" fill="#9aabce" font-size="10">单事务摊销越低</text>
+      <!-- stage commit -->
+      <rect x="530" y="60" width="180" height="180" rx="12" fill="#0f1830" stroke="#5fd38a" stroke-width="1.5"/>
+      <text x="620" y="84" text-anchor="middle" fill="#5fd38a" font-size="12" font-weight="700">③ Commit 阶段</text>
+      <text x="548" y="108" fill="#d7e0f2" font-size="10.5">组内事务依次</text>
+      <text x="548" y="128" fill="#d7e0f2" font-size="10.5">在 InnoDB 提交</text>
+      <text x="548" y="146" fill="#d7e0f2" font-size="10.5">(redo 写 COMMIT)</text>
+      <text x="548" y="174" fill="#9aabce" font-size="10">可按顺序保证</text>
+      <text x="548" y="192" fill="#9aabce" font-size="10">binlog 与提交顺序一致</text>
+      <path d="M310,150 L328,150" stroke="#5b9dff" stroke-width="2" marker-end="url(#ar10t)"/>
+      <path d="M510,150 L528,150" stroke="#5b9dff" stroke-width="2" marker-end="url(#ar10t)"/>
+      <path d="M80,89 L128,120" stroke="#5b9dff" stroke-width="1.5" marker-end="url(#ar10t)"/>
+      <text x="400" y="278" text-anchor="middle" fill="#6b7da3" font-size="11">关键收益：原本 3 次 binlog fsync + 3 次 redo fsync，被压缩成各 1 次</text>
+    </svg>
+    <figcaption><b>图 10</b> · Flush / Sync / Commit 三阶段流水：同组事务共享一次 fsync，吞吐随并发提升</figcaption>
+  </figure>
+
+  <div class="note key"><span class="ic">两个调优旋钮</span><div>
+    <p>组提交的"组"越大，fsync 摊销越划算。MySQL 提供两个参数<strong>主动制造更大的组</strong>（用一点延迟换更高吞吐）：<br>
+    <strong>① <code>binlog_group_commit_sync_delay</code></strong> —— Sync 阶段<em>故意等待 N 微秒</em>，让更多事务挤进这一组再一起刷。<br>
+    <strong>② <code>binlog_group_commit_sync_no_delay_count</code></strong> —— 但如果在等待期间已攒够这么多事务，就提前触发 fsync，不再傻等。<br>
+    redo log 侧也有类似的合并刷盘机制。组提交是 MySQL 5.6 起的重要演进，正是它让"双 1 的强一致"在高并发下依然有可接受的性能——<em>正确性靠 2PC，性能靠组提交</em>，两者配套出现。</p>
+  </div></div>
+</section>
+
+<!-- ============ 11 ============ -->
+<section id="c11">
+  <div class="chap"><span class="num">11</span><h2>关键参数：双 1 配置</h2><div class="rule"></div></div>
+
+  <p>把第 2、3 章的两个刷盘参数放一起，就得到决定"崩溃丢不丢数据"的组合。所谓<strong>"双 1"</strong>，即 <code>innodb_flush_log_at_trx_commit = 1</code> 且 <code>sync_binlog = 1</code>，是<em>最安全</em>的生产标配。</p>
+
+  <div class="tbl">
+    <table>
+      <thead><tr><th>flush_log / sync_binlog</th><th>含义</th><th>崩溃数据安全性</th><th>性能</th></tr></thead>
+      <tbody>
+        <tr><td><strong>1 / 1</strong>（双 1）</td><td>redo 与 binlog 每次提交都 fsync</td><td class="yes">最强，提交即不丢、主从一致</td><td class="no">最低（靠组提交挽回）</td></tr>
+        <tr><td>2 / 1</td><td>redo 写 OS 缓存(每秒 fsync)，binlog 每次 fsync</td><td class="mid">mysqld 崩溃不丢；主机崩溃可能丢约 1 秒 redo</td><td class="mid">较高</td></tr>
+        <tr><td>1 / N</td><td>redo 每次 fsync，binlog 每 N 次 fsync</td><td class="mid">崩溃可能丢最近 N 个事务的 binlog（影响复制）</td><td class="mid">较高</td></tr>
+        <tr><td>0 / 0</td><td>两者都靠后台/OS 定期刷</td><td class="no">最弱，崩溃可能丢约 1 秒数据</td><td class="yes">最高</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn"><span class="ic">怎么选</span><div>
+    <p><strong>金融、订单等不容丢数据 → 必须双 1。</strong>配合组提交，双 1 的性能损失在多数场景可以接受。<br>
+    <strong>日志、埋点等可容忍少量丢失、追求吞吐 → 可放宽到 2/N 甚至 0/0。</strong><br>
+    要特别注意：<strong><code>sync_binlog</code> 放宽不仅影响本机，还直接影响主从</strong>——丢了的 binlog 永远到不了从库，会造成主从数据差异，比丢本机数据更难补救。所以即便放宽 redo（设 2），通常也建议 <code>sync_binlog=1</code> 守住复制底线。这就是"2/1"组合常见的原因。</p>
+  </div></div>
+</section>
+
+<!-- ============ 12 ============ -->
+<section id="c12">
+  <div class="chap"><span class="num">12</span><h2>与 XA 分布式事务的关系</h2><div class="rule"></div></div>
+
+  <p>"两阶段提交"这个词有两层含义，容易混。本篇前面讲的是 MySQL <strong>内部</strong>的 2PC；它和你可能听过的 <strong>XA 分布式事务</strong>，原理同源、场景不同。</p>
+
+  <div class="tbl">
+    <table>
+      <thead><tr><th></th><th>内部 XA（本篇）</th><th>外部 XA（分布式）</th></tr></thead>
+      <tbody>
+        <tr><td><strong>协调谁</strong></td><td>同一个 MySQL 内的 redo log 与 binlog</td><td>跨多个数据库 / 多个 MySQL 实例</td></tr>
+        <tr><td><strong>协调者</strong></td><td>MySQL Server（binlog 作裁判）</td><td>外部事务管理器（如应用 / 中间件）</td></tr>
+        <tr><td><strong>参与者</strong></td><td>InnoDB 引擎 + binlog</td><td>各个资源（多个 RM）</td></tr>
+        <tr><td><strong>触发方式</strong></td><td>自动，每次提交内部进行</td><td>显式 <code>XA START / PREPARE / COMMIT</code> 语句</td></tr>
+        <tr><td><strong>目的</strong></td><td>让两份日志原子一致</td><td>让多个独立系统的事务原子一致</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note key"><span class="ic">共同的内核</span><div>
+    <p>两者都遵循 2PC 的同一套骨架：<strong>先让所有参与者 prepare（进入"可提交但未提交"的状态并持久化），再由协调者根据"是否全部 prepare 成功"统一下达 commit 或 rollback。</strong>区别只在于"参与者是谁、协调者是谁"。<br>
+    本篇的内部 XA 里，<em>InnoDB 是参与者，它 prepare（redo 写 PREPARE）；binlog 的落盘是协调者的"决定"，决定一下，InnoDB 就 commit</em>。理解了内部 2PC，再看分布式 XA 就只是把"两份日志"换成"多个系统"而已。<br>
+    需要提醒：外部 XA 在 MySQL 中存在已知的复杂性与坑（如 prepare 后连接断开的悬挂事务、与 binlog 配合的历史问题），生产中使用需谨慎评估。</p>
+  </div></div>
+</section>
+
+<!-- ============ 13 ============ -->
+<section id="c13">
+  <div class="chap"><span class="num">13</span><h2>常见疑问与边界</h2><div class="rule"></div></div>
+
+  <h3>Q1 · 只有 redo 而没开 binlog，还有 2PC 吗？</h3>
+  <p>如果<strong>没开 binlog</strong>（或用不写 binlog 的引擎），InnoDB 内部就不需要和 binlog 做 2PC——一次普通的 redo 提交即可。<strong>2PC 是"因为有两份要协调的日志"才产生的。</strong>但生产环境几乎都开 binlog（复制、恢复刚需），所以 2PC 是常态。</p>
+
+  <h3>Q2 · 为什么不干脆只用一份日志？</h3>
+  <p>有人设想"让 binlog 兼任崩溃恢复，去掉 redo"或反之。但前面讲过：<strong>redo 是物理日志、循环写、为本机快速恢复优化；binlog 是逻辑日志、追加写、为复制与追溯优化。</strong>两者的写入方式、内容粒度、用途都不同，强行合并会顾此失彼。InnoDB 选择保留两份、用 2PC 协调，是分层架构（引擎层 vs Server 层）下的必然。</p>
+
+  <h3>Q3 · prepare 阶段的 redo 一定要 fsync 吗？</h3>
+  <p>是。prepare 的语义是"我已准备好，崩溃后能凭这份 redo 把事务重建到可提交状态"。<strong>若 prepare 的 redo 没落盘，崩溃后这个 prepared 事务就丢了</strong>，可它的 binlog 可能已经写了 → 又回到撕裂。所以 prepare 阶段必须确保 redo 持久（双 1 下即如此）。</p>
+
+  <h3>Q4 · commit 阶段的 redo 为什么可以不 fsync？</h3>
+  <p>因为<strong>裁决权在 binlog</strong>。只要 binlog 落盘了，崩溃恢复时即使看到 redo 还停在 prepare（commit 标记没刷下去），也会因"binlog 有该 XID"而<em>补做提交</em>（第 8 章 B 情况）。所以 commit 标记丢不丢都不影响最终结果——这正是把判定权交给 binlog 换来的简化。</p>
+
+  <div class="note key"><span class="ic">一句话收束</span><div>
+    <p>2PC 的全部精妙，就在于<strong>"prepare 让 redo 先持久但不拍板，binlog 落盘才拍板，崩溃后以 binlog 为准统一裁决"</strong>。三句话背后，是对"两份独立日志在任意崩溃点都要一致"这一难题的完整解法。</p>
+  </div></div>
+</section>
+
+<!-- ============ 14 ============ -->
+<section id="c14">
+  <div class="chap"><span class="num">14</span><h2>系列总结：连接第三、四篇</h2><div class="rule"></div></div>
+
+  <p>本篇是为第三篇（故障恢复）和第四篇（事务与 MVCC）补上的桥。回看这三篇如何咬合：</p>
+
+  <div class="tbl">
+    <table>
+      <thead><tr><th>篇</th><th>讲了什么</th><th>留下的接口</th></tr></thead>
+      <tbody>
+        <tr><td>③ 故障恢复</td><td>redo/undo/双写 怎么让崩溃后数据不丢、可回滚</td><td>redo 能恢复——但<em>恢复到哪个"提交"为准</em>？</td></tr>
+        <tr><td>④ 事务与 MVCC</td><td>事务的提交/回滚语义、版本可见性</td><td>"提交"在引擎里发生——但它<em>怎么和 binlog 对齐</em>？</td></tr>
+        <tr><td><strong>⑦ 两阶段提交</strong></td><td><strong>用 prepare-commit + XID + binlog 裁决，把两份日志的"提交"绑成一个原子动作</strong></td><td>补全了"提交"的完整定义</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note key"><span class="ic">三篇合一的"提交"全貌</span><div>
+    <p>现在能完整说清一次提交了：<strong>事务修改产生 redo/undo（③④）；提交时 InnoDB 先 prepare——redo 标 PREPARE 并刷盘（③ 的 redo + 本篇的状态机）；再写 binlog 并刷盘，这一刻确定事务"成立"；最后 redo 写 commit 标记，事务对 MVCC 可见（④ 的可见性）。崩溃后，恢复程序用 redo 重做、用 binlog 裁决 prepared 事务（③ 的恢复 + 本篇的裁决），并撤销未提交者（③ 的 undo）。</strong>三篇的机制在这里汇成一条逻辑闭环——这就是 InnoDB"提交"二字的完整含义。</p>
+  </div></div>
+
+  <div class="fin">
+    <h3>InnoDB 系列 · 第七篇</h3>
+    <div class="seq">
+      <b>③ 故障恢复</b><span class="arrow">＋</span><b>④ 事务与 MVCC</b><span class="arrow">＝</span><b>⑦ 两阶段提交（桥）</b>
+    </div>
+    <p style="color:#9aabce;font-size:14px;margin-top:14px">redo 保证"崩溃不丢"，binlog 保证"可复制可追溯"，两阶段提交保证"两者在任何崩溃点都一致"。正确性靠 2PC，性能靠组提交——这一对设计，撑起了 MySQL 既强一致又高并发的提交语义。</p>
+    <p style="color:#6b7da3;font-size:13px;margin-top:10px">自然延伸：<em style="color:#2dd4bf">主从复制全链路</em>（异步 / 半同步 / 组复制 MGR）、<em style="color:#2dd4bf">GTID</em> 如何让复制更可靠、<em style="color:#2dd4bf">基于 binlog 的数据恢复实操</em>（mysqlbinlog + 全量备份做 PITR）。</p>
+  </div>
+
+  <p class="foot">InnoDB 系列 · 第七篇 · 两阶段提交：redo 与 binlog 的一致性 · 14 章</p>
+</section>
+
+</div>
+</body>
+</html>

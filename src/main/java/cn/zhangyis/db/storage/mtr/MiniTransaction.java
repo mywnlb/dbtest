@@ -1,4 +1,6 @@
 package cn.zhangyis.db.storage.mtr;
+import cn.zhangyis.db.storage.fil.io.PageStore;
+
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.Lsn;
@@ -11,7 +13,7 @@ import cn.zhangyis.db.storage.page.PageEnvelope;
 import cn.zhangyis.db.storage.page.PageType;
 import cn.zhangyis.db.storage.redo.LogRange;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
-import cn.zhangyis.db.storage.fil.TablespaceAccessController;
+import cn.zhangyis.db.storage.fil.access.TablespaceAccessController;
 
 /**
  * mini-transaction：短物理临界区的一致性边界（设计 §9）。memo 收集 page latch + buffer fix，

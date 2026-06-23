@@ -3,6 +3,7 @@ package cn.zhangyis.db.storage.trx;
 import cn.zhangyis.db.domain.TransactionId;
 import cn.zhangyis.db.domain.TransactionNo;
 
+import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -24,6 +25,12 @@ public final class TransactionSystem {
     private long nextTransactionNo = 1;
     /** 活跃读写事务表，仅在本类锁内驱动。 */
     private final ActiveTransactionTable active = new ActiveTransactionTable();
+    /**
+     * 存活一致性读 ReadView 集合（purge 低水位用，T-purge）。仅在本类锁内增删。ReadView 未重写 equals，
+     * 故按对象身份去重——同一快照对象登记一次、注销一次。RR 由 {@link ReadViewManager#release} 注销，
+     * RC 由调用方语句末经 {@link ReadViewManager#closeReadView} 注销；未注销表示该快照仍可能需要旧版本。
+     */
+    private final Set<ReadView> liveReadViews = new HashSet<>();
 
     /** 分配单调事务写 id 并登记为活跃读写事务（首次写入时调用）。 */
     TransactionId allocateWriteId() {
@@ -99,7 +106,52 @@ public final class TransactionSystem {
                     up = id;
                 }
             }
-            return new ReadView(txn.transactionId(), up, low, ids);
+            // lowLimitNo = 当前下一个待分配 TransactionNo：此刻之前提交的事务其 TransactionNo 必 < 它。
+            ReadView view = new ReadView(txn.transactionId(), up, low, ids, nextTransactionNo);
+            liveReadViews.add(view);
+            return view;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 注销一个存活 ReadView（purge 低水位用）。RR 由 {@link ReadViewManager#release} 在事务终态前调用，
+     * RC 由调用方语句末经 {@link ReadViewManager#closeReadView} 调用。幂等：重复/未登记的 view 注销为 no-op。
+     *
+     * @param view 待注销的一致性读快照，不能为 null。
+     */
+    void closeReadView(ReadView view) {
+        if (view == null) {
+            throw new TransactionStateException("closeReadView view must not be null");
+        }
+        lock.lock();
+        try {
+            liveReadViews.remove(view);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * purge 提交序低水位（设计 §7.7、§5.6；mvcc §5.4）：所有存活 ReadView 的 {@code min(lowLimitNo)}；无存活
+     * ReadView 则为当前 {@code nextTransactionNo}（此刻之前提交的全部 undo 都可 purge）。一条已提交 undo log 的
+     * {@code TransactionNo} 严格小于本返回值即可被 purge 物理回收——它在每个存活快照创建前就已提交、对所有快照可见。
+     *
+     * <p>锁内读 + 拷贝即返回，不访问 Buffer Pool、不等待（§17 锁顺序约束）。
+     *
+     * @return purge 边界（TransactionNo）。
+     */
+    public TransactionNo purgeLowWaterNo() {
+        lock.lock();
+        try {
+            long low = nextTransactionNo;
+            for (ReadView v : liveReadViews) {
+                if (v.lowLimitNo() < low) {
+                    low = v.lowLimitNo();
+                }
+            }
+            return TransactionNo.of(low);
         } finally {
             lock.unlock();
         }

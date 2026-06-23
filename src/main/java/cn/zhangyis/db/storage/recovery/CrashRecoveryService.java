@@ -1,4 +1,6 @@
 package cn.zhangyis.db.storage.recovery;
+import cn.zhangyis.db.storage.fil.exception.TablespaceCorruptedException;
+
 
 import cn.zhangyis.db.common.exception.DatabaseRuntimeException;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
@@ -7,10 +9,9 @@ import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.SpaceId;
-import cn.zhangyis.db.storage.fil.PageStore;
-import cn.zhangyis.db.storage.fil.TablespaceCorruptedException;
-import cn.zhangyis.db.storage.fsp.SpaceHeaderPhysical;
-import cn.zhangyis.db.storage.fsp.SpaceHeaderRawCodec;
+import cn.zhangyis.db.storage.fil.io.PageStore;
+import cn.zhangyis.db.storage.fsp.header.SpaceHeaderPhysical;
+import cn.zhangyis.db.storage.fsp.header.SpaceHeaderRawCodec;
 import cn.zhangyis.db.storage.redo.RedoCheckpointLabel;
 import cn.zhangyis.db.storage.redo.RedoLogBatch;
 import cn.zhangyis.db.storage.redo.RedoRecoveryReader;

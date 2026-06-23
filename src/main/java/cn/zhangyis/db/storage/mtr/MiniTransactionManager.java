@@ -2,7 +2,7 @@ package cn.zhangyis.db.storage.mtr;
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
-import cn.zhangyis.db.storage.fil.TablespaceAccessController;
+import cn.zhangyis.db.storage.fil.access.TablespaceAccessController;
 
 import java.util.concurrent.atomic.AtomicLong;
 

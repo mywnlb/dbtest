@@ -62,6 +62,25 @@ public final class ReadViewManager {
         if (txn == null) {
             throw new TransactionStateException("release txn must not be null");
         }
+        // 先把事务级 RR 快照从存活集合注销（purge 低水位用），再清缓存。RC 无缓存→cached 为 null→只清缓存。
+        ReadView cached = txn.readView();
+        if (cached != null) {
+            system.closeReadView(cached);
+        }
         txn.clearReadView();
+    }
+
+    /**
+     * 注销一条 READ_COMMITTED 语句级一致性读快照（语句边界）。RR 事务级快照由 {@link #release} 注销、不走本方法。
+     * 调用方（未来 executor / 当前 purge 测试）在每条 RC 一致性读结束后调用，避免 RC 快照在 purge 低水位中无限存活
+     * （评审 #2：RC openReadView 每次新建，不注销会让 purge 边界卡死）。幂等。
+     *
+     * @param view RC 一致性读快照，不能为 null。
+     */
+    public void closeReadView(ReadView view) {
+        if (view == null) {
+            throw new TransactionStateException("closeReadView view must not be null");
+        }
+        system.closeReadView(view);
     }
 }

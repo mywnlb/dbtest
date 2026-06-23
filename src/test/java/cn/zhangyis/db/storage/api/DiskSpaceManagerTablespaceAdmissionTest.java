@@ -1,18 +1,19 @@
 package cn.zhangyis.db.storage.api;
+import cn.zhangyis.db.storage.fil.exception.TablespaceCorruptedException;
+import cn.zhangyis.db.storage.fil.exception.TablespaceNotFoundException;
+import cn.zhangyis.db.storage.fil.exception.TablespaceUnavailableException;
+import cn.zhangyis.db.storage.fil.state.TablespaceState;
+import cn.zhangyis.db.storage.fil.state.TablespaceType;
+
 
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.LruBufferPool;
-import cn.zhangyis.db.storage.fil.FileChannelPageStore;
-import cn.zhangyis.db.storage.fil.PageStore;
-import cn.zhangyis.db.storage.fil.TablespaceCorruptedException;
-import cn.zhangyis.db.storage.fil.TablespaceNotFoundException;
-import cn.zhangyis.db.storage.fil.TablespaceState;
-import cn.zhangyis.db.storage.fil.TablespaceType;
-import cn.zhangyis.db.storage.fil.TablespaceUnavailableException;
-import cn.zhangyis.db.storage.fsp.SegmentPurpose;
+import cn.zhangyis.db.storage.fil.io.FileChannelPageStore;
+import cn.zhangyis.db.storage.fil.io.PageStore;
+import cn.zhangyis.db.storage.fsp.segment.SegmentPurpose;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
 import org.junit.jupiter.api.Test;

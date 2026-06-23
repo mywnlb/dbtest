@@ -9,7 +9,7 @@ import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.domain.TransactionId;
 import cn.zhangyis.db.storage.api.DiskSpaceManager;
 import cn.zhangyis.db.storage.api.DiskSpaceUndoAllocator;
-import cn.zhangyis.db.storage.api.IndexPageAccess;
+import cn.zhangyis.db.storage.api.index.IndexPageAccess;
 import cn.zhangyis.db.storage.api.SegmentRef;
 import cn.zhangyis.db.storage.btree.BTreeDeleteMarkResult;
 import cn.zhangyis.db.storage.btree.BTreeIndex;
@@ -18,9 +18,9 @@ import cn.zhangyis.db.storage.btree.BTreeLookupResult;
 import cn.zhangyis.db.storage.btree.SplitCapableBTreeIndexService;
 import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.LruBufferPool;
-import cn.zhangyis.db.storage.fil.FileChannelPageStore;
-import cn.zhangyis.db.storage.fil.PageStore;
-import cn.zhangyis.db.storage.fsp.SegmentPurpose;
+import cn.zhangyis.db.storage.fil.io.FileChannelPageStore;
+import cn.zhangyis.db.storage.fil.io.PageStore;
+import cn.zhangyis.db.storage.fsp.segment.SegmentPurpose;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
 import cn.zhangyis.db.storage.record.format.HiddenColumns;
@@ -231,8 +231,8 @@ class RollbackServiceTest {
             RollPointer insRp = ctx.undoMgr.beforeInsert(t1, m, TABLE_ID, INDEX_ID, key(1), index.keyDef(), index.schema());
             svc.insertClustered(m, index, row(1), w1, insRp);
             ctx.mgr.commit(m);
-            ctx.undoMgr.onCommit(t1);
             ctx.txnMgr.commit(t1);
+            ctx.undoMgr.onCommit(t1);
 
             // T2 delete-mark
             Transaction t2 = ctx.txnMgr.begin(TransactionOptions.defaults());
@@ -370,7 +370,7 @@ class RollbackServiceTest {
             this.undoAllocator = new DiskSpaceUndoAllocator(disk);
             this.undoAccess = new UndoLogSegmentAccess(pool, PS, undoAllocator, registry);
             this.slots = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 64);
-            this.undoMgr = new UndoLogManager(undoAccess, slots, UNDO_SPACE);
+            this.undoMgr = new UndoLogManager(undoAccess, slots, UNDO_SPACE, new HistoryList());
             this.rollbackService = new RollbackService(service(), undoAccess, slots, txnMgr, mgr);
         }
 

@@ -10,8 +10,8 @@ import cn.zhangyis.db.storage.api.DiskSpaceManager;
 import cn.zhangyis.db.storage.api.DiskSpaceUndoAllocator;
 import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.LruBufferPool;
-import cn.zhangyis.db.storage.fil.FileChannelPageStore;
-import cn.zhangyis.db.storage.fil.PageStore;
+import cn.zhangyis.db.storage.fil.io.FileChannelPageStore;
+import cn.zhangyis.db.storage.fil.io.PageStore;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
 import cn.zhangyis.db.storage.record.schema.ColumnDef;
@@ -281,6 +281,25 @@ class UndoLogSegmentTest {
                     insRp);
             RollPointer updRp = seg.append(upd, keyDef(), schema());
             assertFalse(updRp.insert(), "UPDATE_ROW append must stamp insert=false");
+        });
+    }
+
+    @Test
+    void forEachRecordWithPointerYieldsAddressesThatRoundTrip() {
+        onSegment(seg -> {
+            RollPointer rp1 = seg.append(rec(1, 100, RollPointer.NULL), keyDef(), schema());
+            RollPointer rp2 = seg.append(rec(2, 101, RollPointer.NULL), keyDef(), schema());
+            List<UndoRecord> recs = new ArrayList<>();
+            List<RollPointer> pointers = new ArrayList<>();
+            seg.forEachRecordWithPointer((r, rp) -> {
+                recs.add(r);
+                pointers.add(rp);
+            }, keyDef(), schema());
+            // 遍历给出的地址必须等于 append 返回的 RollPointer（purge 据此与聚簇 DB_ROLL_PTR 比对）
+            assertEquals(List.of(rp1, rp2), pointers);
+            // 每个地址 readRecord 回原记录，证明 pageNo+offset 正确
+            assertEquals(recs.get(0), seg.readRecord(pointers.get(0), keyDef(), schema()));
+            assertEquals(recs.get(1), seg.readRecord(pointers.get(1), keyDef(), schema()));
         });
     }
 

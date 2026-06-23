@@ -5,7 +5,7 @@ import cn.zhangyis.db.domain.Lsn;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.SpaceId;
-import cn.zhangyis.db.storage.fil.PageStore;
+import cn.zhangyis.db.storage.fil.io.PageStore;
 import cn.zhangyis.db.storage.page.PageEnvelopeLayout;
 
 import java.nio.ByteBuffer;
@@ -405,7 +405,11 @@ public final class LruBufferPool implements BufferPool, FrameReleaser {
     /** 调用须持 poolLock。 */
     private void markDirty(BufferFrame frame) {
         Lsn pageLsn = pageLsn(frame);
-        if (!frame.dirty) {
+        // oldestModificationLsn = 自上次刷盘以来最早的修改 LSN：只要当前未设置就设为本次 pageLSN。
+        // 不能用 `!frame.dirty` 作为条件——newPage 对驻留页重初始化时会先在 poolLock 内置 dirty=true（见 acquire
+        // 重初始化路径）而尚未有 LSN；若此处仅在 `!dirty` 时设置，commit 的 markDirty 会因 dirty 已为真而跳过，
+        // 留下 dirty=true 但 oldestModificationLsn=null 的帧，导致 dirtyPageCandidates/checkpoint NPE。
+        if (frame.oldestModificationLsn == null) {
             frame.oldestModificationLsn = pageLsn;
         }
         frame.newestModificationLsn = pageLsn;

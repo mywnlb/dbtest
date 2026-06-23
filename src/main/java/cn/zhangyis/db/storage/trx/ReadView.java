@@ -30,20 +30,30 @@ public final class ReadView {
     private final long lowLimitId;
     /** 创建时活跃读写事务 id（不可变副本）。 */
     private final Set<Long> activeIds;
+    /**
+     * 创建时的提交序低水位 = 当时"下一个待分配 TransactionNo"。purge 用：某已提交 undo log 的 {@code TransactionNo}
+     * 小于所有存活 ReadView 的 {@code lowLimitNo} 时，说明它在每个存活快照创建前就已提交、对所有快照可见，其旧版本
+     * 不再被任何一致性读需要，可被 purge 物理回收。与可见性五规则（按 TransactionId）无关，仅供 purge 边界（按 TransactionNo）。
+     */
+    private final long lowLimitNo;
 
     /**
      * @param creatorTrxId 所属事务写 id（可为 {@link TransactionId#NONE}，不可为 null）。
      * @param upLimitId    低水位。
      * @param lowLimitId   高水位，必须 &gt;= upLimitId。
      * @param activeIds    活跃事务 id，防御性复制为不可变集合；每个元素必须 ∈ {@code [upLimitId, lowLimitId)}。
+     * @param lowLimitNo   创建时下一个待分配 TransactionNo（purge 边界用），必须 &gt;= 0。
      */
-    public ReadView(TransactionId creatorTrxId, long upLimitId, long lowLimitId, Set<Long> activeIds) {
+    public ReadView(TransactionId creatorTrxId, long upLimitId, long lowLimitId, Set<Long> activeIds, long lowLimitNo) {
         if (creatorTrxId == null || activeIds == null) {
             throw new DatabaseValidationException("read view creatorTrxId/activeIds must not be null");
         }
         if (upLimitId > lowLimitId) {
             throw new DatabaseValidationException("read view upLimitId " + upLimitId
                     + " must be <= lowLimitId " + lowLimitId);
+        }
+        if (lowLimitNo < 0) {
+            throw new DatabaseValidationException("read view lowLimitNo must be >= 0: " + lowLimitNo);
         }
         Set<Long> copy = Set.copyOf(activeIds);
         for (long id : copy) {
@@ -56,6 +66,7 @@ public final class ReadView {
         this.upLimitId = upLimitId;
         this.lowLimitId = lowLimitId;
         this.activeIds = copy;
+        this.lowLimitNo = lowLimitNo;
     }
 
     /**
@@ -98,6 +109,11 @@ public final class ReadView {
 
     public long lowLimitId() {
         return lowLimitId;
+    }
+
+    /** 创建时的提交序低水位（下一个待分配 TransactionNo）；purge 边界用。 */
+    public long lowLimitNo() {
+        return lowLimitNo;
     }
 
     /** 活跃事务 id 不可变快照。 */

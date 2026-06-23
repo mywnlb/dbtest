@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>InnoDB 故障恢复原理</title>
+<style>
+:root{--bg:#0d1117;--panel:#161b22;--border:#30363d;--txt:#e6edf3;--sub:#9da7b3;--dim:#6e7681;
+--blue:#4493f8;--teal:#3fb950;--amber:#d29922;--purple:#a371f7;--red:#f85149;
+--mono:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;}
+*{box-sizing:border-box;}html{scroll-behavior:smooth;}
+body{margin:0;background:var(--bg);color:var(--txt);
+font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans CJK SC","Microsoft YaHei",sans-serif;
+line-height:1.75;font-size:15px;}
+.wrap{max-width:920px;margin:0 auto;padding:64px 28px 120px;}
+header{border-bottom:1px solid var(--border);padding-bottom:32px;margin-bottom:8px;}
+header h1{font-size:30px;font-weight:800;letter-spacing:-0.02em;margin:0 0 14px;
+background:linear-gradient(90deg,var(--red),var(--purple));-webkit-background-clip:text;
+background-clip:text;-webkit-text-fill-color:transparent;}
+header .meta{color:var(--sub);font-size:13.5px;line-height:1.7;}
+header .meta code{color:var(--amber);}
+.callout{background:rgba(248,81,73,.07);border:1px solid rgba(248,81,73,.25);border-radius:10px;
+padding:14px 18px;margin:22px 0;font-size:13.5px;color:var(--sub);}
+.callout strong{color:var(--red);}
+nav{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:20px 26px;margin:36px 0 48px;}
+nav h2{font-size:13px;text-transform:uppercase;letter-spacing:0.08em;color:var(--dim);margin:0 0 14px;}
+nav ol{margin:0;padding-left:20px;columns:2;column-gap:36px;}
+nav li{margin:5px 0;break-inside:avoid;}
+nav a{color:var(--txt);text-decoration:none;border-bottom:1px solid transparent;transition:.15s;}
+nav a:hover{color:var(--red);border-bottom-color:var(--red);}
+h2.sec{font-size:23px;font-weight:700;margin:64px 0 22px;padding-top:18px;
+border-top:1px solid var(--border);letter-spacing:-0.01em;}
+h2.sec .n{color:var(--red);font-variant-numeric:tabular-nums;margin-right:10px;}
+h3{font-size:17px;font-weight:650;margin:34px 0 14px;}
+h4{font-size:15px;font-weight:650;margin:24px 0 10px;color:var(--teal);}
+p{margin:14px 0;}strong{color:#fff;font-weight:650;}a{color:var(--amber);}
+code{font-family:var(--mono);font-size:13px;background:#1f2630;padding:2px 6px;border-radius:5px;color:var(--amber);border:1px solid #2a313c;}
+pre{background:#010409;border:1px solid var(--border);border-radius:10px;padding:18px 20px;overflow-x:auto;margin:18px 0;line-height:1.6;}
+pre code{background:none;border:none;padding:0;color:#c9d1d9;font-size:12.5px;}
+blockquote{margin:18px 0;padding:12px 20px;border-left:3px solid var(--amber);
+background:rgba(210,153,34,0.06);border-radius:0 8px 8px 0;color:var(--sub);}
+blockquote strong{color:var(--amber);}
+table{border-collapse:collapse;width:100%;margin:20px 0;font-size:13.5px;}
+th,td{border:1px solid var(--border);padding:9px 13px;text-align:left;vertical-align:top;}
+th{background:#1c2330;color:var(--txt);font-weight:650;}td{color:var(--sub);}
+tr:nth-child(even) td{background:rgba(255,255,255,0.015);}td strong{color:var(--txt);}
+figure{margin:28px 0;text-align:center;}
+figure svg{width:100%;height:auto;border:1px solid var(--border);border-radius:12px;background:var(--bg);display:block;}
+figcaption{color:var(--dim);font-size:12.5px;margin-top:10px;font-style:italic;}
+ul{margin:14px 0;padding-left:24px;}li{margin:6px 0;}
+hr{border:none;border-top:1px solid var(--border);margin:40px 0;}
+.tag{display:inline-block;font-size:11px;padding:1px 8px;border-radius:20px;font-weight:600;vertical-align:middle;}
+.tag.a{background:rgba(163,113,247,.15);color:var(--purple);border:1px solid rgba(163,113,247,.3);}
+.tag.r{background:rgba(68,147,248,.15);color:var(--blue);border:1px solid rgba(68,147,248,.3);}
+.tag.u{background:rgba(210,153,34,.15);color:var(--amber);border:1px solid rgba(210,153,34,.3);}
+::selection{background:rgba(248,81,73,.3);}
+</style></head><body><div class="wrap">
+<header><h1>InnoDB 故障恢复原理</h1>
+<div class="meta">
+承接前两份《存储结构》（磁盘侧）与《Buffer Pool 内存侧链路》（内存侧），这份讲<strong>崩溃恢复</strong>：
+机器突然断电、进程被 kill、操作系统 panic ——重启之后，InnoDB 凭什么能把数据库带回一致状态，且已提交事务一条不丢？<br>
+适用版本：MySQL 5.7 / 8.0，InnoDB 引擎。
+</div></header>
+<div class="callout">
+<strong>核心论断：</strong>InnoDB 的崩溃恢复遵循 <strong>ARIES</strong> 算法（IBM 1992 年提出的工业标准），核心是
+<strong>WAL（先写日志）</strong> + <strong>三阶段恢复（Analysis → Redo → Undo）</strong> + <strong>双写</strong>。
+这套机制让数据库在任何崩溃时刻重启后都能回到"已提交全在、未提交全无"的一致状态——这就是 ACID 中 A 和 D 的兜底保障。
+</div>
+<nav><h2>目录</h2><ol>
+<li><a href="#s1">总览：恢复要解决什么问题</a></li>
+<li><a href="#s2">LSN 体系：恢复的时间轴</a></li>
+<li><a href="#s3">MTR 与 redo 记录</a></li>
+<li><a href="#s4">检查点：水位线推进</a></li>
+<li><a href="#s5">三阶段恢复（核心）</a></li>
+<li><a href="#s6">双写：撕裂页防线</a></li>
+<li><a href="#s7">四种崩溃时机</a></li>
+<li><a href="#s8">ACID 完整闭环</a></li>
+<li><a href="#s9">实战与调优</a></li>
+</ol></nav>
+<h2 class="sec" id="s1"><span class="n">01</span>总览：恢复要解决什么问题</h2>
+<p>崩溃发生在「内存改了、但还没全部刷到磁盘」的瞬间。<strong>内存全部丢失</strong>——Buffer Pool 里的脏页、活跃事务结构、未刷的 Log Buffer 全没了；而<strong>磁盘上幸存的是不完整的画面</strong>：数据文件 <code>.ibd</code> 里的页可能是旧版本、可能是新版本、甚至可能是撕裂的;redo log 里有崩溃前的修改记录(从 checkpoint_lsn 往后的部分)。恢复的任务就是<strong>用磁盘上幸存的这些信息,重建出崩溃瞬间的内存状态,再撤销那些不该留下的痕迹</strong>。</p>
+<figure><svg width="100%" viewBox="0 0 700 520" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif"><defs><marker id="a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5"/></marker></defs><rect x="0" y="0" width="700" height="520" rx="12" fill="#0d1117"/>
+<text x="350" y="28" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">故障恢复总览：用 redo 和 undo 把数据库带回一致状态</text>
+<text x="350" y="48" text-anchor="middle" fill="#6e7681" font-size="10">目标：已提交事务不丢（D）、未提交事务不残留（A）、数据一致（C）</text>
+<text x="350" y="82" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">崩溃瞬间的内存丢失了什么</text>
+<rect x="40" y="96" width="194" height="72" rx="8" fill="#2d1012" stroke="#f85149" stroke-width="0.8"/>
+<text x="137" y="118" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="700">内存脏页</text>
+<text x="137" y="138" text-anchor="middle" fill="#9da7b3" font-size="9">Buffer Pool 中已被修改但未刷盘的页</text>
+<text x="137" y="156" text-anchor="middle" fill="#9da7b3" font-size="9">全部丢失</text>
+<rect x="250" y="96" width="194" height="72" rx="8" fill="#2d220a" stroke="#d29922" stroke-width="0.8"/>
+<text x="347" y="118" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="700">Log Buffer</text>
+<text x="347" y="138" text-anchor="middle" fill="#9da7b3" font-size="9">未来得及刷盘的 redo 日志（取决于策略）</text>
+<text x="347" y="156" text-anchor="middle" fill="#9da7b3" font-size="9">全部丢失</text>
+<rect x="460" y="96" width="194" height="72" rx="8" fill="#1d1530" stroke="#a371f7" stroke-width="0.8"/>
+<text x="557" y="118" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="700">事务状态</text>
+<text x="557" y="138" text-anchor="middle" fill="#9da7b3" font-size="9">活跃事务的内存结构、锁、ReadView 等</text>
+<text x="557" y="156" text-anchor="middle" fill="#9da7b3" font-size="9">全部丢失</text>
+<text x="350" y="196" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">崩溃后磁盘上幸存了什么</text>
+<rect x="40" y="210" width="194" height="72" rx="8" fill="#0d2818" stroke="#3fb950" stroke-width="0.8"/>
+<text x="137" y="232" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="700">已落盘数据页</text>
+<text x="137" y="252" text-anchor="middle" fill="#9da7b3" font-size="9">.ibd 中的页（可能是旧版本或部分新版本）</text>
+<rect x="250" y="210" width="194" height="72" rx="8" fill="#0d2847" stroke="#4493f8" stroke-width="0.8"/>
+<text x="347" y="232" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="700">已落盘 redo 日志</text>
+<text x="347" y="252" text-anchor="middle" fill="#9da7b3" font-size="9">checkpoint_lsn 之后的所有改动记录</text>
+<rect x="460" y="210" width="194" height="72" rx="8" fill="#2d1a0f" stroke="#e8845c" stroke-width="0.8"/>
+<text x="557" y="232" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="700">undo 段（也是页）</text>
+<text x="557" y="252" text-anchor="middle" fill="#9da7b3" font-size="9">事务的旧版本数据，受 redo 保护</text>
+<line x1="350" y1="288" x2="350" y2="308" stroke="#6e7681" stroke-width="1.3" marker-end="url(#a)"/>
+<text x="350" y="326" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">重启时的三阶段恢复（ARIES 算法）</text>
+<rect x="40" y="342" width="194" height="90" rx="8" fill="#1d1530" stroke="#a371f7" stroke-width="0.8"/>
+<text x="137" y="364" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">① Analysis</text>
+<text x="137" y="386" text-anchor="middle" fill="#9da7b3" font-size="9">扫描 redo 找出</text>
+<text x="137" y="404" text-anchor="middle" fill="#9da7b3" font-size="9">崩溃时活跃事务</text>
+<text x="137" y="422" text-anchor="middle" fill="#6e7681" font-size="9">详见图5</text>
+<line x1="234" y1="386" x2="250" y2="386" stroke="#6e7681" stroke-width="1.3" marker-end="url(#a)"/>
+<rect x="250" y="342" width="194" height="90" rx="8" fill="#0d2847" stroke="#4493f8" stroke-width="0.8"/>
+<text x="347" y="364" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">② Redo 前滚</text>
+<text x="347" y="386" text-anchor="middle" fill="#9da7b3" font-size="9">重放 redo 把页带回</text>
+<text x="347" y="404" text-anchor="middle" fill="#9da7b3" font-size="9">崩溃前的最新状态</text>
+<text x="347" y="422" text-anchor="middle" fill="#6e7681" font-size="9">详见图5</text>
+<line x1="444" y1="386" x2="460" y2="386" stroke="#6e7681" stroke-width="1.3" marker-end="url(#a)"/>
+<rect x="460" y="342" width="194" height="90" rx="8" fill="#2d220a" stroke="#d29922" stroke-width="0.8"/>
+<text x="557" y="364" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">③ Undo 后滚</text>
+<text x="557" y="386" text-anchor="middle" fill="#9da7b3" font-size="9">按 undo 撤销</text>
+<text x="557" y="404" text-anchor="middle" fill="#9da7b3" font-size="9">未提交事务的改动</text>
+<text x="557" y="422" text-anchor="middle" fill="#6e7681" font-size="9">详见图5</text>
+<rect x="40" y="452" width="620" height="52" rx="8" fill="#0d2818" stroke="#3fb950" stroke-width="0.8"/>
+<text x="350" y="476" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">最终：数据库回到崩溃前最后一次提交的一致状态</text>
+<text x="350" y="494" text-anchor="middle" fill="#9da7b3" font-size="9">已提交的改动全在（D），未提交的全消失（A），约束不破坏（C）</text>
+</svg><figcaption>图1　恢复总览：崩溃时丢失的内存内容，磁盘幸存的信息，以及三阶段恢复</figcaption></figure>
+<h3>恢复要达成的三个目标(对应 ACID)</h3>
+<ul>
+<li><span class="tag r">D 持久性</span> 已提交事务的所有修改必须完整保留——靠 <strong>redo 前滚</strong> 把已落盘 redo 中的改动全部重放到页上。</li>
+<li><span class="tag a">A 原子性</span> 未提交事务的所有痕迹必须彻底清除——靠 <strong>undo 后滚</strong> 对 Analysis 识别出的活跃事务逐一回滚。</li>
+<li><span class="tag u">C 一致性</span> 数据库约束、B+ 树结构、链表完整性等不能被破坏——靠前两者 + 双写(保证页不撕裂) + MTR(保证物理修改原子)。</li>
+</ul>
+<h2 class="sec" id="s2"><span class="n">02</span>LSN 体系：恢复的时间轴</h2>
+<p>整个恢复机制建立在 <strong>LSN(Log Sequence Number,日志序列号)</strong> 这个抽象之上。LSN 是<strong>字节级单调递增</strong>的——每写一字节 redo,LSN 就加一。所有页、日志、检查点都用 LSN 锚定彼此的相对位置,让"哪些改动已经做了、哪些还没做"在数字上变得可比较。</p>
+<figure><svg width="100%" viewBox="0 0 700 640" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif"><defs><marker id="a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5"/></marker></defs><rect x="0" y="0" width="700" height="640" rx="12" fill="#0d1117"/>
+<text x="350" y="28" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">LSN 体系：四个 LSN 锚定崩溃恢复的全局秩序</text>
+<text x="350" y="48" text-anchor="middle" fill="#6e7681" font-size="10">LSN（Log Sequence Number）= 字节级单调递增的日志序号，是恢复的「时间轴」</text>
+<text x="350" y="82" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">四个关键 LSN（值越大越新）</text>
+<rect x="40" y="98" width="620" height="38" rx="6" fill="#1d1530" stroke="#a371f7" stroke-width="0.8"/>
+<text x="140" y="120" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="700">redo LSN</text>
+<text x="280" y="120" text-anchor="start" fill="#9da7b3" font-size="10">内存中下一个 redo 字节的位置</text>
+<text x="640" y="120" text-anchor="end" fill="#6e7681" font-size="9">最大</text>
+<rect x="40" y="142" width="620" height="38" rx="6" fill="#0d2847" stroke="#4493f8" stroke-width="0.8"/>
+<text x="140" y="164" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="700">flushed LSN</text>
+<text x="280" y="164" text-anchor="start" fill="#9da7b3" font-size="10">已刷盘 redo 的最高位置</text>
+<rect x="40" y="186" width="620" height="38" rx="6" fill="#0d2818" stroke="#3fb950" stroke-width="0.8"/>
+<text x="140" y="208" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="700">page LSN</text>
+<text x="280" y="208" text-anchor="start" fill="#9da7b3" font-size="10">该页最后一次修改对应的 redo LSN</text>
+<text x="640" y="208" text-anchor="end" fill="#6e7681" font-size="9">每页独立</text>
+<rect x="40" y="230" width="620" height="38" rx="6" fill="#2d220a" stroke="#d29922" stroke-width="0.8"/>
+<text x="140" y="252" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="700">checkpoint LSN</text>
+<text x="280" y="252" text-anchor="start" fill="#9da7b3" font-size="10">「此前脏页都已落盘」的水位线</text>
+<text x="640" y="252" text-anchor="end" fill="#6e7681" font-size="9">最小</text>
+<text x="350" y="304" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">LSN 时间轴（崩溃恢复就是在这条轴上工作）</text>
+<line x1="40" y1="380" x2="660" y2="380" stroke="#e6edf3" stroke-width="1.2"/>
+<line x1="80" y1="370" x2="80" y2="390" stroke="#6e7681" stroke-width="2"/>
+<circle cx="80" cy="380" r="4" fill="#6e7681"/>
+<text x="80" y="360" text-anchor="middle" fill="#6e7681" font-size="10">已回收</text>
+<text x="80" y="408" text-anchor="middle" fill="#6e7681" font-size="8.5">已丢弃的 redo</text>
+<line x1="220" y1="370" x2="220" y2="390" stroke="#d29922" stroke-width="2"/>
+<circle cx="220" cy="380" r="4" fill="#d29922"/>
+<text x="220" y="360" text-anchor="middle" fill="#d29922" font-size="10">checkpoint_lsn</text>
+<text x="220" y="408" text-anchor="middle" fill="#6e7681" font-size="8.5">推进过的水位线</text>
+<line x1="380" y1="370" x2="380" y2="390" stroke="#3fb950" stroke-width="2"/>
+<circle cx="380" cy="380" r="4" fill="#3fb950"/>
+<text x="380" y="360" text-anchor="middle" fill="#3fb950" font-size="10">page LSN</text>
+<text x="380" y="408" text-anchor="middle" fill="#6e7681" font-size="8.5">脏页最新修改位置</text>
+<line x1="490" y1="370" x2="490" y2="390" stroke="#4493f8" stroke-width="2"/>
+<circle cx="490" cy="380" r="4" fill="#4493f8"/>
+<text x="490" y="360" text-anchor="middle" fill="#4493f8" font-size="10">flushed LSN</text>
+<text x="490" y="408" text-anchor="middle" fill="#6e7681" font-size="8.5">redo 已刷盘到这</text>
+<line x1="620" y1="370" x2="620" y2="390" stroke="#a371f7" stroke-width="2"/>
+<circle cx="620" cy="380" r="4" fill="#a371f7"/>
+<text x="620" y="360" text-anchor="middle" fill="#a371f7" font-size="10">redo LSN</text>
+<text x="620" y="408" text-anchor="middle" fill="#6e7681" font-size="8.5">内存中最新位置</text>
+<text x="40" y="432" text-anchor="start" fill="#6e7681" font-size="10">← 旧</text>
+<text x="660" y="432" text-anchor="end" fill="#6e7681" font-size="10">新 →</text>
+<text x="350" y="468" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">关键不变式</text>
+<rect x="40" y="486" width="620" height="28" rx="5" fill="#21262d" stroke="#6e7681" stroke-width="0.8"/>
+<text x="70" y="504" text-anchor="start" fill="#d29922" font-size="10" font-weight="700">flushed_lsn ≥ checkpoint_lsn</text>
+<text x="640" y="504" text-anchor="end" fill="#9da7b3" font-size="10">redo 落盘进度 ≥ 检查点水位</text>
+<rect x="40" y="518" width="620" height="28" rx="5" fill="#21262d" stroke="#6e7681" stroke-width="0.8"/>
+<text x="70" y="536" text-anchor="start" fill="#d29922" font-size="10" font-weight="700">page_lsn ≤ redo_lsn</text>
+<text x="640" y="536" text-anchor="end" fill="#9da7b3" font-size="10">页的修改记录必先写入 redo</text>
+<rect x="40" y="550" width="620" height="28" rx="5" fill="#21262d" stroke="#6e7681" stroke-width="0.8"/>
+<text x="70" y="568" text-anchor="start" fill="#d29922" font-size="10" font-weight="700">崩溃恢复起点 = checkpoint_lsn</text>
+<text x="640" y="568" text-anchor="end" fill="#9da7b3" font-size="10">从这往后扫描 redo，往前的 redo 可丢弃</text>
+<rect x="40" y="582" width="620" height="28" rx="5" fill="#21262d" stroke="#6e7681" stroke-width="0.8"/>
+<text x="70" y="600" text-anchor="start" fill="#d29922" font-size="10" font-weight="700">某页若 page_lsn ≥ 某条 redo 的 lsn</text>
+<text x="640" y="600" text-anchor="end" fill="#9da7b3" font-size="10">说明该 redo 已应用到此页，跳过；否则需重放</text>
+</svg><figcaption>图2　LSN 体系：四种 LSN 在一条时间轴上的位置关系与四条不变式</figcaption></figure>
+<h3>四个关键 LSN</h3>
+<table>
+<tr><th>LSN</th><th>位置</th><th>含义</th></tr>
+<tr><td><code>redo_lsn</code></td><td>内存</td><td>Log Buffer 中下一个 redo 字节的位置（最新）</td></tr>
+<tr><td><code>flushed_lsn</code></td><td>内存↔磁盘</td><td>已刷盘 redo 的最高位置；<code>flushed_lsn ≤ redo_lsn</code></td></tr>
+<tr><td><code>page_lsn</code></td><td>每个页内</td><td>该页最后一次被修改时对应的 redo LSN（页头里存着）</td></tr>
+<tr><td><code>checkpoint_lsn</code></td><td>系统级水位</td><td>「此前所有脏页都已落盘」的水位线，恢复起点</td></tr>
+</table>
+<h3>四条不变式(理解恢复的关键)</h3>
+<ul>
+<li><code>flushed_lsn ≥ checkpoint_lsn</code> ——redo 落盘进度始终领先于检查点水位。</li>
+<li><code>page_lsn ≤ redo_lsn</code> ——任何页的修改都对应一条已存在的 redo 记录(WAL 协议)。</li>
+<li><strong>恢复起点 = checkpoint_lsn</strong> ——比这早的 redo 对应的修改必然都已在页上,不需要重放。</li>
+<li><strong>重放幂等性</strong>:对一条 redo,若目标页的 <code>page_lsn ≥ 这条 redo 的 lsn</code>,说明这个修改已经应用过,跳过即可。这条性质让 redo 重放天然幂等,可以反复重启而不会重复执行修改。</li>
+</ul>
+<blockquote>LSN 体系的精髓:把"时间"变成"可比较的数字"。任何时刻只要知道两个 LSN,就能判断它们的先后,这是分布式日志、复制、备份恢复都依赖的基础。</blockquote>
+<h2 class="sec" id="s3"><span class="n">03</span>MTR 与 redo 记录</h2>
+<p>用户写的一个事务,在 InnoDB 内部并不是直接对页做修改,而是<strong>分解为多个 Mini Transaction(MTR)</strong>。MTR 是 InnoDB 对页操作的最小原子单位,介于"事务"和"单条 redo 记录"之间。理解 MTR 才能理解 redo 的正确粒度。</p>
+<figure><svg width="100%" viewBox="0 0 700 580" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif"><defs><marker id="a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5"/></marker></defs><rect x="0" y="0" width="700" height="580" rx="12" fill="#0d1117"/>
+<text x="350" y="28" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">MTR（Mini Transaction）：redo 写入的最小原子单位</text>
+<text x="350" y="48" text-anchor="middle" fill="#6e7681" font-size="10">一个用户事务由 N 个 MTR 组成，每个 MTR 内部对一组页的修改要么都生效要么都不生效</text>
+<rect x="40" y="72" width="300" height="140" rx="8" fill="#1d1530" stroke="#a371f7" stroke-width="0.8"/>
+<text x="190" y="94" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">用户事务 Transaction</text>
+<text x="56" y="116" text-anchor="start" fill="#9da7b3" font-size="10">BEGIN ... COMMIT</text>
+<text x="56" y="134" text-anchor="start" fill="#9da7b3" font-size="10">用户视角的一个事务单元</text>
+<text x="56" y="152" text-anchor="start" fill="#9da7b3" font-size="10">可能涉及多张表、多个 B+ 树</text>
+<text x="56" y="170" text-anchor="start" fill="#9da7b3" font-size="10">内部分解为多个 MTR</text>
+<text x="56" y="194" text-anchor="start" fill="#d29922" font-size="9">由 trx_id 标识</text>
+<rect x="360" y="72" width="300" height="140" rx="8" fill="#0d2818" stroke="#3fb950" stroke-width="0.8"/>
+<text x="510" y="94" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">Mini Transaction (MTR)</text>
+<text x="376" y="116" text-anchor="start" fill="#9da7b3" font-size="10">InnoDB 内部的物理操作单元</text>
+<text x="376" y="134" text-anchor="start" fill="#9da7b3" font-size="10">如：B+ 树插入一条记录的</text>
+<text x="376" y="152" text-anchor="start" fill="#9da7b3" font-size="10">页分裂、链表调整等</text>
+<text x="376" y="170" text-anchor="start" fill="#9da7b3" font-size="10">对一组页的若干次修改</text>
+<text x="376" y="194" text-anchor="start" fill="#d29922" font-size="9">原子写入 redo（同生同灭）</text>
+<line x1="340" y1="142" x2="360" y2="142" stroke="#6e7681" stroke-width="1.3" marker-end="url(#a)"/>
+<text x="350" y="236" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">一个 MTR 内的 redo 写入过程</text>
+<rect x="40" y="254" width="620" height="32" rx="5" fill="#21262d" stroke="#6e7681" stroke-width="0.8"/>
+<text x="64" y="274" text-anchor="start" fill="#3fb950" font-size="11" font-weight="700">①</text>
+<text x="96" y="274" text-anchor="start" fill="#9da7b3" font-size="10">MTR 开始，加锁相关页</text>
+<rect x="40" y="290" width="620" height="32" rx="5" fill="#21262d" stroke="#6e7681" stroke-width="0.8"/>
+<text x="64" y="310" text-anchor="start" fill="#3fb950" font-size="11" font-weight="700">②</text>
+<text x="96" y="310" text-anchor="start" fill="#9da7b3" font-size="10">在内存页 frame 上完成所有修改</text>
+<rect x="40" y="326" width="620" height="32" rx="5" fill="#21262d" stroke="#6e7681" stroke-width="0.8"/>
+<text x="64" y="346" text-anchor="start" fill="#3fb950" font-size="11" font-weight="700">③</text>
+<text x="96" y="346" text-anchor="start" fill="#9da7b3" font-size="10">把这组修改对应的 redo 记录批量写入 log buffer</text>
+<rect x="40" y="362" width="620" height="32" rx="5" fill="#21262d" stroke="#6e7681" stroke-width="0.8"/>
+<text x="64" y="382" text-anchor="start" fill="#3fb950" font-size="11" font-weight="700">④</text>
+<text x="96" y="382" text-anchor="start" fill="#9da7b3" font-size="10">更新这些页的 page_lsn = MTR 末尾 LSN</text>
+<rect x="40" y="398" width="620" height="32" rx="5" fill="#21262d" stroke="#6e7681" stroke-width="0.8"/>
+<text x="64" y="418" text-anchor="start" fill="#3fb950" font-size="11" font-weight="700">⑤</text>
+<text x="96" y="418" text-anchor="start" fill="#9da7b3" font-size="10">把这些脏页挂入 Flush 链表</text>
+<rect x="40" y="434" width="620" height="32" rx="5" fill="#21262d" stroke="#6e7681" stroke-width="0.8"/>
+<text x="64" y="454" text-anchor="start" fill="#3fb950" font-size="11" font-weight="700">⑥</text>
+<text x="96" y="454" text-anchor="start" fill="#9da7b3" font-size="10">MTR 结束，释放页锁</text>
+<rect x="40" y="478" width="620" height="84" rx="8" fill="#2d220a" stroke="#d29922" stroke-width="0.8"/>
+<text x="350" y="500" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">redo 是「物理逻辑日志」</text>
+<text x="60" y="520" text-anchor="start" fill="#9da7b3" font-size="10">• 物理：精确指向「哪个 space、哪个 page、什么偏移」</text>
+<text x="60" y="538" text-anchor="start" fill="#9da7b3" font-size="10">• 逻辑：记录的是「对此处做什么操作」（如 INSERT_REC），而非新页的字节快照</text>
+<text x="60" y="556" text-anchor="start" fill="#e8845c" font-size="9">• 必须基于完整页才能重放 —— 撕裂页会让重放失败，所以需要双写（见图6）</text>
+</svg><figcaption>图3　用户事务由多个 MTR 组成；每个 MTR 对一组页的修改 + 对应 redo 原子写入</figcaption></figure>
+<h3>为什么需要 MTR 这一层</h3>
+<p>考虑 B+ 树插入一条记录:可能涉及叶子页的记录插入、链表调整,如果触发分裂还要修改父节点、新建页、调整兄弟页的双向链表。这些<strong>对多个页的修改必须"同生同灭"</strong>——不能只改了一半就把 redo 写出去,否则崩溃恢复重放 redo 时会得到一棵结构错乱的 B+ 树。MTR 把这组修改打包成一个不可分割的单元:要么全部写入 redo log buffer,要么一条不写。</p>
+<h3>redo 的"物理逻辑"性质</h3>
+<p>InnoDB 的 redo 既不是纯物理日志(完整页镜像,太大)也不是纯逻辑日志(SQL 语句,无法在低层重放)。它是<strong>物理逻辑混合的</strong>:</p>
+<ul>
+<li><strong>物理部分</strong>:精确指向"哪个 space、哪个 page、哪个 offset"。</li>
+<li><strong>逻辑部分</strong>:记录"对此处做了什么操作"(<code>MLOG_REC_INSERT</code>、<code>MLOG_REC_UPDATE_IN_PLACE</code> 等),而不是新值的字节镜像。</li>
+</ul>
+<blockquote>"物理逻辑"日志的优点是体积小、写入快;但代价是<strong>必须基于完整页才能重放</strong>。这是双写存在的根本原因——只有页本身完整,redo 才有用武之地。</blockquote>
+<h2 class="sec" id="s4"><span class="n">04</span>检查点:水位线推进</h2>
+<p>redo log 是<strong>环形复用</strong>的(8.0.30 前 ib_logfile0/1 循环写,8.0.30 起 #ib_redoN 文件组)。但 redo 不能无限增长也不能无脑覆盖——必须先保证它对应的脏页已经落盘,否则覆盖了就丢数据。<strong>检查点(Checkpoint)就是用来推进"哪些 redo 可以安全回收"的水位线</strong>。</p>
+<figure><svg width="100%" viewBox="0 0 700 560" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif"><defs><marker id="a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5"/></marker></defs><rect x="0" y="0" width="700" height="560" rx="12" fill="#0d1117"/>
+<text x="350" y="28" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">检查点 Checkpoint：推进 checkpoint_lsn 水位线</text>
+<text x="350" y="48" text-anchor="middle" fill="#6e7681" font-size="10">作用：让 checkpoint_lsn 之前的 redo 可被环形复用，缩短恢复时间</text>
+<text x="350" y="82" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">水位线推进示意</text>
+<text x="40" y="110" text-anchor="start" fill="#d29922" font-size="10">T0：初始</text>
+<line x1="80" y1="142" x2="500" y2="142" stroke="#6e7681" stroke-width="1"/>
+<circle cx="120" cy="142" r="5" fill="#d29922"/>
+<text x="120" y="130" text-anchor="middle" fill="#d29922" font-size="9">chkpt_lsn</text>
+<circle cx="200" cy="142" r="5" fill="#3fb950"/>
+<text x="200" y="160" text-anchor="middle" fill="#3fb950" font-size="9">最旧脏页 LSN</text>
+<circle cx="280" cy="142" r="5" fill="#a371f7"/>
+<text x="280" y="130" text-anchor="middle" fill="#a371f7" font-size="9">redo_lsn</text>
+<text x="40" y="198" text-anchor="start" fill="#d29922" font-size="10">T1：脏页刷了一批</text>
+<line x1="80" y1="230" x2="500" y2="230" stroke="#6e7681" stroke-width="1"/>
+<circle cx="120" cy="230" r="5" fill="#d29922"/>
+<text x="120" y="218" text-anchor="middle" fill="#d29922" font-size="9">chkpt_lsn</text>
+<circle cx="240" cy="230" r="5" fill="#3fb950"/>
+<text x="240" y="248" text-anchor="middle" fill="#3fb950" font-size="9">最旧脏页 LSN</text>
+<circle cx="340" cy="230" r="5" fill="#a371f7"/>
+<text x="340" y="218" text-anchor="middle" fill="#a371f7" font-size="9">redo_lsn</text>
+<text x="550" y="230" text-anchor="start" fill="#3fb950" font-size="10">脏页落盘</text>
+<text x="40" y="286" text-anchor="start" fill="#d29922" font-size="10">T2：checkpoint 推进</text>
+<line x1="80" y1="318" x2="500" y2="318" stroke="#6e7681" stroke-width="1"/>
+<circle cx="200" cy="318" r="5" fill="#d29922"/>
+<text x="200" y="306" text-anchor="middle" fill="#d29922" font-size="9">chkpt_lsn</text>
+<circle cx="240" cy="318" r="5" fill="#3fb950"/>
+<text x="240" y="336" text-anchor="middle" fill="#3fb950" font-size="9">最旧脏页 LSN</text>
+<circle cx="360" cy="318" r="5" fill="#a371f7"/>
+<text x="360" y="306" text-anchor="middle" fill="#a371f7" font-size="9">redo_lsn</text>
+<text x="550" y="318" text-anchor="start" fill="#d29922" font-size="10">水位推进 →</text>
+<rect x="40" y="386" width="620" height="76" rx="8" fill="#2d220a" stroke="#d29922" stroke-width="0.8"/>
+<text x="350" y="408" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">checkpoint_lsn 推进规则</text>
+<text x="60" y="428" text-anchor="start" fill="#9da7b3" font-size="10">checkpoint_lsn = min(所有未刷盘脏页的 oldest_modification_lsn)</text>
+<text x="60" y="448" text-anchor="start" fill="#d29922" font-size="9">含义：所有 LSN &lt; checkpoint_lsn 的修改，必然都已经在数据页上落盘了</text>
+<rect x="40" y="476" width="620" height="72" rx="8" fill="#0d2818" stroke="#3fb950" stroke-width="0.8"/>
+<text x="350" y="498" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">模糊检查点 Fuzzy Checkpoint：不停机的持续推进</text>
+<text x="60" y="518" text-anchor="start" fill="#9da7b3" font-size="10">• 不是「一次性把所有脏页刷盘再设置 checkpoint」，那会造成长时间停顿</text>
+<text x="60" y="536" text-anchor="start" fill="#9da7b3" font-size="10">• 持续小步推进：脏页一边后台刷，checkpoint_lsn 一边跟着移，避免抖动</text>
+</svg><figcaption>图4　水位线推进示意:脏页刷盘 → checkpoint_lsn 跟着前进 → 旧 redo 可回收</figcaption></figure>
+<h3>checkpoint_lsn 的精确定义</h3>
+<pre><code>checkpoint_lsn = min(所有未刷盘脏页的 oldest_modification_lsn)</code></pre>
+<p>含义:取所有脏页"最早一次修改"的 LSN 中的最小值。这个值之前的所有 redo 对应的修改,必然都已经在数据页上落盘了——因为如果还有某个脏页的修改 LSN 比它小,它就不会是 min 了。</p>
+<h3>模糊检查点(Fuzzy Checkpoint)</h3>
+<p>传统检查点("sharp checkpoint")的做法是"停下所有写操作 → 把所有脏页刷盘 → 设置 checkpoint_lsn",这会造成秒级以上停顿,生产不可接受。InnoDB 用<strong>模糊检查点</strong>:不停机,后台线程持续地按 LSN 顺序刷脏页,每刷掉一批就把 checkpoint_lsn 往前推一点——抖动被均摊掉了。</p>
+<blockquote>检查点推进越快,恢复时要扫描的 redo 越少,恢复越快;但代价是脏页刷盘压力大。<code>innodb_io_capacity</code> / <code>innodb_max_dirty_pages_pct</code> 等参数就是在这两端做权衡。</blockquote>
+<h2 class="sec" id="s5"><span class="n">05</span>三阶段恢复(核心)</h2>
+<p>重启时,InnoDB 不对外开放连接(直到恢复完成),依次执行三个阶段。这套流程来自 ARIES 算法,是事务型数据库的工业标准。</p>
+<figure><svg width="100%" viewBox="0 0 700 820" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif"><defs><marker id="a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5"/></marker></defs><rect x="0" y="0" width="700" height="820" rx="12" fill="#0d1117"/>
+<text x="350" y="28" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">恢复三阶段流程：Analysis → Redo → Undo</text>
+<text x="350" y="48" text-anchor="middle" fill="#6e7681" font-size="10">重启时按顺序执行三阶段，全部完成才对外开放连接</text>
+<rect x="40" y="72" width="620" height="180" rx="10" fill="#1d1530" stroke="#a371f7" stroke-width="0.8"/>
+<text x="350" y="94" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">① Analysis 分析阶段</text>
+<text x="60" y="116" text-anchor="start" fill="#9da7b3" font-size="10">目标：从 checkpoint_lsn 开始扫描 redo，弄清「崩溃瞬间到底有哪些事务在活跃」</text>
+<text x="60" y="138" text-anchor="start" fill="#9da7b3" font-size="10">动作：</text>
+<text x="80" y="158" text-anchor="start" fill="#9da7b3" font-size="10">• 从 checkpoint_lsn 顺序扫描 redo log 到末尾</text>
+<text x="80" y="176" text-anchor="start" fill="#9da7b3" font-size="10">• 维护两张表：活跃事务表（trx_id → 状态）和脏页表（page_id → recovery_lsn）</text>
+<text x="80" y="194" text-anchor="start" fill="#9da7b3" font-size="10">• 遇到 COMMIT 记录 → 该事务从活跃表移除</text>
+<text x="80" y="212" text-anchor="start" fill="#9da7b3" font-size="10">• 扫完留在活跃表里的，就是崩溃时未提交、要在 Undo 阶段回滚的事务</text>
+<text x="60" y="236" text-anchor="start" fill="#d29922" font-size="9">产出：两张表 + redo 重做的起点 LSN</text>
+<line x1="350" y1="254" x2="350" y2="272" stroke="#6e7681" stroke-width="1.3" marker-end="url(#a)"/>
+<rect x="40" y="278" width="620" height="224" rx="10" fill="#0d2847" stroke="#4493f8" stroke-width="0.8"/>
+<text x="350" y="300" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">② Redo 前滚阶段（不区分事务是否提交，全部重做）</text>
+<text x="60" y="322" text-anchor="start" fill="#9da7b3" font-size="10">目标：把数据页恢复到「崩溃瞬间」的状态（包括未提交事务的中间状态）</text>
+<text x="60" y="344" text-anchor="start" fill="#9da7b3" font-size="10">动作：</text>
+<text x="80" y="364" text-anchor="start" fill="#9da7b3" font-size="10">• 从重做起点开始，依次读取每条 redo 记录</text>
+<text x="80" y="382" text-anchor="start" fill="#9da7b3" font-size="10">• 对每条记录定位它要修改的页（必要时从磁盘读入）</text>
+<text x="80" y="400" text-anchor="start" fill="#9da7b3" font-size="10">• 比较该页的 page_lsn 与这条 redo 的 lsn：</text>
+<text x="100" y="418" text-anchor="start" fill="#3fb950" font-size="9">- page_lsn ≥ redo_lsn → 此修改早已应用，跳过（幂等）</text>
+<text x="100" y="436" text-anchor="start" fill="#d29922" font-size="9">- page_lsn &lt; redo_lsn → 重放这条记录，更新页与 page_lsn</text>
+<text x="60" y="460" text-anchor="start" fill="#9da7b3" font-size="10">关键：重做对所有事务一视同仁，包括未提交的——它们的撤销由下一阶段负责</text>
+<text x="60" y="484" text-anchor="start" fill="#d29922" font-size="9">产出：数据页 = 崩溃瞬间状态（已提交+未提交的改动都在）</text>
+<line x1="350" y1="504" x2="350" y2="522" stroke="#6e7681" stroke-width="1.3" marker-end="url(#a)"/>
+<rect x="40" y="528" width="620" height="200" rx="10" fill="#2d220a" stroke="#d29922" stroke-width="0.8"/>
+<text x="350" y="550" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">③ Undo 后滚阶段（撤销未提交事务）</text>
+<text x="60" y="572" text-anchor="start" fill="#9da7b3" font-size="10">目标：把 Analysis 阶段识别出的未提交事务，全部回滚掉</text>
+<text x="60" y="594" text-anchor="start" fill="#9da7b3" font-size="10">动作：</text>
+<text x="80" y="614" text-anchor="start" fill="#9da7b3" font-size="10">• 对每个未提交事务，沿其 undo 链反向遍历</text>
+<text x="80" y="632" text-anchor="start" fill="#9da7b3" font-size="10">• 对每条 undo 记录执行反向操作（INSERT→DELETE，UPDATE→恢复旧值）</text>
+<text x="80" y="650" text-anchor="start" fill="#9da7b3" font-size="10">• 反向操作本身也会写新的 redo（CLR，Compensation Log Record），保证幂等</text>
+<text x="80" y="668" text-anchor="start" fill="#9da7b3" font-size="10">• 全部回滚完成后，标记这些事务为 ROLLBACK 结束</text>
+<text x="60" y="692" text-anchor="start" fill="#d29922" font-size="9">产出：未提交事务的痕迹被彻底清除，数据库进入一致状态</text>
+<text x="60" y="712" text-anchor="start" fill="#3fb950" font-size="9">注：MySQL 8.0 起，此阶段可在数据库对外开放后异步进行（后台 purge 协助）</text>
+<rect x="40" y="748" width="620" height="52" rx="8" fill="#0d2818" stroke="#3fb950" stroke-width="0.8"/>
+<text x="350" y="772" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">恢复完成 → 数据库对外提供服务</text>
+<text x="350" y="790" text-anchor="middle" fill="#9da7b3" font-size="9">已提交的全在（D）、未提交的全无（A）、约束维持（C）</text>
+</svg><figcaption>图5　Analysis → Redo → Undo 三阶段的目标、动作与产出</figcaption></figure>
+<h4><span class="tag a">① Analysis</span> 分析阶段</h4>
+<p>从 <code>checkpoint_lsn</code> 开始<strong>顺序扫描 redo 到末尾</strong>,弄清楚"崩溃瞬间到底有哪些事务在活跃"。InnoDB 在内存里维护两张表:</p>
+<ul>
+<li><strong>活跃事务表(Trx Table)</strong>:trx_id → 状态(active/preparing/committed)。每遇到一条 redo 记录,就把对应事务记到表里;遇到 <code>COMMIT</code> 记录就从表里移除。<strong>扫完后仍留在表里的,就是崩溃时未提交的事务</strong>,要在 Undo 阶段回滚。</li>
+<li><strong>脏页表(Dirty Page Table)</strong>:page_id → recovery_lsn(该页的最早修改 LSN)。用于 Redo 阶段判断从哪条 redo 开始重放,跳过已应用的修改。</li>
+</ul>
+<h4><span class="tag r">② Redo</span> 前滚阶段(<strong>对所有事务一视同仁</strong>)</h4>
+<p>从重做起点开始,逐条读 redo 记录、定位目标页(若不在内存就从磁盘读入)、比对 <code>page_lsn</code>:</p>
+<ul>
+<li><code>page_lsn ≥ redo_lsn</code>:此修改早已应用,<strong>跳过</strong>(这就是幂等性的体现)。</li>
+<li><code>page_lsn &lt; redo_lsn</code>:<strong>重放</strong>这条 redo,把修改应用到页上,更新 <code>page_lsn</code>。</li>
+</ul>
+<blockquote><strong>关键</strong>:Redo 阶段对已提交、未提交事务<strong>一视同仁,全部重做</strong>。直觉上你可能觉得未提交的不该重做——但这是必须的,因为只有先恢复到"崩溃瞬间的完整状态",Undo 阶段才能拿到完整的 undo 链去做撤销。</blockquote>
+<h4><span class="tag u">③ Undo</span> 后滚阶段</h4>
+<p>对 Analysis 阶段识别出的每个未提交事务,沿其 undo 链反向遍历,对每条 undo 记录执行反向操作:</p>
+<ul>
+<li>INSERT → DELETE</li>
+<li>DELETE-mark → 恢复 mark 标志</li>
+<li>UPDATE → 用 undo 里的旧值覆盖</li>
+</ul>
+<p>这里有一个精妙细节:<strong>反向操作本身也会产生新的 redo</strong>,叫 <code>CLR</code>(Compensation Log Record,补偿日志记录)。这保证了 Undo 过程本身也是幂等可恢复的——如果 Undo 阶段进行到一半再次崩溃,下次重启时这部分 CLR 也会被重放,不会出现"回滚了一半"的状态。</p>
+<blockquote>MySQL 8.0 起,Undo 阶段可以在数据库对外开放连接<strong>之后</strong>异步进行,后台 purge 线程协助完成。这能让恢复后的开放服务时间更短。</blockquote>
+<h2 class="sec" id="s6"><span class="n">06</span>双写:撕裂页防线</h2>
+<p>上面整套 redo/undo 机制的前提是<strong>页本身完整</strong>。但磁盘原子写单位通常只有 4KB,而 InnoDB 页是 16KB——一次 16KB 写在 OS 看来是 4 次独立的 4KB 写,中间崩溃就会留下"撕裂页":前 8KB 是新数据、后 8KB 是旧数据,校验和失败、B+ 树结构错乱。redo 是物理逻辑日志,基于撕裂页无法重放,所以必须有<strong>双写(Doublewrite)</strong>这道前置防线。</p>
+<figure><svg width="100%" viewBox="0 0 700 720" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif"><defs><marker id="a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5"/></marker></defs><rect x="0" y="0" width="700" height="720" rx="12" fill="#0d1117"/>
+<text x="350" y="28" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">双写 Doublewrite：解决「部分写入」的关键防线</text>
+<text x="350" y="48" text-anchor="middle" fill="#6e7681" font-size="10">redo 重做的前提是「页本身完整」；双写保证这个前提</text>
+<rect x="40" y="72" width="620" height="116" rx="8" fill="#2d1012" stroke="#f85149" stroke-width="0.8"/>
+<text x="350" y="94" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">问题：撕裂页 Torn Page</text>
+<text x="60" y="116" text-anchor="start" fill="#9da7b3" font-size="10">• InnoDB 页 = 16KB，但 OS/磁盘原子写单位通常只有 4KB</text>
+<text x="60" y="134" text-anchor="start" fill="#9da7b3" font-size="10">• 一次 16KB 写 = 4 次独立的 4KB 写，崩溃可能发生在中间</text>
+<text x="60" y="152" text-anchor="start" fill="#9da7b3" font-size="10">• 结果：磁盘上某页前 8KB 是新数据、后 8KB 是旧数据 → 页结构损坏、校验和失败</text>
+<text x="60" y="172" text-anchor="start" fill="#d29922" font-size="10">• redo 是物理逻辑日志，必须基于完整页重放 → 撕裂页让 redo 无能为力</text>
+<text x="350" y="214" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">双写流程：每次脏页刷盘都先「写两份」</text>
+<rect x="40" y="228" width="620" height="80" rx="8" fill="#0d2847" stroke="#4493f8" stroke-width="0.8"/>
+<text x="350" y="250" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">第一阶段：写双写缓冲区</text>
+<text x="60" y="272" text-anchor="start" fill="#9da7b3" font-size="10">① 把要刷的脏页批量拷贝到内存中的 doublewrite buffer（2MB ≈ 128 页）</text>
+<text x="60" y="290" text-anchor="start" fill="#9da7b3" font-size="10">② 把这 2MB 顺序写入磁盘上的双写区（连续空间），并 fsync</text>
+<line x1="350" y1="308" x2="350" y2="322" stroke="#6e7681" stroke-width="1.3" marker-end="url(#a)"/>
+<rect x="40" y="328" width="620" height="80" rx="8" fill="#0d2818" stroke="#3fb950" stroke-width="0.8"/>
+<text x="350" y="350" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">第二阶段：写到真正位置</text>
+<text x="60" y="372" text-anchor="start" fill="#9da7b3" font-size="10">③ 把这批脏页写到它们在 .ibd 中真实的离散位置（随机写）</text>
+<text x="60" y="390" text-anchor="start" fill="#9da7b3" font-size="10">④ 落盘后，双写区里这批页可被复用</text>
+<text x="350" y="434" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">崩溃恢复时怎么用双写区</text>
+<rect x="40" y="448" width="300" height="180" rx="8" fill="#0d2847" stroke="#4493f8" stroke-width="0.8"/>
+<text x="190" y="470" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">崩溃在第一阶段</text>
+<text x="56" y="492" text-anchor="start" fill="#9da7b3" font-size="10">双写区写坏了无所谓</text>
+<text x="56" y="510" text-anchor="start" fill="#9da7b3" font-size="10">.ibd 中数据还是完整旧版本</text>
+<text x="56" y="528" text-anchor="start" fill="#9da7b3" font-size="10">丢弃双写区残留，</text>
+<text x="56" y="546" text-anchor="start" fill="#9da7b3" font-size="10">直接走 redo 重放即可</text>
+<text x="56" y="580" text-anchor="start" fill="#3fb950" font-size="10">页不会损坏 ✓</text>
+<rect x="360" y="448" width="300" height="180" rx="8" fill="#2d220a" stroke="#d29922" stroke-width="0.8"/>
+<text x="510" y="470" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">崩溃在第二阶段</text>
+<text x="376" y="492" text-anchor="start" fill="#9da7b3" font-size="10">.ibd 中某页可能撕裂</text>
+<text x="376" y="510" text-anchor="start" fill="#9da7b3" font-size="10">但双写区有完整副本</text>
+<text x="376" y="528" text-anchor="start" fill="#9da7b3" font-size="10">扫描 .ibd 校验失败的页</text>
+<text x="376" y="546" text-anchor="start" fill="#9da7b3" font-size="10">→ 从双写区找完整副本覆盖</text>
+<text x="376" y="564" text-anchor="start" fill="#9da7b3" font-size="10">→ 页恢复完整后走 redo</text>
+<text x="376" y="598" text-anchor="start" fill="#3fb950" font-size="10">页可恢复完整 ✓</text>
+<rect x="40" y="648" width="620" height="60" rx="8" fill="#21262d" stroke="#6e7681" stroke-width="0.8"/>
+<text x="350" y="670" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">为什么「写两次」不是两倍 I/O？</text>
+<text x="60" y="690" text-anchor="start" fill="#9da7b3" font-size="10">双写区那次是 2MB 顺序写（很快），被均摊到 128 个页的离散随机写中，占比通常 5%~15%</text>
+</svg><figcaption>图6　双写机制:脏页先顺序写入双写缓冲区,再写到 .ibd 真实位置</figcaption></figure>
+<h3>为什么"写两次"不是两倍 I/O</h3>
+<p>双写缓冲区默认 2MB,正好对应 128 个 16KB 页。脏页刷盘时:</p>
+<ol>
+<li>把这批最多 128 个脏页,作为一个 2MB 块<strong>顺序写</strong>入磁盘上的双写区(系统表空间内或 8.0.20+ 独立的 <code>.dblwr</code> 文件)并 fsync;</li>
+<li>再把这些页写到 <code>.ibd</code> 里它们各自真实的、<strong>离散随机的</strong>位置。</li>
+</ol>
+<p>真正昂贵的是离散随机写(128 次寻址);多出来的那次是一次顺序 2MB 写,被均摊到 128 个页中,实际开销通常只增加 5%~15%,远低于直觉上的"翻倍"。</p>
+<h3>恢复时怎么用双写区</h3>
+<p>启动时 InnoDB 扫描每个数据页的校验和(File Trailer),若发现某页损坏,就<strong>从双写区找这个页的完整副本覆盖回去</strong>,然后再让 redo 接力补齐后续修改。两阶段崩溃都有解:</p>
+<ul>
+<li><strong>崩溃在第一阶段</strong>(双写区还在写):<code>.ibd</code> 没动,数据页完整。直接走 redo 即可。</li>
+<li><strong>崩溃在第二阶段</strong>(写 .ibd 中途):某页可能撕裂,但双写区有完整副本,覆盖修复后走 redo。</li>
+</ul>
+<blockquote>如果你的存储已经保证 16KB 原子写(某些企业级 SSD、ZFS、特定 NVMe atomic write),双写就是纯浪费,可以 <code>innodb_doublewrite=OFF</code> 关掉。</blockquote>
+<h2 class="sec" id="s7"><span class="n">07</span>四种崩溃时机</h2>
+<p>恢复机制要对各种崩溃时机都正确。下面四个场景覆盖了主要可能性。</p>
+<figure><svg width="100%" viewBox="0 0 700 560" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif"><defs><marker id="a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5"/></marker></defs><rect x="0" y="0" width="700" height="560" rx="12" fill="#0d1117"/>
+<text x="350" y="28" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">四种崩溃时机：每种都能正确恢复</text>
+<text x="350" y="48" text-anchor="middle" fill="#6e7681" font-size="10">按崩溃发生的位置分类，看每种情况下恢复机制如何应对</text>
+<rect x="40" y="72" width="620" height="108" rx="8" fill="#2d220a" stroke="#d29922" stroke-width="0.8"/>
+<text x="56" y="94" text-anchor="start" fill="#e6edf3" font-size="12" font-weight="700">场景 A</text>
+<text x="120" y="94" text-anchor="start" fill="#e6edf3" font-size="11">事务执行中、未提交时崩溃</text>
+<text x="60" y="118" text-anchor="start" fill="#9da7b3" font-size="10">• redo 可能写了一部分（包含未提交事务的修改）</text>
+<text x="60" y="138" text-anchor="start" fill="#9da7b3" font-size="10">• 恢复：Redo 阶段全部重做 → Undo 阶段回滚未提交事务 → 痕迹清除</text>
+<text x="60" y="158" text-anchor="start" fill="#3fb950" font-size="9">结论：恢复后无损一致 ✓</text>
+<rect x="40" y="188" width="620" height="108" rx="8" fill="#0d2847" stroke="#4493f8" stroke-width="0.8"/>
+<text x="56" y="210" text-anchor="start" fill="#e6edf3" font-size="12" font-weight="700">场景 B</text>
+<text x="120" y="210" text-anchor="start" fill="#e6edf3" font-size="11">事务已提交、redo 已落盘、数据页未落盘时崩溃</text>
+<text x="60" y="234" text-anchor="start" fill="#9da7b3" font-size="10">• redo 完整，数据页是旧版本</text>
+<text x="60" y="254" text-anchor="start" fill="#9da7b3" font-size="10">• 恢复：Redo 重放把改动补回页上 → 该事务在 Analysis 已知是已提交、无需 Undo</text>
+<text x="60" y="274" text-anchor="start" fill="#3fb950" font-size="9">结论：恢复后无损一致 ✓</text>
+<rect x="40" y="304" width="620" height="108" rx="8" fill="#2d1a0f" stroke="#e8845c" stroke-width="0.8"/>
+<text x="56" y="326" text-anchor="start" fill="#e6edf3" font-size="12" font-weight="700">场景 C</text>
+<text x="120" y="326" text-anchor="start" fill="#e6edf3" font-size="11">脏页正在落盘途中崩溃（撕裂页风险）</text>
+<text x="60" y="350" text-anchor="start" fill="#9da7b3" font-size="10">• .ibd 中页可能损坏</text>
+<text x="60" y="370" text-anchor="start" fill="#9da7b3" font-size="10">• 恢复：双写区找完整副本覆盖 → Redo 接力补齐后续 → 必要时 Undo</text>
+<text x="60" y="390" text-anchor="start" fill="#3fb950" font-size="9">结论：恢复后无损一致 ✓</text>
+<rect x="40" y="420" width="620" height="108" rx="8" fill="#0d2818" stroke="#3fb950" stroke-width="0.8"/>
+<text x="56" y="442" text-anchor="start" fill="#e6edf3" font-size="12" font-weight="700">场景 D</text>
+<text x="120" y="442" text-anchor="start" fill="#e6edf3" font-size="11">redo 写到一半、未落盘时崩溃（=1 时不会丢已提交）</text>
+<text x="60" y="466" text-anchor="start" fill="#9da7b3" font-size="10">• 未刷的部分 redo 丢失</text>
+<text x="60" y="486" text-anchor="start" fill="#9da7b3" font-size="10">• 这些 redo 对应的事务必然尚未返回 commit 成功 → 用户没看到，相当于没发生</text>
+<text x="60" y="506" text-anchor="start" fill="#3fb950" font-size="9">结论：恢复后无损一致 ✓</text>
+</svg><figcaption>图7　四种崩溃时机的对应恢复路径</figcaption></figure>
+<table>
+<tr><th>场景</th><th>崩溃时机</th><th>恢复路径</th></tr>
+<tr><td>A</td><td>事务执行中、未提交</td><td>Redo 全部重做 → Undo 回滚未提交 → 痕迹清除</td></tr>
+<tr><td>B</td><td>已提交,redo 已落盘,数据页未落盘</td><td>Redo 重放补齐 → 该事务无需 Undo</td></tr>
+<tr><td>C</td><td>脏页正在落盘途中(撕裂风险)</td><td>双写区找完整副本覆盖 → Redo 接力 → 必要时 Undo</td></tr>
+<tr><td>D</td><td>redo 写到一半、未落盘</td><td>未刷的 redo 丢失 → 但这些事务必然未返回 commit → 对用户相当于没发生</td></tr>
+</table>
+<blockquote>场景 D 是 ACID 中 D(持久性)的精确边界:<strong>commit 返回成功的事务一定不丢,反过来未返回成功的事务不保证保留</strong>。这就是 <code>innodb_flush_log_at_trx_commit=1</code>(默认)的语义。</blockquote>
+<h2 class="sec" id="s8"><span class="n">08</span>ACID 完整闭环</h2>
+<p>把前面所有机制串起来,看每个 ACID 特性是由谁保障的:</p>
+<figure><svg width="100%" viewBox="0 0 700 540" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif"><defs><marker id="a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5"/></marker></defs><rect x="0" y="0" width="700" height="540" rx="12" fill="#0d1117"/>
+<text x="350" y="28" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">ACID 完整闭环：每个特性由谁保障</text>
+<text x="350" y="48" text-anchor="middle" fill="#6e7681" font-size="10">崩溃恢复机制如何撑起 ACID 四个属性</text>
+<rect x="40" y="72" width="300" height="220" rx="8" fill="#2d220a" stroke="#d29922" stroke-width="0.8"/>
+<text x="190" y="96" text-anchor="middle" fill="#e6edf3" font-size="12.5" font-weight="700">A 原子性 Atomicity</text>
+<text x="190" y="116" text-anchor="middle" fill="#9da7b3" font-size="10">事务要么全做、要么全不做</text>
+<text x="56" y="148" text-anchor="start" fill="#9da7b3" font-size="10">• 写操作时同步生成 undo log</text>
+<text x="56" y="174" text-anchor="start" fill="#9da7b3" font-size="10">• 崩溃后 Undo 阶段回滚未提交事务</text>
+<text x="56" y="200" text-anchor="start" fill="#9da7b3" font-size="10">• 用户 ROLLBACK 也走 undo</text>
+<rect x="56" y="232" width="268" height="40" rx="5" fill="#21262d" stroke="#6e7681" stroke-width="0.8"/>
+<text x="190" y="250" text-anchor="middle" fill="#6e7681" font-size="9">核心机制</text>
+<text x="190" y="266" text-anchor="middle" fill="#d29922" font-size="10">undo log + Undo 阶段</text>
+<rect x="360" y="72" width="300" height="220" rx="8" fill="#0d2818" stroke="#3fb950" stroke-width="0.8"/>
+<text x="510" y="96" text-anchor="middle" fill="#e6edf3" font-size="12.5" font-weight="700">C 一致性 Consistency</text>
+<text x="510" y="116" text-anchor="middle" fill="#9da7b3" font-size="10">事务前后数据满足约束</text>
+<text x="376" y="148" text-anchor="start" fill="#9da7b3" font-size="10">• 由 A、I、D 共同保证</text>
+<text x="376" y="174" text-anchor="start" fill="#9da7b3" font-size="10">• 唯一约束、外键、check 在 SQL 层校验</text>
+<text x="376" y="200" text-anchor="start" fill="#9da7b3" font-size="10">• 崩溃恢复维持约束不被破坏</text>
+<rect x="376" y="232" width="268" height="40" rx="5" fill="#21262d" stroke="#6e7681" stroke-width="0.8"/>
+<text x="510" y="250" text-anchor="middle" fill="#6e7681" font-size="9">核心机制</text>
+<text x="510" y="266" text-anchor="middle" fill="#d29922" font-size="10">A+I+D 联合 + SQL 校验</text>
+<rect x="40" y="302" width="300" height="220" rx="8" fill="#1d1530" stroke="#a371f7" stroke-width="0.8"/>
+<text x="190" y="326" text-anchor="middle" fill="#e6edf3" font-size="12.5" font-weight="700">I 隔离性 Isolation</text>
+<text x="190" y="346" text-anchor="middle" fill="#9da7b3" font-size="10">并发事务互不干扰</text>
+<text x="56" y="378" text-anchor="start" fill="#9da7b3" font-size="10">• 锁（行锁、间隙锁、Next-Key）</text>
+<text x="56" y="404" text-anchor="start" fill="#9da7b3" font-size="10">• MVCC + ReadView + undo 旧版本</text>
+<text x="56" y="430" text-anchor="start" fill="#9da7b3" font-size="10">• 崩溃恢复期间不对外服务</text>
+<rect x="56" y="462" width="268" height="40" rx="5" fill="#21262d" stroke="#6e7681" stroke-width="0.8"/>
+<text x="190" y="480" text-anchor="middle" fill="#6e7681" font-size="9">核心机制</text>
+<text x="190" y="496" text-anchor="middle" fill="#d29922" font-size="10">锁 + MVCC（依赖 undo）</text>
+<rect x="360" y="302" width="300" height="220" rx="8" fill="#0d2847" stroke="#4493f8" stroke-width="0.8"/>
+<text x="510" y="326" text-anchor="middle" fill="#e6edf3" font-size="12.5" font-weight="700">D 持久性 Durability</text>
+<text x="510" y="346" text-anchor="middle" fill="#9da7b3" font-size="10">提交后即使崩溃也不丢</text>
+<text x="376" y="378" text-anchor="start" fill="#9da7b3" font-size="10">• WAL：先写 redo 再延迟刷页</text>
+<text x="376" y="404" text-anchor="start" fill="#9da7b3" font-size="10">• 提交时按策略刷 redo 到磁盘</text>
+<text x="376" y="430" text-anchor="start" fill="#9da7b3" font-size="10">• 崩溃恢复 Redo 阶段重放</text>
+<rect x="376" y="462" width="268" height="40" rx="5" fill="#21262d" stroke="#6e7681" stroke-width="0.8"/>
+<text x="510" y="480" text-anchor="middle" fill="#6e7681" font-size="9">核心机制</text>
+<text x="510" y="496" text-anchor="middle" fill="#d29922" font-size="10">redo log + Redo 阶段</text>
+<text x="350" y="514" text-anchor="middle" fill="#d29922" font-size="11">总：undo + redo + 锁 + MVCC + 双写 + 检查点 = InnoDB 的崩溃安全闭环</text>
+</svg><figcaption>图8　ACID 四特性各自的核心保障机制</figcaption></figure>
+<ul>
+<li><span class="tag a">A 原子性</span> 由 <strong>undo log + Undo 阶段</strong> 保障:任何修改前都生成可逆的 undo 记录,事务要么走到 COMMIT 全部生效,要么被 ROLLBACK 或 Undo 阶段全部撤销。</li>
+<li><span class="tag r">D 持久性</span> 由 <strong>redo log + Redo 阶段</strong> 保障:提交时 redo 已落盘,即使数据页还在内存,崩溃后也能用 redo 重做。</li>
+<li><strong>I 隔离性</strong> 由 <strong>锁(Next-Key Lock 等)+ MVCC + ReadView</strong> 保障;MVCC 读旧版本依赖 undo,所以隔离性也间接依赖 undo。</li>
+<li><strong>C 一致性</strong> 是<strong>结果</strong>:A、I、D 都成立、加上 SQL 层的约束检查(唯一、外键、check)、加上双写保证页结构不损坏 + MTR 保证物理操作原子,共同维持。</li>
+</ul>
+<blockquote><strong>一句话</strong>:undo 管"撤销",redo 管"重做",锁/MVCC 管"并发",双写管"页完整",检查点管"日志回收"——五者合一,构成 InnoDB 的崩溃安全闭环。</blockquote>
+<h2 class="sec" id="s9"><span class="n">09</span>实战与调优</h2>
+<h3>恢复速度的影响因素</h3>
+<p>恢复时间 ≈ 要扫描的 redo 量 + 要重放的 redo 数 + Undo 量。优化恢复速度的核心是<strong>缩短崩溃时 checkpoint_lsn 与 redo_lsn 之间的距离</strong>(即"未落盘脏页对应的 redo 总量")。</p>
+<table>
+<tr><th>参数</th><th>作用</th></tr>
+<tr><td><code>innodb_redo_log_capacity</code>(8.0.30+)</td><td>redo 总容量。太小频繁强制检查点;太大恢复慢</td></tr>
+<tr><td><code>innodb_io_capacity</code> / <code>innodb_io_capacity_max</code></td><td>后台刷脏页的速度上限</td></tr>
+<tr><td><code>innodb_max_dirty_pages_pct</code></td><td>脏页占 Buffer Pool 的最高比例,触发刷盘</td></tr>
+<tr><td><code>innodb_flush_log_at_trx_commit</code></td><td>1(默认,最安全)/ 2(OS 崩溃可能丢 1s)/ 0(MySQL 崩溃可能丢 1s)</td></tr>
+<tr><td><code>innodb_doublewrite</code></td><td>是否启用双写,在保证原子写的存储上可关闭</td></tr>
+</table>
+<h3>innodb_force_recovery:紧急启动模式</h3>
+<p>当正常恢复也失败时(比如 redo 损坏、系统表空间损坏),可以用这个参数<strong>跳过</strong>部分恢复步骤强制启动:</p>
+<table>
+<tr><th>值</th><th>跳过的步骤</th></tr>
+<tr><td>0(默认)</td><td>正常恢复</td></tr>
+<tr><td>1</td><td>忽略损坏页,继续启动</td></tr>
+<tr><td>2</td><td>不启动后台 master 和 purge 线程</td></tr>
+<tr><td>3</td><td>不做事务回滚(跳过 Undo)</td></tr>
+<tr><td>4</td><td>不计算统计信息</td></tr>
+<tr><td>5</td><td>不扫描 undo log(可能丢未提交事务)</td></tr>
+<tr><td>6</td><td>不重做 redo log(最危险,可能丢已提交事务)</td></tr>
+</table>
+<blockquote><strong>使用守则</strong>:从 1 开始递增尝试,启动成功后<strong>立即用 mysqldump 导出数据</strong>,然后重建实例。设为 ≥4 后数据库会进入只读模式,且数据可能已经不一致——它是抢救数据的最后手段,不是日常运行模式。</blockquote>
+<h3>查看恢复过程</h3>
+<p>崩溃恢复的过程会输出到 MySQL 错误日志,关键字搜:<code>InnoDB: Starting crash recovery</code>、<code>Apply batch completed</code>、<code>Doublewrite buffer has been recovered</code>、<code>Rolling back trx with id …</code>。一次"健康"的恢复完整日志通常在几秒到几十秒之间;若你看到恢复跑了几分钟甚至几小时,要检查 redo 容量是否设得过大、或脏页刷盘速度跟不上写入。</p>
+<hr>
+<blockquote style="border-left-color:var(--red);background:rgba(248,81,73,0.06);">
+<strong>三份文档总结</strong>:<br>
+• 第一份《存储结构》讲<strong>数据躺在哪</strong>(表空间→段→区→页→记录);<br>
+• 第二份《Buffer Pool 内存侧》讲<strong>数据如何高效又安全地被使用</strong>(缓存+WAL+脏页管理);<br>
+• 这份《故障恢复》讲<strong>崩溃后如何回到一致状态</strong>(LSN+三阶段+双写+检查点)。<br>
+三者合起来,是 InnoDB 作为一个可靠存储引擎的完整图景。
+</blockquote></div></body></html>

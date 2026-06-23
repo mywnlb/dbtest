@@ -6,8 +6,8 @@ import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.RollPointer;
 import cn.zhangyis.db.domain.TransactionId;
 import cn.zhangyis.db.storage.api.DiskSpaceManager;
-import cn.zhangyis.db.storage.api.IndexPageAccess;
-import cn.zhangyis.db.storage.api.IndexPageHandle;
+import cn.zhangyis.db.storage.api.index.IndexPageAccess;
+import cn.zhangyis.db.storage.api.index.IndexPageHandle;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.page.FilePageHeader;
@@ -196,6 +196,69 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         // 已 delete-marked（半失败/重试）则跳过 deleteMark 直接 purge；否则先逻辑标记再物理摘除
         if (!cursor.isDeleted()) {
             deleter.deleteMark(leaf, offset);
+        }
+        purger.purge(leaf, offset);
+        return new BTreeDeleteResult(true);
+    }
+
+    /**
+     * Purge 物理移除一条**已经 delete-marked** 的聚簇记录（purge 专用，与 {@link #deleteClustered} 的关键区别：
+     * 绝不主动 delete-mark）。purge worker 处理某已提交事务的 DELETE_MARK undo 时调用：re-locate {@code key} →
+     * 必须命中、且记录**当前仍为 delete-marked**、且 {@code DB_TRX_ID==expectedTrxId}（删除该行的事务）、
+     * 且 {@code DB_ROLL_PTR==expectedRollPtr}（= 该 DELETE_MARK undo record 自身地址）→ 才 {@link RecordPagePurger#purge}
+     * 物理摘链回收。任一不符（未命中/未标记/隐藏列不符）一律确认 stale，返回 {@code removed=false} 且**不做任何修改**。
+     *
+     * <p>为什么必须严格：purge 在 boundary 之外异步运行，若像 {@code deleteClustered} 那样对未标记行也先 deleteMark，
+     * 会把一行**存活**记录误删（例如该 key 已被新事务重新插入为 live 行）。purge 只能回收确属本 undo 删除的死行。
+     *
+     * @param key             目标聚簇 key。
+     * @param expectedTrxId   删除该行的事务 id（undo 的 DB_TRX_ID），不能为 null。
+     * @param expectedRollPtr 该 DELETE_MARK undo record 自身的 roll pointer（= 记录应有的 DB_ROLL_PTR），不能为 Java null。
+     * @return {@link BTreeDeleteResult#removed()} 是否物理移除；false 表示确认 stale、未改任何内容。
+     */
+    public BTreeDeleteResult purgeDeleteMarkedClustered(MiniTransaction mtr, BTreeIndex index, SearchKey key,
+                                                        TransactionId expectedTrxId, RollPointer expectedRollPtr) {
+        if (key == null || expectedTrxId == null || expectedRollPtr == null) {
+            throw new DatabaseValidationException(
+                    "purgeDeleteMarkedClustered key/expectedTrxId/expectedRollPtr must not be null");
+        }
+        if (!index.clustered()) {
+            throw new DatabaseValidationException(
+                    "purgeDeleteMarkedClustered requires a clustered index: " + index.indexId());
+        }
+        IndexPageHandle rootHandle = openRoot(mtr, index, PageLatchMode.EXCLUSIVE);
+        RecordPage root = rootHandle.recordPage();
+        if (index.rootLevel() == 0) {
+            return purgeInLeaf(root, index.rootPageId(), index, key, expectedTrxId, expectedRollPtr);
+        }
+        if (index.rootLevel() == 1) {
+            PageId leafId = chooseChild(root, index, key);
+            IndexPageHandle leafHandle = pageAccess.openIndexPageHandle(mtr, leafId, PageLatchMode.EXCLUSIVE);
+            RecordPage leaf = leafHandle.recordPage();
+            validateLeafPage(leaf, index, leafId);
+            return purgeInLeaf(leaf, leafId, index, key, expectedTrxId, expectedRollPtr);
+        }
+        throw new BTreeUnsupportedStructureException("split btree supports rootLevel 0 or 1 only: "
+                + index.rootLevel());
+    }
+
+    /**
+     * 在已定位 leaf 上执行 purge 严格校验：命中 + 已 delete-marked + 隐藏列(DB_TRX_ID/DB_ROLL_PTR)匹配才物理摘除；
+     * 否则不改任何内容（stale 收敛）。与 {@link #deleteInLeaf} 的差别：未标记记录在此**不**会被 deleteMark。
+     */
+    private BTreeDeleteResult purgeInLeaf(RecordPage leaf, PageId leafId, BTreeIndex index, SearchKey key,
+                                          TransactionId expectedTrxId, RollPointer expectedRollPtr) {
+        validateLeafPage(leaf, index, leafId);
+        OptionalInt found = search.findEqual(leaf, key, index.keyDef(), index.schema());
+        if (found.isEmpty()) {
+            return new BTreeDeleteResult(false);
+        }
+        int offset = found.getAsInt();
+        RecordCursor cursor = new RecordCursor(leaf, offset, index.schema(), registry);
+        if (!cursor.isDeleted()
+                || !expectedTrxId.equals(cursor.dbTrxId())
+                || !expectedRollPtr.equals(cursor.dbRollPtr())) {
+            return new BTreeDeleteResult(false);
         }
         purger.purge(leaf, offset);
         return new BTreeDeleteResult(true);

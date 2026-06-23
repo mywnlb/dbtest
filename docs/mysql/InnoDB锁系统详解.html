@@ -1,0 +1,932 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>InnoDB 锁系统详解（深入版）</title>
+<style>
+:root{
+  --bg:#0a111f; --bg2:#0c1426; --surface:#111d36;
+  --surface2:#16223d; --surface3:#1d2c4d; --border:#26375c; --border2:#324a78;
+  --text:#e7edfa; --muted:#9aabce; --faint:#6b7da3;
+  --teal:#2dd4bf; --teal-d:#0f766e; --blue:#5b9dff; --blue-d:#1e4fb0;
+  --purple:#b794f6; --purple-d:#6b46c1; --amber:#f5b955; --amber-d:#b45309;
+  --red:#f0697a; --red-d:#9b2c3a; --green:#5fd38a; --green-d:#15803d;
+  --mono:"JetBrains Mono","Cascadia Code","SF Mono",Consolas,"Liberation Mono",monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans SC",sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{
+  font-family:var(--sans); background:var(--bg); color:var(--text);
+  line-height:1.75; font-size:16px; letter-spacing:.01em;
+  background-image:
+    radial-gradient(900px 500px at 12% -8%, rgba(45,212,191,.10), transparent 60%),
+    radial-gradient(900px 600px at 100% 0%, rgba(91,157,255,.10), transparent 55%),
+    radial-gradient(700px 700px at 50% 120%, rgba(183,148,246,.07), transparent 60%);
+  background-attachment:fixed;
+}
+.wrap{max-width:920px;margin:0 auto;padding:0 24px 120px}
+
+/* ---------- header ---------- */
+.hero{padding:88px 0 56px;text-align:center;position:relative}
+.kicker{font-family:var(--mono);font-size:13px;letter-spacing:.32em;text-transform:uppercase;color:var(--teal);margin-bottom:22px}
+.hero h1{
+  font-size:clamp(34px,6vw,56px);line-height:1.1;font-weight:800;letter-spacing:-.01em;
+  background:linear-gradient(120deg,#fff 10%,var(--teal) 55%,var(--blue) 100%);
+  -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;
+}
+.hero .sub{margin-top:20px;color:var(--muted);font-size:18px;max-width:640px;margin-left:auto;margin-right:auto}
+.series{margin-top:34px;display:flex;gap:10px;justify-content:center;flex-wrap:wrap;font-family:var(--mono);font-size:12.5px}
+.series span{padding:7px 13px;border:1px solid var(--border);border-radius:999px;color:var(--faint);background:rgba(255,255,255,.02)}
+.series span.now{border-color:var(--teal);color:var(--teal);background:rgba(45,212,191,.08);box-shadow:0 0 0 1px rgba(45,212,191,.18)}
+
+/* ---------- TOC ---------- */
+.toc{margin:18px 0 60px;background:linear-gradient(180deg,var(--surface),var(--bg2));border:1px solid var(--border);border-radius:18px;padding:26px 30px}
+.toc h2{font-size:13px;letter-spacing:.22em;text-transform:uppercase;color:var(--faint);font-family:var(--mono);margin-bottom:16px;font-weight:600}
+.toc ol{list-style:none;counter-reset:t;display:grid;grid-template-columns:1fr 1fr;gap:4px 34px}
+.toc li{counter-increment:t}
+.toc a{display:flex;gap:12px;align-items:baseline;padding:8px 6px;border-radius:8px;color:var(--muted);text-decoration:none;transition:.18s;border-bottom:1px solid transparent}
+.toc a:hover{color:var(--text);background:rgba(91,157,255,.07)}
+.toc a::before{content:counter(t,decimal-leading-zero);font-family:var(--mono);font-size:12px;color:var(--teal);min-width:24px}
+
+/* ---------- sections ---------- */
+section{margin:0 0 22px;scroll-margin-top:24px}
+.chap{display:flex;align-items:center;gap:16px;margin:64px 0 26px}
+.chap .num{font-family:var(--mono);font-size:13px;font-weight:700;color:var(--bg);background:linear-gradient(135deg,var(--teal),var(--blue));padding:6px 11px;border-radius:8px;letter-spacing:.05em;flex:none}
+.chap h2{font-size:clamp(24px,3.4vw,32px);font-weight:780;letter-spacing:-.01em}
+.chap .rule{flex:1;height:1px;background:linear-gradient(90deg,var(--border2),transparent)}
+
+h3{font-size:20px;font-weight:700;margin:34px 0 12px;color:#f3f6fd}
+h3::before{content:"";display:inline-block;width:9px;height:9px;border-radius:2px;background:var(--teal);margin-right:11px;transform:translateY(-2px)}
+h4{font-size:16px;font-weight:700;margin:22px 0 8px;color:var(--blue)}
+p{margin:13px 0;color:#d7e0f2}
+strong{color:#fff;font-weight:680}
+em{color:var(--teal);font-style:normal;font-weight:600}
+a.in{color:var(--blue);text-decoration:none;border-bottom:1px dashed var(--border2)}
+code{font-family:var(--mono);font-size:.88em;background:rgba(91,157,255,.12);color:#bcd4ff;padding:2px 7px;border-radius:6px;border:1px solid rgba(91,157,255,.16)}
+
+ul.bul{margin:13px 0 13px 4px;list-style:none}
+ul.bul li{position:relative;padding-left:24px;margin:9px 0;color:#d7e0f2}
+ul.bul li::before{content:"▸";position:absolute;left:2px;top:0;color:var(--teal);font-size:14px}
+
+/* ---------- callouts ---------- */
+.note{border-radius:14px;padding:18px 22px;margin:22px 0;border:1px solid;display:flex;gap:14px;align-items:flex-start}
+.note .ic{font-family:var(--mono);font-weight:800;font-size:13px;flex:none;margin-top:2px}
+.note.key{background:linear-gradient(100deg,rgba(45,212,191,.10),rgba(45,212,191,.03));border-color:rgba(45,212,191,.35)}
+.note.key .ic{color:var(--teal)}
+.note.warn{background:linear-gradient(100deg,rgba(245,185,85,.10),rgba(245,185,85,.03));border-color:rgba(245,185,85,.35)}
+.note.warn .ic{color:var(--amber)}
+.note.danger{background:linear-gradient(100deg,rgba(240,105,122,.10),rgba(240,105,122,.03));border-color:rgba(240,105,122,.35)}
+.note.danger .ic{color:var(--red)}
+.note p{margin:4px 0;color:#e3e9f6}
+.note p:first-child{margin-top:0}
+
+/* ---------- figure ---------- */
+figure{margin:30px 0;background:linear-gradient(180deg,var(--bg2),#0a1322);border:1px solid var(--border);border-radius:18px;padding:24px 22px 14px;overflow:hidden}
+figure svg{display:block;width:100%;height:auto}
+figcaption{margin-top:14px;font-size:13.5px;color:var(--faint);font-family:var(--mono);text-align:center;letter-spacing:.02em}
+figcaption b{color:var(--teal);font-weight:600}
+
+/* ---------- table ---------- */
+.tbl{margin:24px 0;border:1px solid var(--border);border-radius:14px;overflow:hidden}
+table{width:100%;border-collapse:collapse;font-size:14.5px}
+thead th{background:linear-gradient(180deg,var(--surface3),var(--surface));color:#eaf0fb;font-weight:700;text-align:left;padding:13px 16px;border-bottom:1px solid var(--border2);font-size:13.5px;letter-spacing:.02em}
+tbody td{padding:12px 16px;border-bottom:1px solid var(--border);color:#d2dcef;vertical-align:top}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:nth-child(even){background:rgba(255,255,255,.015)}
+td code,th code{font-size:.84em}
+.yes{color:var(--green);font-weight:700}
+.no{color:var(--red);font-weight:700}
+.mid{color:var(--amber);font-weight:700}
+
+/* ---------- code block ---------- */
+pre{margin:20px 0;background:#070d18;border:1px solid var(--border);border-radius:14px;padding:18px 20px;overflow-x:auto;font-family:var(--mono);font-size:13.5px;line-height:1.7;position:relative}
+pre code{background:none;border:none;padding:0;color:#cdd9f0}
+.cm{color:#5d7194}    /* comment */
+.kw{color:var(--purple)}  /* keyword */
+.fn{color:var(--blue)}
+.st{color:var(--green)}
+.nm{color:var(--amber)}
+
+/* ---------- footer ---------- */
+.fin{margin-top:80px;padding:34px 30px;border:1px solid var(--border);border-radius:18px;background:linear-gradient(180deg,var(--surface),var(--bg2));text-align:center}
+.fin h3{justify-content:center}
+.fin h3::before{display:none}
+.fin .seq{display:flex;gap:8px;align-items:center;justify-content:center;flex-wrap:wrap;margin:18px 0 6px;font-family:var(--mono);font-size:13px;color:var(--muted)}
+.fin .seq b{color:var(--teal)}
+.fin .arrow{color:var(--faint)}
+.foot{margin-top:40px;text-align:center;color:var(--faint);font-size:13px;font-family:var(--mono)}
+
+@media(max-width:680px){
+  .toc ol{grid-template-columns:1fr}
+  .wrap{padding:0 16px 80px}
+  .chap{flex-wrap:wrap}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <div class="kicker">InnoDB 系列 · 第五篇 · 深入版</div>
+  <h1>锁系统详解</h1>
+  <p class="sub">从 S/X、意向锁，到记录锁 / 间隙锁 / 临键锁 / 插入意向锁，再到隐式锁、半一致性读、AUTO-INC 锁、元数据锁与死锁检测——一篇讲透 InnoDB 的并发写控制。</p>
+  <div class="series">
+    <span>① 存储结构与数据链路</span>
+    <span>② Buffer Pool 内存侧</span>
+    <span>③ 故障恢复原理</span>
+    <span>④ 事务管理与 MVCC</span>
+    <span class="now">⑤ 锁系统详解</span>
+  </div>
+</header>
+
+<nav class="toc">
+  <h2>目录</h2>
+  <ol>
+    <li><a href="#c1">总览：锁与 MVCC 的分工</a></li>
+    <li><a href="#c2">两个维度：粒度 × 模式</a></li>
+    <li><a href="#c3">共享锁 S 与排他锁 X</a></li>
+    <li><a href="#c4">意向锁 IS / IX</a></li>
+    <li><a href="#c5">锁兼容矩阵</a></li>
+    <li><a href="#c6">锁的内存结构与存储</a></li>
+    <li><a href="#c7">行锁三形态与 supremum</a></li>
+    <li><a href="#c8">间隙锁的特殊性</a></li>
+    <li><a href="#c9">插入意向锁</a></li>
+    <li><a href="#c10">隐式锁与显式锁</a></li>
+    <li><a href="#c11">唯一键冲突与 INSERT 加锁</a></li>
+    <li><a href="#c12">锁加在索引上</a></li>
+    <li><a href="#c13">半一致性读</a></li>
+    <li><a href="#c14">实战：RR 加锁逐条分析与 RC 对比</a></li>
+    <li><a href="#c15">AUTO-INC 锁与自增</a></li>
+    <li><a href="#c16">元数据锁 MDL</a></li>
+    <li><a href="#c17">死锁：成因、案例与检测</a></li>
+    <li><a href="#c18">锁监控实操与系列总结</a></li>
+  </ol>
+</nav>
+
+<!-- ============ 1 ============ -->
+<section id="c1">
+  <div class="chap"><span class="num">01</span><h2>总览：锁与 MVCC 的分工</h2><div class="rule"></div></div>
+
+  <p>第四篇讲清了 <em>MVCC</em>：普通 <code>SELECT</code>（快照读）靠版本链 + ReadView 读历史快照，<strong>完全不加锁</strong>。但并发正确性不可能全靠 MVCC——一旦涉及<strong>写</strong>，或显式的<strong>当前读</strong>，多个事务对同一数据的操作就必须被"串行化"，这就是锁的职责。</p>
+
+  <p>先把分工钉死，这是理解全篇的地基：</p>
+
+  <figure>
+    <svg viewBox="0 0 800 250" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <text x="400" y="28" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">读写两条路径：谁走 MVCC，谁走锁</text>
+      <rect x="50" y="60" width="320" height="150" rx="14" fill="#0f1830" stroke="#2dd4bf" stroke-width="2"/>
+      <text x="210" y="90" text-anchor="middle" fill="#2dd4bf" font-size="14" font-weight="700">快照读（普通 SELECT）</text>
+      <line x1="70" y1="104" x2="350" y2="104" stroke="#26375c"/>
+      <text x="70" y="130" fill="#d7e0f2" font-size="13">机制 → MVCC（版本链 + ReadView）</text>
+      <text x="70" y="156" fill="#5fd38a" font-size="13">不加锁</text>
+      <text x="70" y="182" fill="#9aabce" font-size="12">读不阻塞写、写不阻塞读</text>
+      <rect x="430" y="60" width="320" height="150" rx="14" fill="#141f3a" stroke="#f5b955" stroke-width="2"/>
+      <text x="590" y="90" text-anchor="middle" fill="#f5b955" font-size="14" font-weight="700">当前读（写 / FOR UPDATE）</text>
+      <line x1="450" y1="104" x2="730" y2="104" stroke="#26375c"/>
+      <text x="450" y="130" fill="#d7e0f2" font-size="13">机制 → 锁（S / X / Gap / Next-Key）</text>
+      <text x="450" y="156" fill="#f0697a" font-size="13">加锁，冲突则阻塞</text>
+      <text x="450" y="182" fill="#9aabce" font-size="12">读最新值并保证写正确</text>
+    </svg>
+    <figcaption><b>图 1</b> · MVCC 管"读得快"，锁管"写得对"——两者互补，共同实现隔离性</figcaption>
+  </figure>
+
+  <div class="note key"><span class="ic">三个问题</span><div>
+    <p>本篇所有的锁，作用对象都是<strong>当前读</strong>这条路径。把锁系统讲透，本质是回答三个问题：<br>
+    <strong>① 有哪些锁？</strong>（类型与粒度，第 2–9 章）<br>
+    <strong>② 谁和谁冲突？</strong>（兼容矩阵，第 5、8 章）<br>
+    <strong>③ 一条 SQL 到底锁住了什么、什么时候锁？</strong>（加锁规则与时机，第 10–14 章），以及它出问题时怎么办（死锁与监控，第 17–18 章）。</p>
+  </div></div>
+</section>
+
+<!-- ============ 2 ============ -->
+<section id="c2">
+  <div class="chap"><span class="num">02</span><h2>两个维度：粒度 × 模式</h2><div class="rule"></div></div>
+
+  <p>InnoDB 的锁可以从两个正交维度理解，后面所有锁类型都是它们的组合：</p>
+
+  <ul class="bul">
+    <li><strong>粒度（锁多大）</strong>：<em>表级锁</em> 锁整张表（意向锁、表 S/X、AUTO-INC、元数据锁 MDL）；<em>行级锁</em> 只锁某些索引记录或间隙（记录锁、间隙锁、临键锁、插入意向锁）。InnoDB 以行级锁为主——这正是它相比只有表锁的 MyISAM 能高并发的根本。</li>
+    <li><strong>模式（锁的强度/意图）</strong>：基本模式是<em>共享锁 S</em>（读，可共存）与 <em>排他锁 X</em>（写，独占）；表级还有<em>意向锁 IS/IX</em> 做协调。</li>
+  </ul>
+
+  <figure>
+    <svg viewBox="0 0 800 300" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <defs><marker id="arT" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#5b9dff"/></marker></defs>
+      <text x="400" y="26" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">InnoDB 锁的完整分类</text>
+      <rect x="330" y="44" width="140" height="36" rx="9" fill="#141f3a" stroke="#5b9dff" stroke-width="2"/>
+      <text x="400" y="67" text-anchor="middle" fill="#5b9dff" font-weight="700">InnoDB 锁</text>
+      <rect x="120" y="112" width="220" height="36" rx="9" fill="#0f1830" stroke="#324a78"/>
+      <text x="230" y="135" text-anchor="middle" fill="#d7e0f2">表级锁</text>
+      <rect x="470" y="112" width="220" height="36" rx="9" fill="#0f1830" stroke="#2dd4bf" stroke-width="1.5"/>
+      <text x="580" y="135" text-anchor="middle" fill="#2dd4bf">行级锁（主力）</text>
+      <path d="M380,80 L250,110" stroke="#5b9dff" stroke-width="1.8" fill="none" marker-end="url(#arT)"/>
+      <path d="M420,80 L555,110" stroke="#5b9dff" stroke-width="1.8" fill="none" marker-end="url(#arT)"/>
+      <!-- table children -->
+      <g font-size="10.5">
+      <rect x="70" y="185" width="90" height="30" rx="7" fill="#0a1322" stroke="#324a78"/><text x="115" y="204" text-anchor="middle" fill="#9aabce">意向 IS/IX</text>
+      <rect x="166" y="185" width="80" height="30" rx="7" fill="#0a1322" stroke="#324a78"/><text x="206" y="204" text-anchor="middle" fill="#9aabce">表 S/X</text>
+      <rect x="252" y="185" width="80" height="30" rx="7" fill="#0a1322" stroke="#324a78"/><text x="292" y="204" text-anchor="middle" fill="#9aabce">AUTO-INC</text>
+      <rect x="160" y="225" width="90" height="30" rx="7" fill="#0a1322" stroke="#324a78"/><text x="205" y="244" text-anchor="middle" fill="#9aabce">MDL 元数据</text>
+      </g>
+      <!-- row children -->
+      <g font-size="10.5">
+      <rect x="430" y="185" width="95" height="30" rx="7" fill="#0a1322" stroke="#2dd4bf"/><text x="477" y="204" text-anchor="middle" fill="#2dd4bf">记录 Record</text>
+      <rect x="531" y="185" width="75" height="30" rx="7" fill="#0a1322" stroke="#f5b955"/><text x="568" y="204" text-anchor="middle" fill="#f5b955">间隙 Gap</text>
+      <rect x="612" y="185" width="100" height="30" rx="7" fill="#0a1322" stroke="#b794f6"/><text x="662" y="204" text-anchor="middle" fill="#b794f6">临键 Next-Key</text>
+      <rect x="490" y="225" width="160" height="30" rx="7" fill="#0a1322" stroke="#5fd38a"/><text x="570" y="244" text-anchor="middle" fill="#5fd38a">插入意向 Insert Intention</text>
+      </g>
+      <text x="400" y="285" text-anchor="middle" fill="#6b7da3" font-size="11">左边表级锁负责"协调"，右边行级锁是真正控制并发的主力</text>
+    </svg>
+    <figcaption><b>图 2</b> · 锁的全景分类：本篇会逐一覆盖图中每一个方块</figcaption>
+  </figure>
+</section>
+
+<!-- ============ 3 ============ -->
+<section id="c3">
+  <div class="chap"><span class="num">03</span><h2>共享锁 S 与排他锁 X</h2><div class="rule"></div></div>
+
+  <p>S/X 是锁的两种基本<strong>模式</strong>，在行级和表级都存在，对应"读"和"写"两种意图：</p>
+
+  <ul class="bul">
+    <li><strong>共享锁 S（Shared）</strong>—— 读锁。多个事务可同时持有同一对象的 S 锁，彼此<em>不冲突</em>。手动加：<code>SELECT ... FOR SHARE</code>（旧语法 <code>LOCK IN SHARE MODE</code>）。</li>
+    <li><strong>排他锁 X（Exclusive）</strong>—— 写锁。一个对象同时只能有一个事务持 X 锁，<em>与 S、X 都冲突</em>。<code>UPDATE / DELETE</code> 以及 <code>SELECT ... FOR UPDATE</code> 都加 X。</li>
+  </ul>
+
+  <p>行级 S/X 的兼容关系是一切的起点——"读读相容、读写互斥、写写互斥"：</p>
+
+  <div class="tbl">
+    <table>
+      <thead><tr><th>请求 ↓ / 持有 →</th><th>S</th><th>X</th></tr></thead>
+      <tbody>
+        <tr><td><strong>S</strong></td><td class="yes">兼容 ✓</td><td class="no">冲突 ✗</td></tr>
+        <tr><td><strong>X</strong></td><td class="no">冲突 ✗</td><td class="no">冲突 ✗</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn"><span class="ic">易忽略</span><div>
+    <p>"行级 S/X"和"表级 S/X"是两套东西，作用对象不同但兼容逻辑一样。日常 DML 几乎只用<strong>行级</strong> S/X；<strong>表级</strong> S/X 出现在 <code>LOCK TABLES ... READ/WRITE</code> 或某些 DDL 场景。第 5 章那张 4×4 矩阵里的 S/X 指的是<em>表级</em>，别和这张 2×2 的行级表混淆。</p>
+  </div></div>
+</section>
+
+<!-- ============ 4 ============ -->
+<section id="c4">
+  <div class="chap"><span class="num">04</span><h2>意向锁 IS / IX</h2><div class="rule"></div></div>
+
+  <p>意向锁是<strong>表级</strong>锁，但它存在的唯一目的是为<em>行级</em>锁服务。先看它要解决的问题：</p>
+
+  <div class="note warn"><span class="ic">问题</span><div>
+    <p>事务 A 给大表里的<strong>某一行</strong>加了 X 锁。此时事务 B 想给<strong>整张表</strong>加表级 X 锁（如某些 DDL）。B 必须确认"表里有没有任何一行正被锁着"。若逐行扫描检查，百万行的表会慢到不可接受。</p>
+  </div></div>
+
+  <p>解决办法是<strong>意向锁</strong>：事务在给某行加行锁<em>之前</em>，先在<strong>表级</strong>打一个意向标记，声明"我打算在这张表里加某种行锁"。这样表锁请求只看意向锁即可 O(1) 判断冲突。</p>
+
+  <ul class="bul">
+    <li><strong>IS（意向共享）</strong>—— 打算给某些行加 S 锁前，先加表级 IS。</li>
+    <li><strong>IX（意向排他）</strong>—— 打算给某些行加 X 锁前，先加表级 IX。所有 DML 写都会先拿 IX。</li>
+  </ul>
+
+  <figure>
+    <svg viewBox="0 0 800 230" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <text x="400" y="26" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">意向锁：表级"先报备"，省去逐行检查</text>
+      <rect x="60" y="50" width="300" height="155" rx="12" fill="#0f1830" stroke="#324a78" stroke-width="1.5"/>
+      <rect x="60" y="50" width="300" height="32" rx="12" fill="rgba(245,185,85,.12)" stroke="#f5b955"/>
+      <text x="210" y="71" text-anchor="middle" fill="#f5b955" font-size="12" font-weight="700">表级：IX（意向排他）</text>
+      <rect x="80" y="95" width="260" height="24" rx="6" fill="#0a1322" stroke="#26375c"/><text x="90" y="111" fill="#9aabce" font-size="11">row #1</text>
+      <rect x="80" y="125" width="260" height="24" rx="6" fill="rgba(240,105,122,.12)" stroke="#f0697a"/><text x="90" y="141" fill="#f0697a" font-size="11">row #2  ← 事务A 持 X 锁</text>
+      <rect x="80" y="155" width="260" height="24" rx="6" fill="#0a1322" stroke="#26375c"/><text x="90" y="171" fill="#9aabce" font-size="11">row #3</text>
+      <rect x="440" y="78" width="300" height="100" rx="12" fill="#141f3a" stroke="#5b9dff" stroke-width="1.5"/>
+      <text x="590" y="106" text-anchor="middle" fill="#5b9dff" font-size="12" font-weight="700">事务B 想加 表级 X 锁</text>
+      <text x="460" y="134" fill="#d7e0f2" font-size="12">只需看表上有没有 IX/IS</text>
+      <text x="460" y="156" fill="#f0697a" font-size="12">发现 IX → 立刻判定冲突，O(1)</text>
+      <path d="M362,128 L436,128" stroke="#f0697a" stroke-width="2" fill="none" stroke-dasharray="5 4"/>
+    </svg>
+    <figcaption><b>图 3</b> · 表级 IX 是一面"旗子"：表锁请求只看旗子即可判断冲突，无需扫描每一行</figcaption>
+  </figure>
+
+  <div class="note key"><span class="ic">两条规则</span><div>
+    <p><strong>① 意向锁之间永远相容</strong>——IS、IX 彼此不冲突，它们只是"意图声明"，真正的冲突发生在行锁层面。<br>
+    <strong>② 意向锁只与表级 S/X 冲突</strong>——IX 与表级 S/X 冲突，IS 与表级 X 冲突。意向锁由 InnoDB <em>自动</em>添加，无法手动控制。</p>
+  </div></div>
+</section>
+
+<!-- ============ 5 ============ -->
+<section id="c5">
+  <div class="chap"><span class="num">05</span><h2>锁兼容矩阵</h2><div class="rule"></div></div>
+
+  <p>把 IS、IX、S、X 放一起，得到表级锁的完整兼容矩阵。判断"一个锁请求能否立即获得"——<strong>只要请求的锁与已持有的任一锁冲突，就得等待</strong>：</p>
+
+  <div class="tbl">
+    <table>
+      <thead><tr><th>请求 ↓ / 持有 →</th><th>IS</th><th>IX</th><th>S</th><th>X</th></tr></thead>
+      <tbody>
+        <tr><td><strong>IS</strong></td><td class="yes">✓</td><td class="yes">✓</td><td class="yes">✓</td><td class="no">✗</td></tr>
+        <tr><td><strong>IX</strong></td><td class="yes">✓</td><td class="yes">✓</td><td class="no">✗</td><td class="no">✗</td></tr>
+        <tr><td><strong>S</strong></td><td class="yes">✓</td><td class="no">✗</td><td class="yes">✓</td><td class="no">✗</td></tr>
+        <tr><td><strong>X</strong></td><td class="no">✗</td><td class="no">✗</td><td class="no">✗</td><td class="no">✗</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note key"><span class="ic">怎么记</span><div>
+    <p>不用死背 16 格，抓三条：<br>
+    <strong>① 左上 2×2（IS/IX 互相）全相容</strong>。<br>
+    <strong>② X 一行一列全 ✗</strong>——排他与谁都冲突。<br>
+    <strong>③ 只剩 IX↔S 冲突</strong>——"有人要改某行(IX)"与"有人要锁全表读(S)"无法共存。<br>
+    <span style="color:#f5b955">重要：这张矩阵管的是<em>表级</em>对象。行级锁还有 Gap/Next-Key/插入意向，它们的兼容规则更特殊，见第 8、9 章——尤其"间隙锁之间永远兼容"这条，不在此表内。</span></p>
+  </div></div>
+</section>
+
+<!-- ============ 6 ============ -->
+<section id="c6">
+  <div class="chap"><span class="num">06</span><h2>锁的内存结构与存储</h2><div class="rule"></div></div>
+
+  <p>很多人以为"锁住一行"是在那行数据上写个标记。其实不是——<strong>InnoDB 的锁是独立的内存对象，集中存放在一个叫 <code>lock_sys</code> 的全局结构里，与数据页本身分离。</strong>理解这点，才能解释"为什么锁那么多行内存却没爆""一个 lock 对象怎么表示一批行"。</p>
+
+  <h3>一个锁对象（lock_t）描述什么</h3>
+  <p>InnoDB 不会为每一把行锁都建一个对象。一个 <code>lock_t</code> 对象描述的是：<strong>同一个事务、同一个页面、同一种锁模式</strong>的一组行锁。对象里挂一个<strong>位图（bitmap）</strong>，页内每条记录对应一个 bit（按 <code>heap_no</code> 编号），bit 置 1 表示这条记录被这把锁锁住。</p>
+
+  <figure>
+    <svg viewBox="0 0 800 290" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <defs><marker id="ar6m" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#5b9dff"/></marker></defs>
+      <text x="400" y="26" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">lock_sys 全局哈希 → lock_t 对象（含 bitmap）</text>
+      <!-- lock_sys hash -->
+      <rect x="40" y="55" width="190" height="200" rx="12" fill="#0f1830" stroke="#5b9dff" stroke-width="1.5"/>
+      <text x="135" y="80" text-anchor="middle" fill="#5b9dff" font-size="12" font-weight="700">lock_sys 哈希表</text>
+      <text x="135" y="98" text-anchor="middle" fill="#6b7da3" font-size="10">key = (space_id, page_no)</text>
+      <rect x="58" y="112" width="154" height="26" rx="6" fill="#0a1322" stroke="#26375c"/><text x="68" y="129" fill="#9aabce" font-size="10">页(5,12) →●</text>
+      <rect x="58" y="146" width="154" height="26" rx="6" fill="#0a1322" stroke="#26375c"/><text x="68" y="163" fill="#9aabce" font-size="10">页(5,13) →…</text>
+      <rect x="58" y="180" width="154" height="26" rx="6" fill="#0a1322" stroke="#26375c"/><text x="68" y="197" fill="#9aabce" font-size="10">页(7,3)  →…</text>
+      <text x="135" y="232" text-anchor="middle" fill="#6b7da3" font-size="10">按"页"组织，定位快</text>
+
+      <!-- lock_t object -->
+      <rect x="300" y="55" width="230" height="200" rx="12" fill="#141f3a" stroke="#2dd4bf" stroke-width="2"/>
+      <text x="415" y="80" text-anchor="middle" fill="#2dd4bf" font-size="12" font-weight="700">lock_t 对象</text>
+      <text x="318" y="106" fill="#d7e0f2" font-size="11">trx = 事务 A</text>
+      <text x="318" y="128" fill="#d7e0f2" font-size="11">page = (5,12)</text>
+      <text x="318" y="150" fill="#f0697a" font-size="11">mode = X, Next-Key</text>
+      <text x="318" y="176" fill="#9aabce" font-size="11">bitmap（按 heap_no）:</text>
+      <g font-size="11">
+        <rect x="318" y="186" width="22" height="22" fill="rgba(45,212,191,.2)" stroke="#2dd4bf"/><text x="329" y="201" text-anchor="middle" fill="#2dd4bf">1</text>
+        <rect x="342" y="186" width="22" height="22" fill="#0a1322" stroke="#26375c"/><text x="353" y="201" text-anchor="middle" fill="#6b7da3">0</text>
+        <rect x="366" y="186" width="22" height="22" fill="rgba(45,212,191,.2)" stroke="#2dd4bf"/><text x="377" y="201" text-anchor="middle" fill="#2dd4bf">1</text>
+        <rect x="390" y="186" width="22" height="22" fill="rgba(45,212,191,.2)" stroke="#2dd4bf"/><text x="401" y="201" text-anchor="middle" fill="#2dd4bf">1</text>
+        <rect x="414" y="186" width="22" height="22" fill="#0a1322" stroke="#26375c"/><text x="425" y="201" text-anchor="middle" fill="#6b7da3">0</text>
+      </g>
+      <text x="318" y="232" fill="#9aabce" font-size="10">一个对象 = 同页同模式的一批行锁</text>
+
+      <!-- data page -->
+      <rect x="600" y="55" width="160" height="200" rx="12" fill="#0f1830" stroke="#324a78" stroke-width="1.5"/>
+      <text x="680" y="80" text-anchor="middle" fill="#9aabce" font-size="12" font-weight="700">数据页(5,12)</text>
+      <text x="680" y="98" text-anchor="middle" fill="#6b7da3" font-size="10">记录无锁标记</text>
+      <rect x="616" y="110" width="128" height="22" rx="5" fill="rgba(45,212,191,.12)" stroke="#2dd4bf"/><text x="624" y="126" fill="#2dd4bf" font-size="10">heap_no0 supremum</text>
+      <rect x="616" y="136" width="128" height="22" rx="5" fill="#0a1322" stroke="#26375c"/><text x="624" y="152" fill="#9aabce" font-size="10">heap_no1 rec</text>
+      <rect x="616" y="162" width="128" height="22" rx="5" fill="rgba(45,212,191,.12)" stroke="#2dd4bf"/><text x="624" y="178" fill="#2dd4bf" font-size="10">heap_no2 rec</text>
+      <path d="M532,150 L598,150" stroke="#5b9dff" stroke-width="1.8" fill="none" marker-end="url(#ar6m)"/>
+    </svg>
+    <figcaption><b>图 4</b> · 锁存在 lock_sys 哈希里（按页组织），一个 lock_t 用 bitmap 表示同页同模式的多行锁</figcaption>
+  </figure>
+
+  <div class="note key"><span class="ic">三个推论</span><div>
+    <p><strong>① 锁很省内存</strong>：锁住同一页的 100 行同模式锁，可能只需一个对象 + 100 个 bit，而不是 100 个对象。<br>
+    <strong>② 锁与数据解耦</strong>：数据页里没有"这行被锁了"的标记（隐式锁是例外，见第 10 章），锁信息全在 lock_sys。<br>
+    <strong>③ heap_no=0 是 supremum 伪记录</strong>：每页有一条虚拟的"最大记录"哨兵，用来锁住"最后一条记录到 +∞"的间隙（第 7、8 章会用到它）。</p>
+  </div></div>
+</section>
+
+<!-- ============ 7 ============ -->
+<section id="c7">
+  <div class="chap"><span class="num">07</span><h2>行锁三形态与 supremum</h2><div class="rule"></div></div>
+
+  <p>InnoDB 的"行锁"不止锁行——它有三种形态，区别在<strong>锁住的"范围"不同</strong>。把索引想象成一条数轴：记录是点，记录之间是"间隙"，数轴两端有 <code>-∞</code> 和 <code>+∞</code> 哨兵。</p>
+
+  <h3>① 记录锁 Record Lock —— 锁一个点</h3>
+  <p>精确锁住索引上<strong>某条已存在的记录</strong>（不含其前后间隙）。监控里标记为 <code>X,REC_NOT_GAP</code> 或 <code>S,REC_NOT_GAP</code>。</p>
+
+  <h3>② 间隙锁 Gap Lock —— 锁一段开区间</h3>
+  <p>锁住两条记录<strong>之间的间隙（不含记录本身）</strong>，目的<em>只有一个</em>：阻止别的事务往这个间隙 <code>INSERT</code> 新记录。它<strong>不锁已有记录、不阻止读和改</strong>，纯为防幻读而生。标记为 <code>X,GAP</code>。</p>
+
+  <h3>③ 临键锁 Next-Key Lock —— 点 + 它左边的间隙</h3>
+  <p>= 记录锁 + 间隙锁，锁住<strong>左开右闭区间 (前一记录, 当前记录]</strong>。<strong>这是 RR 隔离级别下行锁的默认形态</strong>。监控里就标记为 <code>X</code>（无后缀即代表 Next-Key）。</p>
+
+  <figure>
+    <svg viewBox="0 0 800 360" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <text x="400" y="24" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">同一条索引数轴上，三种锁锁住的范围</text>
+      <text x="400" y="46" text-anchor="middle" fill="#6b7da3" font-size="11">索引值：10 ── 20 ── 30，右端有 supremum(+∞) 哨兵</text>
+      <!-- Record -->
+      <text x="20" y="92" fill="#2dd4bf" font-size="13" font-weight="700">记录锁</text>
+      <line x1="120" y1="100" x2="740" y2="100" stroke="#324a78" stroke-width="2"/>
+      <circle cx="250" cy="100" r="8" fill="#0a1322" stroke="#2dd4bf"/><text x="250" y="124" text-anchor="middle" fill="#9aabce" font-size="11">10</text>
+      <circle cx="420" cy="100" r="9" fill="#2dd4bf" stroke="#2dd4bf"/><text x="420" y="124" text-anchor="middle" fill="#2dd4bf" font-size="11">20★</text>
+      <circle cx="590" cy="100" r="8" fill="#0a1322" stroke="#2dd4bf"/><text x="590" y="124" text-anchor="middle" fill="#9aabce" font-size="11">30</text>
+      <text x="650" y="92" fill="#2dd4bf" font-size="10">REC_NOT_GAP</text>
+      <!-- Gap -->
+      <text x="20" y="172" fill="#f5b955" font-size="13" font-weight="700">间隙锁</text>
+      <line x1="120" y1="180" x2="740" y2="180" stroke="#324a78" stroke-width="2"/>
+      <circle cx="250" cy="180" r="8" fill="#0a1322" stroke="#f5b955"/><text x="250" y="204" text-anchor="middle" fill="#9aabce" font-size="11">10</text>
+      <rect x="262" y="170" width="146" height="20" rx="6" fill="rgba(245,185,85,.18)" stroke="#f5b955" stroke-dasharray="4 3"/>
+      <text x="335" y="184" text-anchor="middle" fill="#f5b955" font-size="10">(10,20)</text>
+      <circle cx="420" cy="180" r="8" fill="#0a1322" stroke="#f5b955"/><text x="420" y="204" text-anchor="middle" fill="#9aabce" font-size="11">20</text>
+      <circle cx="590" cy="180" r="8" fill="#0a1322" stroke="#f5b955"/><text x="590" y="204" text-anchor="middle" fill="#9aabce" font-size="11">30</text>
+      <text x="650" y="172" fill="#f5b955" font-size="10">GAP · 只禁插</text>
+      <!-- Next-Key -->
+      <text x="20" y="252" fill="#b794f6" font-size="13" font-weight="700">临键锁</text>
+      <line x1="120" y1="260" x2="740" y2="260" stroke="#324a78" stroke-width="2"/>
+      <circle cx="250" cy="260" r="8" fill="#0a1322" stroke="#b794f6"/><text x="250" y="284" text-anchor="middle" fill="#9aabce" font-size="11">10</text>
+      <rect x="262" y="250" width="166" height="20" rx="6" fill="rgba(183,148,246,.18)" stroke="#b794f6" stroke-dasharray="4 3"/>
+      <circle cx="420" cy="260" r="9" fill="#b794f6" stroke="#b794f6"/><text x="420" y="284" text-anchor="middle" fill="#b794f6" font-size="11">20★</text>
+      <text x="345" y="244" text-anchor="middle" fill="#b794f6" font-size="10">(10, 20]</text>
+      <circle cx="590" cy="260" r="8" fill="#0a1322" stroke="#b794f6"/><text x="590" y="284" text-anchor="middle" fill="#9aabce" font-size="11">30</text>
+      <text x="650" y="252" fill="#b794f6" font-size="10">默认形态</text>
+      <text x="400" y="324" text-anchor="middle" fill="#6b7da3" font-size="11">★ = 记录本身被锁　虚线框 = 间隙被锁（左开右闭）</text>
+      <text x="400" y="344" text-anchor="middle" fill="#6b7da3" font-size="11">范围查询会对扫到的每一段都加临键锁，直到右边界，并对最后那段锁到 supremum</text>
+    </svg>
+    <figcaption><b>图 5</b> · 记录锁=点，间隙锁=开区间，临键锁=两者之和（左开右闭）</figcaption>
+  </figure>
+
+  <h3>临键锁的两种退化（减小锁范围、提升并发）</h3>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>退化为</th><th>触发条件</th><th>原因</th></tr></thead>
+      <tbody>
+        <tr><td><strong>记录锁</strong></td><td><em>唯一索引</em>等值查询<em>命中</em></td><td>唯一键不可能再插重复值，间隙无需锁</td></tr>
+        <tr><td><strong>间隙锁</strong></td><td>等值查询<em>未命中</em>任何记录</td><td>没有记录可锁，只剩间隙锁防"插入这个不存在的值"</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note key"><span class="ic">supremum 的作用</span><div>
+    <p>范围查询若扫到表的"末尾"，最后会对 <strong>(最后一条记录, +∞)</strong> 这个间隙加锁，物理上就是锁住 supremum 伪记录的临键锁。这保证了像 <code>WHERE id &gt; 30</code> 这种开放区间也能防住"在末尾插入新行"的幻读。supremum 永远是这页"最大"的存在，锁它就等于锁住通向无穷大的那段间隙。</p>
+  </div></div>
+</section>
+
+<!-- ============ 8 ============ -->
+<section id="c8">
+  <div class="chap"><span class="num">08</span><h2>间隙锁的特殊性</h2><div class="rule"></div></div>
+
+  <p>间隙锁是 InnoDB 锁系统里最反直觉的一种，它不遵守普通 S/X 的兼容规则。单独成章讲清，否则后面的死锁分析会看不懂。</p>
+
+  <h3>特性一：间隙锁之间永远兼容（哪怕一个 S 一个 X）</h3>
+  <p>两个事务可以对<strong>同一个间隙</strong>同时持有间隙锁，无论是 S 型还是 X 型，都不冲突。原因很简单：间隙锁的目的只是"<em>不让别人插入</em>"，多个事务同时表达"这里别插入"毫不矛盾。</p>
+
+  <h3>特性二：间隙锁只阻塞"插入"，不阻塞"读 / 改"</h3>
+  <p>间隙是空的（没有记录），所以间隙锁不会挡住对<em>已有记录</em>的读或改，它唯一会挡住的是 <code>INSERT</code>（准确说是挡住别人申请<em>插入意向锁</em>，见第 9 章）。</p>
+
+  <h3>特性三：间隙锁不分方向，"S/X"对它几乎无意义</h3>
+  <p>由于特性一，间隙锁标记上虽然也带 S/X，但因为间隙锁彼此从不冲突，这个 S/X 标记实际上不影响它和其它间隙锁的关系——只在它"是否阻塞插入意向锁"上起作用。</p>
+
+  <div class="tbl">
+    <table>
+      <thead><tr><th>请求 ↓ / 持有 →</th><th>间隙锁(Gap)</th><th>插入意向锁(II)</th><th>记录锁(Record)</th></tr></thead>
+      <tbody>
+        <tr><td><strong>间隙锁</strong></td><td class="yes">兼容</td><td class="yes">兼容</td><td class="yes">兼容</td></tr>
+        <tr><td><strong>插入意向锁</strong></td><td class="no">阻塞 ✗</td><td class="yes">兼容</td><td class="yes">兼容</td></tr>
+        <tr><td><strong>记录锁</strong></td><td class="yes">兼容</td><td class="yes">兼容</td><td class="mid">看 S/X</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note danger"><span class="ic">关键非对称</span><div>
+    <p>看表里这一格：<strong>"已持有间隙锁"不阻塞"请求插入意向锁"，但"已持有间隙锁"会阻塞"后来的插入意向锁请求"</strong>——准确表述是：<em>当你想插入（申请插入意向锁）时，如果目标间隙上已有别人的间隙锁，你会被阻塞</em>。方向是单向的：间隙锁挡插入意向锁，反之不挡。这条单向阻塞，就是 RR 防幻读的物理落点，也是大量"插入被莫名卡住""间隙锁死锁"的根源。</p>
+  </div></div>
+
+  <div class="note warn"><span class="ic">提示</span><div>
+    <p>间隙锁只在 <strong>RR 及以上</strong>隔离级别启用。<strong>RC 隔离级别几乎不用间隙锁</strong>（仅外键检查、唯一键冲突等极少数场景），所以 RC 下并发插入冲突少、但有幻读。这也是不少高并发系统选择 RC 的原因之一。</p>
+  </div></div>
+</section>
+
+<!-- ============ 9 ============ -->
+<section id="c9">
+  <div class="chap"><span class="num">09</span><h2>插入意向锁 Insert Intention Lock</h2><div class="rule"></div></div>
+
+  <p>名字带"意向"，但它是<strong>行级</strong>锁，是间隙锁的一个特殊变种，专为 <code>INSERT</code> 设计，解决一个矛盾：<em>间隙锁会禁止插入，但两个事务往同一间隙的不同位置插入，本不该互相阻塞。</em></p>
+
+  <p>当事务要在某间隙插入一行时，会先申请该位置的<strong>插入意向锁（II）</strong>，表达"我打算插在这个间隙里的某个具体位置"。它的兼容规则（承接第 8 章）：</p>
+
+  <ul class="bul">
+    <li><strong>插入意向锁之间互相兼容</strong>——多个事务往同一间隙不同位置插入，不阻塞（只要键值不同）。这是它存在的意义：放行并发插入。</li>
+    <li><strong>但它会被已存在的间隙锁 / 临键锁阻塞</strong>——若别的事务已用间隙锁锁住该间隙（为防幻读），插入意向锁就得等待。这正是 Next-Key Lock 防住幻读的"最后一公里"。</li>
+  </ul>
+
+  <figure>
+    <svg viewBox="0 0 800 270" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <text x="400" y="26" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">两种场景：插入意向锁的相容与阻塞</text>
+      <rect x="40" y="50" width="340" height="195" rx="12" fill="#0f1830" stroke="#15803d" stroke-width="1.5"/>
+      <text x="210" y="76" text-anchor="middle" fill="#5fd38a" font-size="13" font-weight="700">场景A · 两个 INSERT 互不阻塞</text>
+      <line x1="70" y1="138" x2="350" y2="138" stroke="#324a78" stroke-width="2"/>
+      <circle cx="90" cy="138" r="7" fill="#0a1322" stroke="#5fd38a"/><text x="90" y="160" text-anchor="middle" fill="#9aabce" font-size="10">10</text>
+      <circle cx="330" cy="138" r="7" fill="#0a1322" stroke="#5fd38a"/><text x="330" y="160" text-anchor="middle" fill="#9aabce" font-size="10">30</text>
+      <text x="150" y="118" fill="#5fd38a" font-size="11">A插15</text>
+      <text x="250" y="118" fill="#5fd38a" font-size="11">B插25</text>
+      <line x1="155" y1="126" x2="155" y2="138" stroke="#5fd38a" stroke-width="2"/>
+      <line x1="265" y1="126" x2="265" y2="138" stroke="#5fd38a" stroke-width="2"/>
+      <text x="210" y="195" text-anchor="middle" fill="#5fd38a" font-size="11">II 锁互相兼容</text>
+      <text x="210" y="217" text-anchor="middle" fill="#9aabce" font-size="11">同间隙不同位置 → 并发插入</text>
+      <rect x="420" y="50" width="340" height="195" rx="12" fill="#141f3a" stroke="#9b2c3a" stroke-width="1.5"/>
+      <text x="590" y="76" text-anchor="middle" fill="#f0697a" font-size="13" font-weight="700">场景B · 被间隙锁挡住</text>
+      <line x1="450" y1="138" x2="730" y2="138" stroke="#324a78" stroke-width="2"/>
+      <rect x="462" y="128" width="256" height="20" rx="6" fill="rgba(245,185,85,.18)" stroke="#f5b955" stroke-dasharray="4 3"/>
+      <text x="590" y="118" text-anchor="middle" fill="#f5b955" font-size="11">事务C 已持间隙锁 (10,30)</text>
+      <circle cx="450" cy="138" r="7" fill="#0a1322" stroke="#f5b955"/>
+      <circle cx="730" cy="138" r="7" fill="#0a1322" stroke="#f5b955"/>
+      <text x="590" y="195" text-anchor="middle" fill="#f0697a" font-size="11">事务D 想插 20 → 阻塞等待</text>
+      <text x="590" y="217" text-anchor="middle" fill="#9aabce" font-size="11">这正是 RR 防幻读的落地点</text>
+    </svg>
+    <figcaption><b>图 6</b> · 插入意向锁彼此相容（并发插入），但被先到的间隙锁阻塞（防幻读）</figcaption>
+  </figure>
+
+  <div class="note key"><span class="ic">闭合第四篇伏笔</span><div>
+    <p><strong>RR 当前读不幻读的物理机制是：范围查询先用临键锁/间隙锁锁住区间，后来者 INSERT 申请插入意向锁时被这个间隙锁挡住，于是插不进来。</strong>"间隙锁防插入"落到锁层面就是"间隙锁 ⊥ 插入意向锁"这一条单向冲突规则。</p>
+  </div></div>
+</section>
+
+<!-- ============ 10 ============ -->
+<section id="c10">
+  <div class="chap"><span class="num">10</span><h2>隐式锁与显式锁</h2><div class="rule"></div></div>
+
+  <p>前面讲的锁都是<strong>显式锁</strong>——在 lock_sys 里实实在在建了 lock_t 对象。但 InnoDB 还有一种<strong>隐式锁（Implicit Lock）</strong>，它<em>不在 lock_sys 里建对象</em>，是一种"省钱"的延迟策略，新手几乎不知道它的存在，却是理解 INSERT 加锁的关键。</p>
+
+  <h3>隐式锁是什么</h3>
+  <p>当一个事务 <code>INSERT</code> 一条新记录时，<strong>InnoDB 默认不为它建立显式锁</strong>。但这条新记录的聚簇索引里写着 <code>DB_TRX_ID</code>（最近修改它的事务，正是插入者）。这个 <code>DB_TRX_ID</code> 本身就构成了一把"隐式的 X 锁"：</p>
+
+  <ul class="bul">
+    <li>别的事务想访问这条记录时，会去检查记录上的 <code>DB_TRX_ID</code> 是否属于一个<strong>仍然活跃（未提交）</strong>的事务。</li>
+    <li>如果是 → 说明这条记录正"隐式地"被那个事务锁着。此时<strong>由访问者"帮"持有者把隐式锁转成显式锁</strong>（在 lock_sys 里补建一个 X 锁对象记到持有者名下），然后访问者再正常去排队等待这把显式锁。</li>
+  </ul>
+
+  <figure>
+    <svg viewBox="0 0 800 250" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <defs><marker id="ar10i" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#5b9dff"/></marker></defs>
+      <text x="400" y="26" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">隐式锁 → 显式锁的延迟转换</text>
+      <!-- step1 -->
+      <rect x="40" y="55" width="220" height="120" rx="12" fill="#0f1830" stroke="#5fd38a" stroke-width="1.5"/>
+      <text x="150" y="80" text-anchor="middle" fill="#5fd38a" font-size="12" font-weight="700">① A 插入新行</text>
+      <text x="58" y="106" fill="#d7e0f2" font-size="11">不建 lock 对象</text>
+      <text x="58" y="128" fill="#d7e0f2" font-size="11">仅写 DB_TRX_ID=A</text>
+      <text x="58" y="152" fill="#9aabce" font-size="10">= 一把"隐式 X 锁"，零成本</text>
+      <!-- step2 -->
+      <rect x="300" y="55" width="220" height="120" rx="12" fill="#141f3a" stroke="#f5b955" stroke-width="1.5"/>
+      <text x="410" y="80" text-anchor="middle" fill="#f5b955" font-size="12" font-weight="700">② B 来访问这行</text>
+      <text x="318" y="106" fill="#d7e0f2" font-size="11">查 DB_TRX_ID=A</text>
+      <text x="318" y="128" fill="#d7e0f2" font-size="11">A 仍活跃 → 有冲突</text>
+      <text x="318" y="152" fill="#9aabce" font-size="10">B 帮 A 补建显式 X 锁</text>
+      <!-- step3 -->
+      <rect x="560" y="55" width="200" height="120" rx="12" fill="#0f1830" stroke="#f0697a" stroke-width="1.5"/>
+      <text x="660" y="80" text-anchor="middle" fill="#f0697a" font-size="12" font-weight="700">③ B 排队等待</text>
+      <text x="578" y="106" fill="#d7e0f2" font-size="11">显式锁记在 A 名下</text>
+      <text x="578" y="128" fill="#d7e0f2" font-size="11">B 进入锁等待队列</text>
+      <text x="578" y="152" fill="#9aabce" font-size="10">A 提交后 B 继续</text>
+      <path d="M262,115 L298,115" stroke="#5b9dff" stroke-width="2" fill="none" marker-end="url(#ar10i)"/>
+      <path d="M522,115 L558,115" stroke="#5b9dff" stroke-width="2" fill="none" marker-end="url(#ar10i)"/>
+      <text x="400" y="210" text-anchor="middle" fill="#6b7da3" font-size="11">没有竞争时，隐式锁永远不会"显化" → 大量 INSERT 几乎零锁开销</text>
+      <text x="400" y="230" text-anchor="middle" fill="#6b7da3" font-size="11">这是 InnoDB 对"插入后基本没人来争"这一常见情况的优化</text>
+    </svg>
+    <figcaption><b>图 7</b> · 隐式锁是延迟策略：无人竞争时零成本，有人来争时才"显化"为显式锁</figcaption>
+  </figure>
+
+  <div class="note key"><span class="ic">为什么这样设计</span><div>
+    <p>绝大多数 <code>INSERT</code> 插入后，短时间内没有别的事务来争这条新行。为这种"大概率无竞争"的情况预先建锁对象是浪费。隐式锁把建锁的成本<strong>推迟到真正发生冲突的那一刻</strong>，由冲突方代为补建。这是典型的"乐观假设 + 惰性求值"，让高频 INSERT 的锁开销趋近于零。隐式锁只存在于聚簇索引（靠 <code>DB_TRX_ID</code>）；二级索引没有该字段，处理方式略有不同，必要时会去聚簇索引回查。</p>
+  </div></div>
+</section>
+
+<!-- ============ 11 ============ -->
+<section id="c11">
+  <div class="chap"><span class="num">11</span><h2>唯一键冲突与 INSERT 加锁</h2><div class="rule"></div></div>
+
+  <p><code>INSERT</code> 看似简单，加锁却最容易出意外，尤其在有<strong>唯一索引</strong>时。它也是生产中死锁的头号来源，必须单独讲。</p>
+
+  <h3>正常 INSERT 的加锁</h3>
+  <p>一次普通插入大致做两件加锁的事：① 对要插入的间隙申请<strong>插入意向锁</strong>（若间隙被锁则等待）；② 插入成功后，对新记录持有<strong>隐式锁</strong>（见上一章），无人争则不显化。</p>
+
+  <h3>遇到唯一键冲突时的加锁（重点）</h3>
+  <p>当插入的值<strong>违反唯一约束</strong>（已存在相同的唯一键），InnoDB 不是简单报错了事——它需要先<strong>读到那条已存在的冲突记录</strong>来确认冲突，这个"读"会<strong>给冲突记录加锁</strong>：</p>
+
+  <ul class="bul">
+    <li>普通 <code>INSERT</code> 撞唯一键 → 对已存在的冲突记录加一个 <strong>S 型 next-key 锁</strong>（RR 下）。这是为了防止它在你这次插入失败的窗口里被删除/修改。</li>
+    <li><code>INSERT ... ON DUPLICATE KEY UPDATE</code> 撞键 → 加 <strong>X 锁</strong>（因为接下来要改它）。</li>
+  </ul>
+
+  <div class="note danger"><span class="ic">经典三事务死锁</span><div>
+    <p>这是面试与故障复盘的常客：<strong>三个事务并发插入同一个唯一键值。</strong><br>
+    ① T1、T2、T3 都 INSERT 同一个唯一值 → T1 先成功插入（持隐式锁），T2、T3 都撞键，于是各自申请那条记录的 <em>S 锁</em>并等待 T1。<br>
+    ② T1 此时<strong>回滚</strong> → 它的隐式锁释放，T2、T3 都拿到 S 锁。<br>
+    ③ T2、T3 现在都想真正插入，各自申请<strong>插入意向 X 锁</strong>，但都被对方持有的 S 锁挡住 → <strong>互相等待，死锁。</strong><br>
+    根因：S 锁可共存（多人能同时持），但接下来要升级到的插入需要排他，于是形成"都持 S、都等 X"的环。</p>
+  </div></div>
+
+  <div class="note warn"><span class="ic">规避</span><div>
+    <p>① 业务层对"插入同一唯一键"的并发做去重/串行（如分布式锁、消息幂等）。② 用 <code>INSERT ... ON DUPLICATE KEY UPDATE</code> 或先 <code>SELECT ... FOR UPDATE</code> 探测，把竞争收敛到一把 X 锁上，避免"多人持 S 再抢 X"。③ 批量插入按唯一键<em>排序</em>后再插，减少交叉等待。</p>
+  </div></div>
+</section>
+
+<!-- ============ 12 ============ -->
+<section id="c12">
+  <div class="chap"><span class="num">12</span><h2>锁加在索引上</h2><div class="rule"></div></div>
+
+  <p>一个极重要、却常被忽略的原理：<strong>InnoDB 的行锁锁的是索引记录，不是"数据行"本身。</strong>这能解释许多反直觉的加锁现象。</p>
+
+  <div class="note danger"><span class="ic">最危险后果</span><div>
+    <p><strong>若查询条件没用到任何索引</strong>，InnoDB 无法精确定位要锁的索引记录，只能在<em>聚簇索引上全表扫描，并对扫到的每条记录加临键锁</em>——实际效果近似<strong>锁全表</strong>，其它写操作几乎全被阻塞。所以 <code>UPDATE t SET ... WHERE 无索引列 = x</code> 在并发下是灾难。<em>加锁查询务必走索引</em>，是性能红线。</p>
+  </div></div>
+
+  <h3>聚簇索引与二级索引都会被锁</h3>
+  <p>通过<strong>二级索引</strong>定位加锁时，InnoDB 不仅锁命中的二级索引记录，还会<strong>回表锁住对应的聚簇索引（主键）记录</strong>。这是为防别的事务绕过二级索引、直接用主键改这行。</p>
+
+  <figure>
+    <svg viewBox="0 0 800 230" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <defs><marker id="ar12" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#f0697a"/></marker></defs>
+      <text x="400" y="26" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">UPDATE ... WHERE name='Bob' 锁住的索引记录</text>
+      <rect x="60" y="55" width="280" height="115" rx="12" fill="#0f1830" stroke="#f5b955" stroke-width="1.5"/>
+      <text x="200" y="80" text-anchor="middle" fill="#f5b955" font-size="12" font-weight="700">二级索引 idx_name</text>
+      <rect x="80" y="95" width="240" height="26" rx="6" fill="rgba(240,105,122,.14)" stroke="#f0697a"/>
+      <text x="90" y="113" fill="#f0697a" font-size="11">'Bob' → id=2　【锁】</text>
+      <rect x="80" y="129" width="240" height="26" rx="6" fill="#0a1322" stroke="#26375c"/>
+      <text x="90" y="147" fill="#9aabce" font-size="11">'Carol' → id=3</text>
+      <rect x="460" y="55" width="280" height="115" rx="12" fill="#0f1830" stroke="#2dd4bf" stroke-width="1.5"/>
+      <text x="600" y="80" text-anchor="middle" fill="#2dd4bf" font-size="12" font-weight="700">聚簇索引（主键 id）</text>
+      <rect x="480" y="95" width="240" height="26" rx="6" fill="rgba(240,105,122,.14)" stroke="#f0697a"/>
+      <text x="490" y="113" fill="#f0697a" font-size="11">id=2 → 整行数据　【也锁】</text>
+      <rect x="480" y="129" width="240" height="26" rx="6" fill="#0a1322" stroke="#26375c"/>
+      <text x="490" y="147" fill="#9aabce" font-size="11">id=3 → ...</text>
+      <path d="M320,108 L456,108" stroke="#f0697a" stroke-width="2" fill="none" marker-end="url(#ar12)"/>
+      <text x="388" y="100" text-anchor="middle" fill="#f0697a" font-size="10">回表加锁</text>
+      <text x="400" y="205" text-anchor="middle" fill="#6b7da3" font-size="11">命中的二级索引记录 + 对应聚簇索引记录，两处都被锁</text>
+    </svg>
+    <figcaption><b>图 8</b> · 走二级索引加锁时，命中的二级索引记录与其聚簇索引记录都会被锁住</figcaption>
+  </figure>
+
+  <div class="note key"><span class="ic">两个推论</span><div>
+    <p><strong>① 同一行用不同条件可能锁不同范围。</strong><code>WHERE id=2</code> 走主键，只锁聚簇索引那条；<code>WHERE name='Bob'</code> 走二级索引，锁二级索引 + 聚簇索引两处，还可能因二级索引值可重复而多加间隙锁。<br>
+    <strong>② 覆盖索引不改变加锁对象。</strong>即便查询被二级索引"覆盖"无需回表读数据，加锁（当前读）时该回表锁聚簇索引记录还是会回表。覆盖索引省的是读的回表，不是锁的回表。</p>
+  </div></div>
+</section>
+
+<!-- ============ 13 ============ -->
+<section id="c13">
+  <div class="chap"><span class="num">13</span><h2>半一致性读 Semi-consistent Read</h2><div class="rule"></div></div>
+
+  <p>这是 <strong>RC 隔离级别下 <code>UPDATE</code> 的一项专门优化</strong>，名字冷僻但很实用，能显著减少 UPDATE 之间的锁等待。</p>
+
+  <h3>问题：UPDATE 必须当前读，会被锁挡住</h3>
+  <p><code>UPDATE t SET ... WHERE c &gt; 100</code> 是当前读，要扫描并锁住所有 <code>c&gt;100</code> 的行。但若某行<strong>当前正被别的事务锁着、且改完后其实不满足 <code>c&gt;100</code></strong>，本不该锁它、更不该为它干等——可普通流程会先去申请锁、被阻塞。</p>
+
+  <h3>半一致性读怎么优化</h3>
+  <p>在 <strong>RC</strong> 下，InnoDB 对 UPDATE 扫描时使用半一致性读：遇到一条<em>已被其它事务加锁</em>的记录，<strong>不立刻等锁，而是先读它的最新已提交版本（走一次 MVCC 快照）</strong>来判断 <code>WHERE</code> 条件：</p>
+  <ul class="bul">
+    <li>若该版本<strong>不满足</strong> WHERE 条件 → 这行本来就不用改，<em>直接跳过，不申请锁、不等待</em>。</li>
+    <li>若该版本<strong>满足</strong>条件 → 才老老实实去申请 X 锁并等待。</li>
+  </ul>
+
+  <div class="note key"><span class="ic">效果与边界</span><div>
+    <p><strong>效果：</strong>大幅减少 UPDATE 因"扫到无关的被锁行"而产生的无谓等待，提升并发更新吞吐。<br>
+    <strong>边界：</strong>它<em>只在 RC（及 READ UNCOMMITTED）下生效，RR 下不启用</em>——因为 RR 要靠对扫描路径全程加锁来防幻读，跳过加锁会破坏可重复读语义。这又一次印证：隔离级别越高，能做的并发优化越少。"半一致"三个字，指的就是"判断条件时用快照（一致性读），真要改时再用当前读"这种半快照半锁定的混合姿态。</p>
+  </div></div>
+</section>
+
+<!-- ============ 14 ============ -->
+<section id="c14">
+  <div class="chap"><span class="num">14</span><h2>实战：RR 加锁逐条分析与 RC 对比</h2><div class="rule"></div></div>
+
+  <p>把前面的规则用到具体 SQL。设表 <code>t(id PK, c KEY, d)</code>，数据 <code>(id,c)</code> = (5,10)、(10,20)、(15,30)，隔离级别先看 RR、<code>FOR UPDATE</code>。</p>
+
+  <h3>逐条拆解（RR）</h3>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>SQL</th><th>定位</th><th>加锁（RR）</th><th>解读</th></tr></thead>
+      <tbody>
+        <tr><td><code>WHERE id=10</code></td><td>主键等值命中</td><td><strong>记录锁</strong> id=10</td><td>唯一索引命中 → 临键退化为记录锁</td></tr>
+        <tr><td><code>WHERE id=12</code></td><td>主键等值未命中</td><td><strong>间隙锁</strong> (10,15)</td><td>命中空 → 退化为间隙锁，禁插 11~14</td></tr>
+        <tr><td><code>WHERE id&gt;10</code></td><td>主键范围</td><td>临键 (10,15]、(15,+∞)</td><td>锁到 supremum，防末尾插入</td></tr>
+        <tr><td><code>WHERE c=20</code></td><td>普通索引等值命中</td><td>二级索引：临键(10,20]+间隙(20,30)；<br>聚簇：记录锁 id=10</td><td>普通索引可重复 → 右边多加间隙防再插 c=20</td></tr>
+        <tr><td><code>WHERE c=20</code> 未命中(如 c=21)</td><td>普通索引等值未命中</td><td>间隙锁 (20,30)</td><td>退化为间隙锁</td></tr>
+        <tr><td><code>WHERE 非索引列=x</code></td><td class="no">无索引</td><td class="no">扫全表，逐行临键锁 ≈ 锁全表</td><td>务必避免</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>同样的 SQL 在 RC 下会怎样</h3>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>维度</th><th>RR</th><th>RC</th></tr></thead>
+      <tbody>
+        <tr><td>间隙锁</td><td class="mid">广泛使用</td><td class="yes">几乎不用</td></tr>
+        <tr><td><code>WHERE c=20</code></td><td>临键 + 右间隙</td><td class="yes">仅记录锁（命中的行）</td></tr>
+        <tr><td>未命中的等值/范围</td><td>加间隙锁</td><td class="yes">不加锁</td></tr>
+        <tr><td>扫到的不匹配行</td><td>也会被加锁（后释放/半一致优化前）</td><td class="yes">条件不符的行加锁后立即释放</td></tr>
+        <tr><td>幻读</td><td class="yes">基本不会</td><td class="no">可能发生</td></tr>
+        <tr><td>并发度</td><td>较低（间隙锁多）</td><td class="yes">较高</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note key"><span class="ic">两点落地</span><div>
+    <p><strong>① RC 释放不匹配行的锁。</strong>RR 扫描时把路径上的行都临键锁住且<em>到事务结束才放</em>（为防幻读）；RC 则对 <code>WHERE</code> 不匹配的行<em>加锁后立刻释放</em>，加上无间隙锁，并发明显更好——代价是放弃了防幻读。<br>
+    <strong>② 加锁形态由"隔离级别 × 索引类型 × 是否命中"三者共同决定。</strong>分析任何一条加锁 SQL，都按这三个维度套：先看隔离级别决定要不要间隙锁，再看走哪个索引决定锁几处，最后看命中与否决定退化形态。</p>
+  </div></div>
+</section>
+
+<!-- ============ 15 ============ -->
+<section id="c15">
+  <div class="chap"><span class="num">15</span><h2>AUTO-INC 锁与自增</h2><div class="rule"></div></div>
+
+  <p>自增主键（<code>AUTO_INCREMENT</code>）背后有一套独立的锁机制，很多人不知道它的存在，但它直接影响批量插入的并发与主从复制的安全。</p>
+
+  <h3>为什么自增需要锁</h3>
+  <p>多个事务并发插入时，必须保证每个拿到的自增值<strong>唯一且不重复</strong>。最朴素的做法是用一把<strong>表级 AUTO-INC 锁</strong>：插入语句开始时拿锁、语句结束才释放，使同一时刻只有一条插入语句在分配自增值。安全，但<em>并发插入被串行化了</em>。</p>
+
+  <h3>三种模式：innodb_autoinc_lock_mode</h3>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>模式</th><th>名称</th><th>行为</th><th>并发 / 连续性</th></tr></thead>
+      <tbody>
+        <tr><td><strong>0</strong></td><td>traditional 传统</td><td>所有插入都持表级 AUTO-INC 锁到语句结束</td><td class="no">并发差，值严格连续</td></tr>
+        <tr><td><strong>1</strong></td><td>consecutive 连续</td><td>能预知行数的简单插入用轻量互斥（分配完即放）；行数不可知的（INSERT...SELECT）退回表锁</td><td class="mid">折中（8.0 前默认）</td></tr>
+        <tr><td><strong>2</strong></td><td>interleaved 交错</td><td>一律用轻量互斥，多语句可交错分配自增值</td><td class="yes">并发最好，值可能不连续</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn"><span class="ic">8.0 的默认变化与陷阱</span><div>
+    <p><strong>MySQL 8.0 默认 <code>innodb_autoinc_lock_mode = 2</code>（交错模式）</strong>，并发最好。但模式 2 有两个要注意的点：<br>
+    <strong>① 自增值可能不连续。</strong>多事务交错分配 + 回滚会"用掉但不回收"中间的值，主键出现空洞是正常现象，不要依赖"自增值连续"。<br>
+    <strong>② 与 binlog 格式相关。</strong>模式 2 下，基于语句的复制（SBR / <code>statement</code> 格式 binlog）可能导致主从自增值不一致，因此模式 2 要求配合<strong>行级 binlog（ROW 格式）</strong>。这也是 8.0 把默认 binlog 改成 ROW、把锁模式改成 2 的连带原因。</p>
+  </div></div>
+
+  <div class="note key"><span class="ic">要点</span><div>
+    <p>AUTO-INC 锁是一种<em>语句级</em>而非事务级的锁——它在语句结束（而非事务提交）就释放（模式 1/2 的轻量分配更是分配完立即释放）。所以它造成的阻塞通常很短，但在<strong>大批量 INSERT...SELECT</strong> 且模式为 0/1 时，可能整条语句期间锁住自增、拖慢其它插入，是排查"批量导入卡住并发写"的一个方向。</p>
+  </div></div>
+</section>
+
+<!-- ============ 16 ============ -->
+<section id="c16">
+  <div class="chap"><span class="num">16</span><h2>元数据锁 MDL（Metadata Lock）</h2><div class="rule"></div></div>
+
+  <p>MDL 是 MySQL <strong>Server 层</strong>（不是 InnoDB 引擎层）的表级锁，保护的是表的<strong>结构（元数据）</strong>。它是生产环境"线上改表把整张表搞挂"事故的头号元凶，务必理解。</p>
+
+  <h3>MDL 解决什么</h3>
+  <p>设想事务 A 正在查询表 t，同时事务 B 执行 <code>ALTER TABLE t DROP COLUMN x</code>。如果不加保护，A 读到一半表结构变了，会直接出错。MDL 的规则是：</p>
+  <ul class="bul">
+    <li><strong>任何 DML（增删改查）都会自动给表加一把 MDL 读锁（共享）</strong>，从语句开始一直持有到<em>整个事务提交</em>。多个 DML 的 MDL 读锁互相兼容。</li>
+    <li><strong>任何 DDL（改表结构）要加 MDL 写锁（排他）</strong>，与所有 MDL 读锁、写锁都冲突。</li>
+  </ul>
+
+  <figure>
+    <svg viewBox="0 0 800 240" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <defs><marker id="ar16" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#6b7da3"/></marker></defs>
+      <text x="400" y="24" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">一个未提交的长查询，能让 ALTER 卡住、进而堵死所有新查询</text>
+      <!-- timeline A -->
+      <text x="20" y="62" fill="#2dd4bf" font-size="12" font-weight="700">长事务A</text>
+      <line x1="120" y1="66" x2="760" y2="66" stroke="#324a78" stroke-width="1.5" marker-end="url(#ar16)"/>
+      <rect x="130" y="56" width="520" height="20" rx="5" fill="rgba(45,212,191,.12)" stroke="#2dd4bf"/>
+      <text x="390" y="71" text-anchor="middle" fill="#2dd4bf" font-size="10">持 MDL 读锁（SELECT 后忘记提交）→ 一直不放</text>
+      <!-- timeline B (DDL) -->
+      <text x="20" y="122" fill="#f0697a" font-size="12" font-weight="700">ALTER B</text>
+      <line x1="120" y1="126" x2="760" y2="126" stroke="#324a78" stroke-width="1.5"/>
+      <line x1="300" y1="114" x2="300" y2="138" stroke="#f0697a" stroke-width="2"/>
+      <rect x="300" y="116" width="350" height="20" rx="5" fill="rgba(240,105,122,.14)" stroke="#f0697a"/>
+      <text x="475" y="131" text-anchor="middle" fill="#f0697a" font-size="10">申请 MDL 写锁 → 被 A 的读锁阻塞，排队等待</text>
+      <!-- timeline C (new query) -->
+      <text x="20" y="182" fill="#f5b955" font-size="12" font-weight="700">新查询C</text>
+      <line x1="120" y1="186" x2="760" y2="186" stroke="#324a78" stroke-width="1.5"/>
+      <line x1="430" y1="174" x2="430" y2="198" stroke="#f5b955" stroke-width="2"/>
+      <rect x="430" y="176" width="220" height="20" rx="5" fill="rgba(245,185,85,.14)" stroke="#f5b955"/>
+      <text x="540" y="191" text-anchor="middle" fill="#f5b955" font-size="10">申请 MDL 读锁 → 排在 B 后面，也卡住！</text>
+      <text x="400" y="228" text-anchor="middle" fill="#6b7da3" font-size="11">写锁请求排队后，后续读锁也要排在它之后 → 表"假死"，连普通 SELECT 都不通</text>
+    </svg>
+    <figcaption><b>图 9</b> · MDL 的连锁阻塞：长事务挡住 DDL，等待中的 DDL 又挡住所有新 DML</figcaption>
+  </figure>
+
+  <div class="note danger"><span class="ic">最致命的连锁</span><div>
+    <p>图里的链条是真实事故模型：<strong>① 一个忘记提交的长事务持着 MDL 读锁；② 你执行 ALTER，DDL 申请 MDL 写锁被它挡住，开始排队；③ 一旦写锁在排队，所有后续新查询的 MDL 读锁都要排在它后面——于是这张表对所有人"假死"，连最简单的 SELECT 都被阻塞。</strong>很多"改个表全站雪崩"的事故就是这么来的。</p>
+  </div></div>
+
+  <div class="note warn"><span class="ic">规避</span><div>
+    <p>① 改表前先查 <code>SELECT * FROM performance_schema.metadata_locks</code> 或 <code>information_schema.innodb_trx</code>，确认没有长事务占着这张表。② 给 DDL 设置 <code>lock_wait_timeout</code>，让它在拿不到 MDL 时<em>快速失败</em>而不是无限等待、连累后续查询。③ 用支持 <code>ALGORITHM=INSTANT/INPLACE</code> 的在线 DDL，或 gh-ost / pt-osc 这类工具做无锁变更。④ 应用层杜绝"开了事务做完查询不及时提交"。</p>
+  </div></div>
+</section>
+
+<!-- ============ 17 ============ -->
+<section id="c17">
+  <div class="chap"><span class="num">17</span><h2>死锁：成因、案例与检测</h2><div class="rule"></div></div>
+
+  <p>有锁就有死锁：两个或多个事务各持对方想要的锁，互相等待，谁也无法前进。死锁的<strong>四个必要条件</strong>（互斥、持有并等待、不可剥夺、循环等待）缺一不可，破坏任意一条即可避免——InnoDB 主要从"循环等待"下手检测。</p>
+
+  <h3>等待图与检测原理</h3>
+  <p>InnoDB 内部维护一张<strong>等待图（wait-for graph）</strong>：节点是事务，有向边 <code>A→B</code> 表示"A 在等 B 持有的锁"。<strong>图中只要出现环，就是死锁。</strong>每次有锁等待发生，检测器就增量检查是否成环，发现即处理。</p>
+
+  <figure>
+    <svg viewBox="0 0 800 240" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <defs><marker id="ar17" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#f0697a"/></marker></defs>
+      <text x="400" y="26" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">等待图成环 = 死锁</text>
+      <circle cx="250" cy="130" r="42" fill="#141f3a" stroke="#2dd4bf" stroke-width="2"/>
+      <text x="250" y="128" text-anchor="middle" fill="#2dd4bf" font-size="15" font-weight="700">事务A</text>
+      <text x="250" y="148" text-anchor="middle" fill="#9aabce" font-size="10">持 id=1</text>
+      <circle cx="550" cy="130" r="42" fill="#141f3a" stroke="#f5b955" stroke-width="2"/>
+      <text x="550" y="128" text-anchor="middle" fill="#f5b955" font-size="15" font-weight="700">事务B</text>
+      <text x="550" y="148" text-anchor="middle" fill="#9aabce" font-size="10">持 id=2</text>
+      <path d="M296,110 C370,80 430,80 504,110" stroke="#f0697a" stroke-width="2.5" fill="none" marker-end="url(#ar17)"/>
+      <text x="400" y="82" text-anchor="middle" fill="#f0697a" font-size="11">A 等 B 的 id=2</text>
+      <path d="M504,150 C430,180 370,180 296,150" stroke="#f0697a" stroke-width="2.5" fill="none" marker-end="url(#ar17)"/>
+      <text x="400" y="196" text-anchor="middle" fill="#f0697a" font-size="11">B 等 A 的 id=1</text>
+      <text x="400" y="226" text-anchor="middle" fill="#6b7da3" font-size="11">检测到 A→B→A 闭环 → 选"代价小"的事务回滚打破环</text>
+    </svg>
+    <figcaption><b>图 10</b> · 死锁检测：等待图出现环，InnoDB 立即回滚其中一个事务作为牺牲者</figcaption>
+  </figure>
+
+  <h3>三个真实死锁案例</h3>
+  <h4>案例一 · 加锁顺序相反（最经典）</h4>
+  <pre><code><span class="cm">-- A: 锁 id=1 再锁 id=2 ；B: 锁 id=2 再锁 id=1</span>
+A: <span class="kw">UPDATE</span> t <span class="kw">SET</span> d=d+<span class="nm">1</span> <span class="kw">WHERE</span> id=<span class="nm">1</span>;   B: <span class="kw">UPDATE</span> t <span class="kw">SET</span> d=d+<span class="nm">1</span> <span class="kw">WHERE</span> id=<span class="nm">2</span>;
+A: <span class="kw">UPDATE</span> t <span class="kw">SET</span> d=d+<span class="nm">1</span> <span class="kw">WHERE</span> id=<span class="nm">2</span>;   B: <span class="kw">UPDATE</span> t <span class="kw">SET</span> d=d+<span class="nm">1</span> <span class="kw">WHERE</span> id=<span class="nm">1</span>;  <span class="cm">-- 死锁</span></code></pre>
+  <p>根因：两个事务<em>访问顺序相反</em>。<strong>修复：所有事务统一按主键升序访问行。</strong></p>
+
+  <h4>案例二 · 唯一键并发插入（见第 11 章）</h4>
+  <p>多个事务插同一唯一值，都持冲突记录的 S 锁，再都申请插入意向 X 锁 → "都持 S、都等 X"成环。修复：业务去重 / 串行化该键的写。</p>
+
+  <h4>案例三 · 间隙锁交叉（RR 特有）</h4>
+  <pre><code><span class="cm">-- 表中无 id=5 的行，A、B 都先探测再插入</span>
+A: <span class="kw">SELECT</span> * <span class="kw">FROM</span> t <span class="kw">WHERE</span> id=<span class="nm">5</span> <span class="kw">FOR UPDATE</span>;  <span class="cm">-- 拿到间隙锁(范围)</span>
+B: <span class="kw">SELECT</span> * <span class="kw">FROM</span> t <span class="kw">WHERE</span> id=<span class="nm">5</span> <span class="kw">FOR UPDATE</span>;  <span class="cm">-- 间隙锁互相兼容，也拿到</span>
+A: <span class="kw">INSERT INTO</span> t <span class="kw">VALUES</span>(<span class="nm">5</span>,...);   <span class="cm">-- 申请插入意向锁，被 B 的间隙锁挡住</span>
+B: <span class="kw">INSERT INTO</span> t <span class="kw">VALUES</span>(<span class="nm">5</span>,...);   <span class="cm">-- 同样被 A 挡住 → 死锁</span></code></pre>
+  <p>根因：第 8 章说过"间隙锁互相兼容、但都挡插入意向锁"。两个事务都先拿到兼容的间隙锁，再都要插入 → 互挡。修复：RC 隔离级别（无间隙锁），或用 <code>INSERT ... ON DUPLICATE KEY UPDATE</code> 收敛到一把锁。</p>
+
+  <h3>处理：回滚牺牲者</h3>
+  <p>检测到死锁后，InnoDB <strong>主动选一个事务回滚</strong>（牺牲者），让另一个继续。选择倾向"<em>改动数据少（undo/持锁少）就回滚谁</em>"，回滚代价低。被回滚方收到 <code>ERROR 1213 (40001): Deadlock found</code>，<strong>应用层应捕获并重试整个事务</strong>。</p>
+
+  <div class="note key"><span class="ic">减少死锁的五条</span><div>
+    <p><strong>① 固定加锁顺序</strong>（按主键升序）——最有效，从源头不让环形成。<br>
+    <strong>② 缩短事务</strong>——持锁时间越短，相遇概率越低。<br>
+    <strong>③ 加锁走索引、缩小范围</strong>——避免无索引扫全表的大范围锁。<br>
+    <strong>④ 一次性锁定所需全部资源</strong>，减少"持有再申请"的链条。<br>
+    <strong>⑤ 必要时降级到 RC</strong>，消除间隙锁这一大类死锁。<br>
+    超大并发下检测本身有开销，可用 <code>innodb_deadlock_detect=OFF</code> 关检测、靠 <code>innodb_lock_wait_timeout</code> 超时兜底，但需权衡响应延迟。</p>
+  </div></div>
+</section>
+
+<!-- ============ 18 ============ -->
+<section id="c18">
+  <div class="chap"><span class="num">18</span><h2>锁监控实操与系列总结</h2><div class="rule"></div></div>
+
+  <p>理论之外，得会用工具看"现在谁锁了什么、谁在等谁"。MySQL 8.0 的 <code>performance_schema</code> 提供了直观的锁视图。</p>
+
+  <h3>三张关键视图</h3>
+  <ul class="bul">
+    <li><code>performance_schema.data_locks</code> —— 当前<strong>所有持有/等待中的锁</strong>，一行一把锁。</li>
+    <li><code>performance_schema.data_lock_waits</code> —— <strong>谁在等谁</strong>的配对（阻塞锁 ↔ 等待锁），排查锁等待的首选。</li>
+    <li><code>information_schema.innodb_trx</code> —— 活跃事务列表，含开始时间（找<em>长事务</em>）、状态、正在等的锁。</li>
+  </ul>
+
+  <h3>data_locks 关键字段怎么读</h3>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>字段</th><th>含义</th><th>典型值 / 解读</th></tr></thead>
+      <tbody>
+        <tr><td><code>LOCK_TYPE</code></td><td>粒度</td><td><code>TABLE</code>（表锁/意向锁）/ <code>RECORD</code>（行锁）</td></tr>
+        <tr><td><code>LOCK_MODE</code></td><td>模式 + 形态</td><td><code>X</code>=X临键；<code>X,REC_NOT_GAP</code>=记录锁；<code>X,GAP</code>=间隙锁；<code>X,INSERT_INTENTION</code>=插入意向；<code>IX</code>=意向排他</td></tr>
+        <tr><td><code>LOCK_STATUS</code></td><td>状态</td><td><code>GRANTED</code>=已持有 / <code>WAITING</code>=等待中</td></tr>
+        <tr><td><code>LOCK_DATA</code></td><td>锁住的具体值</td><td>被锁记录的索引键值，如 <code>10</code>、<code>supremum pseudo-record</code></td></tr>
+        <tr><td><code>INDEX_NAME</code></td><td>锁在哪个索引</td><td><code>PRIMARY</code> / 二级索引名 → 印证"锁加在索引上"</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note key"><span class="ic">实操套路</span><div>
+    <p>排查"SQL 卡住"三步：① <code>SELECT * FROM data_lock_waits</code> 找到"等待者 ↔ 阻塞者"两个 <code>trx_id</code>；② 拿阻塞者的 <code>trx_id</code> 去 <code>innodb_trx</code> 看它在干什么、跑了多久（多半是长事务）；③ 必要时 <code>KILL</code> 阻塞者的连接。复盘死锁则看 <code>SHOW ENGINE INNODB STATUS</code> 的 <em>LATEST DETECTED DEADLOCK</em> 段，里面有双方的 SQL 与持锁/等锁详情。</p>
+  </div></div>
+
+  <h3>本篇全景</h3>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>层面</th><th>锁类型</th><th>作用 / 要点</th></tr></thead>
+      <tbody>
+        <tr><td rowspan="4">表级</td><td>意向锁 IS/IX</td><td>O(1) 协调表锁与行锁，自动添加</td></tr>
+        <tr><td>表 S/X 锁</td><td>整表读写，LOCK TABLES / 部分 DDL</td></tr>
+        <tr><td>AUTO-INC 锁</td><td>自增值分配，lock_mode 0/1/2 影响并发</td></tr>
+        <tr><td>元数据锁 MDL</td><td>保护表结构，长事务 + DDL 易致"表假死"</td></tr>
+        <tr><td rowspan="5">行级</td><td>记录锁 Record</td><td>锁单条记录（REC_NOT_GAP），防改</td></tr>
+        <tr><td>间隙锁 Gap</td><td>锁开区间，只防插入；间隙锁互相兼容</td></tr>
+        <tr><td>临键锁 Next-Key</td><td>记录+左间隙，RR 默认，防改+防插</td></tr>
+        <tr><td>插入意向锁</td><td>并发插入相容、被间隙锁单向阻塞</td></tr>
+        <tr><td>隐式锁</td><td>INSERT 延迟建锁，有冲突才显化，省开销</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="fin">
+    <h3>InnoDB 系列 · 五篇成体系</h3>
+    <div class="seq">
+      <b>① 存储结构</b><span class="arrow">→</span><b>② Buffer Pool</b><span class="arrow">→</span><b>③ 故障恢复</b><span class="arrow">→</span><b>④ 事务与 MVCC</b><span class="arrow">→</span><b>⑤ 锁系统</b>
+    </div>
+    <p style="color:#9aabce;font-size:14px;margin-top:14px">数据在哪 → 怎么用 → 出事怎么救 → 并发读怎么控（MVCC）→ 并发写怎么控（锁）。第四、五篇合起来才是 InnoDB 隔离性的完整答案：<em style="color:#2dd4bf">读靠 MVCC 不阻塞，写靠锁保正确</em>。</p>
+    <p style="color:#6b7da3;font-size:13px;margin-top:10px">可继续延伸：<em style="color:#2dd4bf">两阶段提交</em>（redo 与 binlog 的一致性，把第三、四篇连起来）、<em style="color:#2dd4bf">主从复制</em>（binlog 三格式与 GTID，呼应第 15 章自增）、<em style="color:#2dd4bf">索引与执行计划</em>（B+ 树、回表、覆盖索引、最左前缀）。</p>
+  </div>
+
+  <p class="foot">InnoDB 系列 · 第五篇 · 锁系统详解（深入版）· 18 章</p>
+</section>
+
+</div>
+</body>
+</html>

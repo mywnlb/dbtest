@@ -2,6 +2,7 @@ package cn.zhangyis.db.storage.flush;
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.Lsn;
+import cn.zhangyis.db.storage.flush.policy.FlushAdvice;
 import cn.zhangyis.db.storage.redo.RedoCapacityDecision;
 
 import java.util.List;

@@ -2,7 +2,7 @@ package cn.zhangyis.db.storage.recovery;
 
 import cn.zhangyis.db.domain.Lsn;
 import cn.zhangyis.db.domain.PageId;
-import cn.zhangyis.db.storage.flush.DoublewriteRecoveryScanner;
+import cn.zhangyis.db.storage.flush.doublewrite.DoublewriteRecoveryScanner;
 
 /**
  * undo TRUNCATING 恢复扩展点。实现必须只处理启动配置显式列出的 undo SpaceId：先修复/读取 page0 marker，

@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>InnoDB Buffer Pool 内存侧链路</title>
+<style>
+:root{--bg:#0d1117;--panel:#161b22;--border:#30363d;--txt:#e6edf3;--sub:#9da7b3;--dim:#6e7681;
+--blue:#4493f8;--teal:#3fb950;--amber:#d29922;--purple:#a371f7;--red:#f85149;
+--mono:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;}
+*{box-sizing:border-box;}html{scroll-behavior:smooth;}
+body{margin:0;background:var(--bg);color:var(--txt);
+font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans CJK SC","Microsoft YaHei",sans-serif;
+line-height:1.75;font-size:15px;}
+.wrap{max-width:920px;margin:0 auto;padding:64px 28px 120px;}
+header{border-bottom:1px solid var(--border);padding-bottom:32px;margin-bottom:8px;}
+header h1{font-size:30px;font-weight:800;letter-spacing:-0.02em;margin:0 0 14px;
+background:linear-gradient(90deg,var(--amber),var(--red));-webkit-background-clip:text;
+background-clip:text;-webkit-text-fill-color:transparent;}
+header .meta{color:var(--sub);font-size:13.5px;line-height:1.7;}
+header .meta code{color:var(--amber);}
+.callout{background:rgba(68,147,248,.07);border:1px solid rgba(68,147,248,.25);border-radius:10px;
+padding:14px 18px;margin:22px 0;font-size:13.5px;color:var(--sub);}
+.callout strong{color:var(--blue);}
+nav{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:20px 26px;margin:36px 0 48px;}
+nav h2{font-size:13px;text-transform:uppercase;letter-spacing:0.08em;color:var(--dim);margin:0 0 14px;}
+nav ol{margin:0;padding-left:20px;columns:2;column-gap:36px;}
+nav li{margin:5px 0;break-inside:avoid;}
+nav a{color:var(--txt);text-decoration:none;border-bottom:1px solid transparent;transition:.15s;}
+nav a:hover{color:var(--amber);border-bottom-color:var(--amber);}
+h2.sec{font-size:23px;font-weight:700;margin:64px 0 22px;padding-top:18px;
+border-top:1px solid var(--border);letter-spacing:-0.01em;}
+h2.sec .n{color:var(--amber);font-variant-numeric:tabular-nums;margin-right:10px;}
+h3{font-size:17px;font-weight:650;margin:34px 0 14px;}
+h4{font-size:15px;font-weight:650;margin:24px 0 10px;color:var(--teal);}
+p{margin:14px 0;}strong{color:#fff;font-weight:650;}a{color:var(--amber);}
+code{font-family:var(--mono);font-size:13px;background:#1f2630;padding:2px 6px;border-radius:5px;color:var(--amber);border:1px solid #2a313c;}
+pre{background:#010409;border:1px solid var(--border);border-radius:10px;padding:18px 20px;overflow-x:auto;margin:18px 0;line-height:1.6;}
+pre code{background:none;border:none;padding:0;color:#c9d1d9;font-size:12.5px;}
+blockquote{margin:18px 0;padding:12px 20px;border-left:3px solid var(--amber);
+background:rgba(210,153,34,0.06);border-radius:0 8px 8px 0;color:var(--sub);}
+blockquote strong{color:var(--amber);}
+table{border-collapse:collapse;width:100%;margin:20px 0;font-size:13.5px;}
+th,td{border:1px solid var(--border);padding:9px 13px;text-align:left;vertical-align:top;}
+th{background:#1c2330;color:var(--txt);font-weight:650;}td{color:var(--sub);}
+tr:nth-child(even) td{background:rgba(255,255,255,0.015);}td strong{color:var(--txt);}
+figure{margin:28px 0;text-align:center;}
+figure svg{width:100%;height:auto;border:1px solid var(--border);border-radius:12px;background:var(--bg);display:block;}
+figcaption{color:var(--dim);font-size:12.5px;margin-top:10px;font-style:italic;}
+ul{margin:14px 0;padding-left:24px;}li{margin:6px 0;}
+hr{border:none;border-top:1px solid var(--border);margin:40px 0;}
+.tag{display:inline-block;font-size:11px;padding:1px 8px;border-radius:20px;font-weight:600;vertical-align:middle;}
+.tag.r{background:rgba(248,81,73,.15);color:var(--red);border:1px solid rgba(248,81,73,.3);}
+.tag.b{background:rgba(68,147,248,.15);color:var(--blue);border:1px solid rgba(68,147,248,.3);}
+::selection{background:rgba(210,153,34,.3);}
+</style></head><body><div class="wrap">
+<header><h1>InnoDB Buffer Pool 内存侧链路</h1>
+<div class="meta">
+承接上一份《存储结构与数据链路》的<strong>磁盘侧</strong>，这份讲<strong>内存侧</strong>：页从 <code>.ibd</code> 进入 Buffer Pool 之后，
+LRU / Flush / Change Buffer / Redo / Undo / 检查点如何协同，支撑增删改查并保证崩溃不丢数据。<br>
+适用版本：MySQL 5.7 / 8.0，InnoDB 引擎。
+</div></header>
+<div class="callout">
+<strong>一句话总览：</strong>上层永远只跟 Buffer Pool 打交道，从不直接读写磁盘文件。
+读 → 逻辑读命中/未命中物理读；写 → 改内存页 + 写 redo（WAL），数据页异步刷盘；崩溃 → redo 前滚 + undo 后滚。
+</div>
+<nav><h2>目录</h2><ol>
+<li><a href="#s1">Buffer Pool 整体结构</a></li>
+<li><a href="#s2">LRU 链表：young / old 分代</a></li>
+<li><a href="#s3">访问一个页：逻辑读与物理读</a></li>
+<li><a href="#s4">查询链路（内存侧）</a></li>
+<li><a href="#s5">更新链路与 WAL</a></li>
+<li><a href="#s6">Change Buffer</a></li>
+<li><a href="#s7">持久化闭环：Redo / 检查点 / 恢复</a></li>
+<li><a href="#s8">关键结论速查</a></li>
+</ol></nav>
+<h2 class="sec" id="s1"><span class="n">01</span>Buffer Pool 整体结构</h2>
+<p>Buffer Pool 是 InnoDB 在内存里缓存磁盘页的核心区域，默认占物理内存的 50%~75%（参数 <code>innodb_buffer_pool_size</code>）。它的目标是：让绝大多数页访问命中内存，把昂贵的磁盘随机 I/O 降到最低。</p>
+<figure><svg width="100%" viewBox="0 0 700 680" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif"><defs><marker id="a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5"/></marker></defs><rect x="0" y="0" width="700" height="680" rx="12" fill="#0d1117"/>
+<text x="350" y="28" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">Buffer Pool 整体结构：实例 → chunk → 缓存页 + 三大链表</text>
+<text x="350" y="48" text-anchor="middle" fill="#6e7681" font-size="10">InnoDB 在内存里缓存磁盘页的核心区域，默认占物理内存约 50%~75%</text>
+<text x="350" y="78" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">① 多实例（innodb_buffer_pool_instances）减少锁竞争</text>
+<rect x="40" y="92" width="200" height="56" rx="8" fill="#0d2847" stroke="#4493f8" stroke-width="0.8"/>
+<text x="140" y="114" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">Buffer Pool 实例 0</text>
+<text x="140" y="134" text-anchor="middle" fill="#9da7b3" font-size="10">独立 free/LRU/flush 链表</text>
+<rect x="250" y="92" width="200" height="56" rx="8" fill="#0d2847" stroke="#4493f8" stroke-width="0.8"/>
+<text x="350" y="114" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">Buffer Pool 实例 1</text>
+<text x="350" y="134" text-anchor="middle" fill="#9da7b3" font-size="10">独立 free/LRU/flush 链表</text>
+<rect x="460" y="92" width="200" height="56" rx="8" fill="#0d2847" stroke="#4493f8" stroke-width="0.8"/>
+<text x="560" y="114" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">Buffer Pool 实例 2</text>
+<text x="560" y="134" text-anchor="middle" fill="#9da7b3" font-size="10">独立 free/LRU/flush 链表</text>
+<text x="350" y="180" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">② 每个实例由若干 chunk 组成（支持在线扩缩容）</text>
+<rect x="40" y="194" width="620" height="70" rx="8" fill="#21262d" stroke="#6e7681" stroke-width="0.8"/>
+<rect x="52" y="206" width="140" height="46" rx="8" fill="#1d1530" stroke="#a371f7" stroke-width="0.8"/>
+<text x="122" y="226" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="700">chunk 0</text>
+<text x="122" y="243" text-anchor="middle" fill="#9da7b3" font-size="9">= 一批 16KB 页</text>
+<rect x="210" y="206" width="140" height="46" rx="8" fill="#1d1530" stroke="#a371f7" stroke-width="0.8"/>
+<text x="280" y="226" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="700">chunk 1</text>
+<text x="280" y="243" text-anchor="middle" fill="#9da7b3" font-size="9">= 一批 16KB 页</text>
+<rect x="368" y="206" width="140" height="46" rx="8" fill="#1d1530" stroke="#a371f7" stroke-width="0.8"/>
+<text x="438" y="226" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="700">chunk 2</text>
+<text x="438" y="243" text-anchor="middle" fill="#9da7b3" font-size="9">= 一批 16KB 页</text>
+<rect x="526" y="206" width="140" height="46" rx="8" fill="#1d1530" stroke="#a371f7" stroke-width="0.8"/>
+<text x="596" y="226" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="700">chunk 3</text>
+<text x="596" y="243" text-anchor="middle" fill="#9da7b3" font-size="9">= 一批 16KB 页</text>
+<text x="350" y="296" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">③ chunk 内部：控制块 + 缓存页 一一对应</text>
+<rect x="40" y="310" width="300" height="80" rx="8" fill="#2d220a" stroke="#d29922" stroke-width="0.8"/>
+<text x="190" y="330" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">控制块 control block</text>
+<text x="56" y="350" text-anchor="start" fill="#9da7b3" font-size="10">页号(space,page_no)、LRU/flush 节点</text>
+<text x="56" y="368" text-anchor="start" fill="#9da7b3" font-size="10">指针、最新/最旧修改 LSN、状态位</text>
+<rect x="360" y="310" width="300" height="80" rx="8" fill="#0d2818" stroke="#3fb950" stroke-width="0.8"/>
+<text x="510" y="330" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">缓存页 frame（16KB）</text>
+<text x="376" y="350" text-anchor="start" fill="#9da7b3" font-size="10">磁盘页的完整副本</text>
+<text x="376" y="368" text-anchor="start" fill="#9da7b3" font-size="10">读进来 / 改完等待刷回</text>
+<line x1="340" y1="350" x2="360" y2="350" stroke="#e6edf3" stroke-width="1.2" marker-end="url(#a)"/>
+<text x="350" y="422" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">④ 三大链表管理所有缓存页（控制块串成链）</text>
+<rect x="40" y="436" width="190" height="84" rx="8" fill="#2d1012" stroke="#f85149" stroke-width="0.8"/>
+<text x="135" y="458" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">Free 链表</text>
+<text x="135" y="480" text-anchor="middle" fill="#9da7b3" font-size="10">记录所有空闲页</text>
+<text x="135" y="500" text-anchor="middle" fill="#9da7b3" font-size="10">新页优先从这里取</text>
+<rect x="250" y="436" width="190" height="84" rx="8" fill="#0d2847" stroke="#4493f8" stroke-width="0.8"/>
+<text x="345" y="458" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">LRU 链表</text>
+<text x="345" y="480" text-anchor="middle" fill="#9da7b3" font-size="10">已被使用的页</text>
+<text x="345" y="500" text-anchor="middle" fill="#9da7b3" font-size="10">按冷热淘汰，见图2</text>
+<rect x="460" y="436" width="190" height="84" rx="8" fill="#2d220a" stroke="#d29922" stroke-width="0.8"/>
+<text x="555" y="458" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">Flush 链表</text>
+<text x="555" y="480" text-anchor="middle" fill="#9da7b3" font-size="10">被修改过的脏页</text>
+<text x="555" y="500" text-anchor="middle" fill="#9da7b3" font-size="10">按 LSN 等待刷盘</text>
+<rect x="40" y="540" width="620" height="56" rx="8" fill="#21262d" stroke="#6e7681" stroke-width="0.8"/>
+<text x="350" y="562" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">一个页同时挂在多条链表上</text>
+<text x="350" y="582" text-anchor="middle" fill="#9da7b3" font-size="10">如：一个被修改的页 既在 LRU（管冷热）又在 Flush（管刷盘）</text>
+<text x="350" y="632" text-anchor="middle" fill="#6e7681" font-size="10">页的生命周期：Free → 读入挂 LRU → 被改也挂 Flush → 刷盘后离开 Flush → 淘汰回 Free</text>
+</svg><figcaption>图1　Buffer Pool 结构：多实例 → chunk → 控制块+缓存页，由 Free / LRU / Flush 三链表管理</figcaption></figure>
+<h3>四个层次</h3>
+<ul>
+<li><strong>多实例</strong>（<code>innodb_buffer_pool_instances</code>）：把缓冲池切成多份，各自独立加锁，减少高并发下的锁竞争。</li>
+<li><strong>chunk</strong>：每个实例由若干 chunk 组成，是在线扩缩容的单位（<code>innodb_buffer_pool_chunk_size</code>）。</li>
+<li><strong>控制块 + 缓存页</strong>：每个 16KB 缓存页（frame）配一个控制块，记页号、LRU/Flush 链表节点、修改 LSN、状态位等。</li>
+<li><strong>三大链表</strong>：Free（空闲页）、LRU（管冷热淘汰）、Flush（管脏页刷盘）。一个页可同时挂在多条链表上。</li>
+</ul>
+<blockquote>页的生命周期：<strong>Free → 读入挂 LRU → 被改也挂 Flush → 刷盘后离开 Flush → 淘汰回 Free</strong>。</blockquote>
+<h2 class="sec" id="s2"><span class="n">02</span>LRU 链表：young / old 分代</h2>
+<p>朴素 LRU（最近最少使用）有个致命缺陷：一次全表扫描或预读会读入海量页，若都插到链表头，会把真正的热点页挤出缓存。InnoDB 用<strong>分代 LRU</strong> 解决这个问题。</p>
+<figure><svg width="100%" viewBox="0 0 700 560" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif"><defs><marker id="a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5"/></marker></defs><rect x="0" y="0" width="700" height="560" rx="12" fill="#0d1117"/>
+<text x="350" y="28" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">LRU 链表：young / old 分代，防止全表扫描污染缓存</text>
+<text x="350" y="48" text-anchor="middle" fill="#6e7681" font-size="10">朴素 LRU 会被一次大扫描冲垮，InnoDB 把链表按 5:3 切成两段</text>
+<rect x="40" y="80" width="620" height="150" rx="8" fill="#21262d" stroke="#6e7681" stroke-width="0.8"/>
+<text x="350" y="102" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">LRU 链表（一条，逻辑上分两段）</text>
+<rect x="60" y="116" width="360" height="90" rx="8" fill="#0d2847" stroke="#4493f8" stroke-width="0.8"/>
+<text x="240" y="138" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">young 区（热端，约 5/8）</text>
+<text x="240" y="158" text-anchor="middle" fill="#9da7b3" font-size="10">频繁访问的热点页</text>
+<text x="240" y="176" text-anchor="middle" fill="#9da7b3" font-size="10">链表头 = 最近最常用</text>
+<text x="240" y="194" text-anchor="middle" fill="#9da7b3" font-size="9">命中不一定立刻移到头部（有时间窗口优化）</text>
+<rect x="430" y="116" width="210" height="90" rx="8" fill="#2d220a" stroke="#d29922" stroke-width="0.8"/>
+<text x="535" y="138" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">old 区（冷端，约 3/8）</text>
+<text x="535" y="158" text-anchor="middle" fill="#9da7b3" font-size="10">新读入的页先放这里</text>
+<text x="535" y="176" text-anchor="middle" fill="#9da7b3" font-size="10">midpoint 插入点</text>
+<text x="535" y="194" text-anchor="middle" fill="#9da7b3" font-size="9">链表尾 = 最先淘汰</text>
+<line x1="420" y1="161" x2="430" y2="161" stroke="#6e7681" stroke-width="1" stroke-dasharray="3 2"/>
+<text x="425" y="228" text-anchor="middle" fill="#6e7681" font-size="10">← 越靠左越热（保留）　　越靠右越冷（淘汰）→</text>
+<text x="350" y="268" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">新页读入的流程（midpoint insertion）</text>
+<rect x="40" y="282" width="190" height="72" rx="8" fill="#1d1530" stroke="#a371f7" stroke-width="0.8"/>
+<text x="135" y="306" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">① 新页读入</text>
+<text x="135" y="328" text-anchor="middle" fill="#9da7b3" font-size="10">插到 old 区头部</text>
+<line x1="230" y1="318" x2="250" y2="318" stroke="#e6edf3" stroke-width="1.2" marker-end="url(#a)"/>
+<rect x="250" y="282" width="190" height="72" rx="8" fill="#2d220a" stroke="#d29922" stroke-width="0.8"/>
+<text x="345" y="306" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">② 再次访问</text>
+<text x="345" y="328" text-anchor="middle" fill="#9da7b3" font-size="10">且停留超 1 秒</text>
+<line x1="440" y1="318" x2="460" y2="318" stroke="#e6edf3" stroke-width="1.2" marker-end="url(#a)"/>
+<rect x="460" y="282" width="190" height="72" rx="8" fill="#0d2818" stroke="#3fb950" stroke-width="0.8"/>
+<text x="555" y="306" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">③ 升入 young</text>
+<text x="555" y="328" text-anchor="middle" fill="#9da7b3" font-size="10">移到 young 区头部</text>
+<rect x="40" y="378" width="620" height="150" rx="8" fill="#2d1012" stroke="#f85149" stroke-width="0.8"/>
+<text x="350" y="400" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">为什么要分代？防「预读 / 全表扫描」污染</text>
+<text x="60" y="424" text-anchor="start" fill="#9da7b3" font-size="10">• 全表扫描会一次性读入大量页，若直接进 young 头部，会把真正的热点页挤出缓存</text>
+<text x="60" y="446" text-anchor="start" fill="#9da7b3" font-size="10">• 分代后：扫描读入的页只进 old 区，且「1 秒内的连续访问不升级」</text>
+<text x="60" y="468" text-anchor="start" fill="#9da7b3" font-size="10">• 扫描往往在 1 秒内读完一页的多条记录就走 → 这些页停留 old 区，很快被淘汰</text>
+<text x="60" y="490" text-anchor="start" fill="#9da7b3" font-size="10">• 真正反复访问、且跨越 1 秒的页才升入 young → 热点得以保留</text>
+<text x="60" y="512" text-anchor="start" fill="#d29922" font-size="9">参数：innodb_old_blocks_pct（old 占比，默认37）、innodb_old_blocks_time（默认1000ms）</text>
+</svg><figcaption>图2　LRU 分代：新页先进 old 区，跨越时间窗口的二次访问才升入 young 区</figcaption></figure>
+<ul>
+<li><strong>young 区（热端，约 5/8）</strong>：反复访问的热点页，链表头是最近最常用。</li>
+<li><strong>old 区（冷端，约 3/8）</strong>：新读入的页先放在 old 区头部（midpoint insertion），链表尾最先淘汰。</li>
+</ul>
+<h3>为什么能防污染</h3>
+<ul>
+<li>新页只进 old 区，不会一上来就占据 young。</li>
+<li>「<code>innodb_old_blocks_time</code>（默认 1000ms）内的访问不升级」：全表扫描往往在 1 秒内读完一页的多条记录就走，这些页停在 old 区，很快被淘汰。</li>
+<li>只有<strong>跨越时间窗口、被反复访问</strong>的页才升入 young → 热点得以保留。</li>
+</ul>
+<blockquote>关键参数：<code>innodb_old_blocks_pct</code>（old 区占比，默认 37%）、<code>innodb_old_blocks_time</code>（升级时间窗口，默认 1000ms）。</blockquote>
+<h2 class="sec" id="s3"><span class="n">03</span>访问一个页：逻辑读与物理读</h2>
+<p>无论查询还是更新，访问任何一个页都走同一套入口：先查哈希表看页在不在 Buffer Pool。</p>
+<figure><svg width="100%" viewBox="0 0 700 520" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif"><defs><marker id="a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5"/></marker></defs><rect x="0" y="0" width="700" height="520" rx="12" fill="#0d1117"/>
+<text x="350" y="28" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">访问一个页：逻辑读 → 命中？→ 物理读</text>
+<text x="350" y="48" text-anchor="middle" fill="#6e7681" font-size="10">上层永远只跟 Buffer Pool 打交道，从不直接读写磁盘文件</text>
+<rect x="40" y="72" width="620" height="48" rx="8" fill="#1d1530" stroke="#a371f7" stroke-width="0.8"/>
+<text x="350" y="94" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">SQL 执行器需要页 (space_id, page_no)</text>
+<text x="350" y="110" text-anchor="middle" fill="#9da7b3" font-size="10">例如：B+ 树查找时要访问某个叶子页</text>
+<line x1="350" y1="120" x2="350" y2="140" stroke="#e6edf3" stroke-width="1.2" marker-end="url(#a)"/>
+<rect x="220" y="144" width="260" height="48" rx="8" fill="#2d220a" stroke="#d29922" stroke-width="0.8"/>
+<text x="350" y="166" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">查哈希表：页在 Buffer Pool 吗？</text>
+<text x="350" y="182" text-anchor="middle" fill="#9da7b3" font-size="9">page hash（space+page_no → 控制块）</text>
+<line x1="280" y1="192" x2="170" y2="230" stroke="#3fb950" stroke-width="1.4" marker-end="url(#a)"/>
+<text x="195" y="216" text-anchor="start" fill="#3fb950" font-size="10">命中 hit</text>
+<rect x="40" y="234" width="280" height="90" rx="8" fill="#0d2818" stroke="#3fb950" stroke-width="0.8"/>
+<text x="180" y="256" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">逻辑读命中（快）</text>
+<text x="56" y="278" text-anchor="start" fill="#9da7b3" font-size="10">直接返回内存中的缓存页</text>
+<text x="56" y="298" text-anchor="start" fill="#9da7b3" font-size="10">调整其在 LRU 链表的位置</text>
+<text x="56" y="316" text-anchor="start" fill="#9da7b3" font-size="10">纳秒~微秒级，无磁盘 I/O</text>
+<line x1="420" y1="192" x2="530" y2="230" stroke="#f85149" stroke-width="1.4" marker-end="url(#a)"/>
+<text x="505" y="216" text-anchor="start" fill="#f85149" font-size="10">未命中 miss</text>
+<rect x="380" y="234" width="280" height="90" rx="8" fill="#2d1012" stroke="#f85149" stroke-width="0.8"/>
+<text x="520" y="256" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">未命中 → 物理读（慢）</text>
+<text x="396" y="278" text-anchor="start" fill="#9da7b3" font-size="10">① 从 Free 链表取一个空闲页</text>
+<text x="396" y="298" text-anchor="start" fill="#9da7b3" font-size="10">② Free 没有 → 淘汰 LRU 尾部冷页</text>
+<text x="396" y="316" text-anchor="start" fill="#9da7b3" font-size="10">③ 从 .ibd 磁盘读 16KB 填入，挂 LRU old</text>
+<rect x="40" y="344" width="620" height="60" rx="8" fill="#21262d" stroke="#6e7681" stroke-width="0.8"/>
+<text x="350" y="366" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">若被淘汰的冷页是脏页 → 必须先刷盘再复用</text>
+<text x="350" y="388" text-anchor="middle" fill="#9da7b3" font-size="10">这就是为什么 Free 链表空时，淘汰可能伴随一次写磁盘（见持久化图）</text>
+<rect x="40" y="420" width="620" height="72" rx="8" fill="#0d2847" stroke="#4493f8" stroke-width="0.8"/>
+<text x="350" y="442" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">预读 read-ahead：提前把可能用到的页批量读入</text>
+<text x="60" y="464" text-anchor="start" fill="#9da7b3" font-size="10">• 线性预读：顺序访问一个区的页数超阈值 → 预读下一个区的全部 64 页</text>
+<text x="60" y="484" text-anchor="start" fill="#9da7b3" font-size="10">• 随机预读：一个区内已有多页在缓存 → 预读该区其余页（默认关闭）</text>
+</svg><figcaption>图3　访问路径：page hash 命中走逻辑读，未命中触发物理读与可能的脏页刷出</figcaption></figure>
+<ul>
+<li><span class="tag b">命中</span> <strong>逻辑读</strong>：直接返回内存缓存页，调整 LRU 位置，纳秒~微秒级，无磁盘 I/O。</li>
+<li><span class="tag r">未命中</span> <strong>物理读</strong>：从 Free 链表取空闲页（没有就淘汰 LRU 尾部冷页），从 <code>.ibd</code> 读 16KB 填入，挂到 LRU old 区。</li>
+</ul>
+<blockquote>若被淘汰的冷页是<strong>脏页</strong>，必须先刷盘再复用——这就是 Free 链表枯竭时，一次读可能伴随一次写的原因。</blockquote>
+<h4>预读 read-ahead</h4>
+<p>InnoDB 会提前批量读入可能用到的页：<strong>线性预读</strong>（顺序访问一个区超过阈值 <code>innodb_read_ahead_threshold</code> → 预读下一个区的 64 页）和<strong>随机预读</strong>（默认关闭）。预读的页同样只进 old 区，避免污染。</p>
+<h2 class="sec" id="s4"><span class="n">04</span>查询链路（内存侧）</h2>
+<p>读操作是最轻的路径：<strong>不产生 redo、不产生 undo</strong>（除非 MVCC 需要读 undo 构造旧版本），只可能产生页读入和 LRU 调整。</p>
+<figure><svg width="100%" viewBox="0 0 700 440" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif"><defs><marker id="a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5"/></marker></defs><rect x="0" y="0" width="700" height="440" rx="12" fill="#0d1117"/>
+<text x="350" y="28" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">查询链路（内存侧）：SELECT 一行</text>
+<text x="350" y="48" text-anchor="middle" fill="#6e7681" font-size="10">读操作不产生 redo，只可能产生页的读入与 LRU 调整</text>
+<rect x="60" y="72" width="580" height="46" rx="8" fill="#1d1530" stroke="#a371f7" stroke-width="0.8"/>
+<text x="350" y="92" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">① 解析+优化</text>
+<text x="350" y="110" text-anchor="middle" fill="#9da7b3" font-size="10">选定索引、生成执行计划</text>
+<line x1="350" y1="118" x2="350" y2="132" stroke="#6e7681" stroke-width="1.3" marker-end="url(#a)"/>
+<rect x="60" y="132" width="580" height="46" rx="8" fill="#2d220a" stroke="#d29922" stroke-width="0.8"/>
+<text x="350" y="152" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">② 逐层访问 B+ 树页</text>
+<text x="350" y="170" text-anchor="middle" fill="#9da7b3" font-size="10">每个页都走「逻辑读」检查 Buffer Pool</text>
+<line x1="350" y1="178" x2="350" y2="192" stroke="#6e7681" stroke-width="1.3" marker-end="url(#a)"/>
+<rect x="60" y="192" width="580" height="46" rx="8" fill="#0d2847" stroke="#4493f8" stroke-width="0.8"/>
+<text x="350" y="212" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">③ 命中→直接用 / 未命中→物理读</text>
+<text x="350" y="230" text-anchor="middle" fill="#9da7b3" font-size="10">读入的页挂 LRU old 区</text>
+<line x1="350" y1="238" x2="350" y2="252" stroke="#6e7681" stroke-width="1.3" marker-end="url(#a)"/>
+<rect x="60" y="252" width="580" height="46" rx="8" fill="#0d2818" stroke="#3fb950" stroke-width="0.8"/>
+<text x="350" y="272" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">④ 叶子页内定位记录</text>
+<text x="350" y="290" text-anchor="middle" fill="#9da7b3" font-size="10">二分槽 + next_record 链表扫描</text>
+<line x1="350" y1="298" x2="350" y2="312" stroke="#6e7681" stroke-width="1.3" marker-end="url(#a)"/>
+<rect x="60" y="312" width="580" height="46" rx="8" fill="#2d1a0f" stroke="#e8845c" stroke-width="0.8"/>
+<text x="350" y="332" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">⑤ 返回行 + MVCC 可见性判断</text>
+<text x="350" y="350" text-anchor="middle" fill="#9da7b3" font-size="10">按 ReadView 决定看哪个版本，必要时读 undo 构造旧版本</text>
+<rect x="60" y="376" width="580" height="52" rx="8" fill="#21262d" stroke="#6e7681" stroke-width="0.8"/>
+<text x="350" y="398" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">关键：查询不写 redo / undo（除非触发 MVCC 读 undo）</text>
+<text x="350" y="416" text-anchor="middle" fill="#9da7b3" font-size="10">纯读路径开销 = 逻辑读命中率 + 偶发物理读 + 页内查找</text>
+</svg><figcaption>图4　SELECT 一行的内存侧链路</figcaption></figure>
+<p>第 ⑤ 步的 MVCC 是重点：InnoDB 按事务的 <code>ReadView</code> 判断每个版本是否可见，若当前页上的版本太新（不该被本事务看到），就顺着记录的 <code>DB_ROLL_PTR</code> 去 undo 链里找旧版本构造出可见的那一版。这也是查询<strong>可能</strong>读 undo 的唯一情形。</p>
+<h2 class="sec" id="s5"><span class="n">05</span>更新链路与 WAL</h2>
+<p>写操作（INSERT / UPDATE / DELETE）的核心是 <strong>WAL（Write-Ahead Logging，预写日志）</strong>：<strong>先写日志，数据页延迟落盘</strong>。这是 InnoDB 高性能且不丢数据的根基。</p>
+<figure><svg width="100%" viewBox="0 0 700 620" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif"><defs><marker id="a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5"/></marker></defs><rect x="0" y="0" width="700" height="620" rx="12" fill="#0d1117"/>
+<text x="350" y="28" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">更新链路（WAL）：UPDATE / INSERT / DELETE</text>
+<text x="350" y="48" text-anchor="middle" fill="#d29922" font-size="10">核心思想 Write-Ahead Logging：先写日志，数据页延迟落盘</text>
+<rect x="60" y="72" width="580" height="48" rx="8" fill="#1d1530" stroke="#a371f7" stroke-width="0.8"/>
+<text x="350" y="93" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">① 定位目标页</text>
+<text x="350" y="111" text-anchor="middle" fill="#9da7b3" font-size="9">走查询链路把页读进 Buffer Pool</text>
+<line x1="350" y1="120" x2="350" y2="134" stroke="#6e7681" stroke-width="1.3" marker-end="url(#a)"/>
+<rect x="60" y="134" width="580" height="48" rx="8" fill="#2d1a0f" stroke="#e8845c" stroke-width="0.8"/>
+<text x="350" y="155" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">② 写 undo log</text>
+<text x="350" y="173" text-anchor="middle" fill="#9da7b3" font-size="9">旧版本写入 undo 页（也在 Buffer Pool，自身也受 redo 保护）</text>
+<line x1="350" y1="182" x2="350" y2="196" stroke="#6e7681" stroke-width="1.3" marker-end="url(#a)"/>
+<rect x="60" y="196" width="580" height="48" rx="8" fill="#0d2818" stroke="#3fb950" stroke-width="0.8"/>
+<text x="350" y="217" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">③ 修改内存中的缓存页</text>
+<text x="350" y="235" text-anchor="middle" fill="#9da7b3" font-size="9">在 frame 上原地改 / delete-mark / 插入，页变「脏」</text>
+<line x1="350" y1="244" x2="350" y2="258" stroke="#6e7681" stroke-width="1.3" marker-end="url(#a)"/>
+<rect x="60" y="258" width="580" height="48" rx="8" fill="#2d220a" stroke="#d29922" stroke-width="0.8"/>
+<text x="350" y="279" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">④ 该页挂入 Flush 链表</text>
+<text x="350" y="297" text-anchor="middle" fill="#9da7b3" font-size="9">记录最早修改 LSN（oldest_modification）</text>
+<line x1="350" y1="306" x2="350" y2="320" stroke="#6e7681" stroke-width="1.3" marker-end="url(#a)"/>
+<rect x="60" y="320" width="580" height="48" rx="8" fill="#2d1012" stroke="#f85149" stroke-width="0.8"/>
+<text x="350" y="341" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">⑤ 写 redo log（关键）</text>
+<text x="350" y="359" text-anchor="middle" fill="#9da7b3" font-size="9">物理逻辑日志写入 log buffer，记「对哪页做了什么改动」</text>
+<line x1="350" y1="368" x2="350" y2="382" stroke="#6e7681" stroke-width="1.3" marker-end="url(#a)"/>
+<rect x="60" y="382" width="580" height="48" rx="8" fill="#0d2847" stroke="#4493f8" stroke-width="0.8"/>
+<text x="350" y="403" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">⑥ 提交时 redo 落盘</text>
+<text x="350" y="421" text-anchor="middle" fill="#9da7b3" font-size="9">按 innodb_flush_log_at_trx_commit 刷 redo 到磁盘</text>
+<rect x="60" y="450" width="580" height="58" rx="8" fill="#21262d" stroke="#6e7681" stroke-width="0.8"/>
+<text x="350" y="472" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">提交成功 = redo 已落盘，但数据页此刻可能还在内存（脏页）</text>
+<text x="350" y="492" text-anchor="middle" fill="#d29922" font-size="10">宕机也不怕：重启用 redo 重做即可恢复 → 这就是 WAL 的精髓</text>
+</svg><figcaption>图5　更新链路：改内存页 + 写 undo + 写 redo，提交时 redo 落盘</figcaption></figure>
+<h3>为什么 WAL 能既快又安全</h3>
+<ul>
+<li><strong>快</strong>：数据页改动是<strong>随机写</strong>（页散落在文件各处），而 redo 是<strong>顺序追加写</strong>。提交时只需把 redo 顺序刷盘，数据页留在内存慢慢异步刷——把随机 I/O 换成了顺序 I/O。</li>
+<li><strong>安全</strong>：提交成功 = redo 已落盘。即便此刻数据页还在内存（脏页），宕机后也能用 redo 重做恢复。</li>
+</ul>
+<h4>redo 落盘策略 <code>innodb_flush_log_at_trx_commit</code></h4>
+<table>
+<tr><th>值</th><th>行为</th><th>权衡</th></tr>
+<tr><td><strong>1</strong>（默认）</td><td>每次提交都把 redo 刷到磁盘</td><td>最安全，不丢已提交事务；性能略低</td></tr>
+<tr><td><strong>2</strong></td><td>每次提交写到 OS 缓存，每秒刷盘一次</td><td>MySQL 崩溃不丢，OS 崩溃可能丢 1 秒</td></tr>
+<tr><td><strong>0</strong></td><td>每秒由后台线程刷一次</td><td>最快，崩溃可能丢 1 秒数据</td></tr>
+</table>
+<blockquote><strong>undo 也是数据。</strong>undo 写在 undo 页里（同样在 Buffer Pool 中），undo 页的修改本身也会产生 redo——所以崩溃后 undo 也能被 redo 恢复，回滚才有依据。</blockquote>
+<h2 class="sec" id="s6"><span class="n">06</span>Change Buffer</h2>
+<p>当一个<strong>非唯一二级索引</strong>页不在 Buffer Pool 时，如果为了一次写就把它从磁盘随机读进来，代价很高。Change Buffer 把这些改动<strong>暂存</strong>下来，等该页因别的原因被读入时再一次性合并。</p>
+<figure><svg width="100%" viewBox="0 0 700 540" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif"><defs><marker id="a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5"/></marker></defs><rect x="0" y="0" width="700" height="540" rx="12" fill="#0d1117"/>
+<text x="350" y="28" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">Change Buffer：二级索引写操作的延迟合并</text>
+<text x="350" y="48" text-anchor="middle" fill="#6e7681" font-size="10">当目标二级索引页不在 Buffer Pool 时，把改动暂存，避免立即随机读</text>
+<rect x="40" y="72" width="310" height="96" rx="8" fill="#0d2818" stroke="#3fb950" stroke-width="0.8"/>
+<text x="195" y="94" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">适用：非唯一二级索引</text>
+<text x="56" y="116" text-anchor="start" fill="#9da7b3" font-size="10">• 页不在 Buffer Pool</text>
+<text x="56" y="136" text-anchor="start" fill="#9da7b3" font-size="10">• INSERT / DELETE-mark / purge</text>
+<text x="56" y="156" text-anchor="start" fill="#9da7b3" font-size="10">• 非唯一（唯一索引要查重，必须读页）</text>
+<rect x="360" y="72" width="300" height="96" rx="8" fill="#2d1012" stroke="#f85149" stroke-width="0.8"/>
+<text x="510" y="94" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">不适用</text>
+<text x="376" y="116" text-anchor="start" fill="#9da7b3" font-size="10">• 唯一索引（需读页校验唯一性）</text>
+<text x="376" y="136" text-anchor="start" fill="#9da7b3" font-size="10">• 聚簇索引（主键查找通常已在缓存）</text>
+<text x="376" y="156" text-anchor="start" fill="#9da7b3" font-size="10">• 页已在 Buffer Pool（直接改更快）</text>
+<text x="350" y="200" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">工作流程</text>
+<rect x="60" y="214" width="580" height="44" rx="8" fill="#1d1530" stroke="#a371f7" stroke-width="0.8"/>
+<text x="350" y="233" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">① 写操作到达</text>
+<text x="350" y="250" text-anchor="middle" fill="#9da7b3" font-size="9">目标二级索引页不在内存</text>
+<line x1="350" y1="258" x2="350" y2="270" stroke="#6e7681" stroke-width="1.3" marker-end="url(#a)"/>
+<rect x="60" y="270" width="580" height="44" rx="8" fill="#2d220a" stroke="#d29922" stroke-width="0.8"/>
+<text x="350" y="289" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">② 改动存入 Change Buffer</text>
+<text x="350" y="306" text-anchor="middle" fill="#9da7b3" font-size="9">它本身是系统表空间里的一棵 B+ 树</text>
+<line x1="350" y1="314" x2="350" y2="326" stroke="#6e7681" stroke-width="1.3" marker-end="url(#a)"/>
+<rect x="60" y="326" width="580" height="44" rx="8" fill="#0d2847" stroke="#4493f8" stroke-width="0.8"/>
+<text x="350" y="345" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">③ 之后某次读把该页load进来</text>
+<text x="350" y="362" text-anchor="middle" fill="#9da7b3" font-size="9">或后台 purge / master 线程触发</text>
+<line x1="350" y1="370" x2="350" y2="382" stroke="#6e7681" stroke-width="1.3" marker-end="url(#a)"/>
+<rect x="60" y="382" width="580" height="44" rx="8" fill="#0d2818" stroke="#3fb950" stroke-width="0.8"/>
+<text x="350" y="401" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">④ merge 合并</text>
+<text x="350" y="418" text-anchor="middle" fill="#9da7b3" font-size="9">把暂存的改动应用到页上，页变脏走正常刷盘</text>
+<rect x="40" y="444" width="620" height="64" rx="8" fill="#21262d" stroke="#6e7681" stroke-width="0.8"/>
+<text x="350" y="466" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">收益与代价</text>
+<text x="60" y="486" text-anchor="start" fill="#9da7b3" font-size="10">收益：把多次随机写合并为一次，大幅减少二级索引维护的随机 I/O</text>
+<text x="60" y="502" text-anchor="start" fill="#d29922" font-size="9">代价：内存占一部分 Buffer Pool；崩溃恢复时需重放；读放大风险　参数 innodb_change_buffer_max_size</text>
+</svg><figcaption>图6　Change Buffer：缓存二级索引写改动，延迟到读入时 merge</figcaption></figure>
+<ul>
+<li><strong>适用</strong>：非唯一二级索引的 INSERT / DELETE-mark / purge，且目标页不在内存。</li>
+<li><strong>不适用</strong>：唯一索引（必须读页校验唯一性）、聚簇索引、页已在内存。</li>
+</ul>
+<p><strong>收益</strong>：把多次随机写合并为一次，大幅减少二级索引维护的随机 I/O，对写多读少的场景尤其有效。<strong>代价</strong>：占用一部分 Buffer Pool；崩溃恢复需重放；某些读多场景可能反而增加开销。参数 <code>innodb_change_buffer_max_size</code> 控制其占比。</p>
+<h2 class="sec" id="s7"><span class="n">07</span>持久化闭环：Redo / 检查点 / 恢复</h2>
+<p>这一节把内存和磁盘接成闭环：脏页如何落盘、redo 如何顺序写、检查点如何回收日志、崩溃后如何恢复。</p>
+<figure><svg width="100%" viewBox="0 0 700 720" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif"><defs><marker id="a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5"/></marker></defs><rect x="0" y="0" width="700" height="720" rx="12" fill="#0d1117"/>
+<text x="350" y="28" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">持久化闭环：脏页刷盘、Redo、检查点、崩溃恢复</text>
+<text x="350" y="48" text-anchor="middle" fill="#6e7681" font-size="10">数据页异步落盘，redo 顺序写保证不丢，检查点推进可回收的日志</text>
+<rect x="40" y="70" width="620" height="150" rx="10" fill="#0d2847" stroke="#4493f8" stroke-width="0.8"/>
+<text x="350" y="92" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">内存（Buffer Pool + Log Buffer）</text>
+<rect x="60" y="104" width="260" height="50" rx="8" fill="#2d220a" stroke="#d29922" stroke-width="0.8"/>
+<text x="190" y="124" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">Flush 链表（脏页）</text>
+<text x="190" y="142" text-anchor="middle" fill="#9da7b3" font-size="9">按 oldest LSN 排序</text>
+<rect x="340" y="104" width="300" height="50" rx="8" fill="#2d1012" stroke="#f85149" stroke-width="0.8"/>
+<text x="490" y="124" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">Log Buffer（redo 缓冲）</text>
+<text x="490" y="142" text-anchor="middle" fill="#9da7b3" font-size="9">顺序追加，提交/定时刷盘</text>
+<rect x="60" y="166" width="580" height="44" rx="8" fill="#0d2818" stroke="#3fb950" stroke-width="0.8"/>
+<text x="350" y="186" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">undo 页也在 Buffer Pool 中，且被 redo 保护</text>
+<text x="350" y="202" text-anchor="middle" fill="#9da7b3" font-size="9">回滚 / MVCC 读旧版本都靠它</text>
+<line x1="190" y1="220" x2="190" y2="260" stroke="#d29922" stroke-width="1.3" marker-end="url(#a)"/>
+<text x="205" y="244" text-anchor="start" fill="#d29922" font-size="9">脏页刷盘(异步,随机写)</text>
+<line x1="490" y1="220" x2="490" y2="260" stroke="#f85149" stroke-width="1.3" marker-end="url(#a)"/>
+<text x="505" y="244" text-anchor="start" fill="#f85149" font-size="9">redo 刷盘(顺序写,快)</text>
+<rect x="40" y="264" width="620" height="120" rx="10" fill="#21262d" stroke="#6e7681" stroke-width="0.8"/>
+<text x="350" y="286" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">磁盘</text>
+<rect x="60" y="298" width="260" height="72" rx="8" fill="#0d2818" stroke="#3fb950" stroke-width="0.8"/>
+<text x="190" y="320" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">.ibd 数据文件</text>
+<text x="190" y="340" text-anchor="middle" fill="#9da7b3" font-size="9">段/区/页（前一份文档）</text>
+<text x="190" y="358" text-anchor="middle" fill="#9da7b3" font-size="9">脏页最终写到这里</text>
+<rect x="340" y="298" width="300" height="72" rx="8" fill="#2d1012" stroke="#f85149" stroke-width="0.8"/>
+<text x="490" y="320" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">ib_logfile / redo 日志</text>
+<text x="490" y="340" text-anchor="middle" fill="#9da7b3" font-size="9">环形复用，顺序写</text>
+<text x="490" y="358" text-anchor="middle" fill="#9da7b3" font-size="9">先于数据页落盘（WAL）</text>
+<text x="350" y="418" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">脏页何时刷盘（4 个触发点）</text>
+<rect x="40" y="432" width="148" height="64" rx="8" fill="#2d220a" stroke="#d29922" stroke-width="0.8"/>
+<text x="114" y="454" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="700">LRU 淘汰</text>
+<text x="114" y="474" text-anchor="middle" fill="#9da7b3" font-size="9">冷端要复用脏页时先刷</text>
+<rect x="195" y="432" width="148" height="64" rx="8" fill="#2d220a" stroke="#d29922" stroke-width="0.8"/>
+<text x="269" y="454" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="700">Flush 链表</text>
+<text x="269" y="474" text-anchor="middle" fill="#9da7b3" font-size="9">后台按 LSN 持续刷</text>
+<rect x="350" y="432" width="148" height="64" rx="8" fill="#2d220a" stroke="#d29922" stroke-width="0.8"/>
+<text x="424" y="454" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="700">redo 不足</text>
+<text x="424" y="474" text-anchor="middle" fill="#9da7b3" font-size="9">环形日志快写满，强制推进</text>
+<rect x="505" y="432" width="148" height="64" rx="8" fill="#2d220a" stroke="#d29922" stroke-width="0.8"/>
+<text x="579" y="454" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="700">正常关闭</text>
+<text x="579" y="474" text-anchor="middle" fill="#9da7b3" font-size="9">shutdown 全部刷净</text>
+<rect x="40" y="514" width="620" height="72" rx="8" fill="#1d1530" stroke="#a371f7" stroke-width="0.8"/>
+<text x="350" y="536" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">检查点 Checkpoint：推进「这之前的脏页都已落盘」的水位线</text>
+<text x="60" y="558" text-anchor="start" fill="#9da7b3" font-size="10">• checkpoint_lsn 之前的 redo 不再需要 → 对应日志空间可被环形复用</text>
+<text x="60" y="576" text-anchor="start" fill="#9da7b3" font-size="10">• 模糊检查点 fuzzy checkpoint：不停机、持续小步推进，避免抖动</text>
+<rect x="40" y="602" width="620" height="98" rx="8" fill="#2d1012" stroke="#f85149" stroke-width="0.8"/>
+<text x="350" y="624" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">崩溃恢复（重启）：先 redo 后 undo</text>
+<text x="60" y="646" text-anchor="start" fill="#9da7b3" font-size="10">① redo 重做：从 checkpoint_lsn 起重放 redo，把已提交但未落盘的页改动补上（前滚）</text>
+<text x="60" y="666" text-anchor="start" fill="#9da7b3" font-size="10">② undo 回滚：对崩溃时未提交的事务，用 undo 撤销其改动（后滚）</text>
+<text x="60" y="686" text-anchor="start" fill="#d29922" font-size="10">结果：已提交的不丢、未提交的不留 → 满足持久性 D 与原子性 A</text>
+</svg><figcaption>图7　持久化闭环：脏页异步落盘、redo 顺序写、检查点推进、崩溃前滚后滚</figcaption></figure>
+<h3>脏页何时刷盘（4 个触发点）</h3>
+<ul>
+<li><strong>LRU 淘汰</strong>：冷端要复用一个脏页时，先把它刷盘。</li>
+<li><strong>Flush 链表</strong>：后台线程按 oldest LSN 持续地刷。</li>
+<li><strong>redo 空间不足</strong>：环形 redo 日志快写满时，强制刷脏页以推进检查点。</li>
+<li><strong>正常关闭</strong>：shutdown 时把所有脏页刷净（<code>innodb_fast_shutdown</code> 影响程度）。</li>
+</ul>
+<h3>检查点 Checkpoint</h3>
+<p>检查点是一条水位线 <code>checkpoint_lsn</code>，表示「这之前的脏页都已落盘」。它之前的 redo 不再被需要，对应的日志空间可以被<strong>环形复用</strong>。InnoDB 用<strong>模糊检查点（fuzzy checkpoint）</strong>——不停机、持续小步推进，避免一次性刷大量脏页造成性能抖动。</p>
+<h3>崩溃恢复：先 redo 后 undo</h3>
+<ol>
+<li><strong>redo 前滚（redo / roll-forward）</strong>：从 <code>checkpoint_lsn</code> 开始重放 redo，把「已提交但数据页未落盘」的改动补回到页上。恢复后内存页与提交时一致。</li>
+<li><strong>undo 后滚（undo / rollback）</strong>：对崩溃时<strong>未提交</strong>的事务，用 undo 撤销其已经写到页上的改动。</li>
+</ol>
+<blockquote>最终效果：<strong>已提交的不丢（持久性 D）、未提交的不留（原子性 A）</strong>。redo 保证 D，undo 保证 A，两者配合完成崩溃恢复。</blockquote>
+<h2 class="sec" id="s8"><span class="n">08</span>关键结论速查</h2>
+<table>
+<tr><th>问题</th><th>结论</th></tr>
+<tr><td>上层会直接读写磁盘吗？</td><td>不会。只跟 Buffer Pool 交互，未命中才由后台做物理 I/O</td></tr>
+<tr><td>LRU 为什么分 young/old？</td><td>防止全表扫描/预读把热点页挤出缓存（midpoint + 时间窗口）</td></tr>
+<tr><td>查询会写日志吗？</td><td>不写 redo/undo；仅 MVCC 需要时读 undo 构造旧版本</td></tr>
+<tr><td>WAL 是什么？</td><td>先写 redo 日志再延迟刷数据页，把随机写换成顺序写</td></tr>
+<tr><td>提交了数据就落盘了吗？</td><td>不一定。提交=redo 落盘；数据页可能还是脏页，靠 redo 兜底</td></tr>
+<tr><td>redo 和 undo 分工？</td><td>redo 重做保证持久性(D)，undo 回滚保证原子性(A)</td></tr>
+<tr><td>Change Buffer 干什么？</td><td>暂存非唯一二级索引写改动，合并随机 I/O</td></tr>
+<tr><td>脏页什么时候刷盘？</td><td>LRU 淘汰 / Flush 后台 / redo 不足 / 正常关闭</td></tr>
+<tr><td>检查点的作用？</td><td>推进已落盘水位线，回收可复用的 redo 空间</td></tr>
+<tr><td>崩溃恢复顺序？</td><td>先 redo 前滚补齐已提交，再 undo 后滚撤销未提交</td></tr>
+</table>
+<blockquote>闭环一句话：<strong>读靠缓存命中，写靠 WAL 顺序日志，安全靠 redo+undo+检查点</strong>。磁盘侧的段/区/页是「数据躺在哪」，内存侧的 Buffer Pool 是「数据怎么被高效又安全地用起来」。</blockquote></div></body></html>

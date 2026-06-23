@@ -1,4 +1,6 @@
 package cn.zhangyis.db.storage.recovery;
+import cn.zhangyis.db.storage.fil.state.TablespaceType;
+
 
 import cn.zhangyis.db.domain.Lsn;
 import cn.zhangyis.db.domain.PageId;
@@ -8,9 +10,8 @@ import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.api.DiskSpaceManager;
 import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.LruBufferPool;
-import cn.zhangyis.db.storage.fil.FileChannelPageStore;
-import cn.zhangyis.db.storage.fil.PageStore;
-import cn.zhangyis.db.storage.fil.TablespaceType;
+import cn.zhangyis.db.storage.fil.io.FileChannelPageStore;
+import cn.zhangyis.db.storage.fil.io.PageStore;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
 import cn.zhangyis.db.storage.page.PageType;

@@ -1,0 +1,1096 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MySQL SQL 解析 · 优化 · 执行（深入版）</title>
+<style>
+:root{
+  --bg:#0a111f; --bg2:#0c1426; --surface:#111d36;
+  --surface2:#16223d; --surface3:#1d2c4d; --border:#26375c; --border2:#324a78;
+  --text:#e7edfa; --muted:#9aabce; --faint:#6b7da3;
+  --teal:#2dd4bf; --teal-d:#0f766e; --blue:#5b9dff; --blue-d:#1e4fb0;
+  --purple:#b794f6; --purple-d:#6b46c1; --amber:#f5b955; --amber-d:#b45309;
+  --red:#f0697a; --red-d:#9b2c3a; --green:#5fd38a; --green-d:#15803d;
+  --mono:"JetBrains Mono","Cascadia Code","SF Mono",Consolas,"Liberation Mono",monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans SC",sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{
+  font-family:var(--sans); background:var(--bg); color:var(--text);
+  line-height:1.75; font-size:16px; letter-spacing:.01em;
+  background-image:
+    radial-gradient(900px 500px at 12% -8%, rgba(45,212,191,.10), transparent 60%),
+    radial-gradient(900px 600px at 100% 0%, rgba(91,157,255,.10), transparent 55%),
+    radial-gradient(700px 700px at 50% 120%, rgba(183,148,246,.07), transparent 60%);
+  background-attachment:fixed;
+}
+.wrap{max-width:920px;margin:0 auto;padding:0 24px 120px}
+
+/* ---------- header ---------- */
+.hero{padding:88px 0 56px;text-align:center;position:relative}
+.kicker{font-family:var(--mono);font-size:13px;letter-spacing:.32em;text-transform:uppercase;color:var(--teal);margin-bottom:22px}
+.hero h1{
+  font-size:clamp(34px,6vw,56px);line-height:1.1;font-weight:800;letter-spacing:-.01em;
+  background:linear-gradient(120deg,#fff 10%,var(--teal) 55%,var(--blue) 100%);
+  -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;
+}
+.hero .sub{margin-top:20px;color:var(--muted);font-size:18px;max-width:640px;margin-left:auto;margin-right:auto}
+.series{margin-top:34px;display:flex;gap:10px;justify-content:center;flex-wrap:wrap;font-family:var(--mono);font-size:12.5px}
+.series span{padding:7px 13px;border:1px solid var(--border);border-radius:999px;color:var(--faint);background:rgba(255,255,255,.02)}
+.series span.now{border-color:var(--teal);color:var(--teal);background:rgba(45,212,191,.08);box-shadow:0 0 0 1px rgba(45,212,191,.18)}
+
+/* ---------- TOC ---------- */
+.toc{margin:18px 0 60px;background:linear-gradient(180deg,var(--surface),var(--bg2));border:1px solid var(--border);border-radius:18px;padding:26px 30px}
+.toc h2{font-size:13px;letter-spacing:.22em;text-transform:uppercase;color:var(--faint);font-family:var(--mono);margin-bottom:16px;font-weight:600}
+.toc ol{list-style:none;counter-reset:t;display:grid;grid-template-columns:1fr 1fr;gap:4px 34px}
+.toc li{counter-increment:t}
+.toc a{display:flex;gap:12px;align-items:baseline;padding:8px 6px;border-radius:8px;color:var(--muted);text-decoration:none;transition:.18s;border-bottom:1px solid transparent}
+.toc a:hover{color:var(--text);background:rgba(91,157,255,.07)}
+.toc a::before{content:counter(t,decimal-leading-zero);font-family:var(--mono);font-size:12px;color:var(--teal);min-width:24px}
+
+/* ---------- sections ---------- */
+section{margin:0 0 22px;scroll-margin-top:24px}
+.chap{display:flex;align-items:center;gap:16px;margin:64px 0 26px}
+.chap .num{font-family:var(--mono);font-size:13px;font-weight:700;color:var(--bg);background:linear-gradient(135deg,var(--teal),var(--blue));padding:6px 11px;border-radius:8px;letter-spacing:.05em;flex:none}
+.chap h2{font-size:clamp(24px,3.4vw,32px);font-weight:780;letter-spacing:-.01em}
+.chap .rule{flex:1;height:1px;background:linear-gradient(90deg,var(--border2),transparent)}
+
+h3{font-size:20px;font-weight:700;margin:34px 0 12px;color:#f3f6fd}
+h3::before{content:"";display:inline-block;width:9px;height:9px;border-radius:2px;background:var(--teal);margin-right:11px;transform:translateY(-2px)}
+h4{font-size:16px;font-weight:700;margin:22px 0 8px;color:var(--blue)}
+p{margin:13px 0;color:#d7e0f2}
+strong{color:#fff;font-weight:680}
+em{color:var(--teal);font-style:normal;font-weight:600}
+a.in{color:var(--blue);text-decoration:none;border-bottom:1px dashed var(--border2)}
+code{font-family:var(--mono);font-size:.88em;background:rgba(91,157,255,.12);color:#bcd4ff;padding:2px 7px;border-radius:6px;border:1px solid rgba(91,157,255,.16)}
+
+ul.bul{margin:13px 0 13px 4px;list-style:none}
+ul.bul li{position:relative;padding-left:24px;margin:9px 0;color:#d7e0f2}
+ul.bul li::before{content:"▸";position:absolute;left:2px;top:0;color:var(--teal);font-size:14px}
+
+/* ---------- callouts ---------- */
+.note{border-radius:14px;padding:18px 22px;margin:22px 0;border:1px solid;display:flex;gap:14px;align-items:flex-start}
+.note .ic{font-family:var(--mono);font-weight:800;font-size:13px;flex:none;margin-top:2px}
+.note.key{background:linear-gradient(100deg,rgba(45,212,191,.10),rgba(45,212,191,.03));border-color:rgba(45,212,191,.35)}
+.note.key .ic{color:var(--teal)}
+.note.warn{background:linear-gradient(100deg,rgba(245,185,85,.10),rgba(245,185,85,.03));border-color:rgba(245,185,85,.35)}
+.note.warn .ic{color:var(--amber)}
+.note.danger{background:linear-gradient(100deg,rgba(240,105,122,.10),rgba(240,105,122,.03));border-color:rgba(240,105,122,.35)}
+.note.danger .ic{color:var(--red)}
+.note p{margin:4px 0;color:#e3e9f6}
+.note p:first-child{margin-top:0}
+
+/* ---------- figure ---------- */
+figure{margin:30px 0;background:linear-gradient(180deg,var(--bg2),#0a1322);border:1px solid var(--border);border-radius:18px;padding:24px 22px 14px;overflow:hidden}
+figure svg{display:block;width:100%;height:auto}
+figcaption{margin-top:14px;font-size:13.5px;color:var(--faint);font-family:var(--mono);text-align:center;letter-spacing:.02em}
+figcaption b{color:var(--teal);font-weight:600}
+
+/* ---------- table ---------- */
+.tbl{margin:24px 0;border:1px solid var(--border);border-radius:14px;overflow:hidden}
+table{width:100%;border-collapse:collapse;font-size:14.5px}
+thead th{background:linear-gradient(180deg,var(--surface3),var(--surface));color:#eaf0fb;font-weight:700;text-align:left;padding:13px 16px;border-bottom:1px solid var(--border2);font-size:13.5px;letter-spacing:.02em}
+tbody td{padding:12px 16px;border-bottom:1px solid var(--border);color:#d2dcef;vertical-align:top}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:nth-child(even){background:rgba(255,255,255,.015)}
+td code,th code{font-size:.84em}
+.yes{color:var(--green);font-weight:700}
+.no{color:var(--red);font-weight:700}
+.mid{color:var(--amber);font-weight:700}
+
+/* ---------- code block ---------- */
+pre{margin:20px 0;background:#070d18;border:1px solid var(--border);border-radius:14px;padding:18px 20px;overflow-x:auto;font-family:var(--mono);font-size:13.5px;line-height:1.7;position:relative}
+pre code{background:none;border:none;padding:0;color:#cdd9f0}
+.cm{color:#5d7194}    /* comment */
+.kw{color:var(--purple)}  /* keyword */
+.fn{color:var(--blue)}
+.st{color:var(--green)}
+.nm{color:var(--amber)}
+
+/* ---------- footer ---------- */
+.fin{margin-top:80px;padding:34px 30px;border:1px solid var(--border);border-radius:18px;background:linear-gradient(180deg,var(--surface),var(--bg2));text-align:center}
+.fin h3{justify-content:center}
+.fin h3::before{display:none}
+.fin .seq{display:flex;gap:8px;align-items:center;justify-content:center;flex-wrap:wrap;margin:18px 0 6px;font-family:var(--mono);font-size:13px;color:var(--muted)}
+.fin .seq b{color:var(--teal)}
+.fin .arrow{color:var(--faint)}
+.foot{margin-top:40px;text-align:center;color:var(--faint);font-size:13px;font-family:var(--mono)}
+
+@media(max-width:680px){
+  .toc ol{grid-template-columns:1fr}
+  .wrap{padding:0 16px 80px}
+  .chap{flex-wrap:wrap}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <div class="kicker">InnoDB / MySQL 系列 · 第八篇 · 深入版</div>
+  <h1>SQL 解析 · 优化 · 执行</h1>
+  <p class="sub">一条 SQL 从文本到结果集的全过程。本版把<b>语法分析</b>扩成独立多章（词法、文法与 LALR、优先级冲突、AST），并把<b>查询优化</b>深挖到底：成本与统计、逻辑变换、减少回表、连接算法与连接顺序、跳跃扫描、优化器追踪与实战。</p>
+  <div class="series">
+    <span>① 存储结构</span><span>② Buffer Pool</span><span>③ 故障恢复</span><span>④ MVCC</span>
+    <span>⑤ 锁系统</span><span>⑥ 索引</span><span>⑦ 两阶段提交</span>
+    <span class="now">⑧ 解析·优化·执行</span>
+  </div>
+</header>
+
+<nav class="toc">
+  <h2>目录</h2>
+  <ol>
+    <li><a href="#c1">总览：一条 SQL 的一生</a></li>
+    <li><a href="#c2">词法分析：字符流 → token</a></li>
+    <li><a href="#c3">语法分析①：文法与 LALR(1) 移进-归约</a></li>
+    <li><a href="#c4">语法分析②：运算符优先级与冲突消解</a></li>
+    <li><a href="#c5">AST 构造与语义预处理</a></li>
+    <li><a href="#c6">SQL 执行：火山模型</a></li>
+    <li><a href="#c7">优化器总览：架构与 RBO / CBO</a></li>
+    <li><a href="#c8">成本模型：成本怎么算</a></li>
+    <li><a href="#c9">统计信息：基数与直方图</a></li>
+    <li><a href="#c10">范围优化与行数估算（index dive）</a></li>
+    <li><a href="#c11">逻辑优化①：条件化简与等价变换</a></li>
+    <li><a href="#c12">逻辑优化②：子查询与半连接四策略</a></li>
+    <li><a href="#c13">逻辑优化③：派生表 合并 vs 物化</a></li>
+    <li><a href="#c14">访问路径与索引合并</a></li>
+    <li><a href="#c15">减少回表：覆盖索引 / ICP / MRR</a></li>
+    <li><a href="#c16">索引跳跃扫描 Skip Scan</a></li>
+    <li><a href="#c17">连接顺序与搜索算法</a></li>
+    <li><a href="#c18">嵌套循环族 NLJ / INLJ / BNL / BKA</a></li>
+    <li><a href="#c19">Hash Join 详解</a></li>
+    <li><a href="#c20">Sort-Merge Join 详解</a></li>
+    <li><a href="#c21">三种 JOIN 对比与选择</a></li>
+    <li><a href="#c22">排序、分组与去重优化</a></li>
+    <li><a href="#c23">分页与 LIMIT 优化</a></li>
+    <li><a href="#c24">优化器提示与开关</a></li>
+    <li><a href="#c25">EXPLAIN 与 Optimizer Trace</a></li>
+    <li><a href="#c26">一次完整的查询优化实战</a></li>
+    <li><a href="#c27">动态 DDL：ALGORITHM 与 LOCK</a></li>
+    <li><a href="#c28">INSTANT / INPLACE 原理</a></li>
+    <li><a href="#c29">系列总结</a></li>
+  </ol>
+</nav>
+
+<!-- ============ 1 ============ -->
+<section id="c1">
+  <div class="chap"><span class="num">01</span><h2>总览：一条 SQL 的一生</h2><div class="rule"></div></div>
+  <p>前七篇深入 InnoDB 引擎内部。本篇站在 <strong>MySQL Server 层</strong>，讲一条 SQL 文本如何被解析、优化、执行。<strong>本深入版相比前版，把"语法分析"和"查询优化"两块大幅加厚</strong>——前者是很多人含糊带过的编译原理细节，后者是性能差异的最大来源。</p>
+  <figure>
+    <svg viewBox="0 0 800 210" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="11">
+      <defs><marker id="ar1q" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#5b9dff"/></marker></defs>
+      <text x="400" y="22" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">SQL 处理流水线（本版加厚解析与优化）</text>
+      <rect x="26" y="52" width="92" height="52" rx="9" fill="#0f1830" stroke="#5b9dff"/><text x="72" y="74" text-anchor="middle" fill="#5b9dff" font-weight="700">连接器</text><text x="72" y="92" text-anchor="middle" fill="#9aabce" font-size="9">鉴权</text>
+      <rect x="130" y="46" width="150" height="64" rx="10" fill="#141f3a" stroke="#2dd4bf" stroke-width="2.5"/><text x="205" y="68" text-anchor="middle" fill="#2dd4bf" font-weight="700">解析器 ★★</text><text x="205" y="86" text-anchor="middle" fill="#9aabce" font-size="9">词法/语法/语义</text><text x="205" y="100" text-anchor="middle" fill="#9aabce" font-size="9">本版第 2~5 章</text>
+      <rect x="292" y="46" width="160" height="64" rx="10" fill="#141f3a" stroke="#f5b955" stroke-width="2.5"/><text x="372" y="68" text-anchor="middle" fill="#f5b955" font-weight="700">优化器 ★★★</text><text x="372" y="86" text-anchor="middle" fill="#9aabce" font-size="9">逻辑变换+物理选路</text><text x="372" y="100" text-anchor="middle" fill="#9aabce" font-size="9">本版第 7~26 章</text>
+      <rect x="464" y="52" width="92" height="52" rx="9" fill="#0f1830" stroke="#b794f6"/><text x="510" y="74" text-anchor="middle" fill="#b794f6" font-weight="700">执行器</text><text x="510" y="92" text-anchor="middle" fill="#9aabce" font-size="9">火山模型</text>
+      <rect x="568" y="52" width="90" height="52" rx="9" fill="#0f1830" stroke="#2dd4bf"/><text x="613" y="74" text-anchor="middle" fill="#2dd4bf" font-weight="700">InnoDB</text><text x="613" y="92" text-anchor="middle" fill="#9aabce" font-size="9">①~⑦</text>
+      <g stroke="#5b9dff" stroke-width="1.6" fill="none"><path d="M118,78 L128,78" marker-end="url(#ar1q)"/><path d="M280,78 L290,78" marker-end="url(#ar1q)"/><path d="M452,78 L462,78" marker-end="url(#ar1q)"/><path d="M556,78 L566,78" marker-end="url(#ar1q)"/></g>
+      <text x="400" y="150" text-anchor="middle" fill="#6b7da3" font-size="11">解析(第2~5章, 4章) → 优化(第7~26章, 20章) → 执行(第6章) → 引擎(前七篇)</text>
+      <text x="400" y="174" text-anchor="middle" fill="#9aabce" font-size="10.5">解析又分词法→语法→语义三关；优化又分逻辑变换→物理选路两步</text>
+    </svg>
+    <figcaption><b>图 1</b> · 流水线全貌：本版把解析拆成 4 章、优化拆成 20 章，逐环讲透</figcaption>
+  </figure>
+  <div class="note key"><span class="ic">本版地图</span><div>
+    <p><strong>解析（第 2–5 章）</strong>：词法分析、语法分析（文法/LALR/优先级，共 2 章）、AST 与预处理。<strong>执行（第 6 章）</strong>。<strong>优化器基础（第 7–10 章）</strong>。<strong>逻辑优化（第 11–13 章）</strong>。<strong>物理优化（第 14–23 章）</strong>：访问路径、减少回表、跳跃扫描、连接顺序、三大 JOIN、排序分组、分页。<strong>调控诊断（第 24–26 章）</strong>：提示/开关、EXPLAIN 与 Optimizer Trace、优化实战。<strong>在线 DDL（第 27–28 章）</strong>。</p>
+  </div></div>
+</section>
+
+<!-- ============ 2 ============ -->
+<section id="c2">
+  <div class="chap"><span class="num">02</span><h2>词法分析：字符流 → token</h2><div class="rule"></div></div>
+  <p>SQL 是一串字符，机器无法直接理解。第一步<strong>词法分析（Lexical Analysis / 扫描 Scanning）</strong>把字符流切成一个个有意义的<strong>词法单元（token）</strong>。MySQL 由词法器（源码 <code>sql/sql_lex.cc</code>，配合 <code>lex.h</code> 的符号表）完成。</p>
+  <h3>token 的分类</h3>
+  <p>词法器读字符、按最长匹配原则切出 token，每个 token 带<em>类型</em>和<em>值</em>：</p>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>类型</th><th>例子</th><th>说明</th></tr></thead>
+      <tbody>
+        <tr><td><strong>关键字 keyword</strong></td><td><code>SELECT</code> <code>FROM</code> <code>WHERE</code></td><td>语言保留的词，对应文法的<em>终结符</em></td></tr>
+        <tr><td><strong>标识符 identifier</strong></td><td>表名、列名、别名</td><td>用户起的名字；反引号包裹可与关键字同名</td></tr>
+        <tr><td><strong>字面量 literal</strong></td><td><code>18</code> <code>'abc'</code> <code>3.14</code></td><td>数字、字符串、日期等常量</td></tr>
+        <tr><td><strong>运算符/标点</strong></td><td><code>=</code> <code>&gt;</code> <code>,</code> <code>(</code> <code>)</code></td><td>比较、算术、分隔符</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <h3>词法器还顺手做的事</h3>
+  <ul class="bul">
+    <li><strong>跳过空白与注释</strong>：空格、换行、<code>-- ...</code>、<code>/* ... */</code> 不产生 token（但 <code>/*+ ... */</code> 优化器提示会被特殊保留，见第 24 章）。</li>
+    <li><strong>识别边界</strong>：正确切分字符串引号、转义、数字与小数点，处理字符集与大小写（标识符大小写敏感性取决于系统与平台）。</li>
+    <li><strong>区分保留字与非保留字</strong>：MySQL 关键字分<em>保留（reserved）</em>和<em>非保留（non-reserved）</em>两类——非保留字（如 <code>STATUS</code>、<code>BEGIN</code>）在不引起歧义时可直接当标识符用，保留字（如 <code>SELECT</code>）必须加反引号才能当列名。</li>
+  </ul>
+  <figure>
+    <svg viewBox="0 0 800 150" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="11">
+      <defs><marker id="ar2q" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#2dd4bf"/></marker></defs>
+      <text x="400" y="22" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">SELECT id FROM user WHERE age &gt; 18 的 token 化</text>
+      <rect x="120" y="42" width="560" height="30" rx="7" fill="#0a1322" stroke="#324a78"/><text x="400" y="62" text-anchor="middle" fill="#9aabce" font-size="11">"SELECT id FROM user WHERE age &gt; 18"（字符流）</text>
+      <path d="M400,72 L400,90" stroke="#2dd4bf" stroke-width="1.8" marker-end="url(#ar2q)"/>
+      <g font-size="9.5">
+      <rect x="40" y="98" width="80" height="40" rx="5" fill="rgba(45,212,191,.12)" stroke="#2dd4bf"/><text x="80" y="114" text-anchor="middle" fill="#2dd4bf">SELECT</text><text x="80" y="130" text-anchor="middle" fill="#6b7da3">关键字</text>
+      <rect x="128" y="98" width="60" height="40" rx="5" fill="rgba(91,157,255,.12)" stroke="#5b9dff"/><text x="158" y="114" text-anchor="middle" fill="#5b9dff">id</text><text x="158" y="130" text-anchor="middle" fill="#6b7da3">标识符</text>
+      <rect x="196" y="98" width="70" height="40" rx="5" fill="rgba(45,212,191,.12)" stroke="#2dd4bf"/><text x="231" y="114" text-anchor="middle" fill="#2dd4bf">FROM</text><text x="231" y="130" text-anchor="middle" fill="#6b7da3">关键字</text>
+      <rect x="274" y="98" width="70" height="40" rx="5" fill="rgba(91,157,255,.12)" stroke="#5b9dff"/><text x="309" y="114" text-anchor="middle" fill="#5b9dff">user</text><text x="309" y="130" text-anchor="middle" fill="#6b7da3">标识符</text>
+      <rect x="352" y="98" width="80" height="40" rx="5" fill="rgba(45,212,191,.12)" stroke="#2dd4bf"/><text x="392" y="114" text-anchor="middle" fill="#2dd4bf">WHERE</text><text x="392" y="130" text-anchor="middle" fill="#6b7da3">关键字</text>
+      <rect x="440" y="98" width="60" height="40" rx="5" fill="rgba(91,157,255,.12)" stroke="#5b9dff"/><text x="470" y="114" text-anchor="middle" fill="#5b9dff">age</text><text x="470" y="130" text-anchor="middle" fill="#6b7da3">标识符</text>
+      <rect x="508" y="98" width="50" height="40" rx="5" fill="rgba(245,185,85,.12)" stroke="#f5b955"/><text x="533" y="114" text-anchor="middle" fill="#f5b955">&gt;</text><text x="533" y="130" text-anchor="middle" fill="#6b7da3">运算符</text>
+      <rect x="566" y="98" width="55" height="40" rx="5" fill="rgba(183,148,246,.12)" stroke="#b794f6"/><text x="593" y="114" text-anchor="middle" fill="#b794f6">18</text><text x="593" y="130" text-anchor="middle" fill="#6b7da3">字面量</text>
+      </g>
+    </svg>
+    <figcaption><b>图 2</b> · 词法分析把字符流切成带类型的 token 序列，交给语法分析</figcaption>
+  </figure>
+  <div class="note key"><span class="ic">词法 vs 语法的分工</span><div>
+    <p>词法器只认"<strong>词</strong>"，不关心词的<em>排列</em>是否合法——<code>FROM SELECT id</code> 在词法层完全合法（三个有效 token），要到语法层才会被判为错误。这种"<strong>先分词、再分析结构</strong>"的两级设计，是几乎所有编译器/解释器的标准做法：词法器处理字符级复杂度，让语法分析器只需面对干净的 token 流。下一章看语法分析如何把这串 token 组装成树。</p>
+  </div></div>
+</section>
+
+<!-- ============ 3 ============ -->
+<section id="c3">
+  <div class="chap"><span class="num">03</span><h2>语法分析①：文法与 LALR(1) 移进-归约</h2><div class="rule"></div></div>
+  <p><strong>语法分析（Syntax Analysis / Parsing）</strong>把 token 流按 SQL 的<strong>文法（grammar）</strong>组装成一棵树。MySQL 的语法分析器由 <strong>Bison（GNU 版 yacc）</strong>从文法文件 <code>sql/sql_yacc.yy</code> 生成，是一个 <strong>LALR(1)</strong> 类型的自底向上分析器。本章讲清"文法是什么"和"LALR 怎么分析"。</p>
+
+  <h3>文法：用产生式描述语言</h3>
+  <p>文法由一组<strong>产生式规则（production）</strong>构成，每条形如"<em>非终结符 → 符号串</em>"，意思是"左边这个结构可以由右边这串组成"。两类符号：</p>
+  <ul class="bul">
+    <li><strong>终结符（terminal）</strong>：词法器产出的 token，是文法的"叶子"，不能再展开（如 <code>SELECT</code>、标识符、<code>,</code>）。</li>
+    <li><strong>非终结符（non-terminal）</strong>：语法结构的抽象名字，可继续展开（如 <code>query</code>、<code>select_list</code>、<code>expr</code>）。</li>
+  </ul>
+  <pre><code><span class="cm">// 高度简化的 SELECT 文法（示意，非真实 yacc 写法）</span>
+<span class="kw">query</span>       → SELECT select_list FROM table_ref where_opt
+<span class="kw">select_list</span> → <span class="st">'*'</span>
+            | select_list <span class="st">','</span> column     <span class="cm">// 递归：支持任意多列</span>
+            | column
+<span class="kw">where_opt</span>   → <span class="st">/* 空 */</span>
+            | WHERE expr
+<span class="kw">expr</span>        → column op_compare value
+            | expr AND expr
+            | expr OR expr
+            | <span class="st">'('</span> expr <span class="st">')'</span></code></pre>
+
+  <h3>LALR(1)：自底向上的移进-归约</h3>
+  <p>LALR(1) 用<strong>一个栈</strong>加<strong>向前看 1 个 token（lookahead）</strong>来分析。它<em>自底向上</em>工作，每步只做两个动作之一：</p>
+  <ul class="bul">
+    <li><strong>移进 shift</strong>：把当前 token 压栈，读下一个。（"还凑不成一个结构，先收着"）</li>
+    <li><strong>归约 reduce</strong>：栈顶若干符号正好匹配某条产生式的右侧，就把它们弹出、压入左侧非终结符。（"凑成一个结构了，打包"）</li>
+  </ul>
+  <p>分析器内部其实是一个<strong>状态机</strong>，用两张表驱动：<code>ACTION</code> 表（在某状态遇到某 token，该 shift 还是 reduce）和 <code>GOTO</code> 表（归约出非终结符后跳到哪个状态）。Bison 在编译期就把文法编译成这两张表。</p>
+
+  <h3>一个移进-归约的完整轨迹</h3>
+  <p>以 <code>SELECT id FROM user</code> 为例（省略 where），看栈如何演变（⊢ 表示栈底）：</p>
+  <figure>
+    <svg viewBox="0 0 800 280" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="11">
+      <text x="400" y="22" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">移进-归约轨迹：栈自底向上长出 query</text>
+      <line x1="60" y1="36" x2="60" y2="266" stroke="#26375c"/>
+      <g font-size="10.5">
+      <text x="70" y="52" fill="#6b7da3">步</text><text x="110" y="52" fill="#6b7da3">动作</text><text x="260" y="52" fill="#6b7da3">栈内容（⊢ 为栈底）</text><text x="560" y="52" fill="#6b7da3">剩余输入</text>
+      <line x1="60" y1="60" x2="740" y2="60" stroke="#26375c"/>
+      <text x="74" y="80" fill="#9aabce">1</text><text x="110" y="80" fill="#2dd4bf">shift SELECT</text><text x="260" y="80" fill="#d7e0f2">⊢ SELECT</text><text x="560" y="80" fill="#6b7da3">id FROM user</text>
+      <text x="74" y="102" fill="#9aabce">2</text><text x="110" y="102" fill="#2dd4bf">shift id</text><text x="260" y="102" fill="#d7e0f2">⊢ SELECT id</text><text x="560" y="102" fill="#6b7da3">FROM user</text>
+      <text x="74" y="124" fill="#9aabce">3</text><text x="110" y="124" fill="#f5b955">reduce column→id</text><text x="260" y="124" fill="#d7e0f2">⊢ SELECT column</text><text x="560" y="124" fill="#6b7da3">FROM user</text>
+      <text x="74" y="146" fill="#9aabce">4</text><text x="110" y="146" fill="#f5b955">reduce select_list</text><text x="260" y="146" fill="#d7e0f2">⊢ SELECT select_list</text><text x="560" y="146" fill="#6b7da3">FROM user</text>
+      <text x="74" y="168" fill="#9aabce">5</text><text x="110" y="168" fill="#2dd4bf">shift FROM</text><text x="260" y="168" fill="#d7e0f2">⊢ SELECT select_list FROM</text><text x="560" y="168" fill="#6b7da3">user</text>
+      <text x="74" y="190" fill="#9aabce">6</text><text x="110" y="190" fill="#2dd4bf">shift user</text><text x="260" y="190" fill="#d7e0f2">⊢ ... FROM user</text><text x="560" y="190" fill="#6b7da3">（空）</text>
+      <text x="74" y="212" fill="#9aabce">7</text><text x="110" y="212" fill="#f5b955">reduce table_ref→user</text><text x="260" y="212" fill="#d7e0f2">⊢ SELECT select_list FROM table_ref</text><text x="560" y="212" fill="#6b7da3">（空）</text>
+      <text x="74" y="234" fill="#9aabce">8</text><text x="110" y="234" fill="#5fd38a">reduce query ✓</text><text x="260" y="234" fill="#5fd38a">⊢ query（接受！）</text><text x="560" y="234" fill="#6b7da3">（空）</text>
+      </g>
+      <line x1="60" y1="246" x2="740" y2="246" stroke="#26375c"/>
+      <text x="400" y="264" text-anchor="middle" fill="#6b7da3" font-size="10">shift 把 token 收进栈，reduce 把栈顶按产生式打包；最终归约到 query 即分析成功</text>
+    </svg>
+    <figcaption><b>图 3</b> · 移进-归约轨迹：交替 shift/reduce，栈顶逐步归约，最终长出根符号 query</figcaption>
+  </figure>
+  <div class="note key"><span class="ic">为什么是 LALR(1) 而非递归下降</span><div>
+    <p>解析器主要分两大流派：<em>自顶向下</em>（如手写递归下降、LL）和<em>自底向上</em>（LR/LALR）。MySQL 选 <strong>LALR(1)</strong>（经 Bison 生成），因为它<strong>能处理的文法类更广</strong>（尤其左递归，如上面 <code>select_list → select_list ',' column</code> 这种"列表"结构，自底向上天然支持，而 LL 需要改写），且由工具自动生成、维护成本低。代价是文法冲突（下一章）需要靠优先级声明来消解，且生成的表较大、报错信息不如手写器友好。SQL 语法庞大复杂，LALR(1) 的表达力是关键考量。</p>
+  </div></div>
+</section>
+
+<!-- ============ 4 ============ -->
+<section id="c4">
+  <div class="chap"><span class="num">04</span><h2>语法分析②：运算符优先级与冲突消解</h2><div class="rule"></div></div>
+  <p>上一章的文法有个隐患：<code>expr → expr AND expr | expr OR expr</code> 是<strong>有歧义的</strong>。面对 <code>a OR b AND c</code>，分析器在某一步会<em>既能移进、又能归约</em>，不知道该听谁的——这就是 <strong>移进-归约冲突（shift-reduce conflict）</strong>。本章讲它从哪来、怎么解。</p>
+
+  <h3>歧义：a OR b AND c 该怎么结合</h3>
+  <p>当栈里是 <code>expr OR expr</code>、向前看到 <code>AND</code> 时，有两条路：</p>
+  <ul class="bul">
+    <li><strong>归约</strong>：先把 <code>expr OR expr</code> 打包成一个 <code>expr</code> → 结果是 <code>(a OR b) AND c</code>。</li>
+    <li><strong>移进</strong>：先把 <code>AND</code> 收进栈，等 <code>c</code> 来了先结合 <code>b AND c</code> → 结果是 <code>a OR (b AND c)</code>。</li>
+  </ul>
+  <p>两种解析<strong>语义完全不同</strong>！SQL 规定 <code>AND</code> 优先级高于 <code>OR</code>（像乘法高于加法），所以正确答案是 <code>a OR (b AND c)</code>，即应当<strong>移进</strong>。</p>
+
+  <h3>用优先级声明消解冲突</h3>
+  <p>Bison 不靠改写文法，而是靠<strong>显式声明运算符的优先级与结合性</strong>来裁决冲突。在 yacc 文件里用 <code>%left</code> / <code>%right</code> 按<em>从低到高</em>列出：</p>
+  <pre><code><span class="cm">// 优先级从低到高（越靠下越高）；%left=左结合</span>
+<span class="kw">%left</span>  OR
+<span class="kw">%left</span>  AND
+<span class="kw">%right</span> NOT
+<span class="kw">%left</span>  <span class="st">'='</span> <span class="st">'&lt;'</span> <span class="st">'&gt;'</span>     <span class="cm">// 比较运算符</span>
+<span class="kw">%left</span>  <span class="st">'+'</span> <span class="st">'-'</span>
+<span class="kw">%left</span>  <span class="st">'*'</span> <span class="st">'/'</span>           <span class="cm">// 乘除最高</span></code></pre>
+  <p>规则：<strong>遇到 shift-reduce 冲突时，比较"栈顶规则的优先级"与"向前看 token 的优先级"——谁高听谁；相同则看结合性</strong>（左结合则归约、右结合则移进）。<code>AND</code> 优先级高于 <code>OR</code>，故 <code>a OR b · AND</code> 选择移进，得到正确的 <code>a OR (b AND c)</code>。</p>
+  <figure>
+    <svg viewBox="0 0 800 220" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <text x="400" y="22" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">a OR b AND c：优先级决定移进还是归约</text>
+      <rect x="30" y="44" width="360" height="150" rx="12" fill="#0f1830" stroke="#9b2c3a" stroke-width="1.5"/>
+      <text x="210" y="66" text-anchor="middle" fill="#f0697a" font-size="12" font-weight="700">若错误地归约（OR 先结合）</text>
+      <text x="210" y="92" text-anchor="middle" fill="#d7e0f2" font-size="11">(a OR b) AND c</text>
+      <g stroke="#9b2c3a" stroke-width="1.4" fill="none"><line x1="210" y1="104" x2="150" y2="130"/><line x1="210" y1="104" x2="270" y2="130"/></g>
+      <rect x="110" y="132" width="80" height="22" rx="5" fill="#0a1322" stroke="#f0697a"/><text x="150" y="147" text-anchor="middle" fill="#f0697a" font-size="9">a OR b</text>
+      <rect x="240" y="132" width="60" height="22" rx="5" fill="#0a1322" stroke="#324a78"/><text x="270" y="147" text-anchor="middle" fill="#9aabce" font-size="9">c</text>
+      <text x="210" y="180" text-anchor="middle" fill="#f0697a" font-size="10">语义错！AND 本应优先</text>
+      <rect x="410" y="44" width="360" height="150" rx="12" fill="#141f3a" stroke="#5fd38a" stroke-width="1.8"/>
+      <text x="590" y="66" text-anchor="middle" fill="#5fd38a" font-size="12" font-weight="700">正确地移进（AND 先结合）</text>
+      <text x="590" y="92" text-anchor="middle" fill="#d7e0f2" font-size="11">a OR (b AND c)</text>
+      <g stroke="#5fd38a" stroke-width="1.4" fill="none"><line x1="590" y1="104" x2="530" y2="130"/><line x1="590" y1="104" x2="650" y2="130"/></g>
+      <rect x="500" y="132" width="60" height="22" rx="5" fill="#0a1322" stroke="#324a78"/><text x="530" y="147" text-anchor="middle" fill="#9aabce" font-size="9">a</text>
+      <rect x="610" y="132" width="80" height="22" rx="5" fill="#0a1322" stroke="#5fd38a"/><text x="650" y="147" text-anchor="middle" fill="#5fd38a" font-size="9">b AND c</text>
+      <text x="590" y="180" text-anchor="middle" fill="#5fd38a" font-size="10">AND 优先级高 → 选择移进 ✓</text>
+    </svg>
+    <figcaption><b>图 4</b> · 优先级声明把"AND 高于 OR"告诉分析器，冲突时选择移进，得到正确结合</figcaption>
+  </figure>
+  <div class="note key"><span class="ic">两类冲突 + 实践含义</span><div>
+    <p>LALR 有两类冲突：<strong>移进-归约冲突</strong>（如上，靠优先级解）和<strong>归约-归约冲突</strong>（栈顶能匹配多条产生式，更棘手，常需改写文法）。Bison 编译文法时若发现未消解的冲突会告警。<strong>对使用者的含义：</strong>正因为优先级是这样定义的，写 SQL 时 <code>WHERE a=1 OR b=2 AND c=3</code> 实际等价于 <code>a=1 OR (b=2 AND c=3)</code>——<em>很多逻辑 bug 源于误以为是 (a OR b) AND c</em>。<strong>不确定时加括号</strong>，既消除歧义也让意图清晰。这正是编译原理细节直接影响日常 SQL 正确性的地方。</p>
+  </div></div>
+</section>
+
+<!-- ============ 5 ============ -->
+<section id="c5">
+  <div class="chap"><span class="num">05</span><h2>AST 构造与语义预处理</h2><div class="rule"></div></div>
+  <p>语法分析在移进-归约的同时<strong>构造出一棵树</strong>，并在之后做语义检查。本章讲"树长什么样"和"语义关怎么过"。</p>
+
+  <h3>从解析树到 AST</h3>
+  <p>每次<em>归约</em>时，分析器就<strong>创建一个树节点</strong>，把刚归约的子结构挂上去——于是整个移进-归约过程<em>自底向上地搭出一棵树</em>。原始的、严格对应文法的树叫<strong>解析树（parse tree / 具体语法树）</strong>，它含很多语法噪声（如括号、分隔符节点）。MySQL 8.0 会进一步整理成更干净的<strong>抽象语法树（AST）</strong>——节点是 <code>Parse_tree_root</code>、<code>Query_block</code>、<code>Item</code>（表达式）等类，去掉冗余、只保留语义结构，便于优化器遍历改写。</p>
+  <figure>
+    <svg viewBox="0 0 800 230" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="11">
+      <defs><marker id="ar5q" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#324a78"/></marker></defs>
+      <text x="400" y="20" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">SELECT id,name FROM user WHERE age&gt;18 的 AST</text>
+      <rect x="330" y="38" width="140" height="28" rx="8" fill="#141f3a" stroke="#5fd38a" stroke-width="2"/><text x="400" y="57" text-anchor="middle" fill="#5fd38a" font-size="11" font-weight="700">Query_block</text>
+      <rect x="110" y="100" width="130" height="26" rx="7" fill="#0f1830" stroke="#2dd4bf"/><text x="175" y="117" text-anchor="middle" fill="#2dd4bf" font-size="10">投影 id,name</text>
+      <rect x="335" y="100" width="120" height="26" rx="7" fill="#0f1830" stroke="#5b9dff"/><text x="395" y="117" text-anchor="middle" fill="#5b9dff" font-size="10">FROM user</text>
+      <rect x="540" y="100" width="150" height="26" rx="7" fill="#0f1830" stroke="#f5b955"/><text x="615" y="117" text-anchor="middle" fill="#f5b955" font-size="10">WHERE: Item(&gt;)</text>
+      <g stroke="#324a78" stroke-width="1.4" fill="none"><path d="M370,66 L185,98" marker-end="url(#ar5q)"/><path d="M400,66 L395,98" marker-end="url(#ar5q)"/><path d="M430,66 L610,98" marker-end="url(#ar5q)"/></g>
+      <g font-size="9.5"><rect x="540" y="160" width="60" height="24" rx="5" fill="#0a1322" stroke="#26375c"/><text x="570" y="176" text-anchor="middle" fill="#9aabce">age</text><rect x="630" y="160" width="60" height="24" rx="5" fill="#0a1322" stroke="#26375c"/><text x="660" y="176" text-anchor="middle" fill="#9aabce">18</text></g>
+      <g stroke="#324a78" stroke-width="1.2" fill="none"><path d="M600,126 L575,158"/><path d="M635,126 L658,158"/></g>
+      <text x="400" y="212" text-anchor="middle" fill="#6b7da3" font-size="10.5">归约时建节点 → 自底向上搭树；AST 去掉括号等噪声，只留语义结构，供优化器遍历</text>
+    </svg>
+    <figcaption><b>图 5</b> · AST：归约过程搭出的语义树，是优化器（第 7 章起）的输入</figcaption>
+  </figure>
+
+  <h3>预处理：语法对 ≠ 能执行</h3>
+  <p>有了 AST，还要过<strong>语义关（预处理 / preprocessor，源码 <code>setup_*</code> 系列）</strong>。语法分析只保证"结构合法"，预处理才检查"是否真的说得通"：</p>
+  <ul class="bul">
+    <li><strong>名称解析</strong>：表、列是否真实存在？查数据字典确认。不存在 → <code>Unknown column / Table doesn't exist</code>。</li>
+    <li><strong>歧义消解</strong>：多表有同名列时，<code>SELECT id</code> 的 <code>id</code> 到底指哪张表的？无法确定 → <code>Column 'id' is ambiguous</code>。</li>
+    <li><strong>权限检查</strong>：当前用户有没有权限读这些表/列？</li>
+    <li><strong>展开</strong>：把 <code>*</code> 展开成具体列、把<em>视图</em>展开成其定义、补全默认库名等。</li>
+    <li><strong>类型与函数检查</strong>：函数是否存在、参数个数/类型是否匹配。</li>
+  </ul>
+  <div class="note key"><span class="ic">三关递进，缺一不可</span><div>
+    <p>到此解析全部完成，三关层层递进：<strong>词法</strong>（第 2 章，"是不是合法的词"）→ <strong>语法分析</strong>（第 3–4 章，"词的排列是不是合法结构"，靠文法 + LALR 移进归约 + 优先级建 AST）→ <strong>语义预处理</strong>（本章，"这些名字是否真实、是否有权、能否说通"）。三关都过，才产出一棵<em>语义明确的 AST</em>，交给优化器。提醒：MySQL 8.0 已移除查询缓存，故没有"解析前查缓存命中直接返回"那一步，每条查询都会完整走解析与优化。</p>
+  </div></div>
+</section>
+
+<!-- ============ 6 ============ -->
+<section id="c6">
+  <div class="chap"><span class="num">06</span><h2>SQL 执行：火山模型</h2><div class="rule"></div></div>
+  <p>优化器产出执行计划后，<strong>执行器</strong>按计划驱动引擎取数。组织方式是经典的<strong>火山模型（Volcano / 迭代器模型）</strong>。执行计划是一棵<strong>算子树</strong>，每个算子（扫描、过滤、连接、排序、聚合）实现统一的 <code>next()</code> 接口，每次返回一行。<strong>上层算子调用下层 <code>next()</code> 拉取数据：控制自顶向下，数据自底向上一行行涌出。</strong></p>
+  <figure>
+    <svg viewBox="0 0 800 220" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <defs><marker id="ar6p" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#f5b955"/></marker><marker id="ar6d" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#2dd4bf"/></marker></defs>
+      <text x="400" y="22" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">火山模型：控制向下 next()，数据向上一行行返回</text>
+      <rect x="320" y="42" width="160" height="32" rx="9" fill="#141f3a" stroke="#b794f6" stroke-width="1.8"/><text x="400" y="63" text-anchor="middle" fill="#b794f6" font-size="11" font-weight="700">投影 / 返回客户端</text>
+      <rect x="320" y="98" width="160" height="32" rx="9" fill="#0f1830" stroke="#5fd38a"/><text x="400" y="119" text-anchor="middle" fill="#5fd38a" font-size="11">过滤 age&gt;18</text>
+      <rect x="320" y="154" width="160" height="32" rx="9" fill="#0f1830" stroke="#2dd4bf"/><text x="400" y="175" text-anchor="middle" fill="#2dd4bf" font-size="11">表扫描（引擎）</text>
+      <path d="M300,58 C250,58 250,114 300,114" stroke="#f5b955" stroke-width="1.8" fill="none" marker-end="url(#ar6p)"/>
+      <path d="M300,114 C250,114 250,170 300,170" stroke="#f5b955" stroke-width="1.8" fill="none" marker-end="url(#ar6p)"/>
+      <text x="228" y="90" text-anchor="middle" fill="#f5b955" font-size="10">next()</text><text x="228" y="146" text-anchor="middle" fill="#f5b955" font-size="10">next()</text>
+      <path d="M500,170 C550,170 550,114 500,114" stroke="#2dd4bf" stroke-width="1.8" fill="none" marker-end="url(#ar6d)"/>
+      <path d="M500,114 C550,114 550,58 500,58" stroke="#2dd4bf" stroke-width="1.8" fill="none" marker-end="url(#ar6d)"/>
+      <text x="572" y="90" text-anchor="middle" fill="#2dd4bf" font-size="10">一行</text><text x="572" y="146" text-anchor="middle" fill="#2dd4bf" font-size="10">一行</text>
+      <text x="400" y="208" text-anchor="middle" fill="#6b7da3" font-size="11">每个算子只管"从孩子要一行、处理后给父亲一行"，组合出任意复杂计划</text>
+    </svg>
+    <figcaption><b>图 6</b> · 火山模型：统一 next() 逐行拉取；逐行函数调用有开销，新版在部分场景用批处理摊薄</figcaption>
+  </figure>
+  <div class="note key"><span class="ic">两个延伸</span><div>
+    <p><strong>① 执行器/引擎边界。</strong>执行器调用存储引擎 handler 接口（"读下一行""按索引定位"），怎么从 B+ 树/Buffer Pool 取数是引擎（前七篇）的事。<strong>② 火山模型的代价。</strong>逐行 <code>next()</code> 有虚函数开销，分析型大数据量不划算，现代数据库引入批量处理与算子合并，但理解经典火山模型是看懂执行计划树的基础。</p>
+  </div></div>
+</section>
+
+<!-- ============ 7 ============ -->
+<section id="c7">
+  <div class="chap"><span class="num">07</span><h2>优化器总览：架构与 RBO / CBO</h2><div class="rule"></div></div>
+  <p>优化器是 Server 层的"大脑"。它接过预处理后的 AST，<strong>分两大步</strong>变成最优执行计划：</p>
+  <ul class="bul">
+    <li><strong>逻辑优化（查询变换）</strong>—— <em>等价改写</em> AST，不看成本，只为变成更易优化的形状（化简条件、子查询转半连接、派生表合并）。第 11–13 章。</li>
+    <li><strong>物理优化（基于成本选路）</strong>—— 为可行方案<em>估算成本</em>，选最便宜的：用哪个索引、哪种访问方式、哪种连接算法、什么连接顺序。第 14–23 章。</li>
+  </ul>
+  <div class="tbl">
+    <table>
+      <thead><tr><th></th><th>RBO 基于规则</th><th>CBO 基于成本</th></tr></thead>
+      <tbody>
+        <tr><td><strong>选路依据</strong></td><td>固定优先级规则</td><td>估算成本，选最小</td></tr>
+        <tr><td><strong>看数据分布吗</strong></td><td class="no">不看</td><td class="yes">看（靠统计信息）</td></tr>
+        <tr><td><strong>典型问题</strong></td><td>索引命中 90% 也照用→慢</td><td>统计不准时会估错</td></tr>
+        <tr><td><strong>MySQL 现状</strong></td><td>少数固定场景保留</td><td class="yes">主体，以 CBO 为主</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="note key"><span class="ic">为什么 CBO 会"选错"</span><div>
+    <p>CBO 的聪明完全建立在<strong>成本估算准确</strong>上，而成本估算又依赖<em>统计信息</em>。统计过期/不准 → 估算偏差 → 选次优计划（放着好索引不用、选错连接顺序）。这就是"突然走错索引"第一反应是 <code>ANALYZE TABLE</code> 的原因。第 8–10 章讲它如何估、估什么；第 25 章的 Optimizer Trace 能让你<em>亲眼看到</em>它的估算与选择。</p>
+  </div></div>
+</section>
+
+<!-- ============ 8 ============ -->
+<section id="c8">
+  <div class="chap"><span class="num">08</span><h2>成本模型：成本怎么算</h2><div class="rule"></div></div>
+  <p>CBO 口中的"成本"是个<strong>无量纲相对值</strong>，只用来比较计划优劣，主要两部分相加：</p>
+  <ul class="bul">
+    <li><strong>I/O 成本</strong>：读多少页 × <code>io_block_read_cost</code>（≈1.0）。读"已在 Buffer Pool 的页"比"磁盘页"便宜。</li>
+    <li><strong>CPU 成本</strong>：评估多少行 × <code>row_evaluate_cost</code>（8.0 ≈0.2）。</li>
+  </ul>
+  <pre><code><span class="cm">// 表 1000 页、10 万行</span>
+全表扫描 ≈ 1000 × <span class="nm">1.0</span> + 100000 × <span class="nm">0.2</span> = <span class="nm">21000</span>
+索引命中 200 行(回表200) ≈ 200 × <span class="nm">1.0</span> + 200 × <span class="nm">0.2</span> ≈ <span class="nm">240</span>   <span class="cm">→ 选索引</span>
+索引命中 8 万行(区分度低) ≈ <span class="nm">8万+</span>                          <span class="cm">→ 反比全表贵, 放弃索引</span></code></pre>
+  <div class="note key"><span class="ic">成本常量外置且引擎相关</span><div>
+    <p>8.0 把成本常量放系统表：<code>mysql.server_cost</code>（Server 层操作）与 <code>mysql.engine_cost</code>（引擎层，如 <code>memory_block_read_cost</code> vs <code>io_block_read_cost</code>）。一般无需改，但能解释"同一 SQL 在内存命中率不同时选择不同"。<strong>成本的核心驱动是"预估碰多少行/页"，这个预估来自统计信息（第 9 章）与行数估算（第 10 章）。</strong></p>
+  </div></div>
+</section>
+
+<!-- ============ 9 ============ -->
+<section id="c9">
+  <div class="chap"><span class="num">09</span><h2>统计信息：基数与直方图</h2><div class="rule"></div></div>
+  <p>成本模型要估"碰多少行"，靠两类统计：<em>索引基数</em>和<em>列直方图</em>。</p>
+  <h3>① 索引基数 Cardinality</h3>
+  <p><strong>基数 = 索引列上不同值的个数（估算）</strong>，衡量区分度。<strong>来源</strong>：随机采样若干页（<code>innodb_stats_persistent_sample_pages</code> 默认 20）估算，是近似值。<strong>存储</strong>：8.0 默认持久化（<code>innodb_stats_persistent=ON</code>）于 <code>mysql.innodb_index_stats</code>。<strong>更新</strong>：数据变化超约 10% 自动重算，或手动 <code>ANALYZE TABLE</code>。</p>
+  <h3>② 列直方图 Histogram（8.0 新增）</h3>
+  <p>基数只说"有几种值"，<strong>不说"各占多少"</strong>。直方图刻画分布，尤其服务<em>无索引列</em>。两种：<em>singleton</em>（取值少，每值一桶记占比）、<em>equi-height 等高</em>（取值多，每桶覆盖大致相等行数）。建法：<code>ANALYZE TABLE t UPDATE HISTOGRAM ON col;</code>，存 <code>mysql.column_statistics</code>。</p>
+  <figure>
+    <svg viewBox="0 0 800 195" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <text x="400" y="22" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">直方图刻画分布：基数只说"几种"，直方图说"各占多少"</text>
+      <text x="180" y="48" text-anchor="middle" fill="#9aabce" font-size="11">status 列（基数=3，严重倾斜）</text>
+      <rect x="80" y="64" width="60" height="86" rx="4" fill="rgba(45,212,191,.25)" stroke="#2dd4bf"/><text x="110" y="166" text-anchor="middle" fill="#9aabce" font-size="10">已完成90%</text>
+      <rect x="160" y="132" width="60" height="18" rx="4" fill="rgba(245,185,85,.25)" stroke="#f5b955"/><text x="190" y="166" text-anchor="middle" fill="#9aabce" font-size="10">处理中8%</text>
+      <rect x="240" y="146" width="60" height="4" rx="2" fill="rgba(240,105,122,.4)" stroke="#f0697a"/><text x="270" y="166" text-anchor="middle" fill="#9aabce" font-size="10">已取消2%</text>
+      <line x1="70" y1="150" x2="320" y2="150" stroke="#324a78"/>
+      <rect x="420" y="70" width="320" height="80" rx="12" fill="#0f1830" stroke="#5fd38a" stroke-width="1.5"/><text x="580" y="94" text-anchor="middle" fill="#5fd38a" font-size="12" font-weight="700">优化器据此估选择率</text>
+      <text x="438" y="118" fill="#d7e0f2" font-size="11">WHERE status='处理中' → 估命中 8%</text>
+      <text x="438" y="138" fill="#d7e0f2" font-size="11">WHERE status='已完成' → 估 90%（可能全扫更优）</text>
+    </svg>
+    <figcaption><b>图 7</b> · 直方图记录每种取值占比，让倾斜数据的无索引列也能被准确估算</figcaption>
+  </figure>
+  <div class="note warn"><span class="ic">统计不准的连锁后果</span><div>
+    <p>统计是 CBO 的燃料，<strong>燃料脏了决策就歪</strong>：基数采样偏差→误判区分度→选错索引；缺直方图→倾斜列按均匀分布估→严重高/低估命中行→选错计划甚至连接顺序。<strong>莫名慢查询/走错索引的标准动作：<code>ANALYZE TABLE</code> 重收基数 + 为关键无索引过滤列建直方图。</strong></p>
+  </div></div>
+</section>
+
+<!-- ============ 10 ============ -->
+<section id="c10">
+  <div class="chap"><span class="num">10</span><h2>范围优化与行数估算（index dive）</h2><div class="rule"></div></div>
+  <p>对 <code>WHERE col BETWEEN a AND b</code> 这类<strong>范围条件</strong>，优化器要估<em>命中多少行</em>——这直接决定"走索引值不值"。负责此事的是<strong>范围优化器（Range Optimizer）</strong>。</p>
+  <h3>index dive：钻进索引数一数</h3>
+  <p>光靠基数（平均）估范围不够准。MySQL 用 <strong>index dive（索引下潜）</strong>：<strong>真的钻进 B+ 树，定位范围的起点和终点，估算两点间隔多少条记录</strong>，比平均基数准得多，尤其对分布不均的数据。</p>
+  <figure>
+    <svg viewBox="0 0 800 195" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <defs><marker id="ar10d" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#f5b955"/></marker></defs>
+      <text x="400" y="22" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">index dive：定位 age BETWEEN 20 AND 30 的两端，数中间记录</text>
+      <line x1="70" y1="100" x2="730" y2="100" stroke="#324a78" stroke-width="2"/>
+      <g font-size="10">
+      <circle cx="120" cy="100" r="6" fill="#0a1322" stroke="#5b9dff"/><text x="120" y="122" text-anchor="middle" fill="#9aabce">15</text>
+      <circle cx="250" cy="100" r="7" fill="#f5b955"/><text x="250" y="122" text-anchor="middle" fill="#f5b955">20 起</text>
+      <circle cx="350" cy="100" r="6" fill="#0a1322" stroke="#2dd4bf"/><text x="350" y="122" text-anchor="middle" fill="#9aabce">24</text>
+      <circle cx="450" cy="100" r="6" fill="#0a1322" stroke="#2dd4bf"/><text x="450" y="122" text-anchor="middle" fill="#9aabce">28</text>
+      <circle cx="550" cy="100" r="7" fill="#f5b955"/><text x="550" y="122" text-anchor="middle" fill="#f5b955">30 止</text>
+      <circle cx="680" cy="100" r="6" fill="#0a1322" stroke="#5b9dff"/><text x="680" y="122" text-anchor="middle" fill="#9aabce">42</text>
+      </g>
+      <rect x="244" y="90" width="312" height="20" rx="6" fill="rgba(245,185,85,.14)" stroke="#f5b955" stroke-dasharray="4 3"/>
+      <path d="M250,80 L250,90" stroke="#f5b955" stroke-width="2" marker-end="url(#ar10d)"/><path d="M550,80 L550,90" stroke="#f5b955" stroke-width="2" marker-end="url(#ar10d)"/>
+      <text x="400" y="70" text-anchor="middle" fill="#f5b955" font-size="11">下潜定位两端 → 估区间内约 4 条</text>
+      <text x="400" y="160" text-anchor="middle" fill="#6b7da3" font-size="11">估"命中 4 行"→走索引；估"命中 8 万行"→改全表扫描</text>
+      <text x="400" y="182" text-anchor="middle" fill="#9aabce" font-size="10.5">IN(...) / OR 多区间各自 dive，区间过多则退化用基数估算</text>
+    </svg>
+    <figcaption><b>图 8</b> · index dive：实际下潜 B+ 树定位范围两端估算命中行数，比平均基数准</figcaption>
+  </figure>
+  <div class="note key"><span class="ic">两个实战要点</span><div>
+    <p><strong>① IN 列表过长会放弃 dive。</strong>每个范围都要 dive 一次，当等值范围数超过 <code>eq_range_index_dive_limit</code>（默认 200）时改用基数平均估算——超长 <code>IN (...)</code> 偶尔行数估偏选错计划，源于此。<strong>② 范围优化有内存上限。</strong>条件过于复杂时受 <code>range_optimizer_max_mem_size</code> 限制而放弃精细分析，退回粗估。</p>
+  </div></div>
+</section>
+
+<!-- ============ 11 ============ -->
+<section id="c11">
+  <div class="chap"><span class="num">11</span><h2>逻辑优化①：条件化简与等价变换</h2><div class="rule"></div></div>
+  <p>逻辑优化是<strong>不看成本的等价改写</strong>，把查询变成更易物理优化的形态。先看"条件层面"的变换：</p>
+  <ul class="bul">
+    <li><strong>常量折叠</strong>：<code>WHERE a = 5 + 3</code> → <code>a = 8</code>。</li>
+    <li><strong>等值传递</strong>：<code>WHERE a = b AND a = 10</code> → 推出 <code>b = 10</code>，让 b 也能走索引。威力很大——把一张表的过滤"传染"给等值连接的另一张表。</li>
+    <li><strong>常量表检测</strong>：某表被主键/唯一键等值锁定到至多一行时，当作<em>常量表 const</em>，<strong>优化阶段就先读出来</strong>代入其它条件。EXPLAIN <code>type=const/system</code>。</li>
+    <li><strong>恒真/恒假消除</strong>：去掉 <code>1=1</code>；<code>WHERE id=1 AND id=2</code> 矛盾 → 直接返回空（EXPLAIN <code>Impossible WHERE</code>），根本不查表。</li>
+  </ul>
+  <h3>外连接转内连接（重要）</h3>
+  <p>若 <code>LEFT JOIN</code> 的 <code>WHERE</code> 含对<em>右表列</em>的非空过滤（如 <code>WHERE b.x=5</code>），"右表为 NULL"的行本会被滤掉，<strong>外连接等价于内连接</strong>。好处：内连接<em>对连接顺序无限制</em>，优化器能自由选驱动表，常解锁更优计划。</p>
+  <figure>
+    <svg viewBox="0 0 800 150" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <defs><marker id="ar11x" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#5fd38a"/></marker></defs>
+      <text x="400" y="22" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">WHERE 对右表非空过滤 → LEFT JOIN 退化为 INNER JOIN</text>
+      <rect x="40" y="44" width="340" height="80" rx="12" fill="#0f1830" stroke="#f5b955" stroke-width="1.5"/><text x="210" y="68" text-anchor="middle" fill="#f5b955" font-size="11" font-weight="700">改写前（连接顺序受限）</text><text x="58" y="92" fill="#d7e0f2" font-size="10.5">A LEFT JOIN B ON A.id=B.aid</text><text x="58" y="112" fill="#d7e0f2" font-size="10.5">WHERE B.status = 1</text>
+      <rect x="420" y="44" width="340" height="80" rx="12" fill="#141f3a" stroke="#5fd38a" stroke-width="1.8"/><text x="590" y="68" text-anchor="middle" fill="#5fd38a" font-size="11" font-weight="700">改写后（可自由选驱动表）</text><text x="438" y="92" fill="#d7e0f2" font-size="10.5">A INNER JOIN B ON A.id=B.aid</text><text x="438" y="112" fill="#5fd38a" font-size="10.5">WHERE B.status=1（B 可作驱动表）</text>
+      <path d="M382,84 L418,84" stroke="#5fd38a" stroke-width="2.5" marker-end="url(#ar11x)"/>
+    </svg>
+    <figcaption><b>图 9</b> · 外连接转内连接：右表非空过滤让 NULL 行无意义，解锁更自由的连接顺序</figcaption>
+  </figure>
+  <div class="note key"><span class="ic">为什么先做这些</span><div>
+    <p>这些变换都在<em>物理优化之前</em>做，为物理优化铺路：等值传递让更多表能用索引、外连接转内连接放开连接顺序、Impossible WHERE 直接短路。<strong>规整后的查询，物理优化才能算出更好的账。</strong></p>
+  </div></div>
+</section>
+
+<!-- ============ 12 ============ -->
+<section id="c12">
+  <div class="chap"><span class="num">12</span><h2>逻辑优化②：子查询与半连接四策略</h2><div class="rule"></div></div>
+  <p>子查询是优化重灾区。朴素执行可能对外层<em>每一行</em>都跑一遍子查询。优化器把 <code>IN</code> 子查询<strong>改写成半连接（semi-join）</strong>，用连接算法高效执行。半连接 = 连接，但<strong>每条外层行只要"找到至少一个匹配就保留，且不因多个匹配而重复"</strong>（去重语义）。优化器有四种实现，按成本择优：</p>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>策略</th><th>做法</th><th>适合</th></tr></thead>
+      <tbody>
+        <tr><td><strong>FirstMatch</strong></td><td>外层每行去内层找，<em>找到第一个就停</em></td><td>内层每个外层行匹配多时，避免重复</td></tr>
+        <tr><td><strong>Materialization</strong></td><td>子查询结果<em>去重物化成临时表</em>（带哈希索引），外层查它</td><td>子查询结果小且被反复探测</td></tr>
+        <tr><td><strong>Duplicate Weedout</strong></td><td>当普通连接做，<em>事后用临时表去重</em></td><td>连接高效、去重代价低</td></tr>
+        <tr><td><strong>LooseScan</strong></td><td>利用内层索引有序，<em>每个不同值只取一个</em></td><td>内层连接列有索引且重复值多</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <h3>四策略的执行直觉（同一查询 o.uid IN (SELECT id FROM u WHERE vip=1)）</h3>
+  <pre><code><span class="cm">-- FirstMatch：对每个 o，扫 u 找到一个匹配 uid 就停，跳到下个 o</span>
+<span class="cm">-- Materialization：先 SELECT DISTINCT id FROM u WHERE vip=1 存临时表 t_m，</span>
+<span class="cm">--                  再 o JOIN t_m ON o.uid=t_m.id</span>
+<span class="cm">-- DuplicateWeedout：o JOIN u 正常连(可能产生重复 o)，最后按 o 主键去重</span>
+<span class="cm">-- LooseScan：u 在 id 上有序，扫 u 时每个不同 id 只取一行，天然不重复</span></code></pre>
+  <figure>
+    <svg viewBox="0 0 800 175" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <defs><marker id="ar12x" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#5fd38a"/></marker></defs>
+      <text x="400" y="22" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">IN 子查询 → 半连接 → 4 策略按成本择优</text>
+      <rect x="40" y="44" width="210" height="38" rx="9" fill="#0f1830" stroke="#9b2c3a" stroke-width="1.5"/><text x="145" y="62" text-anchor="middle" fill="#f0697a" font-size="10.5">朴素：每行重跑子查询</text><text x="145" y="77" text-anchor="middle" fill="#f0697a" font-size="9">O(外层 × 子查询)</text>
+      <rect x="290" y="44" width="190" height="38" rx="9" fill="#141f3a" stroke="#2dd4bf" stroke-width="1.8"/><text x="385" y="67" text-anchor="middle" fill="#2dd4bf" font-size="11" font-weight="700">改写为 semi-join</text>
+      <g font-size="9.5">
+      <rect x="540" y="38" width="220" height="20" rx="5" fill="#0a1322" stroke="#5fd38a"/><text x="650" y="52" text-anchor="middle" fill="#5fd38a">FirstMatch / Materialization</text>
+      <rect x="540" y="62" width="220" height="20" rx="5" fill="#0a1322" stroke="#5fd38a"/><text x="650" y="76" text-anchor="middle" fill="#5fd38a">DuplicateWeedout / LooseScan</text>
+      </g>
+      <path d="M250,63 L288,63" stroke="#5fd38a" stroke-width="2" marker-end="url(#ar12x)"/>
+      <path d="M480,63 L538,63" stroke="#5fd38a" stroke-width="1.6"/>
+      <text x="400" y="120" text-anchor="middle" fill="#6b7da3" font-size="11">EXPLAIN 会显示用了哪种(如 FirstMatch / materialized)；NOT IN/NOT EXISTS → 反连接 antijoin(8.0.17+)</text>
+      <text x="400" y="148" text-anchor="middle" fill="#9aabce" font-size="10.5">注意 NOT IN 子查询含 NULL 时的三值逻辑陷阱</text>
+    </svg>
+    <figcaption><b>图 10</b> · 半连接四策略：FirstMatch / Materialization / DuplicateWeedout / LooseScan，按成本择优</figcaption>
+  </figure>
+  <div class="note key"><span class="ic">实践</span><div>
+    <p>多数情况无需手动把 <code>IN</code> 改 <code>JOIN</code>，优化器会做；老版本或它没选好时手动改写仍有效。用 <code>EXPLAIN</code> 看是否出现 <code>&lt;subquery&gt;</code>、<code>FirstMatch</code>、<code>materialized</code> 判断走了哪条；子查询结果集大小影响策略选择，必要时给子查询过滤列建索引。</p>
+  </div></div>
+</section>
+
+<!-- ============ 13 ============ -->
+<section id="c13">
+  <div class="chap"><span class="num">13</span><h2>逻辑优化③：派生表 合并 vs 物化</h2><div class="rule"></div></div>
+  <p><code>FROM (SELECT ...) AS t</code> 派生表与视图，优化器有两种处理，差别巨大：</p>
+  <h3>① 合并 Merge（首选，更快）</h3>
+  <p>把派生表定义<strong>摊平合并进外层</strong>，变成单层查询。这样派生表的 <code>WHERE</code>/连接能和外层一起优化，<em>外层条件可下推、索引可用上</em>。如 <code>SELECT * FROM (SELECT * FROM t WHERE a&gt;5) d WHERE d.b=3</code> → <code>SELECT * FROM t WHERE a&gt;5 AND b=3</code>。</p>
+  <h3>② 物化 Materialize（兜底，较慢）</h3>
+  <p>派生表<strong>无法合并</strong>时（含 <code>GROUP BY</code>/<code>DISTINCT</code>/<code>LIMIT</code>/窗口函数/<code>UNION</code>），<strong>先执行、结果存进临时表</strong>，外层再查临时表。代价：中间结果落地，且临时表上条件下推、索引利用受限。</p>
+  <figure>
+    <svg viewBox="0 0 800 175" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <text x="400" y="22" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">派生表两种命运</text>
+      <rect x="40" y="44" width="340" height="110" rx="12" fill="#141f3a" stroke="#5fd38a" stroke-width="1.8"/><text x="210" y="68" text-anchor="middle" fill="#5fd38a" font-size="12" font-weight="700">合并 Merge（快）</text><text x="58" y="92" fill="#d7e0f2" font-size="10.5">摊平进外层 → 单层查询</text><text x="58" y="112" fill="#d7e0f2" font-size="10.5">外层条件下推、索引可用</text><text x="58" y="134" fill="#9aabce" font-size="10">条件：简单 SELECT（无聚合/DISTINCT/LIMIT）</text>
+      <rect x="420" y="44" width="340" height="110" rx="12" fill="#0f1830" stroke="#f5b955" stroke-width="1.5"/><text x="590" y="68" text-anchor="middle" fill="#f5b955" font-size="12" font-weight="700">物化 Materialize（慢）</text><text x="438" y="92" fill="#d7e0f2" font-size="10.5">先执行子查询 → 存临时表</text><text x="438" y="112" fill="#d7e0f2" font-size="10.5">外层再查临时表</text><text x="438" y="134" fill="#9aabce" font-size="10">触发：含 GROUP BY/DISTINCT/LIMIT/UNION</text>
+    </svg>
+    <figcaption><b>图 11</b> · 能合并就合并（条件下推、用索引）；含聚合等结构则物化成临时表</figcaption>
+  </figure>
+  <div class="note key"><span class="ic">实践要点</span><div>
+    <p><strong>① 尽量让派生表可合并</strong>，能在外层做的过滤别塞进派生表再加聚合。<strong>② 物化临时表默认在内存（TempTable），超限转磁盘</strong>变慢，关注 <code>tmp_table_size</code>/<code>temptable_max_ram</code>。<strong>③ 8.0 会给物化临时表自动加索引（auto_key）</strong>加速外层连接，EXPLAIN 见 <code>&lt;auto_key0&gt;</code>。<strong>④ 非递归 CTE（<code>WITH</code>）处理方式与派生表一致。</strong></p>
+  </div></div>
+</section>
+
+<!-- ============ 14 ============ -->
+<section id="c14">
+  <div class="chap"><span class="num">14</span><h2>访问路径与索引合并</h2><div class="rule"></div></div>
+  <p>进入物理优化。对单表，优化器选<strong>访问路径</strong>，再用成本模型比较。候选：<strong>const/system</strong>（主键/唯一等值，至多一行，优化阶段就读出）、<strong>全表扫描 ALL</strong>（命中占比大时最优）、<strong>索引访问</strong>（<code>ref</code>等值/<code>range</code>范围，可能回表）、<strong>覆盖索引</strong>（免回表，第 15 章）、<strong>索引合并 index_merge</strong>。</p>
+  <h3>索引合并 Index Merge</h3>
+  <p><code>WHERE</code> 用 <code>OR</code>/<code>AND</code> 连接<strong>多个不同索引各自能用的条件</strong>时，可<em>分别用多个索引各扫一遍再合并</em>，而非放弃索引走全表。三种：<em>union（OR 并集）、intersection（AND 交集）、sort-union（带排序并集）</em>。EXPLAIN <code>type=index_merge</code>。</p>
+  <figure>
+    <svg viewBox="0 0 800 150" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <defs><marker id="ar14m" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#5b9dff"/></marker></defs>
+      <text x="400" y="22" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">WHERE a=1 OR b=2（a、b 各有索引）→ index_merge union</text>
+      <rect x="60" y="42" width="170" height="34" rx="9" fill="#0f1830" stroke="#2dd4bf"/><text x="145" y="63" text-anchor="middle" fill="#2dd4bf" font-size="10.5">扫 idx_a 取 a=1</text>
+      <rect x="60" y="88" width="170" height="34" rx="9" fill="#0f1830" stroke="#f5b955"/><text x="145" y="109" text-anchor="middle" fill="#f5b955" font-size="10.5">扫 idx_b 取 b=2</text>
+      <rect x="360" y="65" width="180" height="34" rx="9" fill="#141f3a" stroke="#5fd38a" stroke-width="1.8"/><text x="450" y="86" text-anchor="middle" fill="#5fd38a" font-size="10.5">合并去重 union</text>
+      <rect x="600" y="65" width="150" height="34" rx="9" fill="#0f1830" stroke="#b794f6"/><text x="675" y="86" text-anchor="middle" fill="#b794f6" font-size="10.5">结果集</text>
+      <path d="M230,59 L358,76" stroke="#5b9dff" stroke-width="1.8" marker-end="url(#ar14m)"/><path d="M230,105 L358,90" stroke="#5b9dff" stroke-width="1.8" marker-end="url(#ar14m)"/><path d="M540,82 L598,82" stroke="#5b9dff" stroke-width="1.8" marker-end="url(#ar14m)"/>
+      <text x="400" y="142" text-anchor="middle" fill="#6b7da3" font-size="11">比全表快，但不如一个能覆盖整个条件的联合索引——频繁 index_merge 是"该建联合索引"的信号</text>
+    </svg>
+    <figcaption><b>图 12</b> · 索引合并：多个单列索引各扫各再合并，缺合适联合索引时的折中</figcaption>
+  </figure>
+  <div class="note key"><span class="ic">选路 = 成本 + 统计 + 行数估算</span><div>
+    <p>优化器对每条候选路径，用第 9 章统计 + 第 10 章 dive 估命中行数，用第 8 章成本算成本，选最小。<strong>"为什么没走我的索引"</strong>几乎总是：估"走它成本高于别的路径"（区分度低/命中太多/回表太贵），或统计不准。下一章讲怎么把"回表太贵"降下来。</p>
+  </div></div>
+</section>
+
+<!-- ============ 15 ============ -->
+<section id="c15">
+  <div class="chap"><span class="num">15</span><h2>减少回表：覆盖索引 / ICP / MRR</h2><div class="rule"></div></div>
+  <p>走二级索引常要<strong>回表</strong>（拿主键再查聚簇索引），命中多时大量<em>随机 I/O</em>是性能杀手。优化器三件武器对付回表：</p>
+  <h3>① 覆盖索引 —— 根本不回表</h3>
+  <p>查询所需<em>所有列</em>都在二级索引叶子里（索引列 + 主键），<strong>无需回表</strong>。EXPLAIN <code>Extra: Using index</code>。把高频查询返回列纳入联合索引即可制造。</p>
+  <h3>② 索引条件下推 ICP —— 回表前先过滤</h3>
+  <p><code>WHERE</code> 有<em>能用索引列但不能定位</em>的条件（后缀 <code>LIKE</code>、跳列）时，ICP 让引擎在<strong>回表前</strong>用索引叶子里现成的列值先过滤，<em>只有满足的才回表</em>。EXPLAIN <code>Using index condition</code>。把过滤从"昂贵回表后"提前到"便宜索引扫描时"。</p>
+  <h3>③ 多范围读 MRR —— 把随机回表变顺序</h3>
+  <p>二级索引按索引列有序，但它指向的<em>主键是乱序的</em>，逐行回表对聚簇索引是<strong>随机 I/O</strong>。MRR：<strong>先把要回表的一批主键收集、排序，再按主键顺序回表——随机 I/O 变顺序 I/O。</strong></p>
+  <figure>
+    <svg viewBox="0 0 800 215" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <defs><marker id="ar15x" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#5b9dff"/></marker></defs>
+      <text x="400" y="22" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">MRR：把"随机回表"先排序成"顺序回表"</text>
+      <text x="20" y="56" fill="#f0697a" font-size="12" font-weight="700">无 MRR</text>
+      <rect x="110" y="44" width="180" height="28" rx="7" fill="#0f1830" stroke="#f5b955"/><text x="200" y="62" text-anchor="middle" fill="#f5b955" font-size="10">索引得主键: 50,3,88,12</text>
+      <rect x="340" y="44" width="320" height="28" rx="7" fill="rgba(240,105,122,.14)" stroke="#f0697a"/><text x="500" y="62" text-anchor="middle" fill="#f0697a" font-size="10">逐个回表 50→3→88→12 跳来跳去（随机 I/O）</text>
+      <path d="M290,58 L338,58" stroke="#5b9dff" stroke-width="1.6" marker-end="url(#ar15x)"/>
+      <line x1="60" y1="96" x2="740" y2="96" stroke="#26375c" stroke-dasharray="3 4"/>
+      <text x="20" y="134" fill="#5fd38a" font-size="12" font-weight="700">有 MRR</text>
+      <rect x="110" y="122" width="160" height="28" rx="7" fill="#0f1830" stroke="#f5b955"/><text x="190" y="140" text-anchor="middle" fill="#f5b955" font-size="10">收集主键 50,3,88,12</text>
+      <rect x="290" y="122" width="150" height="28" rx="7" fill="#141f3a" stroke="#2dd4bf" stroke-width="1.6"/><text x="365" y="140" text-anchor="middle" fill="#2dd4bf" font-size="10">排序→3,12,50,88</text>
+      <rect x="460" y="122" width="280" height="28" rx="7" fill="rgba(95,211,138,.14)" stroke="#5fd38a"/><text x="600" y="140" text-anchor="middle" fill="#5fd38a" font-size="10">按序回表 3→12→50→88（顺序 I/O）</text>
+      <path d="M270,136 L288,136" stroke="#5b9dff" stroke-width="1.6" marker-end="url(#ar15x)"/><path d="M440,136 L458,136" stroke="#5b9dff" stroke-width="1.6" marker-end="url(#ar15x)"/>
+      <text x="400" y="184" text-anchor="middle" fill="#6b7da3" font-size="11">主键有序 → 聚簇页大概率相邻 → 顺序读, 易命中预读。EXPLAIN: Using MRR</text>
+      <text x="400" y="204" text-anchor="middle" fill="#9aabce" font-size="10">用 read_rnd_buffer_size 暂存待排序主键</text>
+    </svg>
+    <figcaption><b>图 13</b> · MRR 把回表主键先排序，将随机 I/O 转为顺序 I/O，对范围扫描 + 多行回表收益显著</figcaption>
+  </figure>
+  <div class="note key"><span class="ic">三件武器的关系</span><div>
+    <p><strong>覆盖索引</strong>釜底抽薪——不回表，最优；<strong>ICP</strong>少回表——回表前滤掉无关行；<strong>MRR</strong>回得快——非回不可时随机变顺序。优先级：能覆盖就覆盖，否则 ICP 减少回表行数 + MRR 加速剩余回表。三者常协同出现在同一计划。ICP、MRR 默认开启（受 <code>optimizer_switch</code> 控制，第 24 章）。</p>
+  </div></div>
+</section>
+
+<!-- ============ 16 ============ -->
+<section id="c16">
+  <div class="chap"><span class="num">16</span><h2>索引跳跃扫描 Skip Scan</h2><div class="rule"></div></div>
+  <p>这是 MySQL 8.0.13 新增的优化，专门<strong>挽救"违反最左前缀"的联合索引查询</strong>，是对第六篇最左前缀规则的一个重要补充。</p>
+  <h3>问题：缺了最左列，索引就废了吗</h3>
+  <p>设联合索引 <code>idx(a, b)</code>，查询 <code>WHERE b = 100</code>（<strong>没有 a 的条件</strong>）。按第六篇规则，缺最左列 a，b 在整棵索引里是无序的，<em>传统上只能全表扫描</em>。但如果 <strong>a 的不同值很少</strong>（低基数，如 a 只有 male/female 两种），情况可以改善。</p>
+  <h3>Skip Scan：把缺失的前缀"枚举"出来</h3>
+  <p>跳跃扫描的思路：<strong>既然 a 只有少数几个值，那就把 a 的每个值都"补"上，分别当作 <code>a=val1 AND b=100</code>、<code>a=val2 AND b=100</code>… 各走一次索引区间扫描，再合并。</strong>相当于优化器<em>替你枚举了缺失的最左列</em>，把一个"用不了索引"的查询拆成若干"能用索引"的子扫描。</p>
+  <figure>
+    <svg viewBox="0 0 800 200" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <defs><marker id="ar16x" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#5b9dff"/></marker></defs>
+      <text x="400" y="22" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">idx(a,b) 上 WHERE b=100（缺 a）：枚举 a 的少数值</text>
+      <rect x="300" y="42" width="200" height="36" rx="9" fill="#141f3a" stroke="#f5b955" stroke-width="1.8"/><text x="400" y="60" text-anchor="middle" fill="#f5b955" font-size="11" font-weight="700">a 仅 2 个不同值</text><text x="400" y="74" text-anchor="middle" fill="#9aabce" font-size="9">male / female（低基数）</text>
+      <rect x="90" y="118" width="280" height="40" rx="10" fill="#0f1830" stroke="#2dd4bf"/><text x="230" y="138" text-anchor="middle" fill="#2dd4bf" font-size="10.5">子扫描1: a='male' AND b=100</text><text x="230" y="153" text-anchor="middle" fill="#9aabce" font-size="9">走索引区间</text>
+      <rect x="430" y="118" width="280" height="40" rx="10" fill="#0f1830" stroke="#5fd38a"/><text x="570" y="138" text-anchor="middle" fill="#5fd38a" font-size="10.5">子扫描2: a='female' AND b=100</text><text x="570" y="153" text-anchor="middle" fill="#9aabce" font-size="9">走索引区间</text>
+      <path d="M360,78 L240,116" stroke="#5b9dff" stroke-width="1.6" marker-end="url(#ar16x)"/><path d="M440,78 L560,116" stroke="#5b9dff" stroke-width="1.6" marker-end="url(#ar16x)"/>
+      <text x="400" y="186" text-anchor="middle" fill="#6b7da3" font-size="11">两段索引扫描结果合并 → 避免全表扫描。EXPLAIN Extra: Using index for skip scan</text>
+    </svg>
+    <figcaption><b>图 14</b> · Skip Scan：a 低基数时枚举其每个值 + b 条件，拆成多个索引区间扫描，避免全表扫</figcaption>
+  </figure>
+  <div class="note key"><span class="ic">适用边界</span><div>
+    <p><strong>Skip Scan 只在最左列基数很低时才划算。</strong>若 a 有上万种值，枚举上万次索引扫描，还不如直接全表——优化器会基于成本判断，基数高时不会选它。所以它是个<em>"锦上添花"的补救</em>，<strong>不能因为有 Skip Scan 就忽视最左前缀</strong>：设计索引时仍应让查询能用上最左列，Skip Scan 只兜底"最左列恰好低基数又没被查询用到"的特例。EXPLAIN <code>Extra: Using index for skip scan</code> 标识它生效，受 <code>optimizer_switch</code> 的 <code>skip_scan</code> 控制。</p>
+  </div></div>
+</section>
+
+<!-- ============ 17 ============ -->
+<section id="c17">
+  <div class="chap"><span class="num">17</span><h2>连接顺序与搜索算法</h2><div class="rule"></div></div>
+  <p>多表连接时，优化器要决定<strong>表以什么顺序连接</strong>，这是物理优化里组合空间最大的决策。本章深入它怎么搜。</p>
+  <h3>为什么顺序关键：前缀成本累积</h3>
+  <p>连接逐表"长出"中间结果，优化器<strong>按"连接前缀"逐步累积成本</strong>。<strong>核心原则：让过滤性强（结果行数少）的表靠前，尽早把中间结果压小</strong>，后续每步都在小集合上做，总成本就低。</p>
+  <h3>搜索过程：贪心扩展 + 前缀剪枝</h3>
+  <p>N 张表有 <code>N!</code> 种顺序，全穷举不现实。MySQL 用一种<strong>有限深度的贪心搜索</strong>（源码 <code>greedy_search</code> / <code>best_extension_by_limited_search</code>）：从空前缀出发，每步在"还没加入的表"里挑<em>使当前前缀成本增量最小</em>的表加进来，并对明显差的分支剪枝。看一个三表 A/B/C 的搜索片段：</p>
+  <figure>
+    <svg viewBox="0 0 800 235" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="11">
+      <defs><marker id="ar17x" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#5b9dff"/></marker></defs>
+      <text x="400" y="20" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">连接顺序搜索：前缀树里找成本最低的全排列</text>
+      <rect x="350" y="34" width="100" height="26" rx="7" fill="#141f3a" stroke="#5b9dff"/><text x="400" y="51" text-anchor="middle" fill="#5b9dff" font-size="10">起点 { }</text>
+      <rect x="120" y="92" width="150" height="38" rx="8" fill="#141f3a" stroke="#5fd38a" stroke-width="1.6"/><text x="195" y="109" text-anchor="middle" fill="#5fd38a" font-size="10">先 A（过滤后 10 行）</text><text x="195" y="123" text-anchor="middle" fill="#9aabce" font-size="9">成本增量小 ✓</text>
+      <rect x="320" y="92" width="150" height="38" rx="8" fill="#0f1830" stroke="#9b2c3a"/><text x="395" y="109" text-anchor="middle" fill="#f0697a" font-size="10">先 B（百万行）</text><text x="395" y="123" text-anchor="middle" fill="#f0697a" font-size="9">成本高 → 剪枝 ✂</text>
+      <rect x="520" y="92" width="150" height="38" rx="8" fill="#0f1830" stroke="#324a78"/><text x="595" y="109" text-anchor="middle" fill="#9aabce" font-size="10">先 C ...</text>
+      <g stroke="#324a78" stroke-width="1.4" fill="none"><path d="M370,60 L210,90" marker-end="url(#ar17x)"/><path d="M400,60 L395,90" marker-end="url(#ar17x)"/><path d="M430,60 L590,90" marker-end="url(#ar17x)"/></g>
+      <rect x="110" y="160" width="160" height="36" rx="8" fill="#141f3a" stroke="#5fd38a" stroke-width="1.6"/><text x="190" y="177" text-anchor="middle" fill="#5fd38a" font-size="10">A→C（C 连接列有索引）</text><text x="190" y="190" text-anchor="middle" fill="#9aabce" font-size="9">继续扩展，成本最低</text>
+      <rect x="300" y="160" width="150" height="36" rx="8" fill="#0a1322" stroke="#324a78"/><text x="375" y="181" text-anchor="middle" fill="#9aabce" font-size="10">A→B（中间结果大）</text>
+      <path d="M195,130 L190,158" stroke="#5fd38a" stroke-width="1.6" marker-end="url(#ar17x)"/><path d="M210,130 L360,158" stroke="#324a78" stroke-width="1.3"/>
+      <rect x="120" y="206" width="200" height="24" rx="7" fill="rgba(95,211,138,.14)" stroke="#5fd38a"/><text x="220" y="222" text-anchor="middle" fill="#5fd38a" font-size="10">最终 A→C→B 成本最低 ✓</text>
+      <path d="M190,196 L210,204" stroke="#5fd38a" stroke-width="1.4" marker-end="url(#ar17x)"/>
+      <text x="560" y="180" fill="#6b7da3" font-size="10">剪掉"先连大表"等</text>
+      <text x="560" y="196" fill="#6b7da3" font-size="10">高成本前缀，不再深入</text>
+    </svg>
+    <figcaption><b>图 15</b> · 贪心搜索：从空前缀逐步挑成本增量最小的表加入，对高成本前缀剪枝</figcaption>
+  </figure>
+  <div class="note key"><span class="ic">搜索深度与干预</span><div>
+    <p><code>optimizer_search_depth</code> 控制搜索深度：在"搜得够全"与"优化本身开销"间权衡，设大更可能找到最优但优化变慢，默认（自适应）通常够用。<strong>驱动表（outer）</strong>先遍历，<strong>被驱动表（inner）</strong>对其每行匹配；关键是<em>驱动表小 + 被驱动表连接列有索引</em>（INLJ 高效前提，第 18 章）。<strong>干预：</strong>极少数情况可用 <code>STRAIGHT_JOIN</code> 或 <code>JOIN_ORDER</code> 提示强制顺序，但优化器选错更常源于统计不准/缺索引——先 <code>ANALYZE TABLE</code>、补索引。强制顺序是双刃剑，数据变化后可能反成枷锁。</p>
+  </div></div>
+</section>
+
+<!-- ============ 18 ============ -->
+<section id="c18">
+  <div class="chap"><span class="num">18</span><h2>嵌套循环族 NLJ / INLJ / BNL / BKA</h2><div class="rule"></div></div>
+  <p>嵌套循环是最基础的连接思想，长期是 MySQL 唯一连接方式（8.0 才加 Hash Join）。四个变体：</p>
+  <ul class="bul">
+    <li><strong>NLJ 简单嵌套循环</strong>：对驱动表每行，把被驱动表从头扫一遍，O(R×S)。被驱动表大且无索引时极慢，几乎不用纯 NLJ。</li>
+    <li><strong>INLJ 索引嵌套循环（主力）</strong>：被驱动表连接列<em>有索引</em>，对驱动表每行用索引直接定位，降到约 O(R×log S)。EXPLAIN 被驱动表 <code>ref</code>/<code>eq_ref</code>。</li>
+    <li><strong>BNL 块嵌套循环</strong>：被驱动表<em>无索引</em>时，把驱动表一批行攒进 <code>join_buffer</code>，被驱动表只扫一遍与整批比对。8.0.20 起在等值连接被 Hash Join 取代。</li>
+    <li><strong>BKA 批量键访问</strong>：INLJ 对被驱动表每次定位可能随机回表。BKA <strong>把驱动表一批行的连接键攒起来排序，用 MRR 批量、有序地查被驱动表</strong>——本质 INLJ + join_buffer + MRR，把随机回表变顺序。EXPLAIN <code>Using join buffer (Batched Key Access)</code>，需开 <code>batched_key_access</code>。</li>
+  </ul>
+  <figure>
+    <svg viewBox="0 0 800 175" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <defs><marker id="ar18x" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#5b9dff"/></marker></defs>
+      <text x="400" y="22" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">BKA = INLJ + join_buffer 攒批 + MRR 排序回表</text>
+      <rect x="40" y="44" width="150" height="100" rx="12" fill="#0f1830" stroke="#2dd4bf" stroke-width="1.5"/><text x="115" y="66" text-anchor="middle" fill="#2dd4bf" font-size="11" font-weight="700">驱动表一批行</text><text x="58" y="90" fill="#d7e0f2" font-size="10">攒进 join_buffer</text><text x="58" y="110" fill="#d7e0f2" font-size="10">提取连接键</text><text x="58" y="130" fill="#9aabce" font-size="9.5">key: 50,3,88,12</text>
+      <rect x="240" y="54" width="170" height="80" rx="12" fill="#141f3a" stroke="#f5b955" stroke-width="1.8"/><text x="325" y="78" text-anchor="middle" fill="#f5b955" font-size="11" font-weight="700">MRR 排序键</text><text x="258" y="102" fill="#d7e0f2" font-size="10">3,12,50,88（有序）</text><text x="258" y="122" fill="#5fd38a" font-size="10">顺序去被驱动表查</text>
+      <rect x="460" y="44" width="300" height="100" rx="12" fill="#0f1830" stroke="#5b9dff" stroke-width="1.5"/><text x="610" y="66" text-anchor="middle" fill="#5b9dff" font-size="11" font-weight="700">被驱动表（有索引）</text><text x="478" y="90" fill="#d7e0f2" font-size="10">按有序键批量索引查找</text><text x="478" y="110" fill="#5fd38a" font-size="10">回表变顺序 I/O</text><text x="478" y="130" fill="#9aabce" font-size="9.5">比逐行 INLJ 随机回表省 I/O</text>
+      <path d="M190,94 L238,94" stroke="#5b9dff" stroke-width="1.8" marker-end="url(#ar18x)"/><path d="M410,94 L458,94" stroke="#5b9dff" stroke-width="1.8" marker-end="url(#ar18x)"/>
+    </svg>
+    <figcaption><b>图 16</b> · BKA：把 INLJ 逐行随机回表改成攒批 + 排序 + MRR 顺序回表</figcaption>
+  </figure>
+  <div class="note warn"><span class="ic">现代版本的连接选择</span><div>
+    <p><strong>有索引</strong>：默认 INLJ；大量回表时 BKA 可进一步顺序化。<strong>无索引等值连接</strong>：8.0.20 起走 Hash Join（取代 BNL）。<strong>给连接列建索引让其走 INLJ，仍是最常见也最有效的连接优化。</strong></p>
+  </div></div>
+</section>
+
+<!-- ============ 19 ============ -->
+<section id="c19">
+  <div class="chap"><span class="num">19</span><h2>Hash Join 详解</h2><div class="rule"></div></div>
+  <p><strong>MySQL 8.0.18 引入</strong>，专治"被驱动表连接列无索引的等值连接"。复杂度 O(R+S)，远胜嵌套循环 O(R×S)。两阶段：<strong>Build</strong>（选较小表，按连接列建内存哈希表）+ <strong>Probe</strong>（遍历较大表，每行算哈希去哈希表 O(1) 查找）。</p>
+  <figure>
+    <svg viewBox="0 0 800 240" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <defs><marker id="ar19x" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#5b9dff"/></marker></defs>
+      <text x="400" y="22" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">Hash Join：小表建哈希表，大表逐行 O(1) 探测</text>
+      <rect x="30" y="44" width="150" height="136" rx="12" fill="#0f1830" stroke="#2dd4bf" stroke-width="1.5"/><text x="105" y="66" text-anchor="middle" fill="#2dd4bf" font-size="11" font-weight="700">① Build 小表</text>
+      <g font-size="9.5"><rect x="46" y="80" width="118" height="20" rx="4" fill="rgba(45,212,191,.1)" stroke="#2dd4bf"/><text x="105" y="94" text-anchor="middle" fill="#2dd4bf">k=10,Bob</text><rect x="46" y="104" width="118" height="20" rx="4" fill="rgba(45,212,191,.1)" stroke="#2dd4bf"/><text x="105" y="118" text-anchor="middle" fill="#2dd4bf">k=25,Amy</text><rect x="46" y="128" width="118" height="20" rx="4" fill="rgba(45,212,191,.1)" stroke="#2dd4bf"/><text x="105" y="142" text-anchor="middle" fill="#2dd4bf">k=33,Tom</text></g>
+      <text x="105" y="168" text-anchor="middle" fill="#9aabce" font-size="9.5">按 k 算哈希</text>
+      <rect x="280" y="44" width="200" height="136" rx="12" fill="#141f3a" stroke="#f5b955" stroke-width="2"/><text x="380" y="66" text-anchor="middle" fill="#f5b955" font-size="11" font-weight="700">内存哈希表</text>
+      <g font-size="9.5"><rect x="296" y="80" width="168" height="20" rx="4" fill="#0a1322" stroke="#26375c"/><text x="304" y="94" fill="#f5b955">hash(10)→Bob</text><rect x="296" y="104" width="168" height="20" rx="4" fill="#0a1322" stroke="#26375c"/><text x="304" y="118" fill="#f5b955">hash(25)→Amy</text><rect x="296" y="128" width="168" height="20" rx="4" fill="#0a1322" stroke="#26375c"/><text x="304" y="142" fill="#f5b955">hash(33)→Tom</text></g>
+      <text x="380" y="168" text-anchor="middle" fill="#9aabce" font-size="9.5">查找 O(1)</text>
+      <rect x="580" y="44" width="190" height="136" rx="12" fill="#0f1830" stroke="#5b9dff" stroke-width="1.5"/><text x="675" y="66" text-anchor="middle" fill="#5b9dff" font-size="11" font-weight="700">② Probe 大表</text>
+      <g font-size="9.5"><rect x="596" y="80" width="158" height="20" rx="4" fill="rgba(91,157,255,.1)" stroke="#5b9dff"/><text x="604" y="94" fill="#5b9dff">k=10→命中Bob✓</text><rect x="596" y="104" width="158" height="20" rx="4" fill="rgba(91,157,255,.1)" stroke="#5b9dff"/><text x="604" y="118" fill="#9aabce">k=99→无✗</text><rect x="596" y="128" width="158" height="20" rx="4" fill="rgba(91,157,255,.1)" stroke="#5b9dff"/><text x="604" y="142" fill="#5b9dff">k=25→命中Amy✓</text></g>
+      <text x="675" y="168" text-anchor="middle" fill="#9aabce" font-size="9.5">逐行探测</text>
+      <path d="M180,112 L278,112" stroke="#5b9dff" stroke-width="1.8" marker-end="url(#ar19x)"/><path d="M580,112 L482,112" stroke="#5b9dff" stroke-width="1.8" marker-end="url(#ar19x)"/>
+      <text x="400" y="206" text-anchor="middle" fill="#5fd38a" font-size="11">各扫一遍 = O(R+S)；只适用等值连接 ON a=b，处理不了范围连接</text>
+      <text x="400" y="226" text-anchor="middle" fill="#6b7da3" font-size="10">build 太大装不下 join_buffer → 分区落盘哈希连接(grace)，拆成多个小连接</text>
+    </svg>
+    <figcaption><b>图 17</b> · Hash Join：build 建哈希表、probe 逐行 O(1) 探测；内存不足时分区落盘</figcaption>
+  </figure>
+  <div class="note key"><span class="ic">何时用 + 怎么看</span><div>
+    <p><strong>触发</strong>：等值连接 + 被驱动表连接列<em>无可用索引</em>。<strong>观察</strong>：普通 EXPLAIN <code>Extra: Using join buffer (hash join)</code>；<code>EXPLAIN FORMAT=TREE</code> / <code>ANALYZE</code> 直接显示 <code>Hash Join</code> 算子（第 25 章）。<strong>本质</strong>：把嵌套相乘换成哈希 O(1) 查找，对"大表×大表、无索引、等值"最显著。</p>
+  </div></div>
+</section>
+
+<!-- ============ 20 ============ -->
+<section id="c20">
+  <div class="chap"><span class="num">20</span><h2>Sort-Merge Join 详解</h2><div class="rule"></div></div>
+  <p>Sort-Merge Join（排序归并连接）是数据库理论三大经典连接算法之一。先讲原理，再<strong>诚实说明 MySQL 的实际情况</strong>。</p>
+  <h3>原理：各自排序，再归并</h3>
+  <p><strong>Sort</strong>：两表都按连接列排序（来自索引已有序则跳过）。<strong>Merge</strong>：双指针同时从两个有序序列头部往后走，像拉链——哪边小推进哪边，相等则输出。两表各扫一遍。复杂度 <code>O(R logR + S logS)</code> + <code>O(R+S)</code>；输入已有序时只剩 <code>O(R+S)</code>，且<strong>能高效处理范围连接</strong>（如 <code>R.k ≥ S.k</code>）——Hash Join 做不到。</p>
+  <figure>
+    <svg viewBox="0 0 800 215" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <defs><marker id="ar20x" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#b794f6"/></marker></defs>
+      <text x="400" y="22" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">Sort-Merge：两有序序列双指针归并</text>
+      <text x="150" y="52" text-anchor="middle" fill="#2dd4bf" font-size="11" font-weight="700">表R（按 k 排序）</text>
+      <g font-size="11"><rect x="70" y="64" width="50" height="24" rx="5" fill="rgba(45,212,191,.12)" stroke="#2dd4bf"/><text x="95" y="81" text-anchor="middle" fill="#2dd4bf">10</text><rect x="124" y="64" width="50" height="24" rx="5" fill="rgba(45,212,191,.12)" stroke="#2dd4bf"/><text x="149" y="81" text-anchor="middle" fill="#2dd4bf">25</text><rect x="178" y="64" width="50" height="24" rx="5" fill="rgba(45,212,191,.12)" stroke="#2dd4bf"/><text x="203" y="81" text-anchor="middle" fill="#2dd4bf">40</text></g>
+      <text x="150" y="122" text-anchor="middle" fill="#5b9dff" font-size="11" font-weight="700">表S（按 k 排序）</text>
+      <g font-size="11"><rect x="70" y="134" width="50" height="24" rx="5" fill="rgba(91,157,255,.12)" stroke="#5b9dff"/><text x="95" y="151" text-anchor="middle" fill="#5b9dff">10</text><rect x="124" y="134" width="50" height="24" rx="5" fill="rgba(91,157,255,.12)" stroke="#5b9dff"/><text x="149" y="151" text-anchor="middle" fill="#5b9dff">25</text><rect x="178" y="134" width="50" height="24" rx="5" fill="rgba(91,157,255,.12)" stroke="#5b9dff"/><text x="203" y="151" text-anchor="middle" fill="#5b9dff">55</text></g>
+      <path d="M95,90 L95,132" stroke="#b794f6" stroke-width="2" marker-end="url(#ar20x)"/>
+      <text x="280" y="80" fill="#5fd38a" font-size="10">10=10✓</text><text x="280" y="151" fill="#5fd38a" font-size="10">25=25✓</text>
+      <rect x="430" y="56" width="330" height="100" rx="12" fill="#141f3a" stroke="#5fd38a" stroke-width="1.8"/><text x="595" y="80" text-anchor="middle" fill="#5fd38a" font-size="12" font-weight="700">归并匹配</text><text x="448" y="104" fill="#d7e0f2" font-size="10.5">小的一边推进，相等则输出</text><text x="448" y="124" fill="#d7e0f2" font-size="10.5">两表各扫一遍，无需嵌套</text><text x="448" y="144" fill="#9aabce" font-size="10">擅长有序输入 + 范围连接</text>
+    </svg>
+    <figcaption><b>图 18</b> · Sort-Merge：排序后双指针归并，各扫一遍；尤擅有序输入与范围连接</figcaption>
+  </figure>
+  <div class="note danger"><span class="ic">关于 MySQL 的实话（重要）</span><div>
+    <p><strong>MySQL 并没有实现独立的 Sort-Merge Join 连接算子</strong>——常见误解，务必讲清：<strong>①</strong> MySQL 历史上只有嵌套循环连接，8.0 才补 Hash Join，<em>从未提供专门的 sort-merge join 算子</em>。<strong>②</strong> Sort-Merge 是 Oracle、PostgreSQL、SQL Server 的标配。<strong>③</strong> MySQL 用别的手段达成类似目的：连接键<em>有索引走 INLJ</em>（索引本身有序），<em>无索引等值连接走 Hash Join</em>；MySQL 大量用排序（filesort，第 22 章）但那是为 <code>ORDER BY</code>/<code>GROUP BY</code>，<em>不是连接算子</em>。记住：<strong>讲算法 Sort-Merge 是三大经典之一；落到 MySQL 实现，连接武器只有 INLJ（含 BKA）+ Hash Join 两件。</strong></p>
+  </div></div>
+</section>
+
+<!-- ============ 21 ============ -->
+<section id="c21">
+  <div class="chap"><span class="num">21</span><h2>三种 JOIN 对比与选择</h2><div class="rule"></div></div>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>算法</th><th>复杂度</th><th>适用</th><th>MySQL 支持</th><th>EXPLAIN 标志</th></tr></thead>
+      <tbody>
+        <tr><td><strong>INLJ</strong>（含 BKA）</td><td>O(R×log S)</td><td>被驱动表连接列<em>有索引</em></td><td class="yes">主力，全版本</td><td><code>ref</code>/<code>eq_ref</code>（BKA：join buffer）</td></tr>
+        <tr><td><strong>BNL</strong></td><td>O(R×S/缓冲)</td><td>无索引（旧版兜底）</td><td class="mid">8.0.20 起被 Hash 取代</td><td><code>(Block Nested Loop)</code></td></tr>
+        <tr><td><strong>Hash Join</strong></td><td>O(R+S)</td><td><em>等值</em> + 无索引</td><td class="yes">8.0.18+</td><td><code>(hash join)</code></td></tr>
+        <tr><td><strong>Sort-Merge</strong></td><td>O(R logR+S logS)</td><td>大表等值/<em>范围</em>、已有序</td><td class="no">MySQL 无独立实现</td><td>—（他库才有）</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <figure>
+    <svg viewBox="0 0 800 165" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <defs><marker id="ar21x" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#5b9dff"/></marker></defs>
+      <text x="400" y="22" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">现代 MySQL（8.0.20+）等值连接的选择</text>
+      <rect x="300" y="42" width="200" height="36" rx="9" fill="#141f3a" stroke="#5b9dff" stroke-width="1.8"/><text x="400" y="65" text-anchor="middle" fill="#5b9dff" font-size="11">被驱动表连接列有索引？</text>
+      <rect x="100" y="118" width="240" height="40" rx="10" fill="#0f1830" stroke="#5fd38a" stroke-width="1.5"/><text x="220" y="135" text-anchor="middle" fill="#5fd38a" font-size="11.5" font-weight="700">有 → INLJ（可叠 BKA）</text><text x="220" y="151" text-anchor="middle" fill="#9aabce" font-size="9.5">索引直达，通常最优</text>
+      <rect x="460" y="118" width="240" height="40" rx="10" fill="#0f1830" stroke="#f5b955" stroke-width="1.5"/><text x="580" y="135" text-anchor="middle" fill="#f5b955" font-size="11.5" font-weight="700">无 → Hash Join</text><text x="580" y="151" text-anchor="middle" fill="#9aabce" font-size="9.5">建哈希表，线性高效</text>
+      <path d="M360,78 L240,116" stroke="#5fd38a" stroke-width="1.8" marker-end="url(#ar21x)"/><text x="270" y="104" fill="#5fd38a" font-size="10">是</text>
+      <path d="M440,78 L560,116" stroke="#f5b955" stroke-width="1.8" marker-end="url(#ar21x)"/><text x="510" y="104" fill="#f5b955" font-size="10">否</text>
+    </svg>
+    <figcaption><b>图 19</b> · 等值连接现代选择：有索引走 INLJ，无索引走 Hash Join（BNL 退场）</figcaption>
+  </figure>
+  <div class="note key"><span class="ic">实践结论</span><div>
+    <p><strong>给连接列建索引、让连接走 INLJ，是绝大多数场景首选。</strong>只有连接列实在无法建索引（派生结果、表达式连接）时，Hash Join 才作高效兜底。看到 Hash Join 且慢，往往提示"被驱动表连接列该加索引"。Sort-Merge——记得它是经典算法，但 MySQL 里不必去找，<em>INLJ 的索引有序性 + Hash Join 覆盖了它的场景</em>。</p>
+  </div></div>
+</section>
+
+<!-- ============ 22 ============ -->
+<section id="c22">
+  <div class="chap"><span class="num">22</span><h2>排序、分组与去重优化</h2><div class="rule"></div></div>
+  <p><code>ORDER BY</code>/<code>GROUP BY</code>/<code>DISTINCT</code> 的核心优化目标：<strong>尽量利用索引有序性，避免昂贵的额外排序和临时表</strong>。</p>
+  <h3>ORDER BY：索引有序 vs filesort</h3>
+  <ul class="bul">
+    <li><strong>用索引有序（最优）</strong>：<code>ORDER BY</code> 列是某索引有序前缀时，顺着索引读即有序，<em>无需排序</em>，EXPLAIN 无 filesort。</li>
+    <li><strong>filesort</strong>：无法用索引序时取出数据在 <code>sort_buffer</code> 排。<code>Using filesort</code> <em>不一定是磁盘排序</em>：放得下内存排，放不下才用临时文件归并。两种内存策略：<em>全字段排序</em>（排序列+返回列一起排，少回表）和 <em>rowid 排序</em>（只排序列+主键，排完回表，省内存多回表）。</li>
+  </ul>
+  <h3>GROUP BY：松散 vs 紧凑索引扫描</h3>
+  <ul class="bul">
+    <li><strong>松散索引扫描（最优）</strong>：利用索引有序<em>跳着读</em>，每分组只取少量记录（配合 MAX/MIN）。EXPLAIN <code>Using index for group-by</code>。</li>
+    <li><strong>紧凑索引扫描</strong>：扫索引连续范围但按索引序，无需额外排序/临时表。</li>
+    <li><strong>临时表 + 排序（最差）</strong>：无法用索引序时建临时表分组 + filesort。<code>Using temporary; Using filesort</code> 是<strong>性能警报</strong>。</li>
+  </ul>
+  <figure>
+    <svg viewBox="0 0 800 160" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <text x="400" y="22" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">排序/分组的三档命运（从好到差）</text>
+      <rect x="40" y="42" width="230" height="100" rx="12" fill="#141f3a" stroke="#5fd38a" stroke-width="1.8"/><text x="155" y="66" text-anchor="middle" fill="#5fd38a" font-size="11" font-weight="700">索引有序（最优）</text><text x="58" y="90" fill="#d7e0f2" font-size="10">顺索引读即有序/分组</text><text x="58" y="110" fill="#d7e0f2" font-size="10">松散扫描可跳读</text><text x="58" y="130" fill="#5fd38a" font-size="10">无 filesort/临时表</text>
+      <rect x="285" y="42" width="230" height="100" rx="12" fill="#0f1830" stroke="#f5b955" stroke-width="1.5"/><text x="400" y="66" text-anchor="middle" fill="#f5b955" font-size="11" font-weight="700">filesort（可接受）</text><text x="303" y="90" fill="#d7e0f2" font-size="10">sort_buffer 内存排序</text><text x="303" y="110" fill="#d7e0f2" font-size="10">放不下转临时文件归并</text><text x="303" y="130" fill="#f5b955" font-size="10">Using filesort</text>
+      <rect x="530" y="42" width="230" height="100" rx="12" fill="#0f1830" stroke="#9b2c3a" stroke-width="1.5"/><text x="645" y="66" text-anchor="middle" fill="#f0697a" font-size="11" font-weight="700">临时表+排序（最差）</text><text x="548" y="90" fill="#d7e0f2" font-size="10">建临时表分组去重</text><text x="548" y="110" fill="#d7e0f2" font-size="10">大则转磁盘临时表</text><text x="548" y="130" fill="#f0697a" font-size="10">Using temporary;filesort</text>
+    </svg>
+    <figcaption><b>图 20</b> · 让排序/分组/去重命中索引有序前缀，是消除 filesort 与临时表的关键</figcaption>
+  </figure>
+  <div class="note key"><span class="ic">实践</span><div>
+    <p>① 让 <code>WHERE</code> + <code>ORDER BY</code>/<code>GROUP BY</code> 列组成合适<strong>联合索引</strong>（注意第六篇最左前缀：等值列在前、排序列紧随、方向一致）。② 看到 <code>Using temporary; Using filesort</code> 同时出现多半要调索引。③ <code>DISTINCT</code> 本质同 <code>GROUP BY</code>，能走索引序则免临时表。④ 8.0 支持<strong>降序索引</strong>，混合方向 <code>ORDER BY a ASC, b DESC</code> 也能用索引序。</p>
+  </div></div>
+</section>
+
+<!-- ============ 23 ============ -->
+<section id="c23">
+  <div class="chap"><span class="num">23</span><h2>分页与 LIMIT 优化</h2><div class="rule"></div></div>
+  <p>分页是<strong>深分页</strong>性能塌方的重灾区。<code>SELECT * FROM t ORDER BY id LIMIT 1000000,10</code> 看似只要 10 行，实则<strong>必须先扫描并丢弃前 100 万行</strong>，偏移越大白扫越多；若走二级索引，前 100 万行还可能每行回表。</p>
+  <h3>解法一：覆盖索引 + 延迟回表（deferred join）</h3>
+  <p>先用<strong>覆盖索引</strong>定位那 10 行的<em>主键</em>（不回表，快），再用主键取完整行，把"100 万次回表"降为"10 次"：</p>
+  <pre><code><span class="cm">-- 快：子查询只走覆盖索引拿主键(不回表)，外层只回表10次</span>
+<span class="kw">SELECT</span> t.* <span class="kw">FROM</span> t
+<span class="kw">JOIN</span> (<span class="kw">SELECT</span> id <span class="kw">FROM</span> t <span class="kw">ORDER BY</span> create_time <span class="kw">LIMIT</span> <span class="nm">1000000</span>,<span class="nm">10</span>) d <span class="kw">ON</span> t.id = d.id;</code></pre>
+  <h3>解法二：游标分页 / keyset pagination（最优）</h3>
+  <p>不用 <code>OFFSET</code>，<strong>记住上一页最后一条的位置，下一页从那之后取</strong>，翻多深都恒定快：</p>
+  <pre><code><span class="kw">SELECT</span> * <span class="kw">FROM</span> t <span class="kw">WHERE</span> id &gt; <span class="nm">:last_id</span> <span class="kw">ORDER BY</span> id <span class="kw">LIMIT</span> <span class="nm">10</span>;  <span class="cm">-- 索引直达, 零丢弃</span></code></pre>
+  <figure>
+    <svg viewBox="0 0 800 160" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <text x="400" y="22" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">LIMIT 1000000,10 的三种取法</text>
+      <rect x="40" y="42" width="230" height="100" rx="12" fill="#0f1830" stroke="#9b2c3a" stroke-width="1.5"/><text x="155" y="64" text-anchor="middle" fill="#f0697a" font-size="11" font-weight="700">朴素 OFFSET（慢）</text><text x="58" y="88" fill="#d7e0f2" font-size="10">扫并丢弃前 100 万行</text><text x="58" y="108" fill="#f0697a" font-size="10">可能 100 万次回表</text><text x="58" y="128" fill="#9aabce" font-size="9.5">偏移越大越慢</text>
+      <rect x="285" y="42" width="230" height="100" rx="12" fill="#0f1830" stroke="#f5b955" stroke-width="1.5"/><text x="400" y="64" text-anchor="middle" fill="#f5b955" font-size="11" font-weight="700">延迟回表（较快）</text><text x="303" y="88" fill="#d7e0f2" font-size="10">覆盖索引拿 10 个主键</text><text x="303" y="108" fill="#5fd38a" font-size="10">只回表 10 次</text><text x="303" y="128" fill="#9aabce" font-size="9.5">仍需扫索引前缀</text>
+      <rect x="530" y="42" width="230" height="100" rx="12" fill="#141f3a" stroke="#5fd38a" stroke-width="1.8"/><text x="645" y="64" text-anchor="middle" fill="#5fd38a" font-size="11" font-weight="700">游标分页（最优）</text><text x="548" y="88" fill="#d7e0f2" font-size="10">WHERE id&gt;上页末尾</text><text x="548" y="108" fill="#5fd38a" font-size="10">索引直达，零丢弃</text><text x="548" y="128" fill="#5fd38a" font-size="9.5">翻多深都恒定快</text>
+    </svg>
+    <figcaption><b>图 21</b> · 深分页优化：延迟回表减少回表次数，游标分页彻底消除"扫描并丢弃"</figcaption>
+  </figure>
+  <div class="note key"><span class="ic">取舍</span><div>
+    <p><strong>游标分页最优但有约束</strong>：只能顺序翻、<em>无法跳到第 N 页</em>；排序键需唯一（或加主键做 tiebreaker：<code>WHERE (sort_key,id) &gt; (:k,:id)</code>）。<strong>延迟回表</strong>保留跳页能力、改造小，是不能用游标分页时的折中。<strong>能用游标分页（信息流/无限滚动）就用它；需页码跳转的传统分页用延迟回表 + 限制最大翻页数。</strong></p>
+  </div></div>
+</section>
+
+<!-- ============ 24 ============ -->
+<section id="c24">
+  <div class="chap"><span class="num">24</span><h2>优化器提示与开关</h2><div class="rule"></div></div>
+  <p>优化器偶尔失手（统计不准、估算偏差），MySQL 提供干预手段。</p>
+  <h3>① 优化器开关 optimizer_switch</h3>
+  <p>一组布尔开关控制各项优化：<code>index_merge</code>、<code>mrr</code>、<code>batched_key_access</code>、<code>semijoin</code>、<code>materialization</code>、<code>derived_merge</code>、<code>hash_join</code>、<code>skip_scan</code> 等。一般保持默认，排查"某优化是否捣乱"时临时关某项验证。</p>
+  <h3>② 优化器提示 Optimizer Hints（8.0 推荐）</h3>
+  <p>写在 SQL 里的 <code>/*+ ... */</code>，<strong>只影响当条语句</strong>，比改全局开关精准安全：</p>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>提示</th><th>作用</th></tr></thead>
+      <tbody>
+        <tr><td><code>/*+ JOIN_ORDER(a,b,c) */</code></td><td>指定连接顺序</td></tr>
+        <tr><td><code>/*+ INDEX(t idx) */</code> / <code>NO_INDEX</code></td><td>建议用/不用某索引</td></tr>
+        <tr><td><code>/*+ HASH_JOIN(t1,t2) */</code> / <code>NO_HASH_JOIN</code></td><td>强制/禁止哈希连接</td></tr>
+        <tr><td><code>/*+ BKA(t) */</code> / <code>NO_BKA</code></td><td>开/关批量键访问</td></tr>
+        <tr><td><code>/*+ MAX_EXECUTION_TIME(1000) */</code></td><td>限制语句最长执行 1 秒</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <h3>③ 索引提示 Index Hints（老语法）</h3>
+  <p><code>USE INDEX</code> 建议、<code>FORCE INDEX</code> 强制、<code>IGNORE INDEX</code> 忽略。</p>
+  <div class="note danger"><span class="ic">提示是双刃剑</span><div>
+    <p><strong>能不用就不用。</strong>提示把"动态决策"变成"写死"，今天对、明天数据变了可能反成枷锁。<strong>正确顺序：先 <code>ANALYZE TABLE</code> 修正统计、补索引、改写 SQL；都试过仍选错，才考虑提示，优先语句级 <code>/*+ Hints */</code> 而非改全局 <code>optimizer_switch</code>。</strong></p>
+  </div></div>
+</section>
+
+<!-- ============ 25 ============ -->
+<section id="c25">
+  <div class="chap"><span class="num">25</span><h2>EXPLAIN 与 Optimizer Trace</h2><div class="rule"></div></div>
+  <p>看懂优化器决策，靠 <code>EXPLAIN</code>（看结果）和 <code>Optimizer Trace</code>（看推导过程）。</p>
+  <h3>EXPLAIN 的几种格式</h3>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>形式</th><th>给什么</th><th>何时用</th></tr></thead>
+      <tbody>
+        <tr><td><code>EXPLAIN</code></td><td>type/key/rows/Extra 概览</td><td>快速看走没走索引、有没有 filesort</td></tr>
+        <tr><td><code>FORMAT=JSON</code></td><td>详细成本、各步行数、过滤比</td><td>深挖为何这样选（含 <code>query_cost</code>）</td></tr>
+        <tr><td><code>FORMAT=TREE</code></td><td>算子树形结构</td><td>看 Hash Join / 连接嵌套结构</td></tr>
+        <tr><td><code>EXPLAIN ANALYZE</code></td><td><strong>真正执行</strong>给出<em>实际</em>行数与耗时</td><td>对比"预估 vs 实际"，定位偏差</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>关键列：<code>type</code>（梯子 const&gt;eq_ref&gt;ref&gt;range&gt;index&gt;ALL）、<code>key/key_len</code>（用了哪个索引/几字节）、<code>rows × filtered</code>（预估扫描行 × 过滤后保留比，<strong>连接时上一步 rows×filtered 是下一步驱动行数</strong>）、<code>Extra</code>（<code>Using index</code>/<code>index condition</code>/<code>MRR</code>/<code>filesort</code>/<code>temporary</code>/<code>hash join</code>）。</p>
+  <h3>Optimizer Trace：看见优化器的"思考"</h3>
+  <p>EXPLAIN 给的是<em>结论</em>，<strong>Optimizer Trace 给的是<em>推导全过程</em></strong>——优化器考虑了哪些候选、各自估了多少成本、为什么选了这个、为什么淘汰那个，全以 JSON 记录：</p>
+  <pre><code><span class="kw">SET</span> optimizer_trace = <span class="st">'enabled=on'</span>;
+<span class="kw">SELECT</span> ... ;                                  <span class="cm">-- 执行目标查询</span>
+<span class="kw">SELECT</span> * <span class="kw">FROM</span> information_schema.optimizer_trace<span class="kw">\G</span>  <span class="cm">-- 取出 trace</span>
+<span class="kw">SET</span> optimizer_trace = <span class="st">'enabled=off'</span>;</code></pre>
+  <p>trace 的 JSON 分三段：<code>join_preparation</code>（解析准备）、<code>join_optimization</code>（<strong>核心：条件化简、范围分析、各索引的成本估算、连接顺序搜索</strong>）、<code>join_execution</code>。在 <code>join_optimization</code> 里能看到每个候选索引的 <code>rows_estimation</code>、每种连接顺序的 <code>considered_execution_plans</code> 及其 cost——<strong>这是回答"优化器到底在想什么、为什么不选我的索引"的终极工具。</strong></p>
+  <div class="note key"><span class="ic">EXPLAIN ANALYZE + Trace 的配合</span><div>
+    <p><strong>两者互补：</strong><code>EXPLAIN ANALYZE</code> 告诉你"<em>预估 vs 实际</em>差多少"（发现问题）——若某算子预估 10 行实际 100 万行，就抓到了估算失准的元凶；<code>Optimizer Trace</code> 告诉你"<em>它当初为什么这么估、这么选</em>"（定位根因）——往往指向统计信息不准（回第 9 章 <code>ANALYZE TABLE</code>/建直方图）或缺合适索引。<strong>先用 ANALYZE 发现偏差，再用 Trace 追溯根因，是优化器调优的黄金组合。</strong>注意 ANALYZE 会真实执行（写语句慎用），Trace 有大小上限 <code>optimizer_trace_max_mem_size</code>。</p>
+  </div></div>
+</section>
+
+<!-- ============ 26 ============ -->
+<section id="c26">
+  <div class="chap"><span class="num">26</span><h2>一次完整的查询优化实战</h2><div class="rule"></div></div>
+  <p>前面拆开讲了各项优化。本章用<strong>一个慢查询</strong>把它们串起来，演示真实的优化流程：<em>看 EXPLAIN 找症结 → 逐步施治 → 验证</em>。场景：订单表 <code>orders</code>（千万行）、用户表 <code>users</code>，查"某城市 VIP 用户最近的 10 笔订单"。</p>
+  <pre><code><span class="cm">-- 初始慢查询（执行 8 秒）</span>
+<span class="kw">SELECT</span> o.* <span class="kw">FROM</span> orders o
+<span class="kw">WHERE</span> o.user_id <span class="kw">IN</span> (<span class="kw">SELECT</span> id <span class="kw">FROM</span> users <span class="kw">WHERE</span> city=<span class="st">'北京'</span> <span class="kw">AND</span> vip=1)
+  <span class="kw">AND</span> o.status = <span class="st">'paid'</span>
+<span class="kw">ORDER BY</span> o.create_time <span class="kw">DESC</span>
+<span class="kw">LIMIT</span> <span class="nm">100000</span>, <span class="nm">10</span>;</code></pre>
+
+  <h3>第 1 步：EXPLAIN 找症结</h3>
+  <p><code>EXPLAIN</code> 暴露出四个问题，恰好对应前面四章：</p>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>症状（EXPLAIN 所见）</th><th>对应病根</th><th>章节</th></tr></thead>
+      <tbody>
+        <tr><td>orders <code>type=ALL</code>（全表扫描）</td><td>过滤列 status/user_id 无合适索引</td><td>第 14 章</td></tr>
+        <tr><td>子查询 <code>DEPENDENT SUBQUERY</code></td><td>关联子查询逐行重跑，未转半连接</td><td>第 12 章</td></tr>
+        <tr><td><code>Using filesort</code></td><td>ORDER BY create_time 无法用索引序</td><td>第 22 章</td></tr>
+        <tr><td><code>LIMIT 100000,10</code> 扫弃十万行</td><td>深分页 OFFSET</td><td>第 23 章</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>第 2 步：逐步施治</h3>
+  <figure>
+    <svg viewBox="0 0 800 250" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="11">
+      <defs><marker id="ar26x" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#5fd38a"/></marker></defs>
+      <text x="400" y="20" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">四步优化，逐步把 8 秒压到毫秒级</text>
+      <rect x="30" y="36" width="180" height="46" rx="9" fill="#0f1830" stroke="#2dd4bf"/><text x="120" y="55" text-anchor="middle" fill="#2dd4bf" font-size="10.5" font-weight="700">① 建联合索引</text><text x="120" y="72" text-anchor="middle" fill="#9aabce" font-size="9">orders(status,create_time)</text>
+      <rect x="225" y="36" width="180" height="46" rx="9" fill="#0f1830" stroke="#f5b955"/><text x="315" y="55" text-anchor="middle" fill="#f5b955" font-size="10.5" font-weight="700">② 子查询转 JOIN</text><text x="315" y="72" text-anchor="middle" fill="#9aabce" font-size="9">半连接, users(city,vip)索引</text>
+      <rect x="420" y="36" width="180" height="46" rx="9" fill="#0f1830" stroke="#b794f6"/><text x="510" y="55" text-anchor="middle" fill="#b794f6" font-size="10.5" font-weight="700">③ 消除 filesort</text><text x="510" y="72" text-anchor="middle" fill="#9aabce" font-size="9">create_time 进索引走有序</text>
+      <rect x="615" y="36" width="170" height="46" rx="9" fill="#0f1830" stroke="#5fd38a"/><text x="700" y="55" text-anchor="middle" fill="#5fd38a" font-size="10.5" font-weight="700">④ 游标分页</text><text x="700" y="72" text-anchor="middle" fill="#9aabce" font-size="9">WHERE create_time&lt;上页末</text>
+      <g stroke="#5fd38a" stroke-width="1.6" fill="none"><path d="M210,59 L223,59" marker-end="url(#ar26x)"/><path d="M405,59 L418,59" marker-end="url(#ar26x)"/><path d="M600,59 L613,59" marker-end="url(#ar26x)"/></g>
+      <!-- result query -->
+      <rect x="40" y="104" width="720" height="92" rx="10" fill="#0a1322" stroke="#5fd38a" stroke-width="1.5"/>
+      <text x="56" y="124" fill="#6b7da3" font-size="10">-- 优化后（执行 &lt; 10ms）</text>
+      <text x="56" y="142" fill="#9aabce" font-size="10">SELECT o.* FROM orders o</text>
+      <text x="56" y="158" fill="#9aabce" font-size="10">JOIN users u ON o.user_id=u.id AND u.city='北京' AND u.vip=1</text>
+      <text x="56" y="174" fill="#9aabce" font-size="10">WHERE o.status='paid' AND o.create_time &lt; :last_time</text>
+      <text x="56" y="190" fill="#9aabce" font-size="10">ORDER BY o.create_time DESC LIMIT 10;</text>
+      <text x="400" y="222" text-anchor="middle" fill="#5fd38a" font-size="11">索引覆盖过滤+排序、半连接、游标分页 → type=ref、无 filesort、零丢弃</text>
+      <text x="400" y="240" text-anchor="middle" fill="#6b7da3" font-size="10">用 EXPLAIN ANALYZE 验证：预估与实际行数吻合、各算子耗时骤降</text>
+    </svg>
+    <figcaption><b>图 22</b> · 实战：建索引(14) + 子查询转半连接(12) + 消除 filesort(22) + 游标分页(23)，四招叠加</figcaption>
+  </figure>
+  <div class="note key"><span class="ic">优化的统一方法论</span><div>
+    <p>这个实战浓缩了全篇优化心法的<strong>标准动作</strong>：<strong>① 先 <code>EXPLAIN</code> 定位症结</strong>（type=ALL? filesort? 子查询? 深分页?），不要凭感觉乱改；<strong>② 对症下药</strong>——缺索引就建（让过滤+排序都走索引序，第 14、22 章）、子查询交给半连接（第 12 章）、深分页换游标（第 23 章）；<strong>③ 用 <code>EXPLAIN ANALYZE</code> 验证</strong>预估与实际是否吻合，必要时 <code>ANALYZE TABLE</code> / Optimizer Trace 追根因（第 9、25 章）。<strong>一次只改一处、改完即验</strong>，才能确知每步的效果，也避免引入新问题。</p>
+  </div></div>
+</section>
+
+<!-- ============ 27 ============ -->
+<section id="c27">
+  <div class="chap"><span class="num">27</span><h2>动态 DDL：ALGORITHM 与 LOCK</h2><div class="rule"></div></div>
+  <p><strong>动态 DDL（在线 DDL，Online DDL）</strong>：在不阻塞业务读写的前提下改表结构，呼应第五篇 MDL。</p>
+  <h3>为什么传统改表会锁表</h3>
+  <p>早期改表用<strong>拷贝法</strong>：建新结构临时表 → 逐行拷贝旧数据 → 替换旧表。拷贝期间<strong>禁止写入（甚至禁读）</strong>，大表可能锁几小时。Online DDL 为消除此阻塞而生。</p>
+  <h3>两个子句：ALGORITHM 与 LOCK</h3>
+  <p><code>ALTER TABLE ... ALGORITHM=? LOCK=?</code> 控制改表方式与并发度：</p>
+  <div class="tbl">
+    <table>
+      <thead><tr><th><code>ALGORITHM</code></th><th>做法</th><th>数据拷贝/重建</th><th>并发 DML</th></tr></thead>
+      <tbody>
+        <tr><td><strong>INSTANT</strong>（8.0.12+）</td><td>只改<em>元数据</em>，不碰数据行</td><td class="yes">完全不拷贝</td><td class="yes">几乎不阻塞，秒级</td></tr>
+        <tr><td><strong>INPLACE</strong></td><td>原表<em>原地</em>重建/修改</td><td class="mid">可能重建，但原地</td><td class="yes">多允许并发读写</td></tr>
+        <tr><td><strong>COPY</strong></td><td>建临时表<em>逐行拷贝</em>（旧做法）</td><td class="no">全量拷贝</td><td class="no">阻塞写（至多允许读）</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="tbl">
+    <table>
+      <thead><tr><th><code>LOCK</code></th><th>并发允许</th></tr></thead>
+      <tbody>
+        <tr><td><strong>NONE</strong></td><td class="yes">读 + 写都允许</td></tr>
+        <tr><td><strong>SHARED</strong></td><td class="mid">只允许读，写阻塞</td></tr>
+        <tr><td><strong>EXCLUSIVE</strong></td><td class="no">读写都阻塞</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="note key"><span class="ic">显式指定能"快速失败"</span><div>
+    <p><code>ALTER TABLE t ADD COLUMN x INT, ALGORITHM=INSTANT;</code>——若不支持 INSTANT，MySQL <em>直接报错</em>，而非悄悄退化成慢且锁表的 COPY。你第一时间知道"此变更没法秒级完成"，再决定换方案。指定 <code>LOCK=NONE</code> 同理。<strong>显式声明是生产改表的安全习惯。</strong></p>
+  </div></div>
+</section>
+
+<!-- ============ 28 ============ -->
+<section id="c28">
+  <div class="chap"><span class="num">28</span><h2>INSTANT / INPLACE 原理</h2><div class="rule"></div></div>
+  <h3>INSTANT：只改元数据</h3>
+  <p>8.0 的杀手锏。以加列为例：<strong>不重写每一行，而是把"新列及其默认值"记在表的<em>元数据（数据字典）</em>里。</strong><strong>旧行</strong>物理上没有新列，读取时若是"加列前的旧行"就<em>用元数据里的默认值补上</em>，对用户透明；<strong>新行</strong>插入时才物理带上。因完全不碰已有行，无论表多大都是<strong>毫秒级</strong>。范围逐版本扩大：8.0.12 末尾加列，8.0.29 起任意位置加列及更多操作。</p>
+  <h3>INPLACE：原地重建 + Row Log 收集并发改动</h3>
+  <p>加索引等必须扫描/重组数据的变更走 INPLACE：<strong>原地构建的同时，用一份"变更日志"吸收期间并发写</strong>：</p>
+  <ol style="counter-reset:s;list-style:none;margin:14px 0 14px 4px">
+    <li style="counter-increment:s;position:relative;padding-left:34px;margin:10px 0;color:#d7e0f2"><span style="position:absolute;left:0;top:0;font-family:var(--mono);background:linear-gradient(135deg,#2dd4bf,#5b9dff);color:#0a1322;width:24px;height:24px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700">1</span>开始拿<strong>短暂 MDL 排他锁</strong>做准备，随即降级，<strong>放开并发 DML</strong>。</li>
+    <li style="counter-increment:s;position:relative;padding-left:34px;margin:10px 0;color:#d7e0f2"><span style="position:absolute;left:0;top:0;font-family:var(--mono);background:linear-gradient(135deg,#2dd4bf,#5b9dff);color:#0a1322;width:24px;height:24px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700">2</span>后台扫描旧数据、构建新结构。<strong>期间用户增删改记入 <code>row log</code></strong>，不打断业务。</li>
+    <li style="counter-increment:s;position:relative;padding-left:34px;margin:10px 0;color:#d7e0f2"><span style="position:absolute;left:0;top:0;font-family:var(--mono);background:linear-gradient(135deg,#2dd4bf,#5b9dff);color:#0a1322;width:24px;height:24px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700">3</span>接近完成时<strong>再拿一次短暂排他锁</strong>，把 row log 积累的改动<em>追平</em>，切换、释放。</li>
+  </ol>
+  <figure>
+    <svg viewBox="0 0 800 160" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <text x="400" y="22" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">INPLACE 在线加索引：首尾短锁，中间放行 + Row Log 追平</text>
+      <line x1="60" y1="76" x2="740" y2="76" stroke="#324a78" stroke-width="1.5"/>
+      <rect x="60" y="64" width="50" height="24" rx="5" fill="rgba(240,105,122,.16)" stroke="#f0697a"/><text x="85" y="81" text-anchor="middle" fill="#f0697a" font-size="9">短锁</text>
+      <rect x="115" y="64" width="500" height="24" rx="5" fill="rgba(45,212,191,.12)" stroke="#2dd4bf"/><text x="365" y="81" text-anchor="middle" fill="#2dd4bf" font-size="10">后台构建（DML 正常，改动写 row log）</text>
+      <rect x="620" y="64" width="50" height="24" rx="5" fill="rgba(240,105,122,.16)" stroke="#f0697a"/><text x="645" y="81" text-anchor="middle" fill="#f0697a" font-size="9">短锁</text>
+      <text x="85" y="111" text-anchor="middle" fill="#f0697a" font-size="9.5">准备</text>
+      <text x="365" y="111" text-anchor="middle" fill="#5fd38a" font-size="10">这段时间业务无感（不阻塞）</text>
+      <text x="645" y="111" text-anchor="middle" fill="#f0697a" font-size="9.5">追平+切换</text>
+      <text x="400" y="143" text-anchor="middle" fill="#6b7da3" font-size="11">阻塞只在首尾两个极短窗口，主体构建期读写照常</text>
+    </svg>
+    <figcaption><b>图 23</b> · INPLACE：首尾短暂加锁，中间长时间放开 DML，用 row log 吸收并发改动后追平</figcaption>
+  </figure>
+  <div class="note danger"><span class="ic">呼应第五篇：在线 ≠ 完全无锁</span><div>
+    <p>首尾那两个"短锁"——即便 Online DDL，<strong>开始和结束仍各需一个极短的 MDL 排他锁</strong>更新元数据。第五篇的"<em>长事务挡住 DDL 的 MDL 写锁、排队的 DDL 又挡住所有后续查询 → 表假死</em>"对 Online DDL <strong>同样适用</strong>。<strong>生产改表：</strong>① 即便用 Online DDL，先确认<em>无长事务占着这张表</em>；② 给 DDL 设 <code>lock_wait_timeout</code> 快速失败；③ 超大表或需灰度时用 <strong>gh-ost / pt-online-schema-change</strong>，把锁窗口压到极致。</p>
+  </div></div>
+</section>
+
+<!-- ============ 29 ============ -->
+<section id="c29">
+  <div class="chap"><span class="num">29</span><h2>系列总结</h2><div class="rule"></div></div>
+  <p>本深入版把<strong>语法分析</strong>扩成 4 章、<strong>查询优化</strong>扩成 20 章。回看全篇：</p>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>阶段</th><th>关键内容</th><th>章节</th></tr></thead>
+      <tbody>
+        <tr><td>解析</td><td>词法 → 语法分析(文法/LALR 移进归约/优先级冲突) → AST → 语义预处理</td><td>第 2–5 章</td></tr>
+        <tr><td>执行</td><td>火山模型逐行驱动引擎</td><td>第 6 章</td></tr>
+        <tr><td>优化器基础</td><td>RBO/CBO、成本模型、统计、行数估算(index dive)</td><td>第 7–10 章</td></tr>
+        <tr><td>逻辑优化</td><td>条件化简、子查询半连接四策略、派生表合并/物化</td><td>第 11–13 章</td></tr>
+        <tr><td>物理优化</td><td>访问路径、减少回表(覆盖/ICP/MRR)、跳跃扫描、连接顺序、三大 JOIN、排序分组、分页</td><td>第 14–23 章</td></tr>
+        <tr><td>调控诊断</td><td>提示与开关、EXPLAIN 与 Optimizer Trace、优化实战</td><td>第 24–26 章</td></tr>
+        <tr><td>在线 DDL</td><td>ALGORITHM/LOCK、INSTANT/INPLACE</td><td>第 27–28 章</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="note key"><span class="ic">优化的统一心法</span><div>
+    <p><strong>优化器的一切决策都建立在"预估要碰多少行/页"之上，而这个预估来自统计信息。</strong>所以做优化的三个根本动作：<em>① 喂准统计</em>（ANALYZE、直方图）让它估得准；<em>② 建对索引</em>（覆盖、最左前缀、连接列索引）给它更便宜的路；<em>③ 写好 SQL</em>（避免深分页 OFFSET、让子查询可转半连接、让排序走索引序）从源头减少工作量。把这三件做好，绝大多数查询都不需要强制提示。诊断时 <code>EXPLAIN ANALYZE</code> 发现预估与实际的偏差、<code>Optimizer Trace</code> 追溯根因。</p>
+  </div></div>
+  <div class="note key"><span class="ic">与前七篇汇合</span><div>
+    <p>本篇"执行器"调用前七篇构筑的引擎能力：<strong>优化器选定索引（⑥）→ 执行器调引擎按 B+ 树定位 → 页在 Buffer Pool 找（②）/ 没有从表空间读（①）→ 当前读加锁（⑤）/ 快照读选版本（④）→ 改动写 redo/undo（③）→ 提交走两阶段（⑦）。</strong>八篇构成完整链路：Server 层把 SQL 翻译成最优计划，引擎层把计划落到磁盘字节。</p>
+  </div></div>
+  <div class="fin">
+    <h3>InnoDB / MySQL 系列 · 第八篇（深入版）</h3>
+    <div class="seq"><b>解析（含语法分析 4 章）</b><span class="arrow">→</span><b>优化（20 章）</b><span class="arrow">→</span><b>执行</b><span class="arrow">＋</span><b>在线 DDL</b></div>
+    <p style="color:#9aabce;font-size:14px;margin-top:14px">从字符流到 token、从文法到 AST，再到优化器的成本、统计、变换、减少回表、连接算法、跳跃扫描与诊断——SQL 处理的每一环都已拆透。喂准统计、建对索引、写好 SQL，就是在帮优化器做出更好的决定。</p>
+    <p style="color:#6b7da3;font-size:13px;margin-top:10px">自然延伸：<em style="color:#2dd4bf">主从复制与高可用</em>（异步/半同步/MGR）、<em style="color:#2dd4bf">分库分表</em>、<em style="color:#2dd4bf">性能诊断实战</em>（慢查询日志、performance_schema、火焰图）。</p>
+  </div>
+  <p class="foot">InnoDB / MySQL 系列 · 第八篇 · SQL 解析 · 优化 · 执行（深入版）· 29 章</p>
+</section>
+
+</div>
+</body>
+</html>

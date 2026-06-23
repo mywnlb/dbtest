@@ -4,7 +4,7 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.storage.buf.PageGuard;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
-import cn.zhangyis.db.storage.fil.TablespaceAccessLease;
+import cn.zhangyis.db.storage.fil.access.TablespaceAccessLease;
 import cn.zhangyis.db.domain.SpaceId;
 
 import java.util.ArrayDeque;

@@ -1,4 +1,12 @@
 package cn.zhangyis.db.storage.api;
+import cn.zhangyis.db.storage.fil.access.TablespaceAccessController;
+import cn.zhangyis.db.storage.fil.exception.TablespaceCorruptedException;
+import cn.zhangyis.db.storage.fil.exception.TablespaceNotFoundException;
+import cn.zhangyis.db.storage.fil.exception.TablespaceUnavailableException;
+import cn.zhangyis.db.storage.fil.state.TablespaceState;
+import cn.zhangyis.db.storage.fil.state.TablespaceType;
+import cn.zhangyis.db.storage.fil.state.TablespaceTypeFlags;
+
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.ExtentId;
@@ -10,35 +18,30 @@ import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.PageGuard;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
-import cn.zhangyis.db.storage.fil.CachingTablespaceRegistry;
-import cn.zhangyis.db.storage.fil.DataFileDescriptor;
-import cn.zhangyis.db.storage.fil.PageStore;
-import cn.zhangyis.db.storage.fil.SpaceFlags;
-import cn.zhangyis.db.storage.fil.TablespaceCorruptedException;
-import cn.zhangyis.db.storage.fil.TablespaceMetadata;
-import cn.zhangyis.db.storage.fil.TablespaceNotFoundException;
-import cn.zhangyis.db.storage.fil.TablespaceRegistry;
-import cn.zhangyis.db.storage.fil.TablespaceState;
-import cn.zhangyis.db.storage.fil.TablespaceType;
-import cn.zhangyis.db.storage.fil.TablespaceTypeFlags;
-import cn.zhangyis.db.storage.fil.TablespaceUnavailableException;
+import cn.zhangyis.db.storage.api.tablespace.PageZeroTablespaceMetadataLoader;
+import cn.zhangyis.db.storage.fil.meta.CachingTablespaceRegistry;
+import cn.zhangyis.db.storage.fil.io.DataFileDescriptor;
+import cn.zhangyis.db.storage.fil.io.PageStore;
+import cn.zhangyis.db.storage.fil.state.SpaceFlags;
+import cn.zhangyis.db.storage.fil.meta.TablespaceMetadata;
+import cn.zhangyis.db.storage.fil.meta.TablespaceRegistry;
 import cn.zhangyis.db.storage.page.FilePageHeader;
 import cn.zhangyis.db.storage.page.PageEnvelope;
 import cn.zhangyis.db.storage.page.PageType;
-import cn.zhangyis.db.storage.fsp.DefaultExtentAllocationPolicy;
-import cn.zhangyis.db.storage.fsp.ExtentDescriptorRepository;
-import cn.zhangyis.db.storage.fsp.FileAddress;
-import cn.zhangyis.db.storage.fsp.Flst;
-import cn.zhangyis.db.storage.fsp.FlstBase;
-import cn.zhangyis.db.storage.fsp.FreeExtentService;
-import cn.zhangyis.db.storage.fsp.NoFreeSpaceException;
-import cn.zhangyis.db.storage.fsp.SegmentInodeRepository;
-import cn.zhangyis.db.storage.fsp.SegmentPageAllocator;
-import cn.zhangyis.db.storage.fsp.SegmentPurpose;
-import cn.zhangyis.db.storage.fsp.SegmentSpaceService;
-import cn.zhangyis.db.storage.fsp.SpaceHeaderRepository;
-import cn.zhangyis.db.storage.fsp.SpaceHeaderSnapshot;
-import cn.zhangyis.db.storage.fsp.TablespaceLifecycleHeader;
+import cn.zhangyis.db.storage.fsp.extent.DefaultExtentAllocationPolicy;
+import cn.zhangyis.db.storage.fsp.extent.ExtentDescriptorRepository;
+import cn.zhangyis.db.storage.fsp.flst.FileAddress;
+import cn.zhangyis.db.storage.fsp.flst.Flst;
+import cn.zhangyis.db.storage.fsp.flst.FlstBase;
+import cn.zhangyis.db.storage.fsp.extent.FreeExtentService;
+import cn.zhangyis.db.storage.fsp.exception.NoFreeSpaceException;
+import cn.zhangyis.db.storage.fsp.segment.SegmentInodeRepository;
+import cn.zhangyis.db.storage.fsp.segment.SegmentPageAllocator;
+import cn.zhangyis.db.storage.fsp.segment.SegmentPurpose;
+import cn.zhangyis.db.storage.fsp.segment.SegmentSpaceService;
+import cn.zhangyis.db.storage.fsp.header.SpaceHeaderRepository;
+import cn.zhangyis.db.storage.fsp.header.SpaceHeaderSnapshot;
+import cn.zhangyis.db.storage.fsp.lifecycle.TablespaceLifecycleHeader;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 
 import java.nio.file.Path;
@@ -79,7 +82,7 @@ public final class DiskSpaceManager {
      * 使默认 page0 loader 与普通页访问/flush/truncate 形成真实互斥。
      */
     public DiskSpaceManager(BufferPool pool, PageStore pageStore, PageSize pageSize,
-                            cn.zhangyis.db.storage.fil.TablespaceAccessController accessController) {
+                            cn.zhangyis.db.storage.fil.access.TablespaceAccessController accessController) {
         this(pool, pageStore, pageSize, new CachingTablespaceRegistry(
                 new PageZeroTablespaceMetadataLoader(pageStore, pageSize, accessController)));
     }

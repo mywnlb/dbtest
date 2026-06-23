@@ -2,7 +2,7 @@ package cn.zhangyis.db.storage.redo;
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageSize;
-import cn.zhangyis.db.storage.fil.PageStore;
+import cn.zhangyis.db.storage.fil.io.PageStore;
 
 /**
  * Redo 回放上下文。Recovery 把物理页 store 和实例页大小传给 page handler；handler 不依赖 BufferPool/MTR。

@@ -4,7 +4,7 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.SegmentId;
 import cn.zhangyis.db.domain.SpaceId;
-import cn.zhangyis.db.storage.fsp.SegmentPurpose;
+import cn.zhangyis.db.storage.fsp.segment.SegmentPurpose;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.undo.UndoSegmentHandle;
 import cn.zhangyis.db.storage.undo.UndoSpaceAllocator;
@@ -48,5 +48,17 @@ public final class DiskSpaceUndoAllocator implements UndoSpaceAllocator {
     public PageId allocatePage(MiniTransaction mtr, SpaceId undoSpace, int inodeSlot, SegmentId segmentId) {
         SegmentRef ref = new SegmentRef(undoSpace, inodeSlot, segmentId);
         return diskSpaceManager.allocatePage(mtr, ref);
+    }
+
+    /**
+     * 按 handle 的 inodeSlot/segmentId 重建 SegmentRef 并调用 {@link DiskSpaceManager#dropSegment} 物理回收整段。
+     */
+    @Override
+    public void dropUndoSegment(MiniTransaction mtr, UndoSegmentHandle handle) {
+        if (handle == null) {
+            throw new DatabaseValidationException("undo segment handle must not be null");
+        }
+        SegmentRef ref = new SegmentRef(handle.spaceId(), handle.inodeSlot(), handle.segmentId());
+        diskSpaceManager.dropSegment(mtr, ref);
     }
 }

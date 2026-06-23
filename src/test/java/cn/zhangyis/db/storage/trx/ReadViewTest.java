@@ -19,12 +19,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class ReadViewTest {
 
     private static ReadView rv(long creator, long up, long low, Set<Long> active) {
-        return new ReadView(TransactionId.of(creator), up, low, active);
+        return new ReadView(TransactionId.of(creator), up, low, active, low);
     }
 
     @Test
     void recordByCreatorIsVisible() {
-        ReadView v = new ReadView(TransactionId.of(5), 10, 20, Set.of(12L, 15L));
+        ReadView v = new ReadView(TransactionId.of(5), 10, 20, Set.of(12L, 15L), 20);
         assertTrue(v.isVisible(TransactionId.of(5)), "事务总能看见自己的修改（==creator）");
     }
 
@@ -51,7 +51,7 @@ class ReadViewTest {
     @Test
     void readOnlyCreatorNoneNeverMatchesRule1() {
         // 只读事务 creator=NONE：记录 writer 恒非 NONE，故规则1 永不命中
-        ReadView v = new ReadView(TransactionId.NONE, 10, 10, Set.of());
+        ReadView v = new ReadView(TransactionId.NONE, 10, 10, Set.of(), 10);
         assertTrue(v.isVisible(TransactionId.of(5)), "<up 可见");
         assertFalse(v.isVisible(TransactionId.of(15)), ">=low 不可见");
     }
@@ -73,14 +73,14 @@ class ReadViewTest {
         // active id >= low 非法
         assertThrows(DatabaseValidationException.class, () -> rv(1, 10, 20, Set.of(25L)));
         // creator/active 非 null
-        assertThrows(DatabaseValidationException.class, () -> new ReadView(null, 10, 20, Set.of()));
-        assertThrows(DatabaseValidationException.class, () -> new ReadView(TransactionId.of(1), 10, 20, null));
+        assertThrows(DatabaseValidationException.class, () -> new ReadView(null, 10, 20, Set.of(), 20));
+        assertThrows(DatabaseValidationException.class, () -> new ReadView(TransactionId.of(1), 10, 20, null, 20));
     }
 
     @Test
     void activeIdsAreDefensivelyCopied() {
         Set<Long> src = new HashSet<>(Set.of(12L, 15L));
-        ReadView v = new ReadView(TransactionId.of(99), 10, 20, src);
+        ReadView v = new ReadView(TransactionId.of(99), 10, 20, src, 20);
         src.add(13L); // 改源集合不得影响已建 ReadView
         assertTrue(v.isVisible(TransactionId.of(13)), "13 仍可见（ReadView 持不可变副本，未含 13）");
     }

@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>InnoDB 存储结构与增删改查数据链路</title>
+<style>
+:root{
+  --bg:#0d1117; --panel:#161b22; --border:#30363d;
+  --txt:#e6edf3; --sub:#9da7b3; --dim:#6e7681;
+  --blue:#4493f8; --teal:#3fb950; --amber:#d29922; --purple:#a371f7; --red:#f85149;
+  --mono:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;
+}
+*{box-sizing:border-box;}
+html{scroll-behavior:smooth;}
+body{
+  margin:0; background:var(--bg); color:var(--txt);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans CJK SC","Microsoft YaHei",sans-serif;
+  line-height:1.75; font-size:15px;
+}
+.wrap{max-width:920px; margin:0 auto; padding:64px 28px 120px;}
+header{border-bottom:1px solid var(--border); padding-bottom:32px; margin-bottom:8px;}
+header h1{
+  font-size:30px; font-weight:800; letter-spacing:-0.02em; margin:0 0 14px;
+  background:linear-gradient(90deg,var(--blue),var(--teal)); -webkit-background-clip:text;
+  background-clip:text; -webkit-text-fill-color:transparent;
+}
+header .meta{color:var(--sub); font-size:13.5px; line-height:1.7;}
+header .meta code{color:var(--amber);}
+nav{
+  background:var(--panel); border:1px solid var(--border); border-radius:12px;
+  padding:20px 26px; margin:36px 0 48px;
+}
+nav h2{font-size:13px; text-transform:uppercase; letter-spacing:0.08em; color:var(--dim); margin:0 0 14px;}
+nav ol{margin:0; padding-left:20px; columns:2; column-gap:36px;}
+nav li{margin:5px 0; break-inside:avoid;}
+nav a{color:var(--txt); text-decoration:none; border-bottom:1px solid transparent; transition:.15s;}
+nav a:hover{color:var(--blue); border-bottom-color:var(--blue);}
+h2.sec{
+  font-size:23px; font-weight:700; margin:64px 0 22px; padding-top:18px;
+  border-top:1px solid var(--border); letter-spacing:-0.01em;
+}
+h2.sec .n{color:var(--blue); font-variant-numeric:tabular-nums; margin-right:10px;}
+h3{font-size:17px; font-weight:650; margin:34px 0 14px; color:var(--txt);}
+h4{font-size:15px; font-weight:650; margin:24px 0 10px; color:var(--teal);}
+p{margin:14px 0;}
+strong{color:#fff; font-weight:650;}
+a{color:var(--blue);}
+code{
+  font-family:var(--mono); font-size:13px; background:#1f2630;
+  padding:2px 6px; border-radius:5px; color:var(--amber); border:1px solid #2a313c;
+}
+pre{
+  background:#010409; border:1px solid var(--border); border-radius:10px;
+  padding:18px 20px; overflow-x:auto; margin:18px 0; line-height:1.6;
+}
+pre code{background:none; border:none; padding:0; color:#c9d1d9; font-size:12.5px;}
+blockquote{
+  margin:18px 0; padding:12px 20px; border-left:3px solid var(--amber);
+  background:rgba(210,153,34,0.06); border-radius:0 8px 8px 0; color:var(--sub);
+}
+blockquote strong{color:var(--amber);}
+table{border-collapse:collapse; width:100%; margin:20px 0; font-size:13.5px;}
+th,td{border:1px solid var(--border); padding:9px 13px; text-align:left; vertical-align:top;}
+th{background:#1c2330; color:var(--txt); font-weight:650;}
+td{color:var(--sub);}
+tr:nth-child(even) td{background:rgba(255,255,255,0.015);}
+td strong{color:var(--txt);}
+figure{margin:28px 0; text-align:center;}
+figure svg{
+  width:100%; height:auto; border:1px solid var(--border); border-radius:12px;
+  background:var(--bg); display:block;
+}
+figcaption{color:var(--dim); font-size:12.5px; margin-top:10px; font-style:italic;}
+ul{margin:14px 0; padding-left:24px;}
+li{margin:6px 0;}
+hr{border:none; border-top:1px solid var(--border); margin:40px 0;}
+.tag{display:inline-block; font-size:11px; padding:1px 8px; border-radius:20px; font-weight:600; vertical-align:middle;}
+.tag.sync{background:rgba(68,147,248,.15); color:var(--blue); border:1px solid rgba(68,147,248,.3);}
+.tag.async{background:rgba(248,81,73,.15); color:var(--red); border:1px solid rgba(248,81,73,.3);}
+.kicker{color:var(--teal); font-size:12px; text-transform:uppercase; letter-spacing:.1em; font-weight:700;}
+::selection{background:rgba(68,147,248,.3);}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+<h1>InnoDB 存储结构与增删改查数据链路</h1>
+<div class="meta">
+一份自底向上的笔记：从「页内记录」到「段 / 区 / 页」，再到查找、插入、删除、修改四类操作的完整数据链路。<br>
+适用版本：MySQL 5.7 / 8.0，InnoDB 引擎，<code>COMPACT</code> 行格式，B+ 树聚簇索引叶子页（<code>PAGE_LEVEL=0</code>）。
+</div>
+</header>
+<nav>
+<h2>目录</h2>
+<ol>
+<li><a href="#s1">总览：四级存储层次</a></li>
+<li><a href="#s2">物理结构 vs 逻辑结构</a></li>
+<li><a href="#s3">段、区、页的关系</a></li>
+<li><a href="#s4">页（Page）内部结构</a></li>
+<li><a href="#s5">Page Directory 与分组机制</a></li>
+<li><a href="#s6">查找记录的数据链路</a></li>
+<li><a href="#s7">插入记录的数据链路</a></li>
+<li><a href="#s8">删除记录的数据链路</a></li>
+<li><a href="#s9">修改记录的数据链路</a></li>
+<li><a href="#s10">关键结论速查</a></li>
+</ol>
+</nav>
+<h2 class="sec" id="s1"><span class="n">01</span>总览：四级存储层次</h2>
+<p>InnoDB 把磁盘空间组织成一个自顶向下的层次。理解全部内容的前提是先记住这条归属链：</p>
+<pre><code>表空间 Tablespace (.ibd 文件)
+  └─ 段 Segment        逻辑概念，跨区，不连续
+       └─ 区 Extent     物理连续，64 个页 = 1MB
+            └─ 页 Page   物理实体，16KB，I/O 与缓存的最小单位
+                 └─ 记录 Record  实际数据行</code></pre>
+<table>
+<tr><th>层次</th><th>性质</th><th>大小</th><th>作用</th></tr>
+<tr><td><strong>表空间</strong></td><td>物理文件</td><td>按需增长</td><td>一张表（独立表空间）对应一个 .ibd</td></tr>
+<tr><td><strong>段 Segment</strong></td><td>逻辑</td><td>不固定</td><td>把同类页归为一组（叶子段 / 非叶段）</td></tr>
+<tr><td><strong>区 Extent</strong></td><td>物理连续</td><td>1MB（64 页）</td><td>整块分配，保证顺序 I/O</td></tr>
+<tr><td><strong>页 Page</strong></td><td>物理实体</td><td>16KB</td><td>读写与缓冲池的最小单位</td></tr>
+<tr><td><strong>记录 Record</strong></td><td>数据行</td><td>变长</td><td>实际存储的一行数据</td></tr>
+</table>
+<h2 class="sec" id="s2"><span class="n">02</span>物理结构 vs 逻辑结构</h2>
+<p>这是最容易混淆的地方。两者描述的是<strong>同一批页的两个视角</strong>。</p>
+<h3>物理结构（磁盘上真实存在的）</h3>
+<p><code>.ibd</code> 文件就是一长串 16KB 的页，按页号 0、1、2、3… 紧挨着线性排列：</p>
+<figure><svg width="100%" viewBox="0 0 700 880" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+<defs><marker id="ax" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5"/></marker></defs>
+<rect x="0" y="0" width="700" height="880" rx="12" fill="#0d1117"/>
+<text x="350" y="28" text-anchor="middle" fill="#e6edf3" font-size="16" font-weight="700">t_user.ibd 完整物理结构：管理页本身也是「页」</text>
+<text x="350" y="48" text-anchor="middle" fill="#d29922" font-size="11">关键：XDES 不是独立页类型，前 256MB 的它就嵌在 page 0（FSP_HDR）里</text>
+<text x="350" y="78" text-anchor="middle" fill="#e6edf3" font-size="13" font-weight="700">文件开头固定的前 4 页（顺序写死）</text>
+<rect x="40" y="92" width="310" height="90" rx="8" fill="#2d1012" stroke="#f85149" stroke-width="0.8"/>
+<text x="195" y="113" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">page 0 ：FSP_HDR + XDES</text>
+<text x="56" y="133" text-anchor="start" fill="#9da7b3" font-size="10">表空间大小、Space ID</text>
+<text x="56" y="150" text-anchor="start" fill="#9da7b3" font-size="10">FREE / FREE_FRAG / FULL 区链表头</text>
+<text x="56" y="167" text-anchor="start" fill="#9da7b3" font-size="10">INODE 页链表 + 头 256MB 的 XDES 条目</text>
+<rect x="360" y="92" width="300" height="90" rx="8" fill="#2d220a" stroke="#d29922" stroke-width="0.8"/>
+<text x="510" y="113" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">page 1 ：IBUF_BITMAP</text>
+<text x="376" y="133" text-anchor="start" fill="#9da7b3" font-size="10">Change Buffer 位图</text>
+<text x="376" y="150" text-anchor="start" fill="#9da7b3" font-size="10">记录每页是否有缓存的</text>
+<text x="376" y="167" text-anchor="start" fill="#9da7b3" font-size="10">二级索引修改</text>
+<rect x="40" y="192" width="310" height="90" rx="8" fill="#1d1530" stroke="#a371f7" stroke-width="0.8"/>
+<text x="195" y="213" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">page 2 ：INODE</text>
+<text x="56" y="233" text-anchor="start" fill="#9da7b3" font-size="10">存放 Segment Inode（段描述符）</text>
+<text x="56" y="250" text-anchor="start" fill="#9da7b3" font-size="10">每段一条 Entry，192 字节</text>
+<text x="56" y="267" text-anchor="start" fill="#9da7b3" font-size="10">记段的区链表 + 32 个碎片页指针</text>
+<rect x="360" y="192" width="300" height="90" rx="8" fill="#21262d" stroke="#6e7681" stroke-width="0.8"/>
+<text x="510" y="213" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">page 3 ：SDI</text>
+<text x="376" y="233" text-anchor="start" fill="#9da7b3" font-size="10">序列化数据字典（8.0 起）</text>
+<text x="376" y="250" text-anchor="start" fill="#9da7b3" font-size="10">存表结构定义</text>
+<text x="376" y="267" text-anchor="start" fill="#9da7b3" font-size="10">5.7 无此页</text>
+<text x="350" y="312" text-anchor="middle" fill="#e6edf3" font-size="13" font-weight="700">page 4 起：业务数据页（按段归属，物理上可分散）</text>
+<rect x="40" y="326" width="200" height="74" rx="8" fill="#0d2818" stroke="#3fb950" stroke-width="0.8"/>
+<text x="140" y="347" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">INDEX 页（非叶）</text>
+<text x="56" y="367" text-anchor="start" fill="#9da7b3" font-size="10">聚簇索引 B+ 树根</text>
+<text x="56" y="384" text-anchor="start" fill="#9da7b3" font-size="10">+ 内部节点</text>
+<rect x="250" y="326" width="200" height="74" rx="8" fill="#0d2847" stroke="#4493f8" stroke-width="0.8"/>
+<text x="350" y="347" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">INDEX 页（叶子）</text>
+<text x="266" y="367" text-anchor="start" fill="#9da7b3" font-size="10">聚簇叶子 = 数据行</text>
+<text x="266" y="384" text-anchor="start" fill="#9da7b3" font-size="10">二级叶子 = 索引项</text>
+<rect x="460" y="326" width="200" height="74" rx="8" fill="#2d1a0f" stroke="#e8845c" stroke-width="0.8"/>
+<text x="560" y="347" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">BLOB 溢出页</text>
+<text x="476" y="367" text-anchor="start" fill="#9da7b3" font-size="10">超长 TEXT / BLOB</text>
+<text x="476" y="384" text-anchor="start" fill="#9da7b3" font-size="10">VARCHAR 溢出部分</text>
+<rect x="40" y="410" width="620" height="44" rx="8" fill="#21262d" stroke="#6e7681" stroke-width="0.8"/>
+<text x="160" y="432" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">undo 页 ※</text>
+<text x="490" y="432" text-anchor="middle" fill="#9da7b3" font-size="10">8.0 默认在独立 undo 表空间，不在 t_user.ibd</text>
+<text x="350" y="488" text-anchor="middle" fill="#e6edf3" font-size="13" font-weight="700">大表：每 256MB 重复一组管理页</text>
+<rect x="40" y="502" width="620" height="64" rx="8" fill="none" stroke="#6e7681" stroke-width="0.6"/>
+<rect x="48" y="510" width="120" height="48" rx="8" fill="#2d1012" stroke="#f85149" stroke-width="0.8"/><text x="108.0" y="530" text-anchor="middle" fill="#e6edf3" font-size="10">page 0</text><text x="108.0" y="546" text-anchor="middle" fill="#9da7b3" font-size="9">FSP+XDES</text>
+<rect x="176" y="510" width="92" height="48" rx="8" fill="#2d220a" stroke="#d29922" stroke-width="0.8"/><text x="222.0" y="530" text-anchor="middle" fill="#e6edf3" font-size="10">page 1</text><text x="222.0" y="546" text-anchor="middle" fill="#9da7b3" font-size="9">IBUF</text>
+<rect x="276" y="510" width="160" height="48" rx="8" fill="#21262d" stroke="#6e7681" stroke-width="0.8"/><text x="356.0" y="530" text-anchor="middle" fill="#e6edf3" font-size="10">数据页 …</text><text x="356.0" y="546" text-anchor="middle" fill="#9da7b3" font-size="9">直到 256MB 边界</text>
+<rect x="444" y="510" width="120" height="48" rx="8" fill="#2d1012" stroke="#f85149" stroke-width="0.8"/><text x="504.0" y="530" text-anchor="middle" fill="#e6edf3" font-size="10">XDES 页</text><text x="504.0" y="546" text-anchor="middle" fill="#9da7b3" font-size="9">第16384页</text>
+<rect x="572" y="510" width="80" height="48" rx="8" fill="#2d220a" stroke="#d29922" stroke-width="0.8"/><text x="612.0" y="530" text-anchor="middle" fill="#e6edf3" font-size="10">IBUF</text><text x="612.0" y="546" text-anchor="middle" fill="#9da7b3" font-size="9">位图</text>
+<text x="350" y="584" text-anchor="middle" fill="#9da7b3" font-size="10">单个 FSP_HDR 的 XDES 只能描述 256MB，超出后由专门的 XDES 页接管</text>
+<text x="350" y="618" text-anchor="middle" fill="#e6edf3" font-size="13" font-weight="700">XDES 与 INODE 的分工（都管区，角度不同）</text>
+<rect x="40" y="632" width="300" height="96" rx="8" fill="#2d1012" stroke="#f85149" stroke-width="0.8"/>
+<text x="190" y="653" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">XDES Entry（区描述符，40B）</text>
+<text x="56" y="673" text-anchor="start" fill="#9da7b3" font-size="10">视角：每个区「是什么状态」</text>
+<text x="56" y="690" text-anchor="start" fill="#9da7b3" font-size="10">状态 FREE/FRAG/FULL、归属段 ID</text>
+<text x="56" y="707" text-anchor="start" fill="#9da7b3" font-size="10">+ 该区 64 页的占用 bitmap</text>
+<text x="56" y="724" text-anchor="start" fill="#d29922" font-size="10">位置：page 0 内 或 独立 XDES 页</text>
+<rect x="360" y="632" width="300" height="96" rx="8" fill="#1d1530" stroke="#a371f7" stroke-width="0.8"/>
+<text x="510" y="653" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">INODE Entry（段描述符，192B）</text>
+<text x="376" y="673" text-anchor="start" fill="#9da7b3" font-size="10">视角：每个段「拥有哪些区」</text>
+<text x="376" y="690" text-anchor="start" fill="#9da7b3" font-size="10">FREE/NOT_FULL/FULL 区链表头</text>
+<text x="376" y="707" text-anchor="start" fill="#9da7b3" font-size="10">+ 32 个碎片页指针</text>
+<text x="376" y="724" text-anchor="start" fill="#d29922" font-size="10">位置：page 2（INODE 页）</text>
+<line x1="190" y1="728" x2="190" y2="754" stroke="#f85149" stroke-width="1.5" marker-end="url(#ax)"/>
+<line x1="510" y1="728" x2="510" y2="754" stroke="#a371f7" stroke-width="1.5" marker-end="url(#ax)"/>
+<text x="190" y="770" text-anchor="middle" fill="#9da7b3" font-size="10">回答「这个区空不空」</text>
+<text x="510" y="770" text-anchor="middle" fill="#9da7b3" font-size="10">回答「这个段有哪些区」</text>
+<rect x="170" y="786" width="360" height="48" rx="8" fill="#0d2818" stroke="#3fb950" stroke-width="0.8"/>
+<text x="350" y="807" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">两者配合 = O(1) 分配 / 回收</text>
+<text x="350" y="825" text-anchor="middle" fill="#9da7b3" font-size="10">段查 INODE 找区，区查 XDES 看状态与 bitmap</text>
+<text x="350" y="862" text-anchor="middle" fill="#6e7681" font-size="10">※ 物理上真实存在的永远是「页」，段只是 INODE 里的归属清单</text>
+</svg><figcaption>图1　完整物理结构：FSP_HDR / IBUF_BITMAP / INODE 等管理页本身也是「页」，XDES 嵌在 page 0 中</figcaption></figure>
+<ul>
+<li><strong>物理地址公式</strong>：<code>page N 的文件偏移 = N × 16384 字节</code></li>
+<li><strong>区起始页号</strong>：<code>Extent E 的首页号 = E × 64</code></li>
+<li>磁盘上你能「摸到」的只有三样东西：<strong>文件 → 页 → 页内字节</strong>。</li>
+</ul>
+<h4>.ibd 文件首区（Extent 0）的固定管理页</h4>
+<p>文件最开头是 <strong>顺序写死的固定四页</strong>。注意 <code>XDES</code>（区描述符）<strong>不是独立的页类型</strong>——它是一组 40 字节的条目，头 256MB 范围的条目直接<strong>内嵌在 page 0（FSP_HDR）里</strong>，并不单独占页。</p>
+<table>
+<tr><th>页号</th><th>类型</th><th>作用</th></tr>
+<tr><td>page 0</td><td>FSP_HDR<br>（含 XDES）</td><td>表空间总入口：大小、Space ID、FREE / FREE_FRAG / FULL 区链表头、INODE 页链表；<strong>并内嵌头 256MB 的 XDES 区描述符条目</strong></td></tr>
+<tr><td>page 1</td><td>IBUF_BITMAP</td><td>Change Buffer 位图，记录每页是否有缓存的二级索引修改</td></tr>
+<tr><td>page 2</td><td>INODE</td><td>段信息数组：每个段一条 Entry（192 字节），记该段的区链表头与 32 个碎片页指针</td></tr>
+<tr><td>page 3</td><td>SDI</td><td>序列化数据字典，存表结构定义（8.0 起；5.7 无此页）</td></tr>
+<tr><td>page 4 起</td><td>INDEX / BLOB</td><td>业务数据：聚簇索引与二级索引的 B+ 树（根 / 内部节点 / 叶子），以及超长字段的 BLOB 溢出页</td></tr>
+</table>
+<blockquote>之后每隔 16384 页（256MB）会再插入一组独立的 XDES + IBUF_BITMAP 管理页，因为单个 FSP_HDR 内嵌的 XDES 只能描述 256MB 范围内的区。</blockquote>
+<h4>XDES 与 INODE 的分工</h4>
+<p>两者都和「区」打交道，但视角相反，配合起来让空间分配/回收达到 O(1)：</p>
+<ul>
+<li><strong>XDES Entry（区描述符，40B）</strong>——站在<strong>区</strong>的视角回答：这个区是 FREE / FREE_FRAG / FULL 哪种状态？归属哪个段？它的 64 个页哪些被占用（bitmap）？位置在 page 0 内或独立 XDES 页。</li>
+<li><strong>INODE Entry（段描述符，192B）</strong>——站在<strong>段</strong>的视角回答：这个段拥有哪些区（FREE / NOT_FULL / FULL 三条区链表）？有哪些碎片页？位置在 page 2（INODE 页）。</li>
+</ul>
+<p>分配新页时：先查 INODE 找到段的 NOT_FULL 区链表拿一个区，再查该区的 XDES 看 bitmap 找空闲页置位——全程不用扫描。</p>
+<blockquote><strong>undo 页</strong>在 8.0 里默认放在独立的 undo 表空间（<code>undo_001</code> 等），<strong>不在</strong> <code>t_user.ibd</code> 内；只有老版本或特殊配置才在系统表空间 <code>ibdata1</code>。而 <strong>BLOB / 溢出页</strong> 确实在本表空间文件内。</blockquote>
+<h3>逻辑结构（InnoDB 脑中的归属关系）</h3>
+<p><strong>段在物理层面根本不存在</strong>——用十六进制工具打开 .ibd，找不到任何一段连续区域叫「叶子段」。段的本质是 <strong>page 2（INODE 页）里的一份归属清单</strong>：</p>
+<pre><code>page 2 (INODE 页)
+  ├─ 非叶段 Entry (FSEG_ID=1)
+  │    碎片页: page 4
+  │    NOT_FULL 区链表: Extent 2
+  │
+  └─ 叶子段 Entry (FSEG_ID=2)
+       碎片页: page 5,6,7
+       FULL 区链表: Extent 1
+       NOT_FULL 区链表: Extent 4</code></pre>
+<p>叠到物理文件上看，同一个段的页在磁盘里是<strong>跳着分布</strong>的：</p>
+<figure><svg width="100%" viewBox="0 0 760 600" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+<defs><marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5"/></marker></defs>
+<rect x="0" y="0" width="760" height="600" rx="12" fill="#0d1117"/>
+<text x="380" y="30" text-anchor="middle" fill="#e6edf3" font-size="17" font-weight="700">逻辑结构：段如何「拥有」区和页</text>
+<text x="380" y="52" text-anchor="middle" fill="#9da7b3" font-size="12">同一棵 B+ 树 = 1 个非叶段 + 1 个叶子段，归属记录在 page 2（INODE 页）</text>
+
+<rect x="280" y="70" width="200" height="56" rx="8" fill="#1d1530" stroke="#a371f7"/>
+<text x="380" y="92" text-anchor="middle" fill="#e6edf3" font-size="13" font-weight="700">page 2：INODE 页</text>
+<text x="380" y="110" text-anchor="middle" fill="#9da7b3" font-size="10">每个段一条 Entry（192 字节）</text>
+
+<line x1="330" y1="126" x2="230" y2="160" stroke="#a371f7" stroke-width="1.5" marker-end="url(#ar)"/>
+<line x1="430" y1="126" x2="540" y2="160" stroke="#a371f7" stroke-width="1.5" marker-end="url(#ar)"/>
+
+<rect x="56" y="162" width="270" height="88" rx="8" fill="#0d2818" stroke="#3fb950"/>
+<text x="191" y="182" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">非叶段 INODE Entry</text>
+<text x="72" y="202" fill="#9da7b3" font-size="10">FSEG_ID = 1</text>
+<text x="72" y="220" fill="#9da7b3" font-size="10">碎片页：page 4</text>
+<text x="72" y="238" fill="#9da7b3" font-size="10">NOT_FULL 区链表：Extent 2</text>
+
+<rect x="434" y="162" width="270" height="88" rx="8" fill="#0d2847" stroke="#4493f8"/>
+<text x="569" y="182" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">叶子段 INODE Entry</text>
+<text x="450" y="202" fill="#9da7b3" font-size="10">FSEG_ID = 2</text>
+<text x="450" y="220" fill="#9da7b3" font-size="10">碎片页：page 5,6,7</text>
+<text x="450" y="238" fill="#9da7b3" font-size="10">FULL：Extent 1　NOT_FULL：Extent 4</text>
+
+<text x="380" y="282" text-anchor="middle" fill="#e6edf3" font-size="13" font-weight="700">Entry 指向的真实物理页（页号是分散的）</text>
+
+<line x1="150" y1="250" x2="130" y2="306" stroke="#3fb950" stroke-width="1.2" marker-end="url(#ar)" opacity="0.8"/>
+<line x1="230" y1="250" x2="300" y2="306" stroke="#3fb950" stroke-width="1.2" marker-end="url(#ar)" opacity="0.8"/>
+<rect x="56" y="310" width="130" height="42" rx="6" fill="#0d2818" stroke="#3fb950"/>
+<text x="121" y="328" text-anchor="middle" fill="#e6edf3" font-size="10">page 4（碎片页）</text>
+<text x="121" y="343" text-anchor="middle" fill="#9da7b3" font-size="9">B+ 树根 Root</text>
+<rect x="248" y="310" width="200" height="42" rx="6" fill="#0d2818" stroke="#3fb950"/>
+<text x="348" y="328" text-anchor="middle" fill="#e6edf3" font-size="10">Extent 2 → page 128–191</text>
+<text x="348" y="343" text-anchor="middle" fill="#9da7b3" font-size="9">内部节点 Internal</text>
+
+<line x1="500" y1="250" x2="170" y2="406" stroke="#4493f8" stroke-width="1.2" marker-end="url(#ar)" opacity="0.8"/>
+<line x1="569" y1="250" x2="420" y2="406" stroke="#4493f8" stroke-width="1.2" marker-end="url(#ar)" opacity="0.8"/>
+<line x1="620" y1="250" x2="600" y2="406" stroke="#4493f8" stroke-width="1.2" marker-end="url(#ar)" opacity="0.8"/>
+<rect x="56" y="410" width="210" height="42" rx="6" fill="#0d2847" stroke="#4493f8"/>
+<text x="161" y="428" text-anchor="middle" fill="#e6edf3" font-size="10">page 5,6,7（碎片页）</text>
+<text x="161" y="443" text-anchor="middle" fill="#9da7b3" font-size="9">最早的叶子节点</text>
+<rect x="288" y="410" width="170" height="42" rx="6" fill="#0d2847" stroke="#4493f8"/>
+<text x="373" y="428" text-anchor="middle" fill="#e6edf3" font-size="10">Extent 1 → p64–127</text>
+<text x="373" y="443" text-anchor="middle" fill="#9da7b3" font-size="9">叶子（已满 FULL）</text>
+<rect x="480" y="410" width="224" height="42" rx="6" fill="#0d2847" stroke="#4493f8"/>
+<text x="592" y="428" text-anchor="middle" fill="#e6edf3" font-size="10">Extent 4 → p256–319</text>
+<text x="592" y="443" text-anchor="middle" fill="#9da7b3" font-size="9">叶子（未满）</text>
+
+<text x="380" y="486" text-anchor="middle" fill="#e6edf3" font-size="13" font-weight="700">叠到物理文件：同段的页（同色）跳着分布</text>
+<rect x="40" y="500" width="680" height="56" rx="6" fill="none" stroke="#6e7681"/>
+<rect x="44" y="506" width="66" height="44" rx="3" fill="#1a3a2a" stroke="#3fb950" stroke-width="0.8"/><text x="77.0" y="526" text-anchor="middle" fill="#e6edf3" font-size="9">p4</text><text x="77.0" y="540" text-anchor="middle" fill="#9da7b3" font-size="8">非叶根</text><rect x="114" y="506" width="116" height="44" rx="3" fill="#142a4a" stroke="#4493f8" stroke-width="0.8"/><text x="172.0" y="526" text-anchor="middle" fill="#e6edf3" font-size="9">p5-7</text><text x="172.0" y="540" text-anchor="middle" fill="#9da7b3" font-size="8">叶碎片</text><rect x="234" y="506" width="186" height="44" rx="3" fill="#142a4a" stroke="#4493f8" stroke-width="0.8"/><text x="327.0" y="526" text-anchor="middle" fill="#e6edf3" font-size="9">E1 p64-127</text><text x="327.0" y="540" text-anchor="middle" fill="#9da7b3" font-size="8">叶整区</text><rect x="424" y="506" width="136" height="44" rx="3" fill="#1a3a2a" stroke="#3fb950" stroke-width="0.8"/><text x="492.0" y="526" text-anchor="middle" fill="#e6edf3" font-size="9">E2 p128-191</text><text x="492.0" y="540" text-anchor="middle" fill="#9da7b3" font-size="8">非叶整区</text><rect x="564" y="506" width="66" height="44" rx="3" fill="#1a1a1a" stroke="#6e7681" stroke-width="0.8"/><text x="597.0" y="526" text-anchor="middle" fill="#e6edf3" font-size="9">E3</text><text x="597.0" y="540" text-anchor="middle" fill="#9da7b3" font-size="8">空闲</text><rect x="634" y="506" width="86" height="44" rx="3" fill="#142a4a" stroke="#4493f8" stroke-width="0.8"/><text x="677.0" y="526" text-anchor="middle" fill="#e6edf3" font-size="9">E4</text><text x="677.0" y="540" text-anchor="middle" fill="#9da7b3" font-size="8">叶子</text><text x="40" y="578" fill="#9da7b3" font-size="10">绿=非叶段　蓝=叶子段　灰=未分配。叶子段的页被非叶段和空闲区在物理上切开</text></svg><figcaption>图2　逻辑结构：段通过 INODE 页的归属清单「认领」分散的区和页</figcaption></figure>
+<p>叶子段的页（p5-7、E1、E4）被非叶段和空闲区在物理上切成了好几段，但逻辑上属于同一个段。</p>
+<h2 class="sec" id="s3"><span class="n">03</span>段、区、页的关系</h2>
+<h3>为什么要分这三层？</h3>
+<p>三层各自解决一个独立目标，无法用一个机制兼顾：</p>
+<ul>
+<li><strong>页</strong>：I/O 和缓冲池的最小单位，太大浪费内存，太小管理开销大，16KB 是折衷。</li>
+<li><strong>区</strong>：解决「物理顺序 I/O」。整块 1MB 连续分配，范围扫描时一次磁头定位读 64 页，避免随机寻道。</li>
+<li><strong>段</strong>：解决「逻辑分组」。把叶子节点和内部节点分到不同的段，<strong>全表扫描只读叶子段的区，I/O 完全顺序，不被内部节点页打断</strong>。</li>
+</ul>
+<h3>段的两种核心类型</h3>
+<table>
+<tr><th>段</th><th>存什么</th><th>PAGE_LEVEL</th></tr>
+<tr><td>叶子段 Leaf</td><td>实际数据行</td><td>= 0</td></tr>
+<tr><td>非叶段 Non-leaf</td><td>索引键 + 子页指针</td><td>≥ 1</td></tr>
+</table>
+<h3>区的三种状态（链表归属）</h3>
+<ul>
+<li><strong>FREE</strong>：完全空闲，可整区分配给某段</li>
+<li><strong>FREE_FRAG</strong>：碎片区，页可被不同段零散申请（小段优化用）</li>
+<li><strong>FULL_FRAG</strong>：碎片区页全部用光</li>
+<li>段内部还有 <strong>FREE / NOT_FULL / FULL</strong> 三个链表，管理已归该段的区</li>
+</ul>
+<h3>小段优化</h3>
+<blockquote>段刚创建时<strong>不独占区</strong>，先从 FREE_FRAG 区申请单个「碎片页」，散落在公共区里。<strong>直到该段占用碎片页达到 32 个</strong>，才开始整区整区分配。</blockquote>
+<p>这就是为什么几行数据的小表对应的 ibd 文件可能只有 96KB。</p>
+<h3>两套独立的「顺序」</h3>
+<table>
+<tr><th></th><th>物理顺序（页号）</th><th>逻辑顺序（B+ 树链表）</th></tr>
+<tr><td>由谁决定</td><td>分配时机：先分页号小</td><td>key 大小：叶子页 PREV/NEXT 按主键串联</td></tr>
+<tr><td>示例</td><td>p5 紧挨 p128</td><td>p70 → p65 → p300</td></tr>
+</table>
+<blockquote><strong>主键自增的意义</strong>：让物理写入和逻辑顺序对齐，叶子页接近 100% 填充率。主键随机（如 UUID）会频繁页分裂，叶子物理无序，范围扫描退化为随机 I/O。</blockquote>
+<h2 class="sec" id="s4"><span class="n">04</span>页（Page）内部结构</h2>
+<p>一个 16KB 的索引页（叶子页）从头到尾的字节布局：</p>
+<table>
+<tr><th>组成</th><th>大小</th><th>内容</th></tr>
+<tr><td>File Header</td><td>38B</td><td>页号、类型、前后页指针（FIL_PAGE_PREV/NEXT）、LSN、校验和</td></tr>
+<tr><td>Page Header</td><td>56B</td><td>记录数、槽数、空闲指针、PAGE_LEVEL 等元信息</td></tr>
+<tr><td>Infimum + Supremum</td><td>—</td><td>虚拟最小/最大边界记录，简化链表头尾处理</td></tr>
+<tr><td>User Records</td><td>变长</td><td>实际数据行，向下增长</td></tr>
+<tr><td>Free Space</td><td>变长</td><td>空闲区，新记录从此 append</td></tr>
+<tr><td>Page Directory</td><td>变长</td><td>稀疏槽数组，从页尾向上增长</td></tr>
+<tr><td>File Trailer</td><td>8B</td><td>校验和，检测页是否写完整</td></tr>
+</table>
+<h3>Page Header 关键字段</h3>
+<table>
+<tr><th>字段</th><th>含义</th></tr>
+<tr><td><code>PAGE_N_DIR_SLOTS</code></td><td>槽数组的槽数</td></tr>
+<tr><td><code>PAGE_HEAP_TOP</code></td><td>空闲空间起始偏移，新记录 append 起点</td></tr>
+<tr><td><code>PAGE_N_HEAP</code></td><td>堆中记录总数（含 Infimum/Supremum）</td></tr>
+<tr><td><code>PAGE_FREE</code></td><td>已删除记录构成的「垃圾链表」头，插入时优先复用</td></tr>
+<tr><td><code>PAGE_GARBAGE</code></td><td>可回收字节数，达阈值触发页内重组</td></tr>
+<tr><td><code>PAGE_LAST_INSERT</code> / <code>DIRECTION</code> / <code>N_DIRECTION</code></td><td>判断顺序插入还是随机插入，影响分裂策略</td></tr>
+<tr><td><code>PAGE_N_RECS</code></td><td>用户记录数</td></tr>
+<tr><td><code>PAGE_LEVEL</code></td><td>B+ 树中的层级，0 为叶子</td></tr>
+<tr><td><code>PAGE_BTR_SEG_LEAF / TOP</code></td><td>指向叶子段/非叶段的段头（仅 root 页用到）</td></tr>
+</table>
+<h3>记录头里的两个关键字段</h3>
+<ul>
+<li><strong>heap_no</strong>：记录在堆中的物理序号。Infimum=0，Supremum=1，用户记录从 2 开始按<strong>插入顺序</strong>递增——这正是「物理无序」的体现。</li>
+<li><strong>n_owned</strong>：只在每个分组的<strong>最后一条</strong>（key 最大的那条）上记录该组成员数，组内其他记录为 0。</li>
+</ul>
+<h3>next_record 链表与 Page Directory</h3>
+<p>所有记录通过记录头里的 <code>next_record</code> 串成一条<strong>严格按 key 升序</strong>的单向链表，与物理位置无关；Page Directory 则按分组稀疏地指向每组末尾记录：</p>
+<figure><svg width="100%" viewBox="0 0 760 760" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+<defs><marker id="ab" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5"/></marker></defs>
+<rect x="0" y="0" width="760" height="760" rx="12" fill="#0d1117"/>
+<text x="380" y="28" text-anchor="middle" fill="#e6edf3" font-size="16" font-weight="700">页内结构：next_record 链表 + Page Directory 稀疏槽</text>
+<text x="380" y="48" text-anchor="middle" fill="#9da7b3" font-size="11">蓝=链表（按 key 升序）　橙=槽指向（每组末尾）</text>
+
+<rect x="40" y="62" width="64" height="32" rx="4" fill="#21262d" stroke="#6e7681"/>
+<text x="72" y="82" text-anchor="middle" fill="#e6edf3" font-size="10">FileHdr</text>
+<rect x="40" y="100" width="64" height="32" rx="4" fill="#1d1530" stroke="#a371f7"/>
+<text x="72" y="120" text-anchor="middle" fill="#e6edf3" font-size="10">PageHdr</text>
+
+<rect x="120" y="62" width="320" height="32" rx="5" fill="#0d2818" stroke="#3fb950"/>
+<text x="280" y="82" text-anchor="middle" fill="#e6edf3" font-size="11">Infimum（heap_no=0, n_owned=1）</text>
+<rect x="120" y="104" width="320" height="44" rx="5" fill="#0d2847" stroke="#4493f8"/><text x="134" y="122" fill="#e6edf3" font-size="11" font-weight="700">rec₁  key=5</text><text x="426" y="122" text-anchor="end" fill="#9da7b3" font-size="9">heap_no=2 ｜ 组1</text><text x="134" y="139" fill="#9da7b3" font-size="9">next → rec₂</text><rect x="120" y="154" width="320" height="44" rx="5" fill="#0d2847" stroke="#4493f8"/><text x="134" y="172" fill="#e6edf3" font-size="11" font-weight="700">rec₂  key=12</text><text x="426" y="172" text-anchor="end" fill="#9da7b3" font-size="9">heap_no=3 ｜ 组1</text><text x="134" y="189" fill="#9da7b3" font-size="9">next → rec₃</text><rect x="120" y="204" width="320" height="44" rx="5" fill="#0d2847" stroke="#4493f8"/><text x="134" y="222" fill="#e6edf3" font-size="11" font-weight="700">rec₃  key=18</text><text x="426" y="222" text-anchor="end" fill="#9da7b3" font-size="9">heap_no=4 ｜ 组1末尾</text><text x="134" y="239" fill="#9da7b3" font-size="9">next → rec₄</text><rect x="120" y="254" width="320" height="44" rx="5" fill="#0d2847" stroke="#4493f8"/><text x="134" y="272" fill="#e6edf3" font-size="11" font-weight="700">rec₄  key=25</text><text x="426" y="272" text-anchor="end" fill="#9da7b3" font-size="9">heap_no=5 ｜ 组2</text><text x="134" y="289" fill="#9da7b3" font-size="9">next → rec₅</text><rect x="120" y="304" width="320" height="44" rx="5" fill="#0d2847" stroke="#4493f8"/><text x="134" y="322" fill="#e6edf3" font-size="11" font-weight="700">rec₅  key=31</text><text x="426" y="322" text-anchor="end" fill="#9da7b3" font-size="9">heap_no=6 ｜ 组2</text><text x="134" y="339" fill="#9da7b3" font-size="9">next → rec₆</text><rect x="120" y="354" width="320" height="44" rx="5" fill="#0d2847" stroke="#4493f8"/><text x="134" y="372" fill="#e6edf3" font-size="11" font-weight="700">rec₆  key=42</text><text x="426" y="372" text-anchor="end" fill="#9da7b3" font-size="9">heap_no=7 ｜ 组2</text><text x="134" y="389" fill="#9da7b3" font-size="9">next → rec₇</text><rect x="120" y="404" width="320" height="44" rx="5" fill="#0d2847" stroke="#4493f8"/><text x="134" y="422" fill="#e6edf3" font-size="11" font-weight="700">rec₇  key=56</text><text x="426" y="422" text-anchor="end" fill="#9da7b3" font-size="9">heap_no=8 ｜ 组2末尾</text><text x="134" y="439" fill="#9da7b3" font-size="9">next → Supremum</text><path d="M440 126 L 458 126 L 458 176 L 440 176" fill="none" stroke="#4493f8" stroke-width="1.2" marker-end="url(#ab)" opacity="0.8"/><path d="M440 176 L 458 176 L 458 226 L 440 226" fill="none" stroke="#4493f8" stroke-width="1.2" marker-end="url(#ab)" opacity="0.8"/><path d="M440 226 L 458 226 L 458 276 L 440 276" fill="none" stroke="#4493f8" stroke-width="1.2" marker-end="url(#ab)" opacity="0.8"/><path d="M440 276 L 458 276 L 458 326 L 440 326" fill="none" stroke="#4493f8" stroke-width="1.2" marker-end="url(#ab)" opacity="0.8"/><path d="M440 326 L 458 326 L 458 376 L 440 376" fill="none" stroke="#4493f8" stroke-width="1.2" marker-end="url(#ab)" opacity="0.8"/><path d="M440 376 L 458 376 L 458 426 L 440 426" fill="none" stroke="#4493f8" stroke-width="1.2" marker-end="url(#ab)" opacity="0.8"/><rect x="120" y="454" width="320" height="36" rx="5" fill="#21262d" stroke="#6e7681" stroke-dasharray="4 3"/><text x="280" y="476" text-anchor="middle" fill="#9da7b3" font-size="10">Free Space（向上增长，PAGE_HEAP_TOP 指向起始）</text><rect x="120" y="496" width="320" height="32" rx="5" fill="#0d2818" stroke="#3fb950"/><text x="280" y="516" text-anchor="middle" fill="#e6edf3" font-size="11">Supremum（heap_no=1, n_owned=1）</text><rect x="40" y="538" width="400" height="120" rx="6" fill="#2d220a" stroke="#d29922"/><text x="240" y="558" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">Page Directory（稀疏槽数组，按 key 升序）</text><text x="60" y="578" fill="#d29922" font-size="10">slot₀</text><text x="420" y="578" text-anchor="end" fill="#9da7b3" font-size="10">→ Infimum (n_owned=1)</text><text x="60" y="600" fill="#d29922" font-size="10">slot₁</text><text x="420" y="600" text-anchor="end" fill="#9da7b3" font-size="10">→ rec₃ 组末尾 (n_owned=4)</text><text x="60" y="622" fill="#d29922" font-size="10">slot₂</text><text x="420" y="622" text-anchor="end" fill="#9da7b3" font-size="10">→ rec₇ 组末尾 (n_owned=4)</text><text x="60" y="644" fill="#d29922" font-size="10">slot₃</text><text x="420" y="644" text-anchor="end" fill="#9da7b3" font-size="10">→ Supremum (n_owned=1)</text><rect x="500" y="62" width="180" height="32" rx="5" fill="#2d220a" stroke="#d29922"/><text x="590" y="82" text-anchor="middle" fill="#e6edf3" font-size="10">slot₀ → Infimum</text><path d="M500 78 L 445 78" stroke="#d29922" stroke-width="0.9" stroke-dasharray="3 3" marker-end="url(#ab)" opacity="0.8"/><rect x="500" y="200" width="180" height="32" rx="5" fill="#2d220a" stroke="#d29922"/><text x="590" y="220" text-anchor="middle" fill="#e6edf3" font-size="10">slot₁ → rec₃</text><path d="M500 216 L 445 216" stroke="#d29922" stroke-width="0.9" stroke-dasharray="3 3" marker-end="url(#ab)" opacity="0.8"/><rect x="500" y="400" width="180" height="32" rx="5" fill="#2d220a" stroke="#d29922"/><text x="590" y="420" text-anchor="middle" fill="#e6edf3" font-size="10">slot₂ → rec₇</text><path d="M500 416 L 445 416" stroke="#d29922" stroke-width="0.9" stroke-dasharray="3 3" marker-end="url(#ab)" opacity="0.8"/><rect x="500" y="496" width="180" height="32" rx="5" fill="#2d220a" stroke="#d29922"/><text x="590" y="516" text-anchor="middle" fill="#e6edf3" font-size="10">slot₃ → Supremum</text><path d="M500 512 L 445 512" stroke="#d29922" stroke-width="0.9" stroke-dasharray="3 3" marker-end="url(#ab)" opacity="0.8"/><rect x="500" y="538" width="180" height="120" rx="6" fill="none" stroke="#6e7681" stroke-dasharray="3 3"/><text x="590" y="558" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="700">查找 key=25</text><text x="516" y="580" fill="#9da7b3" font-size="10">① 二分槽 → 落 slot₂</text><text x="516" y="600" fill="#9da7b3" font-size="10">② 上槽 slot₁ = rec₃</text><text x="516" y="620" fill="#9da7b3" font-size="10">③ 从 rec₃.next 扫描</text><text x="516" y="640" fill="#9da7b3" font-size="10">④ rec₄ 命中</text></svg><figcaption>图3　页内结构：记录靠 next_record 链表按 key 有序，Page Directory 稀疏指向每组末尾</figcaption></figure>
+<blockquote><code>next_record</code> 指向的是记录数据的<strong>起始位置</strong>（记录头之后的第一个字节），可直接读到列数据。</blockquote>
+<h2 class="sec" id="s5"><span class="n">05</span>Page Directory 与分组机制</h2>
+<h3>为什么需要稀疏槽？</h3>
+<p>最朴素的做法是每条记录一个槽，但插入/删除时槽数组移动开销大，且占空间。InnoDB 的做法是<strong>分组</strong>：</p>
+<ul>
+<li>每 4~8 条记录为一组（常量 <code>PAGE_DIR_SLOT_MIN_N_OWNED=4</code>，<code>MAX=8</code>）</li>
+<li>只给每组的<strong>最后一条</strong>（最大的）建一个槽</li>
+<li>槽数组按 key 有序，存在页尾，向页头增长</li>
+</ul>
+<h3>分组规则</h3>
+<ul>
+<li>Infimum 组固定 1 条；Supremum 组固定 1 条</li>
+<li>中间组保持 4–8 条，超过 8 则<strong>分裂</strong>出新槽，少于 4 则与邻组<strong>合并</strong></li>
+</ul>
+<h3>示例对应关系</h3>
+<pre><code>slot₀ → Infimum  (n_owned=1)
+slot₁ → rec₃     (n_owned=4，覆盖 Infimum+rec₁+rec₂+rec₃)
+slot₂ → rec₇     (n_owned=4，覆盖 rec₄+rec₅+rec₆+rec₇)
+slot₃ → Supremum (n_owned=1)</code></pre>
+<h3>槽内前缀优化（通用设计，InnoDB 未采用）</h3>
+<p>某些页内记录管理方案会在槽里冗余存放 key 的<strong>前 4 字节</strong>，用少量空间换两件事：① 比较时不用跳转和解析记录（快一个数量级）；② 截断到固定长度后槽保持定长，让二分查找在变长 key 上也能用。</p>
+<blockquote>InnoDB 的 Page Directory <strong>没有</strong>做前缀优化，它走「分组 + 链表扫描」路线。前缀优化更多见于 PostgreSQL B-tree、Mass Tree 等结构。</blockquote>
+<h2 class="sec" id="s6"><span class="n">06</span>查找记录的数据链路</h2>
+<p>以「查找主键 key=25 的行」为例，自顶向下完整链路：</p>
+<figure><svg width="100%" viewBox="0 0 760 380" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif"><defs><marker id="af" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5"/></marker></defs><rect x="0" y="0" width="760" height="380" rx="12" fill="#0d1117"/><text x="380" y="30" text-anchor="middle" fill="#e6edf3" font-size="16" font-weight="700">查找链路：定位主键 key=25</text><rect x="40" y="56" width="160" height="70" rx="7" fill="#1d1530" stroke="#a371f7"/><text x="120.0" y="76" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">① 定位 B+ 树根</text><text x="54" y="96" fill="#9da7b3" font-size="10">由聚簇索引拿 root 页号</text><text x="54" y="114" fill="#9da7b3" font-size="10">偏移 = 页号×16384</text><text x="54" y="132" fill="#9da7b3" font-size="10">读入该页</text><rect x="300" y="56" width="160" height="70" rx="7" fill="#0d2818" stroke="#3fb950"/><text x="380.0" y="76" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">② 跨段下降</text><text x="314" y="96" fill="#9da7b3" font-size="10">root(非叶段)→定位</text><text x="314" y="114" fill="#9da7b3" font-size="10">→内部节点→…</text><text x="314" y="132" fill="#9da7b3" font-size="10">直到叶子页 LEVEL=0</text><rect x="560" y="56" width="160" height="70" rx="7" fill="#0d2847" stroke="#4493f8"/><text x="640.0" y="76" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">③ 进入叶子页</text><text x="574" y="96" fill="#9da7b3" font-size="10">叶子段，含目标记录</text><text x="574" y="114" fill="#9da7b3" font-size="10">进入页内查找</text><text x="574" y="132" fill="#9da7b3" font-size="10">（核心，见下）</text><line x1="200" y1="91" x2="300" y2="91" stroke="#6e7681" stroke-width="1.5" marker-end="url(#af)"/><line x1="460" y1="91" x2="560" y2="91" stroke="#6e7681" stroke-width="1.5" marker-end="url(#af)"/><text x="380" y="170" text-anchor="middle" fill="#e6edf3" font-size="13" font-weight="700">页内查找（阶段3展开）</text><rect x="40" y="186" width="165" height="80" rx="7" fill="#2d220a" stroke="#d29922"/><text x="122.5" y="206" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">二分槽数组</text><text x="54" y="226" fill="#9da7b3" font-size="10">slot₁=k18&lt;25 →右</text><text x="54" y="244" fill="#9da7b3" font-size="10">slot₂=k56≥25</text><text x="54" y="262" fill="#9da7b3" font-size="10">落入 slot₂ 的 group2</text><rect x="300" y="186" width="165" height="80" rx="7" fill="#2d220a" stroke="#d29922"/><text x="382.5" y="206" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">定位扫描起点</text><text x="314" y="226" fill="#9da7b3" font-size="10">取上一槽 slot₁</text><text x="314" y="244" fill="#9da7b3" font-size="10">→ rec₃</text><text x="314" y="262" fill="#9da7b3" font-size="10">作为链表起点</text><rect x="560" y="186" width="165" height="80" rx="7" fill="#0d2818" stroke="#3fb950"/><text x="642.5" y="206" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">链表线性扫描</text><text x="574" y="226" fill="#9da7b3" font-size="10">从 rec₃.next 出发</text><text x="574" y="244" fill="#9da7b3" font-size="10">组内 ≤8 步</text><text x="574" y="262" fill="#9da7b3" font-size="10">rec₄=25 命中 ✓</text><line x1="205" y1="226" x2="300" y2="226" stroke="#6e7681" stroke-width="1.5" marker-end="url(#af)"/><line x1="465" y1="226" x2="560" y2="226" stroke="#6e7681" stroke-width="1.5" marker-end="url(#af)"/><rect x="40" y="296" width="680" height="58" rx="7" fill="none" stroke="#6e7681" stroke-dasharray="4 3"/><text x="56" y="320" fill="#9da7b3" font-size="11">复杂度：O(log₂槽数 + 组内步数)，组内 ≤8 步可忽略。</text><text x="56" y="342" fill="#9da7b3" font-size="11">链路：表空间 → root(非叶段) → 内部节点(非叶段) → 叶子页(叶子段) → 页内二分+链表 → 记录</text></svg><figcaption>图4　查找数据链路</figcaption></figure>
+<h4>阶段 1：定位 B+ 树根</h4>
+<pre><code>由表定义找到聚簇索引 → 拿到 root 页号（如 page 4）
+物理偏移 = 页号 × 16384，从 .ibd 读入该页（若不在 Buffer Pool 则磁盘读）</code></pre>
+<h4>阶段 2：B+ 树自上而下（跨段）</h4>
+<pre><code>root 页(非叶段, LEVEL≥1) → 页内定位子页指针 → 下降到内部节点
+→ 再定位 → … → 直到 PAGE_LEVEL=0 的叶子页</code></pre>
+<h4>阶段 3：页内查找（核心）</h4>
+<pre><code>① 二分槽数组：
+   slot₁=rec₃ key=18 &lt; 25 → 目标在右
+   slot₂=rec₇ key=56 ≥ 25 → 落入 slot₂ 覆盖的 group2
+② 取上一槽 slot₁ 指向的 rec₃ 作为扫描起点
+③ 从 rec₃.next_record 沿链表线性扫描（组内最多 8 步）
+④ rec₄ key=25 命中</code></pre>
+<blockquote><strong>复杂度</strong>：<code>O(log₂槽数 + 组内步数)</code>，组内 ≤8 步可忽略。</blockquote>
+<h2 class="sec" id="s7"><span class="n">07</span>插入记录的数据链路</h2>
+<p>以「插入主键 key=20 的新行」为例：</p>
+<figure><svg width="100%" viewBox="0 0 760 420" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif"><defs><marker id="af" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5"/></marker></defs><rect x="0" y="0" width="760" height="420" rx="12" fill="#0d1117"/><text x="380" y="30" text-anchor="middle" fill="#e6edf3" font-size="16" font-weight="700">插入链路：插入主键 key=20</text><rect x="30" y="52" width="165" height="76" rx="7" fill="#1d1530" stroke="#a371f7"/><text x="112.5" y="72" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">① 定位+找位置</text><text x="44" y="92" fill="#9da7b3" font-size="10">自顶向下到叶子页</text><text x="44" y="110" fill="#9da7b3" font-size="10">页内二分定位</text><text x="44" y="128" fill="#9da7b3" font-size="10">在 rec₃ 与 rec₄ 之间</text><rect x="300" y="52" width="165" height="76" rx="7" fill="#2d220a" stroke="#d29922"/><text x="382.5" y="72" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">② 申请空间</text><text x="314" y="92" fill="#9da7b3" font-size="10">优先复用 PAGE_FREE</text><text x="314" y="110" fill="#9da7b3" font-size="10">垃圾链表</text><text x="314" y="128" fill="#9da7b3" font-size="10">否则 Free Space append</text><rect x="565" y="52" width="165" height="76" rx="7" fill="#0d2847" stroke="#4493f8"/><text x="647.5" y="72" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">③ 写入+串链表</text><text x="579" y="92" fill="#9da7b3" font-size="10">写数据，分配 heap_no</text><text x="579" y="110" fill="#9da7b3" font-size="10">改 next_record 指针</text><text x="579" y="128" fill="#9da7b3" font-size="10">n_owned+1</text><line x1="195" y1="90" x2="300" y2="90" stroke="#6e7681" stroke-width="1.5" marker-end="url(#af)"/><line x1="465" y1="90" x2="565" y2="90" stroke="#6e7681" stroke-width="1.5" marker-end="url(#af)"/><rect x="565" y="160" width="165" height="64" rx="7" fill="#0d2818" stroke="#3fb950"/><text x="647.5" y="180" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">④ 更新元信息</text><text x="579" y="200" fill="#9da7b3" font-size="10">PAGE_N_RECS</text><text x="579" y="218" fill="#9da7b3" font-size="10">PAGE_LAST_INSERT</text><text x="579" y="236" fill="#9da7b3" font-size="10">组&gt;8则分裂加槽</text><line x1="647" y1="128" x2="647" y2="160" stroke="#6e7681" stroke-width="1.5" marker-end="url(#af)"/><text x="380" y="262" text-anchor="middle" fill="#e6edf3" font-size="13" font-weight="700">空间不足时的两级处理</text><rect x="40" y="278" width="320" height="64" rx="7" fill="#2d220a" stroke="#d29922"/><text x="200.0" y="298" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">先：页内重组 reorganize</text><text x="54" y="318" fill="#9da7b3" font-size="10">清理 PAGE_GARBAGE 已删记录</text><text x="54" y="336" fill="#9da7b3" font-size="10">整理碎片、重排槽，再次尝试插入</text><rect x="400" y="278" width="320" height="64" rx="7" fill="#2d1012" stroke="#f85149"/><text x="560.0" y="298" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">仍不足：页分裂 page split</text><text x="414" y="318" fill="#9da7b3" font-size="10">向段申请新页(碎片/整区)→搬一半记录</text><text x="414" y="336" fill="#9da7b3" font-size="10">调叶子 PREV/NEXT→向上层插索引项</text><line x1="360" y1="310" x2="400" y2="310" stroke="#6e7681" stroke-width="1.5" marker-end="url(#af)"/><text x="380" y="372" text-anchor="middle" fill="#9da7b3" font-size="11">顺序插入(自增主键)走右分裂：老页保持满、填充率高；随机插入需搬一半数据、碎片多</text></svg><figcaption>图5　插入数据链路</figcaption></figure>
+<pre><code>1. 自顶向下定位到应插入的叶子页（同查找阶段 1-2）
+2. 页内二分找到插入位置：在 rec₃(k18) 和 rec₄(k25) 之间
+3. 申请记录空间：优先复用 PAGE_FREE 垃圾链表，否则 Free Space append
+4. 写入记录数据，分配新的 heap_no（按插入顺序，不是 key 顺序）
+5. 修改链表指针：rec₃.next → 新记录 → rec₄
+6. 更新所属 group 的 n_owned +1；组 &gt; 8 则分裂加槽
+7. 更新 Page Header：PAGE_N_RECS、PAGE_LAST_INSERT、PAGE_DIRECTION</code></pre>
+<h3>空间不足时的两级处理</h3>
+<ul>
+<li><strong>先：页内重组（reorganize）</strong>——清理 PAGE_GARBAGE 标记的已删除记录，整理碎片、重排槽数组，再次尝试插入。</li>
+<li><strong>仍不足：页分裂（page split）</strong>——向所属段申请新页（碎片页或整区）→ 搬约一半记录 → 调整叶子层 PREV/NEXT 双向链表 → 向上层（非叶段）插入新索引项，可能级联分裂。</li>
+</ul>
+<blockquote>顺序插入（自增主键）走「右分裂」优化：新页几乎不搬数据、老页保持满、填充率高；随机插入需搬一半数据、碎片多。</blockquote>
+<h2 class="sec" id="s8"><span class="n">08</span>删除记录的数据链路</h2>
+<p>InnoDB 的删除是<strong>两阶段</strong>的：先标记，后真正清理。</p>
+<figure><svg width="100%" viewBox="0 0 760 400" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif"><defs><marker id="af" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5"/></marker></defs><rect x="0" y="0" width="760" height="400" rx="12" fill="#0d1117"/><text x="380" y="30" text-anchor="middle" fill="#e6edf3" font-size="16" font-weight="700">删除链路：两阶段（标记 + 异步清理）</text><rect x="30" y="48" width="700" height="120" rx="8" fill="none" stroke="#4493f8" stroke-dasharray="5 3"/><text x="50" y="68" fill="#4493f8" font-size="12" font-weight="700">阶段1：delete mark（事务执行时，同步）</text><rect x="50" y="80" width="150" height="76" rx="7" fill="#1d1530" stroke="#a371f7"/><text x="125.0" y="100" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">定位记录</text><text x="64" y="120" fill="#9da7b3" font-size="10">自顶向下</text><text x="64" y="138" fill="#9da7b3" font-size="10">到叶子页</text><text x="64" y="156" fill="#9da7b3" font-size="10">页内定位目标</text><rect x="300" y="80" width="150" height="76" rx="7" fill="#2d220a" stroke="#d29922"/><text x="375.0" y="100" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">标记删除</text><text x="314" y="120" fill="#9da7b3" font-size="10">deleted_flag=1</text><text x="314" y="138" fill="#9da7b3" font-size="10">记录仍在原位</text><text x="314" y="156" fill="#9da7b3" font-size="10">MVCC 仍可见</text><rect x="560" y="80" width="150" height="76" rx="7" fill="#0d2818" stroke="#3fb950"/><text x="635.0" y="100" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">写 undo</text><text x="574" y="120" fill="#9da7b3" font-size="10">旧版本入 undo log</text><text x="574" y="138" fill="#9da7b3" font-size="10">供 MVCC/回滚</text><text x="574" y="156" fill="#9da7b3" font-size="10">事务提交</text><line x1="200" y1="118" x2="300" y2="118" stroke="#6e7681" stroke-width="1.5" marker-end="url(#af)"/><line x1="450" y1="118" x2="560" y2="118" stroke="#6e7681" stroke-width="1.5" marker-end="url(#af)"/><rect x="30" y="186" width="700" height="148" rx="8" fill="none" stroke="#f85149" stroke-dasharray="5 3"/><text x="50" y="206" fill="#f85149" font-size="12" font-weight="700">阶段2：purge（后台线程，异步，无事务再需旧版本时）</text><rect x="50" y="218" width="150" height="90" rx="7" fill="#2d1012" stroke="#f85149"/><text x="125.0" y="238" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">真正移除</text><text x="64" y="258" fill="#9da7b3" font-size="10">改 next_record</text><text x="64" y="276" fill="#9da7b3" font-size="10">跳过该记录</text><text x="64" y="294" fill="#9da7b3" font-size="10">挂入PAGE_FREE</text><rect x="300" y="218" width="150" height="90" rx="7" fill="#2d220a" stroke="#d29922"/><text x="375.0" y="238" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">回收空间</text><text x="314" y="258" fill="#9da7b3" font-size="10">PAGE_GARBAGE累加</text><text x="314" y="276" fill="#9da7b3" font-size="10">n_owned-1</text><text x="314" y="294" fill="#9da7b3" font-size="10">组&lt;4则合并槽</text><rect x="560" y="218" width="150" height="90" rx="7" fill="#0d2818" stroke="#3fb950"/><text x="635.0" y="238" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">页/区回收</text><text x="574" y="258" fill="#9da7b3" font-size="10">清 undo log</text><text x="574" y="276" fill="#9da7b3" font-size="10">页空→挂 FREE</text><text x="574" y="294" fill="#9da7b3" font-size="10">区空→还表空间</text><line x1="200" y1="263" x2="300" y2="263" stroke="#6e7681" stroke-width="1.5" marker-end="url(#af)"/><line x1="450" y1="263" x2="560" y2="263" stroke="#6e7681" stroke-width="1.5" marker-end="url(#af)"/><text x="380" y="362" text-anchor="middle" fill="#9da7b3" font-size="11">标记而非立即删除：MVCC 下其他事务的一致性读可能仍需旧版本</text></svg><figcaption>图6　删除数据链路（两阶段）</figcaption></figure>
+<h4><span class="tag sync">同步</span> 阶段 1：delete mark（事务执行时）</h4>
+<pre><code>1. 自顶向下定位到记录所在叶子页 → 页内定位目标
+2. 记录头 deleted_flag 置 1（标记删除，记录仍在原位）
+   ↑ 此时记录对 MVCC 仍可见（其他事务快照可能需要旧版本）
+3. 旧版本信息进入 undo log，供 MVCC 和回滚使用</code></pre>
+<h4><span class="tag async">异步</span> 阶段 2：purge（后台线程）</h4>
+<pre><code>4. purge 线程判断：没有活跃事务的快照再需要旧版本
+5. 真正移除：调整 next_record 跳过该记录 → 空间挂入 PAGE_FREE 垃圾链表
+   → 累加 PAGE_GARBAGE → n_owned -1 → 组 &lt; 4 则与相邻组合并删槽
+6. 清理对应 undo log
+7. 页空 → 页挂回 FREE 链表；区空 → 区还给表空间 FREE 链表</code></pre>
+<blockquote>标记而非立即物理删除，是因为 MVCC 下其他事务的一致性读可能还需要这条记录的旧版本。</blockquote>
+<h2 class="sec" id="s9"><span class="n">09</span>修改记录的数据链路</h2>
+<p>InnoDB 的更新分两种情况，路径差异很大。</p>
+<figure><svg width="100%" viewBox="0 0 760 380" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif"><defs><marker id="af" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5"/></marker></defs><rect x="0" y="0" width="760" height="380" rx="12" fill="#0d1117"/><text x="380" y="30" text-anchor="middle" fill="#e6edf3" font-size="16" font-weight="700">修改链路：两种路径</text><rect x="280" y="50" width="200" height="56" rx="7" fill="#1d1530" stroke="#a371f7"/><text x="380.0" y="70" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">判断更新类型</text><text x="294" y="90" fill="#9da7b3" font-size="10">主键? 长度变化?</text><line x1="330" y1="106" x2="200" y2="140" stroke="#6e7681" stroke-width="1.5" marker-end="url(#af)"/><line x1="430" y1="106" x2="560" y2="140" stroke="#6e7681" stroke-width="1.5" marker-end="url(#af)"/><text x="200" y="132" text-anchor="middle" fill="#3fb950" font-size="10">未改主键且长度不变/变小</text><text x="600" y="132" text-anchor="middle" fill="#f85149" font-size="10">改主键 或 变长放不下</text><rect x="40" y="142" width="330" height="100" rx="7" fill="#0d2818" stroke="#3fb950"/><text x="205.0" y="162" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">A. 原地更新 in-place</text><text x="54" y="182" fill="#9da7b3" font-size="10">定位记录 → 直接覆盖写列值</text><text x="54" y="200" fill="#9da7b3" font-size="10">旧值写 undo log</text><text x="54" y="218" fill="#9da7b3" font-size="10">更新 DB_TRX_ID / DB_ROLL_PTR</text><text x="54" y="236" fill="#9da7b3" font-size="10">代价最小：不动链表/槽/分裂</text><rect x="400" y="142" width="330" height="100" rx="7" fill="#2d1012" stroke="#f85149"/><text x="565.0" y="162" text-anchor="middle" fill="#e6edf3" font-size="12" font-weight="700">B. 非原地 delete-mark + insert</text><text x="414" y="182" fill="#9da7b3" font-size="10">旧记录 deleted_flag=1</text><text x="414" y="200" fill="#9da7b3" font-size="10">构造新记录走完整 insert 链路</text><text x="414" y="218" fill="#9da7b3" font-size="10">改主键→可能落到不同叶子页</text><text x="414" y="236" fill="#9da7b3" font-size="10">可能触发页分裂，旧记录 purge 清理</text><rect x="40" y="262" width="690" height="96" rx="7" fill="none" stroke="#6e7681" stroke-dasharray="4 3"/><text x="56" y="286" fill="#9da7b3" font-size="11">• 二级索引更新总是走 B 路径（delete-mark + insert），因为索引列值变化即位置变化</text><text x="56" y="310" fill="#9da7b3" font-size="11">• 修改主键 = 删旧行 + 插新行，代价最大 → 主键不应频繁更新</text><text x="56" y="334" fill="#9da7b3" font-size="11">• 原地更新只动列值与隐藏列，是最快的更新路径</text></svg><figcaption>图7　修改数据链路</figcaption></figure>
+<h4>情况 A：原地更新（in-place update）</h4>
+<p>满足条件：<strong>未修改主键</strong> 且 <strong>更新后记录长度不变或变小</strong>。</p>
+<pre><code>1. 定位记录所在叶子页 → 页内定位目标
+2. 直接在原位修改列值（覆盖写）
+3. 旧值写入 undo log（供 MVCC / 回滚）
+4. 更新隐藏列：DB_TRX_ID、DB_ROLL_PTR</code></pre>
+<p>代价最小，不动链表、不动槽、不分裂。</p>
+<h4>情况 B：非原地更新（delete-mark + insert）</h4>
+<p>触发条件：<strong>修改了主键</strong> 或 <strong>更新后记录变长、原位放不下</strong>。</p>
+<pre><code>1. 对旧记录执行 delete mark（deleted_flag=1）
+2. 构造新记录，执行一次完整 insert（同插入链路）
+   - 改了主键 → 新记录可能落到完全不同的叶子页
+   - 可能触发页分裂
+3. 旧记录由 purge 线程后续异步清理</code></pre>
+<blockquote><strong>二级索引</strong>的更新<strong>总是</strong> delete-mark + insert（不做原地更新），因为索引列值变化即位置变化。修改主键 = 删旧行 + 插新行，代价最大，应尽量避免。</blockquote>
+<h2 class="sec" id="s10"><span class="n">10</span>关键结论速查</h2>
+<table>
+<tr><th>问题</th><th>结论</th></tr>
+<tr><td>段是物理的还是逻辑的？</td><td><strong>逻辑</strong>。归属清单存在 page 2（INODE 页），磁盘上没有连续的「段」</td></tr>
+<tr><td>区是什么？</td><td><strong>物理连续</strong>的 64 个页 = 1MB，整块分配的单位，保证顺序 I/O</td></tr>
+<tr><td>页内记录有序吗？</td><td>物理上<strong>无序</strong>（按插入顺序堆放），靠 next_record 链表逻辑有序</td></tr>
+<tr><td>为什么分叶子段/非叶段？</td><td>让全表扫描只读叶子段的区，I/O 顺序不被内部节点打断</td></tr>
+<tr><td>小表为什么文件很小？</td><td>小段优化：段先用碎片页，占满 32 个才整区分配</td></tr>
+<tr><td>删除是立即物理删除吗？</td><td>否。先 delete-mark，purge 线程异步真正清理</td></tr>
+<tr><td>修改主键为什么慢？</td><td>等价于「删除旧行 + 插入新行」，可能跨页 + 页分裂</td></tr>
+<tr><td>为什么推荐自增主键？</td><td>让物理写入与逻辑顺序对齐，避免随机插入导致的页分裂与碎片</td></tr>
+<tr><td>查找一条记录的链路？</td><td>表空间 → root → 内部节点 → 叶子页 → 页内二分槽 + 链表扫描</td></tr>
+<tr><td>槽里存什么？</td><td>InnoDB：记录偏移量；分组后只给每组末尾建槽（稀疏）</td></tr>
+</table>
+<blockquote>归属链一句话总结：<strong>表空间 ⊃ 段（逻辑）⊃ 区（物理连续）⊃ 页 ⊃ 记录</strong>。物理顺序（页号）由分配时机决定，逻辑顺序（B+ 树链表）由 key 大小决定，两者独立。</blockquote>
+</div>
+</body>
+</html>

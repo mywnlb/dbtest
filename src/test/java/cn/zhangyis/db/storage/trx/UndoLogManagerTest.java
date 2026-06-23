@@ -13,8 +13,8 @@ import cn.zhangyis.db.storage.api.DiskSpaceUndoAllocator;
 import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.LruBufferPool;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
-import cn.zhangyis.db.storage.fil.FileChannelPageStore;
-import cn.zhangyis.db.storage.fil.PageStore;
+import cn.zhangyis.db.storage.fil.io.FileChannelPageStore;
+import cn.zhangyis.db.storage.fil.io.PageStore;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
 import cn.zhangyis.db.storage.record.schema.ColumnDef;
@@ -165,7 +165,7 @@ class UndoLogManagerTest {
             DiskSpaceUndoAllocator allocator = new DiskSpaceUndoAllocator(disk);
             UndoLogSegmentAccess access = new UndoLogSegmentAccess(pool, PS, allocator, registry);
             RollbackSegmentSlotManager slots = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), SLOT_CAPACITY);
-            UndoLogManager undoMgr = new UndoLogManager(access, slots, UNDO_SPACE);
+            UndoLogManager undoMgr = new UndoLogManager(access, slots, UNDO_SPACE, new HistoryList());
             TransactionManager txnMgr = new TransactionManager(new TransactionSystem());
 
             MiniTransaction boot = mgr.begin();
@@ -260,8 +260,8 @@ class UndoLogManagerTest {
             assertEquals(1, h.slots.activeSlotCount(), "slot claimed on first write");
 
             // commit 编排：onCommit 释放 insert undo slot（commit 后不再服务一致性读）
-            h.undoMgr.onCommit(txn);
             h.txnMgr.commit(txn);
+            h.undoMgr.onCommit(txn);
 
             assertEquals(0, h.slots.activeSlotCount(), "onCommit releases the insert undo slot");
 
@@ -272,8 +272,8 @@ class UndoLogManagerTest {
             h.undoMgr.beforeInsert(txn2, m2, TABLE_ID, INDEX_ID, keyOf(200), keyDef(), schema());
             h.mgr.commit(m2);
             assertEquals(1, h.slots.activeSlotCount(), "released slot reusable by next txn");
-            h.undoMgr.onCommit(txn2);
             h.txnMgr.commit(txn2);
+            h.undoMgr.onCommit(txn2);
         });
     }
 
@@ -350,8 +350,8 @@ class UndoLogManagerTest {
             assertEquals(oldHidden, rec.oldHiddenColumns());
 
             // commit 不回收含 delete undo 事务的 slot
-            h.undoMgr.onCommit(txn);
             h.txnMgr.commit(txn);
+            h.undoMgr.onCommit(txn);
             assertEquals(1, h.slots.activeSlotCount(), "slot retained when txn wrote DELETE_MARK undo");
         });
     }
@@ -368,8 +368,8 @@ class UndoLogManagerTest {
             h.mgr.commit(m);
             assertEquals(1, h.slots.activeSlotCount());
 
-            h.undoMgr.onCommit(txn);
             h.txnMgr.commit(txn);
+            h.undoMgr.onCommit(txn);
             assertEquals(1, h.slots.activeSlotCount(),
                     "slot retained when txn wrote UPDATE undo (T1.4 MVCC/purge needs it)");
         });
@@ -389,7 +389,7 @@ class UndoLogManagerTest {
             DiskSpaceManager disk = new DiskSpaceManager(pool, store, PS);
             UndoLogSegmentAccess access = new UndoLogSegmentAccess(pool, PS, new DiskSpaceUndoAllocator(disk), registry);
             RollbackSegmentSlotManager slots = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), SLOT_CAPACITY);
-            UndoLogManager undoMgr = new UndoLogManager(access, slots, UNDO_SPACE);
+            UndoLogManager undoMgr = new UndoLogManager(access, slots, UNDO_SPACE, new HistoryList());
             TransactionManager txnMgr = new TransactionManager(new TransactionSystem());
 
             MiniTransaction boot = mgr.begin();
@@ -463,7 +463,7 @@ class UndoLogManagerTest {
             DiskSpaceUndoAllocator allocator = new DiskSpaceUndoAllocator(disk);
             UndoLogSegmentAccess access = new UndoLogSegmentAccess(pool, PS, allocator, registry);
             RollbackSegmentSlotManager slots = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), SLOT_CAPACITY);
-            UndoLogManager undoMgr = new UndoLogManager(access, slots, UNDO_SPACE);
+            UndoLogManager undoMgr = new UndoLogManager(access, slots, UNDO_SPACE, new HistoryList());
             TransactionManager txnMgr = new TransactionManager(new TransactionSystem());
 
             MiniTransaction boot = mgr.begin();

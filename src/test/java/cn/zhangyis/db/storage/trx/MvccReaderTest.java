@@ -9,16 +9,16 @@ import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.domain.TransactionId;
 import cn.zhangyis.db.storage.api.DiskSpaceManager;
 import cn.zhangyis.db.storage.api.DiskSpaceUndoAllocator;
-import cn.zhangyis.db.storage.api.IndexPageAccess;
+import cn.zhangyis.db.storage.api.index.IndexPageAccess;
 import cn.zhangyis.db.storage.api.SegmentRef;
 import cn.zhangyis.db.storage.btree.BTreeIndex;
 import cn.zhangyis.db.storage.btree.BTreeLookupResult;
 import cn.zhangyis.db.storage.btree.SplitCapableBTreeIndexService;
 import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.LruBufferPool;
-import cn.zhangyis.db.storage.fil.FileChannelPageStore;
-import cn.zhangyis.db.storage.fil.PageStore;
-import cn.zhangyis.db.storage.fsp.SegmentPurpose;
+import cn.zhangyis.db.storage.fil.io.FileChannelPageStore;
+import cn.zhangyis.db.storage.fil.io.PageStore;
+import cn.zhangyis.db.storage.fsp.segment.SegmentPurpose;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
 import cn.zhangyis.db.storage.record.format.HiddenColumns;
@@ -423,7 +423,7 @@ class MvccReaderTest {
             this.svc = new SplitCapableBTreeIndexService(access, disk, registry);
             this.undoAccess = new UndoLogSegmentAccess(pool, PS, new DiskSpaceUndoAllocator(disk), registry);
             this.slots = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 64);
-            this.undoMgr = new UndoLogManager(undoAccess, slots, UNDO_SPACE);
+            this.undoMgr = new UndoLogManager(undoAccess, slots, UNDO_SPACE, new HistoryList());
             this.mvcc = new MvccReader(mgr, svc, undoAccess, UNDO_SPACE, 100);
         }
 
@@ -500,8 +500,8 @@ class MvccReaderTest {
         }
 
         private void commit(Transaction txn) {
-            undoMgr.onCommit(txn);
             txnMgr.commit(txn);
+            undoMgr.onCommit(txn);
         }
     }
 }

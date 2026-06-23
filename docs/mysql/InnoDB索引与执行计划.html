@@ -1,0 +1,829 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>InnoDB 索引与执行计划</title>
+<style>
+:root{
+  --bg:#0a111f; --bg2:#0c1426; --surface:#111d36;
+  --surface2:#16223d; --surface3:#1d2c4d; --border:#26375c; --border2:#324a78;
+  --text:#e7edfa; --muted:#9aabce; --faint:#6b7da3;
+  --teal:#2dd4bf; --teal-d:#0f766e; --blue:#5b9dff; --blue-d:#1e4fb0;
+  --purple:#b794f6; --purple-d:#6b46c1; --amber:#f5b955; --amber-d:#b45309;
+  --red:#f0697a; --red-d:#9b2c3a; --green:#5fd38a; --green-d:#15803d;
+  --mono:"JetBrains Mono","Cascadia Code","SF Mono",Consolas,"Liberation Mono",monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans SC",sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{
+  font-family:var(--sans); background:var(--bg); color:var(--text);
+  line-height:1.75; font-size:16px; letter-spacing:.01em;
+  background-image:
+    radial-gradient(900px 500px at 12% -8%, rgba(45,212,191,.10), transparent 60%),
+    radial-gradient(900px 600px at 100% 0%, rgba(91,157,255,.10), transparent 55%),
+    radial-gradient(700px 700px at 50% 120%, rgba(183,148,246,.07), transparent 60%);
+  background-attachment:fixed;
+}
+.wrap{max-width:920px;margin:0 auto;padding:0 24px 120px}
+
+/* ---------- header ---------- */
+.hero{padding:88px 0 56px;text-align:center;position:relative}
+.kicker{font-family:var(--mono);font-size:13px;letter-spacing:.32em;text-transform:uppercase;color:var(--teal);margin-bottom:22px}
+.hero h1{
+  font-size:clamp(34px,6vw,56px);line-height:1.1;font-weight:800;letter-spacing:-.01em;
+  background:linear-gradient(120deg,#fff 10%,var(--teal) 55%,var(--blue) 100%);
+  -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;
+}
+.hero .sub{margin-top:20px;color:var(--muted);font-size:18px;max-width:640px;margin-left:auto;margin-right:auto}
+.series{margin-top:34px;display:flex;gap:10px;justify-content:center;flex-wrap:wrap;font-family:var(--mono);font-size:12.5px}
+.series span{padding:7px 13px;border:1px solid var(--border);border-radius:999px;color:var(--faint);background:rgba(255,255,255,.02)}
+.series span.now{border-color:var(--teal);color:var(--teal);background:rgba(45,212,191,.08);box-shadow:0 0 0 1px rgba(45,212,191,.18)}
+
+/* ---------- TOC ---------- */
+.toc{margin:18px 0 60px;background:linear-gradient(180deg,var(--surface),var(--bg2));border:1px solid var(--border);border-radius:18px;padding:26px 30px}
+.toc h2{font-size:13px;letter-spacing:.22em;text-transform:uppercase;color:var(--faint);font-family:var(--mono);margin-bottom:16px;font-weight:600}
+.toc ol{list-style:none;counter-reset:t;display:grid;grid-template-columns:1fr 1fr;gap:4px 34px}
+.toc li{counter-increment:t}
+.toc a{display:flex;gap:12px;align-items:baseline;padding:8px 6px;border-radius:8px;color:var(--muted);text-decoration:none;transition:.18s;border-bottom:1px solid transparent}
+.toc a:hover{color:var(--text);background:rgba(91,157,255,.07)}
+.toc a::before{content:counter(t,decimal-leading-zero);font-family:var(--mono);font-size:12px;color:var(--teal);min-width:24px}
+
+/* ---------- sections ---------- */
+section{margin:0 0 22px;scroll-margin-top:24px}
+.chap{display:flex;align-items:center;gap:16px;margin:64px 0 26px}
+.chap .num{font-family:var(--mono);font-size:13px;font-weight:700;color:var(--bg);background:linear-gradient(135deg,var(--teal),var(--blue));padding:6px 11px;border-radius:8px;letter-spacing:.05em;flex:none}
+.chap h2{font-size:clamp(24px,3.4vw,32px);font-weight:780;letter-spacing:-.01em}
+.chap .rule{flex:1;height:1px;background:linear-gradient(90deg,var(--border2),transparent)}
+
+h3{font-size:20px;font-weight:700;margin:34px 0 12px;color:#f3f6fd}
+h3::before{content:"";display:inline-block;width:9px;height:9px;border-radius:2px;background:var(--teal);margin-right:11px;transform:translateY(-2px)}
+h4{font-size:16px;font-weight:700;margin:22px 0 8px;color:var(--blue)}
+p{margin:13px 0;color:#d7e0f2}
+strong{color:#fff;font-weight:680}
+em{color:var(--teal);font-style:normal;font-weight:600}
+a.in{color:var(--blue);text-decoration:none;border-bottom:1px dashed var(--border2)}
+code{font-family:var(--mono);font-size:.88em;background:rgba(91,157,255,.12);color:#bcd4ff;padding:2px 7px;border-radius:6px;border:1px solid rgba(91,157,255,.16)}
+
+ul.bul{margin:13px 0 13px 4px;list-style:none}
+ul.bul li{position:relative;padding-left:24px;margin:9px 0;color:#d7e0f2}
+ul.bul li::before{content:"▸";position:absolute;left:2px;top:0;color:var(--teal);font-size:14px}
+
+/* ---------- callouts ---------- */
+.note{border-radius:14px;padding:18px 22px;margin:22px 0;border:1px solid;display:flex;gap:14px;align-items:flex-start}
+.note .ic{font-family:var(--mono);font-weight:800;font-size:13px;flex:none;margin-top:2px}
+.note.key{background:linear-gradient(100deg,rgba(45,212,191,.10),rgba(45,212,191,.03));border-color:rgba(45,212,191,.35)}
+.note.key .ic{color:var(--teal)}
+.note.warn{background:linear-gradient(100deg,rgba(245,185,85,.10),rgba(245,185,85,.03));border-color:rgba(245,185,85,.35)}
+.note.warn .ic{color:var(--amber)}
+.note.danger{background:linear-gradient(100deg,rgba(240,105,122,.10),rgba(240,105,122,.03));border-color:rgba(240,105,122,.35)}
+.note.danger .ic{color:var(--red)}
+.note p{margin:4px 0;color:#e3e9f6}
+.note p:first-child{margin-top:0}
+
+/* ---------- figure ---------- */
+figure{margin:30px 0;background:linear-gradient(180deg,var(--bg2),#0a1322);border:1px solid var(--border);border-radius:18px;padding:24px 22px 14px;overflow:hidden}
+figure svg{display:block;width:100%;height:auto}
+figcaption{margin-top:14px;font-size:13.5px;color:var(--faint);font-family:var(--mono);text-align:center;letter-spacing:.02em}
+figcaption b{color:var(--teal);font-weight:600}
+
+/* ---------- table ---------- */
+.tbl{margin:24px 0;border:1px solid var(--border);border-radius:14px;overflow:hidden}
+table{width:100%;border-collapse:collapse;font-size:14.5px}
+thead th{background:linear-gradient(180deg,var(--surface3),var(--surface));color:#eaf0fb;font-weight:700;text-align:left;padding:13px 16px;border-bottom:1px solid var(--border2);font-size:13.5px;letter-spacing:.02em}
+tbody td{padding:12px 16px;border-bottom:1px solid var(--border);color:#d2dcef;vertical-align:top}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:nth-child(even){background:rgba(255,255,255,.015)}
+td code,th code{font-size:.84em}
+.yes{color:var(--green);font-weight:700}
+.no{color:var(--red);font-weight:700}
+.mid{color:var(--amber);font-weight:700}
+
+/* ---------- code block ---------- */
+pre{margin:20px 0;background:#070d18;border:1px solid var(--border);border-radius:14px;padding:18px 20px;overflow-x:auto;font-family:var(--mono);font-size:13.5px;line-height:1.7;position:relative}
+pre code{background:none;border:none;padding:0;color:#cdd9f0}
+.cm{color:#5d7194}    /* comment */
+.kw{color:var(--purple)}  /* keyword */
+.fn{color:var(--blue)}
+.st{color:var(--green)}
+.nm{color:var(--amber)}
+
+/* ---------- footer ---------- */
+.fin{margin-top:80px;padding:34px 30px;border:1px solid var(--border);border-radius:18px;background:linear-gradient(180deg,var(--surface),var(--bg2));text-align:center}
+.fin h3{justify-content:center}
+.fin h3::before{display:none}
+.fin .seq{display:flex;gap:8px;align-items:center;justify-content:center;flex-wrap:wrap;margin:18px 0 6px;font-family:var(--mono);font-size:13px;color:var(--muted)}
+.fin .seq b{color:var(--teal)}
+.fin .arrow{color:var(--faint)}
+.foot{margin-top:40px;text-align:center;color:var(--faint);font-size:13px;font-family:var(--mono)}
+
+@media(max-width:680px){
+  .toc ol{grid-template-columns:1fr}
+  .wrap{padding:0 16px 80px}
+  .chap{flex-wrap:wrap}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <div class="kicker">InnoDB 系列 · 第六篇</div>
+  <h1>索引与执行计划</h1>
+  <p class="sub">从"为什么是 B+ 树"讲起：扇出与树高、聚簇索引、回表、覆盖索引、最左前缀、索引下推，再到 EXPLAIN 怎么读、索引为何失效——把 InnoDB 的查找性能讲透。</p>
+  <div class="series">
+    <span>① 存储结构</span>
+    <span>② Buffer Pool</span>
+    <span>③ 故障恢复</span>
+    <span>④ 事务与 MVCC</span>
+    <span>⑤ 锁系统</span>
+    <span class="now">⑥ 索引与执行计划</span>
+  </div>
+</header>
+
+<nav class="toc">
+  <h2>目录</h2>
+  <ol>
+    <li><a href="#c1">总览：索引的本质</a></li>
+    <li><a href="#c2">原理推导：为什么偏偏是 B+ 树</a></li>
+    <li><a href="#c3">B+ 树的结构详解</a></li>
+    <li><a href="#c4">扇出与树高：3 层为何能存千万行</a></li>
+    <li><a href="#c5">聚簇索引 vs 二级索引</a></li>
+    <li><a href="#c6">为什么二级索引存主键而非行指针</a></li>
+    <li><a href="#c7">回表 Table Lookup</a></li>
+    <li><a href="#c8">覆盖索引 Covering Index</a></li>
+    <li><a href="#c9">联合索引与最左前缀</a></li>
+    <li><a href="#c10">索引下推 ICP</a></li>
+    <li><a href="#c11">执行计划 EXPLAIN 详解</a></li>
+    <li><a href="#c12">索引失效的常见场景</a></li>
+    <li><a href="#c13">索引设计原则</a></li>
+    <li><a href="#c14">自适应哈希索引与 Change Buffer</a></li>
+    <li><a href="#c15">系列总结：六篇成体系</a></li>
+  </ol>
+</nav>
+
+<!-- ============ 1 ============ -->
+<section id="c1">
+  <div class="chap"><span class="num">01</span><h2>总览：索引的本质</h2><div class="rule"></div></div>
+
+  <p>前五篇讲了数据怎么存、怎么用、怎么恢复、怎么并发控制。但有一个贯穿始终的问题没正面回答：<strong>给定一个查询条件，InnoDB 怎么在百万、千万行里"瞬间"找到目标行？</strong>答案就是索引。</p>
+
+  <p>索引的本质一句话：<strong>用额外的、按 key 有序组织的数据结构，把"全表扫描的 O(n)"变成"树查找的 O(log n)"。</strong>它是空间换时间——多存一份有序结构，换查找时少扫无数行。</p>
+
+  <figure>
+    <svg viewBox="0 0 800 220" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <text x="400" y="28" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">有没有索引：查 id=857 的两种命运</text>
+      <!-- no index -->
+      <rect x="40" y="55" width="340" height="135" rx="12" fill="#0f1830" stroke="#9b2c3a" stroke-width="1.5"/>
+      <text x="210" y="80" text-anchor="middle" fill="#f0697a" font-size="13" font-weight="700">无索引 · 全表扫描 O(n)</text>
+      <g font-size="11">
+      <rect x="60" y="95" width="40" height="24" rx="4" fill="#0a1322" stroke="#26375c"/><text x="80" y="111" text-anchor="middle" fill="#9aabce">1</text>
+      <rect x="104" y="95" width="40" height="24" rx="4" fill="#0a1322" stroke="#26375c"/><text x="124" y="111" text-anchor="middle" fill="#9aabce">2</text>
+      <rect x="148" y="95" width="40" height="24" rx="4" fill="#0a1322" stroke="#26375c"/><text x="168" y="111" text-anchor="middle" fill="#9aabce">3</text>
+      <text x="210" y="111" fill="#6b7da3">··· 逐行比对 ···</text>
+      <rect x="300" y="95" width="56" height="24" rx="4" fill="rgba(240,105,122,.18)" stroke="#f0697a"/><text x="328" y="111" text-anchor="middle" fill="#f0697a">857</text>
+      </g>
+      <text x="210" y="150" text-anchor="middle" fill="#f0697a" font-size="12">最坏扫 n 行才命中</text>
+      <text x="210" y="172" text-anchor="middle" fill="#9aabce" font-size="11">千万行 = 千万次比对 + 海量磁盘 I/O</text>
+      <!-- with index -->
+      <rect x="420" y="55" width="340" height="135" rx="12" fill="#141f3a" stroke="#2dd4bf" stroke-width="2"/>
+      <text x="590" y="80" text-anchor="middle" fill="#2dd4bf" font-size="13" font-weight="700">有索引 · 树查找 O(log n)</text>
+      <text x="590" y="118" text-anchor="middle" fill="#5fd38a" font-size="20" font-weight="700">3~4 次</text>
+      <text x="590" y="150" text-anchor="middle" fill="#d7e0f2" font-size="12">页定位即命中</text>
+      <text x="590" y="172" text-anchor="middle" fill="#9aabce" font-size="11">千万行也只需 3~4 次磁盘 I/O</text>
+    </svg>
+    <figcaption><b>图 1</b> · 索引把"扫千万行"压缩成"走 3~4 层树"，差距随数据量指数级拉大</figcaption>
+  </figure>
+
+  <div class="note key"><span class="ic">本篇主线</span><div>
+    <p>理解索引，要回答四个递进的问题：<strong>① 用什么数据结构？为什么？</strong>（第 2–4 章，B+ 树原理）<strong>② 索引和数据怎么摆放？</strong>（第 5–6 章，聚簇/二级）<strong>③ 一次查询具体怎么走、怎么优化？</strong>（第 7–10 章，回表/覆盖/最左前缀/ICP）<strong>④ 怎么看它走得对不对、怎么避免走歪？</strong>（第 11–13 章，EXPLAIN 与失效）。原理优先，每个结论都尽量讲清"为什么"。</p>
+  </div></div>
+</section>
+
+<!-- ============ 2 ============ -->
+<section id="c2">
+  <div class="chap"><span class="num">02</span><h2>原理推导：为什么偏偏是 B+ 树</h2><div class="rule"></div></div>
+
+  <p>这是本篇最重要的原理。InnoDB 用 B+ 树做索引不是随便选的，而是<strong>被磁盘的物理特性一步步逼出来的</strong>。我们顺着候选方案淘汰，看 B+ 树是怎么胜出的。</p>
+
+  <h3>前提：磁盘 I/O 是瓶颈，要"少读盘"</h3>
+  <p>内存访问以纳秒计，磁盘（即便 SSD）以微秒到毫秒计，差几个数量级。数据库的数据量远大于内存，索引结构主要躺在磁盘上。所以衡量一个索引结构好不好，核心指标是<strong>一次查找要读几次磁盘（几个磁盘页）</strong>，而不是比较了多少次。<em>磁盘按"页"（InnoDB 16KB）为单位读取</em>——读 1 字节和读 16KB 的代价几乎一样。这个事实决定了一切。</p>
+
+  <h3>候选淘汰赛</h3>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>方案</th><th>致命问题</th><th>结论</th></tr></thead>
+      <tbody>
+        <tr><td><strong>哈希表</strong></td><td>等值 O(1) 很快，但<em>不支持范围查询、排序</em>（哈希打乱了顺序）；<code>WHERE age &gt; 18</code> 退化为全扫</td><td class="no">范围场景出局</td></tr>
+        <tr><td><strong>二叉搜索树 / 红黑树</strong></td><td>每个节点只存 1 个 key、2 个分叉，树<em>又高又瘦</em>。千万数据树高约 24 层 → <em>每次查找最坏读 24 个磁盘页</em></td><td class="no">树太高，读盘太多</td></tr>
+        <tr><td><strong>B 树（B-Tree）</strong></td><td>一个节点存多个 key + 多个分叉，矮胖、读盘少。但<em>每个节点都存数据</em>，导致非叶子节点能放的 key 变少、扇出降低；且<em>范围查询要中序回溯</em>，跨节点跳来跳去</td><td class="mid">接近了，但还能更好</td></tr>
+        <tr><td><strong>B+ 树</strong></td><td>—— 见下方为什么它最优</td><td class="yes">胜出 ✓</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <figure>
+    <svg viewBox="0 0 800 250" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <text x="400" y="24" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">"瘦高"二叉树 vs "矮胖"B+ 树：树高 = 读盘次数</text>
+      <!-- tall thin -->
+      <text x="170" y="52" text-anchor="middle" fill="#f0697a" font-size="12" font-weight="700">二叉树：高而瘦</text>
+      <g stroke="#9b2c3a" stroke-width="1.5" fill="none">
+        <line x1="170" y1="70" x2="130" y2="100"/><line x1="170" y1="70" x2="210" y2="100"/>
+        <line x1="130" y1="115" x2="100" y2="145"/><line x1="130" y1="115" x2="160" y2="145"/>
+        <line x1="100" y1="160" x2="80" y2="190"/><line x1="100" y1="160" x2="120" y2="190"/>
+      </g>
+      <g fill="#0f1830" stroke="#f0697a"><circle cx="170" cy="70" r="11"/><circle cx="130" cy="110" r="11"/><circle cx="210" cy="105" r="9"/><circle cx="100" cy="150" r="11"/><circle cx="160" cy="148" r="9"/><circle cx="80" cy="195" r="9"/><circle cx="120" cy="193" r="9"/></g>
+      <text x="170" y="225" text-anchor="middle" fill="#f0697a" font-size="11">千万行 → 约 24 层 → 24 次 I/O</text>
+      <!-- short fat -->
+      <text x="560" y="52" text-anchor="middle" fill="#2dd4bf" font-size="12" font-weight="700">B+ 树：矮而胖</text>
+      <rect x="470" y="62" width="180" height="22" rx="5" fill="#141f3a" stroke="#2dd4bf"/><text x="560" y="78" text-anchor="middle" fill="#2dd4bf" font-size="10">根：很多 key，多分叉</text>
+      <rect x="420" y="110" width="90" height="20" rx="5" fill="#0f1830" stroke="#5b9dff"/>
+      <rect x="520" y="110" width="90" height="20" rx="5" fill="#0f1830" stroke="#5b9dff"/>
+      <rect x="620" y="110" width="60" height="20" rx="5" fill="#0f1830" stroke="#5b9dff"/>
+      <g stroke="#324a78" stroke-width="1.3"><line x1="520" y1="84" x2="465" y2="108"/><line x1="560" y1="84" x2="565" y2="108"/><line x1="600" y1="84" x2="650" y2="108"/></g>
+      <rect x="420" y="155" width="260" height="20" rx="5" fill="rgba(45,212,191,.12)" stroke="#2dd4bf"/><text x="550" y="170" text-anchor="middle" fill="#2dd4bf" font-size="10">叶子层：双向链表串起全部数据</text>
+      <g stroke="#324a78" stroke-width="1.3"><line x1="465" y1="130" x2="465" y2="153"/><line x1="565" y1="130" x2="540" y2="153"/><line x1="650" y1="130" x2="620" y2="153"/></g>
+      <text x="560" y="225" text-anchor="middle" fill="#2dd4bf" font-size="11">千万行 → 仅约 3 层 → 3 次 I/O</text>
+    </svg>
+    <figcaption><b>图 2</b> · 节点能存的 key 越多（扇出越大），树越矮，查找读盘次数越少——这是 B+ 树取胜的核心逻辑</figcaption>
+  </figure>
+
+  <div class="note key"><span class="ic">B+ 树为什么最优（三个理由）</span><div>
+    <p><strong>① 非叶子节点不存数据，只存 key + 指针</strong> → 同样大小的页能塞下<em>更多 key</em> → 扇出更大、树更矮 → 读盘更少。这是 B+ 树相对 B 树最关键的改进。<br>
+    <strong>② 所有数据都在叶子节点，且叶子用双向链表相连</strong> → 范围查询（<code>BETWEEN</code>、<code>&gt;</code>、<code>ORDER BY</code>）只需定位起点，然后<em>顺着链表横扫</em>，不必在树里反复回溯。<br>
+    <strong>③ 每次查找路径长度都一样（都走到叶子）</strong> → 查询性能稳定可预测，没有 B 树那种"有的 key 在上层很快、有的在底层很慢"的抖动。</p>
+  </div></div>
+</section>
+
+<!-- ============ 3 ============ -->
+<section id="c3">
+  <div class="chap"><span class="num">03</span><h2>B+ 树的结构详解</h2><div class="rule"></div></div>
+
+  <p>上一章讲清了"为什么"，这一章讲清"长什么样"。InnoDB 的 B+ 树有几个必须记住的结构特征——它们直接决定后面回表、覆盖、范围查询的行为。</p>
+
+  <h3>三类节点</h3>
+  <ul class="bul">
+    <li><strong>根节点（root）</strong>—— 树的入口，常驻内存。每次查找都从这里出发。</li>
+    <li><strong>非叶子节点（internal）</strong>—— 只存<em>索引键 + 指向下层节点的指针</em>，<strong>不存任何行数据</strong>。它们是"路标"，负责把查找逐层导航到正确的叶子。</li>
+    <li><strong>叶子节点（leaf）</strong>—— 存放<em>真正的数据</em>（聚簇索引叶子存整行；二级索引叶子存索引列 + 主键值，见第 5 章）。所有叶子在同一层，且通过<strong>双向链表</strong>按 key 顺序首尾相连。</li>
+  </ul>
+
+  <figure>
+    <svg viewBox="0 0 800 320" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <defs><marker id="ar3i" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#324a78"/></marker></defs>
+      <text x="400" y="24" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">一棵 3 层 B+ 树（查找 key=43 的路径高亮）</text>
+      <!-- root -->
+      <rect x="320" y="44" width="160" height="34" rx="8" fill="#141f3a" stroke="#2dd4bf" stroke-width="2"/>
+      <line x1="373" y1="44" x2="373" y2="78" stroke="#26375c"/><line x1="427" y1="44" x2="427" y2="78" stroke="#26375c"/>
+      <text x="346" y="66" text-anchor="middle" fill="#2dd4bf" font-size="12">20</text>
+      <text x="400" y="66" text-anchor="middle" fill="#5fd38a" font-size="12" font-weight="700">50</text>
+      <text x="454" y="66" text-anchor="middle" fill="#2dd4bf" font-size="12">80</text>
+      <text x="500" y="64" fill="#6b7da3" font-size="10">根（非叶子）</text>
+      <!-- internal level -->
+      <rect x="120" y="130" width="120" height="30" rx="7" fill="#0f1830" stroke="#5b9dff"/><text x="180" y="150" text-anchor="middle" fill="#5b9dff" font-size="11">5 | 12</text>
+      <rect x="340" y="130" width="120" height="30" rx="7" fill="#141f3a" stroke="#5fd38a" stroke-width="1.8"/><text x="400" y="150" text-anchor="middle" fill="#5fd38a" font-size="11">30 | 43</text>
+      <rect x="560" y="130" width="120" height="30" rx="7" fill="#0f1830" stroke="#5b9dff"/><text x="620" y="150" text-anchor="middle" fill="#5b9dff" font-size="11">62 | 71</text>
+      <path d="M360,78 L185,128" stroke="#324a78" stroke-width="1.4" marker-end="url(#ar3i)"/>
+      <path d="M400,78 L400,128" stroke="#5fd38a" stroke-width="2" marker-end="url(#ar3i)"/>
+      <path d="M440,78 L615,128" stroke="#324a78" stroke-width="1.4" marker-end="url(#ar3i)"/>
+      <!-- leaf level -->
+      <g font-size="10">
+      <rect x="60" y="215" width="86" height="28" rx="6" fill="#0a1322" stroke="#324a78"/><text x="103" y="233" text-anchor="middle" fill="#9aabce">5,8,12</text>
+      <rect x="150" y="215" width="86" height="28" rx="6" fill="#0a1322" stroke="#324a78"/><text x="193" y="233" text-anchor="middle" fill="#9aabce">20,26</text>
+      <rect x="305" y="215" width="86" height="28" rx="6" fill="#0a1322" stroke="#324a78"/><text x="348" y="233" text-anchor="middle" fill="#9aabce">30,38</text>
+      <rect x="395" y="215" width="92" height="28" rx="6" fill="rgba(95,211,138,.16)" stroke="#5fd38a" stroke-width="1.8"/><text x="441" y="233" text-anchor="middle" fill="#5fd38a">43,46</text>
+      <rect x="545" y="215" width="86" height="28" rx="6" fill="#0a1322" stroke="#324a78"/><text x="588" y="233" text-anchor="middle" fill="#9aabce">62,68</text>
+      <rect x="635" y="215" width="86" height="28" rx="6" fill="#0a1322" stroke="#324a78"/><text x="678" y="233" text-anchor="middle" fill="#9aabce">71,77</text>
+      </g>
+      <path d="M155,145 L110,213" stroke="#324a78" stroke-width="1.2" marker-end="url(#ar3i)"/>
+      <path d="M375,145 L350,213" stroke="#324a78" stroke-width="1.2" marker-end="url(#ar3i)"/>
+      <path d="M420,145 L441,213" stroke="#5fd38a" stroke-width="2" marker-end="url(#ar3i)"/>
+      <!-- doubly linked leaves -->
+      <line x1="146" y1="229" x2="150" y2="229" stroke="#2dd4bf" stroke-width="2"/>
+      <g stroke="#2dd4bf" stroke-width="1.5" stroke-dasharray="3 3">
+        <line x1="236" y1="252" x2="305" y2="252"/><line x1="391" y1="252" x2="395" y2="252"/><line x1="487" y1="252" x2="545" y2="252"/><line x1="631" y1="252" x2="635" y2="252"/>
+      </g>
+      <text x="400" y="282" text-anchor="middle" fill="#2dd4bf" font-size="11">叶子层双向链表（虚线）：按 key 有序，范围查询沿此横扫</text>
+      <text x="400" y="304" text-anchor="middle" fill="#6b7da3" font-size="11">查 43：根(50→走左) → 内部(43) → 叶子[43,46] 命中，共 3 次定位</text>
+    </svg>
+    <figcaption><b>图 3</b> · B+ 树三层结构：非叶子只做导航，数据全在叶子，叶子用双向链表按序相连</figcaption>
+  </figure>
+
+  <div class="note key"><span class="ic">四个必记特征</span><div>
+    <p><strong>① 数据只在叶子</strong>；非叶子节点的 key 是"分界路标"，会在叶子里重复出现。<br>
+    <strong>② 叶子有序且双向链表相连</strong> → 天然支持范围扫描和 <code>ORDER BY</code> 免排序。<br>
+    <strong>③ 一个节点 = 一个磁盘页（16KB）</strong> → 节点内有多个 key，靠页内二分查找定位。<br>
+    <strong>④ 树高极矮</strong>（通常 2~4 层），所以任意 key 的查找代价几乎恒定，下一章算给你看为什么这么矮。</p>
+  </div></div>
+</section>
+
+<!-- ============ 4 ============ -->
+<section id="c4">
+  <div class="chap"><span class="num">04</span><h2>扇出与树高：3 层为何能存千万行</h2><div class="rule"></div></div>
+
+  <p>"千万行只需 3~4 次 I/O"听起来像魔法，其实是一道乘法题。算清楚它，你就彻底理解了 B+ 树为什么快，也能解释很多调优现象。</p>
+
+  <h3>关键概念：扇出（fan-out）</h3>
+  <p><strong>扇出 = 一个节点能指向多少个子节点</strong>，约等于"一个 16KB 页里能放下多少个 (key + 指针) 条目"。扇出越大，每下降一层覆盖的数据就翻越多倍，树就越矮。</p>
+
+  <h3>一道乘法题（估算）</h3>
+  <pre><code><span class="cm">// 非叶子节点：放 key + 指针</span>
+页大小 = <span class="nm">16KB</span> = <span class="nm">16384</span> 字节
+一个条目 ≈ key(<span class="nm">8</span>B, 如 bigint) + 指针(<span class="nm">6</span>B) = <span class="nm">14</span> 字节
+单个非叶子节点扇出 ≈ 16384 / 14 ≈ <span class="nm">1170</span> 个子节点
+
+<span class="cm">// 叶子节点：放整行（假设一行 1KB）</span>
+单个叶子能放行数 ≈ 16384 / 1024 ≈ <span class="nm">16</span> 行
+
+<span class="cm">// 各层级承载的数据量</span>
+<span class="kw">1 层</span>(只有根，是叶子)            : 16 行
+<span class="kw">2 层</span>(根 + 叶子)    : 1170 × 16        ≈ <span class="nm">1.8 万</span>行
+<span class="kw">3 层</span>(根 + 内部 + 叶子): 1170 × 1170 × 16 ≈ <span class="nm">2190 万</span>行
+<span class="kw">4 层</span>                : 1170³ × 16       ≈ <span class="nm">256 亿</span>行</code></pre>
+
+  <figure>
+    <svg viewBox="0 0 800 220" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <text x="400" y="26" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">树高每 +1 层，容量 × 扇出（约 1170 倍）</text>
+      <!-- bars -->
+      <g font-size="11">
+        <rect x="120" y="50" width="80" height="24" rx="5" fill="#0f1830" stroke="#5b9dff"/><text x="160" y="67" text-anchor="middle" fill="#5b9dff">2 层</text>
+        <text x="220" y="67" fill="#9aabce">≈ 1.8 万行　(1170 × 16)</text>
+
+        <rect x="120" y="95" width="200" height="24" rx="5" fill="#141f3a" stroke="#2dd4bf" stroke-width="1.8"/><text x="220" y="112" text-anchor="middle" fill="#2dd4bf" font-weight="700">3 层 ≈ 2190 万行</text>
+        <text x="335" y="112" fill="#9aabce">(1170² × 16) ← 绝大多数表都在这</text>
+
+        <rect x="120" y="140" width="480" height="24" rx="5" fill="#0f1830" stroke="#b794f6"/><text x="360" y="157" text-anchor="middle" fill="#b794f6">4 层 ≈ 256 亿行 (1170³ × 16)</text>
+      </g>
+      <text x="400" y="196" text-anchor="middle" fill="#6b7da3" font-size="11">所以：一张表只要主键是 bigint，几千万行内树高都只有 3，查找恒定 3 次 I/O（还多半命中缓存）</text>
+    </svg>
+    <figcaption><b>图 4</b> · 扇出约 1170 时，3 层即可容纳约 2190 万行——这就是"千万行 3 次 I/O"的来源</figcaption>
+  </figure>
+
+  <div class="note key"><span class="ic">由此能解释的调优现象</span><div>
+    <p><strong>① 为什么主键不宜过长（如别用长字符串/UUID 当主键）。</strong>主键越长，非叶子节点每个条目越大、扇出越小、树越高、I/O 越多；且二级索引叶子都存主键值（第 5 章），主键长还会让<em>所有二级索引</em>一起变大。<br>
+    <strong>② 为什么根节点和上层节点几乎总在内存里。</strong>就那么几个页，反复访问，Buffer Pool（第二篇）会把它们牢牢缓存，实际 I/O 往往只发生在最底层叶子。<br>
+    <strong>③ 为什么单行过大有害。</strong>行越大，单叶子放的行越少，叶子层页数越多、树可能变高。这也是为什么大字段（TEXT/BLOB）常溢出到独立页存储。</p>
+  </div></div>
+</section>
+
+<!-- ============ 5 ============ -->
+<section id="c5">
+  <div class="chap"><span class="num">05</span><h2>聚簇索引 vs 二级索引</h2><div class="rule"></div></div>
+
+  <p>InnoDB 的表数据本身就是按一棵 B+ 树组织的——<strong>表里所有的索引都是 B+ 树，但叶子里放什么不同</strong>。分清这两类索引，是理解回表、覆盖、最左前缀的前提。</p>
+
+  <h3>聚簇索引 Clustered Index（主键索引）</h3>
+  <p>每张 InnoDB 表<strong>有且仅有一棵聚簇索引</strong>，它的叶子节点直接存放<strong>整行数据</strong>。也就是说——<em>聚簇索引就是表本身，数据按主键顺序物理存放在它的叶子里</em>。主键选取规则：有主键用主键；没主键找第一个非空唯一索引；都没有则用隐藏的 <code>DB_ROW_ID</code>（第四篇提过）。</p>
+
+  <h3>二级索引 Secondary Index（辅助索引 / 非聚簇索引）</h3>
+  <p>除主键外的每个索引都是二级索引，它也是一棵 B+ 树，但叶子节点存的是<strong>索引列的值 + 该行的主键值</strong>，<em>不存整行数据</em>。</p>
+
+  <figure>
+    <svg viewBox="0 0 800 310" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <text x="400" y="24" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">同一张 user 表的两棵 B+ 树（PK=id，二级索引在 name 上）</text>
+      <!-- clustered -->
+      <text x="210" y="54" text-anchor="middle" fill="#2dd4bf" font-size="13" font-weight="700">聚簇索引（按 id）· 叶子=整行</text>
+      <rect x="150" y="62" width="120" height="26" rx="6" fill="#141f3a" stroke="#2dd4bf"/><text x="210" y="80" text-anchor="middle" fill="#2dd4bf" font-size="11">10 | 30</text>
+      <g font-size="9.5">
+      <rect x="60" y="120" width="150" height="60" rx="7" fill="#0f1830" stroke="#5b9dff"/>
+      <text x="68" y="138" fill="#9aabce">id=10</text><text x="68" y="152" fill="#d7e0f2">name=Bob</text><text x="68" y="166" fill="#d7e0f2">age=25, city=NY</text>
+      <rect x="220" y="120" width="150" height="60" rx="7" fill="#0f1830" stroke="#5b9dff"/>
+      <text x="228" y="138" fill="#9aabce">id=30</text><text x="228" y="152" fill="#d7e0f2">name=Amy</text><text x="228" y="166" fill="#d7e0f2">age=31, city=LA</text>
+      </g>
+      <line x1="190" y1="88" x2="135" y2="118" stroke="#324a78"/><line x1="230" y1="88" x2="295" y2="118" stroke="#324a78"/>
+      <text x="210" y="200" text-anchor="middle" fill="#5fd38a" font-size="10">叶子直接拿到整行，无需再找</text>
+      <!-- secondary -->
+      <text x="600" y="54" text-anchor="middle" fill="#f5b955" font-size="13" font-weight="700">二级索引（按 name）· 叶子=name+主键</text>
+      <rect x="540" y="62" width="120" height="26" rx="6" fill="#141f3a" stroke="#f5b955"/><text x="600" y="80" text-anchor="middle" fill="#f5b955" font-size="11">Amy | Bob</text>
+      <g font-size="10">
+      <rect x="450" y="120" width="140" height="44" rx="7" fill="#0f1830" stroke="#f5b955"/>
+      <text x="458" y="138" fill="#d7e0f2">name=Amy</text><text x="458" y="154" fill="#f0697a">→ 主键 id=30</text>
+      <rect x="600" y="120" width="140" height="44" rx="7" fill="#0f1830" stroke="#f5b955"/>
+      <text x="608" y="138" fill="#d7e0f2">name=Bob</text><text x="608" y="154" fill="#f0697a">→ 主键 id=10</text>
+      </g>
+      <line x1="580" y1="88" x2="520" y2="118" stroke="#324a78"/><line x1="620" y1="88" x2="670" y2="118" stroke="#324a78"/>
+      <text x="600" y="184" text-anchor="middle" fill="#f0697a" font-size="10">只拿到主键，要 age/city 还得回聚簇索引查</text>
+      <!-- arrow back -->
+      <path d="M520,142 C400,250 250,250 200,182" stroke="#f0697a" stroke-width="2" stroke-dasharray="5 4" fill="none" marker-end="url(#ar5x)"/>
+      <defs><marker id="ar5x" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#f0697a"/></marker></defs>
+      <text x="400" y="270" text-anchor="middle" fill="#f0697a" font-size="11">虚线 = 回表：拿二级索引里的主键，再去聚簇索引取整行（第 7 章）</text>
+    </svg>
+    <figcaption><b>图 5</b> · 聚簇索引叶子放整行；二级索引叶子只放索引列 + 主键，取其它列需"回表"</figcaption>
+  </figure>
+
+  <div class="note key"><span class="ic">一句话区分</span><div>
+    <p><strong>聚簇索引的叶子 = 数据本身；二级索引的叶子 = 一张"索引列 → 主键"的对照表。</strong>走聚簇索引找到叶子就拿到全部列；走二级索引找到叶子只拿到主键，缺的列必须拿主键再去聚簇索引里捞一次。这个"再捞一次"就是回表。</p>
+  </div></div>
+</section>
+
+<!-- ============ 6 ============ -->
+<section id="c6">
+  <div class="chap"><span class="num">06</span><h2>为什么二级索引存主键而非行指针</h2><div class="rule"></div></div>
+
+  <p>这是一个高频原理追问：<strong>二级索引叶子为什么存"主键值"，而不直接存一个指向数据行物理位置的指针（地址）？</strong>用指针不是更快、能一步到位吗？答案揭示了 InnoDB 的一个核心设计权衡。</p>
+
+  <h3>假如存物理指针会怎样</h3>
+  <p>聚簇索引的叶子里存的是整行数据，而 InnoDB 的行<strong>会移动</strong>：页分裂、页合并、行更新导致变长放不下而迁移……每当一行的物理位置变化，所有指向它的"物理指针"都会失效。如果二级索引存的是物理地址，那么<strong>每移动一行，就要去更新所有二级索引里指向它的指针</strong>——一张表有 N 个二级索引，代价高到无法接受。</p>
+
+  <figure>
+    <svg viewBox="0 0 800 230" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <text x="400" y="24" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">行发生物理移动时，两种设计的代价</text>
+      <!-- pointer design -->
+      <rect x="40" y="46" width="340" height="160" rx="12" fill="#0f1830" stroke="#9b2c3a" stroke-width="1.5"/>
+      <text x="210" y="70" text-anchor="middle" fill="#f0697a" font-size="12" font-weight="700">若存物理指针（假想）</text>
+      <rect x="60" y="86" width="120" height="26" rx="6" fill="#0a1322" stroke="#324a78"/><text x="120" y="103" text-anchor="middle" fill="#9aabce" font-size="10">二级索引 idx_a</text>
+      <rect x="60" y="120" width="120" height="26" rx="6" fill="#0a1322" stroke="#324a78"/><text x="120" y="137" text-anchor="middle" fill="#9aabce" font-size="10">二级索引 idx_b</text>
+      <rect x="60" y="154" width="120" height="26" rx="6" fill="#0a1322" stroke="#324a78"/><text x="120" y="171" text-anchor="middle" fill="#9aabce" font-size="10">二级索引 idx_c</text>
+      <rect x="250" y="120" width="110" height="26" rx="6" fill="rgba(240,105,122,.16)" stroke="#f0697a"/><text x="305" y="137" text-anchor="middle" fill="#f0697a" font-size="10">行移动了</text>
+      <g stroke="#f0697a" stroke-width="1.5" stroke-dasharray="4 3"><line x1="180" y1="99" x2="248" y2="128"/><line x1="180" y1="133" x2="248" y2="133"/><line x1="180" y1="167" x2="248" y2="138"/></g>
+      <text x="210" y="200" text-anchor="middle" fill="#f0697a" font-size="10">每个索引的指针都要改！</text>
+      <!-- PK design -->
+      <rect x="420" y="46" width="340" height="160" rx="12" fill="#141f3a" stroke="#2dd4bf" stroke-width="2"/>
+      <text x="590" y="70" text-anchor="middle" fill="#2dd4bf" font-size="12" font-weight="700">InnoDB 实际：存主键值</text>
+      <rect x="440" y="86" width="120" height="26" rx="6" fill="#0a1322" stroke="#324a78"/><text x="500" y="103" text-anchor="middle" fill="#9aabce" font-size="10">idx_a → PK</text>
+      <rect x="440" y="120" width="120" height="26" rx="6" fill="#0a1322" stroke="#324a78"/><text x="500" y="137" text-anchor="middle" fill="#9aabce" font-size="10">idx_b → PK</text>
+      <rect x="440" y="154" width="120" height="26" rx="6" fill="#0a1322" stroke="#324a78"/><text x="500" y="171" text-anchor="middle" fill="#9aabce" font-size="10">idx_c → PK</text>
+      <rect x="630" y="120" width="110" height="26" rx="6" fill="rgba(45,212,191,.14)" stroke="#2dd4bf"/><text x="685" y="137" text-anchor="middle" fill="#2dd4bf" font-size="10">行移动了</text>
+      <g stroke="#2dd4bf" stroke-width="1.3"><line x1="560" y1="99" x2="628" y2="128"/><line x1="560" y1="133" x2="628" y2="133"/><line x1="560" y1="167" x2="628" y2="138"/></g>
+      <text x="590" y="200" text-anchor="middle" fill="#5fd38a" font-size="10">主键值没变 → 二级索引一个都不用动</text>
+    </svg>
+    <figcaption><b>图 6</b> · 存主键的设计：行物理位置变化时，主键值不变，所有二级索引无需更新</figcaption>
+  </figure>
+
+  <div class="note key"><span class="ic">设计权衡的本质</span><div>
+    <p>存主键值，相当于加了一层<strong>稳定的逻辑标识</strong>：物理位置怎么变，主键不变，二级索引指向的就永远有效。<strong>代价是查询时多一次回表</strong>（拿主键再查聚簇索引），<strong>收益是写入时二级索引维护成本极低</strong>。InnoDB 选择了"写得省 + 用主键解耦"，把查找的那点开销留给"回表"——而回表又可以用覆盖索引（第 8 章）来避免。这是一个非常典型的"用一点读代价换大量写代价 + 结构稳定性"的工程权衡。</p>
+  </div></div>
+</section>
+
+<!-- ============ 7 ============ -->
+<section id="c7">
+  <div class="chap"><span class="num">07</span><h2>回表 Table Lookup</h2><div class="rule"></div></div>
+
+  <p>有了第 5、6 章的铺垫，回表就一目了然了。<strong>回表 = 通过二级索引拿到主键后，再用主键去聚簇索引查出完整行</strong>。它本质是<em>走了两棵 B+ 树</em>。</p>
+
+  <h3>一次回表查询的完整路径</h3>
+  <p>以 <code>SELECT * FROM user WHERE name = 'Bob'</code>（name 上有二级索引）为例：</p>
+
+  <figure>
+    <svg viewBox="0 0 800 210" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <defs><marker id="ar7i" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#5b9dff"/></marker></defs>
+      <text x="400" y="26" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">SELECT * WHERE name='Bob' 的回表过程</text>
+      <rect x="30" y="60" width="170" height="90" rx="10" fill="#0f1830" stroke="#f5b955" stroke-width="1.5"/>
+      <text x="115" y="84" text-anchor="middle" fill="#f5b955" font-size="12" font-weight="700">① 查 name 索引树</text>
+      <text x="48" y="108" fill="#d7e0f2" font-size="11">定位 name='Bob'</text>
+      <text x="48" y="130" fill="#f0697a" font-size="11">叶子 → 拿到 id=10</text>
+      <rect x="315" y="60" width="170" height="90" rx="10" fill="#0f1830" stroke="#2dd4bf" stroke-width="1.5"/>
+      <text x="400" y="84" text-anchor="middle" fill="#2dd4bf" font-size="12" font-weight="700">② 查聚簇索引树</text>
+      <text x="333" y="108" fill="#d7e0f2" font-size="11">用 id=10 定位</text>
+      <text x="333" y="130" fill="#5fd38a" font-size="11">叶子 → 拿到整行</text>
+      <rect x="600" y="60" width="170" height="90" rx="10" fill="#141f3a" stroke="#5fd38a" stroke-width="1.8"/>
+      <text x="685" y="84" text-anchor="middle" fill="#5fd38a" font-size="12" font-weight="700">③ 返回结果</text>
+      <text x="618" y="108" fill="#d7e0f2" font-size="11">name,age,city...</text>
+      <text x="618" y="130" fill="#9aabce" font-size="11">完整行返回客户端</text>
+      <path d="M200,105 L313,105" stroke="#5b9dff" stroke-width="2" fill="none" marker-end="url(#ar7i)"/>
+      <text x="256" y="98" text-anchor="middle" fill="#f0697a" font-size="10">回表</text>
+      <path d="M485,105 L598,105" stroke="#5b9dff" stroke-width="2" fill="none" marker-end="url(#ar7i)"/>
+      <text x="400" y="184" text-anchor="middle" fill="#6b7da3" font-size="11">两次 B+ 树查找：name 树（约 3 次 I/O）+ 聚簇树（约 3 次 I/O）</text>
+    </svg>
+    <figcaption><b>图 7</b> · 回表是两棵树的接力：二级索引树给出主键，聚簇索引树给出整行</figcaption>
+  </figure>
+
+  <div class="note warn"><span class="ic">回表的代价与放大</span><div>
+    <p>单次回表只是多一棵树的查找，看似不贵。但<strong>当二级索引命中很多行时，每一行都要回表一次</strong>——例如 <code>WHERE name LIKE 'B%'</code> 命中 1 万行，就是 1 万次随机回表，I/O 被放大上万倍。这就是为什么优化器有时<em>宁可全表扫描也不走二级索引</em>：当预估命中行数占比较大时，大量随机回表反而比顺序全扫更慢。理解这一点，就能理解很多"明明有索引却没走"的现象（详见第 11 章 EXPLAIN）。</p>
+  </div></div>
+
+  <div class="note key"><span class="ic">承上启下</span><div>
+    <p>回表的代价能不能干脆消掉？能——<strong>如果二级索引的叶子里已经包含了查询需要的所有列，就根本不用回聚簇索引。</strong>这就是下一章的覆盖索引。</p>
+  </div></div>
+</section>
+
+<!-- ============ 8 ============ -->
+<section id="c8">
+  <div class="chap"><span class="num">08</span><h2>覆盖索引 Covering Index</h2><div class="rule"></div></div>
+
+  <p><strong>覆盖索引（covering index）不是一种特殊的索引类型，而是一种"查询恰好被索引覆盖"的状态</strong>：当一个查询所需的<em>全部列</em>都能从某个二级索引的叶子里直接取到时，就无需回表——这个二级索引"覆盖"了该查询。</p>
+
+  <h3>对比：回表 vs 覆盖</h3>
+  <p>设 name 上有二级索引（叶子含 name + 主键 id）：</p>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>查询</th><th>需要的列</th><th>二级索引能否提供</th><th>结果</th></tr></thead>
+      <tbody>
+        <tr><td><code>SELECT * WHERE name='Bob'</code></td><td>所有列（含 age、city）</td><td class="no">不能（叶子只有 name、id）</td><td class="no">回表</td></tr>
+        <tr><td><code>SELECT id WHERE name='Bob'</code></td><td>id</td><td class="yes">能（叶子就有 id）</td><td class="yes">覆盖，免回表</td></tr>
+        <tr><td><code>SELECT id,name WHERE name='Bob'</code></td><td>id、name</td><td class="yes">能（叶子两者都有）</td><td class="yes">覆盖，免回表</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <figure>
+    <svg viewBox="0 0 800 200" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <text x="400" y="26" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">覆盖索引：查到二级索引叶子即返回，省掉聚簇索引那一棵</text>
+      <rect x="60" y="55" width="200" height="80" rx="10" fill="#0f1830" stroke="#f5b955" stroke-width="1.5"/>
+      <text x="160" y="80" text-anchor="middle" fill="#f5b955" font-size="12" font-weight="700">查 name 索引树</text>
+      <text x="78" y="104" fill="#d7e0f2" font-size="11">定位 name='Bob'</text>
+      <text x="78" y="124" fill="#5fd38a" font-size="11">叶子含 name + id</text>
+      <rect x="540" y="55" width="200" height="80" rx="10" fill="#141f3a" stroke="#5fd38a" stroke-width="1.8"/>
+      <text x="640" y="80" text-anchor="middle" fill="#5fd38a" font-size="12" font-weight="700">直接返回 id,name</text>
+      <text x="558" y="104" fill="#d7e0f2" font-size="11">所需列已齐全</text>
+      <text x="558" y="124" fill="#5fd38a" font-size="11">无需回表 ✓</text>
+      <path d="M260,95 L538,95" stroke="#5fd38a" stroke-width="2" fill="none" marker-end="url(#ar8c)"/>
+      <defs><marker id="ar8c" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#5fd38a"/></marker></defs>
+      <!-- crossed-out clustered -->
+      <rect x="320" y="65" width="160" height="60" rx="10" fill="#0a1322" stroke="#324a78" stroke-dasharray="4 3"/>
+      <text x="400" y="92" text-anchor="middle" fill="#6b7da3" font-size="11">聚簇索引树</text>
+      <line x1="328" y1="70" x2="472" y2="120" stroke="#f0697a" stroke-width="2"/>
+      <text x="400" y="112" text-anchor="middle" fill="#f0697a" font-size="10">跳过！</text>
+    </svg>
+    <figcaption><b>图 8</b> · 覆盖索引让查询在二级索引这一棵树里就结束，省掉回表的整棵聚簇树查找</figcaption>
+  </figure>
+
+  <div class="note key"><span class="ic">价值与识别</span><div>
+    <p><strong>价值：</strong>对命中行多的查询，覆盖索引把"每行一次随机回表"全部省掉，性能提升常常是数量级的。<br>
+    <strong>识别：</strong>EXPLAIN 的 <code>Extra</code> 列出现 <code>Using index</code>，就代表用上了覆盖索引（注意别和 <code>Using index condition</code> 即 ICP 混淆，见第 10 章）。<br>
+    <strong>实践：</strong>把高频查询常用的<em>返回列</em>也放进联合索引（哪怕它们不参与 WHERE），就能制造覆盖索引——这是"用索引宽度换免回表"的经典手法，但要权衡索引变大带来的写入与存储成本。</p>
+  </div></div>
+</section>
+
+<!-- ============ 9 ============ -->
+<section id="c9">
+  <div class="chap"><span class="num">09</span><h2>联合索引与最左前缀</h2><div class="rule"></div></div>
+
+  <p>联合索引（复合索引）是把多个列组合成一个索引，如 <code>INDEX idx(a, b, c)</code>。它最重要、也最容易踩坑的规则就是<strong>最左前缀原则（leftmost prefix）</strong>。要真正理解它，必须先看清联合索引<em>是怎么排序的</em>——这才是原理。</p>
+
+  <h3>原理：联合索引按"列顺序"逐级排序</h3>
+  <p><code>idx(a, b, c)</code> 的 B+ 树叶子，是<strong>先按 a 排序；a 相同的再按 b 排序；a、b 都相同的再按 c 排序</strong>。就像电话簿按"姓 → 名 → 中间名"排。关键推论：<strong>只有当左边的列是"确定值"时，右边的列才在局部有序，才能用于索引查找。</strong></p>
+
+  <figure>
+    <svg viewBox="0 0 800 240" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <text x="400" y="24" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">idx(a,b,c) 叶子的排序：a 全局有序，b 在 a 内有序，c 在 (a,b) 内有序</text>
+      <g font-size="12">
+        <!-- header -->
+        <rect x="120" y="44" width="180" height="28" rx="5" fill="#141f3a" stroke="#2dd4bf"/><text x="210" y="63" text-anchor="middle" fill="#2dd4bf">a（全局有序）</text>
+        <rect x="310" y="44" width="180" height="28" rx="5" fill="#141f3a" stroke="#5b9dff"/><text x="400" y="63" text-anchor="middle" fill="#5b9dff">b（a 相同内有序）</text>
+        <rect x="500" y="44" width="180" height="28" rx="5" fill="#141f3a" stroke="#b794f6"/><text x="590" y="63" text-anchor="middle" fill="#b794f6">c（a,b 相同内有序）</text>
+        <!-- rows -->
+        <g fill="#d7e0f2">
+        <text x="210" y="98" text-anchor="middle">1</text><text x="400" y="98" text-anchor="middle">10</text><text x="590" y="98" text-anchor="middle">100</text>
+        <text x="210" y="122" text-anchor="middle">1</text><text x="400" y="122" text-anchor="middle">10</text><text x="590" y="122" text-anchor="middle">200</text>
+        <text x="210" y="146" text-anchor="middle">1</text><text x="400" y="146" text-anchor="middle">20</text><text x="590" y="146" text-anchor="middle">100</text>
+        <text x="210" y="170" text-anchor="middle">2</text><text x="400" y="170" text-anchor="middle">10</text><text x="590" y="170" text-anchor="middle">300</text>
+        <text x="210" y="194" text-anchor="middle">2</text><text x="400" y="194" text-anchor="middle">30</text><text x="590" y="194" text-anchor="middle">100</text>
+        </g>
+        <line x1="120" y1="106" x2="680" y2="106" stroke="#26375c"/>
+        <line x1="120" y1="130" x2="680" y2="130" stroke="#26375c"/>
+        <line x1="120" y1="154" x2="680" y2="154" stroke="#26375c"/>
+        <line x1="120" y1="178" x2="680" y2="178" stroke="#26375c"/>
+      </g>
+      <text x="400" y="226" text-anchor="middle" fill="#f5b955" font-size="11">看 c 列：100,200,100,300,100 —— 整体无序！只有锁定 a、b 后（如 a=1,b=10）c 才有序(100,200)</text>
+    </svg>
+    <figcaption><b>图 9</b> · c 列整体是乱的，只有在 a、b 都确定的"小段"内才有序——这就是最左前缀的根因</figcaption>
+  </figure>
+
+  <h3>哪些查询能用 idx(a,b,c)</h3>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>查询条件</th><th>能用到的索引列</th><th>说明</th></tr></thead>
+      <tbody>
+        <tr><td><code>a=1</code></td><td class="yes">a</td><td>用最左列，有效</td></tr>
+        <tr><td><code>a=1 AND b=10</code></td><td class="yes">a, b</td><td>连续从左用，有效</td></tr>
+        <tr><td><code>a=1 AND b=10 AND c=100</code></td><td class="yes">a, b, c</td><td>全用上，最佳</td></tr>
+        <tr><td><code>b=10</code>（跳过 a）</td><td class="no">用不上</td><td>缺最左列 a，c 整体无序，索引失效</td></tr>
+        <tr><td><code>a=1 AND c=100</code>（跳过 b）</td><td class="mid">仅 a</td><td>a 有效定位后，c 在该段无序 → c 用不上索引（但 ICP 可优化，见第 10 章）</td></tr>
+        <tr><td><code>a&gt;1 AND b=10</code>（a 用范围）</td><td class="mid">仅 a</td><td>a 是范围，其后 b 在跨多个 a 段里无序 → b 用不上</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note key"><span class="ic">两条铁律</span><div>
+    <p><strong>① 必须从最左列开始、且中间不能断。</strong>跳过 a 直接查 b，或跳过 b 用 c，被跳过列右边的部分都无法走索引——因为它们在全局是无序的。<br>
+    <strong>② 范围查询（&gt; &lt; LIKE BETWEEN）会"中止"后续列的索引能力。</strong>一旦某列用了范围，它<em>本身能用索引</em>，但它<em>右边的列</em>就无法再用索引定位了（因为范围跨越了多个段，段内才有序）。<br>
+    <strong>实践推论：</strong>设计联合索引时，把<em>等值查询、区分度高</em>的列放左边，把<em>范围查询</em>的列放右边，能最大化索引利用。</p>
+  </div></div>
+</section>
+
+<!-- ============ 10 ============ -->
+<section id="c10">
+  <div class="chap"><span class="num">10</span><h2>索引下推 ICP（Index Condition Pushdown）</h2><div class="rule"></div></div>
+
+  <p>ICP 是 MySQL 5.6 引入的优化，专门<strong>减少回表次数</strong>。它和最左前缀的"失效"场景密切相关，理解它能解释很多"看似用不上索引的列其实帮了忙"的现象。</p>
+
+  <h3>没有 ICP 时的浪费</h3>
+  <p>考虑 <code>idx(a, b)</code> 和查询 <code>WHERE a='X' AND b LIKE '%abc'</code>。<code>b</code> 是后缀模糊，按第 9 章规则<em>不能用于索引定位</em>。没有 ICP 时：存储引擎只用 <code>a='X'</code> 在索引里筛出一批记录，<strong>把它们全部回表</strong>取出整行，再交给 Server 层逐行判断 <code>b LIKE '%abc'</code>。大量不满足 b 条件的行被白白回表了。</p>
+
+  <h3>有 ICP：把 b 的判断"下推"到索引层</h3>
+  <p>ICP 让存储引擎在<strong>回表之前</strong>，就用索引里现成的 <code>b</code> 值先过滤一遍——<em>b 虽然不能用于"定位"，但它的值就在索引叶子里，拿来"过滤"是免费的</em>。只有 a、b 都满足的记录才回表。</p>
+
+  <figure>
+    <svg viewBox="0 0 800 240" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <text x="400" y="22" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">WHERE a='X' AND b LIKE '%abc' 的回表次数对比</text>
+      <!-- without ICP -->
+      <text x="20" y="58" fill="#f0697a" font-size="12" font-weight="700">无 ICP</text>
+      <rect x="110" y="44" width="120" height="28" rx="6" fill="#0f1830" stroke="#f5b955"/><text x="170" y="62" text-anchor="middle" fill="#f5b955" font-size="10">索引筛 a='X'</text>
+      <rect x="270" y="44" width="160" height="28" rx="6" fill="rgba(240,105,122,.16)" stroke="#f0697a"/><text x="350" y="62" text-anchor="middle" fill="#f0697a" font-size="10">100 行全部回表</text>
+      <rect x="470" y="44" width="180" height="28" rx="6" fill="#0f1830" stroke="#324a78"/><text x="560" y="62" text-anchor="middle" fill="#9aabce" font-size="10">Server 判 b → 仅 5 行命中</text>
+      <path d="M230,58 L268,58" stroke="#324a78" stroke-width="1.5" marker-end="url(#ar10c)"/>
+      <path d="M430,58 L468,58" stroke="#324a78" stroke-width="1.5" marker-end="url(#ar10c)"/>
+      <defs><marker id="ar10c" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#324a78"/></marker></defs>
+      <text x="380" y="92" text-anchor="middle" fill="#f0697a" font-size="10">回表 100 次，95 次是浪费</text>
+      <line x1="60" y1="115" x2="740" y2="115" stroke="#26375c" stroke-dasharray="3 4"/>
+      <!-- with ICP -->
+      <text x="20" y="152" fill="#5fd38a" font-size="12" font-weight="700">有 ICP</text>
+      <rect x="110" y="138" width="120" height="28" rx="6" fill="#0f1830" stroke="#f5b955"/><text x="170" y="156" text-anchor="middle" fill="#f5b955" font-size="10">索引筛 a='X'</text>
+      <rect x="270" y="138" width="180" height="28" rx="6" fill="rgba(45,212,191,.14)" stroke="#2dd4bf"/><text x="360" y="156" text-anchor="middle" fill="#2dd4bf" font-size="10">索引层先用 b 过滤</text>
+      <rect x="490" y="138" width="160" height="28" rx="6" fill="rgba(95,211,138,.16)" stroke="#5fd38a"/><text x="570" y="156" text-anchor="middle" fill="#5fd38a" font-size="10">仅 5 行回表</text>
+      <path d="M230,152 L268,152" stroke="#324a78" stroke-width="1.5" marker-end="url(#ar10c)"/>
+      <path d="M450,152 L488,152" stroke="#324a78" stroke-width="1.5" marker-end="url(#ar10c)"/>
+      <text x="380" y="186" text-anchor="middle" fill="#5fd38a" font-size="10">回表 5 次，省掉 95 次随机 I/O</text>
+      <text x="400" y="222" text-anchor="middle" fill="#6b7da3" font-size="11">关键：b 的值本就在索引叶子里，下推到引擎层"先过滤再回表"几乎零成本</text>
+    </svg>
+    <figcaption><b>图 10</b> · ICP 把能在索引层判断的条件"下推"，在回表前过滤掉无关行，大幅减少随机 I/O</figcaption>
+  </figure>
+
+  <div class="note key"><span class="ic">要点</span><div>
+    <p><strong>① 触发条件：</strong>查询用到二级索引，且 WHERE 里有<em>能用该索引列、但不能用于定位</em>的条件（如后缀 LIKE、跳列的等值）。<br>
+    <strong>② 识别：</strong>EXPLAIN 的 <code>Extra</code> 显示 <code>Using index condition</code>（注意与覆盖索引的 <code>Using index</code> 区分——前者下推过滤但仍可能回表，后者根本不回表）。<br>
+    <strong>③ 本质：</strong>ICP 不改变"哪些列能定位"，它改变的是"在哪一层过滤"——把过滤从昂贵的回表之后，提前到便宜的索引扫描之时。这是第 9 章"跳列的右侧条件用不上索引"的一个重要补救。</p>
+  </div></div>
+</section>
+
+<!-- ============ 11 ============ -->
+<section id="c11">
+  <div class="chap"><span class="num">11</span><h2>执行计划 EXPLAIN 详解</h2><div class="rule"></div></div>
+
+  <p>前面讲的都是"索引该怎么走"，<code>EXPLAIN</code> 则告诉你优化器<strong>实际打算怎么走</strong>。在 SQL 前加 <code>EXPLAIN</code>，不真正执行，只返回执行计划。读懂它是索引调优的基本功。</p>
+
+  <h3>最该看的几列</h3>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>列</th><th>含义</th><th>重点关注</th></tr></thead>
+      <tbody>
+        <tr><td><code>type</code></td><td>访问类型（性能等级）</td><td><strong>最重要</strong>。见下方梯子，越靠左越好</td></tr>
+        <tr><td><code>key</code></td><td>实际使用的索引</td><td><code>NULL</code> = 没走索引，需警惕</td></tr>
+        <tr><td><code>key_len</code></td><td>使用的索引长度（字节）</td><td>判断联合索引<em>用到了几列</em>的关键</td></tr>
+        <tr><td><code>rows</code></td><td>预估要扫描的行数</td><td>越小越好；与实际差太大说明统计信息过期</td></tr>
+        <tr><td><code>Extra</code></td><td>额外信息</td><td><code>Using index</code>=覆盖；<code>Using index condition</code>=ICP；<code>Using filesort</code>/<code>Using temporary</code>=要警惕</td></tr>
+        <tr><td><code>possible_keys</code></td><td>可能可用的索引</td><td>与 key 对比，看优化器为何没选某索引</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>type 性能梯子（从好到差）</h3>
+  <figure>
+    <svg viewBox="0 0 800 175" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <text x="400" y="24" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">type 访问类型：从左（最优）到右（最差）</text>
+      <defs><linearGradient id="grad11" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#15803d"/><stop offset="0.5" stop-color="#b45309"/><stop offset="1" stop-color="#9b2c3a"/></linearGradient></defs>
+      <rect x="40" y="50" width="720" height="14" rx="7" fill="url(#grad11)"/>
+      <g font-size="11" text-anchor="middle">
+        <text x="80" y="90" fill="#5fd38a">const</text><text x="80" y="106" fill="#6b7da3" font-size="9">主键/唯一等值</text>
+        <text x="175" y="90" fill="#5fd38a">eq_ref</text><text x="175" y="106" fill="#6b7da3" font-size="9">连接唯一匹配</text>
+        <text x="270" y="90" fill="#9fd17a">ref</text><text x="270" y="106" fill="#6b7da3" font-size="9">普通索引等值</text>
+        <text x="375" y="90" fill="#f5b955">range</text><text x="375" y="106" fill="#6b7da3" font-size="9">索引范围扫描</text>
+        <text x="480" y="90" fill="#f5b955">index</text><text x="480" y="106" fill="#6b7da3" font-size="9">扫整棵索引树</text>
+        <text x="600" y="90" fill="#f0697a">ALL</text><text x="600" y="106" fill="#6b7da3" font-size="9">全表扫描 ✗</text>
+      </g>
+      <g stroke="#26375c"><line x1="80" y1="64" x2="80" y2="74"/><line x1="175" y1="64" x2="175" y2="74"/><line x1="270" y1="64" x2="270" y2="74"/><line x1="375" y1="64" x2="375" y2="74"/><line x1="480" y1="64" x2="480" y2="74"/><line x1="600" y1="64" x2="600" y2="74"/></g>
+      <text x="400" y="148" text-anchor="middle" fill="#9aabce" font-size="11">调优目标：尽量做到 ref 或更好；看到 ALL 或大 rows 的 index，通常是要加/改索引的信号</text>
+      <text x="400" y="166" text-anchor="middle" fill="#6b7da3" font-size="10">（还有 system / index_merge 等，此处略；system 是 const 的特例，最优）</text>
+    </svg>
+    <figcaption><b>图 11</b> · type 等级梯：const/eq_ref/ref 是好结果，range 可接受，index/ALL 多半要优化</figcaption>
+  </figure>
+
+  <div class="note key"><span class="ic">用 key_len 反推用了几列</span><div>
+    <p><code>key_len</code> 是个常被忽略但极有用的列。联合索引 <code>idx(a,b,c)</code>，若 a、b、c 都是 <code>int NOT NULL</code>（各 4 字节），那么 <code>key_len=4</code> 说明只用到 a，<code>=8</code> 说明用到 a、b，<code>=12</code> 说明三列全用。<strong>当你怀疑"最左前缀没生效"时，看 key_len 比看 key 更能确认到底吃进了几列。</strong>（可空列 +1 字节存 NULL 标记，变长列还要算长度前缀，计算时需留意。）</p>
+  </div></div>
+</section>
+
+<!-- ============ 12 ============ -->
+<section id="c12">
+  <div class="chap"><span class="num">12</span><h2>索引失效的常见场景</h2><div class="rule"></div></div>
+
+  <p>"明明建了索引，怎么没走？"几乎都能归到下面几类。它们的共同原理是：<strong>破坏了索引列的有序性，或让优化器无法利用这种有序性。</strong></p>
+
+  <div class="tbl">
+    <table>
+      <thead><tr><th>失效场景</th><th>例子</th><th>原理</th></tr></thead>
+      <tbody>
+        <tr><td><strong>对索引列做运算/函数</strong></td><td><code>WHERE YEAR(t)=2024</code><br><code>WHERE id+1=5</code></td><td>索引存的是<em>原始值</em>的有序结构；列被函数包裹后，有序性对函数结果不再成立 → 只能全扫</td></tr>
+        <tr><td><strong>隐式类型转换</strong></td><td>phone 是 varchar，却 <code>WHERE phone=138...</code>（传数字）</td><td>MySQL 把列<em>转成数字</em>再比，等价于对列做了函数 → 失效</td></tr>
+        <tr><td><strong>前导通配 LIKE</strong></td><td><code>WHERE name LIKE '%bob'</code></td><td>B+ 树按前缀有序，<em>不知道开头是什么</em>就无法定位 → 失效（<code>'bob%'</code> 则可用）</td></tr>
+        <tr><td><strong>违反最左前缀</strong></td><td>idx(a,b)，<code>WHERE b=1</code></td><td>见第 9 章，缺最左列 → 失效</td></tr>
+        <tr><td><strong>OR 连接非索引列</strong></td><td><code>WHERE a=1 OR d=2</code>（d 无索引）</td><td>OR 要求两边都能用索引，否则退化全扫（可用 UNION 改写）</td></tr>
+        <tr><td><strong>区分度太低 / 命中过多</strong></td><td><code>WHERE gender='M'</code></td><td>优化器估算走索引要回表的行数太多，<em>主动放弃</em>索引改全扫（这是优化器的正确选择，非 bug）</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note warn"><span class="ic">两个澄清</span><div>
+    <p><strong>① "索引失效"有两种性质，别混。</strong>前四类是<em>规则上根本用不了</em>（有序性被破坏）；后两类是<em>优化器算了一笔账后主动不用</em>（用了反而更慢）。后者是优化器在帮你，不要硬逼它走索引。<br>
+    <strong>② 函数失效在 8.0 有解。</strong>MySQL 8.0 支持<strong>函数索引</strong>，可对 <code>YEAR(t)</code> 这类表达式直接建索引；或改写查询为范围条件（如 <code>t &gt;= '2024-01-01' AND t &lt; '2025-01-01'</code>）让原始列索引重新生效。</p>
+  </div></div>
+</section>
+
+<!-- ============ 13 ============ -->
+<section id="c13">
+  <div class="chap"><span class="num">13</span><h2>索引设计原则</h2><div class="rule"></div></div>
+
+  <p>把前面的原理落到实践，索引设计有几条经得起推敲的准则：</p>
+
+  <ul class="bul">
+    <li><strong>选区分度高的列建索引。</strong>区分度（cardinality / 总行数）越接近 1 越好。性别、状态这类只有几个取值的列单独建索引意义不大（命中太多、还要回表，优化器多半不走）。</li>
+    <li><strong>联合索引优于多个单列索引。</strong>一个 <code>idx(a,b,c)</code> 能服务 a、(a,b)、(a,b,c) 三种前缀查询，比建三个单列索引更省、更易命中覆盖与最左前缀。MySQL 对多个单列索引一般也只能用其一（或 index_merge，效率有限）。</li>
+    <li><strong>把等值列放左、范围列放右。</strong>承接第 9 章铁律：范围列会中止其右侧列的索引能力，所以让范围列尽量靠右。</li>
+    <li><strong>用覆盖索引消除高频查询的回表。</strong>把高频查询的返回列纳入联合索引，制造 <code>Using index</code>。</li>
+    <li><strong>前缀索引控制长字符串索引的体积。</strong>对很长的 varchar，可只索引前 N 个字符 <code>INDEX(col(20))</code>，在区分度和体积间权衡（但前缀索引<em>无法用于覆盖和 ORDER BY</em>）。</li>
+    <li><strong>主键要短、单调递增。</strong>短 → 扇出大、二级索引小（第 4、6 章）；单调递增（如自增 id）→ 插入总在 B+ 树右端追加，避免随机插入引发的<em>页分裂</em>。这也是不推荐用随机 UUID 当主键的核心原因。</li>
+    <li><strong>索引不是越多越好。</strong>每个索引都是一棵要维护的 B+ 树，<em>写操作要同步更新所有相关索引</em>，索引越多写越慢、占空间越大。只为真正高频的查询建索引。</li>
+  </ul>
+
+  <div class="note key"><span class="ic">页分裂为什么要避免</span><div>
+    <p>当向 B+ 树叶子的<em>中间</em>插入数据、而该页已满时，InnoDB 必须<strong>分裂页</strong>：新建一个页，把原页一半数据挪过去，再调整链表和父节点指针——这是一次昂贵的写放大，还会造成页空间利用率下降（碎片）。<strong>自增主键让插入永远发生在最右页的尾部，几乎不触发中间分裂</strong>；而随机主键（UUID）会到处插入，频繁分裂。这就是"主键单调递增"这条准则背后的原理，它和第 4 章"主键要短"共同决定了主键的选型。</p>
+  </div></div>
+</section>
+
+<!-- ============ 14 ============ -->
+<section id="c14">
+  <div class="chap"><span class="num">14</span><h2>自适应哈希索引与 Change Buffer</h2><div class="rule"></div></div>
+
+  <p>最后补两个与索引紧密相关、且呼应第二篇 Buffer Pool 的机制——它们是 InnoDB 在 B+ 树之上做的两层"加速"和"缓冲"。</p>
+
+  <h3>自适应哈希索引 AHI（Adaptive Hash Index）</h3>
+  <p>B+ 树等值查找要走 3~4 层。如果某些热点 key 被反复等值查询，每次都走树就有点亏。InnoDB 会<strong>自动监测</strong>访问模式，对频繁访问的索引页<strong>在内存里建一个哈希表</strong>，把"热点 key → 页内位置"直接映射，下次等值查找<em>一步到位 O(1)</em>，跳过逐层下降。</p>
+  <ul class="bul">
+    <li><strong>全自动</strong>：由 InnoDB 根据访问频率自行决定建不建，无需也无法手动指定给哪个索引建。</li>
+    <li><strong>只服务等值查询</strong>，对范围查询无效（哈希无序）。</li>
+    <li><strong>是 B+ 树的"缓存层"</strong>，不替代 B+ 树；可通过 <code>innodb_adaptive_hash_index</code> 开关。某些写密集、热点分散的场景关掉它反而更好（维护哈希也有成本）。</li>
+  </ul>
+
+  <h3>Change Buffer（变更缓冲）</h3>
+  <p>呼应第二篇：当修改一条数据时，<em>聚簇索引</em>的页通常已在 Buffer Pool（因为要先定位行），但<em>二级索引</em>的页不一定在内存——若每次改二级索引都先把对应页从磁盘读进来，会产生大量随机读 I/O。</p>
+  <p>Change Buffer 的优化：<strong>对不在内存中的二级索引页的修改（insert/delete/update），先记录在 Change Buffer 里，不立刻读盘；等将来那个页因别的原因被读进内存时，再把缓冲的修改"合并（merge）"进去。</strong>多次对同一页的修改可以攒着一次合并，把随机读摊薄。</p>
+
+  <figure>
+    <svg viewBox="0 0 800 200" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,'JetBrains Mono',Consolas,monospace" font-size="12">
+      <defs><marker id="ar14" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#5b9dff"/></marker></defs>
+      <text x="400" y="24" text-anchor="middle" fill="#e7edfa" font-size="15" font-weight="700">Change Buffer：二级索引页不在内存时，先缓冲改动，晚点合并</text>
+      <rect x="40" y="55" width="180" height="80" rx="10" fill="#0f1830" stroke="#f5b955" stroke-width="1.5"/>
+      <text x="130" y="80" text-anchor="middle" fill="#f5b955" font-size="12" font-weight="700">改二级索引</text>
+      <text x="58" y="104" fill="#d7e0f2" font-size="11">目标页不在内存</text>
+      <text x="58" y="124" fill="#f0697a" font-size="11">不立刻读盘</text>
+      <rect x="310" y="55" width="180" height="80" rx="10" fill="#141f3a" stroke="#2dd4bf" stroke-width="1.8"/>
+      <text x="400" y="80" text-anchor="middle" fill="#2dd4bf" font-size="12" font-weight="700">记入 Change Buffer</text>
+      <text x="328" y="104" fill="#d7e0f2" font-size="11">改动暂存内存</text>
+      <text x="328" y="124" fill="#5fd38a" font-size="11">省下一次随机读</text>
+      <rect x="580" y="55" width="180" height="80" rx="10" fill="#0f1830" stroke="#5fd38a" stroke-width="1.5"/>
+      <text x="670" y="80" text-anchor="middle" fill="#5fd38a" font-size="12" font-weight="700">将来 merge</text>
+      <text x="598" y="104" fill="#d7e0f2" font-size="11">该页被读入时</text>
+      <text x="598" y="124" fill="#d7e0f2" font-size="11">一次性合并改动</text>
+      <path d="M220,95 L308,95" stroke="#5b9dff" stroke-width="2" marker-end="url(#ar14)"/>
+      <path d="M490,95 L578,95" stroke="#5b9dff" stroke-width="2" marker-end="url(#ar14)"/>
+      <text x="400" y="172" text-anchor="middle" fill="#6b7da3" font-size="11">注意：只对"非唯一"二级索引有效——唯一索引必须立刻读页校验唯一性，无法缓冲</text>
+    </svg>
+    <figcaption><b>图 12</b> · Change Buffer 把对二级索引的随机写攒起来延迟合并，显著降低写放大</figcaption>
+  </figure>
+
+  <div class="note key"><span class="ic">为什么唯一索引用不了 Change Buffer</span><div>
+    <p>唯一索引插入时<strong>必须当场判断"这个值是不是已存在"</strong>，而要判断就必须把目标页读进内存检查——既然都要读页了，缓冲就没意义了。所以 <strong>Change Buffer 只对普通（非唯一）二级索引生效</strong>。这也是"唯一约束不是免费的"的一个体现：它换来了正确性，但放弃了这项写优化。写密集且二级索引多的表，可以适当调大 <code>innodb_change_buffer_max_size</code>。</p>
+  </div></div>
+</section>
+
+<!-- ============ 15 ============ -->
+<section id="c15">
+  <div class="chap"><span class="num">15</span><h2>系列总结：六篇成体系</h2><div class="rule"></div></div>
+
+  <p>本篇把 InnoDB 的"查找性能"讲透了，也为整个系列收官。回看全貌：</p>
+
+  <div class="tbl">
+    <table>
+      <thead><tr><th>篇</th><th>主题</th><th>回答的核心问题</th></tr></thead>
+      <tbody>
+        <tr><td>①</td><td>存储结构与数据链路</td><td>数据在磁盘上怎么组织（页/区/段/表空间）</td></tr>
+        <tr><td>②</td><td>Buffer Pool 内存侧</td><td>数据怎么在内存里被缓存和管理</td></tr>
+        <tr><td>③</td><td>故障恢复原理</td><td>崩溃后怎么靠 redo/undo/双写恢复（持久性 D）</td></tr>
+        <tr><td>④</td><td>事务管理与 MVCC</td><td>并发"读"怎么不加锁也一致（隔离性 I·读）</td></tr>
+        <tr><td>⑤</td><td>锁系统</td><td>并发"写"怎么保证正确（隔离性 I·写）</td></tr>
+        <tr><td>⑥</td><td>索引与执行计划</td><td>怎么在海量数据里快速定位（性能）</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note key"><span class="ic">把六篇串成一条线</span><div>
+    <p>一次 <code>SELECT * WHERE name='Bob'</code> 的旅程，恰好穿过整个系列：<strong>优化器选中 name 二级索引（⑥），走 B+ 树定位（⑥），需要的页先在 Buffer Pool 找（②）、没有才从表空间的页里读（①）；回表拿整行（⑥）；如果是当前读还要按隔离级别加锁（⑤），普通快照读则按 ReadView 选版本（④）；整个过程产生的修改由 redo/undo 保驾（③）。</strong>六个子系统各司其职，又彼此咬合——这就是 InnoDB 作为一个成熟存储引擎的完整图景。</p>
+  </div></div>
+
+  <div class="fin">
+    <h3>InnoDB 系列 · 六篇完结</h3>
+    <div class="seq">
+      <b>① 存储结构</b><span class="arrow">→</span><b>② Buffer Pool</b><span class="arrow">→</span><b>③ 故障恢复</b><span class="arrow">→</span><b>④ MVCC</b><span class="arrow">→</span><b>⑤ 锁系统</b><span class="arrow">→</span><b>⑥ 索引</b>
+    </div>
+    <p style="color:#9aabce;font-size:14px;margin-top:14px">存什么 → 怎么缓存 → 怎么不丢 → 怎么并发读 → 怎么并发写 → 怎么快速找。一套讲完，InnoDB 的骨架就清晰了。</p>
+    <p style="color:#6b7da3;font-size:13px;margin-top:10px">若要再进一步：<em style="color:#2dd4bf">查询优化器的成本模型</em>（统计信息、直方图、JOIN 顺序）、<em style="color:#2dd4bf">分区表与分库分表</em>、<em style="color:#2dd4bf">性能诊断</em>（慢查询、performance_schema、火焰图）都是自然的延伸。</p>
+  </div>
+
+  <p class="foot">InnoDB 系列 · 第六篇 · 索引与执行计划 · 15 章</p>
+</section>
+
+</div>
+</body>
+</html>

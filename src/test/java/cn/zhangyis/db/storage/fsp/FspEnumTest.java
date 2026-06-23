@@ -1,4 +1,8 @@
 package cn.zhangyis.db.storage.fsp;
+import cn.zhangyis.db.storage.fsp.exception.FspMetadataException;
+import cn.zhangyis.db.storage.fsp.extent.ExtentState;
+import cn.zhangyis.db.storage.fsp.segment.SegmentPurpose;
+
 
 import cn.zhangyis.db.common.exception.DatabaseRuntimeException;
 import org.junit.jupiter.api.Test;

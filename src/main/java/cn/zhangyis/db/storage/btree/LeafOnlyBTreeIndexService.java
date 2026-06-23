@@ -1,7 +1,7 @@
 package cn.zhangyis.db.storage.btree;
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
-import cn.zhangyis.db.storage.api.IndexPageAccess;
+import cn.zhangyis.db.storage.api.index.IndexPageAccess;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.record.format.LogicalRecord;

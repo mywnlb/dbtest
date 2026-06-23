@@ -5,6 +5,7 @@ import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.RollPointer;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.domain.TransactionId;
+import cn.zhangyis.db.domain.TransactionNo;
 import cn.zhangyis.db.domain.UndoNo;
 import cn.zhangyis.db.domain.UndoSlotId;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
@@ -48,6 +49,8 @@ public final class UndoLogManager {
     private final RollbackSegmentSlotManager slotManager;
     /** undo 表空间；{@code ensureUndoContext} 首写建段时传给 {@link UndoLogSegmentAccess#create}。 */
     private final SpaceId undoSpace;
+    /** 已提交 undo log 的 history list；{@code onCommit} 据事务类型挂入 committed / insert-reclaim 队列供 purge 回收。 */
+    private final HistoryList history;
 
     /**
      * 构造 undo 门面。
@@ -56,14 +59,17 @@ public final class UndoLogManager {
      * @param slotManager 内存 rseg slot 目录，不能为 null；其 {@link RollbackSegmentSlotManager#rollbackSegmentId()}
      *                     作为 {@link UndoContext} 的 rseg id 来源。
      * @param undoSpace   undo 表空间，不能为 null。
+     * @param history     已提交 undo log 的 history list，不能为 null；必须与 {@code PurgeCoordinator} 共享同一实例。
      */
-    public UndoLogManager(UndoLogSegmentAccess access, RollbackSegmentSlotManager slotManager, SpaceId undoSpace) {
-        if (access == null || slotManager == null || undoSpace == null) {
+    public UndoLogManager(UndoLogSegmentAccess access, RollbackSegmentSlotManager slotManager, SpaceId undoSpace,
+                          HistoryList history) {
+        if (access == null || slotManager == null || undoSpace == null || history == null) {
             throw new DatabaseValidationException("undo log manager args must not be null");
         }
         this.access = access;
         this.slotManager = slotManager;
         this.undoSpace = undoSpace;
+        this.history = history;
     }
 
     /**
@@ -233,8 +239,24 @@ public final class UndoLogManager {
             throw new TransactionStateException("onCommit txn must not be null");
         }
         UndoContext ctx = txn.undoContext();
-        if (ctx != null && !ctx.hasUpdateUndo()) {
+        if (ctx == null) {
+            return; // 未写事务：无 undo 段
+        }
+        if (ctx.hasUpdateUndo()) {
+            // 含 update/delete undo：挂入 history list 供 purge 按 TransactionNo boundary 回收（slot/段由 purge 释放，
+            // 不在此 release）。要求 commit 已分配 TransactionNo——编排序必须先 commit 再 onCommit（评审 #3）。
+            TransactionNo no = txn.transactionNo();
+            if (no.isNone()) {
+                throw new TransactionStateException(
+                        "onCommit requires an assigned TransactionNo for an update-undo transaction; "
+                                + "call TransactionManager.commit before onCommit");
+            }
+            history.submitCommitted(new HistoryEntry(no, txn.transactionId(), undoSpace,
+                    ctx.undoFirstPageId(), ctx.slotId()));
+        } else {
+            // 纯 insert undo：提交即不再服务一致性读（§7.2）。立即释放 slot（同现状），段页交 purge dropUndoSegment 回收。
             slotManager.release(ctx.slotId());
+            history.submitInsertReclaim(new InsertReclaimEntry(undoSpace, ctx.undoFirstPageId()));
         }
     }
 

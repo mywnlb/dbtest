@@ -9,6 +9,8 @@ import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.DirtyPageCandidate;
 import cn.zhangyis.db.storage.buf.FlushPageSnapshot;
 import cn.zhangyis.db.storage.fil.PageStore;
+import cn.zhangyis.db.storage.fil.TablespaceAccessController;
+import cn.zhangyis.db.storage.fil.TablespaceAccessLease;
 import cn.zhangyis.db.storage.page.PageImageChecksum;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
 
@@ -30,11 +32,24 @@ public final class FlushCoordinator {
     private final PageSize pageSize;
     private final DoublewriteStrategy doublewrite;
     private final Duration redoWaitTimeout;
+    /** 与 MTR/truncate 共用的 operation lease；flush 持共享 lease 覆盖 snapshot 到 data-file force。 */
+    private final TablespaceAccessController accessController;
 
     public FlushCoordinator(BufferPool bufferPool, PageStore pageStore, RedoLogManager redo, PageSize pageSize,
                             DoublewriteStrategy doublewrite, Duration redoWaitTimeout) {
+        this(bufferPool, pageStore, redo, pageSize, doublewrite, redoWaitTimeout,
+                new TablespaceAccessController());
+    }
+
+    /**
+     * 创建与 lifecycle 服务共享准入控制器的 flush 协调器。截断线程持 X 时可在同线程重入 S 完成 marker flush；
+     * 其它 flusher 会在 X 外等待，不能把尾页 snapshot 跨越物理 truncate。
+     */
+    public FlushCoordinator(BufferPool bufferPool, PageStore pageStore, RedoLogManager redo, PageSize pageSize,
+                            DoublewriteStrategy doublewrite, Duration redoWaitTimeout,
+                            TablespaceAccessController accessController) {
         if (bufferPool == null || pageStore == null || redo == null || pageSize == null
-                || doublewrite == null || redoWaitTimeout == null) {
+                || doublewrite == null || redoWaitTimeout == null || accessController == null) {
             throw new DatabaseValidationException("flush coordinator dependencies must not be null");
         }
         if (redoWaitTimeout.isNegative()) {
@@ -46,6 +61,7 @@ public final class FlushCoordinator {
         this.pageSize = pageSize;
         this.doublewrite = doublewrite;
         this.redoWaitTimeout = redoWaitTimeout;
+        this.accessController = accessController;
     }
 
     /**
@@ -83,6 +99,13 @@ public final class FlushCoordinator {
     }
 
     private FlushResult flushPage(PageId pageId, Lsn observedPageLsn) {
+        try (TablespaceAccessLease ignored = accessController.acquireShared(pageId.spaceId())) {
+            return flushPageUnderLease(pageId, observedPageLsn);
+        }
+    }
+
+    /** 调用方已持目标空间共享 operation lease；整个 snapshot/doublewrite/data force/clean 回调不可跨越 truncate X。 */
+    private FlushResult flushPageUnderLease(PageId pageId, Lsn observedPageLsn) {
         Optional<FlushPageSnapshot> maybeSnapshot = bufferPool.snapshotForFlush(pageId);
         if (maybeSnapshot.isEmpty()) {
             return FlushResult.ok(pageId, observedPageLsn, FlushResultStatus.SKIPPED_NOT_DIRTY);

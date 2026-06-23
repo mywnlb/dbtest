@@ -54,7 +54,7 @@ class MtrRedoAppendTest {
             MiniTransaction mtr = mgr.begin();
             PageGuard g = mtr.getPage(pool, PID, PageLatchMode.EXCLUSIVE);
             g.writeBytes(100, new byte[]{1, 2, 3});
-            mgr.commit(mtr);
+            Lsn committed = mgr.commit(mtr);
 
             List<RedoRecord> recs = mgr.redoLogManager().bufferedRecords();
             assertEquals(1, recs.size());
@@ -62,6 +62,7 @@ class MtrRedoAppendTest {
             PageBytesRecord pb = (PageBytesRecord) recs.get(0);
             assertEquals(100, pb.offset());
             Lsn endLsn = mgr.redoLogManager().currentLsn();
+            assertEquals(endLsn, committed);
             try (PageGuard g2 = pool.getPage(PID, PageLatchMode.SHARED)) {
                 assertEquals(endLsn, PageEnvelope.readPageLsn(g2));
             }

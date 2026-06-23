@@ -48,6 +48,8 @@ public final class RedoLogManager {
     private final RedoLogFlusher flusher;
     /** 已 fsync 的最高 LSN；D3 内存模式恒为 0。 */
     private Lsn flushedToDiskLsn = Lsn.of(0);
+    /** 启动恢复边界是否已显式安装；只允许在首个新 append 前执行一次（同值调用幂等）。 */
+    private boolean recoveredBoundaryInstalled;
 
     public RedoLogManager() {
         this(null, null);
@@ -143,13 +145,49 @@ public final class RedoLogManager {
                 writer.write(batch);
                 pendingBatches.remove(0);
             }
-            flushedToDiskLsn = flusher.flushTo(writer.writtenToDiskLsn());
+            Lsn physicalFlushed = flusher.flushTo(writer.writtenToDiskLsn());
+            // 新进程 writer/flusher 从 0 构造，但 restoreRecoveredBoundary 已安装历史 durable 边界；
+            // 空 pending flush 绝不能把该边界降回 0。只有本进程新写出的更高 LSN 才推进。
+            if (physicalFlushed.value() > flushedToDiskLsn.value()) {
+                flushedToDiskLsn = physicalFlushed;
+            }
             // durable 模式下 buffer/batches 仅作诊断快照；本轮 pending 已全部写盘并 fsync，
             // 这两个列表对恢复无意义，落盘后立即释放，防止长运行 append 累积导致内存无界增长。
             buffer.clear();
             batches.clear();
             flushedAdvanced.signalAll();
             return flushedToDiskLsn;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * redo replay 完成后安装恢复边界，使新 MTR 从 {@code recoveredToLsn} 继续分配，并把历史日志视为已 durable。
+     * 只能在本 manager 尚无新 append/pending batch 时调用；否则重设 nextLsn 会制造重叠区间。
+     *
+     * @param recoveredToLsn recovery reader 验证过的最后完整 LSN。
+     */
+    public void restoreRecoveredBoundary(Lsn recoveredToLsn) {
+        if (recoveredToLsn == null) {
+            throw new DatabaseValidationException("recovered redo boundary must not be null");
+        }
+        lock.lock();
+        try {
+            if (recoveredBoundaryInstalled) {
+                if (nextLsn == recoveredToLsn.value()) {
+                    return;
+                }
+                throw new DatabaseValidationException("redo recovery boundary already installed at " + nextLsn);
+            }
+            if (nextLsn != 0 || !buffer.isEmpty() || !batches.isEmpty() || !pendingBatches.isEmpty()) {
+                throw new DatabaseValidationException(
+                        "redo recovery boundary must be installed before any new append");
+            }
+            nextLsn = recoveredToLsn.value();
+            flushedToDiskLsn = recoveredToLsn;
+            recoveredBoundaryInstalled = true;
+            flushedAdvanced.signalAll();
         } finally {
             lock.unlock();
         }

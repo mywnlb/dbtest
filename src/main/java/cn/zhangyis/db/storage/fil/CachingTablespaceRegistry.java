@@ -16,8 +16,9 @@ import java.util.concurrent.ConcurrentMap;
  *
  * <p>并发：handles 用 ConcurrentHashMap 只保护映射本身；require/requireForRecovery 用 computeIfAbsent 保证
  * “至多加载一次”，markCorrupted/markDiscarded 用 compute 保证“读当前快照 -> 状态机切换 -> 发布”这一读改写
- * 在桶级原子内完成。真实文件生命周期锁（设计文档 §8.1 的 TablespaceLifecycleLatch/DataFileHandleLock 等）
- * 后续由 TablespaceHandle/DataFileHandle 接入，届时再把生命周期串行化下沉到 fil 物理锁层。
+ * 在桶级原子内完成。Registry 只保护逻辑 metadata/state；物理文件生命周期锁已经属于 PageStore/DataFileHandle，
+ * 后续若需要跨普通 IO 与 discard/truncate 的逻辑 lease，应在 Registry/上层 facade 增加独立准入令牌，而不是让
+ * Registry 直接持有 FileChannel。
  *
  * <p>首版简化点（与设计文档差异，后续补齐）：
  * <ul>
@@ -37,7 +38,7 @@ public final class CachingTablespaceRegistry implements TablespaceRegistry {
     private final TablespaceMetadataLoader metadataLoader;
 
     /**
-     * 运行时打开表空间 cache。ConcurrentHashMap 只保护映射本身；真实文件生命周期锁后续由 TablespaceHandle/DataFileHandle 持有。
+     * 运行时打开表空间 cache。ConcurrentHashMap 只保护逻辑句柄映射，文件句柄和物理生命周期锁由 PageStore/DataFileHandle 管理。
      */
     private final ConcurrentMap<SpaceId, TablespaceHandle> handles = new ConcurrentHashMap<>();
 
@@ -55,7 +56,7 @@ public final class CachingTablespaceRegistry implements TablespaceRegistry {
 
     /**
      * 打开表空间并建立运行时句柄。数据流为 SpaceId 进入，直接调用 loader 获取权威元数据，然后替换缓存中的句柄。
-     * 首版没有真实 FileChannel，因此没有文件句柄副作用；后续接入 DataFileHandle 时在这里补充生命周期锁和打开动作。
+     * 文件打开/关闭由 DiskSpaceManager 编排 PageStore 完成；Registry 不直接打开 FileChannel，只发布逻辑 metadata 快照。
      *
      * @param spaceId 表空间编号。
      * @return 打开后的运行时句柄。
@@ -142,8 +143,8 @@ public final class CachingTablespaceRegistry implements TablespaceRegistry {
      *
      * <p>数据流：SpaceId 进入，在 ConcurrentHashMap 桶级原子内完成“读当前快照（缺失则按权威来源加载）->
      * 状态机切到 CORRUPTED -> 发布新句柄”的读改写，避免与并发 refresh/replace/markDiscarded 互相覆盖造成
-     * 丢更新。首版以桶级原子替代设计文档 §8.1 要求的 TablespaceLifecycleLatch(X)，后续接入真实生命周期 latch
-     * 后再下沉到 fil 物理锁层。
+     * 丢更新。该操作只改变逻辑状态；若未来 discard/truncate 需要等待普通 page IO drain，应由上层 lease 或
+     * DataFileHandle 的物理生命周期闩协作完成。
      *
      * @param spaceId 表空间编号。
      * @param reason 损坏原因，进入日志诊断；首版不持久化，后续会进入恢复诊断上下文。
@@ -162,6 +163,27 @@ public final class CachingTablespaceRegistry implements TablespaceRegistry {
         // 标记损坏属于关键生命周期/不可恢复诊断事件，必须留痕：带上 spaceId 与原因，供恢复和人工排查。
         log.warn("tablespace {} marked corrupted: {}", spaceId.value(), reason);
         return corrupted;
+    }
+
+    /**
+     * 标记表空间 INACTIVE。典型语义是 undo 待截断或生命周期转换中：普通 require 必须阻断，recovery 仍需能读取状态。
+     *
+     * <p>与 markCorrupted/markDiscarded 一样，数据流在 ConcurrentHashMap 桶级原子内完成：SpaceId 进入，
+     * 缺失时先从 loader 重建当前快照，再经状态机转到 INACTIVE，最后发布新句柄。该状态不持久化到 page0。
+     *
+     * @param spaceId 表空间编号。
+     * @return inactive 状态句柄。
+     */
+    @Override
+    public TablespaceHandle markInactive(SpaceId spaceId) {
+        validateSpaceId(spaceId);
+        TablespaceHandle inactive = handles.compute(spaceId, (id, existing) -> {
+            Tablespace current = (existing != null ? existing : loadHandle(id)).tablespace();
+            return new TablespaceHandle(current.transitTo(TablespaceState.INACTIVE));
+        });
+        // INACTIVE 是显式生命周期转换，非高频路径；记录空间编号便于定位普通准入失败的原因。
+        log.info("tablespace {} marked inactive", spaceId.value());
+        return inactive;
     }
 
     /**
@@ -185,7 +207,8 @@ public final class CachingTablespaceRegistry implements TablespaceRegistry {
     }
 
     /**
-     * 关闭运行时表空间句柄。首版没有文件句柄，因此只移除 cache；后续接入 DataFileHandle 后需在生命周期 X latch 下关闭文件。
+     * 关闭运行时表空间句柄。这里仅移除 Registry 的逻辑 cache；物理文件关闭由 PageStore.close 在 DataFileHandle
+     * 生命周期闩保护下完成，避免 Registry 混入 FileChannel 所有权。
      *
      * @param spaceId 表空间编号。
      */

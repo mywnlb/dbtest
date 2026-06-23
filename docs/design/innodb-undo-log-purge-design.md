@@ -378,7 +378,7 @@ undo page 逻辑格式：
 
 - 单条 undo record 不能跨 page；过大的 old column image 使用 external undo payload 页。
 - page 内 record 按 `undoNo` 递增追加。
-- `prevRollPointer` 串起事务反向回滚链；聚簇记录的 `DB_ROLL_PTR` 串起记录版本链入口。
+- undo record 内存的上一版本 roll pointer（即该记录更新前的旧 `DB_ROLL_PTR`）串起**记录版本链**；聚簇记录的 `DB_ROLL_PTR` 是版本链入口，§7.5/§14.1 沿此遍历旧版本。事务回滚则按 undo log 内 `undoNo` 顺序反向应用各 undo record，不依赖单独的"事务链"指针——回滚顺序与版本链是两件事，勿混用同一字段表达。
 - undo page 修改必须写 redo；redo 类型由 Redo 模块保存字节级变更，不理解 MVCC。
 
 ### 6.5 UndoRecord Payload

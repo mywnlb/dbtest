@@ -4,6 +4,8 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.storage.buf.PageGuard;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
+import cn.zhangyis.db.storage.fil.TablespaceAccessLease;
+import cn.zhangyis.db.domain.SpaceId;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -28,7 +30,7 @@ final class MtrMemo {
      * @param pageId   page guard 所在页；非 page 资源为 null。
      * @param mode     page guard 持有的 latch 模式；非 page 资源为 null。
      */
-    private record MemoEntry(AutoCloseable resource, PageId pageId, PageLatchMode mode) {
+    private record MemoEntry(AutoCloseable resource, PageId pageId, PageLatchMode mode, SpaceId leaseSpaceId) {
     }
 
     /** 资源栈；push/pop 头部，构成 LIFO。 */
@@ -43,7 +45,7 @@ final class MtrMemo {
         if (resource == null) {
             throw new DatabaseValidationException("memo resource must not be null");
         }
-        stack.push(new MemoEntry(resource, null, null));
+        stack.push(new MemoEntry(resource, null, null, null));
     }
 
     /**
@@ -63,7 +65,28 @@ final class MtrMemo {
         if (mode == null) {
             throw new DatabaseValidationException("memo page latch mode must not be null");
         }
-        stack.push(new MemoEntry(guard, pageId, mode));
+        stack.push(new MemoEntry(guard, pageId, mode, null));
+    }
+
+    /**
+     * 压入表空间共享 lease。lease 在首次 page guard 之前入栈，因而 LIFO 释放时晚于该空间全部 latch/fix，
+     * 保证 truncate 看见共享 lease drain 后不存在遗留页句柄。
+     */
+    void pushTablespaceLease(TablespaceAccessLease lease, SpaceId spaceId) {
+        if (lease == null || spaceId == null) {
+            throw new DatabaseValidationException("tablespace memo lease/space id must not be null");
+        }
+        stack.push(new MemoEntry(lease, null, null, spaceId));
+    }
+
+    /** 同一 MTR 每个表空间只持一个共享 lease，避免重复读锁计数与释放顺序复杂化。 */
+    boolean hasTablespaceLease(SpaceId spaceId) {
+        for (MemoEntry entry : stack) {
+            if (spaceId.equals(entry.leaseSpaceId())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

@@ -25,6 +25,21 @@ final class SpaceHeaderLayout {
     static final int SERVER_VERSION = SDI_ROOT + 8;                // 186 int
     static final int SPACE_VERSION = SERVER_VERSION + 4;           // 190 long (ends 198)
 
+    /** undo 生命周期头魔数（4B）；为 0 表示旧格式未初始化。 */
+    static final int LIFECYCLE_MAGIC = SPACE_VERSION + 8;          // 198 int
+    /** 生命周期头格式版本（4B）。 */
+    static final int LIFECYCLE_FORMAT = LIFECYCLE_MAGIC + 4;       // 202 int
+    /** {@link cn.zhangyis.db.storage.fil.TablespaceState} 稳定状态码（4B）。 */
+    static final int LIFECYCLE_STATE = LIFECYCLE_FORMAT + 4;       // 206 int
+    /** 创建时初始页数，也是本切片物理截断目标（8B）。 */
+    static final int LIFECYCLE_INITIAL_SIZE = LIFECYCLE_STATE + 4; // 210 long
+    /** 每次截断推进的单调 epoch（8B）。 */
+    static final int LIFECYCLE_EPOCH = LIFECYCLE_INITIAL_SIZE + 8; // 218 long
+    /** 当前截断目标页数（8B）。 */
+    static final int LIFECYCLE_TARGET_SIZE = LIFECYCLE_EPOCH + 8;  // 226 long
+    /** 截断完成后要发布的稳定状态码（4B，ends 238）。 */
+    static final int LIFECYCLE_FINISH_STATE = LIFECYCLE_TARGET_SIZE + 8; // 234 int
+
     /** XDES entries 内嵌 page 0 的起始偏移（base 区之后预留到 256）。 */
     static final int XDES_BASE = 256;
 }

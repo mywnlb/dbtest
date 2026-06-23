@@ -17,17 +17,29 @@ public final class TransactionManager {
 
     /** 全局协调器（id/no 分配、活跃表）。 */
     private final TransactionSystem system;
+    /**
+     * 事务级 ReadView 门面（T1.4）。本管理器拥有它（由同一 {@code system} 构造），commit/finishRollback 经它释放
+     * 事务级 ReadView。无状态（RR 缓存挂 Transaction），故按本管理器拥有即可，非全局单例；上层一致性读经
+     * {@link #readViewManager()} 取同一实例。
+     */
+    private final ReadViewManager readViewManager;
 
     public TransactionManager(TransactionSystem system) {
         if (system == null) {
             throw new DatabaseValidationException("transaction system must not be null");
         }
         this.system = system;
+        this.readViewManager = new ReadViewManager(system);
     }
 
     /** 暴露协调器供测试/上层查询活跃事务快照（不暴露内部可变表）。 */
     public TransactionSystem system() {
         return system;
+    }
+
+    /** 暴露本管理器拥有的 ReadView 门面，供一致性读（{@code MvccReader}）取/复用同一实例。 */
+    public ReadViewManager readViewManager() {
+        return readViewManager;
     }
 
     /** 开启事务，状态 ACTIVE；读写事务此时不分配写 id（惰性，§7.1）。 */
@@ -66,18 +78,51 @@ public final class TransactionManager {
             txn.setTransactionNo(system.allocateTransactionNo());
             system.removeActive(txn.transactionId().value());
         }
+        // 移出活跃表后、进入终态前释放事务级 ReadView（T1.4；RC/未开 ReadView 时为 no-op）
+        readViewManager.release(txn);
         txn.transitionTo(TransactionState.COMMITTED);
     }
 
     /**
-     * 回滚：ACTIVE→ROLLING_BACK→ROLLED_BACK。读写事务移出活跃表。**本片不撤销已写记录**（无 undo）。
+     * 回滚：ACTIVE→ROLLING_BACK→ROLLED_BACK。读写事务移出活跃表。
+     *
+     * <p>T1.3c 之前无 undo，本方法只翻状态；T1.3d 起拆为 {@link #beginRollback}/{@link #finishRollback} 两阶段，
+     * 本方法是「无 undo 链可走」（只读/未写事务）的便捷组合：{@code RollbackService} 对有 {@code UndoContext} 的
+     * 事务改为先 {@code beginRollback}、反向走 undo 链、释放 slot，再 {@code finishRollback}，使撤销发生在真正的
+     * {@code ROLLING_BACK} 状态内（设计 §7.6）。本组合行为与旧实现完全一致。
      */
     public void rollback(Transaction txn) {
+        beginRollback(txn);
+        finishRollback(txn);
+    }
+
+    /**
+     * 进入回滚：ACTIVE→ROLLING_BACK。供 {@code RollbackService} 在反向走 undo 链前调用，使整段撤销处于
+     * {@code ROLLING_BACK} 状态。此阶段**不**移出活跃表——事务在撤销完成前仍是活跃读写事务（设计 §7.6 step 1）。
+     */
+    void beginRollback(Transaction txn) {
         requireActive(txn);
         txn.transitionTo(TransactionState.ROLLING_BACK);
+    }
+
+    /**
+     * 收尾回滚：ROLLING_BACK→ROLLED_BACK，读写事务移出活跃表。只有 undo 链**完整**走到 prev=NULL 并释放 slot 后
+     * 才调用；单条 undo 失败不应到达此处（{@code RollbackService} 让异常传播、事务停在 {@code ROLLING_BACK} 可重试）。
+     *
+     * @throws TransactionStateException 当前不在 {@code ROLLING_BACK}（未先 {@link #beginRollback}）。
+     */
+    void finishRollback(Transaction txn) {
+        if (txn == null) {
+            throw new DatabaseValidationException("transaction must not be null");
+        }
+        if (txn.state() != TransactionState.ROLLING_BACK) {
+            throw new TransactionStateException("finishRollback requires ROLLING_BACK: " + txn.state());
+        }
         if (!txn.transactionId().isNone()) {
             system.removeActive(txn.transactionId().value());
         }
+        // 移出活跃表后、进入终态前释放事务级 ReadView（T1.4）
+        readViewManager.release(txn);
         txn.transitionTo(TransactionState.ROLLED_BACK);
     }
 

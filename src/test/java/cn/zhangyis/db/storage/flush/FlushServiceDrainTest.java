@@ -86,6 +86,26 @@ class FlushServiceDrainTest {
         }
     }
 
+    /** 截断 marker 要求全局刷过 marker，而不是只清目标空间，否则其它旧脏页仍会阻止 checkpoint。 */
+    @Test
+    void flushThroughCleansEveryDirtyPageAtOrBeforeMarkerAndAdvancesCheckpoint() {
+        try (PageStore store = new FileChannelPageStore();
+             BufferPool pool = new LruBufferPool(store, PS, 8);
+             RedoLogFileRepository repo = RedoLogFileRepository.open(dir.resolve("redo-barrier.log"))) {
+            createSpaces(store);
+            RedoLogManager redo = RedoLogManager.durable(repo);
+            Lsn lsn1 = appendRedo(redo, PAGE1);
+            Lsn marker = appendRedo(redo, PAGE2);
+            writeDirty(pool, PAGE1, lsn1);
+            writeDirty(pool, PAGE2, marker);
+
+            Lsn checkpoint = service(pool, store, redo).flushThrough(marker, Duration.ofSeconds(1));
+
+            assertTrue(checkpoint.value() >= marker.value());
+            assertTrue(dirtyPages(pool).isEmpty());
+        }
+    }
+
     private FlushService service(BufferPool pool, PageStore store, RedoLogManager redo) {
         FlushCoordinator coordinator = new FlushCoordinator(pool, store, redo, PS,
                 new NoDoublewriteStrategy(), Duration.ofMillis(50));

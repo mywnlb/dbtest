@@ -111,9 +111,51 @@ public final class FileChannelPageStore implements PageStore {
     }
 
     @Override
+    public Path pathOf(SpaceId spaceId) {
+        validateSpaceId(spaceId);
+        return require(spaceId).path();
+    }
+
+    @Override
     public void force(SpaceId spaceId) {
         validateSpaceId(spaceId);
         require(spaceId).force();
+    }
+
+    /**
+     * force 全部已打开句柄。即使某个 force 失败也继续 force 其余，最后汇总抛出，避免部分句柄漏刷。
+     * 先对 values 做快照再遍历，使语义确定、不受并发 create/open 影响。
+     */
+    @Override
+    public void forceAll() {
+        List<RuntimeException> errors = new ArrayList<>();
+        for (DataFileHandle handle : new ArrayList<>(handles.values())) {
+            try {
+                handle.force();
+            } catch (RuntimeException e) {
+                errors.add(e);
+            }
+        }
+        if (!errors.isEmpty()) {
+            DataFilePhysicalException aggregate = new DataFilePhysicalException(
+                    "failed to force " + errors.size() + " tablespace handle(s)", errors.get(0));
+            errors.subList(1, errors.size()).forEach(aggregate::addSuppressed);
+            throw aggregate;
+        }
+    }
+
+    /** 将经过上层校验的单文件截断请求路由到目标物理句柄。 */
+    @Override
+    public void truncate(SpaceId spaceId, PageNo targetSizeInPages) {
+        validateSpaceId(spaceId);
+        require(spaceId).truncateTo(targetSizeInPages);
+    }
+
+    /** 将经过上层校验的“扩到至少 N”请求路由到目标物理句柄（幂等，只增不减）。 */
+    @Override
+    public void ensureCapacity(SpaceId spaceId, PageNo minSizeInPages) {
+        validateSpaceId(spaceId);
+        require(spaceId).ensureCapacity(minSizeInPages);
     }
 
     @Override

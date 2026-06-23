@@ -17,6 +17,7 @@ class PageTypeTest {
         assertEquals(3, PageType.INODE.code());
         assertEquals(4, PageType.SDI.code());
         assertEquals(5, PageType.INDEX.code());
+        assertEquals(6, PageType.UNDO.code());
     }
 
     @Test

@@ -1,0 +1,53 @@
+package cn.zhangyis.db.storage.mtr;
+
+import cn.zhangyis.db.domain.PageId;
+import cn.zhangyis.db.domain.PageNo;
+import cn.zhangyis.db.domain.PageSize;
+import cn.zhangyis.db.domain.SpaceId;
+import cn.zhangyis.db.storage.buf.BufferPool;
+import cn.zhangyis.db.storage.buf.LruBufferPool;
+import cn.zhangyis.db.storage.buf.PageLatchMode;
+import cn.zhangyis.db.storage.fil.FileChannelPageStore;
+import cn.zhangyis.db.storage.fil.PageStore;
+import cn.zhangyis.db.storage.fil.TablespaceAccessController;
+import cn.zhangyis.db.storage.fil.TablespaceAccessLease;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.nio.file.Path;
+import java.time.Duration;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+
+import static org.junit.jupiter.api.Assertions.assertFalse;
+
+/** MTR lease 协作测试：第一次 fix 空间页时取得共享 lease，并在所有 page guard 之后、MTR 结束时释放。 */
+class MiniTransactionTablespaceLeaseTest {
+
+    @TempDir
+    Path dir;
+
+    @Test
+    void pageFixHoldsSharedTablespaceLeaseUntilCommit() throws Exception {
+        SpaceId spaceId = SpaceId.of(79);
+        PageSize pageSize = PageSize.ofBytes(16 * 1024);
+        TablespaceAccessController controller = new TablespaceAccessController(Duration.ofSeconds(2));
+        try (PageStore store = new FileChannelPageStore(); BufferPool pool = new LruBufferPool(store, pageSize, 4)) {
+            store.create(spaceId, dir.resolve("lease.ibu"), pageSize, PageNo.of(1));
+            MiniTransactionManager manager = new MiniTransactionManager(controller);
+            MiniTransaction mtr = manager.begin();
+            mtr.getPage(pool, PageId.of(spaceId, PageNo.of(0)), PageLatchMode.SHARED);
+
+            CompletableFuture<Void> exclusive = CompletableFuture.runAsync(() -> {
+                try (TablespaceAccessLease ignored = controller.acquireExclusive(spaceId)) {
+                    // 取得后立即释放。
+                }
+            });
+            TimeUnit.MILLISECONDS.sleep(100);
+            assertFalse(exclusive.isDone());
+
+            manager.commit(mtr);
+            exclusive.get(1, TimeUnit.SECONDS);
+        }
+    }
+}

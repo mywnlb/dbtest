@@ -1,0 +1,61 @@
+package cn.zhangyis.db.storage.fil;
+
+import cn.zhangyis.db.domain.SpaceId;
+import org.junit.jupiter.api.Test;
+
+import java.time.Duration;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+/** 表空间 operation lease 测试：共享访问可并行，截断独占 lease 必须 drain 已进入的普通访问。 */
+class TablespaceAccessControllerTest {
+
+    @Test
+    void exclusiveLeaseWaitsUntilSharedLeaseCloses() throws Exception {
+        TablespaceAccessController controller = new TablespaceAccessController(Duration.ofSeconds(2));
+        SpaceId spaceId = SpaceId.of(77);
+        TablespaceAccessLease shared = controller.acquireShared(spaceId);
+
+        CompletableFuture<Void> exclusive = CompletableFuture.runAsync(() -> {
+            try (TablespaceAccessLease ignored = controller.acquireExclusive(spaceId)) {
+                // 成功取得即可；future 的完成时刻用于验证 drain 边界。
+            }
+        });
+
+        TimeUnit.MILLISECONDS.sleep(100);
+        assertFalse(exclusive.isDone());
+        shared.close();
+        exclusive.get(1, TimeUnit.SECONDS);
+        assertTrue(exclusive.isDone());
+    }
+
+    @Test
+    void waitingLeaseHasBoundedTimeout() {
+        TablespaceAccessController controller = new TablespaceAccessController(Duration.ofMillis(50));
+        SpaceId spaceId = SpaceId.of(78);
+        try (TablespaceAccessLease ignored = controller.acquireShared(spaceId)) {
+            CompletableFuture<Void> exclusive = CompletableFuture.runAsync(() ->
+                    assertThrows(TablespaceAccessTimeoutException.class,
+                            () -> controller.acquireExclusive(spaceId)));
+            exclusive.join();
+        }
+    }
+
+    /** 跨线程 close 必须被拒绝且不能把 lease 标成已释放，owner 随后仍能正常关闭。 */
+    @Test
+    void leaseCannotBeClosedByAnotherThread() {
+        TablespaceAccessController controller = new TablespaceAccessController(Duration.ofSeconds(1));
+        TablespaceAccessLease lease = controller.acquireShared(SpaceId.of(79));
+        CompletableFuture<Void> wrongThread = CompletableFuture.runAsync(() ->
+                assertThrows(RuntimeException.class, lease::close));
+        wrongThread.join();
+        lease.close();
+        try (TablespaceAccessLease ignored = controller.acquireExclusive(SpaceId.of(79))) {
+            // owner 正常释放共享 lease 后，独占 lease 可立即取得。
+        }
+    }
+}

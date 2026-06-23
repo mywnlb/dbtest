@@ -10,7 +10,18 @@ import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.PageGuard;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
+import cn.zhangyis.db.storage.fil.CachingTablespaceRegistry;
+import cn.zhangyis.db.storage.fil.DataFileDescriptor;
 import cn.zhangyis.db.storage.fil.PageStore;
+import cn.zhangyis.db.storage.fil.SpaceFlags;
+import cn.zhangyis.db.storage.fil.TablespaceCorruptedException;
+import cn.zhangyis.db.storage.fil.TablespaceMetadata;
+import cn.zhangyis.db.storage.fil.TablespaceNotFoundException;
+import cn.zhangyis.db.storage.fil.TablespaceRegistry;
+import cn.zhangyis.db.storage.fil.TablespaceState;
+import cn.zhangyis.db.storage.fil.TablespaceType;
+import cn.zhangyis.db.storage.fil.TablespaceTypeFlags;
+import cn.zhangyis.db.storage.fil.TablespaceUnavailableException;
 import cn.zhangyis.db.storage.page.FilePageHeader;
 import cn.zhangyis.db.storage.page.PageEnvelope;
 import cn.zhangyis.db.storage.page.PageType;
@@ -27,9 +38,11 @@ import cn.zhangyis.db.storage.fsp.SegmentPurpose;
 import cn.zhangyis.db.storage.fsp.SegmentSpaceService;
 import cn.zhangyis.db.storage.fsp.SpaceHeaderRepository;
 import cn.zhangyis.db.storage.fsp.SpaceHeaderSnapshot;
+import cn.zhangyis.db.storage.fsp.TablespaceLifecycleHeader;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -47,6 +60,8 @@ public final class DiskSpaceManager {
     private final BufferPool pool;
     private final PageStore pageStore;
     private final PageSize pageSize;
+    /** 表空间运行时注册表：建/开登记权威 metadata，后续空间管理 API 在 Task 8 经 require 做状态准入。 */
+    private final TablespaceRegistry registry;
     private final SpaceHeaderRepository headerRepo;
     private final ExtentDescriptorRepository xdes;
     private final SegmentInodeRepository inodeRepo;
@@ -56,12 +71,39 @@ public final class DiskSpaceManager {
     private final SegmentPageAllocator allocator;
 
     public DiskSpaceManager(BufferPool pool, PageStore pageStore, PageSize pageSize) {
+        this(pool, pageStore, pageSize, defaultRegistry(pageStore, pageSize));
+    }
+
+    /**
+     * 创建共享 operation controller 的默认组合。生命周期服务、MTR manager 和本构造器应接收同一实例，
+     * 使默认 page0 loader 与普通页访问/flush/truncate 形成真实互斥。
+     */
+    public DiskSpaceManager(BufferPool pool, PageStore pageStore, PageSize pageSize,
+                            cn.zhangyis.db.storage.fil.TablespaceAccessController accessController) {
+        this(pool, pageStore, pageSize, new CachingTablespaceRegistry(
+                new PageZeroTablespaceMetadataLoader(pageStore, pageSize, accessController)));
+    }
+
+    /**
+     * 注入 registry 的构造器。默认构造器使用 {@link CachingTablespaceRegistry} +
+     * {@link PageZeroTablespaceMetadataLoader}，使直接 {@code PageStore.open} 后的 require 懒加载能从 page0 重建 metadata。
+     *
+     * @param pool Buffer Pool，供 FSP 仓储通过 MTR 访问 page0/page2/XDES。
+     * @param pageStore 物理页访问门面，仍保持 registry-free。
+     * @param pageSize 实例页大小。
+     * @param registry 表空间运行时 metadata/状态注册表。
+     */
+    public DiskSpaceManager(BufferPool pool, PageStore pageStore, PageSize pageSize, TablespaceRegistry registry) {
         if (pool == null || pageStore == null || pageSize == null) {
             throw new DatabaseValidationException("DiskSpaceManager dependencies must not be null");
+        }
+        if (registry == null) {
+            throw new DatabaseValidationException("tablespace registry must not be null");
         }
         this.pool = pool;
         this.pageStore = pageStore;
         this.pageSize = pageSize;
+        this.registry = registry;
         this.headerRepo = new SpaceHeaderRepository(pool);
         this.xdes = new ExtentDescriptorRepository(pool, pageSize);
         this.inodeRepo = new SegmentInodeRepository(pool, pageSize);
@@ -71,8 +113,25 @@ public final class DiskSpaceManager {
         this.allocator = new SegmentPageAllocator(pool, inodeRepo, flst, segSpace, new DefaultExtentAllocationPolicy());
     }
 
-    /** 建表空间：物理建文件（fil）→ 初始化 page0 header（currentSize=initialSize、freeLimit=0、nextSegmentId=1、三链空）→ 保留系统 extent0。 */
+    private static TablespaceRegistry defaultRegistry(PageStore pageStore, PageSize pageSize) {
+        if (pageStore == null || pageSize == null) {
+            throw new DatabaseValidationException("DiskSpaceManager dependencies must not be null");
+        }
+        return new CachingTablespaceRegistry(new PageZeroTablespaceMetadataLoader(pageStore, pageSize));
+    }
+
+    /** 建表空间：默认 type=GENERAL，保持既有调用方无需改动。 */
     public void createTablespace(MiniTransaction mtr, SpaceId spaceId, Path path, PageNo initialSizePages) {
+        createTablespace(mtr, spaceId, path, initialSizePages, TablespaceType.GENERAL);
+    }
+
+    /**
+     * 建表空间并登记 runtime metadata。数据流为：物理建文件 → 写 page0 SpaceHeader（type 编入 spaceFlags）→
+     * 保留系统 extent0 → registry.replace 发布 NORMAL 快照。create 时 page0 可能还未刷盘，因此直接用建表参数构造 metadata，
+     * 不走 page-0 raw loader。
+     */
+    public void createTablespace(MiniTransaction mtr, SpaceId spaceId, Path path, PageNo initialSizePages,
+                                 TablespaceType type) {
         requireMtr(mtr);
         requireSpace(spaceId);
         if (path == null) {
@@ -81,28 +140,102 @@ public final class DiskSpaceManager {
         if (initialSizePages == null) {
             throw new DatabaseValidationException("initial size must not be null");
         }
+        if (type == null) {
+            throw new DatabaseValidationException("tablespace type must not be null");
+        }
         pageStore.create(spaceId, path, pageSize, initialSizePages);
-        SpaceHeaderSnapshot fresh = new SpaceHeaderSnapshot(spaceId, pageSize, 0,
+        SpaceHeaderSnapshot fresh = new SpaceHeaderSnapshot(spaceId, pageSize, TablespaceTypeFlags.encode(type),
                 initialSizePages, PageNo.of(0), 1L,
                 FlstBase.EMPTY, FlstBase.EMPTY, FlstBase.EMPTY,
                 PageNo.of(2), 0L, SERVER_VERSION, 1L);
         headerRepo.initialize(mtr, fresh);
+        TablespaceState initialState = type == TablespaceType.UNDO
+                ? TablespaceState.ACTIVE : TablespaceState.NORMAL;
+        if (type == TablespaceType.UNDO) {
+            headerRepo.writeLifecycle(mtr, spaceId, new TablespaceLifecycleHeader(
+                    initialState, initialSizePages, 0L, initialSizePages, TablespaceState.ACTIVE));
+        }
         xdes.reserveSystemExtent(mtr, spaceId);
+        registry.replace(tablespaceMetadata(spaceId, path, type, initialState, initialSizePages));
     }
 
-    /** 打开已存在表空间物理文件（fil）。 */
+    /**
+     * 根据建表参数构造 registry 快照。currentSize 只作为运行时 metadata 初始值，后续 autoextend 的权威 size 仍在 page0。
+     */
+    private TablespaceMetadata tablespaceMetadata(SpaceId spaceId, Path path, TablespaceType type,
+                                                   TablespaceState state, PageNo currentSize) {
+        return new TablespaceMetadata(spaceId, "space-" + spaceId.value(), type, pageSize, state,
+                List.of(DataFileDescriptor.single(path, PageNo.of(0), currentSize)),
+                new SpaceFlags(TablespaceTypeFlags.encode(type)), currentSize, PageNo.of(0), 1L);
+    }
+
+    /** 打开已存在表空间：物理 open 后经 registry.open 从 page0 重建 metadata；注册失败时关闭物理句柄防半开。 */
     public void openTablespace(SpaceId spaceId, Path path) {
         requireSpace(spaceId);
         if (path == null) {
             throw new DatabaseValidationException("path must not be null");
         }
         pageStore.open(spaceId, path, pageSize);
+        try {
+            registry.open(spaceId);
+        } catch (RuntimeException e) {
+            pageStore.close(spaceId);
+            throw e;
+        }
+    }
+
+    /**
+     * recovery 启动打开表空间：物理 open 后走 requireForRecovery，不执行普通状态白名单，允许后续恢复流程读取损坏状态。
+     */
+    public void openTablespaceForRecovery(SpaceId spaceId, Path path) {
+        requireSpace(spaceId);
+        if (path == null) {
+            throw new DatabaseValidationException("path must not be null");
+        }
+        pageStore.open(spaceId, path, pageSize);
+        try {
+            registry.requireForRecovery(spaceId);
+        } catch (RuntimeException e) {
+            pageStore.close(spaceId);
+            throw e;
+        }
     }
 
     /** 关闭表空间物理句柄（fil）。 */
     public void closeTablespace(SpaceId spaceId) {
         requireSpace(spaceId);
         pageStore.close(spaceId);
+    }
+
+    /** 标记表空间 INACTIVE（运行时）：后续空间管理 API require 抛 {@link TablespaceUnavailableException}。 */
+    public void markTablespaceInactive(SpaceId spaceId) {
+        requireSpace(spaceId);
+        registry.markInactive(spaceId);
+    }
+
+    /** 标记表空间 CORRUPTED（运行时）：后续空间管理 API require 抛 {@link TablespaceCorruptedException}。 */
+    public void markTablespaceCorrupted(SpaceId spaceId, String reason) {
+        requireSpace(spaceId);
+        registry.markCorrupted(spaceId, reason);
+    }
+
+    /** 标记表空间 DISCARDED（运行时，仅转 registry 状态，不关闭文件）：后续 require 抛 {@link TablespaceNotFoundException}。 */
+    public void discardTablespace(SpaceId spaceId) {
+        requireSpace(spaceId);
+        registry.markDiscarded(spaceId);
+    }
+
+    /**
+     * 查询 runtime registry 中的表空间状态。该方法不触发 loader，避免诊断路径隐式打开或注册表空间。
+     *
+     * @param spaceId 表空间编号。
+     * @return 当前运行时状态。
+     */
+    public TablespaceState tablespaceState(SpaceId spaceId) {
+        requireSpace(spaceId);
+        return registry.find(spaceId)
+                .map(handle -> handle.tablespace().state())
+                .orElseThrow(() -> new TablespaceNotFoundException("tablespace not registered: " + spaceId.value()));
     }
 
     /** 建 segment：分配 segment id（page0）+ inode 槽（page2），返回句柄。 */
@@ -112,6 +245,7 @@ public final class DiskSpaceManager {
         if (purpose == null) {
             throw new DatabaseValidationException("segment purpose must not be null");
         }
+        requireOrdinaryAccess(mtr, spaceId);
         long segId = headerRepo.allocateNextSegmentId(mtr, spaceId);
         int slot = inodeRepo.allocateSlot(mtr, spaceId, SegmentId.of(segId), purpose);
         return new SegmentRef(spaceId, slot, SegmentId.of(segId));
@@ -127,6 +261,7 @@ public final class DiskSpaceManager {
     public PageId allocatePage(MiniTransaction mtr, SegmentRef ref) {
         requireMtr(mtr);
         requireRef(ref);
+        requireOrdinaryAccess(mtr, ref.spaceId());
         PageId allocated = doAllocatePage(mtr, ref);
         initAllocatedPage(mtr, allocated);
         return allocated;
@@ -163,6 +298,7 @@ public final class DiskSpaceManager {
     public void freePage(MiniTransaction mtr, SegmentRef ref, PageId pageId) {
         requireMtr(mtr);
         requireRef(ref);
+        requireOrdinaryAccess(mtr, ref.spaceId());
         segSpace.freePage(mtr, ref.spaceId(), ref.inodeSlot(), pageId);
     }
 
@@ -170,6 +306,7 @@ public final class DiskSpaceManager {
     public void dropSegment(MiniTransaction mtr, SegmentRef ref) {
         requireMtr(mtr);
         requireRef(ref);
+        requireOrdinaryAccess(mtr, ref.spaceId());
         SpaceId spaceId = ref.spaceId();
         int slot = ref.inodeSlot();
         mtr.getPage(pool, PageId.of(spaceId, PageNo.of(0)), PageLatchMode.EXCLUSIVE);
@@ -190,6 +327,7 @@ public final class DiskSpaceManager {
     public SpaceUsage usage(MiniTransaction mtr, SpaceId spaceId) {
         requireMtr(mtr);
         requireSpace(spaceId);
+        requireOrdinaryAccess(mtr, spaceId);
         SpaceHeaderSnapshot h = headerRepo.read(mtr, spaceId);
         return new SpaceUsage(h.currentSizeInPages(), h.freeLimitPageNo(), h.nextSegmentId());
     }
@@ -223,5 +361,14 @@ public final class DiskSpaceManager {
         if (ref == null) {
             throw new DatabaseValidationException("segment ref must not be null");
         }
+    }
+
+    /**
+     * 先把表空间共享 lease 收进 MTR，再重新检查运行时状态。若调用在 truncate X lease 后排队，
+     * 醒来时会看到最终 ACTIVE/INACTIVE 状态，不会沿用截断前已经通过的陈旧检查结果。
+     */
+    private void requireOrdinaryAccess(MiniTransaction mtr, SpaceId spaceId) {
+        mtr.acquireTablespaceLease(spaceId);
+        registry.require(spaceId);
     }
 }

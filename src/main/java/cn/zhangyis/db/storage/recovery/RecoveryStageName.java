@@ -10,6 +10,16 @@ public enum RecoveryStageName {
     DOUBLEWRITE_REPAIR,
     /** 从 checkpoint 后扫描并重放 redo。 */
     REDO_REPLAY,
+    /** redo 完成后把恢复边界安装到本进程将继续使用的 RedoLogManager，使新 MTR 从 recoveredToLsn 续写、历史日志视为 durable。 */
+    REDO_BOUNDARY_INSTALL,
+    /** redo 完成后续作 durable TRUNCATING undo 表空间，完成前保持流量关闭。 */
+    UNDO_TABLESPACE_RESUME,
+    /**
+     * 把物理文件大小重对齐到 page0 权威逻辑大小，弥补 autoExtend 未 fsync 留下的背离。
+     * 必须晚于 UNDO_TABLESPACE_RESUME：undo 续作会把被截断 undo 表空间的 page0 重建为新小尺寸，
+     * 若 reconcile 抢先按旧大尺寸读 page0，会把刚截断的文件重新撑大、甚至磁盘不足阻断截断。
+     */
+    SPACE_FILE_RECONCILE,
     /** R2 必需阶段成功后开放普通用户流量。 */
     OPEN_TRAFFIC
 }

@@ -66,4 +66,42 @@ public final class TransactionSystem {
             lock.unlock();
         }
     }
+
+    /**
+     * 为一致性读创建 {@link ReadView}（设计 §5.4/§8.1，T1.4）。**在同一临界区内原子完成**：
+     * <ol>
+     *   <li>若 {@code txn} 非只读且尚无写 id：分配并登记 creator 写 id（进活跃表）——使可写事务建 ReadView 后的自身写命中 creator 规则；</li>
+     *   <li>原子捕获 {@code {activeIds, nextTransactionId}}：{@code lowLimitId = nextTransactionId}、
+     *       {@code upLimitId = min(activeIds)}（空集合时 = low）、creator = {@code txn.transactionId()}（只读为 NONE）。</li>
+     * </ol>
+     * 必须原子：否则 active 集合与水位之间出现撕裂读，会破坏 {@link ReadView} 的 active⊆[up,low) 不变量。
+     * 持锁期间只读写内存状态，不访问 Buffer Pool、不等待（§17）。
+     *
+     * @param txn 发起一致性读的事务（只读 creator 保持 NONE；可写则在此分配 creator）。
+     * @return 该时刻的一致性读快照。
+     */
+    ReadView openReadViewSnapshot(Transaction txn) {
+        if (txn == null) {
+            throw new TransactionStateException("openReadViewSnapshot txn must not be null");
+        }
+        lock.lock();
+        try {
+            if (!txn.readOnly() && txn.transactionId().isNone()) {
+                long id = nextTransactionId++;
+                active.register(id);
+                txn.setTransactionId(TransactionId.of(id));
+            }
+            Set<Long> ids = active.snapshot();
+            long low = nextTransactionId;
+            long up = low;
+            for (long id : ids) {
+                if (id < up) {
+                    up = id;
+                }
+            }
+            return new ReadView(txn.transactionId(), up, low, ids);
+        } finally {
+            lock.unlock();
+        }
+    }
 }

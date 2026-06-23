@@ -3,6 +3,7 @@ package cn.zhangyis.db.storage.redo;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.Lsn;
 import cn.zhangyis.db.domain.PageId;
+import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.storage.page.FilePageHeader;
 import cn.zhangyis.db.storage.page.PageEnvelopeLayout;
 
@@ -34,6 +35,16 @@ public final class PageRedoApplyHandler {
             }
             ReplayPage page = pages.get(pageId);
             if (page == null) {
+                if (record instanceof PageInitRecord) {
+                    // PAGE_INIT 是唯一的建页记录：崩溃后物理文件可能被截短到该页之前，按需扩容使其可写。
+                    ensureReplayCapacity(context, pageId);
+                } else if (isBeyondFileEnd(context, pageId)) {
+                    // 首触是 PAGE_BYTES 却越过物理文件尾：该页从未经 PAGE_INIT 建立，凭空造页属于 redo 损坏，
+                    // 不得静默扩容补一个半成品页。正确的 fuzzy checkpoint 下不会出现该情形（未刷的建页 redo 不会被
+                    // checkpoint 越过），故判损坏而非容忍。
+                    throw new RedoLogCorruptedException(
+                            "redo PAGE_BYTES targets uninitialized page beyond data file size: " + pageId);
+                }
                 byte[] current = readPage(context, pageId);
                 if (pageLsn(current).value() >= batch.range().end().value()) {
                     skippedPages.add(pageId);
@@ -68,6 +79,20 @@ public final class PageRedoApplyHandler {
         }
         System.arraycopy(bytes, 0, page.bytes, record.offset(), bytes.length);
         page.touched = true;
+    }
+
+    /**
+     * extend-on-demand（仅 PAGE_INIT 触发）：崩溃后物理文件可能因 autoExtend 未 fsync 而短于 redo 写过的页号。
+     * 重放一个建页记录前先把物理文件扩到能容纳该页（幂等），避免随后的 readPage/writePage 越界。
+     * SPACE_FILE_RECONCILE 阶段会在 replay 之后再按 page0 权威大小补齐 extent 内无 redo 描述的尾部零页。
+     */
+    private static void ensureReplayCapacity(RedoApplyContext context, PageId pageId) {
+        context.pageStore().ensureCapacity(pageId.spaceId(), PageNo.of(pageId.pageNo().value() + 1));
+    }
+
+    /** 目标页号是否越过当前物理文件尾（用于判定首触 PAGE_BYTES 是否指向未建立的页）。 */
+    private static boolean isBeyondFileEnd(RedoApplyContext context, PageId pageId) {
+        return pageId.pageNo().value() >= context.pageStore().currentSizeInPages(pageId.spaceId()).value();
     }
 
     private static byte[] readPage(RedoApplyContext context, PageId pageId) {

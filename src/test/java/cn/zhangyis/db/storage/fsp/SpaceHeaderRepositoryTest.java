@@ -11,6 +11,7 @@ import cn.zhangyis.db.storage.buf.PageGuard;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
 import cn.zhangyis.db.storage.fil.FileChannelPageStore;
 import cn.zhangyis.db.storage.fil.PageStore;
+import cn.zhangyis.db.storage.fil.TablespaceState;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
 import org.junit.jupiter.api.io.TempDir;
@@ -20,6 +21,7 @@ import java.nio.file.Path;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * SpaceHeaderRepository 集成测试：initialize→read 往返（三 list 头为 FlstBase 空链）、标量 setter→read、
@@ -57,6 +59,49 @@ class SpaceHeaderRepositoryTest {
             mgr.commit(r);
 
             assertEquals(freshHeader(), got);
+        }
+    }
+
+    /**
+     * undo 生命周期头位于 page-0 保留区，必须与 FSP header 独立往返，并保留稳定状态码和截断 epoch。
+     */
+    @Test
+    void lifecycleHeaderRoundTripsWithoutChangingFspHeader() {
+        PageStore store = new FileChannelPageStore();
+        store.create(SPACE, dir.resolve("undo.ibu"), PS, PageNo.of(64));
+        try (PageStore s = store; BufferPool pool = new LruBufferPool(store, PS, 8)) {
+            SpaceHeaderRepository repo = new SpaceHeaderRepository(pool);
+            MiniTransactionManager mgr = new MiniTransactionManager();
+            TablespaceLifecycleHeader expected = new TablespaceLifecycleHeader(
+                    TablespaceState.TRUNCATING, PageNo.of(64), 7L, PageNo.of(64), TablespaceState.INACTIVE);
+
+            MiniTransaction w = mgr.begin();
+            repo.initialize(w, freshHeader());
+            repo.writeLifecycle(w, SPACE, expected);
+            mgr.commit(w);
+
+            MiniTransaction r = mgr.begin();
+            assertEquals(expected, repo.readLifecycle(r, SPACE).orElseThrow());
+            assertEquals(freshHeader(), repo.read(r, SPACE));
+            mgr.commit(r);
+        }
+    }
+
+    /** 旧表空间保留区全零时必须明确返回“无生命周期头”，不能把零误解为 EMPTY。 */
+    @Test
+    void legacyPageZeroHasNoLifecycleHeader() {
+        PageStore store = new FileChannelPageStore();
+        store.create(SPACE, dir.resolve("legacy.ibd"), PS, PageNo.of(64));
+        try (PageStore s = store; BufferPool pool = new LruBufferPool(store, PS, 8)) {
+            SpaceHeaderRepository repo = new SpaceHeaderRepository(pool);
+            MiniTransactionManager mgr = new MiniTransactionManager();
+            MiniTransaction w = mgr.begin();
+            repo.initialize(w, freshHeader());
+            mgr.commit(w);
+
+            MiniTransaction r = mgr.begin();
+            assertTrue(repo.readLifecycle(r, SPACE).isEmpty());
+            mgr.commit(r);
         }
     }
 

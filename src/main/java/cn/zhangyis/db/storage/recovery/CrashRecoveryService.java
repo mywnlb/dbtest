@@ -4,10 +4,18 @@ import cn.zhangyis.db.common.exception.DatabaseRuntimeException;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.Lsn;
 import cn.zhangyis.db.domain.PageId;
+import cn.zhangyis.db.domain.PageNo;
+import cn.zhangyis.db.domain.PageSize;
+import cn.zhangyis.db.domain.SpaceId;
+import cn.zhangyis.db.storage.fil.PageStore;
+import cn.zhangyis.db.storage.fil.TablespaceCorruptedException;
+import cn.zhangyis.db.storage.fsp.SpaceHeaderPhysical;
+import cn.zhangyis.db.storage.fsp.SpaceHeaderRawCodec;
 import cn.zhangyis.db.storage.redo.RedoCheckpointLabel;
 import cn.zhangyis.db.storage.redo.RedoLogBatch;
 import cn.zhangyis.db.storage.redo.RedoRecoveryReader;
 
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -64,6 +72,29 @@ public final class CrashRecoveryService {
                 request.dispatcher().applyAll(batches, request.applyContext());
                 stages.add(RecoveryStageName.REDO_REPLAY);
 
+                // 先安装恢复边界，使后续 undo 续作（会 append marker/rebuild redo）从 recoveredToLsn 连续追加。
+                // 与 undo 参与者内部对同一 recoveredToLsn 的安装幂等共存（RedoLogManager 同值再装为 no-op）。
+                if (request.recoveredRedoManager() != null) {
+                    request.recoveredRedoManager().restoreRecoveredBoundary(reader.recoveredToLsn());
+                    stages.add(RecoveryStageName.REDO_BOUNDARY_INSTALL);
+                }
+
+                if (request.undoTablespaceRecovery() != null) {
+                    request.undoTablespaceRecovery().resumeAfterRedo(reader.recoveredToLsn());
+                    stages.add(RecoveryStageName.UNDO_TABLESPACE_RESUME);
+                }
+
+                // reconcile 必须晚于 undo 续作：续作把被截断 undo 表空间的 page0 重建为新小尺寸后，reconcile 才读到正确大小。
+                if (!request.spacesToReconcile().isEmpty()) {
+                    reconcileSpaceFiles(request);
+                    stages.add(RecoveryStageName.SPACE_FILE_RECONCILE);
+                }
+
+                // durability 屏障：开放流量前 force 全部恢复写。replay/repair/reconcile 都绕过 Buffer Pool dirty 跟踪、
+                // 自身不 fsync；若不在此落盘，一旦后续 checkpoint 越过 recoveredToLsn 并回收 redo，再次崩溃将既无 redo
+                // 也无 durable 页，丢失恢复结果。force 后任何越过 recoveredToLsn 的 checkpoint 都是安全的。
+                request.applyContext().pageStore().forceAll();
+
                 gate.openForUserTraffic();
                 stages.add(RecoveryStageName.OPEN_TRAFFIC);
                 state = RecoveryState.OPEN;
@@ -114,12 +145,67 @@ public final class CrashRecoveryService {
         }
     }
 
-    private int repairDoublewritePages(RecoveryRequest request) {
-        if (request.doublewriteScanner() == null) {
-            return 0;
+    /**
+     * SPACE_FILE_RECONCILE：redo replay 后，按显式配置的表空间集，把物理文件大小重对齐到 redo 恢复出的
+     * page0.currentSizeInPages。它弥补 autoExtend 已扩展并写过 page0 大小、但 extent 内仅个别页有 redo 而留下的
+     * 尾部零页——这些页无 redo 描述，只能据 page0 权威逻辑大小补齐。page0（pageNo 0）恒在界内，读出后用
+     * {@link SpaceHeaderRawCodec} 解出 currentSize，再调用幂等的 {@link PageStore#ensureCapacity}。
+     */
+    private void reconcileSpaceFiles(RecoveryRequest request) {
+        PageStore pageStore = request.applyContext().pageStore();
+        PageSize pageSize = request.applyContext().pageSize();
+        for (SpaceId spaceId : request.spacesToReconcile()) {
+            byte[] page0 = new byte[pageSize.bytes()];
+            pageStore.readPage(PageId.of(spaceId, PageNo.of(0)), ByteBuffer.wrap(page0));
+            SpaceHeaderPhysical header = SpaceHeaderRawCodec.readPhysical(ByteBuffer.wrap(page0));
+            validateReconcileHeader(spaceId, pageSize, header);
+            pageStore.ensureCapacity(spaceId, header.currentSizeInPages());
         }
+    }
+
+    /**
+     * 在用 page0 的 currentSizeInPages 驱动物理扩展前做损坏校验：损坏 header 可能带任意大小，盲目据其扩展会触发
+     * 错误的文件增长甚至磁盘耗尽。校验 page0 自描述的 spaceId/pageSize 与请求一致、size 为正、且字节偏移不溢出。
+     * 任一不符抛 {@link TablespaceCorruptedException}，由 recover 统一 fail closed。
+     *
+     * <p>简化点：尚无实例级配置，未对“合理最大页数”设绝对上界；当前以 spaceId/pageSize 身份一致 + 正数 + 溢出
+     * 保护拦截绝大多数损坏，绝对页数上界留待引入表空间大小配置后补充。
+     */
+    private void validateReconcileHeader(SpaceId spaceId, PageSize pageSize, SpaceHeaderPhysical header) {
+        if (!header.spaceId().equals(spaceId)) {
+            throw new TablespaceCorruptedException("reconcile page0 space id mismatch: expected="
+                    + spaceId.value() + " actual=" + header.spaceId().value());
+        }
+        if (!header.pageSize().equals(pageSize)) {
+            throw new TablespaceCorruptedException("reconcile page0 page size mismatch: expected="
+                    + pageSize.bytes() + " actual=" + header.pageSize().bytes());
+        }
+        long pages = header.currentSizeInPages().value();
+        if (pages < 1) {
+            throw new TablespaceCorruptedException(
+                    "reconcile page0 currentSizeInPages must be positive: " + pages);
+        }
+        try {
+            Math.multiplyExact(pages, (long) pageSize.bytes());
+        } catch (ArithmeticException overflow) {
+            throw new TablespaceCorruptedException(
+                    "reconcile page0 currentSizeInPages overflows byte offset: " + pages, overflow);
+        }
+    }
+
+    private int repairDoublewritePages(RecoveryRequest request) {
         int repaired = 0;
+        if (request.undoTablespaceRecovery() != null) {
+            repaired += request.undoTablespaceRecovery().prepareDoublewrite(request.doublewriteScanner());
+        }
+        if (request.doublewriteScanner() == null) {
+            return repaired;
+        }
         for (PageId pageId : request.pagesToRepair()) {
+            if (request.undoTablespaceRecovery() != null
+                    && !request.undoTablespaceRecovery().shouldRepairDoublewritePage(pageId)) {
+                continue;
+            }
             if (request.doublewriteScanner().repairPageIfNeeded(pageId)) {
                 repaired++;
             }

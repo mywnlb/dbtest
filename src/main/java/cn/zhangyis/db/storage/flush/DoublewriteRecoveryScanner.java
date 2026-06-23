@@ -38,6 +38,12 @@ public final class DoublewriteRecoveryScanner {
         if (pageId == null) {
             throw new DatabaseValidationException("page id must not be null");
         }
+        // 越当前物理文件尾的页物理上不存在，谈不上 torn page；崩溃可能把 autoExtend 出的尾部截掉，此处不应
+        // 越界读取或用 doublewrite 复活它（doublewrite 在 redo 之前执行，文件可能仍短）。交给 redo replay 的
+        // extend-on-demand 与 SPACE_FILE_RECONCILE 重建，故跳过。
+        if (pageId.pageNo().value() >= pageStore.currentSizeInPages(pageId.spaceId()).value()) {
+            return false;
+        }
         byte[] current = new byte[pageSize.bytes()];
         pageStore.readPage(pageId, ByteBuffer.wrap(current));
         if (PageImageChecksum.verify(current, pageSize)) {

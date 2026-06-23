@@ -176,8 +176,8 @@ final class DataFileHandle implements AutoCloseable {
      *
      * <p>部分失败语义：若 zeroFill 中途抛 IOException，磁盘文件可能已部分增长，但 currentSizeInPages 仍停留在
      * oldSize（未发布）。currentSizeInPages 是权威逻辑大小，读路径据此拒绝未发布尾部，不会读到半初始化页；
-     * 后续重试 autoExtend 会从 oldSize 重新零填充（重复写零无害）。磁盘物理大小与逻辑大小的暂时背离由未来
-     * redo/recovery 切片统一收敛。
+     * 后续重试 autoExtend 会从 oldSize 重新零填充（重复写零无害）。磁盘物理大小与逻辑大小的暂时背离由
+     * crash recovery 的 SPACE_FILE_RECONCILE 阶段经 {@link #ensureCapacity} 据 page0 权威大小收敛（已实现）。
      *
      * @param policy 扩展策略。
      * @return 扩展后的 currentSizeInPages。
@@ -212,6 +212,15 @@ final class DataFileHandle implements AutoCloseable {
     }
 
     /**
+     * 数据文件路径快照。该值由 create/open 注入并在句柄生命周期内不变，供 metadata loader 重建逻辑表空间快照。
+     *
+     * @return 已打开数据文件路径。
+     */
+    Path path() {
+        return path;
+    }
+
+    /**
      * 对数据文件执行 fsync/force。持 Lifecycle(S) 表示与普通 page IO 同级；close/drop/truncate 需要 Lifecycle(X)，
      * 会等待本次 force 离开。force 不回调 Buffer Pool 或 redo，避免物理文件锁反向进入上层等待。
      */
@@ -223,6 +232,72 @@ final class DataFileHandle implements AutoCloseable {
             } catch (IOException e) {
                 throw new DataFilePhysicalException("force data file failed: " + path, e);
             }
+        }
+    }
+
+    /**
+     * 物理缩短单文件表空间。锁顺序固定为 Lifecycle(X) → FileSize(X)：先 drain 所有普通 IO/extend，
+     * 再串行化尺寸变更；FileChannel.truncate 成功后立即收紧 volatile 逻辑边界，然后 force 元数据。
+     *
+     * <p>若 force 失败，逻辑大小仍保留为目标值，因为物理文件已经不可逆地缩短；这样释放 Lifecycle(X) 后
+     * 读路径不会按旧大小访问 EOF。上层 marker 保持 TRUNCATING，恢复会重做 force/重建并最终收敛。
+     *
+     * @param targetSizeInPages 严格小于当前大小的正页数。
+     */
+    void truncateTo(PageNo targetSizeInPages) {
+        if (targetSizeInPages == null || targetSizeInPages.value() < 1) {
+            throw new DatabaseValidationException("truncate target size must be positive");
+        }
+        try (ResourceGuard lifecycle = lifecycleLatch.acquireExclusive(); ResourceGuard size = fileSizeLock.acquire()) {
+            ensureOpen();
+            long target = targetSizeInPages.value();
+            long current = currentSizeInPages;
+            if (target >= current) {
+                throw new DatabaseValidationException("truncate target must be smaller than current size: target="
+                        + target + ", current=" + current);
+            }
+            final long targetBytes;
+            try {
+                targetBytes = Math.multiplyExact(target, (long) pageSize.bytes());
+            } catch (ArithmeticException overflow) {
+                throw new DatabaseValidationException("truncate target byte offset overflow: " + target, overflow);
+            }
+            try {
+                channel.truncate(targetBytes);
+                // truncate 已改变物理事实，先收紧内存可见边界；force 失败时也不能恢复旧逻辑 size。
+                currentSizeInPages = target;
+                channel.force(true);
+            } catch (IOException e) {
+                throw new DataFilePhysicalException("truncate data file failed: " + path
+                        + " targetPages=" + target, e);
+            }
+        }
+    }
+
+    /**
+     * 幂等"扩到至少 {@code minSizeInPages}"：物理大小已 >= 目标则 no-op；否则在 FileSize(X) 下零填充
+     * [current, target) 并发布新 currentSizeInPages。它是 {@link #truncateTo} 的镜像但只增不减，用于 crash
+     * recovery 把因 autoExtend 未 fsync 而在崩溃后丢失的尾部物理页重对齐到 redo 恢复出的 page0 权威大小。
+     *
+     * <p>锁与可见性同 {@link #autoExtend}：持 Lifecycle(S)+FileSize(X)，零填充完成后再发布 volatile size，
+     * 保证"发布前新页对读不可见"。不 force：recovery replay 幂等，二次恢复会重读 page0 并重新零填充
+     * （重复写零无害），不需要在此承担 fsync 成本。
+     *
+     * @param minSizeInPages 期望的最小物理页数；必须为正。
+     */
+    void ensureCapacity(PageNo minSizeInPages) {
+        if (minSizeInPages == null || minSizeInPages.value() < 1) {
+            throw new DatabaseValidationException("ensure capacity min size must be positive");
+        }
+        try (ResourceGuard s = lifecycleLatch.acquireShared(); ResourceGuard x = fileSizeLock.acquire()) {
+            ensureOpen();
+            long target = minSizeInPages.value();
+            long current = currentSizeInPages;
+            if (target <= current) {
+                return;
+            }
+            zeroFill(channel, current, target, pageSize.bytes());
+            currentSizeInPages = target;
         }
     }
 

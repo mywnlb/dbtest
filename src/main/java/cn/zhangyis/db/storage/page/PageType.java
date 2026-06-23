@@ -19,7 +19,9 @@ public enum PageType {
     /** page 3：序列化数据字典（保留）。 */
     SDI(4),
     /** B+Tree 索引页。 */
-    INDEX(5);
+    INDEX(5),
+    /** Undo 日志页：承载 undo page header + undo record（T1.3a 起）。 */
+    UNDO(6);
 
     private final int code;
 

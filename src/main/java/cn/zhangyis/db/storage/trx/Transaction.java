@@ -1,5 +1,6 @@
 package cn.zhangyis.db.storage.trx;
 
+import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.TransactionId;
 import cn.zhangyis.db.domain.TransactionNo;
 
@@ -9,6 +10,11 @@ import cn.zhangyis.db.domain.TransactionNo;
  * <p>状态、事务 id、提交序号只由 {@link TransactionManager} 经状态机修改（包内可见 setter），不暴露公共 setter，
  * 避免外部绕过状态机破坏不变量。本片不持有 {@code BufferFrame}/{@code PageGuard}，也不含 readView 字段
  * （ReadView 推迟到可见性片）。
+ *
+ * <p>T1.3c 起，事务聚合挂一个惰性 {@link UndoContext}（事务运行时 undo 子状态），由 {@code UndoLogManager} 在
+ * 首写时经包内可见 {@link #setUndoContext} 绑定；首写前为 {@code null}，表示尚未建 insert undo segment。
+ * {@code UndoContext} 的内部推进（{@code lastUndoNo}/{@code lastRollPointer}）由 {@code UndoLogManager} 调其
+ * 包内 setter 完成，不经本类。
  */
 public final class Transaction {
 
@@ -26,6 +32,13 @@ public final class Transaction {
     private TransactionNo transactionNo = TransactionNo.NONE;
     /** 事务状态：仅经 {@link #transitionTo} 推进。 */
     private TransactionState state = TransactionState.ACTIVE;
+    /** 事务 undo 子状态：惰性绑定，首写前为 {@code null}（未建 insert undo segment）。仅 UndoLogManager 修改。 */
+    private UndoContext undoContext;
+    /**
+     * 一致性读快照（T1.4）：RR 事务级复用——首次一致性读经 {@code ReadViewManager.openReadView} 绑定，
+     * 整事务复用同一对象，commit/rollback 时 {@code release} 清空；RC 每读新建、不在此缓存。仅 ReadViewManager 修改。
+     */
+    private ReadView readView;
 
     Transaction(TransactionOptions options, long startTimeMillis) {
         this.isolationLevel = options.isolationLevel();
@@ -62,7 +75,17 @@ public final class Transaction {
         return state;
     }
 
-    // ---- 包内可见：仅 TransactionManager 调用 ----
+    /** 事务 undo 子状态；首写前为 {@code null}（未建 insert undo segment）。 */
+    public UndoContext undoContext() {
+        return undoContext;
+    }
+
+    /** 事务级一致性读快照（RR 复用）；未开或已 release 时为 {@code null}。 */
+    public ReadView readView() {
+        return readView;
+    }
+
+    // ---- 包内可见：仅 TransactionManager / UndoLogManager 调用 ----
 
     void setTransactionId(TransactionId id) {
         this.transactionId = id;
@@ -70,6 +93,34 @@ public final class Transaction {
 
     void setTransactionNo(TransactionNo no) {
         this.transactionNo = no;
+    }
+
+    /**
+     * 绑定事务 undo 子状态。由 {@code UndoLogManager.ensureUndoContext} 在首写时调用；Java null 引用必须拒绝
+     * （避免隐藏 NPE），但调用方控制单次绑定，本 mutator 不强制单次以保持生命周期约束集中在 manager。
+     *
+     * @param ctx undo 子状态，不能为 null。
+     */
+    void setUndoContext(UndoContext ctx) {
+        if (ctx == null) {
+            throw new DatabaseValidationException("undo context must not be null");
+        }
+        this.undoContext = ctx;
+    }
+
+    /**
+     * 绑定事务级一致性读快照（RR）。仅 {@code ReadViewManager.openReadView} 调用；不能为 null。
+     */
+    void bindReadView(ReadView view) {
+        if (view == null) {
+            throw new DatabaseValidationException("read view must not be null");
+        }
+        this.readView = view;
+    }
+
+    /** 清空事务级 ReadView（RR）。仅 {@code ReadViewManager.release} 调用；幂等（已空再清无副作用）。 */
+    void clearReadView() {
+        this.readView = null;
     }
 
     /** 经状态机校验后推进状态；非法转换抛 {@link TransactionStateException}。 */

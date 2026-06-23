@@ -68,6 +68,14 @@ public interface TablespaceRegistry {
     TablespaceHandle markCorrupted(SpaceId spaceId, String reason);
 
     /**
+     * 标记表空间为 INACTIVE，阻断普通 IO/空间管理准入，但允许 recovery 路径继续读取该句柄。
+     *
+     * @param spaceId 表空间编号。
+     * @return inactive 状态的运行时句柄。
+     */
+    TablespaceHandle markInactive(SpaceId spaceId);
+
+    /**
      * 标记表空间已 discard，普通 IO 路径后续不能返回该句柄。
      *
      * @param spaceId 表空间编号。

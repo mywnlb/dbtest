@@ -115,6 +115,42 @@ public final class FlushService {
         }
     }
 
+    /**
+     * 建立 lifecycle marker 的全局持久化屏障：同步 fsync redo，反复刷出所有 oldest LSN 不大于 target 的脏页，
+     * 并推进 checkpoint，直到 checkpoint 覆盖 target。不能只 drain 目标表空间，因为任一其它空间的更老脏页都会
+     * 限制 fuzzy checkpoint；超时则保留上层 TRUNCATING marker，禁止继续物理缩短。
+     *
+     * @param targetLsn 必须已由 marker MTR 分配的目标 LSN。
+     * @param timeout 最大等待时间。
+     * @return 已覆盖 target 的 checkpoint LSN。
+     */
+    public Lsn flushThrough(Lsn targetLsn, Duration timeout) {
+        if (targetLsn == null || timeout == null) {
+            throw new DatabaseValidationException("flush-through target/timeout must not be null");
+        }
+        if (timeout.isNegative()) {
+            throw new DatabaseValidationException("flush-through timeout must not be negative: " + timeout);
+        }
+        long deadline = deadlineFromNow(timeout);
+        redo.flush();
+        while (true) {
+            List<DirtyPageCandidate> candidates = bufferPool.dirtyPageCandidates(targetLsn, bufferPool.capacity());
+            for (DirtyPageCandidate candidate : candidates) {
+                flushCoordinator.singlePageFlush(candidate.pageId());
+            }
+            Lsn checkpoint = checkpointCoordinator.advanceCheckpoint();
+            if (checkpoint.value() >= targetLsn.value()) {
+                return checkpoint;
+            }
+            if (deadlineReached(deadline)) {
+                throw new FlushBarrierTimeoutException("timed out flushing/checkpointing through LSN "
+                        + targetLsn.value() + "; durable=" + redo.flushedToDiskLsn().value()
+                        + ", checkpoint=" + checkpoint.value());
+            }
+            parkBriefly(deadline);
+        }
+    }
+
     private List<PageId> dirtyPagesInSpace(SpaceId spaceId) {
         return bufferPool.dirtyPageCandidates(Lsn.of(Long.MAX_VALUE), bufferPool.capacity())
                 .stream()

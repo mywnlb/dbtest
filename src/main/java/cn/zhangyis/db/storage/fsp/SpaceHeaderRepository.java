@@ -9,6 +9,9 @@ import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.PageGuard;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
+import cn.zhangyis.db.storage.fil.TablespaceState;
+
+import java.util.Optional;
 
 /**
  * SpaceHeaderPage（page 0）仓储（设计 §6.2）。经 MTR 持 page 0 latch 读写 header 字段；写须 X latch。
@@ -73,6 +76,61 @@ public final class SpaceHeaderRepository {
                 g.readLong(SpaceHeaderLayout.SDI_ROOT),
                 g.readInt(SpaceHeaderLayout.SERVER_VERSION),
                 g.readLong(SpaceHeaderLayout.SPACE_VERSION));
+    }
+
+    /**
+     * 在同一 page-0 X latch 下写完整生命周期头。调用方应把状态转换与相关 FSP 修改放进同一 MTR，
+     * 使 redo replay 不会观察到半个 marker。该方法不使用枚举 ordinal，磁盘兼容性由稳定状态码保证。
+     *
+     * @param mtr 当前活动 MTR。
+     * @param spaceId 目标表空间。
+     * @param header 要持久化的完整生命周期快照。
+     */
+    public void writeLifecycle(MiniTransaction mtr, SpaceId spaceId, TablespaceLifecycleHeader header) {
+        requireMtr(mtr);
+        requireSpace(spaceId);
+        if (header == null) {
+            throw new DatabaseValidationException("tablespace lifecycle header must not be null");
+        }
+        PageGuard g = mtr.getPage(pool, page0(spaceId), PageLatchMode.EXCLUSIVE);
+        g.writeInt(SpaceHeaderLayout.LIFECYCLE_MAGIC, TablespaceLifecycleFormat.MAGIC);
+        g.writeInt(SpaceHeaderLayout.LIFECYCLE_FORMAT, TablespaceLifecycleFormat.VERSION);
+        g.writeInt(SpaceHeaderLayout.LIFECYCLE_STATE, header.state().persistentCode());
+        g.writeLong(SpaceHeaderLayout.LIFECYCLE_INITIAL_SIZE, header.initialSizeInPages().value());
+        g.writeLong(SpaceHeaderLayout.LIFECYCLE_EPOCH, header.truncateEpoch());
+        g.writeLong(SpaceHeaderLayout.LIFECYCLE_TARGET_SIZE, header.targetSizeInPages().value());
+        g.writeInt(SpaceHeaderLayout.LIFECYCLE_FINISH_STATE, header.finishState().persistentCode());
+    }
+
+    /**
+     * 读取 page-0 生命周期头。magic 为 0 表示旧格式并返回 empty；其它未知 magic/format 属于元数据损坏，
+     * 必须阻断截断，防止用猜测的 initial size 破坏文件。
+     *
+     * @param mtr 当前活动 MTR。
+     * @param spaceId 目标表空间。
+     * @return 已初始化的生命周期快照，或旧格式的 empty。
+     */
+    public Optional<TablespaceLifecycleHeader> readLifecycle(MiniTransaction mtr, SpaceId spaceId) {
+        requireMtr(mtr);
+        requireSpace(spaceId);
+        PageGuard g = mtr.getPage(pool, page0(spaceId), PageLatchMode.SHARED);
+        int magic = g.readInt(SpaceHeaderLayout.LIFECYCLE_MAGIC);
+        if (magic == 0) {
+            return Optional.empty();
+        }
+        if (magic != TablespaceLifecycleFormat.MAGIC) {
+            throw new FspMetadataException("invalid tablespace lifecycle magic: " + Integer.toHexString(magic));
+        }
+        int format = g.readInt(SpaceHeaderLayout.LIFECYCLE_FORMAT);
+        if (format != TablespaceLifecycleFormat.VERSION) {
+            throw new FspMetadataException("unsupported tablespace lifecycle format: " + format);
+        }
+        return Optional.of(new TablespaceLifecycleHeader(
+                TablespaceState.fromPersistentCode(g.readInt(SpaceHeaderLayout.LIFECYCLE_STATE)),
+                PageNo.of(g.readLong(SpaceHeaderLayout.LIFECYCLE_INITIAL_SIZE)),
+                g.readLong(SpaceHeaderLayout.LIFECYCLE_EPOCH),
+                PageNo.of(g.readLong(SpaceHeaderLayout.LIFECYCLE_TARGET_SIZE)),
+                TablespaceState.fromPersistentCode(g.readInt(SpaceHeaderLayout.LIFECYCLE_FINISH_STATE))));
     }
 
     public void setCurrentSizeInPages(MiniTransaction mtr, SpaceId spaceId, PageNo value) {

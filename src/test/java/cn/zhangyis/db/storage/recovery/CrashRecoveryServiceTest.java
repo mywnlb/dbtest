@@ -30,6 +30,7 @@ import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -152,6 +153,53 @@ class CrashRecoveryServiceTest {
             assertThrows(RecoveryStartupException.class, () -> service.recover(request));
             assertEquals(RecoveryState.FAILED, gate.state());
             assertEquals(RecoveryState.FAILED, service.state());
+        }
+    }
+
+    /** undo TRUNCATING 续作必须位于 redo replay 之后、开放流量之前，并接收完整 recoveredTo 边界。 */
+    @Test
+    void resumesUndoTablespaceAfterRedoBeforeOpeningTraffic() {
+        Path redoPath = dir.resolve("undo-resume-redo.log");
+        LogRange range;
+        try (RedoLogFileRepository redoRepo = RedoLogFileRepository.open(redoPath)) {
+            RedoLogManager redo = RedoLogManager.durable(redoRepo);
+            range = redo.append(List.of(new PageInitRecord(PAGE, PageType.INDEX)));
+            redo.flush();
+        }
+        try (PageStore store = new FileChannelPageStore();
+             RedoLogFileRepository redoRepo = RedoLogFileRepository.open(redoPath);
+             RedoCheckpointStore checkpointStore = RedoCheckpointStore.open(dir.resolve("undo-resume-control"))) {
+            store.create(SPACE, dir.resolve("undo-resume.ibd"), PS, PageNo.of(4));
+            AtomicReference<Lsn> resumedAt = new AtomicReference<>();
+            UndoTablespaceRecoveryParticipant participant = new UndoTablespaceRecoveryParticipant() {
+                @Override
+                public int prepareDoublewrite(DoublewriteRecoveryScanner scanner) {
+                    return 0;
+                }
+
+                @Override
+                public boolean shouldRepairDoublewritePage(PageId pageId) {
+                    return true;
+                }
+
+                @Override
+                public void resumeAfterRedo(Lsn recoveredToLsn) {
+                    resumedAt.set(recoveredToLsn);
+                }
+            };
+            RecoveryRequest request = RecoveryRequest.normal(checkpointStore, redoRepo,
+                            RedoApplyDispatcher.pageDispatcher(), new RedoApplyContext(store, PS))
+                    .withUndoTablespaceRecovery(participant);
+
+            RecoveryReport report = new CrashRecoveryService(new RecoveryTrafficGate()).recover(request);
+
+            assertEquals(range.end(), resumedAt.get());
+            assertEquals(List.of(RecoveryStageName.TRAFFIC_CLOSED,
+                            RecoveryStageName.DOUBLEWRITE_REPAIR,
+                            RecoveryStageName.REDO_REPLAY,
+                            RecoveryStageName.UNDO_TABLESPACE_RESUME,
+                            RecoveryStageName.OPEN_TRAFFIC),
+                    report.completedStages());
         }
     }
 

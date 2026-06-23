@@ -4,6 +4,7 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.Lsn;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageSize;
+import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.fil.PageStore;
 import cn.zhangyis.db.storage.page.PageEnvelopeLayout;
 
@@ -16,7 +17,10 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.time.Duration;
+import java.util.ArrayList;
 import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 
@@ -36,6 +40,8 @@ public final class LruBufferPool implements BufferPool, FrameReleaser {
 
     /** 保护 residentMap / freeList / policy / 各帧 pageId·dirty·fixCount；首版 miss/evict/flush 的盘 IO 也在其内串行。 */
     private final ReentrantLock poolLock = new ReentrantLock();
+    /** release() 在 fixCount 下降时唤醒截断排空；条件始终由 poolLock 保护。 */
+    private final Condition frameReleased = poolLock.newCondition();
     private final Map<PageId, BufferFrame> residentMap = new HashMap<>();
     private final Deque<BufferFrame> freeList = new ArrayDeque<>();
 
@@ -176,6 +182,7 @@ public final class LruBufferPool implements BufferPool, FrameReleaser {
                 markDirty(frame);
             }
             frame.fixCount--;
+            frameReleased.signalAll();
         } finally {
             poolLock.unlock();
         }
@@ -303,6 +310,72 @@ public final class LruBufferPool implements BufferPool, FrameReleaser {
         } finally {
             poolLock.unlock();
         }
+    }
+
+    /**
+     * 等待目标空间所有 fix 归零，然后原子检查 dirty 并从 resident/LRU 移除。等待期间 Condition 会释放 poolLock，
+     * 允许 PageGuard.close 回调 release；成功路径不做磁盘 IO，调用方必须预先完成安全 flush。
+     */
+    @Override
+    public void invalidateTablespace(SpaceId spaceId, Duration timeout) {
+        if (spaceId == null) {
+            throw new DatabaseValidationException("invalidate tablespace space id must not be null");
+        }
+        if (timeout == null || timeout.isZero() || timeout.isNegative()) {
+            throw new DatabaseValidationException("invalidate tablespace timeout must be positive");
+        }
+        long remaining;
+        try {
+            remaining = timeout.toNanos();
+        } catch (ArithmeticException overflow) {
+            throw new DatabaseValidationException("invalidate tablespace timeout is too large", overflow);
+        }
+        poolLock.lock();
+        try {
+            while (hasFixedFrame(spaceId)) {
+                if (remaining <= 0) {
+                    throw new BufferPoolInvalidationTimeoutException(
+                            "timed out waiting fixed frames for tablespace " + spaceId.value());
+                }
+                try {
+                    remaining = frameReleased.awaitNanos(remaining);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new BufferPoolInvalidationTimeoutException(
+                            "interrupted waiting fixed frames for tablespace " + spaceId.value(), interrupted);
+                }
+            }
+            List<BufferFrame> targets = new ArrayList<>();
+            for (BufferFrame frame : residentMap.values()) {
+                if (frame.pageId.spaceId().equals(spaceId)) {
+                    if (frame.dirty) {
+                        throw new DirtyTablespaceInvalidationException(
+                                "dirty frame blocks tablespace invalidation: " + frame.pageId);
+                    }
+                    targets.add(frame);
+                }
+            }
+            for (BufferFrame frame : targets) {
+                residentMap.remove(frame.pageId);
+                policy.onRemove(frame);
+                frame.pageId = null;
+                clearDirty(frame);
+                frame.fixCount = 0;
+                freeList.add(frame);
+            }
+        } finally {
+            poolLock.unlock();
+        }
+    }
+
+    /** 调用须持 poolLock。 */
+    private boolean hasFixedFrame(SpaceId spaceId) {
+        for (BufferFrame frame : residentMap.values()) {
+            if (frame.pageId.spaceId().equals(spaceId) && frame.fixCount > 0) {
+                return true;
+            }
+        }
+        return false;
     }
 
     @Override

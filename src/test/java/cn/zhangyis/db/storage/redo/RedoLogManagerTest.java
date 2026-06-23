@@ -50,4 +50,18 @@ class RedoLogManagerTest {
         assertThrows(UnsupportedOperationException.class, () -> snap.add(new PageInitRecord(PID, PageType.INDEX)));
         assertTrue(snap.get(0) instanceof PageInitRecord);
     }
+
+    /** 恢复完成后新 append 必须从 recoveredTo 继续，不能从 0 覆盖已有日志区间。 */
+    @Test
+    void restoreRecoveredBoundaryBeforeNewAppend() {
+        RedoLogManager mgr = new RedoLogManager();
+        mgr.restoreRecoveredBoundary(cn.zhangyis.db.domain.Lsn.of(100));
+
+        LogRange range = mgr.append(List.of(new PageInitRecord(PID, PageType.INDEX)));
+
+        assertEquals(100L, range.start().value());
+        assertEquals(100L, mgr.flushedToDiskLsn().value());
+        assertThrows(RuntimeException.class,
+                () -> mgr.restoreRecoveredBoundary(cn.zhangyis.db.domain.Lsn.of(200)));
+    }
 }

@@ -3,6 +3,8 @@ package cn.zhangyis.db.storage.record.page;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.storage.buf.PageGuard;
+import cn.zhangyis.db.storage.record.format.HiddenColumnLayout;
+import cn.zhangyis.db.storage.record.format.HiddenColumns;
 import cn.zhangyis.db.storage.record.format.RecordHeader;
 import cn.zhangyis.db.storage.record.format.RecordType;
 
@@ -121,6 +123,22 @@ public final class RecordPage {
         int flags = guard.readBytes(offset + IndexPageLayout.REC_FLAGS_FIELD_OFFSET, 1)[0] & 0xFF;
         flags = deleted ? (flags | 0x01) : (flags & ~0x01);
         guard.writeBytes(offset + IndexPageLayout.REC_FLAGS_FIELD_OFFSET, new byte[]{(byte) flags});
+    }
+
+    /**
+     * 改写聚簇记录的隐藏列 DB_TRX_ID/DB_ROLL_PTR（要求 X，T1.3f）。**外科修补尾部 15B**——隐藏区贴在记录字节末尾
+     * （{@code offset + recordLength - HIDDEN_BYTES}），仅覆写这 15 字节，不动用户列、记录头与 next/heap/flags 字段。
+     * 供 delete-mark/取消标记改版本指针而保持列值与记录长度不变（与 {@link #setDeleted} 配对，两步纯写、无内容 undo
+     * 风险）。调用方须保证该记录为聚簇记录（带隐藏区）；非聚簇记录无隐藏区，调用即破坏记录字节。
+     */
+    public void writeHiddenColumns(int offset, HiddenColumns hidden) {
+        if (hidden == null) {
+            throw new DatabaseValidationException("hidden columns must not be null");
+        }
+        int recordLength = recordHeaderAt(offset).recordLength();
+        byte[] buf = new byte[HiddenColumnLayout.HIDDEN_BYTES];
+        HiddenColumnLayout.encode(buf, 0, hidden.dbTrxId(), hidden.dbRollPtr());
+        guard.writeBytes(offset + recordLength - HiddenColumnLayout.HIDDEN_BYTES, buf);
     }
 
     /**

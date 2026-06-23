@@ -5,6 +5,8 @@ import cn.zhangyis.db.domain.PageId;
 
 import java.util.List;
 import java.util.Optional;
+import java.time.Duration;
+import cn.zhangyis.db.domain.SpaceId;
 
 /**
  * Buffer Pool 门面：在 fil.PageStore 之上提供受控页访问（fix + S/X page latch + LRU 淘汰 + 脏页写回）。
@@ -81,6 +83,16 @@ public interface BufferPool extends AutoCloseable {
      * @return oldest dirty LSN 或 cleanBoundary。
      */
     Lsn oldestDirtyLsnOr(Lsn cleanBoundary);
+
+    /**
+     * 截断前排空目标表空间：在限定时间内等待全部 fix 归零，确认不存在脏帧后移除所有驻留帧。
+     * 该方法不会隐式 flush；发现 dirty 必须抛错，避免绕过 WAL/doublewrite/checkpoint 顺序静默丢页。
+     * 调用方必须已持该表空间独占 operation lease，阻止新的 page fix 与并发 flush 进入。
+     *
+     * @param spaceId 目标表空间。
+     * @param timeout 等待 fix 归零的正超时。
+     */
+    void invalidateTablespace(SpaceId spaceId, Duration timeout);
 
     /** 帧总容量。 */
     int capacity();

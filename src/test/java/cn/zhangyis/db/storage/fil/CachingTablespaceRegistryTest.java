@@ -139,6 +139,19 @@ class CachingTablespaceRegistryTest {
     }
 
     @Test
+    void shouldMarkInactiveBlockingOrdinaryRequireButAllowingRecovery() {
+        CachingTablespaceRegistry registry = new CachingTablespaceRegistry(spaceId -> Optional.of(metadata(TablespaceState.NORMAL)));
+        registry.require(SpaceId.of(10));
+
+        TablespaceHandle inactive = registry.markInactive(SpaceId.of(10));
+
+        assertEquals(TablespaceState.INACTIVE, inactive.tablespace().state());
+        assertThrows(TablespaceUnavailableException.class, () -> registry.require(SpaceId.of(10)));
+        assertEquals(TablespaceState.INACTIVE, registry.requireForRecovery(SpaceId.of(10)).tablespace().state());
+        assertEquals(TablespaceState.INACTIVE, registry.find(SpaceId.of(10)).orElseThrow().tablespace().state());
+    }
+
+    @Test
     void shouldCloseRemoveAndListRuntimeHandles() {
         CachingTablespaceRegistry registry = new CachingTablespaceRegistry(spaceId -> Optional.of(metadata(TablespaceState.NORMAL)));
         registry.open(SpaceId.of(10));

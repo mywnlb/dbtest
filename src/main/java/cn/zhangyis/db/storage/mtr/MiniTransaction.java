@@ -3,6 +3,7 @@ package cn.zhangyis.db.storage.mtr;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.Lsn;
 import cn.zhangyis.db.domain.PageId;
+import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.PageGuard;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
@@ -10,6 +11,7 @@ import cn.zhangyis.db.storage.page.PageEnvelope;
 import cn.zhangyis.db.storage.page.PageType;
 import cn.zhangyis.db.storage.redo.LogRange;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
+import cn.zhangyis.db.storage.fil.TablespaceAccessController;
 
 /**
  * mini-transaction：短物理临界区的一致性边界（设计 §9）。memo 收集 page latch + buffer fix，
@@ -39,9 +41,18 @@ public final class MiniTransaction {
     /** redo 日志管理器（由 Manager 注入，commit 时 append 本 MTR 收集的记录并取得 endLsn）。 */
     private final RedoLogManager redoLogManager;
 
-    MiniTransaction(long id, RedoLogManager redoLogManager) {
+    /** 与截断服务共享的表空间 operation lease 控制器。 */
+    private final TablespaceAccessController accessController;
+
+    MiniTransaction(long id, RedoLogManager redoLogManager, TablespaceAccessController accessController) {
         this.id = id;
         this.redoLogManager = redoLogManager;
+        this.accessController = accessController;
+    }
+
+    /** 包内兼容构造，仅供不参与生命周期协作的 MTR 状态单测使用。 */
+    MiniTransaction(long id, RedoLogManager redoLogManager) {
+        this(id, redoLogManager, new TablespaceAccessController());
     }
 
     /** NEW→ACTIVE。由 Manager.begin 调用。 */
@@ -87,11 +98,30 @@ public final class MiniTransaction {
         return fix(pool, pageId, mode, false, pageType);
     }
 
+    /**
+     * 在执行表空间状态检查前显式取得共享 operation lease。DiskSpaceManager 使用该入口形成
+     * “取共享 lease → 重新读取 Registry 状态 → 操作”的原子准入顺序，消除先检查后等待截断的 TOCTOU。
+     * 同一 MTR/SpaceId 重复调用为 no-op，lease 由 memo 在所有页资源之后释放。
+     *
+     * @param spaceId 要进入的表空间。
+     */
+    public void acquireTablespaceLease(SpaceId spaceId) {
+        ensureActive();
+        if (spaceId == null) {
+            throw new DatabaseValidationException("tablespace lease space id must not be null");
+        }
+        if (!memo.hasTablespaceLease(spaceId)) {
+            memo.pushTablespaceLease(accessController.acquireShared(spaceId), spaceId);
+        }
+    }
+
     private PageGuard fix(BufferPool pool, PageId pageId, PageLatchMode mode, boolean existing, PageType pageType) {
         ensureActive();
         if (pool == null) {
             throw new DatabaseValidationException("buffer pool must not be null");
         }
+        // lease 先于 page fix/latch 获取并先入 memo，LIFO 下最后释放；truncate 的 X lease 因此不会与旧 frame 访问交叉。
+        acquireTablespaceLease(pageId.spaceId());
         // 同页 S→X 升级防护：page latch 是 ReentrantReadWriteLock，不支持读→写升级，若仍持该页 S latch 时再求 X，
         // BufferPool.acquire 的阻塞 latch.lock() 会让本线程自死锁。这里在取 latch 前把它转成可观测的领域异常。
         // X→S 降级与"已持 X 再取 X"放行：已持 X（!holds(X) 为假）说明本线程已是写者，再取 latch 可重入，不会死锁。
@@ -149,7 +179,7 @@ public final class MiniTransaction {
      * 使随后的 pageLSN 盖戳写**不**进 redo（决策④：先分配 LSN 再盖 pageLSN，盖戳不入本批）；对 collector.touchedPages
      * 逐页 {@link PageEnvelope#stampPageLsn} 盖 endLsn（恢复幂等基线）；最后 LIFO 释放 memo（按 wrote 标脏）。
      */
-    void commit() {
+    Lsn commit() {
         transitTo(MiniTransactionState.COMMITTING);
         LogRange range = redoLogManager.append(collector.records());
         Lsn endLsn = range.end();
@@ -159,6 +189,7 @@ public final class MiniTransaction {
         }
         memo.releaseAll();
         transitTo(MiniTransactionState.COMMITTED);
+        return endLsn;
     }
 
     /** ACTIVE→ROLLED_BACK，LIFO 释放 memo；不撤销已写入 buffer 的内容。 */

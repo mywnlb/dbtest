@@ -19,6 +19,43 @@
 
 如果实现需要简化设计文档中的内容，必须在代码注释、测试名称或补充文档中明确简化点、与 MySQL/InnoDB 的差异和后续扩展方向。
 
+## 目标架构图与当前实现地图
+
+`docs/design/diagrams` 下的全局架构图默认表达目标架构和长期设计方向，不要求随每个实现切片逐边同步。开发时不要把全局图中的每条边都当作当前生产代码已经接线的事实。
+
+当前代码真实链路以 `docs/design/current-implementation-map.md` 为准。实现切片完成后，如果模块调用关系、生产代码接线、预留类型状态或已知缺口发生变化，优先只更新该文件中受影响的小节；只有模块职责、依赖方向或目标架构本身变化时，才更新全局架构图。
+
+维护 `current-implementation-map.md` 时必须遵守：
+
+- 实线只能表示当前生产代码已经存在的调用、持有或写入关系。
+- 计划中但尚未接线的关系必须标记为 `planned`、`partial` 或 `unwired`，不能画成已实现实线。
+- 生产代码中的预留类型、无直接生产调用类型或只被测试覆盖的类型，必须进入 `Reserved / Unwired Production Types` 表，并写清保留理由和下一步动作。
+- 首次生成或大幅改写 `current-implementation-map.md` 后，必须按文件内 10 项检查清单复核；发现误导性边、状态不准或占位式表达时，先修正文档再继续实现。
+
+## Superpowers / Agent 工作流约束
+
+本项目允许使用 Superpowers 或类似 agent 工作流工具，但这些工具只提供过程纪律，不能改变本仓库的文档分层和权威来源。
+
+- `docs/design/` 下的厚设计文档是长期教学资产，描述目标架构、模块边界和恢复语义。
+- `docs/design/current-implementation-map.md` 是当前源码真实链路地图，必须基于生产代码调用链核对后更新。
+- 切片 spec 可以持久化，但必须瘦身，默认放在 `docs/design/slices/`，控制在 40-60 行左右，只写本次切片的目标、关键决策、非目标、验收测试和 current map 更新要求。
+- implementation plan 不持久化到仓库。执行计划应放在 agent todo list、PR 描述、issue checklist 或对话上下文中，完成后自然失效。
+- ADR 只记录重大架构取舍，例如“为什么选 A 不选 B”，默认放在 `docs/adr/`，单篇不超过 1 页。
+- 除非用户明确要求，不要生成 `docs/superpowers/specs/`、`docs/superpowers/plans/` 或类似长期计划文件。
+- 使用 Superpowers 时，必须服从本文件的项目文档规则；如果工具默认流程要求生成厚 spec 或持久 plan，应改为生成本项目约定的瘦 slice spec 或临时 todo。
+- 完成任何切片后，评审必须回到源码核对调用链。不能只根据设计文档、计划文件或对话结论判断实现已完成。
+
+## Token 与上下文恢复规则
+
+不要依赖长对话作为项目记忆。长期记忆只能写入少数权威文件，并通过源码与测试重新验证。
+
+- 新会话或上下文压缩后，agent 必须先读 `AGENTS.md` / `CLAUDE.md`、`docs/design/current-implementation-map.md`，再按当前任务只读取相关厚设计文档、slice spec、ADR 和源码。
+- 禁止为了恢复上下文而全量阅读 `docs/design/`。只能按当前切片读取相关设计文档，必要时用 `rg` 定位引用和调用链。
+- Superpowers 只作为过程纪律使用，不允许默认生成厚 spec 或持久 plan 来补偿上下文不足。
+- implementation plan 不入仓库；上下文丢失后，应通过 current map、slice spec、ADR、源码、测试和 `git status` / `git diff` 恢复，而不是依赖旧计划。
+- 每个切片完成后必须更新 `current-implementation-map.md` 中受影响的小节，使后续会话能从源码真实链路恢复。
+- 继续他人或上一轮 agent 的工作前，必须先检查工作区状态，区分已提交内容、未提交改动和未跟踪文件，不得覆盖不属于当前任务的改动。
+
 ## 技术栈与命令
 
 - 构建工具：Gradle。
@@ -183,3 +220,47 @@
 - 不要在并发代码中遗漏释放路径。
 - 不要在恢复、事务、redo、flush 代码中留下未经测试的 happy path。
 - 不要用 TODO/TBD 代替明确设计或实现决策。
+
+<!-- gitnexus:start -->
+# GitNexus — Code Intelligence
+
+This project is indexed by GitNexus as **dbtest** (7025 symbols, 20403 relationships, 296 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+
+> If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
+
+## Always Do
+
+- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `gitnexus_impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
+- **MUST run `gitnexus_detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows.
+- **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
+- When exploring unfamiliar code, use `gitnexus_query({query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
+- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `gitnexus_context({name: "symbolName"})`.
+
+## Never Do
+
+- NEVER edit a function, class, or method without first running `gitnexus_impact` on it.
+- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
+- NEVER rename symbols with find-and-replace — use `gitnexus_rename` which understands the call graph.
+- NEVER commit changes without running `gitnexus_detect_changes()` to check affected scope.
+
+## Resources
+
+| Resource | Use for |
+|----------|---------|
+| `gitnexus://repo/dbtest/context` | Codebase overview, check index freshness |
+| `gitnexus://repo/dbtest/clusters` | All functional areas |
+| `gitnexus://repo/dbtest/processes` | All execution flows |
+| `gitnexus://repo/dbtest/process/{name}` | Step-by-step execution trace |
+
+## CLI
+
+| Task | Read this skill file |
+|------|---------------------|
+| Understand architecture / "How does X work?" | `.claude/skills/gitnexus/gitnexus-exploring/SKILL.md` |
+| Blast radius / "What breaks if I change X?" | `.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md` |
+| Trace bugs / "Why is X failing?" | `.claude/skills/gitnexus/gitnexus-debugging/SKILL.md` |
+| Rename / extract / split / refactor | `.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md` |
+| Tools, resources, schema reference | `.claude/skills/gitnexus/gitnexus-guide/SKILL.md` |
+| Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
+
+<!-- gitnexus:end -->

@@ -183,6 +183,27 @@ public final class SegmentInodeRepository {
         return false;
     }
 
+    /**
+     * 扫描单 inode 页是否仍有已分配槽。undo truncate 只在所有 segment 已由 purge/dropSegment 回收后允许；
+     * 该检查在 lifecycle X lease 内以 page2 S latch 执行，结果不会与新的 segment 分配交叉。
+     *
+     * @param mtr 当前维护 MTR。
+     * @param spaceId undo 表空间。
+     * @return 任一 USED!=0 返回 true。
+     */
+    public boolean hasAllocatedSlots(MiniTransaction mtr, SpaceId spaceId) {
+        requireMtr(mtr);
+        requireSpace(spaceId);
+        PageGuard g = mtr.getPage(pool, inodePage(spaceId), PageLatchMode.SHARED);
+        long max = SegmentInodeLayout.maxInodesInPage(pageSize);
+        for (int slot = 0; slot < max; slot++) {
+            if (g.readInt(SegmentInodeLayout.slotOffset(slot) + SegmentInodeLayout.USED) != 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private void writeLongField(MiniTransaction mtr, SpaceId spaceId, int inodeSlot, int fieldOffset, long value) {
         requireMtr(mtr);
         requireSpace(spaceId);

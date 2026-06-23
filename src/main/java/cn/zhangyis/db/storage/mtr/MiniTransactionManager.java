@@ -2,6 +2,7 @@ package cn.zhangyis.db.storage.mtr;
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
+import cn.zhangyis.db.storage.fil.TablespaceAccessController;
 
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -11,6 +12,9 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public final class MiniTransactionManager {
 
+    /** 所有本 Manager 创建的 MTR 共享；截断服务必须注入同一实例形成真实互斥。 */
+    private final TablespaceAccessController accessController;
+
     /** 当前线程绑定的 MTR；天然按线程隔离。 */
     private final ThreadLocal<MiniTransaction> current = new ThreadLocal<>();
 
@@ -18,7 +22,27 @@ public final class MiniTransactionManager {
     private final AtomicLong idSequence = new AtomicLong();
 
     /** 全局 redo 日志管理器（D3 内存版）；注入每个 MTR，测试经 {@link #redoLogManager()} 检视。 */
-    private final RedoLogManager redoLogManager = new RedoLogManager();
+    private final RedoLogManager redoLogManager;
+
+    public MiniTransactionManager() {
+        this(new TablespaceAccessController(), new RedoLogManager());
+    }
+
+    public MiniTransactionManager(TablespaceAccessController accessController) {
+        this(accessController, new RedoLogManager());
+    }
+
+    /**
+     * 创建共享 operation lease 与指定 redo manager 的 MTR 管理器。截断 marker 必须使用 durable redo manager，
+     * 从而让 commit 返回的 end LSN 能在物理缩短前 fsync。
+     */
+    public MiniTransactionManager(TablespaceAccessController accessController, RedoLogManager redoLogManager) {
+        if (accessController == null || redoLogManager == null) {
+            throw new DatabaseValidationException("MTR access controller/redo manager must not be null");
+        }
+        this.accessController = accessController;
+        this.redoLogManager = redoLogManager;
+    }
 
     /**
      * 开启并绑定一个 MTR。已有当前 MTR 则抛异常（禁静默嵌套，需嵌套应显式建 child）。
@@ -29,7 +53,7 @@ public final class MiniTransactionManager {
         if (current.get() != null) {
             throw new MtrStateException("nested mini transaction not allowed on this thread; create an explicit child");
         }
-        MiniTransaction mtr = new MiniTransaction(idSequence.incrementAndGet(), redoLogManager);
+        MiniTransaction mtr = new MiniTransaction(idSequence.incrementAndGet(), redoLogManager, accessController);
         mtr.activate();
         current.set(mtr);
         return mtr;
@@ -58,10 +82,10 @@ public final class MiniTransactionManager {
      *
      * @param mtr 待提交 MTR。
      */
-    public void commit(MiniTransaction mtr) {
+    public cn.zhangyis.db.domain.Lsn commit(MiniTransaction mtr) {
         requireBound(mtr);
         try {
-            mtr.commit();
+            return mtr.commit();
         } finally {
             current.remove();
         }

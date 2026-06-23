@@ -10,6 +10,7 @@ import org.junit.jupiter.api.Test;
 
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
+import java.nio.file.Files;
 import java.util.Arrays;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -86,6 +87,24 @@ class FileChannelPageStoreTest {
     }
 
     @Test
+    void pathOfReturnsOpenFilePath() {
+        SpaceId space = SpaceId.of(31);
+        Path path = dir.resolve("pathof.ibd");
+        try (PageStore store = new FileChannelPageStore()) {
+            store.create(space, path, PS, PageNo.of(8));
+
+            assertEquals(path, store.pathOf(space));
+        }
+    }
+
+    @Test
+    void pathOfRejectsUnopenedSpace() {
+        try (PageStore store = new FileChannelPageStore()) {
+            assertThrows(TablespaceNotOpenException.class, () -> store.pathOf(SpaceId.of(99)));
+        }
+    }
+
+    @Test
     void shouldRejectDuplicateRegistration() {
         SpaceId space = SpaceId.of(3);
         try (PageStore store = new FileChannelPageStore()) {
@@ -104,6 +123,37 @@ class FileChannelPageStoreTest {
             ByteBuffer dst = ByteBuffer.allocate(PS.bytes());
             assertThrows(TablespaceNotOpenException.class,
                     () -> store.readPage(PageId.of(space, PageNo.of(0)), dst));
+        }
+    }
+
+    /**
+     * 物理截断必须同时缩短文件、发布新页数，并让旧尾页立即变为越界，防止恢复后继续访问 stale tail。
+     */
+    @Test
+    void shouldPhysicallyTruncateAndPublishSmallerSize() throws Exception {
+        SpaceId space = SpaceId.of(32);
+        Path path = dir.resolve("truncate.ibu");
+        try (PageStore store = new FileChannelPageStore()) {
+            store.create(space, path, PS, PageNo.of(4));
+
+            store.truncate(space, PageNo.of(2));
+
+            assertEquals(PageNo.of(2), store.currentSizeInPages(space));
+            assertEquals(2L * PS.bytes(), Files.size(path));
+            assertThrows(PageOutOfBoundsException.class,
+                    () -> store.readPage(PageId.of(space, PageNo.of(2)), ByteBuffer.allocate(PS.bytes())));
+        }
+    }
+
+    @Test
+    void shouldRejectNonShrinkingPhysicalTruncate() {
+        SpaceId space = SpaceId.of(33);
+        try (PageStore store = new FileChannelPageStore()) {
+            store.create(space, dir.resolve("not-shrink.ibu"), PS, PageNo.of(4));
+            assertThrows(DatabaseValidationException.class,
+                    () -> store.truncate(space, PageNo.of(4)));
+            assertThrows(DatabaseValidationException.class,
+                    () -> store.truncate(space, PageNo.of(5)));
         }
     }
 }

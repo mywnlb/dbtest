@@ -4,6 +4,7 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
+import cn.zhangyis.db.domain.RollPointer;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.domain.TransactionId;
 import cn.zhangyis.db.storage.api.DiskSpaceManager;
@@ -40,11 +41,10 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * T1.2 聚簇 insert：begin→insertClustered 盖 DB_TRX_ID/NULL roll ptr，split 跨 leaf 保留隐藏列，
- * node-pointer 根记录不带隐藏区，非法入参拒绝。
+ * T1.2/T1.3c 聚簇 insert：begin→insertClustered 盖 DB_TRX_ID 与调用方传入的 DB_ROLL_PTR（T1.3c 起替换恒 NULL），
+ * split 跨 leaf 保留隐藏列，node-pointer 根记录不带隐藏区，非法入参拒绝。
  */
 class ClusteredInsertTest {
 
@@ -59,14 +59,15 @@ class ClusteredInsertTest {
     private final TypeCodecRegistry registry = new TypeCodecRegistry();
 
     @Test
-    void clusteredInsertStampsTrxIdAndNullRollPtr() {
+    void clusteredInsertStampsTrxIdAndPassedRollPtr() {
         onPool(ctx -> {
             ctx.createTablespaceAndRoot();
             SplitCapableBTreeIndexService svc = ctx.service();
             BTreeIndex index = ctx.clusteredIndex();
+            RollPointer rollPtr = new RollPointer(true, PageNo.of(65), 12);
 
             MiniTransaction m = ctx.mgr.begin();
-            svc.insertClustered(m, index, wideRow(1), TransactionId.of(TRX));
+            svc.insertClustered(m, index, wideRow(1), TransactionId.of(TRX), rollPtr);
             ctx.mgr.commit(m);
 
             MiniTransaction r = ctx.mgr.begin();
@@ -74,7 +75,8 @@ class ClusteredInsertTest {
             ctx.mgr.commit(r);
 
             assertEquals(TransactionId.of(TRX), found.record().hiddenColumns().dbTrxId());
-            assertTrue(found.record().hiddenColumns().dbRollPtr().isNull());
+            assertEquals(rollPtr, found.record().hiddenColumns().dbRollPtr(),
+                    "T1.3c: insertClustered must stamp the caller-supplied DB_ROLL_PTR (no longer恒 NULL)");
         });
     }
 
@@ -87,18 +89,24 @@ class ClusteredInsertTest {
 
             for (long id = 1; id <= 4; id++) {
                 MiniTransaction m = ctx.mgr.begin();
-                BTreeInsertResult result = svc.insertClustered(m, current, wideRow(id), TransactionId.of(TRX));
+                // 每行带不同 DB_ROLL_PTR，验证 split materialize→reinsert 保留 roll ptr
+                RollPointer rollPtr = new RollPointer(true, PageNo.of(65), (int) id);
+                BTreeInsertResult result = svc.insertClustered(m, current, wideRow(id),
+                        TransactionId.of(TRX), rollPtr);
                 current = result.indexAfterInsert();
                 ctx.mgr.commit(m);
             }
             assertEquals(1, current.rootLevel(), "4 wide rows should split the root");
 
-            // 两个子 leaf 上的记录都仍带正确 DB_TRX_ID（split materialize→reinsert 保留隐藏列）
+            // 两个子 leaf 上的记录都仍带正确 DB_TRX_ID 与 DB_ROLL_PTR（split materialize→reinsert 保留隐藏列）
             for (long id : new long[]{1, 4}) {
                 MiniTransaction r = ctx.mgr.begin();
                 BTreeLookupResult found = svc.lookup(r, current, kId(id)).orElseThrow();
                 ctx.mgr.commit(r);
                 assertEquals(TRX, found.record().hiddenColumns().dbTrxId().value());
+                assertEquals(new RollPointer(true, PageNo.of(65), (int) id),
+                        found.record().hiddenColumns().dbRollPtr(),
+                        "split must preserve DB_ROLL_PTR for row " + id);
             }
 
             // 根页 node-pointer 记录用非 clustered 派生 schema 物化 → 无隐藏区
@@ -120,7 +128,7 @@ class ClusteredInsertTest {
             BTreeIndex index = ctx.clusteredIndexNoSegments();
             MiniTransaction m = ctx.mgr.begin();
             assertThrows(DatabaseValidationException.class,
-                    () -> svc.insertClustered(m, index, wideRow(1), TransactionId.NONE));
+                    () -> svc.insertClustered(m, index, wideRow(1), TransactionId.NONE, RollPointer.NULL));
             ctx.mgr.rollbackUncommitted(m);
         });
     }
@@ -133,7 +141,19 @@ class ClusteredInsertTest {
                     idKey(), nonClusteredSchema(), true);
             MiniTransaction m = ctx.mgr.begin();
             assertThrows(DatabaseValidationException.class,
-                    () -> svc.insertClustered(m, nonClustered, smallRow(1), TransactionId.of(TRX)));
+                    () -> svc.insertClustered(m, nonClustered, smallRow(1), TransactionId.of(TRX), RollPointer.NULL));
+            ctx.mgr.rollbackUncommitted(m);
+        });
+    }
+
+    @Test
+    void rejectsNullRollPointer() {
+        onPool(ctx -> {
+            SplitCapableBTreeIndexService svc = ctx.service();
+            BTreeIndex index = ctx.clusteredIndexNoSegments();
+            MiniTransaction m = ctx.mgr.begin();
+            assertThrows(DatabaseValidationException.class,
+                    () -> svc.insertClustered(m, index, wideRow(1), TransactionId.of(TRX), null));
             ctx.mgr.rollbackUncommitted(m);
         });
     }

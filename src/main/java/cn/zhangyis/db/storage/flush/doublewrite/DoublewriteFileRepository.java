@@ -17,6 +17,8 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.zip.CRC32;
@@ -166,6 +168,53 @@ public final class DoublewriteFileRepository implements AutoCloseable {
                 }
             }
             return latest;
+        } catch (IOException e) {
+            throw new FlushWriteException("failed to scan doublewrite file: " + path, e);
+        } finally {
+            ioLock.unlock();
+        }
+    }
+
+    /**
+     * 枚举 doublewrite 文件中所有有效 slot 的去重页号（恢复期"待检查页列表"来源）。有效定义同 {@link #latestCopy}：
+     * slot CRC 匹配且页镜像自身 checksum/trailer 校验通过；无效/尾部截断 slot 跳过。返回首见顺序的去重列表。
+     *
+     * @return 有有效副本的去重 {@link PageId} 列表。
+     */
+    public List<PageId> pageIds() {
+        ioLock.lock();
+        try {
+            LinkedHashSet<PageId> ids = new LinkedHashSet<>();
+            channel.position(0);
+            while (true) {
+                ByteBuffer header = ByteBuffer.allocate(SLOT_HEADER_BYTES);
+                if (!readFullyOrTail(header)) {
+                    break;
+                }
+                header.flip();
+                int magic = header.getInt();
+                if (magic != MAGIC) {
+                    throw new FlushWriteException("doublewrite magic mismatch in " + path + ": " + magic);
+                }
+                int format = header.getInt();
+                int space = header.getInt();
+                long pageNo = header.getLong();
+                header.getLong(); // pageLsn：枚举不需要，append 顺序即新旧顺序。
+                int pageBytes = header.getInt();
+                int expectedCrc = header.getInt();
+                if (format != FORMAT_VERSION || pageBytes != pageSize.bytes()) {
+                    throw new FlushWriteException("doublewrite slot format/page size mismatch in " + path);
+                }
+                ByteBuffer payload = ByteBuffer.allocate(pageBytes);
+                if (!readFullyOrTail(payload)) {
+                    break;
+                }
+                byte[] bytes = payload.array();
+                if (crc32(bytes) == expectedCrc && PageImageChecksum.verify(bytes, pageSize)) {
+                    ids.add(PageId.of(SpaceId.of(space), PageNo.of(pageNo)));
+                }
+            }
+            return List.copyOf(ids);
         } catch (IOException e) {
             throw new FlushWriteException("failed to scan doublewrite file: " + path, e);
         } finally {

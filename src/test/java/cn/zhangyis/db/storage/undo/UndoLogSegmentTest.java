@@ -5,6 +5,7 @@ import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.RollPointer;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.domain.TransactionId;
+import cn.zhangyis.db.domain.TransactionNo;
 import cn.zhangyis.db.domain.UndoNo;
 import cn.zhangyis.db.storage.api.DiskSpaceManager;
 import cn.zhangyis.db.storage.api.DiskSpaceUndoAllocator;
@@ -106,6 +107,21 @@ class UndoLogSegmentTest {
         onSegment(seg ->
                 assertThrows(UndoLogFormatException.class,
                         () -> seg.readRecord(RollPointer.NULL, keyDef(), schema())));
+    }
+
+    @Test
+    void markCommittedWritesStateAndCommitNoForRecoveryHistory() {
+        onSegment(seg -> {
+            assertTrue(seg.isActive());
+            assertFalse(seg.isCommitted());
+
+            seg.markCommitted(TransactionNo.of(42));
+
+            assertFalse(seg.isActive());
+            assertTrue(seg.isCommitted());
+            assertEquals(TransactionNo.of(42), seg.committedTransactionNo(),
+                    "COMMIT_NO is the recovery-time history ordering key");
+        });
     }
 
     private static TableSchema bigSchema() {

@@ -2,6 +2,7 @@ package cn.zhangyis.db.storage.trx;
 
 import cn.zhangyis.db.common.exception.DatabaseRuntimeException;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
+import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.RollPointer;
 import cn.zhangyis.db.storage.btree.BTreeIndex;
 import cn.zhangyis.db.storage.btree.SplitCapableBTreeIndexService;
@@ -14,6 +15,9 @@ import cn.zhangyis.db.storage.record.page.SearchKey;
 import cn.zhangyis.db.storage.undo.UndoLogSegment;
 import cn.zhangyis.db.storage.undo.UndoLogSegmentAccess;
 import cn.zhangyis.db.storage.undo.UndoRecord;
+
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * 事务 rollback 执行器（设计 §7.6/§11.2/§14.4，T1.3d 首次消费 undo）。从 {@link UndoContext#lastRollPointer}
@@ -109,6 +113,60 @@ public final class RollbackService {
         }
         txnMgr.finishRollback(txn);
         return new RollbackSummary(applied);
+    }
+
+    /**
+     * 恢复期回滚一个 ACTIVE undo segment（R 1.2，§14.5）。**无 live {@link Transaction}**：直接从 undo segment 首页
+     * + 显式配置的聚簇索引重建回滚——
+     * <ol>
+     *   <li>只读 MTR `open(SHARED)` + `forEachRecordWithPointer` **正向**收集 {@code (rec, rp)}（每条 record 自身地址）；</li>
+     *   <li>**反向**（最后写的先撤）逐条独立 MTR `applyUndoRecord`（复用 INSERT/UPDATE/DELETE_MARK 反向命令）。</li>
+     * </ol>
+     * 由启动恢复对 `restoreRollbackSegmentSlots` 重建出的、且 undo 段 state=ACTIVE 的 slot 调用；不走 Transaction 状态机
+     * （前台 {@link #rollback} 才走）、不在此释放 slot（恢复编排 release 内存 slot；page3 持久清留后续）。
+     *
+     * <p><b>单显式聚簇索引假设</b>（无 DD）：用 {@code clusteredIndex} 的 keyDef/schema 解码所有 undo；
+     * {@code rec.indexId() != index.indexId()} 抛。<b>幂等</b>：`deleteClustered`/`replaceClustered`/`setClusteredDeleteMark`
+     * 未命中即 no-op，故二次崩溃重复回滚安全。
+     *
+     * @param firstPageId    ACTIVE 事务的 undo segment 首页（来自恢复重建的 slot）。
+     * @param clusteredIndex 显式配置的聚簇索引（提供 keyDef/schema 解码 undo + 删除/恢复目标）。
+     * @return 本次回滚应用的 undo record 条数摘要。
+     */
+    public RollbackSummary rollbackRecovered(PageId firstPageId, BTreeIndex clusteredIndex) {
+        if (firstPageId == null || clusteredIndex == null) {
+            throw new DatabaseValidationException("rollbackRecovered firstPageId/clusteredIndex must not be null");
+        }
+        List<RecordAt> records = new ArrayList<>();
+        MiniTransaction readMtr = mtrMgr.begin();
+        try {
+            UndoLogSegment seg = undoAccess.open(readMtr, firstPageId, PageLatchMode.SHARED);
+            seg.forEachRecordWithPointer((rec, rp) -> records.add(new RecordAt(rec, rp)),
+                    clusteredIndex.keyDef(), clusteredIndex.schema());
+        } catch (RuntimeException e) {
+            mtrMgr.rollbackUncommitted(readMtr);
+            throw e;
+        }
+        mtrMgr.commit(readMtr);
+
+        int applied = 0;
+        for (int i = records.size() - 1; i >= 0; i--) {
+            RecordAt at = records.get(i);
+            MiniTransaction m = mtrMgr.begin();
+            try {
+                applyUndoRecord(m, at.record(), at.pointer(), clusteredIndex);
+            } catch (RuntimeException e) {
+                mtrMgr.rollbackUncommitted(m);
+                throw e;
+            }
+            mtrMgr.commit(m);
+            applied++;
+        }
+        return new RollbackSummary(applied);
+    }
+
+    /** 收集阶段的 (undo record, 其自身 roll pointer) 对；反向应用阶段按写入逆序撤销。 */
+    private record RecordAt(UndoRecord record, RollPointer pointer) {
     }
 
     /**

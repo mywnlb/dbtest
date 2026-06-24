@@ -1,6 +1,4 @@
 package cn.zhangyis.db.storage.flush.cleaner;
-import cn.zhangyis.db.storage.fil.io.PageStore;
-
 
 import cn.zhangyis.db.common.exception.DatabaseRuntimeException;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
@@ -18,10 +16,14 @@ import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * 单线程 page cleaner worker。它只接收 flush request 并调用 {@link FlushService#flushForCapacity(int)}，
- * 不直接访问 Buffer Pool frame 或 PageStore，因此不会在后台线程中引入新的页锁顺序。
+ * 单线程 page cleaner worker。它接收显式 flush request，也可以在空闲超时后执行周期性 capacity tick；
+ * 两种路径都只调用 {@link FlushService#flushForCapacity(int)}，不直接访问 Buffer Pool frame 或 PageStore，
+ * 因此不会在后台线程中引入新的页锁顺序。
  */
 public final class PageCleanerWorker implements AutoCloseable {
+
+    /** 关闭周期 tick 的内部哨兵；显式请求模式保持 F2 既有行为。 */
+    private static final int PERIODIC_DISABLED = -1;
 
     /** 每秒纳秒数，用于 Duration 转换并避免溢出。 */
     private static final long NANOS_PER_SECOND = 1_000_000_000L;
@@ -32,6 +34,8 @@ public final class PageCleanerWorker implements AutoCloseable {
     private final int queueCapacity;
     /** 空闲等待间隔；即使没有 signal，也会周期性醒来检查停止条件。 */
     private final long idleWaitNanos;
+    /** 空闲等待超时后自动执行的 maxPages；为 {@link #PERIODIC_DISABLED} 时不生成周期 tick。 */
+    private final int periodicMaxPages;
     /** 保护状态、队列、lastCycle 和 failure。 */
     private final ReentrantLock lock = new ReentrantLock();
     /** 有新请求或停止请求时唤醒 worker。 */
@@ -55,6 +59,20 @@ public final class PageCleanerWorker implements AutoCloseable {
     private DatabaseRuntimeException failure;
 
     public PageCleanerWorker(FlushService flushService, int queueCapacity, Duration idleWait) {
+        this(flushService, queueCapacity, idleWait, PERIODIC_DISABLED, false);
+    }
+
+    /**
+     * 创建带周期 tick 的 page cleaner。周期 tick 只表达“检查 redo capacity 并推进 checkpoint”的后台节奏；
+     * 真正刷哪些页仍由 {@link FlushService} 内部策略和 WAL gate 决定。{@code periodicMaxPages=0} 时允许只推进
+     * checkpoint，不主动刷脏，便于 engine bootstrap 测试验证后台 checkpoint worker 语义。
+     */
+    public PageCleanerWorker(FlushService flushService, int queueCapacity, Duration idleWait, int periodicMaxPages) {
+        this(flushService, queueCapacity, idleWait, periodicMaxPages, true);
+    }
+
+    private PageCleanerWorker(FlushService flushService, int queueCapacity, Duration idleWait,
+                              int periodicMaxPages, boolean validatePeriodicMaxPages) {
         if (flushService == null || idleWait == null) {
             throw new DatabaseValidationException("page cleaner service/idle wait must not be null");
         }
@@ -64,9 +82,14 @@ public final class PageCleanerWorker implements AutoCloseable {
         if (idleWait.isNegative() || idleWait.isZero()) {
             throw new DatabaseValidationException("page cleaner idle wait must be positive: " + idleWait);
         }
+        if (validatePeriodicMaxPages && periodicMaxPages < 0) {
+            throw new DatabaseValidationException("page cleaner periodic max pages must not be negative: "
+                    + periodicMaxPages);
+        }
         this.flushService = flushService;
         this.queueCapacity = queueCapacity;
         this.idleWaitNanos = timeoutNanos(idleWait);
+        this.periodicMaxPages = periodicMaxPages;
     }
 
     /** 启动后台 worker。只能从 NEW 状态启动一次。 */
@@ -250,7 +273,13 @@ public final class PageCleanerWorker implements AutoCloseable {
                 state = PageCleanerState.IDLE;
                 idleChanged.signalAll();
                 try {
-                    workAvailable.awaitNanos(idleWaitNanos);
+                    long remaining = workAvailable.awaitNanos(idleWaitNanos);
+                    if (remaining <= 0 && requests.isEmpty() && state != PageCleanerState.STOPPING
+                            && periodicTickEnabled()) {
+                        inFlight = true;
+                        state = PageCleanerState.RUNNING;
+                        return periodicMaxPages;
+                    }
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     state = PageCleanerState.STOPPING;
@@ -270,6 +299,10 @@ public final class PageCleanerWorker implements AutoCloseable {
         } finally {
             lock.unlock();
         }
+    }
+
+    private boolean periodicTickEnabled() {
+        return periodicMaxPages != PERIODIC_DISABLED;
     }
 
     private void markCycleComplete(FlushCycleResult cycle) {

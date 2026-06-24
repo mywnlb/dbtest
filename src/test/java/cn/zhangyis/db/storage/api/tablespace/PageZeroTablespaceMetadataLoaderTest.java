@@ -4,11 +4,13 @@ import cn.zhangyis.db.storage.fil.state.TablespaceType;
 import cn.zhangyis.db.storage.fil.state.TablespaceTypeFlags;
 
 
+import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.LruBufferPool;
+import cn.zhangyis.db.storage.fil.exception.TablespaceCorruptedException;
 import cn.zhangyis.db.storage.fil.io.FileChannelPageStore;
 import cn.zhangyis.db.storage.fil.io.PageStore;
 import cn.zhangyis.db.storage.fil.meta.TablespaceMetadata;
@@ -20,9 +22,12 @@ import cn.zhangyis.db.storage.fsp.header.SpaceHeaderSnapshot;
 import cn.zhangyis.db.storage.fsp.lifecycle.TablespaceLifecycleHeader;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
+import cn.zhangyis.db.storage.page.PageEnvelopeLayout;
+import cn.zhangyis.db.storage.page.PageType;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.Optional;
 import java.time.Duration;
@@ -31,6 +36,7 @@ import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
  * PageZeroTablespaceMetadataLoader 测试：刷盘后 raw 读 page0 重建 metadata，未打开表空间时返回 empty。
@@ -73,6 +79,35 @@ class PageZeroTablespaceMetadataLoaderTest {
         }
     }
 
+    /**
+     * page0 信封页类型损坏（非 FSP_HDR）必须被拒绝：物理页虽自描述 spaceId 正确，但页型不是表空间头，
+     * 说明 page0 被覆盖/绑定错误，不能注册成可用表空间，否则后续按 FSP 头解读会读到垃圾元数据。
+     */
+    @Test
+    void rejectsPageZeroWithNonFspHdrPageType() {
+        Path path = dir.resolve("badtype.ibu");
+        writeValidUndoPageZero(path);
+        try (PageStore store = new FileChannelPageStore()) {
+            store.open(SPACE, path, PS);
+            corruptPageZeroInt(store, PageEnvelopeLayout.PAGE_TYPE, PageType.ALLOCATED.code());
+            PageZeroTablespaceMetadataLoader loader = new PageZeroTablespaceMetadataLoader(store, PS);
+            assertThrows(TablespaceCorruptedException.class, () -> loader.load(SPACE));
+        }
+    }
+
+    /** page0 信封页号非 0 表示该物理页不是表空间头页（被错位写入），同样拒绝注册。 */
+    @Test
+    void rejectsPageZeroWithWrongPageNo() {
+        Path path = dir.resolve("badpageno.ibu");
+        writeValidUndoPageZero(path);
+        try (PageStore store = new FileChannelPageStore()) {
+            store.open(SPACE, path, PS);
+            corruptPageZeroInt(store, PageEnvelopeLayout.PAGE_NO, 5);
+            PageZeroTablespaceMetadataLoader loader = new PageZeroTablespaceMetadataLoader(store, PS);
+            assertThrows(TablespaceCorruptedException.class, () -> loader.load(SPACE));
+        }
+    }
+
     @Test
     void returnsEmptyForUnopenedSpace() {
         try (PageStore store = new FileChannelPageStore()) {
@@ -106,5 +141,31 @@ class PageZeroTablespaceMetadataLoaderTest {
             }
             assertEquals(TablespaceType.GENERAL, loading.get(1, TimeUnit.SECONDS).orElseThrow().type());
         }
+    }
+
+    /** 建一个合法的 UNDO page0（经 initialize 盖 FSP_HDR 信封 + ACTIVE lifecycle），关闭时刷盘。 */
+    private void writeValidUndoPageZero(Path path) {
+        try (PageStore store = new FileChannelPageStore(); BufferPool pool = new LruBufferPool(store, PS, 128)) {
+            store.create(SPACE, path, PS, PageNo.of(64));
+            MiniTransactionManager mgr = new MiniTransactionManager();
+            SpaceHeaderRepository headerRepo = new SpaceHeaderRepository(pool);
+            MiniTransaction mtr = mgr.begin();
+            headerRepo.initialize(mtr, new SpaceHeaderSnapshot(SPACE, PS,
+                    TablespaceTypeFlags.encode(TablespaceType.UNDO), PageNo.of(64), PageNo.of(0), 1L,
+                    FlstBase.EMPTY, FlstBase.EMPTY, FlstBase.EMPTY, PageNo.of(2), 0L, 80046, 1L));
+            headerRepo.writeLifecycle(mtr, SPACE, new TablespaceLifecycleHeader(
+                    TablespaceState.ACTIVE, PageNo.of(64), 0L, PageNo.of(64), TablespaceState.ACTIVE));
+            mgr.commit(mtr);
+        }
+    }
+
+    /** 直接对磁盘 page0 的指定偏移写入 int，模拟物理损坏；rewind 后 remaining==pageSize 满足 writePage 约束。 */
+    private static void corruptPageZeroInt(PageStore store, int offset, int value) {
+        PageId page0 = PageId.of(SPACE, PageNo.of(0));
+        ByteBuffer buf = ByteBuffer.allocate(PS.bytes());
+        store.readPage(page0, buf);
+        buf.putInt(offset, value);
+        buf.rewind();
+        store.writePage(page0, buf);
     }
 }

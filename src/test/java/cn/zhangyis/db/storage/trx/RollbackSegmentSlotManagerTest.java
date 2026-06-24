@@ -181,4 +181,28 @@ class RollbackSegmentSlotManagerTest {
         mgr.release(s);
         assertThrows(DatabaseRuntimeException.class, () -> mgr.release(s));
     }
+
+    // ---- 0.3：恢复期 restore（扫 page3 rseg header 后按下标精确重建内存目录） ----
+
+    @Test
+    void restoreRepopulatesSlotByIndex() {
+        RollbackSegmentSlotManager mgr = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 8);
+
+        mgr.restore(UndoSlotId.of(3), page(70));
+
+        assertTrue(mgr.isOccupied(UndoSlotId.of(3)));
+        assertEquals(page(70), mgr.insertUndoFirstPageId(UndoSlotId.of(3)));
+        assertEquals(1, mgr.activeSlotCount());
+        // 恢复后续认领走未占用空槽（first-fit 从 0），不影响已 restore 的 slot
+        assertEquals(UndoSlotId.of(0), mgr.claim(page(71)));
+    }
+
+    @Test
+    void restoreRejectsOccupiedOutOfRangeOrNull() {
+        RollbackSegmentSlotManager mgr = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 4);
+        mgr.restore(UndoSlotId.of(1), page(70));
+        assertThrows(DatabaseRuntimeException.class, () -> mgr.restore(UndoSlotId.of(1), page(71)));
+        assertThrows(DatabaseRuntimeException.class, () -> mgr.restore(UndoSlotId.of(99), page(72)));
+        assertThrows(DatabaseRuntimeException.class, () -> mgr.restore(UndoSlotId.of(2), null));
+    }
 }

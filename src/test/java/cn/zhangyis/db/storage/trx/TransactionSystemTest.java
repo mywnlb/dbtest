@@ -48,4 +48,21 @@ class TransactionSystemTest {
         sys.removeActive(a.value());
         assertEquals(Set.of(), sys.snapshotActiveReadWriteIds());
     }
+
+    @Test
+    void restoreCountersOnlyMovesForwardAndDrivesNextAllocations() {
+        TransactionSystem sys = new TransactionSystem();
+
+        sys.restoreCounters(10, 20);
+        assertEquals(10L, sys.allocateWriteId().value(),
+                "recovered TRANSACTION_ID high water determines the next write id");
+        assertEquals(20L, sys.allocateTransactionNo().value(),
+                "recovered COMMIT_NO high water determines the next transaction no");
+
+        sys.restoreCounters(3, 4);
+        assertEquals(11L, sys.allocateWriteId().value(),
+                "restoreCounters must not move nextTransactionId backward");
+        assertEquals(21L, sys.allocateTransactionNo().value(),
+                "restoreCounters must not move nextTransactionNo backward");
+    }
 }

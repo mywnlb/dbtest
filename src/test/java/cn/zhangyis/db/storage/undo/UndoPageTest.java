@@ -45,7 +45,7 @@ class UndoPageTest {
     @Test
     void formatFirstPageInitsBothHeaders() {
         onFirstPage((page, handle) -> {
-            assertEquals(97, page.freeOffset());
+            assertEquals(105, page.freeOffset());
             assertEquals(0, page.recordCount());
             assertEquals(0L, page.pageLastUndoNo().value());
             assertTrue(page.isFirstPage());
@@ -67,8 +67,8 @@ class UndoPageTest {
             int offA = page.appendRecord(a, UndoNo.of(1));
             byte[] b = {9, 9};
             int offB = page.appendRecord(b, UndoNo.of(2));
-            assertEquals(97, offA);
-            assertEquals(97 + 2 + 3, offB);
+            assertEquals(105, offA);
+            assertEquals(105 + 2 + 3, offB);
             assertEquals(2, page.recordCount());
             assertEquals(2L, page.pageLastUndoNo().value());
             assertArrayEquals(a, page.recordAt(offA));
@@ -111,7 +111,7 @@ class UndoPageTest {
             undoAccess.createFirstPage(m, p1, UndoLogKind.INSERT, TransactionId.of(7), handle);
             UndoPage chain = undoAccess.createChainPage(m, p2, handle);
             assertFalse(chain.isFirstPage());
-            assertEquals(97, chain.freeOffset());
+            assertEquals(105, chain.freeOffset());
             assertEquals(handle.segmentId().value(), chain.segmentId().value());
             assertThrows(UndoLogFormatException.class, chain::transactionId);
             assertThrows(UndoLogFormatException.class, chain::undoKind);

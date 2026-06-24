@@ -55,10 +55,11 @@ public final class UndoTablespaceFspRebuilder {
         }
         SpaceId spaceId = previous.spaceId();
         PageNo target = marker.targetSizeInPages();
-        PageGuard page0 = mtr.newPage(pool, PageId.of(spaceId, PageNo.of(0)),
+        // page0 先经 PAGE_INIT 清零并发 redo（截断后必须重置可能残留的旧 page0）；FSP_HDR 信封头不再在此显式写，
+        // 而由下方 headerRepository.initialize 统一盖戳（同一 MTR 内 re-entrant 复用本 newPage 的 page0 X guard），
+        // 避免两处各写一遍同一信封不变量。
+        mtr.newPage(pool, PageId.of(spaceId, PageNo.of(0)),
                 PageLatchMode.EXCLUSIVE, PageType.FSP_HDR);
-        PageEnvelope.writeHeader(page0, new FilePageHeader(spaceId, 0L,
-                FilePageHeader.FIL_NULL, FilePageHeader.FIL_NULL, 0L, PageType.FSP_HDR));
         PageGuard page2 = mtr.newPage(pool, PageId.of(spaceId, PageNo.of(2)),
                 PageLatchMode.EXCLUSIVE, PageType.INODE);
         PageEnvelope.writeHeader(page2, new FilePageHeader(spaceId, 2L,

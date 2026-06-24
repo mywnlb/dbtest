@@ -56,8 +56,9 @@ public final class FlushService {
     }
 
     /**
-     * 根据当前 redo capacity pressure 执行一轮 flush list 刷脏。没有压力时不刷页，也不推进 checkpoint；
-     * 有压力时由策略决定 target LSN 和页数，刷完后尝试推进 checkpoint。
+     * 根据当前 redo capacity pressure 执行一轮 flush list 刷脏。没有压力时不刷页；只有 dirty view 为空时才把
+     * “无 dirty 且 redo 已 durable”的安全边界写入 redo control，避免后台 tick 把仍未落盘的 dirty 页边界提前发布。
+     * 有压力时由策略决定 target LSN 和页数，刷完后再尝试推进 checkpoint。
      *
      * @param maxPages 调用方允许本轮最多刷出的页数。
      * @return 本轮调度结果。
@@ -72,8 +73,15 @@ public final class FlushService {
         List<FlushResult> results = advice.shouldFlush()
                 ? flushCoordinator.flushList(advice.targetLsn(), advice.maxPages())
                 : List.of();
-        Lsn after = advice.shouldFlush() ? checkpointCoordinator.advanceCheckpoint() : before;
+        Lsn after = advice.shouldFlush() || hasNoDirtyPages()
+                ? checkpointCoordinator.advanceCheckpoint()
+                : before;
         return new FlushCycleResult(decision, advice, results, before, after);
+    }
+
+    /** 无压力后台 tick 的 checkpoint 保护：只有 dirty view 为空时才允许空刷推进恢复起点。 */
+    private boolean hasNoDirtyPages() {
+        return bufferPool.dirtyPageCandidates(redo.currentLsn(), 1).isEmpty();
     }
 
     /**

@@ -18,6 +18,9 @@ import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.PageGuard;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
+import cn.zhangyis.db.storage.page.FilePageHeader;
+import cn.zhangyis.db.storage.page.PageEnvelope;
+import cn.zhangyis.db.storage.page.PageType;
 
 import java.util.Optional;
 
@@ -50,6 +53,12 @@ public final class SpaceHeaderRepository {
             throw new DatabaseValidationException("space header snapshot must not be null");
         }
         PageGuard g = mtr.getPage(pool, page0(h.spaceId()), PageLatchMode.EXCLUSIVE);
+        // page0 物理信封：统一标记为 FSP_HDR 表空间头页（pageNo=0、无兄弟链）。这是 page0 与所有其它页型一致的
+        // FilePageHeader 不变量——loader/recovery 打开时据此判定 page0 真为表空间头，拒绝绑定错误或损坏的物理页。
+        // 信封头经 page guard 写入，作为 PAGE_BYTES 进入 MTR redo，replay 可重建；pageLSN 由 MTR commit 盖戳。
+        // FSP 自描述字段（SPACE_ID@38 等）位于信封头之后，二者偏移不重叠。
+        PageEnvelope.writeHeader(g, new FilePageHeader(h.spaceId(), 0L,
+                FilePageHeader.FIL_NULL, FilePageHeader.FIL_NULL, 0L, PageType.FSP_HDR));
         g.writeInt(SpaceHeaderLayout.SPACE_ID, h.spaceId().value());
         g.writeInt(SpaceHeaderLayout.PAGE_SIZE_BYTES, h.pageSize().bytes());
         g.writeInt(SpaceHeaderLayout.SPACE_FLAGS, h.spaceFlags());

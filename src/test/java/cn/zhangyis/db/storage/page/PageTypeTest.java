@@ -18,6 +18,7 @@ class PageTypeTest {
         assertEquals(4, PageType.SDI.code());
         assertEquals(5, PageType.INDEX.code());
         assertEquals(6, PageType.UNDO.code());
+        assertEquals(7, PageType.RSEG_HEADER.code());
     }
 
     @Test

@@ -3,11 +3,12 @@ package cn.zhangyis.db.storage.undo;
 import cn.zhangyis.db.storage.page.PageEnvelopeLayout;
 
 /**
- * undo page 物理布局（T1.3b 头部拆分）。page header {@code [38,63)} 每页都有，保存页内追加游标、
- * segment 归属和 first 页标志；undo log header {@code [63,97)} 仅 first 页有语义，非 first 页仍预留并清零。
+ * undo page 物理布局（T1.3b 头部拆分，R 1.3 扩展提交序号）。page header {@code [38,63)} 每页都有，保存页内追加游标、
+ * segment 归属和 first 页标志；undo log header {@code [63,105)} 仅 first 页有语义，非 first 页仍预留并清零。
  *
- * <p>所有 undo 页统一 {@link #RECORD_AREA_START}=97，换来 RollPointer.offset 与页内 record 槽解析不区分
- * first/chain 页。页链前后指针复用 FIL header 的 prev/next，不在本布局中重复保存。
+ * <p>所有 undo 页统一 {@link #RECORD_AREA_START}=105，换来 RollPointer.offset 与页内 record 槽解析不区分
+ * first/chain 页。R 1.3 比 T1.3b 多 8 字节 {@link #COMMIT_NO}，这是恢复期重建 history 的提交序权威来源。
+ * 页链前后指针复用 FIL header 的 prev/next，不在本布局中重复保存。
  */
 final class UndoPageLayout {
 
@@ -33,7 +34,7 @@ final class UndoPageLayout {
     static final int TRANSACTION_ID = PAGE_HEADER_END;                       // 63
     /** UndoLogKind ordinal（u8），本片只使用 INSERT。 */
     static final int UNDO_KIND = TRANSACTION_ID + 8;                         // 71
-    /** undo log 状态占位（u8），本片恒 ACTIVE。 */
+    /** undo log 状态（u8）：ACTIVE/COMMITTED，恢复期据此区分 rollback 与 history rebuild。 */
     static final int STATE = UNDO_KIND + 1;                                  // 72
     /** 链首页号（u32），first 页上等于自身页号。 */
     static final int FIRST_PAGE_NO = STATE + 1;                              // 73
@@ -43,14 +44,18 @@ final class UndoPageLayout {
     static final int LOG_RECORD_COUNT = LAST_PAGE_NO + 4;                    // 81
     /** 整条 undo log 链最近一条 record 的 undoNo（u64）。 */
     static final int LOG_LAST_UNDO_NO = LOG_RECORD_COUNT + 8;                // 89
+    /** 提交序号 TransactionNo（u64，R 1.3）；ACTIVE 时为 0，commit 标 COMMITTED 时写入，恢复重建 history 用。 */
+    static final int COMMIT_NO = LOG_LAST_UNDO_NO + 8;                       // 97
     /** undo log header 末尾。 */
-    static final int LOG_HEADER_END = LOG_LAST_UNDO_NO + 8;                  // 97
+    static final int LOG_HEADER_END = COMMIT_NO + 8;                        // 105
 
     /** record area 起点；所有页一致，record 槽格式为 [len u16][payload]。 */
     static final int RECORD_AREA_START = LOG_HEADER_END;
 
-    /** undo log 状态占位常量：ACTIVE。 */
+    /** undo log 状态：ACTIVE（事务未提交，恢复期需回滚）。 */
     static final int STATE_ACTIVE = 0;
+    /** undo log 状态：COMMITTED（事务已提交，恢复期跳过回滚，R 1.2）。 */
+    static final int STATE_COMMITTED = 1;
     /** {@link #PAGE_FLAGS} bit0：first page 标志。 */
     static final int FLAG_FIRST_PAGE = 0x01;
 }

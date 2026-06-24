@@ -22,6 +22,9 @@ import cn.zhangyis.db.storage.fil.io.FileChannelPageStore;
 import cn.zhangyis.db.storage.fil.io.PageStore;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
+import cn.zhangyis.db.storage.page.FilePageHeader;
+import cn.zhangyis.db.storage.page.PageEnvelope;
+import cn.zhangyis.db.storage.page.PageType;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.api.Test;
 
@@ -67,6 +70,34 @@ class SpaceHeaderRepositoryTest {
             mgr.commit(r);
 
             assertEquals(freshHeader(), got);
+        }
+    }
+
+    /**
+     * page0 初始化必须盖统一 FSP_HDR 文件页信封：pageType=FSP_HDR、pageNo=0、spaceId 自描述。
+     * 这是“page0 物理信封校验”切片的写入侧不变量——loader/recovery 据此判定 page0 是否真的是表空间头页。
+     */
+    @Test
+    void initializeStampsFspHdrEnvelopeOnPageZero() {
+        PageStore store = new FileChannelPageStore();
+        store.create(SPACE, dir.resolve("s.ibd"), PS, PageNo.of(64));
+        try (PageStore s = store; BufferPool pool = new LruBufferPool(store, PS, 8)) {
+            SpaceHeaderRepository repo = new SpaceHeaderRepository(pool);
+            MiniTransactionManager mgr = new MiniTransactionManager();
+            MiniTransaction w = mgr.begin();
+            repo.initialize(w, freshHeader());
+            mgr.commit(w);
+
+            MiniTransaction r = mgr.begin();
+            PageGuard g = r.getPage(pool, PageId.of(SPACE, PageNo.of(0)), PageLatchMode.SHARED);
+            FilePageHeader h = PageEnvelope.readHeader(g);
+            mgr.commit(r);
+
+            assertEquals(PageType.FSP_HDR, h.pageType());
+            assertEquals(0L, h.pageNo());
+            assertEquals(SPACE, h.spaceId());
+            assertEquals(FilePageHeader.FIL_NULL, h.prevPageNo());
+            assertEquals(FilePageHeader.FIL_NULL, h.nextPageNo());
         }
     }
 

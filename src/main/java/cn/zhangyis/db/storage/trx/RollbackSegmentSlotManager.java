@@ -134,6 +134,35 @@ public final class RollbackSegmentSlotManager {
         }
     }
 
+    /**
+     * 恢复期重填一个 slot（0.3）。数据流：加锁 → 校验越界/未占用 → 写入 {@code firstPageId}、activeCount++ → 解锁。
+     * 由启动恢复扫 page3 rseg header 后调用，把磁盘上的占用 slot 重建到内存目录。与 {@link #claim} 区别：claim
+     * 自己挑空槽，restore 按磁盘记录的 slot 下标精确重填，故要求该 slot 当前为空——重复 restore（同一 slot 两次）
+     * 是恢复编排 bug，必须抛 {@link DatabaseValidationException} 不静默，否则 activeCount 失衡。
+     *
+     * @param slot                 磁盘记录的 slot 下标。
+     * @param insertUndoFirstPageId 该 slot 登记的 insert undo segment 首页。
+     */
+    public void restore(UndoSlotId slot, PageId insertUndoFirstPageId) {
+        if (slot == null || insertUndoFirstPageId == null) {
+            throw new DatabaseValidationException("restore slot/first page id must not be null");
+        }
+        lock.lock();
+        try {
+            int idx = slot.value();
+            if (idx < 0 || idx >= slotCapacity) {
+                throw new DatabaseValidationException("restore of out-of-range undo slot: " + idx);
+            }
+            if (slots[idx] != null) {
+                throw new DatabaseValidationException("restore of already-occupied undo slot: " + idx);
+            }
+            slots[idx] = insertUndoFirstPageId;
+            activeCount++;
+        } finally {
+            lock.unlock();
+        }
+    }
+
     /** slot 是否已占用；越界 slot 返回 false（只读查询，不抛异常）。 */
     public boolean isOccupied(UndoSlotId slot) {
         if (slot == null) {

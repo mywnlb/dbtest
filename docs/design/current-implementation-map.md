@@ -46,9 +46,9 @@ flowchart TD
 
 | Flow | Current production chain | Current state |
 | --- | --- | --- |
-| Create tablespace | `DiskSpaceManager.createTablespace` -> `PageStore.create` -> `DataFileHandle.create`; then `SpaceHeaderRepository.initialize`; UNDO additionally writes `TablespaceLifecycleHeader(ACTIVE,initialSize,epoch=0)`; reserve extent0 and `TablespaceRegistry.replace` | Implemented; GENERAL publishes NORMAL，UNDO publishes/persists ACTIVE；4-arg overload仍默认 GENERAL |
-| Open tablespace | `DiskSpaceManager.openTablespace` -> `PageStore.open`; `TablespaceRegistry.open` -> `api.tablespace.PageZeroTablespaceMetadataLoader` 持 S lease raw 读 page0 (`PageZeroTablespaceMetadataLoader.java:94`) -> physical/lifecycle codecs | Implemented for already-known path；新 UNDO 恢复持久状态，旧 UNDO 无 lifecycle header 时按 NORMAL 打开但禁止 truncate |
-| Recovery open | `DiskSpaceManager.openTablespaceForRecovery` -> `PageStore.open` -> `TablespaceRegistry.requireForRecovery` -> page0 loader | Implemented；允许加载 TRUNCATING，供启动恢复续作 |
+| Create tablespace | `DiskSpaceManager.createTablespace` -> `PageStore.create` -> `DataFileHandle.create`; then `SpaceHeaderRepository.initialize`（含 page0 FSP_HDR 信封盖戳）; UNDO additionally writes `TablespaceLifecycleHeader(ACTIVE,initialSize,epoch=0)`; reserve extent0 and `TablespaceRegistry.replace` | Implemented; GENERAL publishes NORMAL，UNDO publishes/persists ACTIVE；4-arg overload仍默认 GENERAL；page0 现携带统一 FSP_HDR FilePageHeader 信封 |
+| Open tablespace | `DiskSpaceManager.openTablespace` -> `PageStore.open`; `TablespaceRegistry.open` -> `api.tablespace.PageZeroTablespaceMetadataLoader` 持 S lease raw 读 page0 (`PageZeroTablespaceMetadataLoader.java:110`) -> FSP_HDR 信封校验(`:111` pageType==FSP_HDR/pageNo==0，否则 `TablespaceCorruptedException`) -> physical/lifecycle codecs | Implemented for already-known path；新 UNDO 恢复持久状态，旧 UNDO 无 lifecycle header 时按 NORMAL 打开但禁止 truncate；checksum/trailer 校验仍 deferred |
+| Recovery open | `DiskSpaceManager.openTablespaceForRecovery` -> `PageStore.open` -> `TablespaceRegistry.requireForRecovery` -> page0 loader（同样做 FSP_HDR 信封校验） | Implemented；允许加载 TRUNCATING，供启动恢复续作 |
 | Space-management admission | `DiskSpaceManager.createSegment/allocatePage/freePage/dropSegment/usage` -> `MiniTransaction.acquireTablespaceLease(S)` (`MiniTransaction.java:108`) -> `TablespaceRegistry.require`（lease 后复核）-> FSP | Implemented；拒绝 CORRUPTED/INACTIVE/TRUNCATING/DISCARDED，消除状态先检后等待竞态 |
 | Allocate page | `DiskSpaceManager.allocatePage` -> `TablespaceRegistry.require` -> `SegmentPageAllocator` -> `SegmentSpaceService` / `FreeExtentService`; on no space, `PageStore.extend` then `SpaceHeaderRepository.setCurrentSizeInPages` and retry | Implemented for current FSP model; registry size snapshot is not updated after autoextend because page0 remains the size authority；autoextend 现 crash-safe：恢复期 `SPACE_FILE_RECONCILE` 经 `PageStore.ensureCapacity` 把物理文件长度重对齐到 redo 恢复出的 page0 大小 |
 | Typed INDEX/UNDO access | `api.index.IndexPageAccess` / `UndoPageAccess` -> `MiniTransaction.getPage/newPage` -> 每 SpaceId 一个 S lease -> `BufferPool` -> `PageStore` | Implemented operation lease；typed access 本身仍不查 Registry 状态，完整状态准入依赖上层 facade |
@@ -61,11 +61,11 @@ flowchart TD
 | Package area | Representative classes | Current state | Notes |
 | --- | --- | --- | --- |
 | `storage.api` disk facade | `DiskSpaceManager`, `SegmentRef`, `SpaceUsage`, `DiskSpaceUndoAllocator` | Implemented | DiskSpaceManager 管普通 FSP；SegmentRef/SpaceUsage 是门面值对象；undo allocator 是 undo 端口适配器 |
-| `storage.api.undotruncate` lifecycle orchestration | `UndoTablespaceTruncationService`, `UndoTablespaceTruncationRecovery` | Implemented (truncate/recovery test-wired) | 可恢复 UNDO 物理收缩与 recovery participant；仍在 api 侧以保持依赖方向，不放入底层 `storage.undo` |
+| `storage.api.undotruncate` lifecycle orchestration | `UndoTablespaceTruncationService`, `UndoTablespaceTruncationRecovery` | Implemented; recovery wired by `StorageEngine` E2 | 可恢复 UNDO 物理收缩与 recovery participant；E2 existing open 构造恢复参与者用于 TRUNCATING 续作；主动 truncate 仍待 purge/DML 调度 |
 | `storage.api.index` typed index page entry | `IndexPageAccess`, `IndexPageHandle` | Implemented | Bridges B+Tree/record code to `MiniTransaction`-owned page guards |
-| `storage.api.tablespace` metadata adapter | `PageZeroTablespaceMetadataLoader` | Implemented | Registry 懒加载协作者；留在 api 侧以避免 `fil` 直接编排 `fsp` page0/lifecycle codec |
+| `storage.api.tablespace` metadata adapter | `PageZeroTablespaceMetadataLoader` | Implemented | Registry 懒加载协作者；留在 api 侧以避免 `fil` 直接编排 `fsp` page0/lifecycle codec；打开/恢复时先做 page0 FSP_HDR 信封校验(pageType/pageNo)，checksum 校验 deferred |
 | `storage.fsp.flst` file-list primitives | `FileAddress`, `Flst`, `FlstBase`, `FlstNode` | Implemented | FSP/XDES/INODE 链表指针与 base/node 编解码；不接触文件 IO |
-| `storage.fsp.header` space header | `SpaceHeaderRepository`, `SpaceHeaderSnapshot`, `SpaceHeaderRawCodec`, `SpaceHeaderPhysical` | Implemented | page0 header 读写与 raw metadata 加载；layout 常量供 extent/lifecycle codec 共享 |
+| `storage.fsp.header` space header | `SpaceHeaderRepository`, `SpaceHeaderSnapshot`, `SpaceHeaderRawCodec`, `SpaceHeaderPhysical` | Implemented | page0 header 读写与 raw metadata 加载；`initialize` 盖 page0 FSP_HDR FilePageHeader 信封头；layout 常量供 extent/lifecycle codec 共享 |
 | `storage.fsp.extent` extent management | `ExtentDescriptorRepository`, `ExtentState`, `FreeExtentService`, `ExtentAllocationPolicy` | Implemented | XDES state/owner/bitmap + 全局 FREE/FREE_FRAG/FULL_FRAG 分配；不打开文件 |
 | `storage.fsp.segment` segment management | `SegmentInodeRepository`, `SegmentPurpose`, `SegmentSpaceService`, `SegmentPageAllocator` | Implemented | INODE slot、segment extent list、fragment 页和 segment 页分配 |
 | `storage.fsp.lifecycle` lifecycle marker | `TablespaceLifecycleHeader`, `TablespaceLifecycleRawCodec` | Implemented | page0 198–237 持久化 UNDO lifecycle marker |
@@ -73,7 +73,7 @@ flowchart TD
 | `storage.fsp.exception` exceptions | `FspMetadataException`, `NoFreeSpaceException` | Implemented | FSP 元数据损坏/空间耗尽领域异常 |
 | `storage.fil.io` physical IO | `PageStore`, `FileChannelPageStore`, `DataFileDescriptor`, `DataFileHandle`, `AutoExtendPolicy` | Implemented | State/registry-free；单文件 `truncate`（缩短）与 `ensureCapacity`（幂等扩到至少 N，crash recovery 用），均持 physical Lifecycle->FileSize(X)、零填充/缩短后发布 size；`forceAll` 汇总 force 全部句柄（恢复末尾 durability 屏障） |
 | `storage.fil.lock` physical locks | `TablespaceLifecycleLatch`, `FileSizeLock`, `ResourceGuard`, `DataFileHandleLock`, `FsyncLock`, `PageIoRangeLock` | Implemented / partially reserved | lifecycle/file-size 已由 `DataFileHandle` 使用；`DataFileHandleLock`/`FsyncLock`/`PageIoRangeLock` 仍为预留物理锁 |
-| `storage.fil.access` operation admission | `TablespaceAccessController`, `TablespaceAccessLease` | Implemented | controller 每 SpaceId 公平显式 RW lease；`StorageEngine` E1 创建单实例并注入 MTR/loader/disk/flush |
+| `storage.fil.access` operation admission | `TablespaceAccessController`, `TablespaceAccessLease` | Implemented | controller 每 SpaceId 公平显式 RW lease；`StorageEngine` E1/E2 创建单实例并注入 MTR/loader/disk/flush/recovery undo truncate |
 | `storage.fil.meta` runtime metadata | `TablespaceRegistry`, `CachingTablespaceRegistry`, `TablespaceMetadata`, `Tablespace`, `TablespaceHandle` | Implemented for runtime admission | registry 保存当前进程打开视图；UNDO lifecycle 持久化，普通 state/discard/corruption 仍仅 runtime |
 | `storage.fil.state` type/state values | `TablespaceState`, `TablespaceType`, `TablespaceTypeFlags`, `SpaceFlags` | Implemented | 表空间类型与状态编码值对象；状态转换由 api/engine 层编排 |
 | `storage.fil.exception` exceptions | `TablespaceNotFoundException`, `TablespaceUnavailableException`, `DataFilePhysicalException`, `PageOutOfBoundsException` | Implemented | 表空间文件缺失、越界、损坏、不可用等 fil 领域异常 |
@@ -111,15 +111,15 @@ flowchart TD
 | MTR commit | `MiniTransaction.commit` -> append redo -> stamp touched pageLSN -> `memo.releaseAll()` LIFO（page guard 先于 tablespace lease）-> 返回 batch end LSN | Implemented；默认 manager 仍为内存 redo；可注入 durable manager 供 truncation/recovery 使用 |
 | MTR rollback | `MiniTransaction.rollbackUncommitted` -> `memo.releaseAll()` only (`:167`) | Implemented; dirty pages stay dirty — no buffer-content undo (documented simplification `:18-19`) |
 | Dirty page mark | `PageGuard.close` -> `FrameReleaser.release(frame, wrote)` -> `LruBufferPool.release` OR-dirties via `markDirty` under `poolLock`; sets `oldestModificationLsn`/`newestModificationLsn`/bumps `dirtyVersion` | Implemented；**E1 修 bug**：`markDirty` 改用 `oldestModificationLsn==null` 守卫（原 `!dirty`）——newPage 对驻留页重初始化先置 dirty=true（无 LSN），双 newPage 同 MTR（allocatePage+createIndexPage 同根页）后 commit markDirty 会因 dirty 已真而漏设 oldestMod，留 dirty+null oldestMod 帧致 flush/checkpoint NPE。flush-after-双newPage 之前潜伏（既有 btree 测试不 flush 未触发） |
-| Eviction | `LruBufferPool.obtainVictim` (`:152`) -> `policy.victimOrder()` first `fixCount==0` frame -> if dirty `writeBack` -> `pageStore.writePage` (`:167`) -> reuse | Implemented; no WAL gate on eviction writeBack (gap — WAL gate lives only in `FlushCoordinator`) |
-| Checkpoint feed | `flush.checkpoint.CheckpointCoordinator` -> `bufferPool.oldestDirtyLsnOr(current)` -> `LruBufferPool` scans resident frames under `poolLock` for min `oldestModificationLsn` (`:292-306`) | Implemented; called by tests and `StorageEngine` foreground checkpoint/close path |
+| Eviction | `LruBufferPool.obtainVictim(cleanSkip)` 优先 free/clean 帧直接复用；仅有脏 unfixed 帧时记 PageId、出 `poolLock` 经 `DirtyVictimFlusher.flushVictim`（→`FlushCoordinator.singlePageFlush`：WAL gate+checksum+doublewrite+`completeFlush`）刷干净后回环重选；本轮 `cleanSkip` 防空转，无干净帧抛 `BufferPoolExhaustedException`。无 flusher 退回 legacy `writeBack` | Implemented；注入 flusher（生产 `StorageEngine`）后脏页淘汰 WAL 安全：redo 未 durable→`flushVictim` 返回 false→不写盘；`FAILED`→抛根因不吞。legacy no-flusher 路径字节级不变 |
+| Checkpoint feed | `flush.checkpoint.CheckpointCoordinator` -> `bufferPool.oldestDirtyLsnOr(current)` -> `LruBufferPool` scans resident frames under `poolLock` for min `oldestModificationLsn` (`:292-306`) | Implemented; called by tests, `StorageEngine` foreground checkpoint/close path, and E3a background page cleaner tick |
 | Tablespace invalidation | `UndoTablespaceTruncationService` 持 X lease -> `LruBufferPool.invalidateTablespace` Condition 等待 fixCount=0 -> dirty 则拒绝 -> 从 resident/LRU 移除该 space 全部 frame | Implemented；fixed 等待有 timeout/interrupt；不隐式绕过 WAL flush |
 
 ### Package Status
 
 | Package area | Representative classes | Current state | Notes |
 | --- | --- | --- | --- |
-| `storage.buf` pool core | `BufferPool`, `LruBufferPool`, `BufferFrame`, `PageGuard`, `PageLatchMode` | Implemented (test-wired) | sole impl；新增 per-space invalidate + frame release Condition；单 poolLock 仍串行 metadata/disk IO |
+| `storage.buf` pool core | `BufferPool`, `LruBufferPool`, `BufferFrame`, `PageGuard`, `PageLatchMode`, `DirtyVictimFlusher` | Implemented (production-wired) | sole impl；per-space invalidate + frame release Condition；新增 `DirtyVictimFlusher` 淘汰端口（set-once 注入，`StorageEngine` 生产注入）使脏页淘汰经 WAL 管线；单 poolLock 仍串行 metadata/disk IO |
 | `storage.buf` replacement | `ReplacementPolicy`, `LruReplacementPolicy` | Implemented | Plain LRU via `LinkedHashSet`; only impl; injection ctor `LruBufferPool(...,ReplacementPolicy)` only used by tests |
 | `storage.buf` flush support | `DirtyPageCandidate`, `FlushPageSnapshot`, `BufferPoolExhaustedException` | Implemented | Value objects consumed by flush module; `LruBufferPool.failFlush` is a documented no-op (`:278-289`) |
 | `storage.buf` write listener | `PageWriteListener` | Implemented | DI seam; only production impl is `MtrRedoCollector`; `NO_OP` path has no production caller |
@@ -229,16 +229,16 @@ flowchart TD
   MtrCommit["MiniTransaction.commit"] -->|append records| Mgr["RedoLogManager"]
   MgrMgr["MiniTransactionManager"] -->|owns new RedoLogManager| Mgr
   Mgr -->|memory mode: no writer/flusher| Buffer["in-memory buffer + batches"]
-  Mgr -. "durable() factory, test-only" .-> Writer["RedoLogWriter"]
+  Mgr -->|durable() factory: StorageEngine + tests| Writer["RedoLogWriter"]
   Writer -.-> Repo["RedoLogFileRepository.append"]
-  Mgr -. "flush(), test-only" .-> Flusher["RedoLogFlusher"]
+  Mgr -->|flush(): StorageEngine checkpoint/close + recovery/truncate + tests| Flusher["RedoLogFlusher"]
   Flusher -.-> Repo
   Repo -.-> File["redo data file"]
   Collector["MtrRedoCollector"] -->|onWrite| PBR["PageBytesRecord"]
   Collector -->|recordInit| PIR["PageInitRecord"]
   FlushCoord["FlushCoordinator"] -->|flushedToDiskLsn / waitFlushed WAL gate| Mgr
   Checkpoint["CheckpointCoordinator"] -->|currentLsn / flushedToDiskLsn| Mgr
-  Recovery["CrashRecoveryService (test-only)"] --> Reader["RedoRecoveryReader"]
+  Recovery["CrashRecoveryService (StorageEngine E2 + tests)"] --> Reader["RedoRecoveryReader"]
   Reader --> Repo
   Recovery --> Dispatcher["RedoApplyDispatcher"]
   Dispatcher --> Handler["PageRedoApplyHandler"]
@@ -255,8 +255,9 @@ flowchart TD
 | Durable write | `RedoLogManager.flush()` -> writer append -> repository force -> 单调推进 durable LSN | Implemented；`StorageEngine.checkpoint/close` 与 `UndoTablespaceTruncationService` 主动驱动；默认 test helpers 仍可用 memory mode |
 | WAL gate (flush module) | `FlushCoordinator.flushPage` -> `redo.flushedToDiskLsn()` (`FlushCoordinator.java:91`) + `redo.waitFlushed(pageLsn, timeout)` (`:92`) | Implemented；`StorageEngine` durable redo 路径可通过 WAL gate；memory-mode 组合中 durable LSN 恒 0，会跳过脏页 |
 | Checkpoint read | `flush.checkpoint.CheckpointCoordinator.advanceCheckpoint` -> `redo.currentLsn()` + `redo.flushedToDiskLsn()`; if `checkpointStore != null` -> `RedoCheckpointStore.write(RedoCheckpointLabel.of(...))` | Implemented；`StorageEngine` 和 tests 构造 checkpoint coordinator；checkpoint store 由 `StorageEngine`/tests 打开 |
-| Redo replay (recovery) | `CrashRecoveryService` -> checkpoint-aware replay -> optional `UndoTablespaceRecoveryParticipant.resumeAfterRedo(recoveredTo)` -> `RedoLogManager.restoreRecoveredBoundary` -> truncate续作 -> open traffic | Implemented code、test-wired；恢复边界安装后新 redo 从 recoveredTo 连续追加，durable LSN 不倒退 |
-| Capacity pressure | `FlushService.flushForCapacity` -> `RedoCapacityPolicy.evaluate(redo.currentLsn(), checkpointLsn)` (`FlushService.java:67`) -> `RedoCapacityDecision(pressure, age, targetLsn)` | Implemented code；`StorageEngine` 注入 fixed policy；当前只报告 pressure 并驱动 foreground/background flush，仍不 throttle append |
+| Redo replay (recovery) | `StorageEngine.open(existing)` -> recovery-open system UNDO + configured data spaces -> `CrashRecoveryService.recover` -> checkpoint-aware replay -> `RedoLogManager.restoreRecoveredBoundary(recoveredTo)` -> optional `UndoTablespaceRecoveryParticipant.resumeAfterRedo(recoveredTo)` -> `SPACE_FILE_RECONCILE` -> open traffic | Implemented production path for explicitly configured spaces；恢复边界安装后新 redo 从 recoveredTo 连续追加，durable LSN 不倒退；无 DD/tablespace discovery |
+| Capacity pressure | `StorageEngine.open` starts `PageCleanerWorker` (when enabled) -> periodic `FlushService.flushForCapacity` -> `RedoCapacityPolicy.evaluate(redo.currentLsn(), checkpointLsn)` -> `RedoCapacityDecision(pressure, age, targetLsn)` | Implemented production path；`StorageEngine` 注入 fixed policy并启动单线程 page cleaner；当前仍不 throttle append；**后台 redo flush 已由 `RedoFlushWorker` 接**（独立于 page cleaner，见下） |
+| Background redo flush | `StorageEngine.open` starts `RedoFlushWorker` (when `backgroundFlushEnabled`) -> periodic/on-demand `RedoFlushTarget.flush()` (-> `RedoLogManagerFlushTarget` -> `RedoLogManager.flush()`) -> 推进 `flushedToDiskLsn` + 唤醒 `waitFlushed` | Implemented production path；空转跳过（`currentLsn<=flushedToDiskLsn` 不 fsync）；失败即 FAILED；engine 在 page cleaner 前启动、close 时先停（停 page cleaner→停 redo flusher→final flushThrough）；解淘汰/flush WAL gate 因无人 flush 而跳过的根因 |
 
 ### Package Status
 
@@ -265,8 +266,9 @@ flowchart TD
 | `storage.redo` core | `RedoLogManager`, batches/ranges/physical records | Partial | 默认 manager 为 memory mode；`StorageEngine`/truncation 测试组合注入 durable manager；支持 recovery boundary 恢复与连续续写 |
 | `storage.redo` durable IO | `RedoLogWriter`, `RedoLogFlusher`, `RedoLogFileRepository` | Implemented | `StorageEngine` 和 tests 打开 append-only redo file；no rotation/recycling; frame = magic + payloadLen + crc32 + payload |
 | `storage.redo` checkpoint | `RedoCheckpointStore`, `RedoCheckpointLabel` | Implemented | Two-slot fuzzy checkpoint with CRC32；`StorageEngine` 和 tests 打开；`flush.checkpoint.CheckpointCoordinator` 写入 |
-| `storage.redo` recovery | `RedoRecoveryReader`, `RedoApplyDispatcher`, `RedoApplyContext`, `PageRedoApplyHandler` | Implemented (test-only) | `RedoApplyDispatcher.pageDispatcher()` factory only in tests; single-handler dispatch (only `PageRedoApplyHandler`); `RedoApplyContext` carries `fil.io.PageStore` |
+| `storage.redo` recovery | `RedoRecoveryReader`, `RedoApplyDispatcher`, `RedoApplyContext`, `PageRedoApplyHandler` | Implemented; production-wired by `StorageEngine` E2 | `StorageEngine.open(existing)` constructs `pageDispatcher` + `RedoApplyContext(PageStore,pageSize)`；single-handler dispatch (only `PageRedoApplyHandler`)；只恢复已打开/显式配置的表空间 |
 | `storage.redo` capacity | `RedoCapacityPolicy`, `RedoCapacityPressure`, `RedoCapacityDecision` | Implemented | `StorageEngine` 和 tests 使用 fixed capacity；4 pressure levels NONE/ASYNC_FLUSH/SYNC_FLUSH/HARD_LIMIT; consumed by `FlushService` |
+| `storage.redo` background flush | `RedoFlushWorker`, `RedoFlushWorkerState`, `RedoFlushTarget`, `RedoLogManagerFlushTarget` | Implemented; production-wired by `StorageEngine` | 单 daemon 线程周期/on-demand 驱动 `redo.flush()`，空转跳过、失败即 FAILED；worker 依赖 `RedoFlushTarget` 端口（生产用 `RedoLogManagerFlushTarget` 适配，便于测试注入 fake）；不改 `RedoLogManager` 锁结构 |
 | `storage.redo` exceptions | `RedoLogIoException` (runtime), `RedoLogCorruptedException` (fatal) | Implemented | `RedoLogCorruptedException` extends `DatabaseFatalException`; thrown by repo/reader/handler on corruption |
 
 ## Flush + Doublewrite + Checkpoint Slice
@@ -275,11 +277,12 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-  Worker["PageCleanerWorker (owns Thread)"] -->|flushForCapacity| Svc["FlushService"]
+  Engine["StorageEngine.open/close"] -->|start/stop| Worker["PageCleanerWorker (owns Thread)"]
+  Worker -->|flushForCapacity| Svc["FlushService"]
   Svc -->|evaluate| CapPolicy["RedoCapacityPolicy"]
   Svc -->|plan| AdaptPolicy["AdaptiveFlushPolicy"]
   Svc -->|flushList / singlePageFlush| Coord["FlushCoordinator"]
-  Svc -->|advanceCheckpoint| Ckpt["CheckpointCoordinator"]
+  Svc -->|advanceCheckpoint after flush or clean tick| Ckpt["CheckpointCoordinator"]
   Coord -->|dirtyPageCandidates / snapshotForFlush / completeFlush / failFlush| BP["BufferPool"]
   Coord -->|flushedToDiskLsn / waitFlushed WAL gate| Redo["RedoLogManager"]
   Coord -->|stamp| Chksum["PageImageChecksum"]
@@ -292,30 +295,30 @@ flowchart TD
   Recover["RecoverableDoublewriteStrategy"] --> DWFile
   Scanner["DoublewriteRecoveryScanner"] -->|latestCopy| DWFile
   Scanner -->|readPage / writePage / force| Store
-  Recovery["CrashRecoveryService (test-only)"] -->|repairPageIfNeeded| Scanner
+  Recovery["CrashRecoveryService (StorageEngine E2 + tests)"] -->|repairPageIfNeeded when scanner configured| Scanner
 ```
 
 ### Current Data Chains
 
 | Flow | Current production chain | Current state |
 | --- | --- | --- |
-| Capacity-driven flush | `flush.cleaner.PageCleanerWorker.runLoop` -> `FlushService.flushForCapacity` -> `RedoCapacityPolicy.evaluate(redo.currentLsn(), checkpointLsn)` -> `flush.policy.AdaptiveFlushPolicy.plan(decision, maxPages)` -> if `advice.shouldFlush()`: `FlushCoordinator.flushList(targetLsn, maxPages)` -> `bufferPool.dirtyPageCandidates` -> per page `flushPage` -> then `flush.checkpoint.CheckpointCoordinator.advanceCheckpoint()` | Implemented code; `PageCleanerWorker` only test-instantiated；`FlushService` also由 `StorageEngine` 前台 checkpoint/close 路径持有；无生产后台 flush driver thread |
+| Capacity-driven flush | `StorageEngine.open` -> `new PageCleanerWorker(flushService, queue, interval, maxPages)` -> `start()`；worker idle timeout 或显式 request -> `FlushService.flushForCapacity` -> `RedoCapacityPolicy.evaluate(redo.currentLsn(), checkpointLsn)` -> `AdaptiveFlushPolicy.plan(decision,maxPages)` -> if pressure: `FlushCoordinator.flushList` -> per page WAL gate/doublewrite/data file -> checkpoint；if no pressure and dirty view empty: checkpoint-only tick | Implemented production path (E3a)；`StorageEngine.close` 先 `PageCleanerWorker.stop(timeout)` 再 final `flushThrough`；无 purge driver、无 supervisor 重启、无后台 redo flusher |
 | Single page flush | `FlushCoordinator.flushPage` 持 space S lease -> snapshot -> WAL gate -> checksum/doublewrite -> data write+force -> complete | Implemented foreground path；与 truncate X lease 互斥；WAL gate 仍逐页同步 |
 | Tablespace drain | `FlushService.drainTablespace(spaceId, duration)` (`:84`) -> loop `bufferPool.dirtyPageCandidates(MAX, capacity)` filtered by spaceId -> per page `FlushCoordinator.singlePageFlush` (`:109`) -> `advanceCheckpoint()` (`:111`); `LockSupport.parkNanos(1ms)` backoff on no progress (`:113`) | Implemented code; no production caller; busy-waits with parkNanos (no condition wake-up from BufferPool) |
 | Lifecycle flush barrier | `FlushService.flushThrough(marker,timeout)` -> redo flush -> 刷出所有 space 中 oldest<=marker 的 dirty page -> `flush.checkpoint.CheckpointCoordinator.advanceCheckpoint` 直到 checkpoint>=marker | Implemented；truncate 和 `StorageEngine.close/checkpoint` 在物理关闭/缩短前强制调用 |
-| Checkpoint advance | `flush.checkpoint.CheckpointCoordinator.advanceCheckpoint` -> `computeSafeCheckpointLsn` = `min(bufferPool.oldestDirtyLsnOr(current), redo.currentLsn(), redo.flushedToDiskLsn())` -> if safe > last: if `checkpointStore != null` -> `checkpointStore.write(RedoCheckpointLabel.of(safe, redo.currentLsn(), now))`, then publish `lastCheckpointLsn = safe` | Implemented code; called by `FlushService` from tests and `StorageEngine` foreground lifecycle；no periodic checkpoint thread; "closed LSN" approximated by `currentLsn()` |
+| Checkpoint advance | `flush.checkpoint.CheckpointCoordinator.advanceCheckpoint` -> `computeSafeCheckpointLsn` = `min(bufferPool.oldestDirtyLsnOr(current), redo.currentLsn(), redo.flushedToDiskLsn())` -> if safe > last: if `checkpointStore != null` -> `checkpointStore.write(RedoCheckpointLabel.of(safe, redo.currentLsn(), now))`, then publish `lastCheckpointLsn = safe` | Implemented code; called by `FlushService` from tests, `StorageEngine` foreground lifecycle, and E3a periodic page cleaner tick；"closed LSN" approximated by `currentLsn()` |
 | Doublewrite write | `flush.doublewrite.RecoverableDoublewriteStrategy.beforeDataFileWrite` -> `repository.append(snapshot)` -> `repository.force()` = `channel.force(true)` | Implemented; full-copy fsync'd before data file write; no slot reclamation (`afterDataFileWrite` is no-op); doublewrite file grows unbounded |
-| Doublewrite repair | recovery participant 先修显式配置 UNDO page0/读 marker；普通 scanner 对 pageNo>= 当前文件大小的越界页跳过（交 redo 重建）、对 TRUNCATING space 的 pageNo>=target 跳过；其余 checksum-invalid 页从 doublewrite copy 修复 | Implemented；仍只处理显式 page 列表/显式 undo SpaceId，无 discovery |
+| Doublewrite repair | recovery participant 先修显式配置 UNDO page0/读 marker；普通 scanner 对 pageNo>= 当前文件大小的越界页跳过（交 redo 重建）、对 TRUNCATING space 的 pageNo>=target 跳过；其余 checksum-invalid 页从 doublewrite copy 修复 | **Implemented production path（0.2）**：`StorageEngine` E2 配 `DoublewriteRecoveryScanner` + `DoublewriteFileRepository.pageIds()`（**过滤到恢复已打开空间**：系统 undo + `recoveryTablespaces`，避免 scanner 读未打开空间），真正修复 torn data/undo 页；未打开空间的 torn 页留待该空间打开/discovery |
 
 ### Package Status
 
 | Package area | Representative classes | Current state | Notes |
 | --- | --- | --- | --- |
-| `storage.flush` facade/coordinator | `FlushService`, `FlushCoordinator`, `FlushCycleResult`, `FlushResult`, `FlushResultStatus`, `TablespaceDrainResult` | Implemented | Ties redo capacity -> flush -> checkpoint；`StorageEngine` 构造 E1 前台 flush/checkpoint 路径；无后台 driver |
+| `storage.flush` facade/coordinator | `FlushService`, `FlushCoordinator`, `FlushCycleResult`, `FlushResult`, `FlushResultStatus`, `TablespaceDrainResult`, `CoordinatedDirtyVictimFlusher` | Implemented | Ties redo capacity -> flush -> checkpoint；`StorageEngine` 构造 foreground barrier + E3a background page cleaner path；`CoordinatedDirtyVictimFlusher` 适配 buf 淘汰端口到 `singlePageFlush`（CLEAN→true/skip→false/FAILED→抛），`StorageEngine` 注入 pool |
 | `storage.flush.policy` adaptive policy | `AdaptiveFlushPolicy`, `FlushAdvice` | Implemented | Maps redo capacity pressure to flush batch advice；`StorageEngine` 注入 fixed policy |
 | `storage.flush.checkpoint` checkpoint | `CheckpointCoordinator` | Implemented | Fuzzy checkpoint = min(oldestDirty, current, flushed); optional `RedoCheckpointStore` persistence；`StorageEngine` 注入 checkpoint store |
-| `storage.flush.doublewrite` doublewrite | `DoublewriteStrategy`, `NoDoublewriteStrategy`, `RecoverableDoublewriteStrategy`, `DoublewriteFileRepository`, `DoublewriteRecoveryScanner`, `DoublewriteMode` | Implemented | E1 uses `NoDoublewriteStrategy`; recoverable strategy/repository/scanner still tests/recovery-wired；`DETECT_ONLY` mode deferred |
-| `storage.flush.cleaner` page cleaner | `PageCleanerWorker`, `PageCleanerState`, `PageCleanerStoppedException` | Implemented (test-only) | Single daemon `Thread` "minimysql-page-cleaner"；bounded queue；failure is terminal；`StorageEngine` 尚未 start 后台 cleaner |
+| `storage.flush.doublewrite` doublewrite | `DoublewriteStrategy`, `RecoverableDoublewriteStrategy`, `NoDoublewriteStrategy`, `DoublewriteFileRepository`(+`pageIds()`), `DoublewriteRecoveryScanner`, `DoublewriteMode` | Implemented; **recoverable 模式 production-wired（0.2）** | `StorageEngine` 注入 `RecoverableDoublewriteStrategy`（前向，每次 flush 前写整页副本+fsync）+ E2 配 scanner + `DoublewriteFileRepository.pageIds()`（恢复待检查页来源）；`NoDoublewriteStrategy` 仅测试用；slot 回收（append-only unbounded，0.5）/`DETECT_ONLY`/全空间 discovery deferred |
+| `storage.flush.cleaner` page cleaner | `PageCleanerWorker`, `PageCleanerState`, `PageCleanerStoppedException` | Implemented; production-wired by `StorageEngine` E3a | Single daemon `Thread` "minimysql-page-cleaner"；bounded explicit queue + periodic idle tick；failure is terminal；no supervisor restart |
 | `storage.flush` exceptions | `FlushWriteException`, `FlushBarrierTimeoutException` | Implemented | Root flush exceptions shared by coordinator/doublewrite/cleaner/barrier |
 
 ## Transaction Layer Slice
@@ -347,26 +350,26 @@ flowchart TD
 
 | Flow | Current production chain | Current state |
 | --- | --- | --- |
-| Begin | `TransactionManager.begin(options)` (`:34`) -> `new Transaction(options, now)` state `ACTIVE`; **no id allocation** (lazy) | Implemented (test-only); `new TransactionManager` has zero production matches |
+| Begin | `TransactionManager.begin(options)` (`:34`) -> `new Transaction(options, now)` state `ACTIVE`; **no id allocation** (lazy) | Implemented; `StorageEngine` constructs `TransactionManager`，但普通 SQL/session DML 入口尚未接 |
 | Assign write id | `TransactionManager.assignWriteId(txn)` (`:45`) -> requires `ACTIVE`, rejects read-only -> `system.allocateWriteId()` (`:53`) -> `txn.setTransactionId` (`:54`); idempotent if already set | Implemented (test-only); `allocateWriteId` -> `active.register(id)` (`TransactionSystem.java:33`) |
-| Commit | `TransactionManager.commit(txn)` -> `ACTIVE -> COMMITTING` -> if id != NONE: `allocateTransactionNo` + `setTransactionNo` + `removeActive` -> `COMMITTING -> COMMITTED`。slot 回收由编排另调 `UndoLogManager.onCommit(txn)`（释放 insert undo slot，T1.3d）；`commit()` public 行为不变（不自动调 onCommit） | Implemented (test-only); 无 flush、无持久 undo header mark；onCommit 只回收内存 slot，不回收 undo 页 |
+| Commit | `TransactionManager.commit(txn)` -> `ACTIVE -> COMMITTING` -> if id != NONE: `allocateTransactionNo` + `setTransactionNo` + `removeActive` -> `COMMITTING -> COMMITTED`。slot 回收由编排另调 `UndoLogManager.onCommit(txn)`（释放 insert undo slot，T1.3d）；`commit()` public 行为不变（不自动调 onCommit） | Implemented; `onCommit` 在 engine 注入 `mtrManager/headerRepo` 时持久写 undo first 页 `STATE_COMMITTED + COMMIT_NO`，纯 insert 同 MTR 清 page3 slot；含 update/delete 入 history，普通 SQL/session commit facade 尚未接 |
 | Rollback (consume undo, T1.3d) | `RollbackService.rollback(txn, clusteredIndex)` -> `txnMgr.beginRollback`（ACTIVE→ROLLING_BACK）-> 若有 `UndoContext`：从 `ctx.lastRollPointer` 反向走链，每条独立 MTR（`undoAccess.open(SHARED)` + `readRecord` + `applyUndoRecord`→INSERT_ROW 调 `deleteClustered` + `commit`）-> `slotManager.release(ctx.slotId)` -> `txnMgr.finishRollback`（removeActive + →ROLLED_BACK）-> `RollbackSummary(applied)` | Implemented (test-only); `new RollbackService` = 0 prod；trx→btree 新边；单条失败回滚当前 MTR 并传播、停 ROLLING_BACK 可重试；纯状态 `TransactionManager.rollback()` 仍供只读/未写事务 |
-| Undo write (INSERT) | `UndoLogManager.beforeInsert(txn,mtr,tableId,indexId,clusterKey,keyDef,schema)` (`UndoLogManager.java:94`) -> require ACTIVE + non-NONE txnId -> `ensureUndoContext` (`:137`): 首写 `access.create` (`:143`) + `slotManager.claim(firstPageId)` (`:145`) + `new UndoContext(rseg,slot,firstPageId)` + `txn.setUndoContext`; 续写 `access.open(firstPageId, EXCLUSIVE)` (`:140`) -> `UndoNo.of(ctx.lastUndoNo+1)` -> `new UndoRecord(INSERT_ROW, undoNo, txnId, tableId, indexId, clusterKey, ctx.lastRollPointer)` -> `seg.append` (`:116`) -> `ctx.setLastUndoNo/setLastRollPointer` (`:119-120`) -> return insert `RollPointer` | Implemented (test-only); `new UndoLogManager` = 0 prod matches；undo append 与聚簇写同 MTR（WAL 同 redo batch，§7.2）；MTR rollback 不撤销页内容 → 失败插入留 orphan undo，由 T1.3d `RollbackService` full rollback 幂等清理（`deleteClustered` 未命中=no-op） |
-| Slot claim | `RollbackSegmentSlotManager.claim(firstPageId)` (`RollbackSegmentSlotManager.java:66`) -> `ReentrantLock` 串行扫空 slot -> 登记 `slots[i]=firstPageId`、`activeCount++` -> return `UndoSlotId.of(i)`；无空槽抛 `UndoSlotExhaustedException` | Implemented (test-only); 锁内不分配页、不访问 BufferPool、不等待 IO（§9.3） |
-| Slot release (T1.3d) | `RollbackSegmentSlotManager.release(slot)` -> `ReentrantLock` 内校验已占用 -> `slots[idx]=null`、`activeCount--`（first-fit 可重认领）；由 commit（`UndoLogManager.onCommit`）与 rollback（`RollbackService`）调用 | Implemented (test-only); 释放未占用/越界/null 抛 `DatabaseValidationException`；只回收内存 slot，不回收 undo 页/段；持久 rseg header/恢复扫描留 T1.3e+ |
+| Undo write (INSERT) | `UndoLogManager.beforeInsert(txn,mtr,tableId,indexId,clusterKey,keyDef,schema)` (`UndoLogManager.java:94`) -> require ACTIVE + non-NONE txnId -> `ensureUndoContext` (`:137`): 首写 `access.create` (`:143`) + `slotManager.claim(firstPageId)` (`:145`) + `new UndoContext(rseg,slot,firstPageId)` + `txn.setUndoContext`; 续写 `access.open(firstPageId, EXCLUSIVE)` (`:140`) -> `UndoNo.of(ctx.lastUndoNo+1)` -> `new UndoRecord(INSERT_ROW, undoNo, txnId, tableId, indexId, clusterKey, ctx.lastRollPointer)` -> `seg.append` (`:116`) -> `ctx.setLastUndoNo/setLastRollPointer` (`:119-120`) -> return insert `RollPointer` | Implemented; `StorageEngine` constructs `UndoLogManager` with durable MTR/header repo，but DML orchestration is still test-driven；undo append 与聚簇写同 MTR（WAL 同 redo batch，§7.2）；MTR rollback 不撤销页内容 → 失败插入留 orphan undo，由 `RollbackService` full rollback / recovery rollback 幂等清理 |
+| Slot claim | `RollbackSegmentSlotManager.claim(firstPageId)` -> `ReentrantLock` 串行扫空 slot -> 登记 `slots[i]`、`activeCount++` -> `UndoSlotId.of(i)`；无空槽抛 `UndoSlotExhaustedException` | Implemented；**0.3**：`UndoLogManager.ensureUndoContext` 认领后**同一 MTR** 经 `RollbackSegmentHeaderRepository.writeSlot` 持久到 undo page3（redo 保护，crash-safe）——engine 注入 headerRepo 时生效，纯内存 fixture 不持久 |
+| Slot release (T1.3d) | `RollbackSegmentSlotManager.release(slot)` -> 锁内校验已占用 -> `slots[idx]=null`、`activeCount--`（first-fit 可重认领）；由 `UndoLogManager.onCommit` / `RollbackService` / `PurgeCoordinator` 调用 | Implemented；**0.3**：纯 insert 事务 `onCommit` 释放在短 MTR 内清空 page3 槽（**提交后才释放内存**，engine 路径）；`RollbackService`/`PurgeCoordinator` 释放**暂未持久**——slot 重用时 page3 被覆盖、R 1.2 读 undo 状态判 active/committed，无正确性问题，留后续 |
 | ReadView 创建 (T1.4) | `ReadViewManager.openReadView(txn)` -> 按隔离级别 RR 缓存到 `Transaction.readView` / RC 新建 / RU·SERIALIZABLE 抛 -> `TransactionSystem.openReadViewSnapshot(txn)`（锁内：可写事务分配 creator id + 原子捕获 {activeIds, nextId, **nextTransactionNo→`ReadView.lowLimitNo`**} 建 `ReadView` 并**登记 live 集合**，purge 用） | Implemented (test-only); commit/finishRollback 调 `release` 清 RR 缓存并注销 live view；RC 经 `ReadViewManager.closeReadView` 语句末注销（purge 边界用，T-purge） |
-| Purge boundary + 单线程聚簇 purge (T-purge) | `TransactionSystem.purgeLowWaterNo()`=min(live ReadView lowLimitNo)/无则 nextTransactionNo -> `PurgeCoordinator.runBatch(maxLogs)`：排空 insert-reclaim（`dropUndoSegment`）→ `HistoryList.peekCommitted` FIFO 取 `transactionNo<boundary`（≥即停）→ 只读 MTR `UndoLogSegment.forEachRecordWithPointer` 收集 DELETE_MARK(key,地址) → 每条独立 index MTR `SplitCapableBTreeIndexService.purgeDeleteMarkedClustered`（严格：仍 delete-marked+隐藏列匹配才物理移除）→ 全成功 `dropUndoSegment`+`release` slot+`pollCommitted` | Implemented (test-only); `onCommit` 编排：先 `commit` 分配 No 再 `onCommit` 入 history（update/delete）或 insert-reclaim+release slot（insert-only）；latch 纪律先 undo 后 index；per-entry 原子（硬失败保留队首停批）；`new PurgeCoordinator` = 0 prod matches |
-| Consistent read (MVCC, T1.4) | `MvccReader.read(readView, index, key)` -> MTR-1 `btree.lookup` 物化当前版本并提交（释放 index latch）-> 循环 `ReadView.isVisible(trxId)`：可见即重建 `LogicalRecord` 返回；否则 rollPtr NULL/insert→empty，UPDATE→独立 MTR `undoAccess.readRecordByRollPointer` 读 undo→校验 type/key→沿 `oldHidden.dbRollPtr` 构造上一版本（visited+maxVersionHops 防环） | Implemented (test-only); 任一时刻不同持 index+undo latch（§17）；`new MvccReader` = 0 prod matches |
+| Purge boundary + 单线程聚簇 purge (T-purge) | `TransactionSystem.purgeLowWaterNo()`=min(live ReadView lowLimitNo)/无则 nextTransactionNo -> `PurgeCoordinator.runBatch(maxLogs)`：排空 insert-reclaim（`dropUndoSegment`）→ `HistoryList.peekCommitted` FIFO 取 `transactionNo<boundary`（≥即停）→ 只读 MTR `UndoLogSegment.forEachRecordWithPointer` 收集 DELETE_MARK(key,地址) → 每条独立 index MTR `SplitCapableBTreeIndexService.purgeDeleteMarkedClustered`（严格：仍 delete-marked+隐藏列匹配才物理移除）→ 全成功 `dropUndoSegment`+`release` slot+`pollCommitted` | Implemented; `StorageEngine` 配 `clusteredIndex` 时生产启动 `PurgeDriverWorker` 周期调用；`onCommit` 入 history，R 1.3 恢复期从 COMMITTED undo header 重建 history；latch 纪律先 undo 后 index；per-entry 原子（硬失败保留队首停批） |
+| Consistent read (MVCC, T1.4) | `MvccReader.read(readView, index, key)` -> MTR-1 `btree.lookup` 物化当前版本并提交（释放 index latch）-> 循环 `ReadView.isVisible(trxId)`：可见即重建 `LogicalRecord` 返回；否则 rollPtr NULL/insert→empty，UPDATE→独立 MTR `undoAccess.readRecordByRollPointer` 读 undo→校验 type/key→沿 `oldHidden.dbRollPtr` 构造上一版本（visited+maxVersionHops 防环） | Implemented; `StorageEngine` production-held，session/executor 尚未调用；任一时刻不同持 index+undo latch（§17） |
 
 ### Package Status
 
 | Package area | Representative classes | Current state | Notes |
 | --- | --- | --- | --- |
-| `storage.trx` facade | `TransactionManager`, `UndoLogManager`, `RollbackService`, `ReadViewManager`, `MvccReader`, `PurgeCoordinator`, `HistoryList`, `PurgeSummary` | Implemented (test-only) | 生命周期门面（+`begin/finishRollback` 两阶段 T1.3d；拥有 `ReadViewManager`、commit/finishRollback 调 `release` T1.4）+ undo 写门面（`onCommit` 入 history/insert-reclaim，T-purge）+ rollback 执行器 + ReadView 门面（RR/RC + `closeReadView` + live 登记 T-purge）+ MVCC 一致性读 + **单线程 purge 协调器 + history list**（trx→btree+undo，T-purge）；`new PurgeCoordinator`/`new HistoryList` = 0 prod matches |
-| `storage.trx` system | `TransactionSystem`, `ActiveTransactionTable` | Implemented (test-only) | Monotonic trx-id/trx-no allocation + `TreeSet<Long>` active table; `ReentrantLock`; T1.4 加 `openReadViewSnapshot(txn)`（锁内原子：可写事务分配 creator id + 捕获 {activeIds, nextTransactionId} 建 `ReadView`）；`snapshotActiveReadWriteIds()` 保留 |
-| `storage.trx` aggregate | `Transaction`, `TransactionState`, `TransactionOptions`, `IsolationLevel`, `UndoContext`, `ReadView` | Implemented (test-only) | 5-state FSM；T1.3c 惰性 `UndoContext`；**T1.4 增 `Transaction.readView` 字段**（RR 复用，仅 `ReadViewManager` 改）+ `ReadView`（creator/up/low/activeIds + 五规则 `isVisible`，不可变）；**`IsolationLevel` 改为驱动 RR/RC ReadView 生命周期**（RU/SERIALIZABLE 拒绝） |
-| `storage.trx` undo context | `UndoContext` | Implemented (test-only) | T1.3c 事务 undo 子状态（设计 §5.3 简化版）：`rollbackSegmentId`/`slotId`/`insertUndoFirstPageId`/`lastUndoNo`/`lastRollPointer`；`updateUndoLogId`/`savepointStack`/`modifiedTables` 留 T1.3d+；包内 setter 仅 `UndoLogManager` 调 |
-| `storage.trx` rseg slot | `RollbackSegmentSlotManager`, `UndoSlotExhaustedException` | Implemented (test-only) | T1.3c 内存 rseg slot 目录：固定单一默认 `RollbackSegmentId`，`ReentrantLock` 串行认领；T1.3d 加 `release`（commit/rollback 回收）；无持久化/恢复扫描；`UndoSlotExhaustedException` extends `DatabaseRuntimeException` |
+| `storage.trx` facade | `TransactionManager`, `UndoLogManager`, `RollbackService`, `ReadViewManager`, `MvccReader`, `PurgeCoordinator`, `HistoryList`, `PurgeSummary` | Implemented; production-held by `StorageEngine` | 生命周期门面（+`begin/finishRollback` 两阶段 T1.3d；拥有 `ReadViewManager`、commit/finishRollback 调 `release` T1.4）+ undo 写门面（`onCommit` 入 history/insert-reclaim，R 1.3 写 `COMMIT_NO`）+ rollback 执行器 + ReadView 门面 + MVCC 一致性读 + 单线程 purge 协调器；普通 SQL/session DML facade 尚未接 |
+| `storage.trx` system | `TransactionSystem`, `ActiveTransactionTable` | Implemented; production-held by `StorageEngine` | Monotonic trx-id/trx-no allocation + `TreeSet<Long>` active table; `ReentrantLock`; T1.4 加 `openReadViewSnapshot(txn)`；R 1.3 加 `restoreCounters(nextId,nextNo)`，恢复期只前进不回退，使 purge boundary 覆盖重建 history |
+| `storage.trx` aggregate | `Transaction`, `TransactionState`, `TransactionOptions`, `IsolationLevel`, `UndoContext`, `ReadView` | Implemented; DML use still test-driven | 5-state FSM；T1.3c 惰性 `UndoContext`；T1.4 增 `Transaction.readView` 字段 + `ReadView` 五规则；`IsolationLevel` 驱动 RR/RC ReadView 生命周期（RU/SERIALIZABLE 拒绝） |
+| `storage.trx` undo context | `UndoContext` | Implemented; DML use still test-driven | T1.3c 事务 undo 子状态（设计 §5.3 简化版）：`rollbackSegmentId`/`slotId`/`insertUndoFirstPageId`/`lastUndoNo`/`lastRollPointer`；`updateUndoLogId`/`savepointStack`/`modifiedTables` 留 T1.3d+；包内 setter 仅 `UndoLogManager` 调 |
+| `storage.trx` rseg slot | `RollbackSegmentSlotManager`, `UndoSlotExhaustedException` | Implemented | 内存 rseg slot 目录：固定单一默认 `RollbackSegmentId`，`ReentrantLock` 串行认领 + `release`；**0.3 加 `restore`**（恢复扫 page3 按下标重建）；claim/release 经 `UndoLogManager` 持久到 page3 rseg header（engine 路径），fixture 仍纯内存 |
 | `storage.trx` exception | `TransactionStateException`, `UndoSlotExhaustedException` | Implemented (test-only) | Both extend `DatabaseRuntimeException`; `TransactionStateException` thrown by `TransactionManager`/`Transaction`/`UndoLogManager.beforeInsert` on illegal state / non-ACTIVE / NONE txn id |
 
 ## Recovery Layer Slice
@@ -397,17 +400,17 @@ flowchart TD
 
 | Flow | Current production chain | Current state |
 | --- | --- | --- |
-| Recovery orchestration | `CrashRecoveryService.recover(request)` -> `gate.closeForRecovery()` -> doublewrite repair -> `checkpointStore().readLatest()` -> `new RedoRecoveryReader(...)` -> `reader.readBatches()` -> `dispatcher().applyAll(...)` -> 若 `recoveredRedoManager()` 非空 `restoreRecoveredBoundary(recoveredTo)` -> 若 undo participant 非空 `resumeAfterRedo(recoveredTo)` -> 若 `spacesToReconcile()` 非空 `reconcileSpaceFiles(request)` -> `pageStore().forceAll()` -> `gate.openForUserTraffic()` -> `RecoveryReport` | Implemented code; **7 enum stages**: `TRAFFIC_CLOSED -> DOUBLEWRITE_REPAIR -> REDO_REPLAY -> [REDO_BOUNDARY_INSTALL] -> [UNDO_TABLESPACE_RESUME] -> [SPACE_FILE_RECONCILE] -> OPEN_TRAFFIC`（方括号三阶段按 request 条件触发；reconcile 必晚于 undo resume）；forceAll 在开放流量前落盘全部恢复写；**no UNDO_ROLLBACK / PURGE_RESUME / DDL_RECOVERY stage**; `CrashRecoveryService` only test-instantiated |
-| Space file reconcile (autoextend crash-safety) | undo resume 后若 `spacesToReconcile()` 非空：`reconcileSpaceFiles` 逐空间 `PageStore.readPage(page0)` -> `SpaceHeaderRawCodec.readPhysical` -> `validateReconcileHeader`（spaceId/pageSize 一致、size>0、偏移不溢出，否则 `TablespaceCorruptedException`）-> 幂等 `PageStore.ensureCapacity`；replay 期 `PageRedoApplyHandler` 仅对 PAGE_INIT extend-on-demand，首触越界 PAGE_BYTES 判 `RedoLogCorruptedException` | Implemented (test-wired)；复用物理 PAGE_BYTES（无新 redo 类型）；只恢复物理文件长度，不重建 FSP bitmap；弥补 autoExtend 不 fsync 在崩溃后留下的"物理短于 page0 逻辑"背离 |
+| Recovery orchestration | `StorageEngine.open(existing)` -> `DiskSpaceManager.openTablespaceForRecovery(undo + EngineConfig.recoveryTablespaces)` -> `CrashRecoveryService.recover(request)` -> `gate.closeForRecovery()` -> doublewrite stage -> checkpoint read -> `RedoRecoveryReader.readBatches` -> `dispatcher.applyAll` -> `RedoLogManager.restoreRecoveredBoundary(recoveredTo)` -> `UndoTablespaceTruncationRecovery.resumeAfterRedo` -> `SPACE_FILE_RECONCILE` -> `PageStore.forceAll` -> `gate.openForUserTraffic` -> `StorageEngine.restoreRollbackSegmentSlots` -> `recoverRollbackSegmentTransactions`（ACTIVE 回滚；COMMITTED 按 `COMMIT_NO` 重建 history + `TransactionSystem.restoreCounters`）-> background redo/page/purge workers -> publish OPEN | Implemented production path; **7 formal enum stages**: `TRAFFIC_CLOSED -> DOUBLEWRITE_REPAIR -> REDO_REPLAY -> [REDO_BOUNDARY_INSTALL] -> [UNDO_TABLESPACE_RESUME] -> [SPACE_FILE_RECONCILE] -> OPEN_TRAFFIC`（E2 engine 请求固定带后三个条件阶段）；forceAll 在开放流量前落盘恢复写；事务 rollback / purge resume 目前是 engine 后恢复步，非正式 stage；DDL_RECOVERY 未接 |
+| Space file reconcile (autoextend crash-safety) | undo resume 后若 `spacesToReconcile()` 非空：`reconcileSpaceFiles` 逐空间 `PageStore.readPage(page0)` -> `SpaceHeaderRawCodec.readPhysical` -> `validateReconcileHeader`（spaceId/pageSize 一致、size>0、偏移不溢出，否则 `TablespaceCorruptedException`）-> 幂等 `PageStore.ensureCapacity`；replay 期 `PageRedoApplyHandler` 仅对 PAGE_INIT extend-on-demand，首触越界 PAGE_BYTES 判 `RedoLogCorruptedException` | Implemented; `StorageEngine` E2 对系统 UNDO + 显式配置数据表空间执行；只恢复物理文件长度，不重建 FSP bitmap；弥补 autoExtend 不 fsync 在崩溃后留下的"物理短于 page0 逻辑"背离 |
 | Failure path | any `DatabaseRuntimeException` (`:75`) or `RuntimeException` (`:78`) -> `failClosed(mode, e)` (`:134`) -> `gate.failClosed(error)` (`:135`) -> state `FAILED` (`:136`) -> FAILED `RecoveryReport` with zeroed LSNs/counts (`:138-139`) -> throw `RecoveryStartupException` (`:77`/`:80`) | Implemented; gate stays closed on failure; `RecoveryStartupException` extends `DatabaseFatalException` |
 
 ### Package Status
 
 | Package area | Representative classes | Current state | Notes |
 | --- | --- | --- | --- |
-| `storage.recovery` facade | `CrashRecoveryService`, `RecoveryTrafficGate`, `RecoveryState` | Implemented (test-only) | `new CrashRecoveryService` = 0 production matches; no bootstrap/engine/startup class exists; gate not consulted by any session/storage-API entry |
-| `storage.recovery` request/report | `RecoveryRequest`, `RecoveryReport`, `RecoveryMode`, `RecoveryStageName` | Implemented (test-only) | `RecoveryRequest` carries `RedoCheckpointStore`/`RedoLogFileRepository`/`RedoApplyDispatcher`/`RedoApplyContext`/`DoublewriteRecoveryScanner`/`UndoTablespaceRecoveryParticipant`/`spacesToReconcile`/`recoveredRedoManager`; factories `normal`/`withDoublewriteRepair`/`withUndoTablespaceRecovery`/`withSpaceFileReconcile`/`withRedoBoundaryInstall` test-only; only `NORMAL` mode implemented; 7 enum stages（`REDO_BOUNDARY_INSTALL`/`UNDO_TABLESPACE_RESUME`/`SPACE_FILE_RECONCILE` 条件触发）|
-| `storage.recovery` exception | `RecoveryStartupException` | Implemented (test-only) | Extends `DatabaseFatalException`; thrown by `CrashRecoveryService` on fail-closed |
+| `storage.recovery` facade | `CrashRecoveryService`, `RecoveryTrafficGate`, `RecoveryState` | Implemented; production-wired by `StorageEngine` E2 | `StorageEngine.open(existing)` constructs service/gate and exposes `recoveryState()`/`lastRecoveryReport()`；session/storage API 仍未查询 gate |
+| `storage.recovery` request/report | `RecoveryRequest`, `RecoveryReport`, `RecoveryMode`, `RecoveryStageName` | Implemented; production-wired by `StorageEngine` E2 | `StorageEngine` builds NORMAL request with redo repo/checkpoint/dispatcher/context/recovered manager/undo participant/reconcile spaces + **doublewrite scanner + `dwRepo.pageIds()`（过滤到恢复已打开空间）（0.2）** |
+| `storage.recovery` exception | `RecoveryStartupException` | Implemented | Extends `DatabaseFatalException`; thrown by `CrashRecoveryService` on fail-closed |
 
 ## Undo Log Layer Slice
 
@@ -452,8 +455,9 @@ flowchart TD
 
 | Package area | Representative classes | Current state | Notes |
 | --- | --- | --- | --- |
-| `storage.undo` access | `UndoLogSegmentAccess`, `UndoLogSegment`, `UndoLog`, `UndoSegmentHandle`, `UndoSpaceAllocator` (port) | Implemented (test-only) | `UndoLogSegmentAccess` is public MTR entry：`UndoLogManager` 经它 create/open/append；T1.4 加 `readRecordByRollPointer`（按 roll pointer 跨段直读单条 undo + 槽边界/insert 位/indexId 校验），供 `MvccReader` 构造旧版本；`UndoSpaceAllocator` port inverts undo->api; `new UndoLogSegmentAccess(...)` = 0 prod matches |
-| `storage.undo` page | `UndoPageAccess`, `UndoPage`, `UndoPageLayout` | Implemented | `UndoPageAccess` centralizes `PageType.UNDO` envelope writes; `UndoPageLayout` pkg-private constants (record area start=97 uniform); `UndoPage` pkg-private ctor (only `UndoPageAccess` creates) |
+| `storage.undo` access | `UndoLogSegmentAccess`, `UndoLogSegment`, `UndoLog`, `UndoSegmentHandle`, `UndoSpaceAllocator` (port) | Implemented; production-held by `StorageEngine` | `UndoLogSegmentAccess` is public MTR entry：`UndoLogManager` 经它 create/open/append；T1.4 加 `readRecordByRollPointer`（按 roll pointer 跨段直读单条 undo + 槽边界/insert 位/indexId 校验），供 `MvccReader` 构造旧版本；**R 1.2/1.3 加 `UndoLogSegment.markCommitted`/`state`/`isActive`/`isCommitted`/`committedTransactionNo`**（commit 写 `STATE_COMMITTED + COMMIT_NO`，恢复判 active/committed 并按提交序重建 history）；`UndoSpaceAllocator` port inverts undo->api; `UndoLogSegmentAccess` 现由 `StorageEngine` 生产持有（恢复读 state/回滚/history 重建） |
+| `storage.undo` page | `UndoPageAccess`, `UndoPage`, `UndoPageLayout` | Implemented | `UndoPageAccess` centralizes `PageType.UNDO` envelope writes; `UndoPageLayout` pkg-private constants (record area start=105 after R 1.3 `COMMIT_NO`); `UndoPage` pkg-private ctor (only `UndoPageAccess` creates) |
+| `storage.undo` rseg header | `RollbackSegmentHeaderRepository`, `RollbackSegmentHeaderLayout`, `RollbackSegmentHeaderSnapshot` | Implemented; production-wired by `StorageEngine`（0.3） | undo 表空间固定 **page3** slot 目录 `format`/`writeSlot`/`read`（redo 保护，`PageType.RSEG_HEADER`）；engine fresh format、slot claim/release 持久、恢复扫描共用；§6.3 history/cached·free segment/lastTransactionNo 富字段留后续；truncate rebuild 重格式化 page3 deferred |
 | `storage.undo` record | `UndoRecord`, `UndoRecordCodec`, `UndoRecordType`, `UndoLogKind` | Partial | `INSERT_ROW`(T1.3a) + `UPDATE_ROW`(T1.3e) + `DELETE_MARK`(T1.3f) 全部编解码（UPDATE/DELETE 带全量旧 image：旧隐藏列+全列；DELETE 不存 old delete flag=阶段差异）；`UndoRecord` 类型判别(insert()/update()/deleteMark() 工厂，old* 可空性校验)；混合段段头 `UndoLogKind` 非权威、记录 type 字节权威；codec self-framing |
 | `storage.undo` exceptions | `UndoPageOverflowException`, `UndoLogFormatException` | Implemented | `UndoPageOverflowException` thrown pre-mutation (MTR rollback leaves no half-written page); `UndoLogFormatException` for physical corruption |
 | `storage.api` undo adapter | `DiskSpaceUndoAllocator` | Implemented (test-only) | Implements `UndoSpaceAllocator`; delegates to `DiskSpaceManager.createSegment(UNDO)`/`allocatePage`; T1.3c 起被 `UndoLogManager`（test-only）调用，仍无生产组合根 |
@@ -475,7 +479,7 @@ flowchart TD
 
 ## Reserved / Unwired Production Types
 
-> 以下类型存在于生产源码中，但在 `src/main/java` 内没有任何构造点或调用点（仅在 `src/test/java` 中被构造/调用）。按 AGENTS.md 要求，每个必须写清保留理由和下一步动作。
+> 以下类型存在于生产源码中，但尚未完全闭环、无直接生产调用，或只有部分能力接线。按 AGENTS.md 要求，每个必须写清现状、保留理由和下一步动作。
 
 ### fil.lock 层未接线锁
 
@@ -489,7 +493,7 @@ flowchart TD
 
 | Type | Current caller | Why it exists | Next action |
 | --- | --- | --- | --- |
-| `UndoTablespaceTruncationService` / `UndoTablespaceTruncationRecovery` | 相互接线并接 `CrashRecoveryService` 扩展点；构造仅在 tests | 可由未来 purge 调用的 crash-safe UNDO 物理收缩与启动续作 | 在 engine bootstrap 共享 controller/redo/flush/registry 并注入；purge 片接调用方 |
+| `UndoTablespaceTruncationService` / `UndoTablespaceTruncationRecovery` | `StorageEngine.open(existing)` 构造 recovery participant；tests；主动 truncate 仍无 purge 调用方 | 可由未来 purge 调用的 crash-safe UNDO 物理收缩与启动续作 | 已在 engine recovery bootstrap 共享 controller/redo/flush/registry 并注入；purge 片接主动 truncate 调用方 |
 
 ### buf + mtr 层部分预留类型
 
@@ -522,33 +526,32 @@ flowchart TD
 
 | Type | Current caller | Why it exists | Next action |
 | --- | --- | --- | --- |
-| `RedoLogWriter` / `RedoLogFlusher` / `RedoLogFileRepository` | `StorageEngine` + tests | Durable redo write/flush/file IO | Add redo recycling/rotation and background flush driver |
-| `RedoCheckpointStore` / `RedoCheckpointLabel` | `StorageEngine` + tests | Fuzzy checkpoint control file | Feed startup recovery request in E2 |
-| `RedoRecoveryReader` / `RedoApplyDispatcher` / `RedoApplyContext` / `PageRedoApplyHandler` | Tests only (`CrashRecoveryService` is test-only) | Redo replay path | Wire `CrashRecoveryService` into engine startup |
-| `RedoCapacityPolicy` / `RedoCapacityPressure` / `RedoCapacityDecision` | `StorageEngine` + tests | Redo capacity pressure evaluation | Wire `PageCleanerWorker` into engine |
+| `RedoLogWriter` / `RedoLogFlusher` / `RedoLogFileRepository` | `StorageEngine` + tests | Durable redo write/flush/file IO | Add redo recycling/rotation and true background redo writer/flusher |
+| `RedoCheckpointStore` / `RedoCheckpointLabel` | `StorageEngine` + tests | Fuzzy checkpoint control file | Add redo recycling integration and richer checkpoint diagnostics |
+| `RedoRecoveryReader` / `RedoApplyDispatcher` / `RedoApplyContext` / `PageRedoApplyHandler` | `StorageEngine.open(existing)` + tests | Redo replay path for configured/opened tablespaces | Add tablespace discovery and more redo handlers as formats expand |
+| `RedoCapacityPolicy` / `RedoCapacityPressure` / `RedoCapacityDecision` | `StorageEngine` + tests | Redo capacity pressure evaluation | Add append throttle / wait policy and config-driven thresholds |
 
-### flush 层无后台生产驱动
+### flush 层部分未接线能力
 
 | Type | Current caller | Why it exists | Next action |
 | --- | --- | --- | --- |
-| `FlushService` / `FlushCoordinator` / `flush.checkpoint.CheckpointCoordinator` | `StorageEngine` composition root + `UndoTablespaceTruncationService` + tests | Flush facade + per-page WAL/doublewrite executor + checkpoint/lifecycle barrier | Add background flush/checkpoint driver |
-| `PageCleanerWorker` | Tests only | Single-threaded background page cleaner (owns `Thread`); `start()` never called in production | Start from a future engine lifecycle |
-| `flush.doublewrite.NoDoublewriteStrategy` / `RecoverableDoublewriteStrategy` / `DoublewriteFileRepository` / `DoublewriteRecoveryScanner` | `NoDoublewriteStrategy` in `StorageEngine`; recoverable doublewrite stack tests/recovery-wired | Doublewrite strategies + append-only file + torn-page repair | Inject recoverable strategy from engine config when `DoublewriteMode != OFF` |
+| `FlushService` / `FlushCoordinator` / `flush.checkpoint.CheckpointCoordinator` | `StorageEngine` composition root + `PageCleanerWorker` + `UndoTablespaceTruncationService` + tests | Flush facade + per-page WAL/doublewrite executor + checkpoint/lifecycle barrier | Add metrics/backoff policy and unify legacy `BufferPool.flush` path |
+| `flush.doublewrite.NoDoublewriteStrategy` | Tests only（生产已改用 recoverable） | OFF 模式占位 / 不想要 doublewrite 开销的定向测试 | 引入 `DoublewriteMode` 配置开关时作为 OFF 实现；否则保留为测试桩 |
 | `flush.policy.AdaptiveFlushPolicy` | `StorageEngine` + tests | Maps `RedoCapacityDecision` -> `FlushAdvice` | Replace fixed policy with config-driven adaptive policy |
 
 ### trx 层整包无生产引用
 
 | Type | Current caller | Why it exists | Next action |
 | --- | --- | --- | --- |
-| `TransactionManager` / `TransactionSystem` / `Transaction` / `TransactionState` / `TransactionOptions` / `IsolationLevel` / `ActiveTransactionTable` / `TransactionStateException` | Tests only (`import cn.zhangyis.db.storage.trx` = 0 prod matches) | In-memory transaction lifecycle + active table + state FSM | Wire from session/executor once SQL layer begins transactions; add ReadView field in visibility slice |
-| `UndoLogManager` / `UndoContext` / `RollbackSegmentSlotManager` / `UndoSlotExhaustedException` (T1.3c) / `RollbackService` / `RollbackSummary` (T1.3d) | Tests only (`new UndoLogManager`/`new RollbackService` = 0 prod matches) | 事务 undo 写门面（+`onCommit` 入 history/insert-reclaim，T-purge）+ 事务 undo 子状态 + 内存 rseg slot 目录（+`release`）+ rollback 执行器 | Wire from session/executor DML facade；持久 rseg header / 恢复期 active slot 扫描 留后续 |
-| `PurgeCoordinator` / `HistoryList` / `HistoryEntry` / `InsertReclaimEntry` / `PurgeSummary` (T-purge) | Tests only (`new PurgeCoordinator`/`new HistoryList` = 0 prod matches) | 单线程 purge 协调器 + 内存 history list（committed update/delete + insert-reclaim 两队列）；按 `purgeLowWaterNo` 回收 delete-marked 聚簇记录 + `dropUndoSegment` | Wire from engine/background purge driver；持久 history + recovery resume + 多 worker 留后续片 |
+| `TransactionManager` / `TransactionSystem` / `Transaction` / `TransactionState` / `TransactionOptions` / `IsolationLevel` / `ActiveTransactionTable` / `TransactionStateException` | `StorageEngine` production-held; DML still test-driven | In-memory transaction lifecycle + active table + state FSM; `TransactionSystem.restoreCounters` now used by recovery to advance id/no high water | Wire from session/executor once SQL layer begins transactions; LockManager/current-read/prepared states remain future work |
+| `UndoLogManager` / `UndoContext` / `RollbackSegmentSlotManager` / `UndoSlotExhaustedException` (T1.3c) / `RollbackService` / `RollbackSummary` (T1.3d) | `StorageEngine` production-held; DML writes still test-driven | 事务 undo 写门面（+`onCommit` 入 history/insert-reclaim，T-purge）+ 事务 undo 子状态 + rseg slot 目录（+`release`+`restore`）+ rollback 执行器；engine recovery scans page3 and uses `RollbackService.rollbackRecovered` for ACTIVE slots | Wire from session/executor DML facade；slot claim/onCommit-release 持久到 page3；`RollbackService`/`PurgeCoordinator` release 持久化仍 deferred |
+| `PurgeCoordinator`(impl `PurgeTarget`) / `PurgeDriverWorker` / `PurgeDriverWorkerState` / `HistoryList` / `HistoryEntry` / `InsertReclaimEntry` / `PurgeSummary` | **0.4 production-wired by `StorageEngine`（配置 `clusteredIndex` 时）；R 1.3 recovery rebuilds committed history** | 单线程 purge 协调器 + **后台 purge driver**（单 daemon 线程周期/on-demand `runBatch`，失败即 FAILED）+ 内存 history list；按 `purgeLowWaterNo` 回收 delete-marked 聚簇记录 + `dropUndoSegment`；恢复期从 COMMITTED undo header 重建 `HistoryEntry` 并按 `COMMIT_NO` FIFO 入队 | 多 worker + 二级索引 purge + formal `RESUME_PURGE` stage / DD-driven multi-index recovery 留后续片 |
 
-### recovery 层整包无生产引用
+### recovery 层已由 Engine E2 接入
 
 | Type | Current caller | Why it exists | Next action |
 | --- | --- | --- | --- |
-| `CrashRecoveryService` / recovery request/report/gate + `UndoTablespaceRecoveryParticipant` | service 构造仅 tests；内部已调用 undo recovery participant | doublewrite -> redo -> undo tablespace resume -> traffic open 编排 | Wire into engine bootstrap/startup；session/storage API 查询 gate |
+| `CrashRecoveryService` / recovery request/report/gate + `UndoTablespaceRecoveryParticipant` | `StorageEngine.open(existing)` + tests；engine exposes `recoveryState()` / `lastRecoveryReport()` | doublewrite stage -> redo -> undo tablespace resume -> space-file reconcile -> traffic open 编排 | Session/storage API 查询 gate；接入 doublewrite scanner、tablespace discovery、UNDO_ROLLBACK/PURGE_RESUME/DDL_RECOVERY |
 
 ### undo 层整包无生产引用
 
@@ -565,12 +568,10 @@ flowchart TD
 
 | Gap | Current consequence | Preferred resolution |
 | --- | --- | --- |
-| 生产组合根 E1 已接线；recovery/后台/DML 待接 | **engine bootstrap E1**：`storage.engine.StorageEngine`(+`EngineConfig`/`EngineState`/`EngineStateException`) 组合根已接线 buf+mtr(durable redo)+disk+trx+undo(HistoryList)+btree+flush(NoDoublewrite)+checkpoint，共享单一 `TablespaceAccessController`；`open()`(fresh 建系统 undo 表空间 / existing 安装 redo 边界)、`close()/checkpoint()` 经 `FlushService.flushThrough` 按 WAL 顺序持久。`StorageEngine` 本身仍仅 tests 构造（无 main/launcher）。**剩余**：E2 启动崩溃恢复（`CrashRecoveryService` 接 open）、E3 后台 flush/checkpoint/purge driver、E4 DML facade（接 `PurgeCoordinator`）、WAL-safe 脏页淘汰、doublewrite 修复 | 按 E2/E3/E4 继续；E1 假设无脏页淘汰（容量>工作集） |
-| WAL 在生产路径未强制 | `MiniTransaction.commit` 只调 `redoLogManager.append`（内存模式），不调 `flush()`；`FlushCoordinator` 的 WAL gate 在生产中 `flushedToDiskLsn` 恒 0 会跳过所有脏页 | 在 MTR commit 或 flush driver 中驱动 `redo.flush()`；切换 `RedoLogManager` 为 durable 模式 |
-| 无 checkpoint 驱动循环 | `flush.checkpoint.CheckpointCoordinator.advanceCheckpoint` 由 `StorageEngine` foreground `checkpoint/close` 和 tests 调用；无周期 checkpoint 线程 | 添加后台 checkpoint tick |
-| 无后台异步 flush 线程 | `PageCleanerWorker` 拥有 `Thread` 但生产中从未 `start()`；无持续脏页刷盘 | 从 engine 生命周期启动 `PageCleanerWorker` |
-| 无 recovery 启动入口 | `CrashRecoveryService` 从未被生产代码构造；crash 后无法自动恢复 | 在 engine bootstrap 中构造并调用 `CrashRecoveryService.recover` |
-| `RecoveryTrafficGate` 无入口查询 | gate 被 `CrashRecoveryService` 驱动但无 session/storage-API 入口查询 `gate.state()` | 在 storage facade 或 session 入口添加 gate 查询 |
+| 生产组合根 E1/E2/E3a/R 1.3 已接线；DML/完整恢复待接 | **engine bootstrap**：`StorageEngine`(+`EngineConfig`/`EngineTablespaceConfig`/`EngineState`/`EngineStateException`) 组合根已接线 buf+mtr(durable redo)+disk+trx+undo(HistoryList)+btree+flush/checkpoint+recovery+page cleaner/redo flusher/purge driver，共享单一 `TablespaceAccessController` 与 registry；`open()` fresh 建系统 undo 表空间，existing 对系统 UNDO + 显式 `recoveryTablespaces` 执行 `CrashRecoveryService.recover`（redo replay、redo boundary install、UNDO tablespace resume、SPACE_FILE_RECONCILE），随后扫描 page3：ACTIVE rollback，COMMITTED history rebuild + counter restore；按配置启动后台 workers。`StorageEngine` 本身仍仅 tests 构造（无 main/launcher）。**剩余**：E4 DML facade、DD/tablespace discovery、多索引 recovery、formal UNDO_ROLLBACK/PURGE_RESUME/DDL stages | 按 E4/完整 recovery 继续；无 DD discovery，恢复/rollback/purge resume 仍依赖显式配置的表空间和单聚簇索引 |
+| 后台 redo flush 已接；commit durable policy / 拆锁 / recent tracker 仍缺 | `RedoFlushWorker`（`StorageEngine` 启动）周期/on-demand 驱动 `redo.flush()`，`flushedToDiskLsn` 自动前进，淘汰/flush 的 WAL gate 不再因无人 flush 而长时间跳过；**但** `MiniTransaction.commit` 仍不等 durable（无 `FLUSH_ON_COMMIT`），`RedoLogManager` 的 append 与 fsync 仍同一 `lock` 串行（未拆 LSN 分配锁 vs write/flush 锁、无 recent_written/recent_closed tracker），checkpoint 仍用 `currentLsn()` 近似 `closedLsn` | commit durable policy（`FLUSH_ON_COMMIT`/等待）；拆锁 + recent_written/recent_closed tracker；closedLsn 修复（独立片）|
+| recovery 启动入口只覆盖显式配置表空间 | `StorageEngine.open(existing)` 已构造并调用 `CrashRecoveryService.recover`，但只能恢复系统 UNDO 和 `EngineConfig.recoveryTablespaces`，没有 data dictionary/tablespace discovery（doublewrite scanner/pages 已由 engine 配置，0.2，但页列表来自 doublewrite 文件枚举 + 过滤到已打开空间，非全空间 discovery）| 接 data dictionary / tablespace discovery 替代显式空间集与 doublewrite 页过滤 |
+| `RecoveryTrafficGate` 只有 engine 状态查询 | `StorageEngine.recoveryState()` / `lastRecoveryReport()` 可查询启动恢复结果；session/storage API 尚未在每个入口查询 gate | 在 storage facade 或 session 入口添加 gate 查询 |
 
 ### Disk Manager 缺口
 
@@ -579,7 +580,7 @@ flowchart TD
 | Global `architecture.mmd` shows `PageStore --> TablespaceRegistry` | Misleading if read as current wiring | Treat global graph as target architecture; current implementation uses `PageStore` registry-free |
 | Typed page access has lease but no Registry state check | `api.index.IndexPageAccess`/`UndoPageAccess` 经 MTR 持 S lease，可与 truncate X 互斥；若上层绕过 facade，仍不会拒绝稳定 INACTIVE | 在生产 storage facade 统一执行 lease 后 Registry 复核；PageStore 继续 state-free |
 | 普通 lifecycle state 仍为 runtime-only | UNDO ACTIVE/INACTIVE/TRUNCATING 已进 page0；`markCorrupted/discard` 和普通 GENERAL 状态重启仍丢失 | 后续普通 tablespace lifecycle/discard 持久化切片补齐 |
-| page0 still lacks FSP_HDR envelope validation | `api.tablespace.PageZeroTablespaceMetadataLoader` validates spaceId/pageSize through `SpaceHeaderRawCodec`, but cannot verify `PageType.FSP_HDR` | Add page0 `FilePageHeader`/FSP_HDR envelope in a separate storage-page slice |
+| page0 FSP_HDR 信封已校验，checksum/trailer 仍未校验 | `SpaceHeaderRepository.initialize` 盖 page0 FSP_HDR 信封；`PageZeroTablespaceMetadataLoader` 打开/恢复时校验 `pageType==FSP_HDR` + `pageNo==0`（不符抛 `TablespaceCorruptedException`）。但 raw 直读不校验 checksum——写回/淘汰路径未盖 `PageImageChecksum`（只有 `FlushCoordinator` 盖），合法 page0 的 checksum 仍为 0，现在校验会误判损坏 | 待写盘统一盖 checksum（或 page0 读经校验路径）后，单独接入 checksum/trailer 校验 |
 | Registry type for existing 4-arg create defaults to GENERAL | Existing undo test harnesses that call 4-arg `createTablespace` register as GENERAL even when segment purpose is UNDO | Switch undo harnesses or undo allocator setup to typed `TablespaceType.UNDO` when that semantic distinction becomes required |
 | Data-file fsync throttle is absent | Concurrent `PageStore.force` calls only share `TablespaceLifecycleLatch(S)` | Implement `FsyncLock` if concurrent data-file fsync becomes a tested behavior |
 
@@ -590,7 +591,7 @@ flowchart TD
 | 单 `poolLock` 串行化磁盘 IO | miss/evict/flush 的盘 IO 在 `poolLock` 内串行（documented `LruBufferPool.java:24-25`） | 引入 per-frame loading 状态把 IO 移出池锁 |
 | MTR rollback 不撤销 buffer 内容 | `rollbackUncommitted` 只 `releaseAll`，脏页保持脏（documented `:18-19`） | 依赖 redo/recovery 切片做内容撤销 |
 | 无跨页 latch 顺序强制 | `MiniTransaction` 禁止同页 S->X 升级但无一般升序 pageId latch 排序 | 在 `MtrMemo`/`MiniTransaction` 添加一般 latch 排序策略 |
-| `LruBufferPool.writeBack` 无 WAL gate | 淘汰写回直接调 `pageStore.writePage` 不检查 redo 持久性 | WAL gate 应在淘汰路径也生效，或淘汰只刷干净页 |
+| 脏页淘汰 WAL gate 已闭合（生产侧）| 注入 `DirtyVictimFlusher` 后脏 victim 经 WAL gate+checksum+doublewrite 刷盘，绝不在 `poolLock` 内直写；legacy `flushAll`/无 flusher 独立测试池仍直接 `writeBack`（test/close-only，不承诺 WAL 安全）| recoverable doublewrite（0.2）+ 后台 redo flusher（0.1）已接，淘汰现获真 torn-page 防护；剩余统一/移除 legacy `flushAll` 直写路径 |
 | 页替换策略仅 plain LRU | 单 `LinkedHashSet`，无 LRU-K / young-old / ARC | 按需添加替换策略 |
 
 ### Record 缺口
@@ -621,7 +622,7 @@ flowchart TD
 | Gap | Current consequence | Preferred resolution |
 | --- | --- | --- |
 | 仅 2 种 redo 记录类型 | 只有 `PAGE_INIT`/`PAGE_BYTES`，无 MLOG 逻辑 redo | 按需添加逻辑 redo 类型 |
-| `append` 被 `flush` 的 fsync 串行 | 同一 `lock` 下 append 和 fsync 互斥（documented `:18-20`） | 拆分 LSN 分配锁与 write/flush 锁 + 后台 writer/flusher |
+| `append` 被 `flush` 的 fsync 串行 | 同一 `lock` 下 append 和 fsync 互斥（documented `:18-20`）；后台 flusher（`RedoFlushWorker`）已接但仍走该单 `lock`，故不恶化也不解此串行 | 拆分 LSN 分配锁与 write/flush 锁（recent_written/recent_closed tracker）使 append 不被 fsync 阻塞 |
 | 无 redo 文件轮转/回收 | 单 append-only 文件无上限 | 添加 rotation/recycling/capacity reclaim |
 | `RedoApplyDispatcher` 单 handler | 只注册 `PageRedoApplyHandler` | 按需添加多 handler dispatch table |
 
@@ -641,7 +642,7 @@ flowchart TD
 | --- | --- | --- |
 | MVCC ReadView + 一致性读已接（T1.4 + T1.3f delete 可见性） | `ReadView`（五规则可见性）+ `ReadViewManager`（RR/RC）+ `openReadViewSnapshot`（锁内原子建快照）+ `MvccReader`（沿版本链构造旧版本，独立 MTR、不同持 index+undo latch）；T1.3f 加 delete-mark 可见性（`lookupIncludingDeleted` + 可见删除→消失/不可见→删除前版本）、**版本链所有权校验**（undo.transactionId==当前版本 trxId）、**MTR 异常清理**（修 T1.4 泄漏） | locking/current read、RU/SERIALIZABLE、二级索引 MVCC 留后续片 |
 | 无 LockManager | 无 `LockManager`/record-lock 类；SERIALIZABLE 不支持 | 在锁切片实现 LockManager |
-| rollback 消费 undo 已接（T1.3d/e/f） | `RollbackService.rollback` 反向走链，每条独立 MTR：INSERT_ROW→`deleteClustered`、UPDATE_ROW→`replaceClustered` 恢复旧 image、DELETE_MARK→`setClusteredDeleteMark(false)` 取消标记还原存活（均所有权校验 dbTrxId+dbRollPtr 幂等）；走到 prev=NULL 后按 hasUpdateUndo 决定释放 slot + finishRollback | 恢复期 rollback 留后续片 |
+| rollback 消费 undo 已接（T1.3d/e/f） | `RollbackService.rollback` 反向走链，每条独立 MTR：INSERT_ROW→`deleteClustered`、UPDATE_ROW→`replaceClustered` 恢复旧 image、DELETE_MARK→`setClusteredDeleteMark(false)` 取消标记还原存活（均所有权校验 dbTrxId+dbRollPtr 幂等）；走到 prev=NULL 后按 hasUpdateUndo 决定释放 slot + finishRollback | **恢复期 rollback 已接（R 1.2）**：`RollbackService.rollbackRecovered(firstPage, 配置索引)` 无 live Transaction，`forEachRecordWithPointer` 正向收集→反向逐条 MTR 应用；engine 恢复扫 rseg 读 undo state，ACTIVE 段回滚（单显式索引，多索引/DD/prepared 留后续）|
 | 失败插入 orphan undo 由幂等 rollback 兑现（T1.3d） | MTR 仍无 content undo，但 `deleteClustered` 未命中/所有权不匹配即 no-op，故 `RollbackService` full rollback 幂等清理 orphan undo（已写 undo 无对应行）；slot 仍释放 | 生产 DML facade 失败边界 + statement/savepoint rollback 留 T1.3e+ |
 | 无生产 DML facade | `assignWriteId → beforeInsert → insertClustered`、commit 编排（`onCommit`+`commit`）、`RollbackService.rollback` 均仅由测试驱动，无 session/executor 生产入口 | 在 SQL executor/DML facade 切片接线 |
 | 无 `PREPARED`/`RECOVERED_ACTIVE` 状态 | XA/recovery 事务状态不支持 | 在 trx-recovery 切片添加 |
@@ -650,26 +651,26 @@ flowchart TD
 
 | Gap | Current consequence | Preferred resolution |
 | --- | --- | --- |
-| 无 UNDO_ROLLBACK / PURGE_RESUME / DDL_RECOVERY 阶段 | 已有 `UNDO_TABLESPACE_RESUME`（只续作物理 truncate）；未回滚未提交事务、未恢复 purge history | 添加事务 undo rollback、purge resume、DDL recovery 阶段 |
+| formal PURGE_RESUME / DDL_RECOVERY 阶段缺（engine 后恢复步已接 R 1.2/R 1.3） | 已有 `UNDO_TABLESPACE_RESUME`（续作物理 truncate）；engine 恢复扫 rseg（0.3）→读 undo 段 state：ACTIVE 经 `RollbackService.rollbackRecovered`（显式单聚簇索引，无 DD）回滚；COMMITTED 读取 `COMMIT_NO`/`TRANSACTION_ID` 重建 committed history，`TransactionSystem.restoreCounters` 复位 id/no，高水位覆盖 history 后由后台 purge driver 续作 | 添加正式 `RecoveryStageName.UNDO_ROLLBACK`/`RESUME_PURGE`、DDL recovery、多索引/DD/prepared txn；现有 engine 后恢复步保留为简化实现 |
 | `RecoveryMode` 仅 `NORMAL` 实现 | `READ_ONLY_VALIDATE` / `FORCE_SKIP_CORRUPT_TABLESPACE` 是扩展点 | 按需实现 |
-| doublewrite/tablespace 无 discovery | 普通 repair 仍用 `pagesToRepair`；undo truncate recovery 使用显式配置 SpaceId 集合并要求全部已打开 | 后续实现 discovery/loadAll 与全页 checksum 扫描 |
+| doublewrite/tablespace 无 discovery | Engine E2 只打开系统 UNDO + `EngineConfig.recoveryTablespaces`；doublewrite repair 已由 engine 配 scanner + `dwRepo.pageIds()`（过滤到恢复已打开空间，0.2），但页列表来自 doublewrite 文件枚举而非全空间 checksum discovery；undo truncate recovery 使用显式配置 SpaceId 集合并要求全部已打开 | 后续实现 discovery/loadAll 与全页 checksum 扫描，替代显式空间集 |
 
 ### Undo 缺口
 
 | Gap | Current consequence | Preferred resolution |
 | --- | --- | --- |
 | rollback 消费者已接（T1.3d） | `RollbackService`（trx→btree 新边）读 undo 链经 `deleteClustered` 删已插入行；`TransactionManager.rollback` 拆为 `beginRollback`/`finishRollback` 两阶段，撤销夹在 ROLLING_BACK 内 | 见上「rollback 消费 undo 已接」 |
-| slot 回收已接 purge；持久 rseg/recovery 仍缺 | T-purge 起 committed undo 段由 `PurgeCoordinator` 经 boundary 判死并 `dropUndoSegment` 回收页 + release slot（insert undo commit 即回收）；history/slot 仍为内存，无持久 rseg header / active slot 扫描 / 恢复期 history 重建 | 持久 rseg header + 恢复期 history 重建 + purge→undo tablespace truncate 调度留后续片 |
+| slot 目录 0.3 已持久 + R 1.3 history 恢复已接；部分 release 路径仍缺 | **slot claim/onCommit-release 已持久到 undo page3 + 恢复扫描重建内存目录（0.3，engine 路径）**；COMMITTED 段由恢复期读取 `COMMIT_NO` 重建 history 后交给 `PurgeCoordinator` boundary 判死并 `dropUndoSegment` 回收；`RollbackService`/`PurgeCoordinator` 释放仍未持久、truncate rebuild 未重格式化 page3（test-wired 路径，未 engine 触达） | 全 release 路径持久 + truncate rebuild page3 format + formal recovery stages + 多 rseg/history 链表 |
 | 无 btree merge / 空页回收 / node-pointer 删除维护 | `deleteClustered` 删后空 leaf 留页、root node pointer lowKey 仅作保守下界（不更新）；height-1 无 merge/redistribute | merge/空页回收/多层树留 B+Tree 后续片 |
 | 无多索引 rollback 解析 | `RollbackService` 单聚簇索引假设（用传入 index 的 schema 解码所有 undo）；无 data dictionary 按 indexId 解析 | 多索引/二级索引删除随 data dictionary 片接入 |
-| 单线程聚簇 purge 已实现（T-purge，test-wired） | `HistoryList`（提交序 FIFO，update/delete）+ insert-reclaim 队列 + `PurgeCoordinator.runBatch`：按 `purgeLowWaterNo`（最老 live ReadView lowLimitNo）回收 delete-marked 聚簇记录（严格 `purgeDeleteMarkedClustered`）+ `dropUndoSegment` 回收段；`onCommit` 入 history | 多 worker / 二级索引 purge / 持久 history / recovery resume / `UndoLogKind.UPDATE` 独立 log 留后续片 |
-| truncate 机制已实现但无 purge 调度 | `UndoTablespaceTruncationService` 可恢复收缩并由 recovery 续作；生产 DML/purge 无调用方，活动 inode 会拒绝 | purge 先判定 undo 死亡并 dropSegment，再选择/调用 truncate；接 engine bootstrap |
+| 单线程聚簇 purge + **后台 driver + recovery resume 已接（0.4/R 1.3）** | `HistoryList` + `PurgeCoordinator.runBatch`（按 `purgeLowWaterNo` 回收 delete-marked 记录 + `dropUndoSegment`）；`StorageEngine` 配 `clusteredIndex` 时启动 `PurgeDriverWorker` 后台周期驱动；`onCommit` 入 history；重启时 COMMITTED undo 段重建 history 后继续 purge（无 DD，单显式索引） | 多 worker / 二级索引 purge / `UndoLogKind.UPDATE` 独立 log / 持久 history 链表留后续片 |
+| truncate 机制已实现但无 purge→truncate 调度 | `UndoTablespaceTruncationService` 可恢复收缩并由 recovery 续作；后台 purge driver 已接（0.4）但**未驱动 undo tablespace truncate**（purge 只 dropUndoSegment 回收段页，不判 tablespace 死亡触发物理收缩）；活动 inode 会拒绝 | purge→undo tablespace truncate 调度（判 undo 死亡 → truncate）留后续片 |
 | 版本链已被 MVCC 读消费（T1.3e/f 建 + T1.4/f 读） | UPDATE/DELETE undo 存全量旧 image 建记录版本链；`MvccReader` 跨事务直读 undo、沿 `oldHidden.dbRollPtr` 遍历构造旧版本，遍历接受 UPDATE_ROW+DELETE_MARK + **每跳所有权校验 `undo.transactionId()==当前版本 DB_TRX_ID`**（T1.3f 加固）；delete-mark 可见性：可见删除→行消失、不可见→见删除前版本 | 二级索引回表 MVCC；purge 物理移除 delete-marked |
 | 单混合 undo 段（T1.3e 简化） | insert+update 同段；段头 `UndoLogKind` 非权威（记录 type 字节权威）；含 update 的已提交事务 slot/段不再泄漏——T-purge 经 history list + `PurgeCoordinator` 在 boundary 后 `dropUndoSegment`+release slot 回收 | 独立 insert/update undo log 留后续片（当前单混合段已可被 purge 回收） |
 | 无 extern undo payload（T1.3e） | UPDATE 全量旧 image 超单页即抛 `UndoPageOverflowException`（不支持 extern 页）；无改聚簇 PK（`replaceClustered` REQUIRES_REINSERT→抛） | extern undo payload + 改 PK update 留后续片 |
 | 单 writer 假设 | `UndoLogSegment` 假设单 EXCLUSIVE append 会话；T1.3c 同事务串行 beforeInsert 满足该假设 | 实现并发 multi-writer 锁序 / rseg slot 选择 |
 | 单 undo 表空间假设 | `RollPointer` 只编 pageNo+offset；T1.3c 固定单一默认 rseg，rseg/slot 存 `UndoContext` + 内存目录不进指针 | 扩展多 rseg/多 undo 表空间编码 |
-| recovery 仅有 undo tablespace truncate 续作 | `UndoTablespaceRecoveryParticipant` 在 redo 后续作 TRUNCATING；尚无未提交事务 undo rollback / purge resume | 后续接持久 rseg 扫描、事务 rollback、purge resume |
+| recovery 仍缺 DD discovery / formal stages | `UndoTablespaceRecoveryParticipant` 在 redo 后续作 TRUNCATING；engine 后恢复步已扫 rseg 做 ACTIVE rollback + COMMITTED history rebuild/purge resume，但依赖显式配置表空间和单聚簇索引，且不进入正式 `RecoveryStageName` | 接 DD/tablespace discovery、多索引 recovery、prepared txn、正式 UNDO_ROLLBACK/PURGE_RESUME/DDL_RECOVERY stages |
 
 ## 10-Pass Review Checklist
 
@@ -705,7 +706,7 @@ flowchart TD
 | 9 | 跨模块调用链一致 | PASS | MTR commit（`:154`）、WAL gate（`FlushCoordinator:91-92`）、page access 链在 buf/mtr/redo/flush/disk 小节描述吻合 |
 | 10 | 只描述当前实现，不改写目标设计 | PASS | "目标架构" 仅在 header 引用全局设计文档时出现，map 本身无目标设计声明 |
 | 11 | 生产代码无 `synchronized`/`wait`/`notify` | PASS | `src/main/java` 全量 grep 0 匹配 |
-| 12 | test-only 构造声明验证 | PASS | test-only 表已排除 E1 接线的 `FlushService`/`IndexPageAccess`/redo IO；仍保留 `CrashRecoveryService`/`PageCleanerWorker`/`PurgeCoordinator` 等未进生产组合根类型 |
+| 12 | test-only 构造声明验证 | PASS | 2026-06-18 当时 test-only 表已排除 E1 接线的 `FlushService`/`IndexPageAccess`/redo IO；E3a 后 `PageCleanerWorker` 已生产接线，当前状态见 Flush Package Status |
 | 13 | 异常层次验证 | PASS | 30 个异常类：27 extends `DatabaseRuntimeException`（含 2 个 base 类），3 extends `DatabaseFatalException`（`RedoLogCorruptedException`/`DataFileCorruptedException`/`RecoveryStartupException`） |
 | 14 | domain VO 消费范围验证 | PASS | `UndoNo` 仅被 `storage.undo` 4 文件 import；`TransactionNo` 仅被 `storage.trx` 2 文件 import；与 map 描述一致 |
 | 15 | 最终通读 | PASS | 10 模块小节结构一致（Current Flow + Data Chains + Package Status）；全局 Reserved/Unwired 按模块分组；Known Gaps 按模块分组；无遗漏模块 |

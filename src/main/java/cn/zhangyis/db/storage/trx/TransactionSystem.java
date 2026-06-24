@@ -64,6 +64,33 @@ public final class TransactionSystem {
         }
     }
 
+    /**
+     * 恢复期复位 id/no 计数器（R 1.3，单调只前进）。崩溃后由 restored undo 段算出的高水位驱动：
+     * {@code nextTransactionId = max(creator TRANSACTION_ID)+1}、{@code nextTransactionNo = max(COMMIT_NO)+1}。
+     * 使恢复后新事务 id/no 不与 pre-crash 已提交事务重复，且 {@link #purgeLowWaterNo}（= nextTransactionNo）覆盖
+     * 重建的 committed history（其 TransactionNo 必 &lt; 复位值）→ 后台 purge 可续作。锁内只写内存，不访问 IO。
+     *
+     * @param nextTransactionId 复位后下一个待分配写 id（&gt;=1）。
+     * @param nextTransactionNo 复位后下一个待分配提交序号（&gt;=1）。
+     */
+    public void restoreCounters(long nextTransactionId, long nextTransactionNo) {
+        if (nextTransactionId < 1 || nextTransactionNo < 1) {
+            throw new TransactionStateException("restore counters must be >= 1: id=" + nextTransactionId
+                    + " no=" + nextTransactionNo);
+        }
+        lock.lock();
+        try {
+            if (nextTransactionId > this.nextTransactionId) {
+                this.nextTransactionId = nextTransactionId;
+            }
+            if (nextTransactionNo > this.nextTransactionNo) {
+                this.nextTransactionNo = nextTransactionNo;
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
     /** 活跃读写事务 id 的不可变快照（拷贝后立即释放锁）。 */
     public Set<Long> snapshotActiveReadWriteIds() {
         lock.lock();

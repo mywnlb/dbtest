@@ -61,10 +61,11 @@ public final class UndoPage {
         setU32(UndoPageLayout.LAST_PAGE_NO, self);
         guard.writeLong(UndoPageLayout.LOG_RECORD_COUNT, 0L);
         guard.writeLong(UndoPageLayout.LOG_LAST_UNDO_NO, 0L);
+        guard.writeLong(UndoPageLayout.COMMIT_NO, 0L); // ACTIVE：尚未提交，commit 时写入提交序号
     }
 
     /**
-     * 格式化 undo chain 页。chain 页仍预留 log header 宽度并清零 {@code [63,97)}，这样 record area 起点
+     * 格式化 undo chain 页。chain 页仍预留 log header 宽度并清零 {@code [63,105)}，这样 record area 起点
      * 与 first 页完全一致；first-only 访问器会通过 {@link #isFirstPage()} 拒绝解析这些清零字节。
      *
      * @param handle segment 定位；页必须与 handle 所属表空间一致。
@@ -257,10 +258,28 @@ public final class UndoPage {
         return all[idx];
     }
 
-    /** first 页 log header 中的状态占位值。 */
+    /** first 页 log header 中的 undo log 状态（ACTIVE/COMMITTED）。 */
     int state() {
         requireFirstPage();
         return getU8(UndoPageLayout.STATE);
+    }
+
+    /** 写 first 页 log header 状态（X，R 1.2）。commit 时标 COMMITTED，使恢复期能据此跳过已提交事务回滚。 */
+    void setLogState(int state) {
+        requireFirstPage();
+        setU8(UndoPageLayout.STATE, state);
+    }
+
+    /** first 页 log header 中的提交序号 TransactionNo（R 1.3）；0 表尚未提交。 */
+    long commitNo() {
+        requireFirstPage();
+        return guard.readLong(UndoPageLayout.COMMIT_NO);
+    }
+
+    /** 写 first 页 log header 提交序号（X，R 1.3）。commit 时与 STATE=COMMITTED 同 MTR 写，恢复重建 history 用。 */
+    void setCommitNo(long commitNo) {
+        requireFirstPage();
+        guard.writeLong(UndoPageLayout.COMMIT_NO, commitNo);
     }
 
     /** first 页 log header 中的链首页号。 */

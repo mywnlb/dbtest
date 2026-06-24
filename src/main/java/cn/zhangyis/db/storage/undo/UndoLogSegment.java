@@ -6,6 +6,7 @@ import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.RollPointer;
 import cn.zhangyis.db.domain.TransactionId;
+import cn.zhangyis.db.domain.TransactionNo;
 import cn.zhangyis.db.domain.UndoNo;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
@@ -156,6 +157,47 @@ public final class UndoLogSegment {
         heldPages.put(newId.pageNo().value(), newPage);
         current = newPage;
         return current.appendRecord(payload, undoNo);
+    }
+
+    /**
+     * 标记本 undo segment 已提交（R 1.2/R 1.3）：写 first 页 log header {@code STATE=COMMITTED} 与
+     * {@code COMMIT_NO}（要求 EXCLUSIVE 会话，redo 保护）。恢复期据此把 ACTIVE 段判为未提交事务回滚，把
+     * COMMITTED 段按提交序重建 history 后交给 purge 续作。
+     */
+    public void markCommitted(TransactionNo commitNo) {
+        if (mode != PageLatchMode.EXCLUSIVE) {
+            throw new DatabaseValidationException("markCommitted requires an EXCLUSIVE undo log segment session");
+        }
+        if (commitNo == null) {
+            throw new DatabaseValidationException("markCommitted commitNo must not be null");
+        }
+        firstPage.setLogState(UndoPageLayout.STATE_COMMITTED);
+        firstPage.setCommitNo(commitNo.value()); // R 1.3：与 STATE 同 MTR 写提交序号，供恢复重建 history
+    }
+
+    /** first 页 log header 中的 undo log 状态原始值（{@code STATE_ACTIVE}/{@code STATE_COMMITTED}）。 */
+    public int state() {
+        return firstPage.state();
+    }
+
+    /** 是否 ACTIVE（未提交）；恢复期 ACTIVE 段需回滚。 */
+    public boolean isActive() {
+        return firstPage.state() == UndoPageLayout.STATE_ACTIVE;
+    }
+
+    /** 是否 COMMITTED；恢复期 COMMITTED 段不回滚，而是重建 history 交给 purge 后台续作。 */
+    public boolean isCommitted() {
+        return firstPage.state() == UndoPageLayout.STATE_COMMITTED;
+    }
+
+    /** 提交序号（R 1.3）；仅 COMMITTED 段有意义，恢复重建 history 用。 */
+    public TransactionNo committedTransactionNo() {
+        return TransactionNo.of(firstPage.commitNo());
+    }
+
+    /** 本 undo log 所属事务写 id（creator）；恢复重建 history / 计数器复位用。 */
+    public TransactionId creatorTransactionId() {
+        return firstPage.transactionId();
     }
 
     /**

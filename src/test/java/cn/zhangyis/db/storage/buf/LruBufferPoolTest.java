@@ -1,5 +1,6 @@
 package cn.zhangyis.db.storage.buf;
 
+import cn.zhangyis.db.common.exception.DatabaseRuntimeException;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageNo;
@@ -10,7 +11,10 @@ import cn.zhangyis.db.storage.fil.io.PageStore;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.api.Test;
 
+import java.nio.ByteBuffer;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -75,6 +79,95 @@ class LruBufferPoolTest {
                 assertEquals(0xAA, g.readInt(0));
             }
             pool.close();
+        }
+    }
+
+    @Test
+    void attachVictimFlusherRejectsNullAndRepeat() {
+        try (PageStore store = openStore(8)) {
+            LruBufferPool pool = new LruBufferPool(store, PS, 2);
+            assertThrows(DatabaseValidationException.class, () -> pool.attachVictimFlusher(null));
+            DirtyVictimFlusher flusher = pageId -> true;
+            pool.attachVictimFlusher(flusher);
+            // set-once：重复注入必须拒绝，避免运行期换刷盘实现造成不一致。
+            assertThrows(DatabaseValidationException.class, () -> pool.attachVictimFlusher(flusher));
+        }
+    }
+
+    /** 注入 flusher 后，淘汰脏 victim 必须经端口刷干净再复用帧，不在锁内直接 writeBack。 */
+    @Test
+    void dirtyVictimEvictedThroughAttachedFlusher() {
+        try (PageStore store = openStore(8)) {
+            LruBufferPool pool = new LruBufferPool(store, PS, 1);
+            FakeVictimFlusher flusher = new FakeVictimFlusher(pool);
+            pool.attachVictimFlusher(flusher);
+            try (PageGuard g = pool.getPage(page(0), PageLatchMode.EXCLUSIVE)) {
+                g.writeInt(0, 0xAA);
+            }
+            try (PageGuard g = pool.getPage(page(1), PageLatchMode.EXCLUSIVE)) {
+                g.writeInt(0, 0xBB);
+            }
+            assertEquals(List.of(page(0)), flusher.calls);
+            assertEquals(1, pool.residentCount());
+        }
+    }
+
+    /**
+     * 核心正确性：flusher 返回 false（模拟 redo 未 durable）时脏 victim 不得被写盘，且本轮只尝试一次
+     * （skip set 防空转），无干净帧可用即抛耗尽——WAL 不被破坏。
+     */
+    @Test
+    void dirtyVictimNotWrittenAndExhaustsWhenFlusherReturnsFalse() {
+        try (PageStore store = openStore(8)) {
+            LruBufferPool pool = new LruBufferPool(store, PS, 1);
+            FakeVictimFlusher flusher = new FakeVictimFlusher(pool);
+            flusher.succeed = false;
+            pool.attachVictimFlusher(flusher);
+            try (PageGuard g = pool.getPage(page(0), PageLatchMode.EXCLUSIVE)) {
+                g.writeInt(0, 0xAA);
+            }
+            assertThrows(BufferPoolExhaustedException.class,
+                    () -> pool.getPage(page(1), PageLatchMode.EXCLUSIVE));
+            assertEquals(List.of(page(0)), flusher.calls);
+            byte[] disk = new byte[PS.bytes()];
+            store.readPage(page(0), ByteBuffer.wrap(disk));
+            assertEquals(0, ByteBuffer.wrap(disk).getInt(0), "dirty page must not reach disk via eviction");
+        }
+    }
+
+    /** flusher 抛真 IO 失败必须向上传播，不能被吞成 BufferPoolExhaustedException 掩盖盘故障。 */
+    @Test
+    void flusherFailurePropagatesAndIsNotSwallowedAsExhaustion() {
+        try (PageStore store = openStore(8)) {
+            LruBufferPool pool = new LruBufferPool(store, PS, 1);
+            FakeVictimFlusher flusher = new FakeVictimFlusher(pool);
+            flusher.fail = true;
+            pool.attachVictimFlusher(flusher);
+            try (PageGuard g = pool.getPage(page(0), PageLatchMode.EXCLUSIVE)) {
+                g.writeInt(0, 0xAA);
+            }
+            DatabaseRuntimeException ex = assertThrows(DatabaseRuntimeException.class,
+                    () -> pool.getPage(page(1), PageLatchMode.EXCLUSIVE));
+            assertFalse(ex instanceof BufferPoolExhaustedException);
+            assertTrue(ex.getMessage().contains("induced"));
+        }
+    }
+
+    /** 干净 victim 直接复用，不应调用 flusher（只对脏帧走刷盘管线）。 */
+    @Test
+    void cleanVictimEvictedWithoutCallingFlusher() {
+        try (PageStore store = openStore(8)) {
+            LruBufferPool pool = new LruBufferPool(store, PS, 1);
+            FakeVictimFlusher flusher = new FakeVictimFlusher(pool);
+            pool.attachVictimFlusher(flusher);
+            try (PageGuard g = pool.getPage(page(0), PageLatchMode.SHARED)) {
+                g.readInt(0);
+            }
+            try (PageGuard g = pool.getPage(page(1), PageLatchMode.EXCLUSIVE)) {
+                g.writeInt(0, 0xBB);
+            }
+            assertTrue(flusher.calls.isEmpty());
+            assertEquals(1, pool.residentCount());
         }
     }
 
@@ -214,6 +307,33 @@ class LruBufferPoolTest {
         try (PageStore store = openStore(2)) {
             assertThrows(DatabaseValidationException.class, () -> new LruBufferPool(store, PS, 0));
             assertThrows(DatabaseValidationException.class, () -> new LruBufferPool(null, PS, 1));
+        }
+    }
+
+    /**
+     * 测试用淘汰刷盘端口：用 Buffer Pool 真实 snapshot/completeFlush 模拟"刷干净"的副作用（不写盘、不走 WAL），
+     * 以便聚焦验证淘汰逻辑（路由、复用、skip set、失败传播），不引入完整 flush 管线 infra。
+     */
+    private static final class FakeVictimFlusher implements DirtyVictimFlusher {
+        private final BufferPool pool;
+        private final List<PageId> calls = new ArrayList<>();
+        private boolean succeed = true;
+        private boolean fail = false;
+
+        FakeVictimFlusher(BufferPool pool) {
+            this.pool = pool;
+        }
+
+        @Override
+        public boolean flushVictim(PageId pageId) {
+            calls.add(pageId);
+            if (fail) {
+                throw new DatabaseRuntimeException("induced flush failure for " + pageId);
+            }
+            if (!succeed) {
+                return false;
+            }
+            return pool.snapshotForFlush(pageId).map(pool::completeFlush).orElse(false);
         }
     }
 }

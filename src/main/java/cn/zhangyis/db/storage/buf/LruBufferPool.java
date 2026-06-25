@@ -54,7 +54,9 @@ public final class LruBufferPool implements BufferPool, FrameReleaser {
     private final Deque<BufferFrame> freeList = new ArrayDeque<>();
 
     public LruBufferPool(PageStore pageStore, PageSize pageSize, int capacity) {
-        this(pageStore, pageSize, capacity, new LruReplacementPolicy());
+        // 默认采用 midpoint LRU（Phase A）：读入进 old 子链、提升窗 + youngDistanceThreshold 抗扫描污染。
+        // 生产时钟用墙钟驱动 oldBlocksTime；测试可经 4 参构造注入可控时钟的策略。
+        this(pageStore, pageSize, capacity, new MidpointLruReplacementPolicy(System::currentTimeMillis));
     }
 
     LruBufferPool(PageStore pageStore, PageSize pageSize, int capacity, ReplacementPolicy policy) {

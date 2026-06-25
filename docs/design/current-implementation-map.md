@@ -90,7 +90,7 @@ flowchart TD
   Mtr --> Pool["LruBufferPool"]
   Pool --> Store["PageStore readPage/writePage on miss/evict"]
   Pool --> Frame["BufferFrame (ReentrantReadWriteLock pageLatch)"]
-  Pool --> Policy["LruReplacementPolicy"]
+  Pool --> Policy["MidpointLruReplacementPolicy (old/new sublists)"]
   Mtr --> Collector["MtrRedoCollector implements PageWriteListener"]
   Collector --> RedoRecords["PageBytesRecord / PageInitRecord"]
   Mgr["MiniTransactionManager"] --> Mtr
@@ -120,7 +120,7 @@ flowchart TD
 | Package area | Representative classes | Current state | Notes |
 | --- | --- | --- | --- |
 | `storage.buf` pool core | `BufferPool`, `LruBufferPool`, `BufferFrame`, `PageGuard`, `PageLatchMode`, `DirtyVictimFlusher` | Implemented (production-wired) | sole impl；per-space invalidate + frame release Condition；新增 `DirtyVictimFlusher` 淘汰端口（set-once 注入，`StorageEngine` 生产注入）使脏页淘汰经 WAL 管线；单 poolLock 仍串行 metadata/disk IO |
-| `storage.buf` replacement | `ReplacementPolicy`, `LruReplacementPolicy` | Implemented | Plain LRU via `LinkedHashSet`; only impl; injection ctor `LruBufferPool(...,ReplacementPolicy)` only used by tests |
+| `storage.buf` replacement | `ReplacementPolicy`, `MidpointLruReplacementPolicy` | Implemented (production-wired) | Midpoint LRU(old/new 子链)：读入进 old 头、`oldBlocksTime`(注入毫秒时钟) 提升窗 + `youngDistanceThreshold`(young 子链 1/4) 抗抖动 → 抗扫描污染（Phase A 0.8）；sole impl，injection ctor `LruBufferPool(...,ReplacementPolicy)` 供测试注入可控时钟；read-ahead-aware 分类、`oldBlocksPct` 配比再平衡待 0.10 |
 | `storage.buf` flush support | `DirtyPageCandidate`, `FlushPageSnapshot`, `BufferPoolExhaustedException` | Implemented | Value objects consumed by flush module; `LruBufferPool.failFlush` is a documented no-op (`:278-289`) |
 | `storage.buf` write listener | `PageWriteListener` | Implemented | DI seam; only production impl is `MtrRedoCollector`; `NO_OP` path has no production caller |
 | `storage.mtr` transaction | `MiniTransaction`, `MiniTransactionManager`, `MiniTransactionState`, `MtrSavepoint` | Implemented (test-wired) | Manager 可注入共享 controller + durable redo；commit 返回 marker end LSN；默认构造仍内存 redo |
@@ -592,7 +592,7 @@ flowchart TD
 | MTR rollback 不撤销 buffer 内容 | `rollbackUncommitted` 只 `releaseAll`，脏页保持脏（documented `:18-19`） | 依赖 redo/recovery 切片做内容撤销 |
 | 无跨页 latch 顺序强制 | `MiniTransaction` 禁止同页 S->X 升级但无一般升序 pageId latch 排序 | 在 `MtrMemo`/`MiniTransaction` 添加一般 latch 排序策略 |
 | 脏页淘汰 WAL gate 已闭合（生产侧）| 注入 `DirtyVictimFlusher` 后脏 victim 经 WAL gate+checksum+doublewrite 刷盘，绝不在 `poolLock` 内直写；legacy `flushAll`/无 flusher 独立测试池仍直接 `writeBack`（test/close-only，不承诺 WAL 安全）| recoverable doublewrite（0.2）+ 后台 redo flusher（0.1）已接，淘汰现获真 torn-page 防护；剩余统一/移除 legacy `flushAll` 直写路径 |
-| 页替换策略仅 plain LRU | 单 `LinkedHashSet`，无 LRU-K / young-old / ARC | 按需添加替换策略 |
+| 替换策略 = midpoint LRU（Phase A 0.8 已落） | `MidpointLruReplacementPolicy`：old/new 双子链 + `oldBlocksTime` 提升窗 + `youngDistanceThreshold` 抗抖动，已抗一次性大扫描污染（`largeScanDoesNotEvictHotWorkingSet` 验证）；仍缺 read-ahead-aware 访问型分类、`oldBlocksPct` 容量配比再平衡 | 随 0.10 read-ahead 补访问型分类与配比再平衡 |
 
 ### Record 缺口
 

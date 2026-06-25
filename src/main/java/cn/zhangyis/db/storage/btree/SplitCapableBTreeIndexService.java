@@ -160,20 +160,8 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
             throw new DatabaseValidationException(
                     "deleteClustered requires a clustered index: " + index.indexId());
         }
-        IndexPageHandle rootHandle = openRoot(mtr, index, PageLatchMode.EXCLUSIVE);
-        RecordPage root = rootHandle.recordPage();
-        if (index.rootLevel() == 0) {
-            return deleteInLeaf(root, index.rootPageId(), index, key, expectedTrxId, expectedRollPtr);
-        }
-        if (index.rootLevel() == 1) {
-            PageId leafId = chooseChild(root, index, key);
-            IndexPageHandle leafHandle = pageAccess.openIndexPageHandle(mtr, leafId, PageLatchMode.EXCLUSIVE);
-            RecordPage leaf = leafHandle.recordPage();
-            validateLeafPage(leaf, index, leafId);
-            return deleteInLeaf(leaf, leafId, index, key, expectedTrxId, expectedRollPtr);
-        }
-        throw new BTreeUnsupportedStructureException("split btree supports rootLevel 0 or 1 only: "
-                + index.rootLevel());
+        LeafLocation leaf = findLeaf(mtr, index, key, PageLatchMode.EXCLUSIVE);
+        return deleteInLeaf(leaf.page(), leaf.pageId(), index, key, expectedTrxId, expectedRollPtr);
     }
 
     /**
@@ -226,20 +214,8 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
             throw new DatabaseValidationException(
                     "purgeDeleteMarkedClustered requires a clustered index: " + index.indexId());
         }
-        IndexPageHandle rootHandle = openRoot(mtr, index, PageLatchMode.EXCLUSIVE);
-        RecordPage root = rootHandle.recordPage();
-        if (index.rootLevel() == 0) {
-            return purgeInLeaf(root, index.rootPageId(), index, key, expectedTrxId, expectedRollPtr);
-        }
-        if (index.rootLevel() == 1) {
-            PageId leafId = chooseChild(root, index, key);
-            IndexPageHandle leafHandle = pageAccess.openIndexPageHandle(mtr, leafId, PageLatchMode.EXCLUSIVE);
-            RecordPage leaf = leafHandle.recordPage();
-            validateLeafPage(leaf, index, leafId);
-            return purgeInLeaf(leaf, leafId, index, key, expectedTrxId, expectedRollPtr);
-        }
-        throw new BTreeUnsupportedStructureException("split btree supports rootLevel 0 or 1 only: "
-                + index.rootLevel());
+        LeafLocation leaf = findLeaf(mtr, index, key, PageLatchMode.EXCLUSIVE);
+        return purgeInLeaf(leaf.page(), leaf.pageId(), index, key, expectedTrxId, expectedRollPtr);
     }
 
     /**
@@ -296,20 +272,8 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         if (newRecord.hiddenColumns() == null) {
             throw new DatabaseValidationException("replaceClustered newRecord must carry hidden columns (clustered)");
         }
-        IndexPageHandle rootHandle = openRoot(mtr, index, PageLatchMode.EXCLUSIVE);
-        RecordPage root = rootHandle.recordPage();
-        if (index.rootLevel() == 0) {
-            return replaceInLeaf(root, index.rootPageId(), index, key, newRecord, expectedTrxId, expectedRollPtr);
-        }
-        if (index.rootLevel() == 1) {
-            PageId leafId = chooseChild(root, index, key);
-            IndexPageHandle leafHandle = pageAccess.openIndexPageHandle(mtr, leafId, PageLatchMode.EXCLUSIVE);
-            RecordPage leaf = leafHandle.recordPage();
-            validateLeafPage(leaf, index, leafId);
-            return replaceInLeaf(leaf, leafId, index, key, newRecord, expectedTrxId, expectedRollPtr);
-        }
-        throw new BTreeUnsupportedStructureException("split btree supports rootLevel 0 or 1 only: "
-                + index.rootLevel());
+        LeafLocation leaf = findLeaf(mtr, index, key, PageLatchMode.EXCLUSIVE);
+        return replaceInLeaf(leaf.page(), leaf.pageId(), index, key, newRecord, expectedTrxId, expectedRollPtr);
     }
 
     /**
@@ -362,20 +326,8 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         if (!index.clustered()) {
             throw new DatabaseValidationException("setClusteredDeleteMark requires a clustered index: " + index.indexId());
         }
-        IndexPageHandle rootHandle = openRoot(mtr, index, PageLatchMode.EXCLUSIVE);
-        RecordPage root = rootHandle.recordPage();
-        if (index.rootLevel() == 0) {
-            return markInLeaf(root, index.rootPageId(), index, key, deleted, newHidden, expectedTrxId, expectedRollPtr);
-        }
-        if (index.rootLevel() == 1) {
-            PageId leafId = chooseChild(root, index, key);
-            IndexPageHandle leafHandle = pageAccess.openIndexPageHandle(mtr, leafId, PageLatchMode.EXCLUSIVE);
-            RecordPage leaf = leafHandle.recordPage();
-            validateLeafPage(leaf, index, leafId);
-            return markInLeaf(leaf, leafId, index, key, deleted, newHidden, expectedTrxId, expectedRollPtr);
-        }
-        throw new BTreeUnsupportedStructureException("split btree supports rootLevel 0 or 1 only: "
-                + index.rootLevel());
+        LeafLocation leaf = findLeaf(mtr, index, key, PageLatchMode.EXCLUSIVE);
+        return markInLeaf(leaf.page(), leaf.pageId(), index, key, deleted, newHidden, expectedTrxId, expectedRollPtr);
     }
 
     /**
@@ -433,19 +385,8 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         if (key == null) {
             throw new DatabaseValidationException("btree lookup key must not be null");
         }
-        IndexPageHandle rootHandle = openRoot(mtr, index, PageLatchMode.SHARED);
-        RecordPage root = rootHandle.recordPage();
-        if (index.rootLevel() == 0) {
-            return lookupInLeaf(root, index.rootPageId(), index, key, includeDeleted);
-        }
-        if (index.rootLevel() == 1) {
-            PageId child = chooseChild(root, index, key);
-            RecordPage leaf = pageAccess.openIndexPage(mtr, child, PageLatchMode.SHARED);
-            validateLeafPage(leaf, index, child);
-            return lookupInLeaf(leaf, child, index, key, includeDeleted);
-        }
-        throw new BTreeUnsupportedStructureException("split btree supports rootLevel 0 or 1 only: "
-                + index.rootLevel());
+        LeafLocation leaf = findLeaf(mtr, index, key, PageLatchMode.SHARED);
+        return lookupInLeaf(leaf.page(), leaf.pageId(), index, key, includeDeleted);
     }
 
     /**
@@ -464,36 +405,27 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         if (range == null) {
             throw new DatabaseValidationException("btree scan range must not be null");
         }
-        IndexPageHandle rootHandle = openRoot(mtr, index, PageLatchMode.SHARED);
         if (range.limit() == 0) {
             return List.of();
         }
-        if (index.rootLevel() == 0) {
-            ScanAccumulator acc = new ScanAccumulator(range.limit());
-            scanLeafPage(rootHandle.recordPage(), index.rootPageId(), index, range, acc);
-            return acc.results();
-        }
-        if (index.rootLevel() == 1) {
-            PageId leafId = chooseChild(rootHandle.recordPage(), index, range.lowerKey());
-            ScanAccumulator acc = new ScanAccumulator(range.limit());
-            while (true) {
-                IndexPageHandle leafHandle = pageAccess.openIndexPageHandle(mtr, leafId, PageLatchMode.SHARED);
-                RecordPage leaf = leafHandle.recordPage();
-                validateLeafPage(leaf, index, leafId);
-                boolean stop = scanLeafPage(leaf, leafId, index, range, acc);
-                if (stop || acc.full()) {
-                    break;
-                }
-                long next = leafHandle.fileHeader().nextPageNo();
-                if (next == FilePageHeader.FIL_NULL) {
-                    break;
-                }
-                leafId = PageId.of(index.rootPageId().spaceId(), PageNo.of(next));
+        // 任意树高：先 findLeaf 定位 lowerKey 所在起始 leaf，再沿 FIL sibling next 链顺序扫（level 0 时起始 leaf 即 root，无 next）。
+        PageId leafId = findLeaf(mtr, index, range.lowerKey(), PageLatchMode.SHARED).pageId();
+        ScanAccumulator acc = new ScanAccumulator(range.limit());
+        while (true) {
+            IndexPageHandle leafHandle = pageAccess.openIndexPageHandle(mtr, leafId, PageLatchMode.SHARED);
+            RecordPage leaf = leafHandle.recordPage();
+            validateLeafPage(leaf, index, leafId);
+            boolean stop = scanLeafPage(leaf, leafId, index, range, acc);
+            if (stop || acc.full()) {
+                break;
             }
-            return acc.results();
+            long next = leafHandle.fileHeader().nextPageNo();
+            if (next == FilePageHeader.FIL_NULL) {
+                break;
+            }
+            leafId = PageId.of(index.rootPageId().spaceId(), PageNo.of(next));
         }
-        throw new BTreeUnsupportedStructureException("split btree supports rootLevel 0 or 1 only: "
-                + index.rootLevel());
+        return acc.results();
     }
 
     /**
@@ -609,10 +541,6 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         if (mtr == null || index == null || mode == null) {
             throw new DatabaseValidationException("btree mtr/index/mode must not be null");
         }
-        if (index.rootLevel() > 1) {
-            throw new BTreeUnsupportedStructureException("split btree supports rootLevel 0 or 1 only: "
-                    + index.rootLevel());
-        }
         IndexPageHandle root = pageAccess.openIndexPageHandle(mtr, index.rootPageId(), mode);
         IndexPageHeader header = root.recordPage().header();
         if (header.indexId() != index.indexId()) {
@@ -624,6 +552,36 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
                     + " snapshot=" + index.rootLevel());
         }
         return root;
+    }
+
+    /**
+     * 从 root 逐层下降到 leaf（level 0），支持任意树高（解锁 height>1）。非叶层用 {@link #chooseChild}（node-pointer
+     * schema 与层级无关）选子页并逐层校验 header.indexId；读用 SHARED、写用 EXCLUSIVE，全路径页 latch 由 MTR memo
+     * 持有至 commit（悲观全路径，latch coupling / 乐观→悲观下降留 0.13）。返回定位到的 leaf 句柄/页视图/页号。
+     */
+    private LeafLocation findLeaf(MiniTransaction mtr, BTreeIndex index, SearchKey key, PageLatchMode mode) {
+        if (key == null) {
+            throw new DatabaseValidationException("btree findLeaf key must not be null");
+        }
+        IndexPageHandle handle = openRoot(mtr, index, mode);
+        RecordPage page = handle.recordPage();
+        PageId pageId = index.rootPageId();
+        while (page.header().level() > 0) {
+            PageId childId = chooseChild(page, index, key);
+            handle = pageAccess.openIndexPageHandle(mtr, childId, mode);
+            page = handle.recordPage();
+            pageId = childId;
+            if (page.header().indexId() != index.indexId()) {
+                throw new BTreeStructureCorruptedException("child page index id mismatch at " + pageId
+                        + ": page=" + page.header().indexId() + " expected=" + index.indexId());
+            }
+        }
+        validateLeafPage(page, index, pageId);
+        return new LeafLocation(handle, page, pageId);
+    }
+
+    /** {@link #findLeaf} 定位结果：leaf 句柄（scan 取 sibling 链/header）、leaf 页视图、leaf 物理页号。 */
+    private record LeafLocation(IndexPageHandle handle, RecordPage page, PageId pageId) {
     }
 
     private void validateLeafPage(RecordPage page, BTreeIndex index, PageId pageId) {

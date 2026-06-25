@@ -176,33 +176,24 @@ class SplitCapableBTreeIndexServiceTest {
     }
 
     @Test
-    void parentOverflowFailsBeforeLeafRewrite() {
+    void parentOverflowGrowsTreeInsteadOfFailing() {
         onBTreePool((ctx) -> {
             ctx.createTablespaceAndRoot();
+            // 宽 node pointer 灌满 level-1 root 后，原先抛 BTreeParentSplitRequiredException；现在 parent/root split 接管，
+            // 树长高且全部记录可经多层 scan 取回（有序）。
             BTreeIndex current = new BTreeIndex(INDEX_ID, ctx.rootPageId, 0, payloadKey(), wideSchema(), true,
                     ctx.leafSegment, ctx.nonLeafSegment);
             BTreeIndexService service = ctx.service();
             List<Long> inserted = new ArrayList<>();
-            BTreeParentSplitRequiredException caught = null;
-
             for (long id = 1; id <= 12; id++) {
                 MiniTransaction m = ctx.mgr.begin();
-                try {
-                    BTreeInsertResult result = service.insert(m, current, payloadKeyRow(id));
-                    current = result.indexAfterInsert();
-                    ctx.mgr.commit(m);
-                    inserted.add(id);
-                } catch (BTreeParentSplitRequiredException e) {
-                    ctx.mgr.rollbackUncommitted(m);
-                    caught = e;
-                    break;
-                } catch (Throwable t) {
-                    ctx.mgr.rollbackUncommitted(m);
-                    throw t;
-                }
+                BTreeInsertResult result = service.insert(m, current, payloadKeyRow(id));
+                current = result.indexAfterInsert();
+                ctx.mgr.commit(m);
+                inserted.add(id);
             }
 
-            assertTrue(caught != null, "wide node pointers should fill the level-1 root in this test");
+            assertTrue(current.rootLevel() >= 2, "wide node pointers grow the tree past level 1 via parent split");
             MiniTransaction read = ctx.mgr.begin();
             List<Long> ids = service.scan(read, current,
                             new BTreeScanRange(kPayload(1), true, kPayload(99), true, 100))
@@ -241,6 +232,36 @@ class SplitCapableBTreeIndexServiceTest {
                     recoveredMtr.commit(read);
                     assertEquals(List.of(1L, 2L, 3L, 4L), ids);
                 }
+            }
+        });
+    }
+
+    @Test
+    void rootSplitGrowsTreeToLevelTwo() {
+        onBTreePool((ctx) -> {
+            ctx.createTablespaceAndRoot();
+            // payloadKey()：5000B key → node pointer ~5KB → level-1 root 仅容 ~3 指针，少量行即触发原地 root split。
+            BTreeIndex current = new BTreeIndex(INDEX_ID, ctx.rootPageId, 0, payloadKey(), wideSchema(), true,
+                    ctx.leafSegment, ctx.nonLeafSegment);
+            BTreeIndexService service = ctx.service();
+            long id = 1;
+            while (current.rootLevel() < 2 && id <= 40) {
+                MiniTransaction m = ctx.mgr.begin();
+                BTreeInsertResult result = service.insert(m, current, payloadKeyRow(id));
+                current = result.indexAfterInsert();
+                ctx.mgr.commit(m);
+                id++;
+            }
+
+            assertEquals(2, current.rootLevel(), "wide node pointers force an in-place root split to level 2");
+            assertEquals(ctx.rootPageId, current.rootPageId(), "root page id stays stable across split");
+
+            long inserted = id - 1;
+            for (long k = 1; k <= inserted; k++) {
+                MiniTransaction read = ctx.mgr.begin();
+                BTreeLookupResult found = service.lookup(read, current, kPayload(k)).orElseThrow();
+                assertEquals(k, idOf(found));
+                ctx.mgr.commit(read);
             }
         });
     }

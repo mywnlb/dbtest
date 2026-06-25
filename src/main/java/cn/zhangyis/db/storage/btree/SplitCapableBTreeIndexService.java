@@ -438,34 +438,19 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
             throw new DatabaseValidationException("btree insert record must not be null");
         }
         SearchKey key = keyOf(record, index);
-        IndexPageHandle rootHandle = openRoot(mtr, index, PageLatchMode.EXCLUSIVE);
-        RecordPage root = rootHandle.recordPage();
-        if (index.rootLevel() == 0) {
-            ensureUniqueAbsent(root, index.rootPageId(), index, key);
-            try {
-                RecordRef ref = inserter.insert(root, index.rootPageId(), record, index.keyDef(), index.schema());
-                return new BTreeInsertResult(index, ref);
-            } catch (RecordPageOverflowException overflow) {
-                requireLeafSegment(index);
-                return splitRootLeaf(mtr, index, rootHandle, record);
-            }
+        // 任意树高：X 下降记录 path（root→leaf），叶页放得下直接插，溢出则自底向上 split 传播（必要时原地长高）。
+        List<IndexPageHandle> path = descendPath(mtr, index, key, PageLatchMode.EXCLUSIVE);
+        IndexPageHandle leafHandle = path.get(path.size() - 1);
+        RecordPage leaf = leafHandle.recordPage();
+        PageId leafId = leafHandle.pageId();
+        ensureUniqueAbsent(leaf, leafId, index, key);
+        try {
+            RecordRef ref = inserter.insert(leaf, leafId, record, index.keyDef(), index.schema());
+            return new BTreeInsertResult(index, ref);
+        } catch (RecordPageOverflowException overflow) {
+            requireLeafSegment(index);
+            return splitLeafAndPropagate(mtr, index, path, record);
         }
-        if (index.rootLevel() == 1) {
-            PageId leafId = chooseChild(root, index, key);
-            IndexPageHandle leafHandle = pageAccess.openIndexPageHandle(mtr, leafId, PageLatchMode.EXCLUSIVE);
-            RecordPage leaf = leafHandle.recordPage();
-            validateLeafPage(leaf, index, leafId);
-            ensureUniqueAbsent(leaf, leafId, index, key);
-            try {
-                RecordRef ref = inserter.insert(leaf, leafId, record, index.keyDef(), index.schema());
-                return new BTreeInsertResult(index, ref);
-            } catch (RecordPageOverflowException overflow) {
-                requireLeafSegment(index);
-                return splitLevelOneLeaf(mtr, index, rootHandle, leafHandle, record);
-            }
-        }
-        throw new BTreeUnsupportedStructureException("split btree supports rootLevel 0 or 1 only: "
-                + index.rootLevel());
     }
 
     /** root leaf 页满时的稳定 root split：旧 root 内容物化到内存，root 重建为 level-1，两个新 leaf 保存旧/新记录。 */
@@ -494,28 +479,41 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         root.format(index.indexId(), 1);
         rootHandle.writeSiblingLinks(FilePageHeader.FIL_NULL, FilePageHeader.FIL_NULL);
         BTreeIndex after = index.withRootLevel(1);
-        insertRootPointer(root, after, new BTreeNodePointer(lowKey(split.left(), index), leftId));
-        insertRootPointer(root, after, new BTreeNodePointer(lowKey(split.right(), index), rightId));
+        insertPointer(root, index.rootPageId(), after, new BTreeNodePointer(lowKey(split.left(), index), leftId));
+        insertPointer(root, index.rootPageId(), after, new BTreeNodePointer(lowKey(split.right(), index), rightId));
         return new BTreeInsertResult(index, insertedRef, after, true, List.of(leftId, rightId));
     }
 
     /**
-     * level-1 leaf split：先确认 root 能容纳一个新 pointer，再重写旧 leaf 并创建一个新 right leaf。
-     * 当前切片不实现 parent split，因此父页不足时必须在任何 leaf rewrite 前失败。
+     * leaf 溢出后的 split 传播入口（任意树高）。leaf 即 root（path 仅 root）→ 原地长高（level 0→1，复用
+     * {@link #splitRootLeaf}）；否则 leaf=左半、新右兄弟=右半，separator 经 {@link #insertSeparator} 上插父页，
+     * 父满则递归内部 split，直至某层放下或根原地长高。
      */
-    private BTreeInsertResult splitLevelOneLeaf(MiniTransaction mtr, BTreeIndex index, IndexPageHandle rootHandle,
-                                               IndexPageHandle oldLeafHandle, LogicalRecord inserted) {
-        RecordPage root = rootHandle.recordPage();
+    private BTreeInsertResult splitLeafAndPropagate(MiniTransaction mtr, BTreeIndex index,
+                                                    List<IndexPageHandle> path, LogicalRecord inserted) {
+        int depth = path.size() - 1;
+        IndexPageHandle leafHandle = path.get(depth);
+        if (depth == 0) {
+            return splitRootLeaf(mtr, index, leafHandle, inserted);
+        }
+        List<PageId> allocated = new ArrayList<>();
+        LeafSplitResult ls = splitNonRootLeaf(mtr, index, leafHandle, inserted, allocated);
+        BTreeNodePointer separator = new BTreeNodePointer(ls.rightLowKey(), ls.newRightId());
+        BTreeIndex after = insertSeparator(mtr, index, path, depth - 1, separator, allocated);
+        return new BTreeInsertResult(index, ls.insertedRef(), after, true, List.copyOf(allocated));
+    }
+
+    /** 非 root leaf split：旧 leaf 改写为左半、分配新右兄弟存右半、维护双向 sibling 链；返回新插入 ref + 右半 lowKey + 新右兄弟页号。 */
+    private LeafSplitResult splitNonRootLeaf(MiniTransaction mtr, BTreeIndex index, IndexPageHandle oldLeafHandle,
+                                             LogicalRecord inserted, List<PageId> allocated) {
         RecordPage oldLeaf = oldLeafHandle.recordPage();
         PageId oldLeafId = oldLeafHandle.pageId();
         FilePageHeader oldLeafHeader = oldLeafHandle.fileHeader();
         List<LogicalRecord> records = sortedWithInserted(materializeLeafRecords(oldLeaf, index), inserted, index);
         SplitRows split = splitRows(records);
-        BTreeNodePointer newPointer = new BTreeNodePointer(lowKey(split.right(), index),
-                PageId.of(oldLeafId.spaceId(), PageNo.of(0)));
-        ensureRootHasRoomForPointer(root, index, newPointer);
 
         PageId newLeafId = disk.allocatePage(mtr, index.leafSegment());
+        allocated.add(newLeafId);
         RecordPage newLeaf = pageAccess.createIndexPage(mtr, newLeafId, index.indexId(), 0);
         IndexPageHandle newLeafHandle = pageAccess.openIndexPageHandle(mtr, newLeafId, PageLatchMode.EXCLUSIVE);
 
@@ -533,8 +531,69 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         if (insertedRef == null) {
             insertedRef = newInsertedRef;
         }
-        insertRootPointer(root, index, new BTreeNodePointer(lowKey(split.right(), index), newLeafId));
-        return new BTreeInsertResult(index, insertedRef, index, true, List.of(newLeafId));
+        return new LeafSplitResult(insertedRef, lowKey(split.right(), index), newLeafId);
+    }
+
+    /**
+     * 把 separator 插入 {@code path[depth]}（非叶页）。放得下直接插（树高不变）；放不下则对该非叶页做内部 split：
+     * 它若是 root 则原地长高（level L→L+1），否则改写为左半 + 新右兄弟存右半，新 separator 继续向上递归。
+     * 返回插入后调用方应使用的索引快照（仅原地长高会改 rootLevel）。
+     */
+    private BTreeIndex insertSeparator(MiniTransaction mtr, BTreeIndex index, List<IndexPageHandle> path,
+                                       int depth, BTreeNodePointer separator, List<PageId> allocated) {
+        IndexPageHandle parentHandle = path.get(depth);
+        RecordPage parent = parentHandle.recordPage();
+        if (pointerFits(parent, index, separator)) {
+            insertPointer(parent, parentHandle.pageId(), index, separator);
+            return index;
+        }
+        requireNonLeafSegment(index);
+        List<BTreeNodePointer> combined = materializePointers(parent, index);
+        combined.add(separator);
+        combined.sort((a, b) -> keyComparator.compare(a.lowKey(), b.lowKey(), index.keyDef(), index.schema()));
+        SplitPointers split = splitPointers(combined);
+        if (depth == 0) {
+            return growRootWithInternal(mtr, index, parentHandle, split, allocated);
+        }
+        PageId newSiblingId = splitNonRootInternal(mtr, index, parentHandle, split, allocated);
+        BTreeNodePointer upSeparator = new BTreeNodePointer(split.right().get(0).lowKey(), newSiblingId);
+        return insertSeparator(mtr, index, path, depth - 1, upSeparator, allocated);
+    }
+
+    /** root（非叶，level L）原地长高：分配两个 level-L 新子页存左右半 pointer，root 页号不变重建为 level L+1 两 pointer。 */
+    private BTreeIndex growRootWithInternal(MiniTransaction mtr, BTreeIndex index, IndexPageHandle rootHandle,
+                                            SplitPointers split, List<PageId> allocated) {
+        int oldLevel = index.rootLevel();
+        PageId leftId = disk.allocatePage(mtr, index.nonLeafSegment());
+        allocated.add(leftId);
+        RecordPage leftPage = pageAccess.createIndexPage(mtr, leftId, index.indexId(), oldLevel);
+        PageId rightId = disk.allocatePage(mtr, index.nonLeafSegment());
+        allocated.add(rightId);
+        RecordPage rightPage = pageAccess.createIndexPage(mtr, rightId, index.indexId(), oldLevel);
+        writePointers(leftPage, leftId, split.left(), index);
+        writePointers(rightPage, rightId, split.right(), index);
+
+        RecordPage root = rootHandle.recordPage();
+        root.format(index.indexId(), oldLevel + 1);
+        rootHandle.writeSiblingLinks(FilePageHeader.FIL_NULL, FilePageHeader.FIL_NULL);
+        BTreeIndex after = index.withRootLevel(oldLevel + 1);
+        insertPointer(root, index.rootPageId(), index, new BTreeNodePointer(split.left().get(0).lowKey(), leftId));
+        insertPointer(root, index.rootPageId(), index, new BTreeNodePointer(split.right().get(0).lowKey(), rightId));
+        return after;
+    }
+
+    /** 非 root 内部页 split：该页改写为左半 pointer、分配新右兄弟存右半 pointer（非叶页不参与 leaf sibling 链）；返回新右兄弟页号。 */
+    private PageId splitNonRootInternal(MiniTransaction mtr, BTreeIndex index, IndexPageHandle nodeHandle,
+                                        SplitPointers split, List<PageId> allocated) {
+        RecordPage node = nodeHandle.recordPage();
+        int level = node.header().level();
+        PageId newSiblingId = disk.allocatePage(mtr, index.nonLeafSegment());
+        allocated.add(newSiblingId);
+        RecordPage newSibling = pageAccess.createIndexPage(mtr, newSiblingId, index.indexId(), level);
+        node.format(index.indexId(), level);
+        writePointers(node, nodeHandle.pageId(), split.left(), index);
+        writePointers(newSibling, newSiblingId, split.right(), index);
+        return newSiblingId;
     }
 
     private IndexPageHandle openRoot(MiniTransaction mtr, BTreeIndex index, PageLatchMode mode) {
@@ -560,10 +619,23 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
      * 持有至 commit（悲观全路径，latch coupling / 乐观→悲观下降留 0.13）。返回定位到的 leaf 句柄/页视图/页号。
      */
     private LeafLocation findLeaf(MiniTransaction mtr, BTreeIndex index, SearchKey key, PageLatchMode mode) {
+        List<IndexPageHandle> path = descendPath(mtr, index, key, mode);
+        IndexPageHandle leaf = path.get(path.size() - 1);
+        return new LeafLocation(leaf, leaf.recordPage(), leaf.pageId());
+    }
+
+    /**
+     * 从 root 逐层下降到 leaf，返回完整路径（root 在 0、leaf 在末尾）。供 insert split 自底向上传播取祖先页；
+     * 读路径只取末项即可（见 {@link #findLeaf}）。每层 latch 由 MTR memo 持有至 commit。
+     */
+    private List<IndexPageHandle> descendPath(MiniTransaction mtr, BTreeIndex index, SearchKey key,
+                                              PageLatchMode mode) {
         if (key == null) {
-            throw new DatabaseValidationException("btree findLeaf key must not be null");
+            throw new DatabaseValidationException("btree descend key must not be null");
         }
+        List<IndexPageHandle> path = new ArrayList<>();
         IndexPageHandle handle = openRoot(mtr, index, mode);
+        path.add(handle);
         RecordPage page = handle.recordPage();
         PageId pageId = index.rootPageId();
         while (page.header().level() > 0) {
@@ -575,9 +647,10 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
                 throw new BTreeStructureCorruptedException("child page index id mismatch at " + pageId
                         + ": page=" + page.header().indexId() + " expected=" + index.indexId());
             }
+            path.add(handle);
         }
         validateLeafPage(page, index, pageId);
-        return new LeafLocation(handle, page, pageId);
+        return path;
     }
 
     /** {@link #findLeaf} 定位结果：leaf 句柄（scan 取 sibling 链/header）、leaf 页视图、leaf 物理页号。 */
@@ -691,19 +764,53 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         return insertedRef;
     }
 
-    private void insertRootPointer(RecordPage root, BTreeIndex index, BTreeNodePointer pointer) {
+    /** 向非叶页插入一个 node pointer（root 或任意内部页；node-pointer schema 与层级无关，故只需 index 派生 schema）。 */
+    private void insertPointer(RecordPage page, PageId pageId, BTreeIndex index, BTreeNodePointer pointer) {
         BTreeNodePointerSchema pointerSchema = BTreeNodePointerSchema.from(index);
         LogicalRecord record = pointerCodec.toRecord(pointer, pointerSchema);
-        inserter.insert(root, index.rootPageId(), record, pointerSchema.keyDef(), pointerSchema.schema());
+        inserter.insert(page, pageId, record, pointerSchema.keyDef(), pointerSchema.schema());
     }
 
-    private void ensureRootHasRoomForPointer(RecordPage root, BTreeIndex index, BTreeNodePointer pointer) {
+    /** 批量写入 node pointer 到已格式化的非叶页（调用方负责先 format/createIndexPage 到目标 level）。 */
+    private void writePointers(RecordPage page, PageId pageId, List<BTreeNodePointer> pointers, BTreeIndex index) {
+        for (BTreeNodePointer pointer : pointers) {
+            insertPointer(page, pageId, index, pointer);
+        }
+    }
+
+    /** 物化非叶页的全部 node pointer（按页内顺序），供内部 split 在内存对半切分。 */
+    private List<BTreeNodePointer> materializePointers(RecordPage page, BTreeIndex index) {
+        BTreeNodePointerSchema pointerSchema = BTreeNodePointerSchema.from(index);
+        List<BTreeNodePointer> pointers = new ArrayList<>();
+        for (int off : page.recordOffsetsInOrder()) {
+            LogicalRecord record = new RecordCursor(page, off, pointerSchema.schema(), registry).materialize();
+            pointers.add(pointerCodec.fromRecord(record, pointerSchema));
+        }
+        return pointers;
+    }
+
+    /** 非叶页是否还容得下一个新 node pointer（= 旧 ensureRootHasRoomForPointer 的判定，返回布尔而非抛出）。 */
+    private boolean pointerFits(RecordPage page, BTreeIndex index, BTreeNodePointer pointer) {
         BTreeNodePointerSchema pointerSchema = BTreeNodePointerSchema.from(index);
         LogicalRecord record = pointerCodec.toRecord(pointer, pointerSchema);
         int required = recordEncoder.encode(record, pointerSchema.schema()).length + 8;
-        if (required > root.freeSpace()) {
-            throw new BTreeParentSplitRequiredException("root page has no room for another node pointer in index "
-                    + index.indexId());
+        return required <= page.freeSpace();
+    }
+
+    /** 内部页 pointer 列表对半切（min-key-pointer 约定，右半保留全部，separator=右半首 pointer 的 lowKey）。 */
+    private SplitPointers splitPointers(List<BTreeNodePointer> pointers) {
+        if (pointers.size() < 2) {
+            throw new BTreeStructureCorruptedException("cannot split fewer than two node pointers");
+        }
+        int mid = pointers.size() >>> 1;
+        return new SplitPointers(List.copyOf(pointers.subList(0, mid)),
+                List.copyOf(pointers.subList(mid, pointers.size())));
+    }
+
+    private void requireNonLeafSegment(BTreeIndex index) {
+        if (index.nonLeafSegment() == null) {
+            throw new BTreeUnsupportedStructureException(
+                    "btree parent/root split requires non-leaf segment metadata for index " + index.indexId());
         }
     }
 
@@ -744,6 +851,14 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
 
     /** 分裂后的左右记录集；两侧都必须非空。 */
     private record SplitRows(List<LogicalRecord> left, List<LogicalRecord> right) {
+    }
+
+    /** 非叶页内部 split 的左右 pointer 集；两侧都必须非空。 */
+    private record SplitPointers(List<BTreeNodePointer> left, List<BTreeNodePointer> right) {
+    }
+
+    /** 非 root leaf split 结果：新插入记录页内短期 ref、右半最小 key（separator）、新右兄弟页号。 */
+    private record LeafSplitResult(RecordRef insertedRef, SearchKey rightLowKey, PageId newRightId) {
     }
 
     /** scan 结果累积器，集中管理 limit 与不可变输出。 */

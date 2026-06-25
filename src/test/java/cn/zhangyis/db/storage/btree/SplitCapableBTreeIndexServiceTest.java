@@ -266,6 +266,66 @@ class SplitCapableBTreeIndexServiceTest {
         });
     }
 
+    @Test
+    void internalNonRootSplitPropagatesToLevelThree() {
+        onBTreePool((ctx) -> {
+            ctx.createTablespaceAndRoot();
+            BTreeIndex current = new BTreeIndex(INDEX_ID, ctx.rootPageId, 0, payloadKey(), wideSchema(), true,
+                    ctx.leafSegment, ctx.nonLeafSegment);
+            BTreeIndexService service = ctx.service();
+            // 一路灌到 level 3：途中必然发生非 root 内部页 split（level-1 页满 → separator 上插 level-2 root）。
+            long id = 1;
+            while (current.rootLevel() < 3 && id <= 60) {
+                MiniTransaction m = ctx.mgr.begin();
+                BTreeInsertResult result = service.insert(m, current, payloadKeyRow(id));
+                current = result.indexAfterInsert();
+                ctx.mgr.commit(m);
+                id++;
+            }
+
+            assertEquals(3, current.rootLevel(), "deep inserts grow the tree to level 3");
+            assertEquals(ctx.rootPageId, current.rootPageId(), "root page id stable across all splits");
+            long inserted = id - 1;
+            for (long k = 1; k <= inserted; k++) {
+                MiniTransaction read = ctx.mgr.begin();
+                assertEquals(k, idOf(service.lookup(read, current, kPayload(k)).orElseThrow()),
+                        "every key reachable through 3-level navigation");
+                ctx.mgr.commit(read);
+            }
+        });
+    }
+
+    @Test
+    void multiLevelScanReturnsAllInOrder() {
+        onBTreePool((ctx) -> {
+            ctx.createTablespaceAndRoot();
+            BTreeIndex current = new BTreeIndex(INDEX_ID, ctx.rootPageId, 0, payloadKey(), wideSchema(), true,
+                    ctx.leafSegment, ctx.nonLeafSegment);
+            BTreeIndexService service = ctx.service();
+            long id = 1;
+            // 长到 level≥2 后再多灌几行，确保多个 leaf 跨 sibling 链
+            while ((current.rootLevel() < 2 || id <= 18) && id <= 40) {
+                MiniTransaction m = ctx.mgr.begin();
+                current = service.insert(m, current, payloadKeyRow(id)).indexAfterInsert();
+                ctx.mgr.commit(m);
+                id++;
+            }
+            long inserted = id - 1;
+            assertTrue(current.rootLevel() >= 2, "tree is multi-level");
+
+            List<Long> expected = new ArrayList<>();
+            for (long k = 1; k <= inserted; k++) {
+                expected.add(k);
+            }
+            MiniTransaction read = ctx.mgr.begin();
+            List<Long> ids = service.scan(read, current,
+                            new BTreeScanRange(kPayload(1), true, kPayload(9999), true, 200))
+                    .stream().map(SplitCapableBTreeIndexServiceTest::idOf).toList();
+            ctx.mgr.commit(read);
+            assertEquals(expected, ids, "multi-level scan crosses all leaves in key order");
+        });
+    }
+
     private void assertFound(BTreeContext ctx, BTreeIndex index, long id) {
         MiniTransaction read = ctx.mgr.begin();
         try {

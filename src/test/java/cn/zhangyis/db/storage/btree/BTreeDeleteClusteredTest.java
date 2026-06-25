@@ -17,6 +17,7 @@ import cn.zhangyis.db.storage.fil.io.PageStore;
 import cn.zhangyis.db.storage.fsp.segment.SegmentPurpose;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
+import cn.zhangyis.db.storage.record.format.HiddenColumns;
 import cn.zhangyis.db.storage.record.format.LogicalRecord;
 import cn.zhangyis.db.storage.record.format.RecordType;
 import cn.zhangyis.db.storage.record.page.RecordPage;
@@ -196,7 +197,102 @@ class BTreeDeleteClusteredTest {
         });
     }
 
+    @Test
+    void multiLevelClusteredDeleteReplaceMarkPurge() {
+        onPool(ctx -> {
+            ctx.createTablespaceAndRoot();
+            SplitCapableBTreeIndexService svc = ctx.service();
+            // 宽聚簇 KEY（5000B varchar 主键）→ node pointer ~5KB → 少量行即长出多层树（idKey 太小，root 容纳上百指针）。
+            BTreeIndex current = new BTreeIndex(INDEX_ID, ctx.rootPageId, 0, wideKeyDef(), wideKeySchema(), true,
+                    ctx.leafSegment, ctx.nonLeafSegment);
+
+            long id = 1;
+            while (current.rootLevel() < 2 && id <= 40) {
+                MiniTransaction m = ctx.mgr.begin();
+                current = svc.insertClustered(m, current, wideKeyRow(id), TransactionId.of(TRX),
+                        new RollPointer(true, PageNo.of(65), (int) id)).indexAfterInsert();
+                ctx.mgr.commit(m);
+                id++;
+            }
+            long inserted = id - 1;
+            assertTrue(current.rootLevel() >= 2, "wide clustered key grows the tree past level 1");
+            assertTrue(inserted >= 8, "enough rows span multiple leaves");
+
+            // delete key 3（所有权 = 插入时 (TRX, rp3)）
+            MiniTransaction d = ctx.mgr.begin();
+            assertTrue(svc.deleteClustered(d, current, kKey(3), TransactionId.of(TRX),
+                    new RollPointer(true, PageNo.of(65), 3)).removed(), "multi-level delete removes the row");
+            ctx.mgr.commit(d);
+
+            // replace key 5（同 key 换隐藏列；expected=插入版本）
+            MiniTransaction rep = ctx.mgr.begin();
+            assertTrue(svc.replaceClustered(rep, current, kKey(5),
+                    wideKeyRowWithHidden(5, TransactionId.of(TRX), new RollPointer(true, PageNo.of(66), 105)),
+                    TransactionId.of(TRX), new RollPointer(true, PageNo.of(65), 5)).replaced(),
+                    "multi-level replace updates the matching row");
+            ctx.mgr.commit(rep);
+
+            // delete-mark key 7，再 purge
+            MiniTransaction mk = ctx.mgr.begin();
+            assertTrue(svc.setClusteredDeleteMark(mk, current, kKey(7), true,
+                    new HiddenColumns(TransactionId.of(TRX), new RollPointer(true, PageNo.of(66), 207)),
+                    TransactionId.of(TRX), new RollPointer(true, PageNo.of(65), 7)).changed(),
+                    "multi-level delete-mark flips the matching row");
+            ctx.mgr.commit(mk);
+
+            MiniTransaction look = ctx.mgr.begin();
+            assertTrue(svc.lookup(look, current, kKey(7)).isEmpty(), "delete-marked hidden from normal lookup");
+            assertTrue(svc.lookupIncludingDeleted(look, current, kKey(7)).isPresent(), "still visible to MVCC read");
+            ctx.mgr.commit(look);
+
+            MiniTransaction pg = ctx.mgr.begin();
+            assertTrue(svc.purgeDeleteMarkedClustered(pg, current, kKey(7), TransactionId.of(TRX),
+                    new RollPointer(true, PageNo.of(66), 207)).removed(), "multi-level purge physically removes");
+            ctx.mgr.commit(pg);
+
+            // 终态校验：删/purge 的不在、replace 的在、其余仍可查（多层导航全程正确）。
+            MiniTransaction r = ctx.mgr.begin();
+            assertTrue(svc.lookup(r, current, kKey(3)).isEmpty(), "deleted gone");
+            assertTrue(svc.lookup(r, current, kKey(5)).isPresent(), "replaced present");
+            assertTrue(svc.lookupIncludingDeleted(r, current, kKey(7)).isEmpty(), "purged gone");
+            assertTrue(svc.lookup(r, current, kKey(1)).isPresent(), "untouched key present");
+            assertTrue(svc.lookup(r, current, kKey(inserted)).isPresent(), "last key present");
+            ctx.mgr.commit(r);
+        });
+    }
+
     // ---- helpers ----
+
+    /** 宽聚簇 KEY schema：column0 = varchar(5000) 主键、column1 = int payload；clustered=true。 */
+    private static TableSchema wideKeySchema() {
+        return new TableSchema(1, List.of(
+                new ColumnDef(new ColumnId(0), "k", ColumnType.varchar(5000, true), 0),
+                new ColumnDef(new ColumnId(1), "v", ColumnType.intType(false, false), 1)), true);
+    }
+
+    private static IndexKeyDef wideKeyDef() {
+        return new IndexKeyDef(INDEX_ID, List.of(new KeyPartDef(new ColumnId(0), KeyOrder.ASC, 0)));
+    }
+
+    /** id 顺序可排序的宽 key 值：%06d 前缀保证按 id 升序，再补到 5000B。 */
+    private static String wideKeyValue(long id) {
+        String prefix = String.format("%06d", id);
+        return prefix + "x".repeat(5000 - prefix.length());
+    }
+
+    private static SearchKey kKey(long id) {
+        return new SearchKey(List.of(new ColumnValue.StringValue(wideKeyValue(id))));
+    }
+
+    private static LogicalRecord wideKeyRow(long id) {
+        return new LogicalRecord(1, List.of(new ColumnValue.StringValue(wideKeyValue(id)),
+                new ColumnValue.IntValue(id)), false, RecordType.CONVENTIONAL);
+    }
+
+    private static LogicalRecord wideKeyRowWithHidden(long id, TransactionId txnId, RollPointer rp) {
+        return new LogicalRecord(1, List.of(new ColumnValue.StringValue(wideKeyValue(id)),
+                new ColumnValue.IntValue(id)), false, RecordType.CONVENTIONAL, new HiddenColumns(txnId, rp));
+    }
 
     private static TableSchema clusteredSchema() {
         return new TableSchema(1, List.of(

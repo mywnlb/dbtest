@@ -182,7 +182,7 @@ flowchart TD
 flowchart TD
   Facade["BTreeIndexService (interface)"]
   Facade --> Leaf["LeafOnlyBTreeIndexService (B1/B2 rootLevel=0)"]
-  Facade --> Split["SplitCapableBTreeIndexService (B3 rootLevel<=1)"]
+  Facade --> Split["SplitCapableBTreeIndexService (任意高度)"]
   Leaf --> PageAccess["api.index IndexPageAccess"]
   Split --> PageAccess
   Split --> Disk["DiskSpaceManager.allocatePage (split)"]
@@ -193,7 +193,8 @@ flowchart TD
   Split --> RSearch
   Leaf --> RInserter["RecordPageInserter"]
   Split --> RInserter
-  Split -. "parent split unimplemented" .-> ParentExc["BTreeParentSplitRequiredException"]
+  Split --> Descend["findLeaf / descendPath (N 层导航)"]
+  Split --> SplitEngine["splitLeafAndPropagate / insertSeparator / growRootWithInternal (自底向上 split + 原地 root split)"]
   Tests["tests only"] --> Facade
 ```
 
@@ -201,11 +202,10 @@ flowchart TD
 
 | Flow | Current production chain | Current state |
 | --- | --- | --- |
-| Point lookup | `BTreeIndexService.lookup` -> `openRoot` S-latch -> level 0 `search.findEqual` -> `RecordCursor` -> `materialize` `BTreeLookupResult` | Implemented (both services); SplitCapable also handles level-1 `chooseChild` routing (`:124-127`) |
-| Bounded scan | `SplitCapableBTreeIndexService.scan` (`:145`) -> `openRoot` S -> level 1 `chooseChild` -> sibling loop via `fileHeader().nextPageNo()` (`FIL_NULL` termination `:170`) -> `scanLeafPage` per page | Implemented in SplitCapable; LeafOnly inherits interface default -> single-page `scanLeaf` (`BTreeIndexService.java:40-42`) |
-| Insert (no split) | `insert` -> `openRoot` X-latch -> unique check `search.findEqual` -> `inserter.insert` | Implemented (both services); `RecordPageOverflowException` -> `BTreeSplitRequiredException` (LeafOnly `:127`) or split (SplitCapable) |
-| Root-leaf split | `SplitCapableBTreeIndexService.splitRootLeaf` (`:222`) -> `materializeLeafRecords` + `sortedWithInserted` + `splitRows` -> `disk.allocatePage` x2 (`:228,230`) -> `pageAccess.createIndexPage` x2 (`:229,231`) -> `writeSiblingLinks` -> `insertAll` x2 -> `root.format(indexId,1)` -> `insertRootPointer` x2 (`:247-248`) -> returns `BTreeInsertResult(split=true)` | Implemented; root page reused, content rewritten to level-1 |
-| Level-1 leaf split | `SplitCapableBTreeIndexService.splitLevelOneLeaf` (`:256`) -> `ensureRootHasRoomForPointer` **first** (`:266`, throws `BTreeParentSplitRequiredException` `:428` if no room) -> `disk.allocatePage` (`:268`) -> `createIndexPage` (`:269`) -> sibling link surgery -> `insertAll` x2 -> `insertRootPointer` (`:286`) | Implemented; parent split NOT implemented — `BTreeParentSplitRequiredException` thrown before any leaf rewrite |
+| Point lookup | `BTreeIndexService.lookup` -> SplitCapable `findLeaf`（N 层 `chooseChild` 下降，S）-> `search.findEqual` -> `RecordCursor` -> `materialize` | Implemented；SplitCapable 任意高度（0.11）；LeafOnly 仍 level 0 |
+| Bounded scan | `SplitCapableBTreeIndexService.scan` -> `findLeaf(lowerKey)` 任意高度定位起始 leaf -> sibling loop via `fileHeader().nextPageNo()`（`FIL_NULL` 终止）-> `scanLeafPage` per page | Implemented；任意高度（起始 leaf 经 N 层导航，后续沿 leaf sibling 链）|
+| Insert (no split) | `insert` -> `descendPath` X-latch root→leaf -> unique check -> `inserter.insert` | Implemented（both services）；overflow → `BTreeSplitRequiredException`（LeafOnly）或 split 传播（SplitCapable）|
+| Insert split 传播（0.11） | `insert` overflow -> `splitLeafAndPropagate`：leaf 即 root → `splitRootLeaf`（原地 level0→1）；否则 `splitNonRootLeaf`（旧 leaf=左半 + 新右兄弟 + sibling 链）→ `insertSeparator` 上插父页 -> 父满则内部 split：root→`growRootWithInternal`（两 level-L 新子页 + root 页号不变重建 level L+1）、非 root→`splitNonRootInternal` 递归上插。leaf 行/内部 pointer 统一对半切，separator=右半 lowKey | Implemented（任意高度）；内部/root-split 子页自 `nonLeafSegment` 分配；root 页号稳定；返回 `BTreeInsertResult(after.withRootLevel, allocatedPages)` |
 | Clustered insert | `SplitCapableBTreeIndexService.insertClustered(mtr, index, record, transactionId, rollPointer)` (`:91`) -> stamps `new HiddenColumns(transactionId, rollPointer)`（T1.3c 起调用方传入真 insert undo 指针，替换恒 NULL） -> delegates `insert` (`:106`) | Implemented; `DB_ROLL_PTR` 由上层 orchestration（`assignWriteId → UndoLogManager.beforeInsert → insertClustered`）传入；不 import trx/undo |
 | Clustered delete (T1.3d) | `SplitCapableBTreeIndexService.deleteClustered(mtr, index, key, expectedTrxId, expectedRollPtr)` -> 导航 leaf (level 0/1, X) -> `deleteInLeaf`：`search.findEqual` -> 所有权校验 `RecordCursor.dbTrxId()/dbRollPtr()` 匹配 -> 未标记 `deleter.deleteMark` 后 `purger.purge`，已标记直接 `purge` -> `BTreeDeleteResult(removed)` | Implemented (test-wired via `RollbackService`); 幂等（未命中/不匹配=no-op）；不 import trx/undo（收 SearchKey + domain 值对象）；无 merge/空页回收 |
 | Clustered replace (T1.3e) | `SplitCapableBTreeIndexService.replaceClustered(mtr, index, key, newRecordWithHidden, expectedTrxId, expectedRollPtr)` -> 导航 leaf (X) -> `replaceInLeaf`：`findEqual` -> 所有权校验 -> `updater.update` 整记录替换；REQUIRES_REINSERT(改 PK)→`BTreeUnsupportedStructureException` -> `BTreeUpdateResult(replaced)` | Implemented; 前向 UPDATE 与 rollback 恢复共用；前向 orchestration（`lookup→beforeUpdate→replaceClustered`）test-wired，rollback 恢复经 `RollbackService`(src/main)；幂等；不 import trx/undo |
@@ -217,8 +217,8 @@ flowchart TD
 | --- | --- | --- | --- |
 | `storage.btree` facade | `BTreeIndexService` (interface), `BTreeIndex` (descriptor record), `BTreeLookupResult`, `BTreeInsertResult`, `BTreeScanRange` | Implemented (test-wired) | `import cn.zhangyis.db.storage.btree.*` has **zero** production matches; entire package only constructed in tests |
 | `storage.btree` leaf-only | `LeafOnlyBTreeIndexService` | Implemented (test-wired) | B1/B2 rootLevel=0 only; point lookup + in-page scan + insert-no-split; `new`'d only at `LeafOnlyBTreeIndexServiceTest` |
-| `storage.btree` split-capable | `SplitCapableBTreeIndexService`, `BTreeNodePointer`, `BTreeNodePointerCodec`, `BTreeNodePointerSchema`, `SearchKeyComparator` | Implemented (test-wired) | B3 root-leaf split + level-1 routing + leaf split + sibling scan + clustered insert; `new`'d only at `SplitCapableBTreeIndexServiceTest`/`ClusteredInsertTest` |
-| `storage.btree` exceptions | `BTreeException` + 6 subclasses | Implemented | `BTreeDuplicateKeyException` (physical unique check), `BTreeSplitRequiredException`, `BTreeParentSplitRequiredException` (parent split unimplemented), `BTreeRootChangedException` (snapshot lag guard), `BTreeStructureCorruptedException`, `BTreeUnsupportedStructureException` |
+| `storage.btree` split-capable | `SplitCapableBTreeIndexService`, `BTreeNodePointer`, `BTreeNodePointerCodec`, `BTreeNodePointerSchema`, `SearchKeyComparator` | Implemented (test-wired) | **任意高度（0.11）**：N 层 `findLeaf` 导航 + 自底向上 split 传播 + 内部页 split + 原地 root split；`nonLeafSegment` 分配内部/root-split 子页；clustered insert/delete/replace/mark/purge 全多层可用；merge/redistribute/shrink 留 0.12；`new`'d only in tests |
+| `storage.btree` exceptions | `BTreeException` + 5 subclasses | Implemented | `BTreeDuplicateKeyException` (physical unique check), `BTreeSplitRequiredException`, `BTreeRootChangedException` (snapshot lag guard), `BTreeStructureCorruptedException`, `BTreeUnsupportedStructureException`（0.11 删 `BTreeParentSplitRequiredException`，parent split 已实现）|
 
 ## Redo Log Layer Slice
 
@@ -611,11 +611,10 @@ flowchart TD
 | Gap | Current consequence | Preferred resolution |
 | --- | --- | --- |
 | 无 delete / merge | 接口只有 `lookup`/`scan`/`insert` | 添加 delete + merge API |
-| 无 parent split | `ensureRootHasRoomForPointer` 抛 `BTreeParentSplitRequiredException` | 实现 parent split 以支持 >1 层树 |
-| 树高上限 1 | `rootLevel > 1` 被拒绝 | 实现 parent split 后解除 |
+| parent split + 树高 >1 已实现（0.11） | 自底向上 split 传播 + 内部页 split + 原地 root split；N 层 `findLeaf` 导航；`rootLevel>1` 拒绝已移除 | 剩余 merge/redistribute/root shrink/空页回收 → 0.12；latch coupling/乐观下降 → 0.13 |
 | 无事务锁等待 / MVCC 可见性 | btree 不做可见性判断 | 在 trx/MVCC 切片接入 |
 | 唯一检查仅物理 | delete-marked key 被视为重复 | 接入 MVCC 可见性后做逻辑唯一检查 |
-| `nonLeafSegment` 未用于分配 | root split 复用同页重写 | 在 parent split 切片启用 non-leaf segment 分配 |
+| `nonLeafSegment` 已用于分配（0.11） | 内部页/root-split 子页经 `index.nonLeafSegment()` 分配（`requireNonLeafSegment` 校验）；root 仍页号稳定原地重建 | — |
 
 ### Redo 缺口
 
@@ -661,7 +660,7 @@ flowchart TD
 | --- | --- | --- |
 | rollback 消费者已接（T1.3d） | `RollbackService`（trx→btree 新边）读 undo 链经 `deleteClustered` 删已插入行；`TransactionManager.rollback` 拆为 `beginRollback`/`finishRollback` 两阶段，撤销夹在 ROLLING_BACK 内 | 见上「rollback 消费 undo 已接」 |
 | slot 目录 0.3 已持久 + R 1.3 history 恢复已接；部分 release 路径仍缺 | **slot claim/onCommit-release 已持久到 undo page3 + 恢复扫描重建内存目录（0.3，engine 路径）**；COMMITTED 段由恢复期读取 `COMMIT_NO` 重建 history 后交给 `PurgeCoordinator` boundary 判死并 `dropUndoSegment` 回收；`RollbackService`/`PurgeCoordinator` 释放仍未持久、truncate rebuild 未重格式化 page3（test-wired 路径，未 engine 触达） | 全 release 路径持久 + truncate rebuild page3 format + formal recovery stages + 多 rseg/history 链表 |
-| 无 btree merge / 空页回收 / node-pointer 删除维护 | `deleteClustered` 删后空 leaf 留页、root node pointer lowKey 仅作保守下界（不更新）；height-1 无 merge/redistribute | merge/空页回收/多层树留 B+Tree 后续片 |
+| 无 btree merge / 空页回收 / node-pointer 删除维护 | `deleteClustered`/`purge` 删后空 leaf 留页、parent node pointer lowKey 仅作保守下界（不更新，路由仍正确）；任意高度（0.11）但无 merge/redistribute/root shrink | merge/redistribute/root shrink/空页回收留 0.12 |
 | 无多索引 rollback 解析 | `RollbackService` 单聚簇索引假设（用传入 index 的 schema 解码所有 undo）；无 data dictionary 按 indexId 解析 | 多索引/二级索引删除随 data dictionary 片接入 |
 | 单线程聚簇 purge + **后台 driver + recovery resume 已接（0.4/R 1.3）** | `HistoryList` + `PurgeCoordinator.runBatch`（按 `purgeLowWaterNo` 回收 delete-marked 记录 + `dropUndoSegment`）；`StorageEngine` 配 `clusteredIndex` 时启动 `PurgeDriverWorker` 后台周期驱动；`onCommit` 入 history；重启时 COMMITTED undo 段重建 history 后继续 purge（无 DD，单显式索引） | 多 worker / 二级索引 purge / `UndoLogKind.UPDATE` 独立 log / 持久 history 链表留后续片 |
 | truncate 机制已实现但无 purge→truncate 调度 | `UndoTablespaceTruncationService` 可恢复收缩并由 recovery 续作；后台 purge driver 已接（0.4）但**未驱动 undo tablespace truncate**（purge 只 dropUndoSegment 回收段页，不判 tablespace 死亡触发物理收缩）；活动 inode 会拒绝 | purge→undo tablespace truncate 调度（判 undo 死亡 → truncate）留后续片 |

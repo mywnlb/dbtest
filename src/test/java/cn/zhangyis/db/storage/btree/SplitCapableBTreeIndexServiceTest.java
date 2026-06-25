@@ -179,7 +179,7 @@ class SplitCapableBTreeIndexServiceTest {
     void parentOverflowGrowsTreeInsteadOfFailing() {
         onBTreePool((ctx) -> {
             ctx.createTablespaceAndRoot();
-            // 宽 node pointer 灌满 level-1 root 后，原先抛 BTreeParentSplitRequiredException；现在 parent/root split 接管，
+            // 宽 node pointer 灌满 level-1 root 后，0.11 之前在父页不足时失败；现在 parent/root split 接管，
             // 树长高且全部记录可经多层 scan 取回（有序）。
             BTreeIndex current = new BTreeIndex(INDEX_ID, ctx.rootPageId, 0, payloadKey(), wideSchema(), true,
                     ctx.leafSegment, ctx.nonLeafSegment);

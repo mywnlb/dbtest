@@ -44,3 +44,6 @@ bin/
 
 ### Mac OS ###
 .DS_Store
+
+### Understand-Anything 工具缓存（按需手动运行，不入仓）###
+.understand-anything/

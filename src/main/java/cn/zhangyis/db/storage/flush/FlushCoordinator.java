@@ -114,6 +114,9 @@ public final class FlushCoordinator {
         FlushPageSnapshot snapshot = maybeSnapshot.orElseThrow();
         if (snapshot.pageLsn().value() > redo.flushedToDiskLsn().value()
                 && !redo.waitFlushed(snapshot.pageLsn(), redoWaitTimeout)) {
+            // 已 snapshot（帧已 DIRTY→FLUSHING）但 WAL gate 未放行：不能写盘，必须把帧从 FLUSHING 退回 DIRTY，
+            // 否则它会被排除出 flush 候选/淘汰、永久卡在 FLUSHING（WAL 未 durable 时 flush 正确跳过，但状态须复位）。
+            bufferPool.failFlush(pageId);
             return FlushResult.ok(pageId, snapshot.pageLsn(), FlushResultStatus.SKIPPED_REDO_NOT_DURABLE);
         }
         try {

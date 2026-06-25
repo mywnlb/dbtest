@@ -31,6 +31,12 @@ final class BufferFrame {
     /** 是否含未落盘修改。由 poolLock 保护：PageGuard.close 按是否写过 OR 置位，flush/写回后清零，淘汰时读取。 */
     boolean dirty;
 
+    /**
+     * 帧生命周期 / IO 状态（§5.7）。由 poolLock 保护，经 {@link FrameStateMachine} 转换，取代隐式的"空闲/载入中/刷盘中"布尔。
+     * 不变量：{@code dirty ⟺ state ∈ {DIRTY, FLUSHING}}；新帧初始 FREE，载入期 LOADING，刷盘期 FLUSHING（仍 dirty）。
+     */
+    BufferFrameState state = BufferFrameState.FREE;
+
     /** 首次变脏的 LSN；只有 dirty=true 时有效，checkpoint 不能越过该值。由 poolLock 保护。 */
     Lsn oldestModificationLsn;
 

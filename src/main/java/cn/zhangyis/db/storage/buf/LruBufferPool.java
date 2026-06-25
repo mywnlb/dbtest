@@ -40,6 +40,9 @@ public final class LruBufferPool implements BufferPool, FrameReleaser {
     private final int capacity;
     private final ReplacementPolicy policy;
 
+    /** 帧状态机：集中执行 BufferFrame.state 的合法转换（§5.7）。所有调用在 poolLock 下串行，故无需自身加锁。 */
+    private final FrameStateMachine stateMachine = new FrameStateMachine();
+
     /**
      * 淘汰脏 victim 时委托的 WAL 安全刷盘端口；null 表示独立/测试池，淘汰脏帧退回 legacy {@link #writeBack}。
      * set-once、bootstrap 注入、热路径只读，故 volatile 即可安全发布。
@@ -149,6 +152,7 @@ public final class LruBufferPool implements BufferPool, FrameReleaser {
                         // 清零延后到取得 X latch 之后做（见方法末尾）——不能在 poolLock 内、未持 page latch 时改页内容，
                         // 否则会与持锁读者撞车、绕过 page latch 语义。dirty 在 poolLock 下置位（dirty 由 poolLock 保护）。
                         resident.dirty = true;
+                        stateMachine.transition(resident, BufferFrameState.DIRTY);
                         resetAfterLatch = true;
                     }
                     resident.fixCount++;
@@ -178,11 +182,13 @@ public final class LruBufferPool implements BufferPool, FrameReleaser {
                     } catch (RuntimeException loadError) {
                         victim.pageId = null;
                         clearDirty(victim);
+                        stateMachine.transition(victim, BufferFrameState.FREE);
                         freeList.add(victim);
                         throw loadError;
                     }
                     victim.pageId = pageId;
                     clearDirty(victim);
+                    stateMachine.transition(victim, BufferFrameState.CLEAN);
                     victim.fixCount = 1;
                     residentMap.put(pageId, victim);
                     policy.onInsert(victim);
@@ -228,6 +234,10 @@ public final class LruBufferPool implements BufferPool, FrameReleaser {
             if (frame.fixCount != 0) {
                 continue;
             }
+            if (frame.state == BufferFrameState.FLUSHING) {
+                // 正在刷盘的帧处于 IO 中，不能被淘汰（否则与刷盘写竞争/重复刷）；待 flush 完成转 CLEAN 后再考虑。
+                continue;
+            }
             if (!frame.dirty) {
                 return frame;
             }
@@ -246,6 +256,7 @@ public final class LruBufferPool implements BufferPool, FrameReleaser {
     private void writeBack(BufferFrame frame) {
         pageStore.writePage(frame.pageId, ByteBuffer.wrap(frame.data));
         clearDirty(frame);
+        stateMachine.transition(frame, BufferFrameState.CLEAN);
     }
 
     @Override
@@ -303,7 +314,9 @@ public final class LruBufferPool implements BufferPool, FrameReleaser {
         poolLock.lock();
         try {
             return residentMap.values().stream()
-                    .filter(frame -> frame.dirty && frame.oldestModificationLsn.value() <= targetLsn.value())
+                    // 跳过 FLUSHING 帧：已有单 IO owner 在刷它，重复入候选会导致重复刷/竞争 snapshot。
+                    .filter(frame -> frame.dirty && frame.state != BufferFrameState.FLUSHING
+                            && frame.oldestModificationLsn.value() <= targetLsn.value())
                     .sorted(Comparator.comparingLong(frame -> frame.oldestModificationLsn.value()))
                     .limit(maxPages)
                     .map(frame -> new DirtyPageCandidate(frame.pageId,
@@ -322,10 +335,14 @@ public final class LruBufferPool implements BufferPool, FrameReleaser {
         poolLock.lock();
         try {
             BufferFrame frame = residentMap.get(pageId);
-            if (frame == null || !frame.dirty || frame.fixCount != 0) {
+            // 仅 DIRTY 帧可被认领刷盘：FLUSHING 已被另一 IO owner 持有（单 owner，拒二次 snapshot），
+            // CLEAN/LOADING 无需刷；fixCount!=0 时内容不稳定，不取快照。state==DIRTY 蕴含 dirty==true。
+            if (frame == null || frame.state != BufferFrameState.DIRTY || frame.fixCount != 0) {
                 return Optional.empty();
             }
             byte[] image = Arrays.copyOf(frame.data, frame.data.length);
+            // DIRTY → FLUSHING：标记单 IO owner 已开始刷盘；dirty 仍为 true（未 durable），故 oldest-dirty 边界仍含本帧。
+            stateMachine.transition(frame, BufferFrameState.FLUSHING);
             return Optional.of(new FlushPageSnapshot(pageId,
                     frame.newestModificationLsn, frame.dirtyVersion, image));
         } finally {
@@ -341,14 +358,20 @@ public final class LruBufferPool implements BufferPool, FrameReleaser {
         poolLock.lock();
         try {
             BufferFrame frame = residentMap.get(snapshot.pageId());
-            if (frame == null || !frame.dirty || frame.fixCount != 0) {
+            // 只接受由本次 snapshot 置为 FLUSHING 的帧；若已被淘汰/复用/状态改变则放弃（返回 false，不动状态）。
+            if (frame == null || frame.state != BufferFrameState.FLUSHING) {
                 return false;
             }
-            if (frame.dirtyVersion == snapshot.dirtyVersion()
+            if (frame.fixCount == 0
+                    && frame.dirtyVersion == snapshot.dirtyVersion()
                     && frame.newestModificationLsn.equals(snapshot.pageLsn())) {
+                // snapshot 后未再被修改 → 落盘镜像即当前内容，FLUSHING → CLEAN 清脏。
                 clearDirty(frame);
+                stateMachine.transition(frame, BufferFrameState.CLEAN);
                 return true;
             }
+            // 刷盘期又被改（dirtyVersion 变）或被重新 fix → 落盘镜像已过期，FLUSHING → DIRTY 保留脏待重刷。
+            stateMachine.transition(frame, BufferFrameState.DIRTY);
             return false;
         } finally {
             poolLock.unlock();
@@ -362,8 +385,11 @@ public final class LruBufferPool implements BufferPool, FrameReleaser {
         }
         poolLock.lock();
         try {
-            // F1 没有 FLUSHING 中间态；失败只保留 dirty，等待下一轮选择。
-            residentMap.get(pageId);
+            // 刷盘 IO 失败：FLUSHING → DIRTY，保留脏页待下一轮重刷（dirty 全程为 true，不丢未落盘修改）。
+            BufferFrame frame = residentMap.get(pageId);
+            if (frame != null && frame.state == BufferFrameState.FLUSHING) {
+                stateMachine.transition(frame, BufferFrameState.DIRTY);
+            }
         } finally {
             poolLock.unlock();
         }
@@ -434,6 +460,7 @@ public final class LruBufferPool implements BufferPool, FrameReleaser {
                 policy.onRemove(frame);
                 frame.pageId = null;
                 clearDirty(frame);
+                stateMachine.transition(frame, BufferFrameState.FREE);
                 frame.fixCount = 0;
                 freeList.add(frame);
             }
@@ -489,6 +516,11 @@ public final class LruBufferPool implements BufferPool, FrameReleaser {
         frame.newestModificationLsn = pageLsn;
         frame.dirtyVersion++;
         frame.dirty = true;
+        // 状态：非刷盘中则进 DIRTY；若帧正 FLUSHING（刷盘期被写）则保持 FLUSHING——dirtyVersion 已推进，
+        // completeFlush 会因版本不符判定落盘镜像过期并退回 DIRTY，故此处不抢转，避免丢失"刷盘镜像已陈旧"信号。
+        if (frame.state != BufferFrameState.FLUSHING) {
+            stateMachine.transition(frame, BufferFrameState.DIRTY);
+        }
     }
 
     /** 调用须持 poolLock。 */

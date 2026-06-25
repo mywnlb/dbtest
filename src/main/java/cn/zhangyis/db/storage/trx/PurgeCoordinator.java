@@ -40,7 +40,7 @@ import java.util.Optional;
  * <p><b>本片范围</b>：单线程同步（无后台线程）、单聚簇索引、内存 history；二级索引 purge、多 worker、多 rseg、
  * 持久 history、recovery resume 留后续片。
  */
-public final class PurgeCoordinator {
+public final class PurgeCoordinator implements PurgeTarget {
 
     private final MiniTransactionManager mgr;
     private final TransactionSystem system;

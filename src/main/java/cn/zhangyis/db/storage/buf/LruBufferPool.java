@@ -27,9 +27,10 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 
 /**
- * LRU Buffer Pool 实现。单 poolLock 保护帧表/空闲列表/LRU/帧元数据，miss/evict/flush 的盘 IO 在 poolLock 内串行
- * （首版简化点：后续引入 per-frame loading 状态把 IO 移出池锁）。每帧 page latch 在 poolLock 之外获取，不嵌套。
- * fixCount>0 不可淘汰；脏帧淘汰经 PageStore.writePage 写回。
+ * LRU Buffer Pool 实现。单 poolLock 保护帧表/空闲列表/LRU/帧元数据短临界区；**miss 读盘已移出 poolLock**（per-frame
+ * LOADING 占位 + PageLoadFuture，§7.1/§7.3）：owner 锁内装 LOADING 占位后出锁读盘，不同页 miss 可并发读，同页后到者
+ * 命中 LOADING 即有界等待该页 load future、醒后重查 residentMap，不持锁阻塞。脏 victim 淘汰亦在锁外经 WAL 管线刷盘。
+ * 每帧 page latch 在 poolLock 之外获取，不嵌套；fixCount>0 不可淘汰。
  *
  * <p>同时实现 FrameReleaser：PageGuard.close() 回调 release 在 poolLock 下 OR 脏并 unfix。
  */
@@ -49,12 +50,18 @@ public final class LruBufferPool implements BufferPool, FrameReleaser {
      */
     private volatile DirtyVictimFlusher victimFlusher;
 
-    /** 保护 residentMap / freeList / policy / 各帧 pageId·dirty·fixCount；首版 miss/evict/flush 的盘 IO 也在其内串行。 */
+    /** 保护 residentMap / freeList / policy / 各帧 pageId·dirty·fixCount·state·loadFuture 的短临界区；盘 IO（读盘/刷盘）在锁外。 */
     private final ReentrantLock poolLock = new ReentrantLock();
     /** release() 在 fixCount 下降时唤醒截断排空；条件始终由 poolLock 保护。 */
     private final Condition frameReleased = poolLock.newCondition();
     private final Map<PageId, BufferFrame> residentMap = new HashMap<>();
     private final Deque<BufferFrame> freeList = new ArrayDeque<>();
+
+    /** 默认 load 超时：命中 LOADING 页的等待者最长等待时长，避免 IO owner 卡死时无限期阻塞。 */
+    private static final Duration DEFAULT_LOAD_TIMEOUT = Duration.ofSeconds(30);
+
+    /** 等待 LOADING 页完成的有界超时（纳秒）；超时抛 {@link BufferPoolLoadTimeoutException}。构造期固定。 */
+    private final long loadTimeoutNanos;
 
     public LruBufferPool(PageStore pageStore, PageSize pageSize, int capacity) {
         // 默认采用 midpoint LRU（Phase A）：读入进 old 子链、提升窗 + youngDistanceThreshold 抗扫描污染。
@@ -63,6 +70,12 @@ public final class LruBufferPool implements BufferPool, FrameReleaser {
     }
 
     LruBufferPool(PageStore pageStore, PageSize pageSize, int capacity, ReplacementPolicy policy) {
+        this(pageStore, pageSize, capacity, policy, DEFAULT_LOAD_TIMEOUT);
+    }
+
+    /** 全参构造（含 load 超时）：测试可注入短超时以验证 LOADING 等待的有界性。 */
+    LruBufferPool(PageStore pageStore, PageSize pageSize, int capacity, ReplacementPolicy policy,
+                  Duration loadTimeout) {
         if (pageStore == null) {
             throw new DatabaseValidationException("page store must not be null");
         }
@@ -75,10 +88,18 @@ public final class LruBufferPool implements BufferPool, FrameReleaser {
         if (policy == null) {
             throw new DatabaseValidationException("replacement policy must not be null");
         }
+        if (loadTimeout == null || loadTimeout.isZero() || loadTimeout.isNegative()) {
+            throw new DatabaseValidationException("load timeout must be positive: " + loadTimeout);
+        }
         this.pageStore = pageStore;
         this.pageSize = pageSize;
         this.capacity = capacity;
         this.policy = policy;
+        try {
+            this.loadTimeoutNanos = loadTimeout.toNanos();
+        } catch (ArithmeticException overflow) {
+            throw new DatabaseValidationException("load timeout is too large: " + loadTimeout, overflow);
+        }
         for (int i = 0; i < capacity; i++) {
             freeList.add(new BufferFrame(pageSize));
         }
@@ -141,62 +162,84 @@ public final class LruBufferPool implements BufferPool, FrameReleaser {
         BufferFrame chosen;
         boolean resetAfterLatch = false;
         Set<PageId> cleanSkip = null;
+        // 每轮在 poolLock 内确定唯一的出锁动作：刷脏 victim / 读盘载入 / 等待他人载入；锁内完成则直接 break。
         while (true) {
             PageId victimToClean = null;
+            BufferFrame loadingVictim = null;
+            PageLoadFuture awaitFuture = null;
             poolLock.lock();
             try {
                 BufferFrame resident = residentMap.get(pageId);
                 if (resident != null) {
-                    if (!readFromDisk) {
-                        // 页创建命中驻留页：重初始化（复用帧），对齐 InnoDB buf_page_create。
-                        // 清零延后到取得 X latch 之后做（见方法末尾）——不能在 poolLock 内、未持 page latch 时改页内容，
-                        // 否则会与持锁读者撞车、绕过 page latch 语义。dirty 在 poolLock 下置位（dirty 由 poolLock 保护）。
-                        resident.dirty = true;
-                        stateMachine.transition(resident, BufferFrameState.DIRTY);
-                        resetAfterLatch = true;
-                    }
-                    resident.fixCount++;
-                    policy.onAccess(resident);
-                    chosen = resident;
-                    break;
-                }
-                BufferFrame victim = obtainVictim(cleanSkip);
-                if (victim.dirty && victimFlusher != null) {
-                    // 脏 victim + 已注入 flusher：锁内只记 PageId，出锁刷盘后回环重选，绝不在 poolLock 内写盘。
-                    victimToClean = victim.pageId;
-                } else {
-                    if (victim.dirty) {
-                        // 无 flusher 的独立/测试池：退回 legacy 直接写回（字节级保持既有行为；不承诺 WAL 安全）。
-                        writeBack(victim);
-                    }
-                    if (victim.pageId != null) {
-                        residentMap.remove(victim.pageId);
-                        policy.onRemove(victim);
-                    }
-                    try {
-                        if (readFromDisk) {
-                            pageStore.readPage(pageId, ByteBuffer.wrap(victim.data));
-                        } else {
-                            Arrays.fill(victim.data, (byte) 0);
+                    if (resident.state == BufferFrameState.LOADING) {
+                        // 命中正在载入的页：取 load future 出锁有界等待，**绝不缓存帧引用**，醒来回环重查 residentMap。
+                        awaitFuture = resident.loadFuture;
+                    } else {
+                        if (!readFromDisk) {
+                            // 页创建命中驻留页：重初始化（复用帧），对齐 InnoDB buf_page_create。
+                            // 清零延后到取得 X latch 之后做（见方法末尾）——不能在 poolLock 内、未持 page latch 时改页内容，
+                            // 否则会与持锁读者撞车、绕过 page latch 语义。dirty 在 poolLock 下置位（dirty 由 poolLock 保护）。
+                            resident.dirty = true;
+                            stateMachine.transition(resident, BufferFrameState.DIRTY);
+                            resetAfterLatch = true;
                         }
-                    } catch (RuntimeException loadError) {
-                        victim.pageId = null;
-                        clearDirty(victim);
-                        stateMachine.transition(victim, BufferFrameState.FREE);
-                        freeList.add(victim);
-                        throw loadError;
+                        resident.fixCount++;
+                        policy.onAccess(resident);
+                        chosen = resident;
+                        break;
                     }
-                    victim.pageId = pageId;
-                    clearDirty(victim);
-                    stateMachine.transition(victim, BufferFrameState.CLEAN);
-                    victim.fixCount = 1;
-                    residentMap.put(pageId, victim);
-                    policy.onInsert(victim);
-                    chosen = victim;
-                    break;
+                } else {
+                    BufferFrame victim = obtainVictim(cleanSkip);
+                    if (victim.dirty && victimFlusher != null) {
+                        // 脏 victim + 已注入 flusher：锁内只记 PageId，出锁刷盘后回环重选，绝不在 poolLock 内写盘。
+                        victimToClean = victim.pageId;
+                    } else {
+                        if (victim.dirty) {
+                            // 无 flusher 的独立/测试池：退回 legacy 直接写回（字节级保持既有行为；不承诺 WAL 安全）。
+                            writeBack(victim);
+                        }
+                        if (victim.pageId != null) {
+                            residentMap.remove(victim.pageId);
+                            policy.onRemove(victim);
+                        }
+                        if (readFromDisk) {
+                            // 装 LOADING 占位（in-lock）：owner 自持 fixCount=1 防载入期被淘汰，建 load future、注册 residentMap；
+                            // **暂不 onInsert**（待读盘成功发布 CLEAN 才入 LRU）。随后出 poolLock 读盘，后到同页者见 LOADING 即等。
+                            victim.pageId = pageId;
+                            clearDirty(victim);
+                            stateMachine.transition(victim, BufferFrameState.LOADING);
+                            victim.fixCount = 1;
+                            victim.loadFuture = new PageLoadFuture();
+                            residentMap.put(pageId, victim);
+                            loadingVictim = victim;
+                        } else {
+                            // newPage miss：无盘 IO，锁内清零并直接发布 CLEAN（清零内容延后到取 X latch 之后，见方法末尾）。
+                            Arrays.fill(victim.data, (byte) 0);
+                            victim.pageId = pageId;
+                            clearDirty(victim);
+                            stateMachine.transition(victim, BufferFrameState.CLEAN);
+                            victim.fixCount = 1;
+                            residentMap.put(pageId, victim);
+                            policy.onInsert(victim);
+                            chosen = victim;
+                            break;
+                        }
+                    }
                 }
             } finally {
                 poolLock.unlock();
+            }
+            // ===== 出 poolLock 的三类动作，每轮至多一类；其余回环 =====
+            if (awaitFuture != null) {
+                // 有界等待他人载入：成功/失败均返回后回环重查（成功→命中 CLEAN 自 fix；失败/被淘汰→重新成为 owner）。
+                // 超时或中断抛 BufferPoolLoadTimeoutException，绝不悬挂。
+                awaitFuture.await(loadTimeoutNanos, pageId);
+                continue;
+            }
+            if (loadingVictim != null) {
+                // 锁外读盘 + 发布 CLEAN（或失败回收占位并抛）；owner 保留其 fix，返回该帧。
+                chosen = readAndPublish(pageId, loadingVictim);
+                break;
             }
             // 出 poolLock：经端口把脏 victim 经 WAL 管线刷干净（内部做 WAL gate/doublewrite/写盘/completeFlush）。
             // 真 IO 失败抛领域异常并向上传播；返回 false=本轮未清成→计入 skip set 回环重选，避免对未 durable 页空转。
@@ -217,6 +260,53 @@ public final class LruBufferPool implements BufferPool, FrameReleaser {
             Arrays.fill(chosen.data, (byte) 0);
         }
         return new PageGuard(this, chosen, mode, latch);
+    }
+
+    /**
+     * 出 poolLock 读盘并发布 CLEAN（设计 §7.1/§7.3）。owner 已在锁内装好 LOADING 占位（fixCount=1、loadFuture）。
+     *
+     * <p><b>载入握手序（评审点 2，杜绝等待者拿到已完成 future 却撞淘汰）</b>：
+     * <ul>
+     *   <li>读盘成功：重取 poolLock，LOADING→CLEAN、{@code onInsert} 入 LRU、清 loadFuture；**owner 保留其 fix=1**
+     *       （它即需该页的调用方，故该帧在 owner 关闭 guard 前不会被淘汰，给等待者重查留出安全窗）。出锁 complete
+     *       future 唤醒等待者——等待者随后重取 poolLock 按 pageId 重查命中 CLEAN 再 fix，不信任任何缓存引用。</li>
+     *   <li>读盘失败：重取 poolLock，移除占位、帧复位 FREE 回 free list、清 loadFuture；出锁以异常 complete future
+     *       唤醒等待者（其 await 返回后回环重试），向上抛根因。绝不留永久 LOADING 占位（§7.3 末条）。</li>
+     * </ul>
+     */
+    private BufferFrame readAndPublish(PageId pageId, BufferFrame frame) {
+        PageLoadFuture future = frame.loadFuture;
+        try {
+            // 锁外读盘：此帧为 LOADING + fixCount=1 且不在 victimOrder，无人能淘汰或改它，data 数组归 owner 独占。
+            pageStore.readPage(pageId, ByteBuffer.wrap(frame.data));
+        } catch (RuntimeException loadError) {
+            poolLock.lock();
+            try {
+                residentMap.remove(pageId);
+                frame.pageId = null;
+                clearDirty(frame);
+                stateMachine.transition(frame, BufferFrameState.FREE);
+                frame.fixCount = 0;
+                frame.loadFuture = null;
+                freeList.add(frame);
+            } finally {
+                poolLock.unlock();
+            }
+            future.failExceptionally(loadError);
+            throw loadError;
+        }
+        poolLock.lock();
+        try {
+            // 发布 CLEAN：此刻才 onInsert 入 LRU；owner 保留 fixCount=1。data 写在前、poolLock 发布在后，
+            // 等待者经 poolLock 重查即获得对 data 的可见性（happens-before），无需依赖 future 传递内容。
+            stateMachine.transition(frame, BufferFrameState.CLEAN);
+            policy.onInsert(frame);
+            frame.loadFuture = null;
+        } finally {
+            poolLock.unlock();
+        }
+        future.complete();
+        return frame;
     }
 
     /**

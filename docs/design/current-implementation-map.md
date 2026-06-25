@@ -104,7 +104,7 @@ flowchart TD
 
 | Flow | Current production chain | Current state |
 | --- | --- | --- |
-| Page fix (INDEX) | `api.index.IndexPageAccess.openIndexPage` -> `MiniTransaction.getPage` -> `LruBufferPool.getPage` -> `acquire` (poolLock: resident hit or `obtainVictim` + `pageStore.readPage` `:120`) -> release poolLock -> `pageLatch.lock` -> `new PageGuard` -> `attachWriteListener(MtrRedoCollector)` + `memo.pushPageGuard` (`MiniTransaction.java:103-106`) | Implemented; single `poolLock` serializes miss/evict disk IO (documented simplification `LruBufferPool.java:24-25`) |
+| Page fix (INDEX) | `api.index.IndexPageAccess.openIndexPage` -> `MiniTransaction.getPage` -> `LruBufferPool.getPage` -> `acquire` (poolLock: resident hit / 命中 LOADING 出锁等 `PageLoadFuture` / `obtainVictim` 装 LOADING 占位后**出 poolLock** `readAndPublish` 读盘) -> release poolLock -> `pageLatch.lock` -> `new PageGuard` -> `attachWriteListener(MtrRedoCollector)` + `memo.pushPageGuard` (`MiniTransaction.java:103-106`) | Implemented；miss 读盘已移出 poolLock（Phase B：per-frame LOADING + load future，不同页并发读、同页只读一次、有界等待）|
 | Page fix (UNDO) | `UndoPageAccess.openUndoPage` -> `MiniTransaction.getPage` (same path); page-type gate rejects non-UNDO pages (`UndoPageAccess.java:79-81`) | Implemented |
 | New page (INDEX) | `api.index.IndexPageAccess.createIndexPage` -> `MiniTransaction.newPage` -> `LruBufferPool.newPage` -> `acquire(readFromDisk=false)` -> zero-fill under X latch; MTR `collector.recordInit(pageId, PageType.INDEX)` (`MiniTransaction.java:109`) | Implemented |
 | New page (UNDO) | `UndoPageAccess.newUndoEnvelope` -> `MiniTransaction.newPage(...,PageType.UNDO)` (`UndoPageAccess.java:86`) | Implemented |
@@ -119,9 +119,9 @@ flowchart TD
 
 | Package area | Representative classes | Current state | Notes |
 | --- | --- | --- | --- |
-| `storage.buf` pool core | `BufferPool`, `LruBufferPool`, `BufferFrame`, `PageGuard`, `PageLatchMode`, `DirtyVictimFlusher` | Implemented (production-wired) | sole impl；per-space invalidate + frame release Condition；新增 `DirtyVictimFlusher` 淘汰端口（set-once 注入，`StorageEngine` 生产注入）使脏页淘汰经 WAL 管线；单 poolLock 仍串行 metadata/disk IO |
+| `storage.buf` pool core | `BufferPool`, `LruBufferPool`, `BufferFrame`, `PageGuard`, `PageLatchMode`, `DirtyVictimFlusher`, `BufferFrameState`, `FrameStateMachine`, `PageLoadFuture`, `BufferPoolLoadTimeoutException` | Implemented (production-wired) | sole impl；per-space invalidate + frame release Condition；`DirtyVictimFlusher` 淘汰端口经 WAL 管线；**Phase B**：显式 `FrameStateMachine`(FREE/LOADING/CLEAN/DIRTY/FLUSHING) + miss 读盘移出 poolLock（LOADING 占位 + `PageLoadFuture` 有界等待）+ FLUSHING 与 dirty 正交；DIRTY_PENDING/EVICTING/STALE 态、读写并发期 IO_FIX 细分 deferred |
 | `storage.buf` replacement | `ReplacementPolicy`, `MidpointLruReplacementPolicy` | Implemented (production-wired) | Midpoint LRU(old/new 子链)：读入进 old 头、`oldBlocksTime`(注入毫秒时钟) 提升窗 + `youngDistanceThreshold`(young 子链 1/4) 抗抖动 → 抗扫描污染（Phase A 0.8）；sole impl，injection ctor `LruBufferPool(...,ReplacementPolicy)` 供测试注入可控时钟；read-ahead-aware 分类、`oldBlocksPct` 配比再平衡待 0.10 |
-| `storage.buf` flush support | `DirtyPageCandidate`, `FlushPageSnapshot`, `BufferPoolExhaustedException` | Implemented | Value objects consumed by flush module; `LruBufferPool.failFlush` is a documented no-op (`:278-289`) |
+| `storage.buf` flush support | `DirtyPageCandidate`, `FlushPageSnapshot`, `BufferPoolExhaustedException` | Implemented | Value objects consumed by flush module；`failFlush` 现 FLUSHING→DIRTY（Phase B，不再 no-op）；`snapshotForFlush` DIRTY→FLUSHING、`completeFlush` 版本符→CLEAN/不符→DIRTY；`FlushCoordinator` WAL-gate skip 路径补 `failFlush` 复位 |
 | `storage.buf` write listener | `PageWriteListener` | Implemented | DI seam; only production impl is `MtrRedoCollector`; `NO_OP` path has no production caller |
 | `storage.mtr` transaction | `MiniTransaction`, `MiniTransactionManager`, `MiniTransactionState`, `MtrSavepoint` | Implemented (test-wired) | Manager 可注入共享 controller + durable redo；commit 返回 marker end LSN；默认构造仍内存 redo |
 | `storage.mtr` memo + collector | `MtrMemo`, `MtrRedoCollector`, `MtrStateException` | Implemented | memo 同时持 page guard 与 per-space lease；LIFO 保证 latch/fix 先释放、lease 最后释放 |
@@ -588,7 +588,7 @@ flowchart TD
 
 | Gap | Current consequence | Preferred resolution |
 | --- | --- | --- |
-| 单 `poolLock` 串行化磁盘 IO | miss/evict/flush 的盘 IO 在 `poolLock` 内串行（documented `LruBufferPool.java:24-25`） | 引入 per-frame loading 状态把 IO 移出池锁 |
+| miss 读盘已移出 `poolLock`（Phase B 0.9 已落） | per-frame LOADING 占位 + `PageLoadFuture` 有界等待：不同页 miss 并发读、同页只读一次、读失败清占位、命中 LOADING 超时/中断不悬挂；脏 victim 刷盘亦在锁外；仅帧表/LRU/state 短临界区在锁内。**剩余**：legacy `flush`/`flushAll` 仍持锁直写（test/close-only）；读写并发期更细的 IO_FIX/EVICTING 态、多 instance 分片未做 | legacy flush 路径统一/移除；按需细分 IO 状态、多 pool instance 分片（0.10） |
 | MTR rollback 不撤销 buffer 内容 | `rollbackUncommitted` 只 `releaseAll`，脏页保持脏（documented `:18-19`） | 依赖 redo/recovery 切片做内容撤销 |
 | 无跨页 latch 顺序强制 | `MiniTransaction` 禁止同页 S->X 升级但无一般升序 pageId latch 排序 | 在 `MtrMemo`/`MiniTransaction` 添加一般 latch 排序策略 |
 | 脏页淘汰 WAL gate 已闭合（生产侧）| 注入 `DirtyVictimFlusher` 后脏 victim 经 WAL gate+checksum+doublewrite 刷盘，绝不在 `poolLock` 内直写；legacy `flushAll`/无 flusher 独立测试池仍直接 `writeBack`（test/close-only，不承诺 WAL 安全）| recoverable doublewrite（0.2）+ 后台 redo flusher（0.1）已接，淘汰现获真 torn-page 防护；剩余统一/移除 legacy `flushAll` 直写路径 |

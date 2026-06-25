@@ -49,6 +49,12 @@ final class BufferFrame {
     /** 固定计数，>0 不可被淘汰。由 poolLock 保护。 */
     int fixCount;
 
+    /**
+     * 载入完成信号；仅在 state==LOADING 时非空，发布 CLEAN / 回收占位后置回 null。由 poolLock 保护（赋值/读取）。
+     * 命中 LOADING 帧的等待者在 poolLock 内取得本引用后出锁有界等待，避免持锁阻塞。
+     */
+    PageLoadFuture loadFuture;
+
     /** 页内容 S/X 闩。 */
     final ReentrantReadWriteLock pageLatch = new ReentrantReadWriteLock();
 

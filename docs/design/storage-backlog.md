@@ -40,7 +40,7 @@
 | 0.6 | 真 adaptive flush（redo 生成率/IO capacity/neighbor/idle percent）+ 压力 throttle（sync→前台等 checkpoint、hard→暂停 redo reservation） | F | 中 | 把 `fixed` 简化策略换成设计版 |
 | 0.7 | 碎片打包：`DETECT_ONLY` 模式、PageCleaner supervisor 重启、metrics snapshot、清理 legacy `BufferPool.flush`、`drainTablespace` busy-wait 改 condition 唤醒（现 `LockSupport.parkNanos(1ms)` 无 BufferPool 唤醒）、`RecoveryMode` 的 `READ_ONLY_VALIDATE`/`FORCE_SKIP_CORRUPT` | F/R | 小 | 韧性/可观测/收尾，可拼成一片 |
 | 0.8 | ✅ **Midpoint LRU（old/new 子链）+ 扫描抗污染已落**（2026-06-25，Phase A）：`MidpointLruReplacementPolicy` 读入进 old 头、`oldBlocksTime`(注入毫秒时钟)提升窗 + `youngDistanceThreshold`(young 1/4)抗抖动，默认接线、`largeScanDoesNotEvictHotWorkingSet` 验证；删除 plain `LruReplacementPolicy`。**剩余**：read-ahead-aware 访问型分类、`oldBlocksPct` 容量配比再平衡（随 0.10） | BP | 中 | buffer pool 质量最直接提升 |
-| 0.9 | **per-frame IO/loading 状态（盘 IO 移出 `poolLock`）+ 显式 `FrameStateMachine`（FLUSHING 态）**（§5.6/§5.7/§7.3） | BP | 中-大 | 解 buffer pool 最大并发瓶颈——单 `poolLock` 串行 miss/evict/flush 盘 IO |
+| 0.9 | ✅ **per-frame IO/loading 状态 + 显式 FrameStateMachine 已落**（2026-06-25，Phase B）：`BufferFrameState`(FREE/LOADING/CLEAN/DIRTY/FLUSHING)+`FrameStateMachine`；miss 读盘移出 `poolLock`（LOADING 占位 + `PageLoadFuture` 有界等待，不同页并发读/同页只读一次/失败清占位/超时·中断不悬挂）；FLUSHING 与 dirty 正交。**剩余**：legacy `flush`/`flushAll` 持锁直写、DIRTY_PENDING/EVICTING/STALE 态、多 instance 分片（0.10） | BP | 中-大 | buffer pool 最大并发瓶颈已解（单 `poolLock` 不再串行 miss 盘 IO）|
 | 0.10 | Read-Ahead（linear/random）、warmup dump/load、多 instance 分片 + 专用 `PageHashTable`、升序 pageId latch 排序 | BP | 各中 | 独立特性，可分片做 |
 | 0.11 | **parent split（解锁树高 >1）**（§8.2） | B | 中-大 | btree 最高杠杆内部缺口；现 `ensureRootHasRoomForPointer` 满抛 `BTreeParentSplitRequiredException`、`rootLevel>1` 拒绝 |
 | 0.12 | redistribute / merge / root shrink（§8.3） | B | 中 | 删后空 leaf 回收、多层树收缩；依赖 0.11 的多层结构 |

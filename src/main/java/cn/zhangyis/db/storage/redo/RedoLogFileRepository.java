@@ -2,160 +2,66 @@ package cn.zhangyis.db.storage.redo;
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 
-import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.nio.channels.FileChannel;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
-import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * Redo 物理文件仓储（R1 简化版，单文件 append-only）。批次帧格式由 {@link RedoBatchFrameCodec} 统一定义。
+ * Redo 物理文件仓储角色：向 redo writer/flusher/recovery 暴露稳定的「追加批次 / fsync / 顺序扫描」能力，
+ * 屏蔽底层是单文件还是文件环。
  *
- * <p>简化点：只实现单 redo 文件、同步追加和扫描；不做循环文件、capacity/checkpoint 回收和 log block 对齐——这些由
- * 0.18 的文件环仓储承担。完整 frame 的结构错误视为致命损坏，不完整尾部视为 crash 截断点，由扫描停止。
+ * <p>两种实现共用 {@link RedoBatchFrameCodec} 的帧格式，因此一种实现写出的 redo 可被另一种实现在 crash recovery 时读回：
+ * <ul>
+ *   <li>{@link SingleFileRedoLogRepository}：R1 单 append-only 文件，简单但无界增长，保留给现有测试与最小场景；</li>
+ *   <li>{@link RotatingRedoLogRepository}：0.18 文件环，轮转 + checkpoint 回收，长跑下占用有界。</li>
+ * </ul>
+ *
+ * <p>本接口只承载两种实现都具备的公共能力；文件环特有的回收边界推进等在其具体类上，避免接口被单一实现的细节污染。
  */
-public final class RedoLogFileRepository implements AutoCloseable {
-
-    /** redo 文件路径，用于异常诊断。 */
-    private final Path path;
-    /** redo 文件 channel；追加、force、扫描都通过该对象。 */
-    private final FileChannel channel;
-    /** 保护 channel position/force/read 扫描，避免追加和恢复读取互相干扰。 */
-    private final ReentrantLock ioLock = new ReentrantLock();
-
-    private RedoLogFileRepository(Path path, FileChannel channel) {
-        this.path = path;
-        this.channel = channel;
-    }
+public interface RedoLogFileRepository extends AutoCloseable {
 
     /**
-     * 打开或创建单个 redo 文件。父目录不存在时自动创建；文件内容保留，追加写从当前文件末尾开始。
-     *
-     * @param path redo 文件路径。
-     * @return 已打开仓储。
-     */
-    public static RedoLogFileRepository open(Path path) {
-        if (path == null) {
-            throw new DatabaseValidationException("redo log path must not be null");
-        }
-        try {
-            Path parent = path.getParent();
-            if (parent != null) {
-                Files.createDirectories(parent);
-            }
-            FileChannel channel = FileChannel.open(path, StandardOpenOption.CREATE,
-                    StandardOpenOption.READ, StandardOpenOption.WRITE);
-            return new RedoLogFileRepository(path, channel);
-        } catch (IOException e) {
-            throw new RedoLogIoException("failed to open redo log file: " + path, e);
-        }
-    }
-
-    /**
-     * 追加一个完整 redo 批次。调用方负责按 LSN 顺序调用；本仓储只保证单批 bytes 原样追加。
+     * 追加一个完整 redo 批次。调用方负责按 LSN 顺序调用；实现只保证单批 bytes 原样落到底层文件。
      *
      * @param batch 待写入批次。
      */
-    public void append(RedoLogBatch batch) {
-        if (batch == null) {
-            throw new DatabaseValidationException("redo log batch must not be null");
-        }
-        ByteBuffer frame = RedoBatchFrameCodec.encodeFrame(batch);
-        ioLock.lock();
-        try {
-            channel.position(channel.size());
-            while (frame.hasRemaining()) {
-                channel.write(frame);
-            }
-        } catch (IOException e) {
-            throw new RedoLogIoException("failed to append redo batch to file: " + path, e);
-        } finally {
-            ioLock.unlock();
-        }
-    }
+    void append(RedoLogBatch batch);
 
-    /** 对 redo 文件执行 fsync/force，调用成功后 writer 已写入的 LSN 才能发布为 flushedToDiskLsn。 */
-    public void force() {
-        ioLock.lock();
-        try {
-            channel.force(true);
-        } catch (IOException e) {
-            throw new RedoLogIoException("failed to force redo log file: " + path, e);
-        } finally {
-            ioLock.unlock();
+    /** 对底层 redo 文件执行 fsync/force；成功后 writer 已写入的 LSN 才能发布为 flushedToDiskLsn。 */
+    void force();
+
+    /**
+     * 按 LSN 顺序扫描出当前保留的全部完整批次；不完整尾部（torn tail）视为 crash 截断点，不进入返回列表。
+     *
+     * @return 按 LSN 顺序排列的完整批次。
+     */
+    List<RedoLogBatch> readBatches();
+
+    @Override
+    void close();
+
+    /**
+     * 打开或创建单 redo 文件仓储（R1 行为）。保留为静态工厂，使既有 {@code RedoLogFileRepository.open(path)} 调用点
+     * 在接口化后仍可编译，并默认得到单文件实现。
+     *
+     * @param path redo 文件路径。
+     * @return 单文件仓储。
+     */
+    static RedoLogFileRepository open(Path path) {
+        if (path == null) {
+            throw new DatabaseValidationException("redo log path must not be null");
         }
+        return SingleFileRedoLogRepository.open(path);
     }
 
     /**
-     * 顺序扫描完整 redo 批次。遇到不完整 frame header 或 payload 时停止，作为 crash 后的 torn tail 处理。
+     * 打开或创建 redo 文件环仓储（0.18）。
      *
-     * @return 完整可校验批次。
+     * @param dir                  redo 目录。
+     * @param fileCount            文件数（≥1）。
+     * @param maxFrameBytesPerFile 单文件帧容量上限（不含文件头，&gt;0）。
+     * @return 文件环仓储。
      */
-    public List<RedoLogBatch> readBatches() {
-        ioLock.lock();
-        try {
-            List<RedoLogBatch> out = new ArrayList<>();
-            channel.position(0);
-            while (true) {
-                ByteBuffer header = ByteBuffer.allocate(RedoBatchFrameCodec.FRAME_HEADER_BYTES);
-                if (!readFullyOrTail(header)) {
-                    break;
-                }
-                header.flip();
-                int magic = header.getInt();
-                if (magic != RedoBatchFrameCodec.MAGIC) {
-                    throw new RedoLogCorruptedException("redo frame magic mismatch in " + path + ": " + magic);
-                }
-                int payloadLength = header.getInt();
-                int expectedCrc = header.getInt();
-                if (payloadLength <= 0 || payloadLength > RedoBatchFrameCodec.MAX_PAYLOAD_BYTES) {
-                    throw new RedoLogCorruptedException("redo frame payload length invalid in "
-                            + path + ": " + payloadLength);
-                }
-                ByteBuffer payload = ByteBuffer.allocate(payloadLength);
-                if (!readFullyOrTail(payload)) {
-                    break;
-                }
-                byte[] bytes = payload.array();
-                if (RedoBatchFrameCodec.crc32(bytes) != expectedCrc) {
-                    throw new RedoLogCorruptedException("redo frame checksum mismatch in " + path);
-                }
-                out.add(RedoBatchFrameCodec.decodePayload(bytes));
-            }
-            return out;
-        } catch (IOException e) {
-            throw new RedoLogIoException("failed to read redo log file: " + path, e);
-        } finally {
-            ioLock.unlock();
-        }
-    }
-
-    @Override
-    public void close() {
-        ioLock.lock();
-        try {
-            channel.close();
-        } catch (IOException e) {
-            throw new RedoLogIoException("failed to close redo log file: " + path, e);
-        } finally {
-            ioLock.unlock();
-        }
-    }
-
-    private boolean readFullyOrTail(ByteBuffer dst) throws IOException {
-        while (dst.hasRemaining()) {
-            int n = channel.read(dst);
-            if (n < 0) {
-                return false;
-            }
-            if (n == 0) {
-                return false;
-            }
-        }
-        return true;
+    static RotatingRedoLogRepository openRing(Path dir, int fileCount, long maxFrameBytesPerFile) {
+        return RotatingRedoLogRepository.open(dir, fileCount, maxFrameBytesPerFile);
     }
 }

@@ -37,7 +37,7 @@ import java.util.concurrent.locks.ReentrantLock;
  * header/trailer/checksum（仍用 batch frame + CRC32，0.20）；无容量分级 throttle（环满直接 fail-closed，0.6）；
  * 文件非预分配，随 append 增长。
  */
-public final class RotatingRedoLogRepository implements AutoCloseable {
+public final class RotatingRedoLogRepository implements RedoLogFileRepository {
 
     /** 文件头 magic：ASCII "RLFR"。 */
     private static final int HEADER_MAGIC = 0x524C4652;
@@ -120,6 +120,7 @@ public final class RotatingRedoLogRepository implements AutoCloseable {
      *
      * @param batch 待写入批次。
      */
+    @Override
     public void append(RedoLogBatch batch) {
         if (batch == null) {
             throw new DatabaseValidationException("redo log batch must not be null");
@@ -169,6 +170,7 @@ public final class RotatingRedoLogRepository implements AutoCloseable {
     }
 
     /** 对所有持有 redo 的文件执行 fsync。轮转可能跨文件，故 force 覆盖全部 inUse 文件以保证已写 LSN 落盘。 */
+    @Override
     public void force() {
         ioLock.lock();
         try {
@@ -190,6 +192,7 @@ public final class RotatingRedoLogRepository implements AutoCloseable {
      *
      * @return 按 LSN 顺序排列的完整批次。
      */
+    @Override
     public List<RedoLogBatch> readBatches() {
         ioLock.lock();
         try {
@@ -247,7 +250,7 @@ public final class RotatingRedoLogRepository implements AutoCloseable {
         ioLock.lock();
         try {
             for (RingFile f : files) {
-                f.close();
+                f.closeFile();
             }
         } catch (IOException e) {
             throw new RedoLogIoException("failed to close redo ring: " + dir, e);
@@ -405,7 +408,7 @@ public final class RotatingRedoLogRepository implements AutoCloseable {
             }
         }
 
-        private void close() throws IOException {
+        private void closeFile() throws IOException {
             channel.close();
         }
 

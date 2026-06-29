@@ -23,6 +23,7 @@ import cn.zhangyis.db.storage.record.page.RecordPageDeleter;
 import cn.zhangyis.db.storage.record.page.RecordPageInserter;
 import cn.zhangyis.db.storage.record.page.RecordPageOverflowException;
 import cn.zhangyis.db.storage.record.page.RecordPagePurger;
+import cn.zhangyis.db.storage.record.page.RecordPageReorganizer;
 import cn.zhangyis.db.storage.record.page.RecordPageSearch;
 import cn.zhangyis.db.storage.record.page.RecordPageUpdater;
 import cn.zhangyis.db.storage.record.page.RecordRef;
@@ -72,6 +73,8 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
     private final RecordPagePurger purger;
     /** 页内 update 算子；{@code replaceClustered} 整记录替换（原地/搬迁），key 变化返回 REQUIRES_REINSERT。 */
     private final RecordPageUpdater updater;
+    /** 页内重组算子；merge 前压实 survivor，把 garbage（已 purge 空洞）回收为连续空闲，使 victim 条目可放入。 */
+    private final RecordPageReorganizer reorganizer;
     /** 页容量（来自 {@link IndexPageAccess}）；merge 的 underflow 阈值（MERGE_THRESHOLD≈50%）与 fit 判定按它折算。 */
     private final PageSize pageSize;
 
@@ -93,6 +96,7 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         this.deleter = new RecordPageDeleter();
         this.purger = new RecordPagePurger();
         this.updater = new RecordPageUpdater(registry);
+        this.reorganizer = new RecordPageReorganizer();
     }
 
     /**
@@ -742,7 +746,11 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         return null; // parent 仅 1 child，无同父兄弟
     }
 
-    /** survivor 是否容得下 victim 全部条目（leaf 行或内部 pointer），每条目计 encode+{@link #MERGE_ENTRY_MARGIN}。 */
+    /**
+     * survivor 是否容得下 victim 全部条目（leaf 行或内部 pointer），每条目计 encode+{@link #MERGE_ENTRY_MARGIN}。
+     * 比较基准是 survivor 的**可回收空闲**（{@code freeSpace()+garbage()}）而非仅连续空闲：merge 执行时会先 reorganize
+     * survivor 压实 garbage（见 {@link #mergeLeaf}/{@link #mergeInternal}），届时连续空闲 == 可回收空闲。
+     */
     private boolean mergeFits(MergePair pair, boolean leaf, BTreeIndex index) {
         RecordPage survivor = pair.survivor().recordPage();
         RecordPage victim = pair.victim().recordPage();
@@ -757,18 +765,20 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
                 required += recordEncoder.encode(pointerCodec.toRecord(p, ps), ps.schema()).length + MERGE_ENTRY_MARGIN;
             }
         }
-        return required <= survivor.freeSpace();
+        return required <= survivor.freeSpace() + survivor.header().garbage();
     }
 
     /**
-     * 叶页 merge：把 victim 全部行并入 survivor（victim 所有 key &gt; survivor，按页内顺序插入即追加保持有序），再修 FIL 链：
-     * survivor 是相邻对左者，原 {@code survivor.next==victim}，改为 {@code victim.next}，并令远兄弟 {@code victim.next.prev=survivor}。
+     * 叶页 merge：先 reorganize survivor 压实 garbage（把历次 purge 留下的空洞回收为连续空闲），再把 victim 全部行并入
+     * survivor（victim 所有 key &gt; survivor，按页内顺序插入即追加保持有序），最后修 FIL 链：survivor 是相邻对左者，
+     * 原 {@code survivor.next==victim}，改为 {@code victim.next}，并令远兄弟 {@code victim.next.prev=survivor}。
      */
     private void mergeLeaf(MiniTransaction mtr, BTreeIndex index, MergePair pair) {
         IndexPageHandle survivorHandle = pair.survivor();
         IndexPageHandle victimHandle = pair.victim();
         RecordPage survivor = survivorHandle.recordPage();
         RecordPage victim = victimHandle.recordPage();
+        reorganizer.reorganize(survivor);
         for (LogicalRecord row : materializeLeafRecords(victim, index)) {
             inserter.insert(survivor, pair.survivorId(), row, index.keyDef(), index.schema());
         }
@@ -781,10 +791,11 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         }
     }
 
-    /** 内部页 merge：把 victim 全部 node pointer 并入 survivor（victim key 段整体 &gt; survivor，按序追加）；内部页不参与 FIL 链。 */
+    /** 内部页 merge：先 reorganize survivor 压实 garbage，再把 victim 全部 node pointer 并入 survivor（victim key 段整体 &gt; survivor，按序追加）；内部页不参与 FIL 链。 */
     private void mergeInternal(BTreeIndex index, MergePair pair) {
         RecordPage survivor = pair.survivor().recordPage();
         RecordPage victim = pair.victim().recordPage();
+        reorganizer.reorganize(survivor);
         writePointers(survivor, pair.survivorId(), materializePointers(victim, index), index);
     }
 

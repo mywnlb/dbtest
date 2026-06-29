@@ -297,6 +297,135 @@ class BTreeDeleteClusteredTest {
         });
     }
 
+    @Test
+    void deleteAllRowsShrinksTreeToLevelZero() {
+        onPool(ctx -> {
+            ctx.createTablespaceAndRoot();
+            SplitCapableBTreeIndexService svc = ctx.service();
+            BTreeIndex current = new BTreeIndex(INDEX_ID, ctx.rootPageId, 0, wideKeyDef(), wideKeySchema(), true,
+                    ctx.leafSegment, ctx.nonLeafSegment);
+            long id = 1;
+            while (current.rootLevel() < 2 && id <= 40) {
+                MiniTransaction m = ctx.mgr.begin();
+                current = svc.insertClustered(m, current, wideKeyRow(id), TransactionId.of(TRX),
+                        new RollPointer(true, PageNo.of(65), (int) id)).indexAfterInsert();
+                ctx.mgr.commit(m);
+                id++;
+            }
+            long inserted = id - 1;
+            assertTrue(current.rootLevel() >= 2, "multi-level tree before deletes");
+
+            int totalFreed = 0;
+            for (long k = 1; k <= inserted; k++) {
+                MiniTransaction d = ctx.mgr.begin();
+                BTreeDeleteResult res = svc.deleteClustered(d, current, kKey(k), TransactionId.of(TRX),
+                        new RollPointer(true, PageNo.of(65), (int) k));
+                current = res.indexAfter();
+                ctx.mgr.commit(d);
+                assertTrue(res.removed(), "key " + k + " removed");
+                totalFreed += res.freedPages().size();
+            }
+
+            assertEquals(0, current.rootLevel(), "deleting every row collapses the tree to a level-0 root leaf");
+            assertEquals(ctx.rootPageId, current.rootPageId(), "root page id stays stable across shrink");
+            assertTrue(totalFreed > 0, "merge/shrink freed interior + leaf pages");
+
+            MiniTransaction r = ctx.mgr.begin();
+            for (long k = 1; k <= inserted; k++) {
+                assertTrue(svc.lookup(r, current, kKey(k)).isEmpty(), "key " + k + " gone after full delete");
+            }
+            ctx.mgr.commit(r);
+
+            // 树仍可复用：collapse 后重新插入仍可查（root 页号稳定、空间回收后可再分配）。
+            MiniTransaction m2 = ctx.mgr.begin();
+            current = svc.insertClustered(m2, current, wideKeyRow(1), TransactionId.of(TRX),
+                    new RollPointer(true, PageNo.of(65), 1)).indexAfterInsert();
+            ctx.mgr.commit(m2);
+            MiniTransaction r2 = ctx.mgr.begin();
+            assertTrue(svc.lookup(r2, current, kKey(1)).isPresent(), "tree reusable after full shrink");
+            ctx.mgr.commit(r2);
+        });
+    }
+
+    @Test
+    void internalUnderflowPropagatesAndShrinksRoot() {
+        onPool(ctx -> {
+            ctx.createTablespaceAndRoot();
+            SplitCapableBTreeIndexService svc = ctx.service();
+            BTreeIndex current = new BTreeIndex(INDEX_ID, ctx.rootPageId, 0, wideKeyDef(), wideKeySchema(), true,
+                    ctx.leafSegment, ctx.nonLeafSegment);
+            long id = 1;
+            while (current.rootLevel() < 2 && id <= 40) {
+                MiniTransaction m = ctx.mgr.begin();
+                current = svc.insertClustered(m, current, wideKeyRow(id), TransactionId.of(TRX),
+                        new RollPointer(true, PageNo.of(65), (int) id)).indexAfterInsert();
+                ctx.mgr.commit(m);
+                id++;
+            }
+            long inserted = id - 1;
+            int originalLevel = current.rootLevel();
+            assertTrue(originalLevel >= 2, "start from a level-2 tree");
+
+            // 删掉除最后两行外的全部 key：欠载沿内部层向上传播，root 至少 shrink 一层；剩余行仍可查。
+            int totalFreed = 0;
+            for (long k = 1; k <= inserted - 2; k++) {
+                MiniTransaction d = ctx.mgr.begin();
+                BTreeDeleteResult res = svc.deleteClustered(d, current, kKey(k), TransactionId.of(TRX),
+                        new RollPointer(true, PageNo.of(65), (int) k));
+                current = res.indexAfter();
+                ctx.mgr.commit(d);
+                assertTrue(res.removed(), "key " + k + " removed");
+                totalFreed += res.freedPages().size();
+            }
+
+            assertTrue(current.rootLevel() < originalLevel,
+                    "internal-node merges propagate up and shrink the root at least one level");
+            assertTrue(totalFreed > 0, "interior/leaf pages freed during propagation");
+            assertEquals(ctx.rootPageId, current.rootPageId(), "root page id stable across propagation/shrink");
+
+            MiniTransaction r = ctx.mgr.begin();
+            assertTrue(svc.lookup(r, current, kKey(inserted - 1)).isPresent(), "kept key present");
+            assertTrue(svc.lookup(r, current, kKey(inserted)).isPresent(), "kept key present");
+            assertTrue(svc.lookup(r, current, kKey(1)).isEmpty(), "deleted key gone");
+            ctx.mgr.commit(r);
+        });
+    }
+
+    @Test
+    void mergeSkippedWhenCombinedDoesNotFit() {
+        onPool(ctx -> {
+            ctx.createTablespaceAndRoot();
+            SplitCapableBTreeIndexService svc = ctx.service();
+            BTreeIndex current = new BTreeIndex(INDEX_ID, ctx.rootPageId, 0, wideKeyDef(), wideKeySchema(), true,
+                    ctx.leafSegment, ctx.nonLeafSegment);
+            // 1..5 → [1,2],[3,4,5]：右 leaf 满（3 行）。
+            for (long id = 1; id <= 5; id++) {
+                MiniTransaction m = ctx.mgr.begin();
+                current = svc.insertClustered(m, current, wideKeyRow(id), TransactionId.of(TRX),
+                        new RollPointer(true, PageNo.of(65), (int) id)).indexAfterInsert();
+                ctx.mgr.commit(m);
+            }
+            assertEquals(1, current.rootLevel(), "5 wide-key rows form a level-1 tree with a full right leaf");
+
+            // 删最左 key 使左 leaf 欠载（1 行），但其唯一同父兄弟（满 3 行）容不下 → merge 跳过、无回收。
+            MiniTransaction d = ctx.mgr.begin();
+            BTreeDeleteResult res = svc.deleteClustered(d, current, kKey(1), TransactionId.of(TRX),
+                    new RollPointer(true, PageNo.of(65), 1));
+            current = res.indexAfter();
+            ctx.mgr.commit(d);
+
+            assertTrue(res.removed(), "key 1 removed");
+            assertTrue(res.freedPages().isEmpty(), "underfull leaf cannot merge into a full sibling → no page freed");
+            assertEquals(1, current.rootLevel(), "no merge → tree stays level 1");
+
+            MiniTransaction r = ctx.mgr.begin();
+            List<Long> ids = svc.scan(r, current, new BTreeScanRange(kKey(1), true, kKey(5), true, 50))
+                    .stream().map(BTreeDeleteClusteredTest::vOf).toList();
+            ctx.mgr.commit(r);
+            assertEquals(List.of(2L, 3L, 4L, 5L), ids, "remaining keys intact and ordered after skipped merge");
+        });
+    }
+
     // ---- helpers ----
 
     /** scan 结果取 payload 列（column1 = int v = id）。 */

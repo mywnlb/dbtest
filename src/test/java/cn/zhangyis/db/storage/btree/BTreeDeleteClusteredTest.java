@@ -261,7 +261,48 @@ class BTreeDeleteClusteredTest {
         });
     }
 
+    @Test
+    void underfullLeafMergesIntoSiblingAndRemovesParentPointer() {
+        onPool(ctx -> {
+            ctx.createTablespaceAndRoot();
+            SplitCapableBTreeIndexService svc = ctx.service();
+            // 宽聚簇 KEY（5000B）→ 每 leaf ~2-3 行、node pointer ~5KB → 6 行长成 level-1 三叶树。
+            BTreeIndex current = new BTreeIndex(INDEX_ID, ctx.rootPageId, 0, wideKeyDef(), wideKeySchema(), true,
+                    ctx.leafSegment, ctx.nonLeafSegment);
+            for (long id = 1; id <= 6; id++) {
+                MiniTransaction m = ctx.mgr.begin();
+                current = svc.insertClustered(m, current, wideKeyRow(id), TransactionId.of(TRX),
+                        new RollPointer(true, PageNo.of(65), (int) id)).indexAfterInsert();
+                ctx.mgr.commit(m);
+            }
+            assertEquals(1, current.rootLevel(), "6 wide-key rows form a level-1 tree");
+
+            // 删最大 key（落在最右 leaf）使其欠载 → merge 进左兄弟、root 少一指针，但仍 ≥2 leaf（不整树 shrink）。
+            MiniTransaction d = ctx.mgr.begin();
+            BTreeDeleteResult res = svc.deleteClustered(d, current, kKey(6), TransactionId.of(TRX),
+                    new RollPointer(true, PageNo.of(65), 6));
+            current = res.indexAfter();
+            ctx.mgr.commit(d);
+
+            assertTrue(res.removed(), "key 6 must be removed");
+            assertFalse(res.freedPages().isEmpty(), "underfull leaf merged into sibling → victim page freed");
+            assertEquals(1, current.rootLevel(), "merging two of three leaves keeps the tree at level 1");
+
+            // 剩余 key 跨 sibling 链有序 scan 回（验证 merge 后链与 parent 结构完整）。
+            MiniTransaction r = ctx.mgr.begin();
+            List<Long> ids = svc.scan(r, current, new BTreeScanRange(kKey(1), true, kKey(6), true, 50))
+                    .stream().map(BTreeDeleteClusteredTest::vOf).toList();
+            ctx.mgr.commit(r);
+            assertEquals(List.of(1L, 2L, 3L, 4L, 5L), ids, "remaining keys intact and ordered after merge");
+        });
+    }
+
     // ---- helpers ----
+
+    /** scan 结果取 payload 列（column1 = int v = id）。 */
+    private static long vOf(BTreeLookupResult row) {
+        return ((ColumnValue.IntValue) row.record().columnValues().get(1)).value();
+    }
 
     /** 宽聚簇 KEY schema：column0 = varchar(5000) 主键、column1 = int payload；clustered=true。 */
     private static TableSchema wideKeySchema() {

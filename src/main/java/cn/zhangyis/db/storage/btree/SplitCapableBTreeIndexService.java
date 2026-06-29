@@ -3,6 +3,7 @@ package cn.zhangyis.db.storage.btree;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageNo;
+import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.RollPointer;
 import cn.zhangyis.db.domain.TransactionId;
 import cn.zhangyis.db.storage.api.DiskSpaceManager;
@@ -71,6 +72,8 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
     private final RecordPagePurger purger;
     /** 页内 update 算子；{@code replaceClustered} 整记录替换（原地/搬迁），key 变化返回 REQUIRES_REINSERT。 */
     private final RecordPageUpdater updater;
+    /** 页容量（来自 {@link IndexPageAccess}）；merge 的 underflow 阈值（MERGE_THRESHOLD≈50%）与 fit 判定按它折算。 */
+    private final PageSize pageSize;
 
     public SplitCapableBTreeIndexService(IndexPageAccess pageAccess, DiskSpaceManager disk,
                                          TypeCodecRegistry registry) {
@@ -80,6 +83,7 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         this.pageAccess = pageAccess;
         this.disk = disk;
         this.registry = registry;
+        this.pageSize = pageAccess.pageSize();
         this.search = new RecordPageSearch(registry);
         this.inserter = new RecordPageInserter(registry);
         this.recordComparator = new RecordComparator(registry);
@@ -160,16 +164,20 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
             throw new DatabaseValidationException(
                     "deleteClustered requires a clustered index: " + index.indexId());
         }
-        LeafLocation leaf = findLeaf(mtr, index, key, PageLatchMode.EXCLUSIVE);
-        return deleteInLeaf(leaf.page(), leaf.pageId(), index, key, expectedTrxId, expectedRollPtr);
+        List<IndexPageHandle> path = descendPath(mtr, index, key, PageLatchMode.EXCLUSIVE);
+        return deleteInLeaf(mtr, index, path, key, expectedTrxId, expectedRollPtr);
     }
 
     /**
-     * 在已定位的 leaf 上执行所有权校验 + delete-mark + purge。{@code findEqual} 返回的是物理命中（含 delete-marked），
+     * 在已定位的 leaf（path 末项）上执行所有权校验 + delete-mark + purge，物理删除成功后触发欠载回收
+     * （merge + 原地 root shrink，见 {@link #reclaimAfterRemoval}）。{@code findEqual} 返回的是物理命中（含 delete-marked），
      * 因此这里要先按隐藏列确认归属、再判断是否已标记，避免对非本 undo 的行或已标记的行误操作。
      */
-    private BTreeDeleteResult deleteInLeaf(RecordPage leaf, PageId leafId, BTreeIndex index, SearchKey key,
-                                          TransactionId expectedTrxId, RollPointer expectedRollPtr) {
+    private BTreeDeleteResult deleteInLeaf(MiniTransaction mtr, BTreeIndex index, List<IndexPageHandle> path,
+                                          SearchKey key, TransactionId expectedTrxId, RollPointer expectedRollPtr) {
+        IndexPageHandle leafHandle = path.get(path.size() - 1);
+        RecordPage leaf = leafHandle.recordPage();
+        PageId leafId = leafHandle.pageId();
         validateLeafPage(leaf, index, leafId);
         OptionalInt found = search.findEqual(leaf, key, index.keyDef(), index.schema());
         if (found.isEmpty()) {
@@ -186,7 +194,8 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
             deleter.deleteMark(leaf, offset);
         }
         purger.purge(leaf, offset);
-        return BTreeDeleteResult.removed(index, List.of());
+        MergeOutcome outcome = reclaimAfterRemoval(mtr, index, path);
+        return BTreeDeleteResult.removed(outcome.indexAfter(), outcome.freedPages());
     }
 
     /**
@@ -214,16 +223,20 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
             throw new DatabaseValidationException(
                     "purgeDeleteMarkedClustered requires a clustered index: " + index.indexId());
         }
-        LeafLocation leaf = findLeaf(mtr, index, key, PageLatchMode.EXCLUSIVE);
-        return purgeInLeaf(leaf.page(), leaf.pageId(), index, key, expectedTrxId, expectedRollPtr);
+        List<IndexPageHandle> path = descendPath(mtr, index, key, PageLatchMode.EXCLUSIVE);
+        return purgeInLeaf(mtr, index, path, key, expectedTrxId, expectedRollPtr);
     }
 
     /**
-     * 在已定位 leaf 上执行 purge 严格校验：命中 + 已 delete-marked + 隐藏列(DB_TRX_ID/DB_ROLL_PTR)匹配才物理摘除；
+     * 在已定位 leaf（path 末项）上执行 purge 严格校验：命中 + 已 delete-marked + 隐藏列(DB_TRX_ID/DB_ROLL_PTR)匹配才物理摘除；
      * 否则不改任何内容（stale 收敛）。与 {@link #deleteInLeaf} 的差别：未标记记录在此**不**会被 deleteMark。
+     * 物理摘除成功后同样触发欠载回收（{@link #reclaimAfterRemoval}）。
      */
-    private BTreeDeleteResult purgeInLeaf(RecordPage leaf, PageId leafId, BTreeIndex index, SearchKey key,
-                                          TransactionId expectedTrxId, RollPointer expectedRollPtr) {
+    private BTreeDeleteResult purgeInLeaf(MiniTransaction mtr, BTreeIndex index, List<IndexPageHandle> path,
+                                          SearchKey key, TransactionId expectedTrxId, RollPointer expectedRollPtr) {
+        IndexPageHandle leafHandle = path.get(path.size() - 1);
+        RecordPage leaf = leafHandle.recordPage();
+        PageId leafId = leafHandle.pageId();
         validateLeafPage(leaf, index, leafId);
         OptionalInt found = search.findEqual(leaf, key, index.keyDef(), index.schema());
         if (found.isEmpty()) {
@@ -237,7 +250,8 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
             return BTreeDeleteResult.noChange(index);
         }
         purger.purge(leaf, offset);
-        return BTreeDeleteResult.removed(index, List.of());
+        MergeOutcome outcome = reclaimAfterRemoval(mtr, index, path);
+        return BTreeDeleteResult.removed(outcome.indexAfter(), outcome.freedPages());
     }
 
     /**
@@ -594,6 +608,248 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         writePointers(node, nodeHandle.pageId(), split.left(), index);
         writePointers(newSibling, newSiblingId, split.right(), index);
         return newSiblingId;
+    }
+
+    // =====================================================================
+    // 删除 / purge 后的欠载回收（0.12）：merge 同父相邻兄弟 + 摘 parent pointer + free page + 自底向上传播 + 原地 root shrink。
+    // 设计 §8.3/§5.6。本切片不做 redistribute（fit 不下即留欠载/留退化页 → 0.12b）。
+    //
+    // min-key-pointer 约定（每个 node pointer 携子树 lowKey、split 右半整体保留）使 merge 对 leaf/内部页统一：
+    // survivor 恒取相邻对的【左】者、victim 取【右】者，把 victim 条目并入 survivor、从 parent 摘 victim 的 pointer —— survivor
+    // 的父 pointer key 不变，故【无 separator 下拉/更新】。叶页额外修 FIL prev/next；内部页不参与 FIL 链。
+    //
+    // 锁：悲观全路径 X（descend 已持）+ 额外取 sibling/远兄弟/child 的 X，均入 MTR memo，commit 统一释放（无 latch coupling，0.13）。
+    // redo：复用物理 PAGE_BYTES/PAGE_INIT（move 条目 = inserter 写、摘 pointer = purger 写、root.format = PAGE_INIT），无 btree 专用逻辑 redo。
+    // =====================================================================
+
+    /** 一条记录被物理摘除后，survivor 容纳 victim 所需的每条目额外余量（目录槽 + 对齐安全），与 {@link #pointerFits} 的 +8 一致。 */
+    private static final int MERGE_ENTRY_MARGIN = 8;
+
+    /**
+     * 欠载回收入口：从刚删过记录的 leaf（path 末项）向上评估 merge。返回操作后的索引快照（root shrink 会降 rootLevel，
+     * root 页号稳定）与本次回收的页集合。无 segment 元数据（leaf-only 风格）无法 freePage，保守不回收。
+     */
+    private MergeOutcome reclaimAfterRemoval(MiniTransaction mtr, BTreeIndex index, List<IndexPageHandle> path) {
+        if (index.leafSegment() == null || index.nonLeafSegment() == null) {
+            return new MergeOutcome(index, List.of());
+        }
+        List<PageId> freed = new ArrayList<>();
+        BTreeIndex after = considerMerge(mtr, index, path, path.size() - 1, freed);
+        return new MergeOutcome(after, List.copyOf(freed));
+    }
+
+    /**
+     * 评估 {@code path[depth]} 是否欠载并 merge，自底向上传播。{@code depth==0}（节点即 root）不 merge（root 无兄弟）。
+     * 否则：欠载 → 经 parent 的 pointer 顺序选同父相邻兄弟（survivor=左/victim=右）→ fit 则 merge、摘 victim 的 parent
+     * pointer、free victim 页 → 传播：parent 非 root 且欠载则递归到 {@code depth-1}；parent 是 root 且剩 1 pointer 则 shrinkRoot。
+     *
+     * <p>fit 不下（survivor 容不下 victim 全部条目）即返回原 index：留欠载页（甚至退化的 1-pointer 内部页），由 0.12b
+     * 的 redistribute 再平衡，导航仍正确（chooseChild 对单 pointer 也返回该子）。
+     */
+    private BTreeIndex considerMerge(MiniTransaction mtr, BTreeIndex index, List<IndexPageHandle> path,
+                                    int depth, List<PageId> freed) {
+        if (depth == 0) {
+            return index; // 节点即 root：root 不与兄弟 merge（root 允许欠载）
+        }
+        IndexPageHandle nodeHandle = path.get(depth);
+        RecordPage node = nodeHandle.recordPage();
+        if (!isUnderfull(node)) {
+            return index;
+        }
+        IndexPageHandle parentHandle = path.get(depth - 1);
+        RecordPage parent = parentHandle.recordPage();
+        boolean parentIsRoot = (depth - 1 == 0);
+
+        MergePair pair = chooseMergePair(mtr, index, parent, nodeHandle);
+        if (pair == null) {
+            // 无同父兄弟（parent 仅 1 child）：parent 是 root 即 shrink；非 root 退化页留待 0.12b。
+            if (parentIsRoot && userRecordCount(parent) == 1) {
+                return shrinkRoot(mtr, index, parentHandle, freed);
+            }
+            return index;
+        }
+        boolean leaf = node.header().level() == 0;
+        if (!mergeFits(pair, leaf, index)) {
+            return index; // 容不下：留欠载（redistribute = 0.12b）
+        }
+        if (leaf) {
+            mergeLeaf(mtr, index, pair);
+        } else {
+            mergeInternal(index, pair);
+        }
+        removePointerFromParent(parent, parentHandle.pageId(), index, pair.victimId());
+        freed.add(pair.victimId());
+        disk.freePage(mtr, leaf ? index.leafSegment() : index.nonLeafSegment(), pair.victimId());
+
+        if (parentIsRoot) {
+            // 摘 pointer 后 root 剩 1 pointer → 原地 shrink；否则 root 允许任意 ≥2 pointer（含欠载），收工。
+            if (userRecordCount(parent) == 1) {
+                return shrinkRoot(mtr, index, parentHandle, freed);
+            }
+            return index;
+        }
+        // parent 非 root：可能因少一 pointer 而欠载，向上递归（parent 在 path 中仍持 X，内容已更新）。
+        return considerMerge(mtr, index, path, depth - 1, freed);
+    }
+
+    /**
+     * MERGE_THRESHOLD≈50%：页内**活记录占用**低于页一半即视为欠载（空页恒欠载）。
+     *
+     * <p>关键：必须用「可回收空闲」= {@code freeSpace()（连续）+ garbage()（已删记录字节，purge 挂入 GarbageList 但不降 heapTop）}
+     * 来判断填充率，而非仅连续 {@code freeSpace()}。否则刚 purge 出的空洞计入 garbage 而非连续空闲，会把实际很空的页误判为「满」。
+     * 页头/目录开销相对 16KB 页可忽略，故按 {@code pageSize/2} 折算（与 InnoDB 基于 PAGE_GARBAGE 的精确阈值相比为教学简化）。
+     */
+    private boolean isUnderfull(RecordPage page) {
+        int reclaimableFree = page.freeSpace() + page.header().garbage();
+        return reclaimableFree * 2 > pageSize.bytes();
+    }
+
+    /** 非叶页的 node pointer 数 / 叶页的用户记录数（= header.nRecs，含 delete-marked）。shrink 用它判 root 是否只剩 1 child。 */
+    private int userRecordCount(RecordPage page) {
+        return page.header().nRecs();
+    }
+
+    /**
+     * 经 parent 的 pointer 顺序选同父相邻 merge 对（保证同父，无需依赖 FIL 链）：node 在 parent 有序 pointer 中下标 i，
+     * 有左兄弟取 (i-1, i)、否则取 (i, i+1)；survivor 恒为对的左者（其父 pointer key 不变）。仅 1 child 返回 null。
+     * 兄弟页不在 descend path 上，故在此取 X 入 MTR memo。
+     */
+    private MergePair chooseMergePair(MiniTransaction mtr, BTreeIndex index, RecordPage parent,
+                                      IndexPageHandle nodeHandle) {
+        List<BTreeNodePointer> pointers = materializePointers(parent, index);
+        PageId nodeId = nodeHandle.pageId();
+        int i = -1;
+        for (int k = 0; k < pointers.size(); k++) {
+            if (pointers.get(k).childPageId().equals(nodeId)) {
+                i = k;
+                break;
+            }
+        }
+        if (i < 0) {
+            throw new BTreeStructureCorruptedException("child " + nodeId
+                    + " not found in parent pointers for index " + index.indexId());
+        }
+        if (i > 0) {
+            PageId leftId = pointers.get(i - 1).childPageId();
+            IndexPageHandle left = pageAccess.openIndexPageHandle(mtr, leftId, PageLatchMode.EXCLUSIVE);
+            return new MergePair(left, nodeHandle, leftId, nodeId);
+        }
+        if (i + 1 < pointers.size()) {
+            PageId rightId = pointers.get(i + 1).childPageId();
+            IndexPageHandle right = pageAccess.openIndexPageHandle(mtr, rightId, PageLatchMode.EXCLUSIVE);
+            return new MergePair(nodeHandle, right, nodeId, rightId);
+        }
+        return null; // parent 仅 1 child，无同父兄弟
+    }
+
+    /** survivor 是否容得下 victim 全部条目（leaf 行或内部 pointer），每条目计 encode+{@link #MERGE_ENTRY_MARGIN}。 */
+    private boolean mergeFits(MergePair pair, boolean leaf, BTreeIndex index) {
+        RecordPage survivor = pair.survivor().recordPage();
+        RecordPage victim = pair.victim().recordPage();
+        int required = 0;
+        if (leaf) {
+            for (LogicalRecord row : materializeLeafRecords(victim, index)) {
+                required += recordEncoder.encode(row, index.schema()).length + MERGE_ENTRY_MARGIN;
+            }
+        } else {
+            BTreeNodePointerSchema ps = BTreeNodePointerSchema.from(index);
+            for (BTreeNodePointer p : materializePointers(victim, index)) {
+                required += recordEncoder.encode(pointerCodec.toRecord(p, ps), ps.schema()).length + MERGE_ENTRY_MARGIN;
+            }
+        }
+        return required <= survivor.freeSpace();
+    }
+
+    /**
+     * 叶页 merge：把 victim 全部行并入 survivor（victim 所有 key &gt; survivor，按页内顺序插入即追加保持有序），再修 FIL 链：
+     * survivor 是相邻对左者，原 {@code survivor.next==victim}，改为 {@code victim.next}，并令远兄弟 {@code victim.next.prev=survivor}。
+     */
+    private void mergeLeaf(MiniTransaction mtr, BTreeIndex index, MergePair pair) {
+        IndexPageHandle survivorHandle = pair.survivor();
+        IndexPageHandle victimHandle = pair.victim();
+        RecordPage survivor = survivorHandle.recordPage();
+        RecordPage victim = victimHandle.recordPage();
+        for (LogicalRecord row : materializeLeafRecords(victim, index)) {
+            inserter.insert(survivor, pair.survivorId(), row, index.keyDef(), index.schema());
+        }
+        long victimNext = victimHandle.fileHeader().nextPageNo();
+        survivorHandle.writeSiblingLinks(survivorHandle.fileHeader().prevPageNo(), victimNext);
+        if (victimNext != FilePageHeader.FIL_NULL) {
+            PageId farId = PageId.of(pair.victimId().spaceId(), PageNo.of(victimNext));
+            IndexPageHandle far = pageAccess.openIndexPageHandle(mtr, farId, PageLatchMode.EXCLUSIVE);
+            far.writeSiblingLinks(pair.survivorId().pageNo().value(), far.fileHeader().nextPageNo());
+        }
+    }
+
+    /** 内部页 merge：把 victim 全部 node pointer 并入 survivor（victim key 段整体 &gt; survivor，按序追加）；内部页不参与 FIL 链。 */
+    private void mergeInternal(BTreeIndex index, MergePair pair) {
+        RecordPage survivor = pair.survivor().recordPage();
+        RecordPage victim = pair.victim().recordPage();
+        writePointers(survivor, pair.survivorId(), materializePointers(victim, index), index);
+    }
+
+    /** 从 parent 摘除指向 {@code victimId} 的 node pointer（deleteMark + purge；node pointer 非系统记录可标记后摘）。 */
+    private void removePointerFromParent(RecordPage parent, PageId parentId, BTreeIndex index, PageId victimId) {
+        BTreeNodePointerSchema ps = BTreeNodePointerSchema.from(index);
+        for (int off : parent.recordOffsetsInOrder()) {
+            BTreeNodePointer p = pointerCodec.fromRecord(
+                    new RecordCursor(parent, off, ps.schema(), registry).materialize(), ps);
+            if (p.childPageId().equals(victimId)) {
+                deleter.deleteMark(parent, off);
+                purger.purge(parent, off);
+                return;
+            }
+        }
+        throw new BTreeStructureCorruptedException("victim pointer " + victimId
+                + " not found in parent " + parentId + " for index " + index.indexId());
+    }
+
+    /**
+     * 原地 root shrink：root 恰剩 1 个 node pointer 时，把唯一 child 内容吸收进 root（root 页号稳定）、树高 -1、free child。
+     * child 是 leaf → root 退回 level-0 leaf（FIL 链清 NULL）；child 是内部页 → root 降到 child level 并吸收其 pointer，
+     * 若吸收后 root 仍只剩 1 pointer 则级联再 shrink。返回降级后的索引快照。
+     */
+    private BTreeIndex shrinkRoot(MiniTransaction mtr, BTreeIndex index, IndexPageHandle rootHandle, List<PageId> freed) {
+        RecordPage root = rootHandle.recordPage();
+        BTreeNodePointerSchema ps = BTreeNodePointerSchema.from(index);
+        int off = root.recordOffsetsInOrder().get(0);
+        PageId childId = pointerCodec.fromRecord(
+                new RecordCursor(root, off, ps.schema(), registry).materialize(), ps).childPageId();
+        int childLevel = index.rootLevel() - 1;
+        IndexPageHandle childHandle = pageAccess.openIndexPageHandle(mtr, childId, PageLatchMode.EXCLUSIVE);
+        RecordPage child = childHandle.recordPage();
+
+        if (childLevel == 0) {
+            // 先物化 child 行，再 format(0) 清空 root 重灌（format 重置 nRecs/infimum/supremum）。
+            List<LogicalRecord> rows = materializeLeafRecords(child, index);
+            root.format(index.indexId(), 0);
+            rootHandle.writeSiblingLinks(FilePageHeader.FIL_NULL, FilePageHeader.FIL_NULL);
+            for (LogicalRecord row : rows) {
+                inserter.insert(root, index.rootPageId(), row, index.keyDef(), index.schema());
+            }
+            freed.add(childId);
+            disk.freePage(mtr, index.leafSegment(), childId);
+            return index.withRootLevel(0);
+        }
+        List<BTreeNodePointer> pointers = materializePointers(child, index);
+        root.format(index.indexId(), childLevel);
+        rootHandle.writeSiblingLinks(FilePageHeader.FIL_NULL, FilePageHeader.FIL_NULL);
+        writePointers(root, index.rootPageId(), pointers, index);
+        freed.add(childId);
+        disk.freePage(mtr, index.nonLeafSegment(), childId);
+        BTreeIndex after = index.withRootLevel(childLevel);
+        if (userRecordCount(root) == 1) {
+            return shrinkRoot(mtr, after, rootHandle, freed);
+        }
+        return after;
+    }
+
+    /** 欠载回收结果：操作后索引快照（root shrink 会降 rootLevel）+ 回收页集合。 */
+    private record MergeOutcome(BTreeIndex indexAfter, List<PageId> freedPages) {
+    }
+
+    /** merge 的相邻同父页对：survivor 恒为左者（保留、父 pointer key 不变），victim 为右者（并入 survivor 后被摘 pointer + free）。 */
+    private record MergePair(IndexPageHandle survivor, IndexPageHandle victim, PageId survivorId, PageId victimId) {
     }
 
     /**

@@ -439,6 +439,82 @@ class BTreeDeleteClusteredTest {
         return ((ColumnValue.IntValue) row.record().columnValues().get(1)).value();
     }
 
+    @Test
+    void internalRedistributeKeepsSubtreesBalanced() {
+        onPool(ctx -> {
+            ctx.createTablespaceAndRoot();
+            SplitCapableBTreeIndexService svc = ctx.service();
+            BTreeIndex current = new BTreeIndex(INDEX_ID, ctx.rootPageId, 0, wideKeyDef(), wideKeySchema(), true,
+                    ctx.leafSegment, ctx.nonLeafSegment);
+            // 10 宽 key 行 → level-2 树：root 两个 level-1 子，左 A=2 ptr、右 B=3 ptr（满）。
+            for (long n = 1; n <= 10; n++) {
+                MiniTransaction m = ctx.mgr.begin();
+                current = svc.insertClustered(m, current, wideKeyRow(n), TransactionId.of(TRX),
+                        new RollPointer(true, PageNo.of(65), (int) n)).indexAfterInsert();
+                ctx.mgr.commit(m);
+            }
+            assertEquals(2, current.rootLevel(), "10 wide-key rows form a level-2 tree");
+            List<Integer> before = new ArrayList<>();
+            collectFills(ctx, current, before, new ArrayList<>());
+            assertEquals(List.of(2, 3), before, "root has a 2-ptr left and a full 3-ptr right level-1 child");
+
+            // 删最小 key → 左 A 一个 leaf 欠载并 merge → A 降到 1 ptr 欠载 → 与满兄弟 B(3 ptr) 合计 4>3 fit 不下
+            // → 触发 internal redistribute 平分为 2+2（而非 0.12 留 1-ptr 退化内部页或 shrink）。
+            MiniTransaction d = ctx.mgr.begin();
+            BTreeDeleteResult res = svc.deleteClustered(d, current, kKey(1), TransactionId.of(TRX),
+                    new RollPointer(true, PageNo.of(65), 1));
+            current = res.indexAfter();
+            ctx.mgr.commit(d);
+            assertTrue(res.removed(), "key 1 removed");
+
+            List<Integer> after = new ArrayList<>();
+            collectFills(ctx, current, after, new ArrayList<>());
+            assertEquals(2, current.rootLevel(), "internal redistribute keeps the tree at level 2 (no shrink)");
+            assertEquals(List.of(2, 2), after,
+                    "internal redistribute rebalances the two level-1 children to 2+2 (no 1-ptr degenerate page)");
+
+            MiniTransaction r = ctx.mgr.begin();
+            List<Long> ids = svc.scan(r, current, new BTreeScanRange(kKey(1), true, kKey(10), true, 50))
+                    .stream().map(BTreeDeleteClusteredTest::vOf).toList();
+            ctx.mgr.commit(r);
+            assertEquals(List.of(2L, 3L, 4L, 5L, 6L, 7L, 8L, 9L, 10L), ids, "remaining keys intact and ordered");
+        });
+    }
+
+    /** 遍历整树，收集非根内部页的 pointer 数与 leaf 的记录数（白盒结构检查）。 */
+    private void collectFills(Ctx ctx, BTreeIndex index, List<Integer> internalNonRoot, List<Integer> leaves) {
+        MiniTransaction r = ctx.mgr.begin();
+        try {
+            walk(ctx, index, index.rootPageId(), index.rootLevel(), true, internalNonRoot, leaves, r);
+            ctx.mgr.commit(r);
+        } catch (Throwable t) {
+            ctx.mgr.rollbackUncommitted(r);
+            throw t;
+        }
+    }
+
+    private void walk(Ctx ctx, BTreeIndex index, PageId pageId, int level, boolean isRoot,
+                      List<Integer> internalNonRoot, List<Integer> leaves, MiniTransaction r) {
+        RecordPage page = ctx.access.openIndexPage(r, pageId, PageLatchMode.SHARED);
+        if (level == 0) {
+            leaves.add(page.header().nRecs());
+            return;
+        }
+        if (!isRoot) {
+            internalNonRoot.add(page.header().nRecs());
+        }
+        BTreeNodePointerSchema ps = BTreeNodePointerSchema.from(index);
+        BTreeNodePointerCodec codec = new BTreeNodePointerCodec();
+        List<PageId> children = new ArrayList<>();
+        for (int off : page.recordOffsetsInOrder()) {
+            children.add(codec.fromRecord(
+                    new RecordCursor(page, off, ps.schema(), registry).materialize(), ps).childPageId());
+        }
+        for (PageId c : children) {
+            walk(ctx, index, c, level - 1, false, internalNonRoot, leaves, r);
+        }
+    }
+
     /** 白盒读 level-1 树各 leaf 的用户记录数（按 root pointer 顺序），验证 redistribute 后相邻对均衡而非 1+3 留欠载。 */
     private List<Long> leafRecordCounts(Ctx ctx, BTreeIndex index) {
         MiniTransaction r = ctx.mgr.begin();

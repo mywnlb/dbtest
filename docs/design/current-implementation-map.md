@@ -266,7 +266,7 @@ flowchart TD
 | Package area | Representative classes | Current state | Notes |
 | --- | --- | --- | --- |
 | `storage.redo` core | `RedoLogManager`, `ContiguousLsnTracker`, `RedoLogIo`, batches/ranges/physical records | Partial | 默认 manager 为 memory mode；`StorageEngine`/truncation 测试组合注入 durable manager；支持 recovery boundary 恢复与连续续写；recent written/closed 连续边界已接，append 与 fsync 状态锁已拆分 |
-| `storage.redo` durable IO | `RedoLogWriter`, `RedoLogFlusher`, `RedoLogFileRepository` | Implemented | `StorageEngine` 和 tests 打开 append-only redo file；no rotation/recycling; frame = magic + payloadLen + crc32 + payload |
+| `storage.redo` durable IO | `RedoLogWriter`, `RedoLogFlusher`, `RedoLogFileRepository`(接口), `SingleFileRedoLogRepository`, `RotatingRedoLogRepository`, `RedoBatchFrameCodec` | Implemented | `RedoLogFileRepository` 现为角色接口（append/force/readBatches）；`SingleFileRedoLogRepository`=单 append-only（`StorageEngine` 默认）；`RotatingRedoLogRepository`(0.18a)=固定文件环，轮转 + checkpoint 回收 + 跨文件恢复扫描，经接口可插入 durable/recovery，但 engine bootstrap 仍构造单文件、环未生产接线；frame 编解码抽到 `RedoBatchFrameCodec`，两实现共用（magic + payloadLen + crc32 + payload） |
 | `storage.redo` checkpoint | `RedoCheckpointStore`, `RedoCheckpointLabel` | Implemented | Two-slot fuzzy checkpoint with CRC32；`StorageEngine` 和 tests 打开；`flush.checkpoint.CheckpointCoordinator` 写入 |
 | `storage.redo` recovery | `RedoRecoveryReader`, `RedoApplyDispatcher`, `RedoApplyContext`, `PageRedoApplyHandler` | Implemented; production-wired by `StorageEngine` E2 | `StorageEngine.open(existing)` constructs `pageDispatcher` + `RedoApplyContext(PageStore,pageSize)`；single-handler dispatch (only `PageRedoApplyHandler`)；只恢复已打开/显式配置的表空间 |
 | `storage.redo` capacity | `RedoCapacityPolicy`, `RedoCapacityPressure`, `RedoCapacityDecision` | Implemented | `StorageEngine` 和 tests 使用 fixed capacity；4 pressure levels NONE/ASYNC_FLUSH/SYNC_FLUSH/HARD_LIMIT; consumed by `FlushService` |
@@ -529,7 +529,8 @@ flowchart TD
 
 | Type | Current caller | Why it exists | Next action |
 | --- | --- | --- | --- |
-| `RedoLogWriter` / `RedoLogFlusher` / `RedoLogFileRepository` | `StorageEngine` + tests | Durable redo write/flush/file IO | Add redo recycling/rotation and true background redo writer/flusher |
+| `RedoLogWriter` / `RedoLogFlusher` / `RedoLogFileRepository`(接口) / `SingleFileRedoLogRepository` | `StorageEngine` + tests | Durable redo write/flush/单文件 IO | Add true background redo writer/flusher |
+| `RotatingRedoLogRepository` / `RedoBatchFrameCodec` / `RedoLogCapacityExceededException` | tests + `RedoLogFileRepository.openRing`（无生产 engine 调用） | 0.18a redo 文件环：轮转 + checkpoint 回收 + 跨文件恢复扫描；经接口已可插入 `RedoLogManager.durable` / `RedoRecoveryReader`（含集成测试） | `StorageEngine` bootstrap 改用 `openRing` + 把持久 `checkpointLsn` 经 `advanceReclaimBoundary` 注入（0.18b 生产接线） |
 | `RedoCheckpointStore` / `RedoCheckpointLabel` | `StorageEngine` + tests | Fuzzy checkpoint control file | Add redo recycling integration and richer checkpoint diagnostics |
 | `RedoRecoveryReader` / `RedoApplyDispatcher` / `RedoApplyContext` / `PageRedoApplyHandler` | `StorageEngine.open(existing)` + tests | Redo replay path for configured/opened tablespaces | Add tablespace discovery and more redo handlers as formats expand |
 | `RedoCapacityPolicy` / `RedoCapacityPressure` / `RedoCapacityDecision` | `StorageEngine` + tests | Redo capacity pressure evaluation | Add append throttle / wait policy and config-driven thresholds |
@@ -625,7 +626,7 @@ flowchart TD
 | --- | --- | --- |
 | 仅 2 种 redo 记录类型 | 只有 `PAGE_INIT`/`PAGE_BYTES`，无 MLOG 逻辑 redo | 按需添加逻辑 redo 类型 |
 | commit 不等 redo durable | `MiniTransaction.commit` append redo、发布 dirty 并 markClosed 后返回；事务层没有按策略等待 write/fsync | 添加 commit durability policy（`FLUSH_ON_COMMIT`/`WRITE_ON_COMMIT`/后台刷盘策略） |
-| 无 redo 文件轮转/回收 | 单 append-only 文件无上限 | 添加 rotation/recycling/capacity reclaim |
+| redo 文件轮转/回收未生产接线 | `RotatingRedoLogRepository`(0.18a) 已实现轮转 + checkpoint 回收 + 跨文件恢复扫描，并经接口可插入 durable/recovery（744 tests）；但 `StorageEngine` bootstrap 仍构造单文件 `SingleFileRedoLogRepository`，环未生产接线、回收边界未由 checkpoint 注入 | `StorageEngine` 改用 `openRing` + checkpoint 推进后调 `advanceReclaimBoundary`（0.18b）；再叠加容量 throttle(0.6)、log block checksum(0.20) |
 | `RedoApplyDispatcher` 单 handler | 只注册 `PageRedoApplyHandler` | 按需添加多 handler dispatch table |
 
 ### Flush 缺口

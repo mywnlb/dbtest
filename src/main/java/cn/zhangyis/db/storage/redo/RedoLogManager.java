@@ -15,9 +15,9 @@ import java.util.concurrent.locks.ReentrantLock;
  * <p>默认构造器保持 D3 内存语义（不配置 redo 文件），供 MTR/FSP 现有测试继续使用。通过 {@link #durable} 创建的实例会把
  * append 批次保存在 pending 队列，{@link #flush()} 同步写 redo 文件并 fsync，成功后推进 flushedToDiskLsn。
  *
- * <p><b>并发简化（已知瓶颈）</b>：{@link #flush()} 在持有 {@code lock} 期间执行 writer 写文件与 flusher fsync，
- * 而 {@link #append} 也抢同一把锁——即所有 append 会被一次 fsync 完全串行化阻塞。R1/R2 接受该简化（同步驱动、
- * 无后台线程）；待后台 writer/flusher 落地时应拆分「LSN 分配锁」与「write/flush 锁」，使 append 不被 fsync 阻塞。
+ * <p><b>并发边界</b>：{@code lock} 只保护 LSN 分配、pending 队列、recent closed 和 durable 边界；
+ * {@code ioLock} 串行 redo 文件 write/fsync。flush 执行阻塞 IO 时不持有状态锁，因此前台 append 可继续预留
+ * 新 LSN 并进入下一轮 pending，但同一时间仍只有一个 flush owner 写 redo 文件。
  */
 public final class RedoLogManager {
 
@@ -25,6 +25,8 @@ public final class RedoLogManager {
 
     /** 保护 nextLsn 与 buffer 的互斥锁。 */
     private final ReentrantLock lock = new ReentrantLock();
+    /** 串行 redo 文件 write/fsync；不得在持有状态锁时等待该锁，避免 append 被长 fsync 间接阻塞。 */
+    private final ReentrantLock ioLock = new ReentrantLock();
     /** durability 等待条件；flush 推进 flushedToDiskLsn 后唤醒。 */
     private final Condition flushedAdvanced = lock.newCondition();
     /** 下一个空闲 LSN（long 计数，append 时推进）。 */
@@ -42,22 +44,33 @@ public final class RedoLogManager {
     private final List<RedoLogBatch> batches = new ArrayList<>();
     /** 尚未写入 redo 文件的批次。 */
     private final List<RedoLogBatch> pendingBatches = new ArrayList<>();
-    /** 可选 writer；为空表示 D3 内存模式。 */
-    private final RedoLogWriter writer;
-    /** 可选 flusher；为空表示 D3 内存模式。 */
-    private final RedoLogFlusher flusher;
+    /**
+     * 已写入 OS/page cache、但尚未完成 fsync 的批次。force 失败后保留在这里，下一次 flush 成功后再清理诊断快照。
+     */
+    private final List<RedoLogBatch> writtenNotFlushedBatches = new ArrayList<>();
+    /** 可选 redo IO 端口；为空表示 D3 内存模式。 */
+    private final RedoLogIo io;
     /** 已 fsync 的最高 LSN；D3 内存模式恒为 0。 */
     private Lsn flushedToDiskLsn = Lsn.of(0);
+    /**
+     * writer 可读取的 recent written 连续边界。当前 append 同步完成 buffer 写入，因此批次创建后立即推进；
+     * 后续若拆成真正并发 log buffer segment，可继续复用该 tracker 合并乱序写入完成事件。
+     */
+    private final ContiguousLsnTracker recentWritten = new ContiguousLsnTracker(Lsn.of(0));
+    /**
+     * checkpoint 可见的 recent closed 连续边界。只有 MTR 已把相关 dirty page 发布到 Buffer Pool 后才允许推进，
+     * 否则 fuzzy checkpoint 可能越过尚未进入 flush list 的 redo 区间，导致崩溃恢复缺少必要日志。
+     */
+    private final ContiguousLsnTracker recentClosed = new ContiguousLsnTracker(Lsn.of(0));
     /** 启动恢复边界是否已显式安装；只允许在首个新 append 前执行一次（同值调用幂等）。 */
     private boolean recoveredBoundaryInstalled;
 
     public RedoLogManager() {
-        this(null, null);
+        this(null);
     }
 
-    private RedoLogManager(RedoLogWriter writer, RedoLogFlusher flusher) {
-        this.writer = writer;
-        this.flusher = flusher;
+    RedoLogManager(RedoLogIo io) {
+        this.io = io;
     }
 
     /**
@@ -70,7 +83,7 @@ public final class RedoLogManager {
         if (repository == null) {
             throw new DatabaseValidationException("redo log repository must not be null");
         }
-        return new RedoLogManager(new RedoLogWriter(repository), new RedoLogFlusher(repository));
+        return new RedoLogManager(new RepositoryRedoLogIo(repository));
     }
 
     /**
@@ -95,9 +108,10 @@ public final class RedoLogManager {
             if (!records.isEmpty()) {
                 RedoLogBatch batch = new RedoLogBatch(new LogRange(Lsn.of(start), Lsn.of(end)), records);
                 batches.add(batch);
-                if (writer != null) {
+                if (io != null) {
                     pendingBatches.add(batch);
                 }
+                recentWritten.mark(batch.range());
             }
             return new LogRange(Lsn.of(start), Lsn.of(end));
         } finally {
@@ -110,6 +124,46 @@ public final class RedoLogManager {
         lock.lock();
         try {
             return Lsn.of(nextLsn);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** 已连续写入 redo buffer、可供 writer 顺序写出的 LSN 边界。 */
+    public Lsn readyForWriteLsn() {
+        lock.lock();
+        try {
+            return recentWritten.boundary();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** 所有已发布 dirty page 的连续 redo 边界，checkpoint 不能越过该值。 */
+    public Lsn closedLsn() {
+        lock.lock();
+        try {
+            return recentClosed.boundary();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 标记一个 redo 区间已经完成 dirty page 发布，可以纳入 checkpoint 边界。
+     *
+     * <p>调用方必须保证该方法发生在 pageLSN 盖戳与 dirty 发布之后；若提前关闭，checkpoint 可能持久化到
+     * 一个无法覆盖 Buffer Pool dirty view 的 LSN，崩溃恢复会从过新的位置开始扫描。
+     *
+     * @param range 已发布完成的 redo 区间；空区间不改变边界。
+     */
+    public void markClosed(LogRange range) {
+        if (range == null) {
+            throw new DatabaseValidationException("closed redo range must not be null");
+        }
+        lock.lock();
+        try {
+            recentClosed.mark(range);
         } finally {
             lock.unlock();
         }
@@ -135,30 +189,53 @@ public final class RedoLogManager {
      * @return flush 后的 durable LSN。
      */
     public Lsn flush() {
-        lock.lock();
-        try {
-            if (writer == null || flusher == null) {
+        if (io == null) {
+            lock.lock();
+            try {
                 return flushedToDiskLsn;
+            } finally {
+                lock.unlock();
             }
-            while (!pendingBatches.isEmpty()) {
-                RedoLogBatch batch = pendingBatches.get(0);
-                writer.write(batch);
-                pendingBatches.remove(0);
+        }
+        ioLock.lock();
+        try {
+            while (true) {
+                RedoLogBatch batch;
+                lock.lock();
+                try {
+                    if (pendingBatches.isEmpty()) {
+                        break;
+                    }
+                    batch = pendingBatches.get(0);
+                } finally {
+                    lock.unlock();
+                }
+                io.write(batch);
+                lock.lock();
+                try {
+                    removeWrittenPendingBatch(batch);
+                    writtenNotFlushedBatches.add(batch);
+                } finally {
+                    lock.unlock();
+                }
             }
-            Lsn physicalFlushed = flusher.flushTo(writer.writtenToDiskLsn());
-            // 新进程 writer/flusher 从 0 构造，但 restoreRecoveredBoundary 已安装历史 durable 边界；
-            // 空 pending flush 绝不能把该边界降回 0。只有本进程新写出的更高 LSN 才推进。
-            if (physicalFlushed.value() > flushedToDiskLsn.value()) {
-                flushedToDiskLsn = physicalFlushed;
+            Lsn physicalFlushed = io.flushTo(io.writtenToDiskLsn());
+            lock.lock();
+            try {
+                // 新进程 writer/flusher 从 0 构造，但 restoreRecoveredBoundary 已安装历史 durable 边界；
+                // 空 pending flush 绝不能把该边界降回 0。只有本进程新写出的更高 LSN 才推进。
+                if (physicalFlushed.value() > flushedToDiskLsn.value()) {
+                    flushedToDiskLsn = physicalFlushed;
+                }
+                // durable 模式下 buffer/batches 仅作诊断快照；已成功 fsync 的批次对恢复无意义，落盘后释放。
+                clearFlushedDiagnostics();
+                flushedAdvanced.signalAll();
+                return flushedToDiskLsn;
+            } finally {
+                lock.unlock();
             }
-            // durable 模式下 buffer/batches 仅作诊断快照；本轮 pending 已全部写盘并 fsync，
-            // 这两个列表对恢复无意义，落盘后立即释放，防止长运行 append 累积导致内存无界增长。
-            buffer.clear();
-            batches.clear();
-            flushedAdvanced.signalAll();
-            return flushedToDiskLsn;
         } finally {
-            lock.unlock();
+            ioLock.unlock();
         }
     }
 
@@ -180,12 +257,15 @@ public final class RedoLogManager {
                 }
                 throw new DatabaseValidationException("redo recovery boundary already installed at " + nextLsn);
             }
-            if (nextLsn != 0 || !buffer.isEmpty() || !batches.isEmpty() || !pendingBatches.isEmpty()) {
+            if (nextLsn != 0 || !buffer.isEmpty() || !batches.isEmpty()
+                    || !pendingBatches.isEmpty() || !writtenNotFlushedBatches.isEmpty()) {
                 throw new DatabaseValidationException(
                         "redo recovery boundary must be installed before any new append");
             }
             nextLsn = recoveredToLsn.value();
             flushedToDiskLsn = recoveredToLsn;
+            recentWritten.reset(recoveredToLsn);
+            recentClosed.reset(recoveredToLsn);
             recoveredBoundaryInstalled = true;
             flushedAdvanced.signalAll();
         } finally {
@@ -260,6 +340,52 @@ public final class RedoLogManager {
             return List.copyOf(batches);
         } finally {
             lock.unlock();
+        }
+    }
+
+    private void removeWrittenPendingBatch(RedoLogBatch batch) {
+        if (!pendingBatches.isEmpty() && pendingBatches.get(0).equals(batch)) {
+            pendingBatches.remove(0);
+            return;
+        }
+        if (!pendingBatches.remove(batch)) {
+            throw new DatabaseValidationException("written redo batch no longer pending: " + batch.range());
+        }
+    }
+
+    private void clearFlushedDiagnostics() {
+        for (RedoLogBatch batch : writtenNotFlushedBatches) {
+            batches.remove(batch);
+            for (int i = 0; i < batch.records().size() && !buffer.isEmpty(); i++) {
+                buffer.remove(0);
+            }
+        }
+        writtenNotFlushedBatches.clear();
+    }
+
+    /** 生产 redo IO 适配器：复用现有 writer/flusher，但由 manager 外层 ioLock 串行调用。 */
+    private static final class RepositoryRedoLogIo implements RedoLogIo {
+        private final RedoLogWriter writer;
+        private final RedoLogFlusher flusher;
+
+        private RepositoryRedoLogIo(RedoLogFileRepository repository) {
+            this.writer = new RedoLogWriter(repository);
+            this.flusher = new RedoLogFlusher(repository);
+        }
+
+        @Override
+        public Lsn write(RedoLogBatch batch) {
+            return writer.write(batch);
+        }
+
+        @Override
+        public Lsn writtenToDiskLsn() {
+            return writer.writtenToDiskLsn();
+        }
+
+        @Override
+        public Lsn flushTo(Lsn target) {
+            return flusher.flushTo(target);
         }
     }
 }

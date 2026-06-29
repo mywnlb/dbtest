@@ -3,10 +3,17 @@ package cn.zhangyis.db.storage.redo;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.SpaceId;
+import cn.zhangyis.db.domain.Lsn;
 import cn.zhangyis.db.storage.page.PageType;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -32,6 +39,65 @@ class RedoLogManagerTest {
         assertEquals(r1.end().value() + b.byteLength(), r2.end().value());
         assertEquals(r2.end(), mgr.currentLsn());
         assertEquals(2, mgr.bufferedRecords().size());
+    }
+
+    @Test
+    void appendDoesNotAdvanceClosedLsnUntilRangeIsClosed() {
+        RedoLogManager mgr = new RedoLogManager();
+
+        LogRange range = mgr.append(List.of(new PageInitRecord(PID, PageType.INDEX)));
+
+        assertEquals(range.end(), mgr.currentLsn(), "append still reserves the current LSN boundary");
+        assertEquals(0L, mgr.closedLsn().value(), "redo is not checkpoint-safe before dirty pages are published");
+        mgr.markClosed(range);
+        assertEquals(range.end(), mgr.closedLsn(), "closing the range publishes it to checkpoint");
+    }
+
+    @Test
+    void appendPublishesReadyForWriteLsn() {
+        RedoLogManager mgr = new RedoLogManager();
+
+        LogRange range = mgr.append(List.of(new PageBytesRecord(PID, 16, new byte[]{5})));
+
+        assertEquals(range.end(), mgr.readyForWriteLsn(),
+                "synchronous append writes the log buffer before returning");
+    }
+
+    @Test
+    void recentClosedMergesOutOfOrderRangesOnlyWhenContiguous() {
+        RedoLogManager mgr = new RedoLogManager();
+        LogRange first = mgr.append(List.of(new PageBytesRecord(PID, 0, new byte[]{1})));
+        LogRange second = mgr.append(List.of(new PageBytesRecord(PID, 8, new byte[]{2})));
+
+        mgr.markClosed(second);
+        assertEquals(0L, mgr.closedLsn().value(), "later range alone must not create a checkpoint gap");
+
+        mgr.markClosed(first);
+        assertEquals(second.end(), mgr.closedLsn(), "closing the missing prefix merges pending later ranges");
+    }
+
+    @Test
+    void appendDoesNotWaitForOngoingFlushFsync() throws Exception {
+        BlockingRedoIo io = new BlockingRedoIo();
+        RedoLogManager mgr = new RedoLogManager(io);
+        LogRange first = mgr.append(List.of(new PageBytesRecord(PID, 0, new byte[]{1})));
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<Lsn> flush = executor.submit(mgr::flush);
+            assertTrue(io.flushEntered.await(1, TimeUnit.SECONDS), "flush must enter the injected fsync wait");
+
+            Future<LogRange> append = executor.submit(
+                    () -> mgr.append(List.of(new PageBytesRecord(PID, 8, new byte[]{2}))));
+
+            LogRange second = append.get(200, TimeUnit.MILLISECONDS);
+            assertEquals(first.end(), second.start(), "append can reserve the next LSN while fsync is still blocked");
+
+            io.releaseFlush.countDown();
+            assertEquals(first.end(), flush.get(1, TimeUnit.SECONDS));
+        } finally {
+            io.releaseFlush.countDown();
+            executor.shutdownNow();
+        }
     }
 
     @Test
@@ -63,5 +129,36 @@ class RedoLogManagerTest {
         assertEquals(100L, mgr.flushedToDiskLsn().value());
         assertThrows(RuntimeException.class,
                 () -> mgr.restoreRecoveredBoundary(cn.zhangyis.db.domain.Lsn.of(200)));
+    }
+
+    private static final class BlockingRedoIo implements RedoLogIo {
+        private final CountDownLatch flushEntered = new CountDownLatch(1);
+        private final CountDownLatch releaseFlush = new CountDownLatch(1);
+        private final AtomicLong written = new AtomicLong();
+
+        @Override
+        public Lsn write(RedoLogBatch batch) {
+            written.set(batch.range().end().value());
+            return batch.range().end();
+        }
+
+        @Override
+        public Lsn writtenToDiskLsn() {
+            return Lsn.of(written.get());
+        }
+
+        @Override
+        public Lsn flushTo(Lsn target) {
+            flushEntered.countDown();
+            try {
+                if (!releaseFlush.await(2, TimeUnit.SECONDS)) {
+                    throw new AssertionError("test fsync was not released");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError("test fsync interrupted", e);
+            }
+            return target;
+        }
     }
 }

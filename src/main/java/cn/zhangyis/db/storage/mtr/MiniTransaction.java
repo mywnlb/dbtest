@@ -179,7 +179,8 @@ public final class MiniTransaction {
      *
      * <p>WAL/LSN 语义：先 {@code append} 本 MTR 收集的 redo records 取得 batch endLsn；再 {@code disable} collector，
      * 使随后的 pageLSN 盖戳写**不**进 redo（决策④：先分配 LSN 再盖 pageLSN，盖戳不入本批）；对 collector.touchedPages
-     * 逐页 {@link PageEnvelope#stampPageLsn} 盖 endLsn（恢复幂等基线）；最后 LIFO 释放 memo（按 wrote 标脏）。
+     * 逐页 {@link PageEnvelope#stampPageLsn} 盖 endLsn（恢复幂等基线）；随后 LIFO 释放 memo（按 wrote 标脏）。
+     * 只有释放完成后才关闭 redo range，保证 checkpoint 不会越过尚未发布到 Buffer Pool dirty view 的页面修改。
      */
     Lsn commit() {
         transitTo(MiniTransactionState.COMMITTING);
@@ -190,6 +191,7 @@ public final class MiniTransaction {
             PageEnvelope.stampPageLsn(memo.guardFor(pid), endLsn);
         }
         memo.releaseAll();
+        redoLogManager.markClosed(range);
         transitTo(MiniTransactionState.COMMITTED);
         return endLsn;
     }

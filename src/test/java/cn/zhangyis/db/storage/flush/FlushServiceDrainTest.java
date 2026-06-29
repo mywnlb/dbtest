@@ -16,6 +16,7 @@ import cn.zhangyis.db.storage.flush.checkpoint.CheckpointCoordinator;
 import cn.zhangyis.db.storage.flush.doublewrite.NoDoublewriteStrategy;
 import cn.zhangyis.db.storage.flush.policy.AdaptiveFlushPolicy;
 import cn.zhangyis.db.storage.page.PageEnvelopeLayout;
+import cn.zhangyis.db.storage.redo.LogRange;
 import cn.zhangyis.db.storage.redo.PageBytesRecord;
 import cn.zhangyis.db.storage.redo.RedoCapacityPolicy;
 import cn.zhangyis.db.storage.redo.RedoLogFileRepository;
@@ -52,10 +53,12 @@ class FlushServiceDrainTest {
              RedoLogFileRepository repo = RedoLogFileRepository.open(dir.resolve("redo.log"))) {
             createSpaces(store);
             RedoLogManager redo = RedoLogManager.durable(repo);
-            Lsn lsn1 = appendRedo(redo, PAGE1);
-            Lsn lsn2 = appendRedo(redo, PAGE2);
-            writeDirty(pool, PAGE1, lsn1);
-            writeDirty(pool, PAGE2, lsn2);
+            LogRange range1 = appendRedo(redo, PAGE1);
+            LogRange range2 = appendRedo(redo, PAGE2);
+            writeDirty(pool, PAGE1, range1.end());
+            writeDirty(pool, PAGE2, range2.end());
+            redo.markClosed(range1);
+            redo.markClosed(range2);
 
             TablespaceDrainResult result = service(pool, store, redo)
                     .drainTablespace(SPACE1, Duration.ofMillis(200));
@@ -75,8 +78,9 @@ class FlushServiceDrainTest {
              RedoLogFileRepository repo = RedoLogFileRepository.open(dir.resolve("redo.log"))) {
             createSpaces(store);
             RedoLogManager redo = RedoLogManager.durable(repo);
-            Lsn lsn1 = appendRedo(redo, PAGE1);
-            writeDirty(pool, PAGE1, lsn1);
+            LogRange range1 = appendRedo(redo, PAGE1);
+            writeDirty(pool, PAGE1, range1.end());
+            redo.markClosed(range1);
 
             try (PageGuard ignored = pool.getPage(PAGE1, PageLatchMode.SHARED)) {
                 TablespaceDrainResult result = service(pool, store, redo)
@@ -97,14 +101,16 @@ class FlushServiceDrainTest {
              RedoLogFileRepository repo = RedoLogFileRepository.open(dir.resolve("redo-barrier.log"))) {
             createSpaces(store);
             RedoLogManager redo = RedoLogManager.durable(repo);
-            Lsn lsn1 = appendRedo(redo, PAGE1);
-            Lsn marker = appendRedo(redo, PAGE2);
-            writeDirty(pool, PAGE1, lsn1);
-            writeDirty(pool, PAGE2, marker);
+            LogRange range1 = appendRedo(redo, PAGE1);
+            LogRange markerRange = appendRedo(redo, PAGE2);
+            writeDirty(pool, PAGE1, range1.end());
+            writeDirty(pool, PAGE2, markerRange.end());
+            redo.markClosed(range1);
+            redo.markClosed(markerRange);
 
-            Lsn checkpoint = service(pool, store, redo).flushThrough(marker, Duration.ofSeconds(1));
+            Lsn checkpoint = service(pool, store, redo).flushThrough(markerRange.end(), Duration.ofSeconds(1));
 
-            assertTrue(checkpoint.value() >= marker.value());
+            assertTrue(checkpoint.value() >= markerRange.end().value());
             assertTrue(dirtyPages(pool).isEmpty());
         }
     }
@@ -122,10 +128,10 @@ class FlushServiceDrainTest {
         store.create(SPACE2, dir.resolve("s2.ibd"), PS, PageNo.of(4));
     }
 
-    private static Lsn appendRedo(RedoLogManager redo, PageId pageId) {
-        Lsn lsn = redo.append(List.of(new PageBytesRecord(pageId, 256, new byte[]{1, 2, 3}))).end();
+    private static LogRange appendRedo(RedoLogManager redo, PageId pageId) {
+        LogRange range = redo.append(List.of(new PageBytesRecord(pageId, 256, new byte[]{1, 2, 3})));
         redo.flush();
-        return lsn;
+        return range;
     }
 
     private static void writeDirty(BufferPool pool, PageId pageId, Lsn lsn) {

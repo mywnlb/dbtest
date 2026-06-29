@@ -21,6 +21,7 @@ import cn.zhangyis.db.storage.page.PageImageChecksum;
 import cn.zhangyis.db.storage.recovery.RecoveryReport;
 import cn.zhangyis.db.storage.recovery.RecoveryStageName;
 import cn.zhangyis.db.storage.recovery.RecoveryState;
+import cn.zhangyis.db.storage.redo.LogRange;
 import cn.zhangyis.db.storage.redo.PageBytesRecord;
 import cn.zhangyis.db.storage.redo.RedoCheckpointLabel;
 import cn.zhangyis.db.storage.redo.RedoCheckpointStore;
@@ -205,9 +206,11 @@ class StorageEngineTest {
         try {
             engine.checkpoint();
             RedoLogManager redo = engine.miniTransactionManager().redoLogManager();
-            Lsn target = redo.append(List.of(new PageBytesRecord(PageId.of(DATA_SPACE, PageNo.of(7)),
-                    RECOVERY_OFFSET, new byte[]{9}))).end();
+            LogRange range = redo.append(List.of(new PageBytesRecord(PageId.of(DATA_SPACE, PageNo.of(7)),
+                    RECOVERY_OFFSET, new byte[]{9})));
             redo.flush();
+            redo.markClosed(range);
+            Lsn target = range.end();
 
             assertTrue(awaitUntil(() -> engine.lastBackgroundFlushCycle()
                     .filter(cycle -> cycle.checkpointAfter().value() >= target.value())

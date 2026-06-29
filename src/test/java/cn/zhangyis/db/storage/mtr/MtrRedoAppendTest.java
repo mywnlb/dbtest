@@ -72,6 +72,19 @@ class MtrRedoAppendTest {
     }
 
     @Test
+    void commitClosesRedoRangeAfterDirtyPublish() {
+        onPool((pool, mgr) -> {
+            MiniTransaction mtr = mgr.begin();
+            mtr.getPage(pool, PID, PageLatchMode.EXCLUSIVE).writeBytes(120, new byte[]{4});
+
+            Lsn committed = mgr.commit(mtr);
+
+            assertEquals(committed, mgr.redoLogManager().closedLsn(),
+                    "MTR commit must publish closed LSN after dirty page release");
+        });
+    }
+
+    @Test
     void newPageProducesPageInitAndStamps() {
         onPool((pool, mgr) -> {
             PageId fresh = PageId.of(SPACE, PageNo.of(5));

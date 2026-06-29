@@ -13,8 +13,8 @@ import java.util.concurrent.locks.ReentrantLock;
  * fuzzy checkpoint 协调器。F1 默认构造器只计算和单调发布内存安全 checkpoint LSN；R2 可注入
  * {@link RedoCheckpointStore} 持久化 redo control label。它仍不触发后台 page cleaner，也不回收 redo 文件。
  *
- * <p>F1 的简化 closed LSN：R1 redo append 是同步完成、dirty 发布也在 MTR commit 内完成，因此暂用
- * {@link RedoLogManager#currentLsn()} 表示 closed/current 边界。后续引入 recent-closed tracker 后可替换该输入。
+ * <p>checkpoint 必须读取 {@link RedoLogManager#closedLsn()}，不能用 current LSN 代替。current 只说明 redo
+ * 已分配到哪里，closed 才说明相关 dirty page 已发布到 Buffer Pool 的 flush 视图。
  */
 public final class CheckpointCoordinator {
 
@@ -48,10 +48,13 @@ public final class CheckpointCoordinator {
      * @return 当前安全 checkpoint LSN。
      */
     public Lsn computeSafeCheckpointLsn() {
-        Lsn current = redo.currentLsn();
-        Lsn oldestDirty = bufferPool.oldestDirtyLsnOr(current);
         Lsn flushed = redo.flushedToDiskLsn();
-        return min(oldestDirty, current, flushed);
+        Lsn closed = redo.closedLsn();
+        if (!bufferPool.hasDirtyPages()) {
+            return min(closed, flushed);
+        }
+        Lsn oldestDirty = bufferPool.oldestDirtyLsnOr(flushed);
+        return min(oldestDirty, closed, flushed);
     }
 
     /**
@@ -88,5 +91,9 @@ public final class CheckpointCoordinator {
     private static Lsn min(Lsn a, Lsn b, Lsn c) {
         long value = Math.min(a.value(), Math.min(b.value(), c.value()));
         return Lsn.of(value);
+    }
+
+    private static Lsn min(Lsn a, Lsn b) {
+        return Lsn.of(Math.min(a.value(), b.value()));
     }
 }

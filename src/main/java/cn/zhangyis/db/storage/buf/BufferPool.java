@@ -85,6 +85,14 @@ public interface BufferPool extends AutoCloseable {
     Lsn oldestDirtyLsnOr(Lsn cleanBoundary);
 
     /**
+     * 当前是否存在任何 dirty frame。Checkpoint 需要区分“没有脏页，可推进到 redo durable 边界”和
+     * “存在脏页，必须同时受 oldest dirty 与 redo closed LSN 限制”这两种语义。
+     *
+     * @return 任意驻留帧仍为 dirty 时返回 true。
+     */
+    boolean hasDirtyPages();
+
+    /**
      * 截断前排空目标表空间：在限定时间内等待全部 fix 归零，确认不存在脏帧后移除所有驻留帧。
      * 该方法不会隐式 flush；发现 dirty 必须抛错，避免绕过 WAL/doublewrite/checkpoint 顺序静默丢页。
      * 调用方必须已持该表空间独占 operation lease，阻止新的 page fix 与并发 flush 进入。

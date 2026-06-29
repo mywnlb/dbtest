@@ -502,6 +502,16 @@ public final class LruBufferPool implements BufferPool, FrameReleaser {
         }
     }
 
+    @Override
+    public boolean hasDirtyPages() {
+        poolLock.lock();
+        try {
+            return residentMap.values().stream().anyMatch(frame -> frame.dirty);
+        } finally {
+            poolLock.unlock();
+        }
+    }
+
     /**
      * 等待目标空间所有 fix 归零，然后原子检查 dirty 并从 resident/LRU 移除。等待期间 Condition 会释放 poolLock，
      * 允许 PageGuard.close 回调 release；成功路径不做磁盘 IO，调用方必须预先完成安全 flush。

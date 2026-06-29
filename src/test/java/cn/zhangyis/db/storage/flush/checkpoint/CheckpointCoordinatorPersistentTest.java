@@ -12,6 +12,7 @@ import cn.zhangyis.db.storage.buf.PageLatchMode;
 import cn.zhangyis.db.storage.fil.io.FileChannelPageStore;
 import cn.zhangyis.db.storage.fil.io.PageStore;
 import cn.zhangyis.db.storage.page.PageEnvelopeLayout;
+import cn.zhangyis.db.storage.redo.LogRange;
 import cn.zhangyis.db.storage.redo.PageBytesRecord;
 import cn.zhangyis.db.storage.redo.RedoCheckpointLabel;
 import cn.zhangyis.db.storage.redo.RedoCheckpointStore;
@@ -45,8 +46,9 @@ class CheckpointCoordinatorPersistentTest {
              RedoCheckpointStore checkpointStore = RedoCheckpointStore.open(dir.resolve("redo-control"))) {
             store.create(SPACE, dir.resolve("s.ibd"), PS, PageNo.of(4));
             RedoLogManager redo = RedoLogManager.durable(repo);
-            redo.append(List.of(new PageBytesRecord(PAGE, 200, new byte[]{1})));
+            LogRange range = redo.append(List.of(new PageBytesRecord(PAGE, 200, new byte[]{1})));
             redo.flush();
+            redo.markClosed(range);
 
             CheckpointCoordinator coordinator = new CheckpointCoordinator(pool, redo, checkpointStore);
             Lsn checkpoint = coordinator.advanceCheckpoint();
@@ -66,8 +68,9 @@ class CheckpointCoordinatorPersistentTest {
              RedoCheckpointStore checkpointStore = RedoCheckpointStore.open(dir.resolve("redo-control"))) {
             store.create(SPACE, dir.resolve("s.ibd"), PS, PageNo.of(4));
             RedoLogManager redo = RedoLogManager.durable(repo);
-            redo.append(List.of(new PageBytesRecord(PAGE, 200, new byte[]{1})));
+            LogRange range = redo.append(List.of(new PageBytesRecord(PAGE, 200, new byte[]{1})));
             redo.flush();
+            redo.markClosed(range);
             CheckpointCoordinator coordinator = new CheckpointCoordinator(pool, redo, checkpointStore);
             Lsn first = coordinator.advanceCheckpoint();
 

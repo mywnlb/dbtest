@@ -15,6 +15,7 @@ import cn.zhangyis.db.storage.flush.checkpoint.CheckpointCoordinator;
 import cn.zhangyis.db.storage.flush.doublewrite.NoDoublewriteStrategy;
 import cn.zhangyis.db.storage.flush.policy.AdaptiveFlushPolicy;
 import cn.zhangyis.db.storage.page.PageEnvelopeLayout;
+import cn.zhangyis.db.storage.redo.LogRange;
 import cn.zhangyis.db.storage.redo.PageBytesRecord;
 import cn.zhangyis.db.storage.redo.RedoCapacityPressure;
 import cn.zhangyis.db.storage.redo.RedoCapacityPolicy;
@@ -50,8 +51,9 @@ class FlushServiceCapacityTest {
              RedoLogFileRepository repo = RedoLogFileRepository.open(dir.resolve("redo.log"))) {
             store.create(SPACE, dir.resolve("s.ibd"), PS, PageNo.of(8));
             RedoLogManager redo = RedoLogManager.durable(repo);
-            Lsn dirtyLsn = appendDirtyThenGrowRedo(redo);
-            writeDirty(pool, PAGE, dirtyLsn);
+            LogRange dirtyRange = appendDirtyThenGrowRedo(redo);
+            writeDirty(pool, PAGE, dirtyRange.end());
+            redo.markClosed(dirtyRange);
 
             FlushService service = flushService(pool, store, redo, RedoCapacityPolicy.fixed(100));
             FlushCycleResult result = service.flushForCapacity(10);
@@ -71,15 +73,16 @@ class FlushServiceCapacityTest {
              RedoLogFileRepository repo = RedoLogFileRepository.open(dir.resolve("redo.log"))) {
             store.create(SPACE, dir.resolve("s.ibd"), PS, PageNo.of(8));
             RedoLogManager redo = RedoLogManager.durable(repo);
-            Lsn dirtyLsn = appendOneRedo(redo, PAGE);
-            writeDirty(pool, PAGE, dirtyLsn);
+            LogRange dirtyRange = appendOneRedo(redo, PAGE);
+            writeDirty(pool, PAGE, dirtyRange.end());
+            redo.markClosed(dirtyRange);
 
             FlushService service = flushService(pool, store, redo, RedoCapacityPolicy.fixed(10_000));
             FlushCycleResult result = service.flushForCapacity(10);
 
             assertEquals(RedoCapacityPressure.NONE, result.capacityDecision().pressure());
             assertTrue(result.results().isEmpty());
-            assertEquals(dirtyLsn, pool.oldestDirtyLsnOr(Lsn.of(999)));
+            assertEquals(dirtyRange.end(), pool.oldestDirtyLsnOr(Lsn.of(999)));
             assertEquals(result.checkpointBefore(), result.checkpointAfter());
         }
     }
@@ -93,19 +96,19 @@ class FlushServiceCapacityTest {
                 AdaptiveFlushPolicy.fixed(1, 8));
     }
 
-    private Lsn appendDirtyThenGrowRedo(RedoLogManager redo) {
-        Lsn dirty = appendOneRedo(redo, PAGE);
+    private LogRange appendDirtyThenGrowRedo(RedoLogManager redo) {
+        LogRange dirty = appendOneRedo(redo, PAGE);
         for (int i = 0; i < 8; i++) {
-            appendOneRedo(redo, REDO_ONLY_PAGE);
+            redo.markClosed(appendOneRedo(redo, REDO_ONLY_PAGE));
         }
         redo.flush();
         return dirty;
     }
 
-    private Lsn appendOneRedo(RedoLogManager redo, PageId pageId) {
-        Lsn end = redo.append(List.of(new PageBytesRecord(pageId, 256, new byte[]{1, 2, 3}))).end();
+    private LogRange appendOneRedo(RedoLogManager redo, PageId pageId) {
+        LogRange range = redo.append(List.of(new PageBytesRecord(pageId, 256, new byte[]{1, 2, 3})));
         redo.flush();
-        return end;
+        return range;
     }
 
     private static void writeDirty(BufferPool pool, PageId pageId, Lsn lsn) {

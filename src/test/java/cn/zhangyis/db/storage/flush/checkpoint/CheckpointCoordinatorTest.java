@@ -12,6 +12,7 @@ import cn.zhangyis.db.storage.buf.PageLatchMode;
 import cn.zhangyis.db.storage.fil.io.FileChannelPageStore;
 import cn.zhangyis.db.storage.fil.io.PageStore;
 import cn.zhangyis.db.storage.page.PageEnvelopeLayout;
+import cn.zhangyis.db.storage.redo.LogRange;
 import cn.zhangyis.db.storage.redo.PageBytesRecord;
 import cn.zhangyis.db.storage.redo.RedoLogFileRepository;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
@@ -42,10 +43,11 @@ class CheckpointCoordinatorTest {
              RedoLogFileRepository repo = RedoLogFileRepository.open(dir.resolve("redo.log"))) {
             store.create(SPACE, dir.resolve("s.ibd"), PS, PageNo.of(4));
             RedoLogManager redo = RedoLogManager.durable(repo);
-            redo.append(List.of(new PageBytesRecord(PAGE, 200, new byte[]{1})));
+            LogRange range = redo.append(List.of(new PageBytesRecord(PAGE, 200, new byte[]{1})));
             redo.flush();
             long durable = redo.flushedToDiskLsn().value();
             writeDirty(pool, durable);
+            redo.markClosed(range);
 
             CheckpointCoordinator coordinator = new CheckpointCoordinator(pool, redo);
 
@@ -56,14 +58,51 @@ class CheckpointCoordinatorTest {
     }
 
     @Test
+    void safeCheckpointUsesClosedLsnInsteadOfCurrentLsn() {
+        try (PageStore store = new FileChannelPageStore();
+             BufferPool pool = new LruBufferPool(store, PS, 4);
+             RedoLogFileRepository repo = RedoLogFileRepository.open(dir.resolve("redo-closed.log"))) {
+            store.create(SPACE, dir.resolve("s-closed.ibd"), PS, PageNo.of(4));
+            RedoLogManager redo = RedoLogManager.durable(repo);
+            redo.append(List.of(new PageBytesRecord(PAGE, 200, new byte[]{1})));
+            redo.flush();
+            long durable = redo.flushedToDiskLsn().value();
+            writeDirty(pool, durable);
+
+            CheckpointCoordinator coordinator = new CheckpointCoordinator(pool, redo);
+
+            assertEquals(Lsn.of(0), coordinator.computeSafeCheckpointLsn(),
+                    "dirty page exists but its redo range has not been closed");
+        }
+    }
+
+    @Test
+    void safeCheckpointDoesNotPassUnclosedRedoEvenWhenDirtyViewIsEmpty() {
+        try (PageStore store = new FileChannelPageStore();
+             BufferPool pool = new LruBufferPool(store, PS, 4);
+             RedoLogFileRepository repo = RedoLogFileRepository.open(dir.resolve("redo-unclosed-clean.log"))) {
+            store.create(SPACE, dir.resolve("s-unclosed-clean.ibd"), PS, PageNo.of(4));
+            RedoLogManager redo = RedoLogManager.durable(repo);
+            redo.append(List.of(new PageBytesRecord(PAGE, 200, new byte[]{1})));
+            redo.flush();
+
+            CheckpointCoordinator coordinator = new CheckpointCoordinator(pool, redo);
+
+            assertEquals(Lsn.of(0), coordinator.computeSafeCheckpointLsn(),
+                    "an empty dirty view is not enough while a redo range is not closed");
+        }
+    }
+
+    @Test
     void safeCheckpointUsesRedoFlushedWhenThereAreNoDirtyPages() {
         try (PageStore store = new FileChannelPageStore();
              BufferPool pool = new LruBufferPool(store, PS, 4);
              RedoLogFileRepository repo = RedoLogFileRepository.open(dir.resolve("redo.log"))) {
             store.create(SPACE, dir.resolve("s.ibd"), PS, PageNo.of(4));
             RedoLogManager redo = RedoLogManager.durable(repo);
-            redo.append(List.of(new PageBytesRecord(PAGE, 200, new byte[]{1})));
+            LogRange range = redo.append(List.of(new PageBytesRecord(PAGE, 200, new byte[]{1})));
             redo.flush();
+            redo.markClosed(range);
 
             CheckpointCoordinator coordinator = new CheckpointCoordinator(pool, redo);
 

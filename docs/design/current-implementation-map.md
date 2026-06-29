@@ -207,19 +207,19 @@ flowchart TD
 | Insert (no split) | `insert` -> `descendPath` X-latch root→leaf -> unique check -> `inserter.insert` | Implemented（both services）；overflow → `BTreeSplitRequiredException`（LeafOnly）或 split 传播（SplitCapable）|
 | Insert split 传播（0.11） | `insert` overflow -> `splitLeafAndPropagate`：leaf 即 root → `splitRootLeaf`（原地 level0→1）；否则 `splitNonRootLeaf`（旧 leaf=左半 + 新右兄弟 + sibling 链）→ `insertSeparator` 上插父页 -> 父满则内部 split：root→`growRootWithInternal`（两 level-L 新子页 + root 页号不变重建 level L+1）、非 root→`splitNonRootInternal` 递归上插。leaf 行/内部 pointer 统一对半切，separator=右半 lowKey | Implemented（任意高度）；内部/root-split 子页自 `nonLeafSegment` 分配；root 页号稳定；返回 `BTreeInsertResult(after.withRootLevel, allocatedPages)` |
 | Clustered insert | `SplitCapableBTreeIndexService.insertClustered(mtr, index, record, transactionId, rollPointer)` (`:91`) -> stamps `new HiddenColumns(transactionId, rollPointer)`（T1.3c 起调用方传入真 insert undo 指针，替换恒 NULL） -> delegates `insert` (`:106`) | Implemented; `DB_ROLL_PTR` 由上层 orchestration（`assignWriteId → UndoLogManager.beforeInsert → insertClustered`）传入；不 import trx/undo |
-| Clustered delete (T1.3d；0.12 merge) | `SplitCapableBTreeIndexService.deleteClustered(...)` -> `descendPath` 导航 leaf（任意高度，X，全路径入 memo）-> `deleteInLeaf`：`search.findEqual` -> 所有权校验 `RecordCursor.dbTrxId()/dbRollPtr()` 匹配 -> 未标记 `deleter.deleteMark` 后 `purger.purge`，已标记直接 `purge` -> `reclaimAfterRemoval`（见下 Underflow reclaim）-> `BTreeDeleteResult(removed, indexAfter, freedPages)` | Implemented (test-wired via `RollbackService`); 幂等（未命中/不匹配=no-op）；不 import trx/undo（收 SearchKey + domain 值对象）；**0.12 起删成功触发 merge + 原地 root shrink + free page** |
-| Clustered purge (T1.3d；0.12 merge) | `SplitCapableBTreeIndexService.purgeDeleteMarkedClustered(...)` -> `descendPath` 导航 leaf（任意高度，X）-> `purgeInLeaf`：`findEqual` -> 严格校验（命中 + 仍 delete-marked + 隐藏列匹配）-> `purger.purge` -> `reclaimAfterRemoval` -> `BTreeDeleteResult(removed, indexAfter, freedPages)` | Implemented (test-wired via `PurgeCoordinator`)；stale=no-op；与 delete 共用 0.12 欠载回收 |
+| Clustered delete (T1.3d；0.12 merge) | `SplitCapableBTreeIndexService.deleteClustered(...)` -> `descendPath` 导航 leaf（任意高度，X，全路径入 memo）-> `deleteInLeaf`：`search.findEqual` -> 所有权校验 `RecordCursor.dbTrxId()/dbRollPtr()` 匹配 -> 未标记 `deleter.deleteMark` 后 `purger.purge`，已标记直接 `purge` -> `reclaimAfterRemoval`（见下 Underflow reclaim）-> `BTreeDeleteResult(removed, indexAfter, freedPages)` | Implemented (StorageEngine service root + `RollbackService` + tests); 幂等（未命中/不匹配=no-op）；不 import trx/undo（收 SearchKey + domain 值对象）；**0.12 起删成功触发 merge + 原地 root shrink + free page** |
+| Clustered purge (T1.3d；0.12 merge) | `SplitCapableBTreeIndexService.purgeDeleteMarkedClustered(...)` -> `descendPath` 导航 leaf（任意高度，X）-> `purgeInLeaf`：`findEqual` -> 严格校验（命中 + 仍 delete-marked + 隐藏列匹配）-> `purger.purge` -> `reclaimAfterRemoval` -> `BTreeDeleteResult(removed, indexAfter, freedPages)` | Implemented (StorageEngine service root + `PurgeCoordinator` + tests)；stale=no-op；与 delete 共用 0.12 欠载回收 |
 | Clustered replace (T1.3e) | `SplitCapableBTreeIndexService.replaceClustered(mtr, index, key, newRecordWithHidden, expectedTrxId, expectedRollPtr)` -> 导航 leaf (X) -> `replaceInLeaf`：`findEqual` -> 所有权校验 -> `updater.update` 整记录替换；REQUIRES_REINSERT(改 PK)→`BTreeUnsupportedStructureException` -> `BTreeUpdateResult(replaced)` | Implemented; 前向 UPDATE 与 rollback 恢复共用；前向 orchestration（`lookup→beforeUpdate→replaceClustered`）test-wired，rollback 恢复经 `RollbackService`(src/main)；幂等；不 import trx/undo |
 | Clustered delete-mark (T1.3f) | `SplitCapableBTreeIndexService.setClusteredDeleteMark(mtr, index, key, deleted, newHidden, expectedTrxId, expectedRollPtr)` -> 导航 leaf (X) -> `markInLeaf` plan-then-execute：`findEqual`(含已标记)→所有权校验→翻转合法校验→`RecordPage.setDeleted`+`RecordPage.writeHiddenColumns`(两步纯写) -> `BTreeDeleteMarkResult(changed)`；`lookupIncludingDeleted` 不过滤 delete-marked | Implemented; 前向删除(true)与 rollback 取消标记(false)共用；幂等(所有权不符=false)、非法翻转抛；不 import trx/undo；物理移除归 purge（不触发 merge，记录数不变）|
-| Underflow reclaim (0.12，delete+purge 共用) | `deleteInLeaf`/`purgeInLeaf` 物理删除成功 -> `reclaimAfterRemoval` -> `considerMerge(path, depth)`：`isUnderfull`(可回收空闲 `freeSpace+garbage` > 页半) -> `chooseMergePair`（parent pointer 顺序，survivor=左/victim=右）-> `mergeFits`(reclaimable) -> `reorganize` survivor 压实 + 并入 victim（leaf 修 FIL 链）-> `removePointerFromParent`(deleteMark+purge) -> `disk.freePage(victim)` -> 传播 `considerMerge(depth-1)` / parent 是 root 剩 1 pointer 则 `shrinkRoot`（吸收唯一 child、树高-1、级联）| Implemented (test-wired)；min-key-pointer 约定下 survivor 父 pointer key 不变（无 separator 下拉/更新）；fit 不下即留欠载（redistribute=0.12b）；root 页号稳定；额外 sibling/远兄弟/child latch 入 MTR memo，无 latch coupling（0.13）|
+| Underflow reclaim (0.12 merge+shrink / 0.12b redistribute，delete+purge 共用) | `deleteInLeaf`/`purgeInLeaf` 物理删除成功 -> `reclaimAfterRemoval` -> `considerMerge(path, depth)`：`isUnderfull`(可回收空闲 `freeSpace+garbage` > 页半) -> `chooseMergePair`（parent pointer 顺序，survivor=左/victim=右）-> `mergeFits`(reclaimable)？**fit** → `reorganize` survivor 压实 + 并入 victim（leaf 修 FIL 链）-> `removePointerFromParent`(deleteMark+purge) -> `disk.freePage(victim)` -> 传播 `considerMerge(depth-1)` / parent 是 root 剩 1 pointer 则 `shrinkRoot`（吸收唯一 child、树高-1、级联）；**fit 不下** → `redistribute`：合并相邻对对半重分到两页（`splitRows`/`splitPointers`）+ 只更新 parent 中 right 成员 lowKey（删旧插新）| Implemented (StorageEngine service root + tests)；min-key-pointer 约定下 survivor/left 父 pointer key 不变（merge 无 separator 更新、redistribute 仅改 right lowKey）；**redistribute 不删页/不传播/不改树高**（leaf+internal 统一，0.12b）；root 页号稳定；额外 sibling/远兄弟/child latch 入 MTR memo，无 latch coupling（0.13）|
 
 ### Package Status
 
 | Package area | Representative classes | Current state | Notes |
 | --- | --- | --- | --- |
-| `storage.btree` facade | `BTreeIndexService` (interface), `BTreeIndex` (descriptor record), `BTreeLookupResult`, `BTreeInsertResult`, `BTreeScanRange` | Implemented (test-wired) | `import cn.zhangyis.db.storage.btree.*` has **zero** production matches; entire package only constructed in tests |
-| `storage.btree` leaf-only | `LeafOnlyBTreeIndexService` | Implemented (test-wired) | B1/B2 rootLevel=0 only; point lookup + in-page scan + insert-no-split; `new`'d only at `LeafOnlyBTreeIndexServiceTest` |
-| `storage.btree` split-capable | `SplitCapableBTreeIndexService`, `BTreeNodePointer`, `BTreeNodePointerCodec`, `BTreeNodePointerSchema`, `SearchKeyComparator` | Implemented (test-wired) | **任意高度（0.11）**：N 层 `findLeaf` 导航 + 自底向上 split 传播 + 内部页 split + 原地 root split；`nonLeafSegment` 分配内部/root-split 子页；clustered insert/delete/replace/mark/purge 全多层可用。**merge + 原地 root shrink（0.12，无 redistribute）**：删/purge 后 underflow→merge 同父兄弟（reorganize survivor + 并入 victim）→摘 parent pointer→`disk.freePage`→自底向上传播→root 剩 1 pointer 原地 shrink；导航改按 root 页**实际 level**（`openRoot` 不再断言 `rootLevel` 相等）。redistribute/退化页再平衡留 0.12b；`new`'d only in tests |
+| `storage.btree` facade | `BTreeIndexService` (interface), `BTreeIndex` (descriptor record), `BTreeLookupResult`, `BTreeInsertResult`, `BTreeScanRange` | Implemented (partially production-wired) | `StorageEngine` 构造并暴露 `SplitCapableBTreeIndexService`；descriptor/result 值对象随该 service 进入生产根。`BTreeIndexService` interface 与 leaf-only 旧实现仍主要是测试/遗留抽象；SQL executor/DD DML 尚未接入 |
+| `storage.btree` leaf-only | `LeafOnlyBTreeIndexService` | Implemented (test-wired) | B1/B2 rootLevel=0 only; point lookup + in-page scan + insert-no-split; retained for regression/teaching tests while production root uses split-capable service |
+| `storage.btree` split-capable | `SplitCapableBTreeIndexService`, `BTreeNodePointer`, `BTreeNodePointerCodec`, `BTreeNodePointerSchema`, `SearchKeyComparator` | Implemented (StorageEngine service root + tests) | `StorageEngine` constructs/exposes the service; no normal session/executor/DD DML facade yet. **任意高度（0.11）**：N 层 `findLeaf` 导航 + 自底向上 split 传播 + 内部页 split + 原地 root split；`nonLeafSegment` 分配内部/root-split 子页；clustered insert/delete/replace/mark/purge 全多层可用。**merge + 原地 root shrink（0.12）+ redistribute（0.12b）**：删/purge 后 underflow→`mergeFits`？fit 则 merge 同父兄弟（reorganize survivor + 并入 victim）→摘 parent pointer→`disk.freePage`→自底向上传播→root 剩 1 pointer 原地 shrink；fit 不下则 `redistribute` 对半再平衡相邻对（只更新 right pointer lowKey、不删页/不传播）。导航改按 root 页**实际 level**（`openRoot` 不再断言 `rootLevel` 相等）。leaf+internal 统一；按记录数精确阈值 borrow 仍简化为对半 |
 | `storage.btree` exceptions | `BTreeException` + 5 subclasses | Implemented | `BTreeDuplicateKeyException` (physical unique check), `BTreeSplitRequiredException`, `BTreeStructureCorruptedException`, `BTreeUnsupportedStructureException`；`BTreeRootChangedException` 自 0.12 起**不再由 `openRoot` 的 level guard 抛出**（导航按实际 root level；reserved 供 0.13/2.7 并发重定位协议）|
 
 ## Redo Log Layer Slice
@@ -289,7 +289,8 @@ flowchart TD
   Coord -->|flushedToDiskLsn / waitFlushed WAL gate| Redo["RedoLogManager"]
   Coord -->|stamp| Chksum["PageImageChecksum"]
   Coord -->|beforeDataFileWrite / afterDataFileWrite| DW["DoublewriteStrategy"]
-  DW -->|append + force| DWFile["DoublewriteFileRepository"]
+  DW -->|append/single batch + force + releaseSlot| DWFile["DoublewriteFileRepository"]
+  Batch["DoublewriteBatch (repository primitive)"] -. "test-wired; production dispatch still per-page" .-> DWFile
   Coord -->|writePage + force| Store["PageStore"]
   Ckpt -->|oldestDirtyLsnOr| BP
   Ckpt -->|currentLsn / flushedToDiskLsn| Redo
@@ -309,7 +310,7 @@ flowchart TD
 | Tablespace drain | `FlushService.drainTablespace(spaceId, duration)` (`:84`) -> loop `bufferPool.dirtyPageCandidates(MAX, capacity)` filtered by spaceId -> per page `FlushCoordinator.singlePageFlush` (`:109`) -> `advanceCheckpoint()` (`:111`); `LockSupport.parkNanos(1ms)` backoff on no progress (`:113`) | Implemented code; no production caller; busy-waits with parkNanos (no condition wake-up from BufferPool) |
 | Lifecycle flush barrier | `FlushService.flushThrough(marker,timeout)` -> redo flush -> 刷出所有 space 中 oldest<=marker 的 dirty page -> `flush.checkpoint.CheckpointCoordinator.advanceCheckpoint` 直到 checkpoint>=marker | Implemented；truncate 和 `StorageEngine.close/checkpoint` 在物理关闭/缩短前强制调用 |
 | Checkpoint advance | `flush.checkpoint.CheckpointCoordinator.advanceCheckpoint` -> `computeSafeCheckpointLsn` = `min(bufferPool.oldestDirtyLsnOr(current), redo.currentLsn(), redo.flushedToDiskLsn())` -> if safe > last: if `checkpointStore != null` -> `checkpointStore.write(RedoCheckpointLabel.of(safe, redo.currentLsn(), now))`, then publish `lastCheckpointLsn = safe` | Implemented code; called by `FlushService` from tests, `StorageEngine` foreground lifecycle, and E3a periodic page cleaner tick；"closed LSN" approximated by `currentLsn()` |
-| Doublewrite write | `flush.doublewrite.RecoverableDoublewriteStrategy.beforeDataFileWrite` -> `repository.append(snapshot)` -> `repository.force()` = `channel.force(true)` | Implemented; full-copy fsync'd before data file write; no slot reclamation (`afterDataFileWrite` is no-op); doublewrite file grows unbounded |
+| Doublewrite write | `flush.doublewrite.RecoverableDoublewriteStrategy.beforeDataFileWrite` -> `repository.append(snapshot)`（内部走 single `DoublewriteBatch`）-> `repository.force()` = `channel.force(true)`；data file force 成功后 `afterDataFileWrite` -> `repository.releaseSlot(snapshot)` | Implemented; full-copy fsync'd before data file write；0.5 后 `DoublewriteFileRepository` 默认 1024 个固定 slot 循环复用，in-flight slot 在 data file force 前不可覆盖；仓储已提供 `appendBatch/releaseBatch` 连续 slot 原语（test-wired），但生产 `FlushCoordinator` 仍逐页调用；磁盘副本不主动擦除，直到后续 slot 写入覆盖前仍可供 recovery 使用 |
 | Doublewrite repair | recovery participant 先修显式配置 UNDO page0/读 marker；普通 scanner 对 pageNo>= 当前文件大小的越界页跳过（交 redo 重建）、对 TRUNCATING space 的 pageNo>=target 跳过；其余 checksum-invalid 页从 doublewrite copy 修复 | **Implemented production path（0.2）**：`StorageEngine` E2 配 `DoublewriteRecoveryScanner` + `DoublewriteFileRepository.pageIds()`（**过滤到恢复已打开空间**：系统 undo + `recoveryTablespaces`，避免 scanner 读未打开空间），真正修复 torn data/undo 页；未打开空间的 torn 页留待该空间打开/discovery |
 
 ### Package Status
@@ -319,7 +320,7 @@ flowchart TD
 | `storage.flush` facade/coordinator | `FlushService`, `FlushCoordinator`, `FlushCycleResult`, `FlushResult`, `FlushResultStatus`, `TablespaceDrainResult`, `CoordinatedDirtyVictimFlusher` | Implemented | Ties redo capacity -> flush -> checkpoint；`StorageEngine` 构造 foreground barrier + E3a background page cleaner path；`CoordinatedDirtyVictimFlusher` 适配 buf 淘汰端口到 `singlePageFlush`（CLEAN→true/skip→false/FAILED→抛），`StorageEngine` 注入 pool |
 | `storage.flush.policy` adaptive policy | `AdaptiveFlushPolicy`, `FlushAdvice` | Implemented | Maps redo capacity pressure to flush batch advice；`StorageEngine` 注入 fixed policy |
 | `storage.flush.checkpoint` checkpoint | `CheckpointCoordinator` | Implemented | Fuzzy checkpoint = min(oldestDirty, current, flushed); optional `RedoCheckpointStore` persistence；`StorageEngine` 注入 checkpoint store |
-| `storage.flush.doublewrite` doublewrite | `DoublewriteStrategy`, `RecoverableDoublewriteStrategy`, `NoDoublewriteStrategy`, `DoublewriteFileRepository`(+`pageIds()`), `DoublewriteRecoveryScanner`, `DoublewriteMode` | Implemented; **recoverable 模式 production-wired（0.2）** | `StorageEngine` 注入 `RecoverableDoublewriteStrategy`（前向，每次 flush 前写整页副本+fsync）+ E2 配 scanner + `DoublewriteFileRepository.pageIds()`（恢复待检查页来源）；`NoDoublewriteStrategy` 仅测试用；slot 回收（append-only unbounded，0.5）/`DETECT_ONLY`/全空间 discovery deferred |
+| `storage.flush.doublewrite` doublewrite | `DoublewriteStrategy`, `RecoverableDoublewriteStrategy`, `NoDoublewriteStrategy`, `DoublewriteBatch`, `DoublewriteFileRepository`(+`pageIds()`), `DoublewriteRecoveryScanner`, `DoublewriteMode` | Implemented; **recoverable 模式 production-wired（0.2）+ bounded slot reuse（0.5）+ repository batch primitive（test-wired）** | `StorageEngine` 注入 `RecoverableDoublewriteStrategy`（前向，每次 flush 前写整页副本+fsync，data file force 后释放 in-flight slot）+ E2 配 scanner + `DoublewriteFileRepository.pageIds()`（恢复待检查页来源）；`DoublewriteBatch` 可在同一文件锁内连续写 slot 并一次 force，但生产 `FlushCoordinator` 尚未批量 dispatch；`NoDoublewriteStrategy` 仅测试用；`DETECT_ONLY`/flush-list 与 LRU 双文件/全空间 discovery deferred |
 | `storage.flush.cleaner` page cleaner | `PageCleanerWorker`, `PageCleanerState`, `PageCleanerStoppedException` | Implemented; production-wired by `StorageEngine` E3a | Single daemon `Thread` "minimysql-page-cleaner"；bounded explicit queue + periodic idle tick；failure is terminal；no supervisor restart |
 | `storage.flush` exceptions | `FlushWriteException`, `FlushBarrierTimeoutException` | Implemented | Root flush exceptions shared by coordinator/doublewrite/cleaner/barrier |
 
@@ -502,7 +503,6 @@ flowchart TD
 | Type | Current caller | Why it exists | Next action |
 | --- | --- | --- | --- |
 | `BufferPool.flush(PageId)` / `flushAll()` | Tests only (`flushAll` called by `LruBufferPool.close()` in tests) | Legacy synchronous flush path; flush module uses snapshot/callback API instead | Either remove or wire as fallback flush |
-| `BufferPool.failFlush` | `FlushCoordinator` | Production caller exists through `StorageEngine`; impl body is documented no-op | Add FLUSHING intermediate state when flush coordinator is fully stress-tested |
 | `MtrMemo.push(AutoCloseable)` | None | Generic non-page resource push; all production code uses `pushPageGuard` | Use for non-page latch/fix reservations if needed |
 
 ### record 层 test-only 算子
@@ -510,19 +510,19 @@ flowchart TD
 | Type | Current caller | Why it exists | Next action |
 | --- | --- | --- | --- |
 | `RecordDecoder` | Tests only (3 test classes) | Standalone decoder; production decode path goes through `RecordFieldResolver` via `RecordCursor` | Wire into a read/scan path, or fold into `RecordFieldResolver` if redundant |
-| `RecordPageDeleter` | `SplitCapableBTreeIndexService.deleteClustered` (T1.3d, test-wired) + tests | In-page delete-mark operator | rollback 已用；MVCC delete-mark 写路径留 T1.3e+ |
-| `RecordPagePurger` | `SplitCapableBTreeIndexService.deleteClustered` (T1.3d, test-wired) + tests | In-page purge: physically remove delete-marked record + dir/group fixup | rollback 已用（删未提交插入）；后台 purge coordinator 留 purge 片 |
-| `RecordPageReorganizer` | `SplitCapableBTreeIndexService` merge（`mergeLeaf`/`mergeInternal` 压实 survivor，0.12，test-wired）+ tests | In-page dense rewrite + GarbageList reclaim + dir/n_owned rebuild | merge 已用；其余 page-compaction admin op 仍待 |
-| `RecordPageUpdater` | `SplitCapableBTreeIndexService.replaceClustered` (T1.3e, test-wired via `RollbackService`) + tests | In-page update: in-place / move / reinsert-required | UPDATE 写 + rollback 恢复已用；改聚簇 PK(REQUIRES_REINSERT) 抛 unsupported |
+| `RecordPageDeleter` | `SplitCapableBTreeIndexService.deleteClustered` (StorageEngine service root + rollback tests) + tests | In-page delete-mark operator | rollback 已用；普通 session/executor delete facade 仍待 |
+| `RecordPagePurger` | `SplitCapableBTreeIndexService.deleteClustered` / `purgeDeleteMarkedClustered` (StorageEngine service root + rollback/purge tests) + tests | In-page purge: physically remove delete-marked record + dir/group fixup | rollback/purge 已用；普通后台 purge 仍是单显式聚簇索引 |
+| `RecordPageReorganizer` | `SplitCapableBTreeIndexService` merge（`mergeLeaf`/`mergeInternal` 压实 survivor，0.12，StorageEngine service root + tests）+ tests | In-page dense rewrite + GarbageList reclaim + dir/n_owned rebuild | merge 已用；其余 page-compaction admin op 仍待 |
+| `RecordPageUpdater` | `SplitCapableBTreeIndexService.replaceClustered` (StorageEngine service root + `RollbackService`) + tests | In-page update: in-place / move / reinsert-required | UPDATE 写 + rollback 恢复已用；普通 session/executor update facade 仍待；改聚簇 PK(REQUIRES_REINSERT) 抛 unsupported |
 | `UpdateResult` / `UpdateOutcome` | `RecordPageUpdater` (via `replaceClustered`, T1.3e) + tests | Update result value objects | live；REQUIRES_REINSERT → `BTreeUnsupportedStructureException` |
 | `UnsupportedColumnTypeException` | None (never thrown) | `TypeCodecRegistry.codecFor` switch is exhaustive over `TypeId` | Reserved for future extensible type dispatch |
 
-### btree 层整包无生产引用
+### btree 层仍未上接 SQL/DD 的类型
 
 | Type | Current caller | Why it exists | Next action |
 | --- | --- | --- | --- |
-| `BTreeIndexService` (interface) + `LeafOnlyBTreeIndexService` + `SplitCapableBTreeIndexService` | Tests only | `import cn.zhangyis.db.storage.btree.*` = 0 production matches; entire package is a test-wired island | Wire from executor/DD once SQL layer needs index access |
-| `BTreeNodePointer` / `BTreeNodePointerCodec` / `BTreeNodePointerSchema` / `SearchKeyComparator` | Tests only (only `SplitCapableBTreeIndexService` uses them) | Non-leaf node-pointer model + in-memory key comparator for split sort | Goes live when SplitCapable is wired upward |
+| `BTreeIndexService` (interface) | Tests/legacy abstraction only; production root exposes concrete `SplitCapableBTreeIndexService` from `StorageEngine` | Old BTree facade contract kept for teaching/regression while split-capable API grew more operations | Either expose the interface through storage API after SQL DML lands, or remove/fold it |
+| `LeafOnlyBTreeIndexService` | Tests only | Root-level-only B1/B2 implementation retained as small reference path and regression target | Remove after split-capable tests fully cover the same cases, or keep explicitly as teaching fixture |
 | `BTreeRootChangedException` | None（0.12 起 `openRoot` 不再抛）| 旧 root snapshot-lag guard；导航改按 root 页实际 level 后 level 相等断言去除（root shrink 使批量 rollback/purge 的快照合法陈旧）| 0.13/2.7 并发下以 latch coupling + 版本校验重定位时复用，否则移除 |
 
 ### redo 层持久化/恢复/容量路径
@@ -593,9 +593,10 @@ flowchart TD
 | --- | --- | --- |
 | miss 读盘已移出 `poolLock`（Phase B 0.9 已落） | per-frame LOADING 占位 + `PageLoadFuture` 有界等待：不同页 miss 并发读、同页只读一次、读失败清占位、命中 LOADING 超时/中断不悬挂；脏 victim 刷盘亦在锁外；仅帧表/LRU/state 短临界区在锁内。**剩余**：legacy `flush`/`flushAll` 仍持锁直写（test/close-only）；读写并发期更细的 IO_FIX/EVICTING 态、多 instance 分片未做 | legacy flush 路径统一/移除；按需细分 IO 状态、多 pool instance 分片（0.10） |
 | MTR rollback 不撤销 buffer 内容 | `rollbackUncommitted` 只 `releaseAll`，脏页保持脏（documented `:18-19`） | 依赖 redo/recovery 切片做内容撤销 |
-| 无跨页 latch 顺序强制 | `MiniTransaction` 禁止同页 S->X 升级但无一般升序 pageId latch 排序 | 在 `MtrMemo`/`MiniTransaction` 添加一般 latch 排序策略 |
+| MTR savepoint/commit/latch discipline 仍偏简化 | `MiniTransaction` 禁止同页 S->X 升级且有 `MtrSavepoint`，但无一般升序 pageId latch 排序；commit 只按 memo 顺序释放/append redo，没有把跨页 latch 顺序、closed LSN/recent tracker 与 redo collector 命令分类拆开建模 | 在 `MtrMemo`/`MiniTransaction` 添加一般 latch 排序策略；细分 savepoint rollback、commit ordering、redo collector 命令分类 |
 | 脏页淘汰 WAL gate 已闭合（生产侧）| 注入 `DirtyVictimFlusher` 后脏 victim 经 WAL gate+checksum+doublewrite 刷盘，绝不在 `poolLock` 内直写；legacy `flushAll`/无 flusher 独立测试池仍直接 `writeBack`（test/close-only，不承诺 WAL 安全）| recoverable doublewrite（0.2）+ 后台 redo flusher（0.1）已接，淘汰现获真 torn-page 防护；剩余统一/移除 legacy `flushAll` 直写路径 |
 | 替换策略 = midpoint LRU（Phase A 0.8 已落） | `MidpointLruReplacementPolicy`：old/new 双子链 + `oldBlocksTime` 提升窗 + `youngDistanceThreshold` 抗抖动，已抗一次性大扫描污染（`largeScanDoesNotEvictHotWorkingSet` 验证）；仍缺 read-ahead-aware 访问型分类、`oldBlocksPct` 容量配比再平衡 | 随 0.10 read-ahead 补访问型分类与配比再平衡 |
+| truncate/drop stale-frame 版本语义缺 | `invalidateTablespace` 可 drain/remove 单空间 frame，但没有 `TablespaceVersion` / `SpaceLifecycleClock`、waiter recheck、PageHashTable stale validation；drop/truncate 与并发 page admission 的陈旧帧边界仍靠调用纪律 | 引入空间生命周期版本，miss/load/admit/lookup/waiter 唤醒后统一复核，防止旧 frame 在 drop/truncate 后重新入表 |
 
 ### Record 缺口
 
@@ -604,7 +605,7 @@ flowchart TD
 | 类型子集：仅 13 `TypeId` | 无 TIME/TIMESTAMP/YEAR/TEXT/BLOB/ENUM/SET/JSON/bitstring | 扩展 `TypeId` + 对应 `TypeCodec` |
 | 仅 BINARY collation / UTF8 charset | 无大小写不敏感 / weight-based collation；无其他 charset | 扩展 `CollationStrategy` / `CharsetId` |
 | 无 overflow chain | 记录内联上限 65535，超长直接抛 `RecordTooLargeException` | 实现 BLOB/overflow page 指针机制 |
-| Delete/Purge/Reorganize/Update 算子无生产调用 | trx/MVCC/purge 未接入 record 层 | 在 trx 层落地后接入 |
+| Delete/Purge/Reorganize/Update 算子已有服务根触达，但缺普通 DML/DD 驱动 | `StorageEngine` 构造 `SplitCapableBTreeIndexService`，rollback/purge/MVCC 路径可经 btree service 使用 record 原语；普通 session/executor DML、二级索引与 DD 元数据仍未驱动这些算子 | 在 DML facade、DD index metadata、LockManager/current-read 片中补普通写路径与多索引协作 |
 | `DB_ROLL_PTR` 写真指针 + rollback 消费 + 版本链结构已建（T1.3c/d/e） | T1.3c insert 指针；T1.3d rollback 删；T1.3e `replaceClustered` 写真 update 指针、UPDATE undo 存全量旧 image，**记录版本链结构已建**（`DB_ROLL_PTR`→update undo→`oldHidden.dbRollPtr`）；但无 ReadView 遍历、无 delete-mark undo | T1.4 ReadView+`buildPreviousVersion` 读版本链；T1.3f delete-mark undo |
 | 索引页头缺 `PAGE_MAX_TRX_ID` / `PAGE_BTR_SEG_LEAF` / `PAGE_BTR_TOP` | MVCC 可见性 / B+Tree segment 指针不支持 | 在 MVCC / B+Tree segment 切片补充 |
 | 无 prefix index | `KeyPartDef.prefixBytes > 0` 被 `RecordComparator` 忽略 | 实现 prefix index 比较逻辑 |
@@ -613,8 +614,7 @@ flowchart TD
 
 | Gap | Current consequence | Preferred resolution |
 | --- | --- | --- |
-| 无 delete / merge | 接口只有 `lookup`/`scan`/`insert` | 添加 delete + merge API |
-| parent split + 树高 >1 已实现（0.11） | 自底向上 split 传播 + 内部页 split + 原地 root split；N 层 `findLeaf` 导航；`rootLevel>1` 拒绝已移除 | 剩余 merge/redistribute/root shrink/空页回收 → 0.12；latch coupling/乐观下降 → 0.13 |
+| 结构性 insert/delete/merge/redistribute 已接，仍缺并发下降协议 | 自底向上 split、内部页 split、原地 root split、delete/purge 后 merge、原地 root shrink、redistribute、victim free page 已实现；但仍无 latch coupling/乐观下降/root 版本重定位协议 | 0.13 补 B+Tree latch coupling、root/version retry、safe node 判断 |
 | 无事务锁等待 / MVCC 可见性 | btree 不做可见性判断 | 在 trx/MVCC 切片接入 |
 | 唯一检查仅物理 | delete-marked key 被视为重复 | 接入 MVCC 可见性后做逻辑唯一检查 |
 | `nonLeafSegment` 已用于分配（0.11） | 内部页/root-split 子页经 `index.nonLeafSegment()` 分配（`requireNonLeafSegment` 校验）；root 仍页号稳定原地重建 | — |
@@ -632,7 +632,7 @@ flowchart TD
 
 | Gap | Current consequence | Preferred resolution |
 | --- | --- | --- |
-| 无 doublewrite slot 回收 | `afterDataFileWrite` 是 no-op，doublewrite 文件无界增长 | 添加 slot reclamation / truncate |
+| doublewrite 生产仍为单文件逐页 dispatch | 0.5 已把 append-only 改成固定 slot 复用，并提供仓储级 `DoublewriteBatch` 连续 slot 原语；但 flush list 与 LRU/single page 仍共用一个文件，`FlushCoordinator/FlushService` 生产链仍逐页调用策略 | 添加 FlushList/LRU 双文件与生产 batch dispatch 策略 |
 | `drainTablespace` busy-wait | `LockSupport.parkNanos(1ms)` 无 condition wake-up | 添加 BufferPool 条件变量唤醒 |
 | `DoublewriteMode.DETECT_ONLY` 缺失 | 只有 `OFF` / `DETECT_AND_RECOVER` | 按需添加 detect-only 模式 |
 | `PageCleanerWorker` 失败即终止 | 无重启策略，`FAILED` 后需新建 worker | 添加 supervisor 重启策略 |
@@ -656,6 +656,7 @@ flowchart TD
 | formal PURGE_RESUME / DDL_RECOVERY 阶段缺（engine 后恢复步已接 R 1.2/R 1.3） | 已有 `UNDO_TABLESPACE_RESUME`（续作物理 truncate）；engine 恢复扫 rseg（0.3）→读 undo 段 state：ACTIVE 经 `RollbackService.rollbackRecovered`（显式单聚簇索引，无 DD）回滚；COMMITTED 读取 `COMMIT_NO`/`TRANSACTION_ID` 重建 committed history，`TransactionSystem.restoreCounters` 复位 id/no，高水位覆盖 history 后由后台 purge driver 续作 | 添加正式 `RecoveryStageName.UNDO_ROLLBACK`/`RESUME_PURGE`、DDL recovery、多索引/DD/prepared txn；现有 engine 后恢复步保留为简化实现 |
 | `RecoveryMode` 仅 `NORMAL` 实现 | `READ_ONLY_VALIDATE` / `FORCE_SKIP_CORRUPT_TABLESPACE` 是扩展点 | 按需实现 |
 | doublewrite/tablespace 无 discovery | Engine E2 只打开系统 UNDO + `EngineConfig.recoveryTablespaces`；doublewrite repair 已由 engine 配 scanner + `dwRepo.pageIds()`（过滤到恢复已打开空间，0.2），但页列表来自 doublewrite 文件枚举而非全空间 checksum discovery；undo truncate recovery 使用显式配置 SpaceId 集合并要求全部已打开 | 后续实现 discovery/loadAll 与全页 checksum 扫描，替代显式空间集 |
+| Recovery control-plane/observability 不完整 | `RecoveryTrafficGate` 目前提供状态/报告查询；storage/session API 入口尚未统一拒绝恢复期普通访问；无持久恢复进度 journal、恢复后后台 worker resume 诊断、恢复期锁/等待快照 | 在 storage facade/session 入口强制检查 gate；补恢复进度 journal、worker resume 结果记录、恢复锁快照/诊断接口 |
 
 ### Undo 缺口
 
@@ -663,7 +664,7 @@ flowchart TD
 | --- | --- | --- |
 | rollback 消费者已接（T1.3d） | `RollbackService`（trx→btree 新边）读 undo 链经 `deleteClustered` 删已插入行；`TransactionManager.rollback` 拆为 `beginRollback`/`finishRollback` 两阶段，撤销夹在 ROLLING_BACK 内 | 见上「rollback 消费 undo 已接」 |
 | slot 目录 0.3 已持久 + R 1.3 history 恢复已接；部分 release 路径仍缺 | **slot claim/onCommit-release 已持久到 undo page3 + 恢复扫描重建内存目录（0.3，engine 路径）**；COMMITTED 段由恢复期读取 `COMMIT_NO` 重建 history 后交给 `PurgeCoordinator` boundary 判死并 `dropUndoSegment` 回收；`RollbackService`/`PurgeCoordinator` 释放仍未持久、truncate rebuild 未重格式化 page3（test-wired 路径，未 engine 触达） | 全 release 路径持久 + truncate rebuild page3 format + formal recovery stages + 多 rseg/history 链表 |
-| 无 btree merge / 空页回收 / node-pointer 删除维护 | `deleteClustered`/`purge` 删后空 leaf 留页、parent node pointer lowKey 仅作保守下界（不更新，路由仍正确）；任意高度（0.11）但无 merge/redistribute/root shrink | merge/redistribute/root shrink/空页回收留 0.12 |
+| btree 回收已接；undo 侧仍缺二级索引 purge 协调 | `deleteClustered`/`purgeDeleteMarkedClustered` 已在物理删除后触发 merge/redistribute/root shrink/free page；当前 purge driver 仍只拿显式单聚簇 index，无 DD 索引集合 | 随 DD/多索引 purge 切片解析 indexId，协调二级索引 delete-mark/purge 与聚簇回收 |
 | 无多索引 rollback 解析 | `RollbackService` 单聚簇索引假设（用传入 index 的 schema 解码所有 undo）；无 data dictionary 按 indexId 解析 | 多索引/二级索引删除随 data dictionary 片接入 |
 | 单线程聚簇 purge + **后台 driver + recovery resume 已接（0.4/R 1.3）** | `HistoryList` + `PurgeCoordinator.runBatch`（按 `purgeLowWaterNo` 回收 delete-marked 记录 + `dropUndoSegment`）；`StorageEngine` 配 `clusteredIndex` 时启动 `PurgeDriverWorker` 后台周期驱动；`onCommit` 入 history；重启时 COMMITTED undo 段重建 history 后继续 purge（无 DD，单显式索引） | 多 worker / 二级索引 purge / `UndoLogKind.UPDATE` 独立 log / 持久 history 链表留后续片 |
 | truncate 机制已实现但无 purge→truncate 调度 | `UndoTablespaceTruncationService` 可恢复收缩并由 recovery 续作；后台 purge driver 已接（0.4）但**未驱动 undo tablespace truncate**（purge 只 dropUndoSegment 回收段页，不判 tablespace 死亡触发物理收缩）；活动 inode 会拒绝 | purge→undo tablespace truncate 调度（判 undo 死亡 → truncate）留后续片 |

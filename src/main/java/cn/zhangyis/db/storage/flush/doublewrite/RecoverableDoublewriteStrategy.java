@@ -1,6 +1,7 @@
 package cn.zhangyis.db.storage.flush.doublewrite;
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
+import cn.zhangyis.db.common.exception.DatabaseRuntimeException;
 import cn.zhangyis.db.storage.buf.FlushPageSnapshot;
 
 /**
@@ -28,7 +29,24 @@ public final class RecoverableDoublewriteStrategy implements DoublewriteStrategy
         if (snapshot == null) {
             throw new DatabaseValidationException("flush page snapshot must not be null");
         }
-        repository.append(snapshot);
-        repository.force();
+        boolean appended = false;
+        try {
+            repository.append(snapshot);
+            appended = true;
+            repository.force();
+        } catch (DatabaseRuntimeException e) {
+            if (appended) {
+                repository.releaseSlot(snapshot);
+            }
+            throw e;
+        }
+    }
+
+    @Override
+    public void afterDataFileWrite(FlushPageSnapshot snapshot) {
+        if (snapshot == null) {
+            throw new DatabaseValidationException("flush page snapshot must not be null");
+        }
+        repository.releaseSlot(snapshot);
     }
 }

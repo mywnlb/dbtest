@@ -37,7 +37,7 @@ import java.util.concurrent.locks.ReentrantLock;
  * header/trailer/checksum（仍用 batch frame + CRC32，0.20）；无容量分级 throttle（环满直接 fail-closed，0.6）；
  * 文件非预分配，随 append 增长。
  */
-public final class RotatingRedoLogRepository implements RedoLogFileRepository {
+public final class RotatingRedoLogRepository implements RedoLogFileRepository, RedoReclaimBoundary {
 
     /** 文件头 magic：ASCII "RLFR"。 */
     private static final int HEADER_MAGIC = 0x524C4652;
@@ -221,6 +221,7 @@ public final class RotatingRedoLogRepository implements RedoLogFileRepository {
      *
      * @param checkpointLsn 已持久 checkpoint LSN。
      */
+    @Override
     public void advanceReclaimBoundary(Lsn checkpointLsn) {
         if (checkpointLsn == null) {
             throw new DatabaseValidationException("redo reclaim boundary must not be null");

@@ -53,6 +53,8 @@ import cn.zhangyis.db.storage.redo.RedoFlushWorker;
 import cn.zhangyis.db.storage.redo.RedoFlushWorkerState;
 import cn.zhangyis.db.storage.redo.RedoLogFileRepository;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
+import cn.zhangyis.db.storage.redo.RedoReclaimBoundary;
+import cn.zhangyis.db.storage.redo.RotatingRedoLogRepository;
 import cn.zhangyis.db.storage.redo.RedoLogManagerFlushTarget;
 import cn.zhangyis.db.storage.trx.HistoryEntry;
 import cn.zhangyis.db.storage.trx.HistoryList;
@@ -176,9 +178,21 @@ public final class StorageEngine {
         } catch (IOException e) {
             throw new DatabaseRuntimeException("create engine baseDir failed: " + config.baseDir(), e);
         }
-        boolean fresh = !Files.exists(config.redoFile());
-
-        this.redoRepo = RedoLogFileRepository.open(config.redoFile());
+        // redo 后端：默认单 append-only 文件；config 启用文件环时改用 RotatingRedoLogRepository（0.18b），
+        // 并把环作为回收边界端口交给 CheckpointCoordinator。fresh 判定按各自存在性：单文件看 redo.log，文件环看 redo 目录。
+        RedoReclaimBoundary redoReclaim;
+        boolean fresh;
+        if (config.redoRotationEnabled()) {
+            fresh = !Files.exists(config.redoDir());
+            RotatingRedoLogRepository ring = RedoLogFileRepository.openRing(
+                    config.redoDir(), config.redoRotation().fileCount(), config.redoRotation().fileBytes());
+            this.redoRepo = ring;
+            redoReclaim = ring;
+        } else {
+            fresh = !Files.exists(config.redoFile());
+            this.redoRepo = RedoLogFileRepository.open(config.redoFile());
+            redoReclaim = null;
+        }
         this.redo = RedoLogManager.durable(redoRepo);
         this.checkpointStore = RedoCheckpointStore.open(config.redoControlFile());
         // doublewrite 文件早于 FlushCoordinator/recovery 打开、跨进程持久：恢复枚举到的是上一进程的整页副本。
@@ -211,7 +225,8 @@ public final class StorageEngine {
 
         FlushCoordinator flushCoordinator = new FlushCoordinator(pool, store, redo, config.pageSize(),
                 new RecoverableDoublewriteStrategy(doublewriteRepo), config.flushTimeout(), accessController);
-        CheckpointCoordinator checkpointCoordinator = new CheckpointCoordinator(pool, redo, checkpointStore);
+        CheckpointCoordinator checkpointCoordinator =
+                new CheckpointCoordinator(pool, redo, checkpointStore, redoReclaim);
         this.flushService = new FlushService(pool, flushCoordinator, checkpointCoordinator, redo,
                 RedoCapacityPolicy.fixed(config.redoCapacityBytes()),
                 AdaptiveFlushPolicy.fixed(1, config.bufferPoolCapacityFrames()));

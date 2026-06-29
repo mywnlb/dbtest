@@ -6,6 +6,7 @@ import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.redo.RedoCheckpointLabel;
 import cn.zhangyis.db.storage.redo.RedoCheckpointStore;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
+import cn.zhangyis.db.storage.redo.RedoReclaimBoundary;
 
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -22,6 +23,11 @@ public final class CheckpointCoordinator {
     private final RedoLogManager redo;
     /** 可选 redo control store；为空时保持 F1 内存 checkpoint 语义。 */
     private final RedoCheckpointStore checkpointStore;
+    /**
+     * 可选 redo 回收边界端口（0.18b）；为空时不驱动 redo 文件回收（单文件仓储场景）。checkpoint 持久并单调前进后，
+     * 把已持久 checkpoint LSN 推送给它，让 redo 文件环复用旧文件。
+     */
+    private final RedoReclaimBoundary redoReclaimBoundary;
     private final ReentrantLock lock = new ReentrantLock();
     private Lsn lastCheckpointLsn = Lsn.of(0);
 
@@ -34,12 +40,24 @@ public final class CheckpointCoordinator {
      * 写入成功后才发布内存 lastCheckpointLsn；control 写失败时保持旧 checkpoint，避免恢复起点虚高。
      */
     public CheckpointCoordinator(BufferPool bufferPool, RedoLogManager redo, RedoCheckpointStore checkpointStore) {
+        this(bufferPool, redo, checkpointStore, null);
+    }
+
+    /**
+     * 创建可持久化 checkpoint 且驱动 redo 文件回收的协调器（0.18b）。当安全 checkpoint 单调前进并持久化后，
+     * 通过 {@code redoReclaimBoundary} 把已持久 checkpoint LSN 推送给 redo 文件层；redo 据此回收落在该边界之内的旧文件。
+     *
+     * @param redoReclaimBoundary redo 回收边界端口（可空，单文件仓储场景传 null）。
+     */
+    public CheckpointCoordinator(BufferPool bufferPool, RedoLogManager redo, RedoCheckpointStore checkpointStore,
+                                 RedoReclaimBoundary redoReclaimBoundary) {
         if (bufferPool == null || redo == null) {
             throw new DatabaseValidationException("checkpoint buffer pool/redo must not be null");
         }
         this.bufferPool = bufferPool;
         this.redo = redo;
         this.checkpointStore = checkpointStore;
+        this.redoReclaimBoundary = redoReclaimBoundary;
     }
 
     /**
@@ -64,6 +82,8 @@ public final class CheckpointCoordinator {
      */
     public Lsn advanceCheckpoint() {
         Lsn safe = computeSafeCheckpointLsn();
+        Lsn published;
+        boolean advanced = false;
         lock.lock();
         try {
             if (safe.value() > lastCheckpointLsn.value()) {
@@ -71,11 +91,19 @@ public final class CheckpointCoordinator {
                     checkpointStore.write(RedoCheckpointLabel.of(safe, redo.currentLsn(), System.currentTimeMillis()));
                 }
                 lastCheckpointLsn = safe;
+                advanced = true;
             }
-            return lastCheckpointLsn;
+            published = lastCheckpointLsn;
         } finally {
             lock.unlock();
         }
+        // 回收边界推进必须晚于 checkpoint label 持久化（上面已在锁内完成），否则崩溃后会从旧 checkpoint 重放却发现
+        // 所需 redo 已被新一代覆盖。放在 checkpoint 锁之外推进：advanceReclaimBoundary 走 redo 文件 IO 锁，不在持
+        // checkpoint 锁时等待文件锁，避免与 flush 的 append/force 形成长时间互等；回收边界自身单调，并发推进安全。
+        if (advanced && redoReclaimBoundary != null) {
+            redoReclaimBoundary.advanceReclaimBoundary(published);
+        }
+        return published;
     }
 
     /** 最近一次发布的内存 checkpoint LSN。 */

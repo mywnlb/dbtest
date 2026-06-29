@@ -48,6 +48,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.ByteBuffer;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
@@ -182,6 +183,40 @@ class StorageEngineTest {
         MiniTransaction r = e3.miniTransactionManager().begin();
         assertEquals("v1", payloadOf(e3.btreeService().lookup(r, index, search(1)).orElseThrow()));
         assertEquals("v2", payloadOf(e3.btreeService().lookup(r, index, search(2)).orElseThrow()));
+        e3.miniTransactionManager().commit(r);
+        e3.close();
+    }
+
+    @Test
+    void bootstrapsWithRotatingRedoAndRecoversAcrossRestart() {
+        // 0.18b：config 启用文件环后，引擎 bootstrap 走 RotatingRedoLogRepository，checkpoint 经回收边界端口推动文件环回收，
+        // 恢复期跨文件读回 redo。容量取足够大，保证 fresh 建库/插入的单个 MTR 批次不超过单文件容量。
+        EngineConfig cfg = config().withRedoRotation(4, 8L * 1024 * 1024);
+        Path dataPath = dir.resolve("data.ibd");
+
+        StorageEngine e1 = new StorageEngine(cfg);
+        e1.open();
+        assertTrue(Files.exists(cfg.redoDir().resolve("redo-000000.log")),
+                "rotation 模式应在 redo 目录建文件环");
+        assertFalse(Files.exists(cfg.redoFile()), "rotation 模式不写单 redo.log");
+        BTreeIndex index = createClusteredIndex(e1, dataPath);
+        insertRow(e1, index, 1, "v1");
+        e1.checkpoint(); // 推进 checkpoint → 经 RedoReclaimBoundary 推动文件环回收
+        e1.close();
+
+        StorageEngine e2 = new StorageEngine(cfg);
+        e2.open(); // 走文件环 recovery（RecoveryRequest 经接口读 ring）
+        e2.diskSpaceManager().openTablespace(DATA_SPACE, dataPath);
+        insertRow(e2, index, 2, "v2"); // 恢复后续写
+        e2.close();
+
+        StorageEngine e3 = new StorageEngine(cfg);
+        e3.open();
+        e3.diskSpaceManager().openTablespace(DATA_SPACE, dataPath);
+        MiniTransaction r = e3.miniTransactionManager().begin();
+        assertEquals("v1", payloadOf(e3.btreeService().lookup(r, index, search(1)).orElseThrow()));
+        assertEquals("v2", payloadOf(e3.btreeService().lookup(r, index, search(2)).orElseThrow()),
+                "文件环模式下数据跨两次重启持久");
         e3.miniTransactionManager().commit(r);
         e3.close();
     }

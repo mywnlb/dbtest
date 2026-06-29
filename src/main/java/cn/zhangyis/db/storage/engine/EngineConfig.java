@@ -31,6 +31,7 @@ import java.util.Set;
  * @param backgroundFlushInterval  后台 page cleaner 空闲 tick 间隔；tick 会评估 redo capacity 并尝试推进 checkpoint。
  * @param backgroundFlushMaxPages  后台 tick 每轮最多刷出的页数；0 表示只推进 checkpoint，不主动刷脏。
  * @param backgroundFlushStopTimeout close 时等待后台线程退出的边界，超时会作为 close 错误上报。
+ * @param redoRotation             redo 文件环配置（0.18b）；{@code null}=单 append-only redo 文件，非空=启用文件环 + checkpoint 回收。
  */
 public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapacityFrames,
                            SpaceId undoSpaceId, PageNo undoSpaceInitialPages, int slotCapacity,
@@ -38,7 +39,7 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                            List<EngineTablespaceConfig> recoveryTablespaces,
                            boolean backgroundFlushEnabled, int pageCleanerQueueCapacity,
                            Duration backgroundFlushInterval, int backgroundFlushMaxPages,
-                           Duration backgroundFlushStopTimeout) {
+                           Duration backgroundFlushStopTimeout, RedoRotationConfig redoRotation) {
 
     /** 默认启动后台 page cleaner，使 engine open 后具备持续 checkpoint tick 能力。 */
     private static final boolean DEFAULT_BACKGROUND_FLUSH_ENABLED = true;
@@ -62,6 +63,23 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 slotCapacity, maxVersionHops, flushTimeout, redoCapacityBytes, recoveryTablespaces,
                 DEFAULT_BACKGROUND_FLUSH_ENABLED, DEFAULT_PAGE_CLEANER_QUEUE_CAPACITY,
                 DEFAULT_BACKGROUND_FLUSH_INTERVAL, bufferPoolCapacityFrames, flushTimeout);
+    }
+
+    /**
+     * 兼容旧（无 redo 文件环）签名的便利构造器：redo 沿用单 append-only 文件。新增 0.18b 的 {@code redoRotation} 组件后，
+     * 该构造器让既有 15 参调用点零改动继续编译，默认不启用文件环。
+     */
+    public EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapacityFrames,
+                        SpaceId undoSpaceId, PageNo undoSpaceInitialPages, int slotCapacity,
+                        int maxVersionHops, Duration flushTimeout, long redoCapacityBytes,
+                        List<EngineTablespaceConfig> recoveryTablespaces,
+                        boolean backgroundFlushEnabled, int pageCleanerQueueCapacity,
+                        Duration backgroundFlushInterval, int backgroundFlushMaxPages,
+                        Duration backgroundFlushStopTimeout) {
+        this(baseDir, pageSize, bufferPoolCapacityFrames, undoSpaceId, undoSpaceInitialPages,
+                slotCapacity, maxVersionHops, flushTimeout, redoCapacityBytes, recoveryTablespaces,
+                backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
+                backgroundFlushMaxPages, backgroundFlushStopTimeout, null);
     }
 
     public EngineConfig {
@@ -108,9 +126,33 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
         recoveryTablespaces = List.copyOf(recoveryTablespaces);
     }
 
-    /** redo 日志文件路径。 */
+    /** redo 日志文件路径（单文件模式）。 */
     public Path redoFile() {
         return baseDir.resolve("redo.log");
+    }
+
+    /** redo 文件环目录（0.18b 文件环模式），环内文件命名为 {@code redo-NNNNNN.log}。 */
+    public Path redoDir() {
+        return baseDir.resolve("redo");
+    }
+
+    /** 是否启用 redo 文件环。 */
+    public boolean redoRotationEnabled() {
+        return redoRotation != null;
+    }
+
+    /**
+     * 派生一个启用 redo 文件环的配置副本（其余字段不变）。便于在不重复罗列全部组件的情况下 opt-in 文件环。
+     *
+     * @param fileCount 文件数（≥2）。
+     * @param fileBytes 单文件帧容量上限（不含文件头）。
+     * @return 启用文件环的新配置。
+     */
+    public EngineConfig withRedoRotation(int fileCount, long fileBytes) {
+        return new EngineConfig(baseDir, pageSize, bufferPoolCapacityFrames, undoSpaceId, undoSpaceInitialPages,
+                slotCapacity, maxVersionHops, flushTimeout, redoCapacityBytes, recoveryTablespaces,
+                backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
+                backgroundFlushMaxPages, backgroundFlushStopTimeout, new RedoRotationConfig(fileCount, fileBytes));
     }
 
     /** redo control（checkpoint label）文件路径。 */

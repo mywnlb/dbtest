@@ -16,13 +16,16 @@ import cn.zhangyis.db.storage.redo.LogRange;
 import cn.zhangyis.db.storage.redo.PageBytesRecord;
 import cn.zhangyis.db.storage.redo.RedoLogFileRepository;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
+import cn.zhangyis.db.storage.redo.RedoReclaimBoundary;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 
 /**
  * F1 checkpoint 测试：safe checkpoint LSN 是 dirty oldest、redo current/closed、redo flushed 的安全交集。
@@ -107,6 +110,47 @@ class CheckpointCoordinatorTest {
             CheckpointCoordinator coordinator = new CheckpointCoordinator(pool, redo);
 
             assertEquals(redo.flushedToDiskLsn(), coordinator.computeSafeCheckpointLsn());
+        }
+    }
+
+    @Test
+    void advanceCheckpointPushesRedoReclaimBoundaryWhenAdvanced() {
+        try (PageStore store = new FileChannelPageStore();
+             BufferPool pool = new LruBufferPool(store, PS, 4);
+             RedoLogFileRepository repo = RedoLogFileRepository.open(dir.resolve("redo-reclaim.log"))) {
+            store.create(SPACE, dir.resolve("s-reclaim.ibd"), PS, PageNo.of(4));
+            RedoLogManager redo = RedoLogManager.durable(repo);
+            LogRange range = redo.append(List.of(new PageBytesRecord(PAGE, 200, new byte[]{1})));
+            redo.flush();
+            long durable = redo.flushedToDiskLsn().value();
+            writeDirty(pool, durable);
+            redo.markClosed(range);
+
+            AtomicReference<Lsn> reclaimed = new AtomicReference<>();
+            CheckpointCoordinator coordinator = new CheckpointCoordinator(pool, redo, null, reclaimed::set);
+
+            assertEquals(Lsn.of(durable), coordinator.advanceCheckpoint());
+            assertEquals(Lsn.of(durable), reclaimed.get(),
+                    "checkpoint 推进后把已持久 checkpoint LSN 推送给 redo 回收边界");
+        }
+    }
+
+    @Test
+    void doesNotTouchReclaimBoundaryWhenCheckpointDoesNotAdvance() {
+        try (PageStore store = new FileChannelPageStore();
+             BufferPool pool = new LruBufferPool(store, PS, 4);
+             RedoLogFileRepository repo = RedoLogFileRepository.open(dir.resolve("redo-noadvance.log"))) {
+            store.create(SPACE, dir.resolve("s-noadvance.ibd"), PS, PageNo.of(4));
+            RedoLogManager redo = RedoLogManager.durable(repo);
+            // append 但不 markClosed → closedLsn 仍为 0 → 安全 checkpoint 不前进。
+            redo.append(List.of(new PageBytesRecord(PAGE, 200, new byte[]{1})));
+            redo.flush();
+
+            AtomicReference<Lsn> reclaimed = new AtomicReference<>();
+            CheckpointCoordinator coordinator = new CheckpointCoordinator(pool, redo, null, reclaimed::set);
+
+            assertEquals(Lsn.of(0), coordinator.advanceCheckpoint());
+            assertNull(reclaimed.get(), "checkpoint 未推进时不触碰回收边界，避免过早放开覆盖");
         }
     }
 

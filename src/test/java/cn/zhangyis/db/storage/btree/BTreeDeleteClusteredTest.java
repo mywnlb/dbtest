@@ -20,6 +20,7 @@ import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
 import cn.zhangyis.db.storage.record.format.HiddenColumns;
 import cn.zhangyis.db.storage.record.format.LogicalRecord;
 import cn.zhangyis.db.storage.record.format.RecordType;
+import cn.zhangyis.db.storage.record.page.RecordCursor;
 import cn.zhangyis.db.storage.record.page.RecordPage;
 import cn.zhangyis.db.storage.record.page.RecordPageDeleter;
 import cn.zhangyis.db.storage.record.page.RecordPageSearch;
@@ -37,6 +38,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.OptionalInt;
 
@@ -392,7 +394,7 @@ class BTreeDeleteClusteredTest {
     }
 
     @Test
-    void mergeSkippedWhenCombinedDoesNotFit() {
+    void underfullLeafBorrowsFromFullSiblingViaRedistribute() {
         onPool(ctx -> {
             ctx.createTablespaceAndRoot();
             SplitCapableBTreeIndexService svc = ctx.service();
@@ -407,7 +409,7 @@ class BTreeDeleteClusteredTest {
             }
             assertEquals(1, current.rootLevel(), "5 wide-key rows form a level-1 tree with a full right leaf");
 
-            // 删最左 key 使左 leaf 欠载（1 行），但其唯一同父兄弟（满 3 行）容不下 → merge 跳过、无回收。
+            // 删最左 key 使左 leaf 欠载（1 行），同父右兄弟（满 3 行）容不下 merge → 改 redistribute 对半再平衡（0.12b）。
             MiniTransaction d = ctx.mgr.begin();
             BTreeDeleteResult res = svc.deleteClustered(d, current, kKey(1), TransactionId.of(TRX),
                     new RollPointer(true, PageNo.of(65), 1));
@@ -415,14 +417,18 @@ class BTreeDeleteClusteredTest {
             ctx.mgr.commit(d);
 
             assertTrue(res.removed(), "key 1 removed");
-            assertTrue(res.freedPages().isEmpty(), "underfull leaf cannot merge into a full sibling → no page freed");
-            assertEquals(1, current.rootLevel(), "no merge → tree stays level 1");
+            assertTrue(res.freedPages().isEmpty(), "redistribute 不删页 → 无回收");
+            assertEquals(1, current.rootLevel(), "redistribute 不改树高");
+
+            // 白盒：两 leaf 记录数从「留欠载」的 1+3 再平衡为 2+2（这是 redistribute 而非 0.12 留欠载的判据）。
+            assertEquals(List.of(2L, 2L), leafRecordCounts(ctx, current),
+                    "redistribute rebalances the adjacent pair to ~half each");
 
             MiniTransaction r = ctx.mgr.begin();
             List<Long> ids = svc.scan(r, current, new BTreeScanRange(kKey(1), true, kKey(5), true, 50))
                     .stream().map(BTreeDeleteClusteredTest::vOf).toList();
             ctx.mgr.commit(r);
-            assertEquals(List.of(2L, 3L, 4L, 5L), ids, "remaining keys intact and ordered after skipped merge");
+            assertEquals(List.of(2L, 3L, 4L, 5L), ids, "remaining keys intact and ordered after redistribute");
         });
     }
 
@@ -431,6 +437,28 @@ class BTreeDeleteClusteredTest {
     /** scan 结果取 payload 列（column1 = int v = id）。 */
     private static long vOf(BTreeLookupResult row) {
         return ((ColumnValue.IntValue) row.record().columnValues().get(1)).value();
+    }
+
+    /** 白盒读 level-1 树各 leaf 的用户记录数（按 root pointer 顺序），验证 redistribute 后相邻对均衡而非 1+3 留欠载。 */
+    private List<Long> leafRecordCounts(Ctx ctx, BTreeIndex index) {
+        MiniTransaction r = ctx.mgr.begin();
+        List<Long> counts = new ArrayList<>();
+        BTreeNodePointerSchema ps = BTreeNodePointerSchema.from(index);
+        BTreeNodePointerCodec codec = new BTreeNodePointerCodec();
+        try {
+            RecordPage root = ctx.access.openIndexPage(r, index.rootPageId(), PageLatchMode.SHARED);
+            for (int off : root.recordOffsetsInOrder()) {
+                BTreeNodePointer p = codec.fromRecord(
+                        new RecordCursor(root, off, ps.schema(), registry).materialize(), ps);
+                RecordPage leaf = ctx.access.openIndexPage(r, p.childPageId(), PageLatchMode.SHARED);
+                counts.add((long) leaf.header().nRecs());
+            }
+            ctx.mgr.commit(r);
+            return counts;
+        } catch (Throwable t) {
+            ctx.mgr.rollbackUncommitted(r);
+            throw t;
+        }
     }
 
     /** 宽聚簇 KEY schema：column0 = varchar(5000) 主键、column1 = int payload；clustered=true。 */

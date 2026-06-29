@@ -674,7 +674,9 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         }
         boolean leaf = node.header().level() == 0;
         if (!mergeFits(pair, leaf, index)) {
-            return index; // 容不下：留欠载（redistribute = 0.12b）
+            // merge 放不下（相邻对合计 > 一页）→ redistribute 对半再平衡（0.12b）：双方脱离欠载、不删页/不传播/不改树高。
+            redistribute(index, pair, leaf, parent, parentHandle.pageId());
+            return index;
         }
         if (leaf) {
             mergeLeaf(mtr, index, pair);
@@ -797,6 +799,59 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         RecordPage victim = pair.victim().recordPage();
         reorganizer.reorganize(survivor);
         writePointers(survivor, pair.survivorId(), materializePointers(victim, index), index);
+    }
+
+    /**
+     * redistribute 对半再平衡（0.12b，merge 放不下时的 fallback）：把相邻同父对（left=survivor / right=victim）的全部条目
+     * 合并后**对半重分**到两页，使双方都脱离欠载。只更新 parent 中 **right 成员** 的 lowKey——min-key-pointer 约定下
+     * left 的 lowKey = 左半首条 = 原 left 首条（不变），仅 right 的最小 key 变。**不删页、不动 FIL 链
+     * （format 只碰页体不碰信封区）、不向上传播、不改树高**，故相对 merge 少改父页、避免页空洞。leaf 与内部页统一。
+     *
+     * <p>数据流：先在任何 format 前 materialize left+right 全部条目（左全 &lt; 右、各自有序）→ {@link #splitRows}/
+     * {@link #splitPointers} 对半 → 两页各 {@code format} 后重灌左/右半 → 删 parent 中 right 旧 pointer（按 childId）
+     * + 插 {@code (newRightLowKey → rightId)} 新 pointer（parent pointer 数不变，不会令 parent 欠载）。
+     *
+     * <p>进入前提（{@code mergeFits=false} 且选到相邻兄弟）保证两页合计 &gt; 一页 ⟹ 条目数 ≥ 2 且对半后每页 &lt; 一页、
+     * &gt; 半页（脱离欠载）；防御：万一合计 &lt; 2 直接返回（留原状，不抛）。
+     */
+    private void redistribute(BTreeIndex index, MergePair pair, boolean leaf, RecordPage parent, PageId parentId) {
+        RecordPage left = pair.survivor().recordPage();
+        RecordPage right = pair.victim().recordPage();
+        PageId leftId = pair.survivorId();
+        PageId rightId = pair.victimId();
+        SearchKey newRightLowKey;
+        if (leaf) {
+            List<LogicalRecord> all = new ArrayList<>(materializeLeafRecords(left, index));
+            all.addAll(materializeLeafRecords(right, index));
+            if (all.size() < 2) {
+                return;
+            }
+            SplitRows s = splitRows(all);
+            left.format(index.indexId(), 0);
+            for (LogicalRecord row : s.left()) {
+                inserter.insert(left, leftId, row, index.keyDef(), index.schema());
+            }
+            right.format(index.indexId(), 0);
+            for (LogicalRecord row : s.right()) {
+                inserter.insert(right, rightId, row, index.keyDef(), index.schema());
+            }
+            newRightLowKey = keyOf(s.right().get(0), index);
+        } else {
+            int level = left.header().level();
+            List<BTreeNodePointer> all = new ArrayList<>(materializePointers(left, index));
+            all.addAll(materializePointers(right, index));
+            if (all.size() < 2) {
+                return;
+            }
+            SplitPointers s = splitPointers(all);
+            left.format(index.indexId(), level);
+            writePointers(left, leftId, s.left(), index);
+            right.format(index.indexId(), level);
+            writePointers(right, rightId, s.right(), index);
+            newRightLowKey = s.right().get(0).lowKey();
+        }
+        removePointerFromParent(parent, parentId, index, rightId);
+        insertPointer(parent, parentId, index, new BTreeNodePointer(newRightLowKey, rightId));
     }
 
     /** 从 parent 摘除指向 {@code victimId} 的 node pointer（deleteMark + purge；node pointer 非系统记录可标记后摘）。 */

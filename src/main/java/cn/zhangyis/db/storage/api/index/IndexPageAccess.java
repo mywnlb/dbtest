@@ -34,6 +34,14 @@ public final class IndexPageAccess {
     }
 
     /**
+     * 暴露页大小（只读）。B+Tree merge 需要按页容量判定 underflow 阈值（MERGE_THRESHOLD≈50%）与 merge fit，
+     * 故服务层经此读取页容量；本类仍不暴露 frame/裸文件。
+     */
+    public PageSize pageSize() {
+        return pageSize;
+    }
+
+    /**
      * 建并格式化一个 INDEX 页（要求在 mtr 内）：newPage(X,INDEX) → 写信封(INDEX) → format(indexId,level)。
      * 产 PAGE_INIT(INDEX) + 信封/格式 PAGE_BYTES；commit 盖 pageLSN。
      *

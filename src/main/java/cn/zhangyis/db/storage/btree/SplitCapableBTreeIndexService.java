@@ -173,20 +173,20 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         validateLeafPage(leaf, index, leafId);
         OptionalInt found = search.findEqual(leaf, key, index.keyDef(), index.schema());
         if (found.isEmpty()) {
-            return new BTreeDeleteResult(false);
+            return BTreeDeleteResult.noChange(index);
         }
         int offset = found.getAsInt();
         RecordCursor cursor = new RecordCursor(leaf, offset, index.schema(), registry);
         // 所有权校验：dbTrxId+dbRollPtr 同时匹配才是本 undo 插入的行；否则不删（幂等收敛）
         if (!expectedTrxId.equals(cursor.dbTrxId()) || !expectedRollPtr.equals(cursor.dbRollPtr())) {
-            return new BTreeDeleteResult(false);
+            return BTreeDeleteResult.noChange(index);
         }
         // 已 delete-marked（半失败/重试）则跳过 deleteMark 直接 purge；否则先逻辑标记再物理摘除
         if (!cursor.isDeleted()) {
             deleter.deleteMark(leaf, offset);
         }
         purger.purge(leaf, offset);
-        return new BTreeDeleteResult(true);
+        return BTreeDeleteResult.removed(index, List.of());
     }
 
     /**
@@ -227,17 +227,17 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         validateLeafPage(leaf, index, leafId);
         OptionalInt found = search.findEqual(leaf, key, index.keyDef(), index.schema());
         if (found.isEmpty()) {
-            return new BTreeDeleteResult(false);
+            return BTreeDeleteResult.noChange(index);
         }
         int offset = found.getAsInt();
         RecordCursor cursor = new RecordCursor(leaf, offset, index.schema(), registry);
         if (!cursor.isDeleted()
                 || !expectedTrxId.equals(cursor.dbTrxId())
                 || !expectedRollPtr.equals(cursor.dbRollPtr())) {
-            return new BTreeDeleteResult(false);
+            return BTreeDeleteResult.noChange(index);
         }
         purger.purge(leaf, offset);
-        return new BTreeDeleteResult(true);
+        return BTreeDeleteResult.removed(index, List.of());
     }
 
     /**
@@ -596,6 +596,15 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         return newSiblingId;
     }
 
+    /**
+     * 打开 root 页。<b>导航高度权威（0.12）</b>：descend 始终按 root 页**实际 level** 下降（见 {@link #descendPath}），
+     * 故这里只校验 {@code indexId}（拿错页/元数据损坏的硬判据），不再断言 {@code header.level()==index.rootLevel()}。
+     *
+     * <p>原因：root shrink 会降低实际 level，而批量 rollback/purge 持同一 {@link BTreeIndex} 快照跨多条记录
+     * （每条独立 MTR）调用，shrink 后快照 {@code rootLevel} 必然陈旧——严格相等断言会把合法的 shrink 误判为
+     * 「root changed」。页才是树高的权威；快照 level 仅作 {@code indexAfter} 观测/回填用。并发场景下的真正
+     * 重定位/重启协议留 0.13/2.7，届时再以 latch coupling + 版本校验替代（{@code BTreeRootChangedException} 保留备用）。
+     */
     private IndexPageHandle openRoot(MiniTransaction mtr, BTreeIndex index, PageLatchMode mode) {
         if (mtr == null || index == null || mode == null) {
             throw new DatabaseValidationException("btree mtr/index/mode must not be null");
@@ -605,10 +614,6 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         if (header.indexId() != index.indexId()) {
             throw new BTreeStructureCorruptedException("root page index id mismatch: page="
                     + header.indexId() + " expected=" + index.indexId());
-        }
-        if (header.level() != index.rootLevel()) {
-            throw new BTreeRootChangedException("root level changed: page=" + header.level()
-                    + " snapshot=" + index.rootLevel());
         }
         return root;
     }

@@ -671,6 +671,16 @@ public final class LruBufferPool implements BufferPool, FrameReleaser {
     }
 
     @Override
+    public List<PageId> residentPageIds() {
+        poolLock.lock();
+        try {
+            return List.copyOf(residentMap.keySet());
+        } finally {
+            poolLock.unlock();
+        }
+    }
+
+    @Override
     public void close() {
         flushAll();
     }

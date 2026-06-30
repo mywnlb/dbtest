@@ -222,6 +222,29 @@ class StorageEngineTest {
     }
 
     @Test
+    void warmupDumpsAtCloseAndReopensCleanly() {
+        // 0.10b：close 写出 buffer pool warmup dump，reopen 时 load 预取回池（最佳努力，不破坏恢复/数据）。
+        EngineConfig cfg = config();
+        Path dataPath = dir.resolve("data.ibd");
+
+        StorageEngine e1 = new StorageEngine(cfg);
+        e1.open();
+        BTreeIndex index = createClusteredIndex(e1, dataPath);
+        insertRow(e1, index, 1, "v1");
+        e1.close();
+        assertTrue(Files.exists(cfg.bufferPoolDumpFile()), "close 应写出 buffer pool warmup dump 文件");
+
+        StorageEngine e2 = new StorageEngine(cfg);
+        e2.open(); // open 期 warmup load 预取上次热页（不阻断、不破坏恢复）
+        e2.diskSpaceManager().openTablespace(DATA_SPACE, dataPath);
+        MiniTransaction r = e2.miniTransactionManager().begin();
+        assertEquals("v1", payloadOf(e2.btreeService().lookup(r, index, search(1)).orElseThrow()),
+                "warmup 接线后数据跨重启仍可读");
+        e2.miniTransactionManager().commit(r);
+        e2.close();
+    }
+
+    @Test
     void checkpointMakesRedoDurable() {
         StorageEngine engine = new StorageEngine(config());
         engine.open();

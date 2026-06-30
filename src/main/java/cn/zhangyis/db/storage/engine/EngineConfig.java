@@ -184,6 +184,11 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
         return baseDir.resolve("doublewrite.dwb");
     }
 
+    /** buffer pool warmup dump 文件路径（close 保存热页定位、open 预取）。不参与 crash recovery，损坏可丢弃。 */
+    public Path bufferPoolDumpFile() {
+        return baseDir.resolve("buffer-pool.dump");
+    }
+
     /**
      * 后台 redo flusher（{@code RedoFlushWorker}）的周期间隔。当前派生自 {@link #backgroundFlushInterval()}
      * （与 page cleaner 同后台节奏），以命名 hook 形式暴露：将来若 redo 刷盘需要独立节奏，可升级为独立配置组件

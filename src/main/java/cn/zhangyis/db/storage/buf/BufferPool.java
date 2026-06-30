@@ -117,6 +117,14 @@ public interface BufferPool extends AutoCloseable {
     /** 当前驻留帧数。 */
     int residentCount();
 
+    /**
+     * 快照当前驻留页的 {@code PageId} 列表（只读定位信息，不含页体）。供 warmup dump 在 close 时保存热页定位。
+     * 实现在内部短临界区内拷贝，调用方拿到的是不可变快照。
+     *
+     * @return 驻留页 PageId 不可变快照。
+     */
+    List<PageId> residentPageIds();
+
     /** 关闭：flushAll 后释放（假设无活跃句柄）。 */
     @Override
     void close();

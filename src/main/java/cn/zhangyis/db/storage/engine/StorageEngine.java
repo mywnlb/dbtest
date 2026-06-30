@@ -33,6 +33,7 @@ import cn.zhangyis.db.storage.flush.FlushService;
 import cn.zhangyis.db.storage.flush.cleaner.PageCleanerState;
 import cn.zhangyis.db.storage.flush.cleaner.PageCleanerWorker;
 import cn.zhangyis.db.storage.buf.ReadAheadService;
+import cn.zhangyis.db.storage.buf.BufferPoolWarmupService;
 import cn.zhangyis.db.storage.flush.checkpoint.CheckpointCoordinator;
 import cn.zhangyis.db.storage.flush.doublewrite.DoublewriteFileRepository;
 import cn.zhangyis.db.storage.flush.doublewrite.DoublewriteRecoveryScanner;
@@ -260,6 +261,8 @@ public final class StorageEngine {
         startBackgroundPurgeDriver();
         // read-ahead 在 bootstrap/recover 之后启动并接钩子：建库/恢复的 page access 不触发预取；之后普通 getPage 顺序访问才驱动。
         startBackgroundReadAhead(lruPool);
+        // warmup load：上次 close 的热页定位预取回池（缺失/损坏 dump no-op；未打开空间的页由 prefetch 跳过）。最佳努力，不阻断 open。
+        new BufferPoolWarmupService().load(pool, config.bufferPoolDumpFile());
         if (fresh) {
             recoveryGate.openForUserTraffic();
         }
@@ -496,6 +499,8 @@ public final class StorageEngine {
         stopBackgroundRedoFlusher();
         stopBackgroundPurgeDriver();
         flushService.flushThrough(redo.currentLsn(), config.flushTimeout());
+        // warmup dump：后台 worker 已停、dirty 已刷，residentMap 稳定，保存热页定位供下次 open 预取。最佳努力（IO 失败不抛）。
+        new BufferPoolWarmupService().dump(pool, config.bufferPoolDumpFile());
         List<RuntimeException> errors = new ArrayList<>();
         closeQuietly(pool, errors);
         closeQuietly(store, errors);

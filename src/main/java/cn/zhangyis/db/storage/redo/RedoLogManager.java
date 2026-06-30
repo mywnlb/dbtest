@@ -29,6 +29,8 @@ public final class RedoLogManager {
     private final ReentrantLock ioLock = new ReentrantLock();
     /** durability 等待条件；flush 推进 flushedToDiskLsn 后唤醒。 */
     private final Condition flushedAdvanced = lock.newCondition();
+    /** write 等待条件；write/flush 推进 writtenToDiskLsn 后唤醒。 */
+    private final Condition writtenAdvanced = lock.newCondition();
     /** 下一个空闲 LSN（long 计数，append 时推进）。 */
     private long nextLsn = 0;
     /**
@@ -52,6 +54,11 @@ public final class RedoLogManager {
     private final RedoLogIo io;
     /** 已 fsync 的最高 LSN；D3 内存模式恒为 0。 */
     private Lsn flushedToDiskLsn = Lsn.of(0);
+    /**
+     * 已写入 OS page cache、但未必 fsync 的最高 LSN（三阶段中的 write 边界）。WRITE_ON_COMMIT 等待该值。
+     * 不变量：{@code flushedToDiskLsn <= writtenToDiskLsn}（fsync 不会领先于 write）。D3 内存模式恒为 0。
+     */
+    private Lsn writtenToDiskLsn = Lsn.of(0);
     /**
      * writer 可读取的 recent written 连续边界。当前 append 同步完成 buffer 写入，因此批次创建后立即推进；
      * 后续若拆成真正并发 log buffer segment，可继续复用该 tracker 合并乱序写入完成事件。
@@ -170,6 +177,82 @@ public final class RedoLogManager {
     }
 
     /**
+     * 三阶段中的「write」：把 pending redo 写到 OS page cache（不 fsync），推进 {@link #writtenToDiskLsn}。
+     * 供 WRITE_ON_COMMIT 使用——崩溃进程不丢、但宕机/断电可能丢。D3 内存模式无 IO，返回当前 writtenToDiskLsn（0）。
+     *
+     * @return write 后已写入 OS cache 的最高 LSN。
+     */
+    public Lsn write() {
+        if (io == null) {
+            lock.lock();
+            try {
+                return writtenToDiskLsn;
+            } finally {
+                lock.unlock();
+            }
+        }
+        ioLock.lock();
+        try {
+            drainPendingToWritten();
+            lock.lock();
+            try {
+                return writtenToDiskLsn;
+            } finally {
+                lock.unlock();
+            }
+        } finally {
+            ioLock.unlock();
+        }
+    }
+
+    /** 已写入 OS page cache、但未必 fsync 的最高 LSN（write 边界）。 */
+    public Lsn writtenToDiskLsn() {
+        lock.lock();
+        try {
+            return writtenToDiskLsn;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 等待 {@link #writtenToDiskLsn()} 覆盖目标 LSN（OS-cache 写入边界）。带明确 timeout，不无界等待。
+     *
+     * @param target  目标 written LSN。
+     * @param timeout 最大等待时间。
+     * @return true 表示目标已写到 OS cache；false 表示 timeout 或线程被中断。
+     */
+    public boolean waitWritten(Lsn target, Duration timeout) {
+        if (target == null || timeout == null) {
+            throw new DatabaseValidationException("redo wait target/timeout must not be null");
+        }
+        if (timeout.isNegative()) {
+            throw new DatabaseValidationException("redo wait timeout must not be negative: " + timeout);
+        }
+        lock.lock();
+        try {
+            if (writtenToDiskLsn.value() >= target.value()) {
+                return true;
+            }
+            long nanos = timeoutNanos(timeout);
+            while (writtenToDiskLsn.value() < target.value()) {
+                if (nanos <= 0) {
+                    return false;
+                }
+                try {
+                    nanos = writtenAdvanced.awaitNanos(nanos);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+            }
+            return true;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
      * 已 fsync 到 redo 文件的最高 LSN。Flush 模块未来的 WAL gate 使用该值判断 {@code pageLSN <= flushedToDiskLsn}。
      */
     public Lsn flushedToDiskLsn() {
@@ -199,26 +282,7 @@ public final class RedoLogManager {
         }
         ioLock.lock();
         try {
-            while (true) {
-                RedoLogBatch batch;
-                lock.lock();
-                try {
-                    if (pendingBatches.isEmpty()) {
-                        break;
-                    }
-                    batch = pendingBatches.get(0);
-                } finally {
-                    lock.unlock();
-                }
-                io.write(batch);
-                lock.lock();
-                try {
-                    removeWrittenPendingBatch(batch);
-                    writtenNotFlushedBatches.add(batch);
-                } finally {
-                    lock.unlock();
-                }
-            }
+            drainPendingToWritten();
             Lsn physicalFlushed = io.flushTo(io.writtenToDiskLsn());
             lock.lock();
             try {
@@ -263,11 +327,14 @@ public final class RedoLogManager {
                         "redo recovery boundary must be installed before any new append");
             }
             nextLsn = recoveredToLsn.value();
+            // 恢复到的 redo 既已 durable，write 与 flush 边界都置为 recoveredToLsn（保持 flushed <= written 不变量）。
             flushedToDiskLsn = recoveredToLsn;
+            writtenToDiskLsn = recoveredToLsn;
             recentWritten.reset(recoveredToLsn);
             recentClosed.reset(recoveredToLsn);
             recoveredBoundaryInstalled = true;
             flushedAdvanced.signalAll();
+            writtenAdvanced.signalAll();
         } finally {
             lock.unlock();
         }
@@ -338,6 +405,46 @@ public final class RedoLogManager {
         lock.lock();
         try {
             return List.copyOf(batches);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 把 pending 批次顺序写到 OS page cache（不 fsync），并推进 {@link #writtenToDiskLsn}（单调）。
+     *
+     * <p>必须在持有 {@code ioLock} 时调用：实际文件 write 期间不持状态锁，故前台 append 可继续预留 LSN/入 pending。
+     * {@link #write()} 与 {@link #flush()} 共用本方法，保证两条路径推进 write 边界的逻辑一致；推进后唤醒
+     * {@link #writtenAdvanced} 上的 {@code waitWritten} 等待者。
+     */
+    private void drainPendingToWritten() {
+        while (true) {
+            RedoLogBatch batch;
+            lock.lock();
+            try {
+                if (pendingBatches.isEmpty()) {
+                    break;
+                }
+                batch = pendingBatches.get(0);
+            } finally {
+                lock.unlock();
+            }
+            io.write(batch);
+            lock.lock();
+            try {
+                removeWrittenPendingBatch(batch);
+                writtenNotFlushedBatches.add(batch);
+            } finally {
+                lock.unlock();
+            }
+        }
+        Lsn written = io.writtenToDiskLsn();
+        lock.lock();
+        try {
+            if (written.value() > writtenToDiskLsn.value()) {
+                writtenToDiskLsn = written;
+                writtenAdvanced.signalAll();
+            }
         } finally {
             lock.unlock();
         }

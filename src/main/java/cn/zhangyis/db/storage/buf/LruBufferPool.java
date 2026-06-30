@@ -50,6 +50,12 @@ public final class LruBufferPool implements BufferPool, FrameReleaser {
      */
     private volatile DirtyVictimFlusher victimFlusher;
 
+    /**
+     * 可选 read-ahead 钩子；null 表示未启用预取。set-once、bootstrap 注入、热路径只读，故 volatile 即可安全发布。
+     * {@code getPage} 命中/未命中后回调它上报访问；它必须廉价且不抛异常（在 demand read 热路径上）。
+     */
+    private volatile ReadAheadHook readAheadHook;
+
     /** 保护 residentMap / freeList / policy / 各帧 pageId·dirty·fixCount·state·loadFuture 的短临界区；盘 IO（读盘/刷盘）在锁外。 */
     private final ReentrantLock poolLock = new ReentrantLock();
     /** release() 在 fixCount 下降时唤醒截断排空；条件始终由 poolLock 保护。 */
@@ -125,9 +131,35 @@ public final class LruBufferPool implements BufferPool, FrameReleaser {
         }
     }
 
+    /**
+     * 注入 read-ahead 钩子（set-once）。生产 {@code StorageEngine} 在启动 read-ahead 服务时注入一次；
+     * 独立/测试池可不注入（无预取）。
+     */
+    public void attachReadAheadHook(ReadAheadHook hook) {
+        if (hook == null) {
+            throw new DatabaseValidationException("read-ahead hook must not be null");
+        }
+        poolLock.lock();
+        try {
+            if (this.readAheadHook != null) {
+                throw new DatabaseValidationException("read-ahead hook already attached (set-once)");
+            }
+            this.readAheadHook = hook;
+        } finally {
+            poolLock.unlock();
+        }
+    }
+
     @Override
     public PageGuard getPage(PageId pageId, PageLatchMode mode) {
-        return acquire(pageId, mode, true);
+        PageGuard guard = acquire(pageId, mode, true);
+        // demand read 后上报访问，驱动 linear read-ahead 检测。钩子在 poolLock 之外调用，且约定廉价/不抛异常，
+        // 故不影响 getPage 临界区与返回的 guard。newPage（页创建）不上报：read-ahead 只跟踪需求读的顺序模式。
+        ReadAheadHook hook = readAheadHook;
+        if (hook != null) {
+            hook.recordAccess(pageId);
+        }
+        return guard;
     }
 
     @Override

@@ -14,7 +14,7 @@ import java.util.concurrent.locks.Lock;
  */
 public final class PageGuard implements AutoCloseable {
 
-    /** 关闭回调，回到 pool 在 poolLock 下 OR 脏并 unfix。 */
+    /** 关闭回调，回到 pool 在 instanceLock 下 OR 脏并 unfix。 */
     private final FrameReleaser releaser;
 
     /** 被访问的帧。 */
@@ -122,7 +122,7 @@ public final class PageGuard implements AutoCloseable {
         }
     }
 
-    /** 释放：先放 page latch，再回调 pool 在 poolLock 下 OR 脏并 unfix。幂等。 */
+    /** 释放：先放 page latch，再回调 pool 在 instanceLock 下 OR 脏并 unfix。幂等。 */
     @Override
     public void close() {
         if (closed) {

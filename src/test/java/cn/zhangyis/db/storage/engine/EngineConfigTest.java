@@ -54,6 +54,22 @@ class EngineConfigTest {
     }
 
     @Test
+    void bufferPoolInstanceCountDefaultsToOneAndIsConfigurable() {
+        EngineConfig c = valid();
+        assertEquals(1, c.bufferPoolInstanceCount(), "默认单实例池（生产保守 N=1）");
+
+        EngineConfig sharded = c.withBufferPoolInstanceCount(4);
+        assertEquals(4, sharded.bufferPoolInstanceCount(), "wither 配置 N>1");
+        assertEquals(1, c.bufferPoolInstanceCount(), "wither 不改原配置（不可变）");
+
+        assertThrows(DatabaseValidationException.class, () -> c.withBufferPoolInstanceCount(0),
+                "分片数须 >=1");
+        // valid() 容量 256 帧；分片数不能超过帧数（否则有分片分到 0 帧）。
+        assertThrows(DatabaseValidationException.class, () -> c.withBufferPoolInstanceCount(257),
+                "分片数须 <= bufferPoolCapacityFrames");
+    }
+
+    @Test
     void recoveryTablespacesAreValidatedAndSnapshotted() {
         Path path = dir.resolve("data.ibd");
         EngineTablespaceConfig tablespace = new EngineTablespaceConfig(SpaceId.of(10), path);

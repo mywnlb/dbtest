@@ -32,6 +32,8 @@ import java.util.Set;
  * @param backgroundFlushMaxPages  后台 tick 每轮最多刷出的页数；0 表示只推进 checkpoint，不主动刷脏。
  * @param backgroundFlushStopTimeout close 时等待后台线程退出的边界，超时会作为 close 错误上报。
  * @param redoRotation             redo 文件环配置（0.18b）；{@code null}=单 append-only redo 文件，非空=启用文件环 + checkpoint 回收。
+ * @param bufferPoolInstanceCount  buffer pool 分片数（0.10d，≥1 且 ≤ bufferPoolCapacityFrames）；默认 1（生产保守，对齐
+ *                                 单实例池行为），由 {@link StorageEngine} 经本访问器构造 {@code LruBufferPool}。
  */
 public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapacityFrames,
                            SpaceId undoSpaceId, PageNo undoSpaceInitialPages, int slotCapacity,
@@ -39,7 +41,8 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                            List<EngineTablespaceConfig> recoveryTablespaces,
                            boolean backgroundFlushEnabled, int pageCleanerQueueCapacity,
                            Duration backgroundFlushInterval, int backgroundFlushMaxPages,
-                           Duration backgroundFlushStopTimeout, RedoRotationConfig redoRotation) {
+                           Duration backgroundFlushStopTimeout, RedoRotationConfig redoRotation,
+                           int bufferPoolInstanceCount) {
 
     /** 默认启动后台 page cleaner，使 engine open 后具备持续 checkpoint tick 能力。 */
     private static final boolean DEFAULT_BACKGROUND_FLUSH_ENABLED = true;
@@ -47,6 +50,8 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
     private static final int DEFAULT_PAGE_CLEANER_QUEUE_CAPACITY = 4;
     /** 默认后台 tick 间隔；教学实现优先稳定性，避免测试/开发环境频繁空转。 */
     private static final Duration DEFAULT_BACKGROUND_FLUSH_INTERVAL = Duration.ofSeconds(1);
+    /** 默认 buffer pool 分片数；生产保守 1（对齐 MySQL 单实例默认 + 本片"机制完整、生产 N=1"基调）。 */
+    private static final int DEFAULT_BUFFER_POOL_INSTANCE_COUNT = 1;
 
     public EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapacityFrames,
                         SpaceId undoSpaceId, PageNo undoSpaceInitialPages, int slotCapacity,
@@ -79,7 +84,8 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
         this(baseDir, pageSize, bufferPoolCapacityFrames, undoSpaceId, undoSpaceInitialPages,
                 slotCapacity, maxVersionHops, flushTimeout, redoCapacityBytes, recoveryTablespaces,
                 backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
-                backgroundFlushMaxPages, backgroundFlushStopTimeout, RedoRotationConfig.defaults());
+                backgroundFlushMaxPages, backgroundFlushStopTimeout, RedoRotationConfig.defaults(),
+                DEFAULT_BUFFER_POOL_INSTANCE_COUNT);
     }
 
     public EngineConfig {
@@ -121,6 +127,14 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
         if (backgroundFlushStopTimeout.isZero() || backgroundFlushStopTimeout.isNegative()) {
             throw new DatabaseValidationException("backgroundFlushStopTimeout must be positive: "
                     + backgroundFlushStopTimeout);
+        }
+        if (bufferPoolInstanceCount < 1) {
+            throw new DatabaseValidationException("bufferPoolInstanceCount must be >= 1: " + bufferPoolInstanceCount);
+        }
+        // 每个分片至少分到 1 帧，否则容量切分非法（与 LruBufferPool.buildInstances 一致，提前在 config 层给清晰错误）。
+        if (bufferPoolInstanceCount > bufferPoolCapacityFrames) {
+            throw new DatabaseValidationException("bufferPoolInstanceCount must be <= bufferPoolCapacityFrames: count="
+                    + bufferPoolInstanceCount + " frames=" + bufferPoolCapacityFrames);
         }
         validateRecoveryTablespaces(undoSpaceId, recoveryTablespaces);
         recoveryTablespaces = List.copyOf(recoveryTablespaces);
@@ -166,7 +180,21 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
         return new EngineConfig(baseDir, pageSize, bufferPoolCapacityFrames, undoSpaceId, undoSpaceInitialPages,
                 slotCapacity, maxVersionHops, flushTimeout, redoCapacityBytes, recoveryTablespaces,
                 backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
-                backgroundFlushMaxPages, backgroundFlushStopTimeout, rotation);
+                backgroundFlushMaxPages, backgroundFlushStopTimeout, rotation, bufferPoolInstanceCount);
+    }
+
+    /**
+     * 派生一个使用指定 buffer pool 分片数的配置副本（其余字段不变）。生产默认 1（单实例池），测试可经此显式配置 N&gt;1
+     * 验证多 instance 行为，无需重复罗列全部组件。
+     *
+     * @param instanceCount 分片数（≥1 且 ≤ bufferPoolCapacityFrames）。
+     * @return 使用指定分片数的新配置。
+     */
+    public EngineConfig withBufferPoolInstanceCount(int instanceCount) {
+        return new EngineConfig(baseDir, pageSize, bufferPoolCapacityFrames, undoSpaceId, undoSpaceInitialPages,
+                slotCapacity, maxVersionHops, flushTimeout, redoCapacityBytes, recoveryTablespaces,
+                backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
+                backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, instanceCount);
     }
 
     /** redo control（checkpoint label）文件路径。 */

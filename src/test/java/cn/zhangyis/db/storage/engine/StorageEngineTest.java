@@ -137,6 +137,28 @@ class StorageEngineTest {
     // ---- durable 往返 + 重开续写 ----
 
     @Test
+    void engineRunsWithMultipleBufferPoolInstances() {
+        // 0.10d：验证 config.bufferPoolInstanceCount() 真正驱动生产 LruBufferPool 分片——
+        // 引擎以 N=4 打开，btree 页经 facade 路由到 4 个分片，插入/查找端到端可用。
+        EngineConfig cfg = config().withBufferPoolInstanceCount(4);
+        Path dataPath = dir.resolve("data.ibd");
+
+        StorageEngine engine = new StorageEngine(cfg);
+        engine.open();
+        BTreeIndex index = createClusteredIndex(engine, dataPath);
+        insertRow(engine, index, 1, "v1");
+        insertRow(engine, index, 2, "v2");
+
+        MiniTransaction r = engine.miniTransactionManager().begin();
+        BTreeLookupResult f1 = engine.btreeService().lookup(r, index, search(1)).orElseThrow();
+        BTreeLookupResult f2 = engine.btreeService().lookup(r, index, search(2)).orElseThrow();
+        engine.miniTransactionManager().commit(r);
+        assertEquals("v1", payloadOf(f1));
+        assertEquals("v2", payloadOf(f2));
+        engine.close();
+    }
+
+    @Test
     void durableRoundTripAcrossRestart() {
         EngineConfig cfg = config();
         Path dataPath = dir.resolve("data.ibd");

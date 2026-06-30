@@ -62,6 +62,28 @@ class LruBufferPoolTest {
     }
 
     @Test
+    void residentCountInRangeCountsResidentPagesOnly() {
+        try (PageStore store = openStore(16)) {
+            LruBufferPool pool = new LruBufferPool(store, PS, 8);
+            // 载入页 2,4,5（区间 [2,6) 内，跳过 3）与区间外的页 8。
+            for (long no : new long[]{2, 4, 5, 8}) {
+                try (PageGuard g = pool.getPage(page(no), PageLatchMode.SHARED)) {
+                    g.readInt(0);
+                }
+            }
+            // 区间 [2,6) = 页 2,3,4,5；其中驻留的是 2,4,5 → 计 3（未驻留 3 与区间外 8 都不计）。
+            assertEquals(3, pool.residentCountInRange(SPACE, 2, 4),
+                    "只统计区间内已驻留页（2,4,5），跳过未驻留 3 与区间外 8");
+            assertEquals(0, pool.residentCountInRange(SPACE, 10, 4), "区间内无驻留页计 0");
+            assertEquals(0, pool.residentCountInRange(SpaceId.of(99), 2, 4), "其它表空间同区间计 0");
+            assertThrows(DatabaseValidationException.class, () -> pool.residentCountInRange(null, 0, 1));
+            assertThrows(DatabaseValidationException.class, () -> pool.residentCountInRange(SPACE, -1, 1));
+            assertThrows(DatabaseValidationException.class, () -> pool.residentCountInRange(SPACE, 0, 0));
+            pool.close();
+        }
+    }
+
+    @Test
     void shouldEvictLruWriteBackDirtyAndReReadFromDisk() {
         try (PageStore store = openStore(8)) {
             LruBufferPool pool = new LruBufferPool(store, PS, 2);

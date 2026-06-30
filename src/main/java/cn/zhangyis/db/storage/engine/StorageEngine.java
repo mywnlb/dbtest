@@ -155,6 +155,11 @@ public final class StorageEngine {
     private ReadAheadService readAheadService;
     /** linear read-ahead 触发阈值（同一 extent 连续访问页数，对齐 InnoDB 默认 56）。当前固定常量，按需再升为 config。 */
     private static final int READ_AHEAD_THRESHOLD = 56;
+    /**
+     * random read-ahead 触发阈值（0.10c）：0=禁用，对齐 MySQL 默认 {@code innodb_random_read_ahead=OFF}。
+     * 禁用时 {@code recordAccess} 不查 residentCountInRange，普通路径无额外开销。生产启用留 config（延后）。
+     */
+    private static final int RANDOM_READ_AHEAD_THRESHOLD = 0;
     /** read-ahead 预取请求队列容量；队满丢弃，绝不挤占前台需求读。 */
     private static final int READ_AHEAD_QUEUE_CAPACITY = 64;
     /** E3a 后台 redo flusher；周期驱动 redo.flush() 使 durable LSN 自动前进，解淘汰/flush 的 WAL gate 卡顿。 */
@@ -207,7 +212,9 @@ public final class StorageEngine {
         this.doublewriteRepo = DoublewriteFileRepository.open(config.doublewriteFile(), config.pageSize());
         this.accessController = new TablespaceAccessController();
         this.store = new FileChannelPageStore();
-        LruBufferPool lruPool = new LruBufferPool(store, config.pageSize(), config.bufferPoolCapacityFrames());
+        // 0.10d：按 config 分片数构造 buffer pool（默认 1=单实例池，生产保守；测试经 withBufferPoolInstanceCount 配 N>1）。
+        LruBufferPool lruPool = new LruBufferPool(store, config.pageSize(), config.bufferPoolCapacityFrames(),
+                config.bufferPoolInstanceCount());
         this.pool = lruPool;
         this.registry = new CachingTablespaceRegistry(
                 new PageZeroTablespaceMetadataLoader(store, config.pageSize(), accessController));
@@ -463,14 +470,16 @@ public final class StorageEngine {
     }
 
     /**
-     * 0.10a：启动后台 linear read-ahead 服务并接 Buffer Pool 钩子。仅在后台启用时启动；阈值取 InnoDB 默认 56，
-     * 故一般负载（含既有测试）不触发预取、行为不变。必须晚于 bootstrap/recover，使其只跟踪普通 getPage 顺序访问。
+     * 0.10a/0.10c：启动后台 read-ahead 服务并接 Buffer Pool 钩子。仅在后台启用时启动；linear 阈值取 InnoDB 默认 56，
+     * random 阈值取 {@link #RANDOM_READ_AHEAD_THRESHOLD}=0（禁用，对齐 MySQL OFF），故一般负载（含既有测试）不触发
+     * 预取、行为不变。必须晚于 bootstrap/recover，使其只跟踪普通 getPage 访问。
      */
     private void startBackgroundReadAhead(LruBufferPool lruPool) {
         if (!config.backgroundFlushEnabled()) {
             return;
         }
-        readAheadService = new ReadAheadService(pool, READ_AHEAD_THRESHOLD, READ_AHEAD_QUEUE_CAPACITY);
+        readAheadService = new ReadAheadService(pool, READ_AHEAD_THRESHOLD, RANDOM_READ_AHEAD_THRESHOLD,
+                READ_AHEAD_QUEUE_CAPACITY);
         readAheadService.start();
         lruPool.attachReadAheadHook(readAheadService);
     }

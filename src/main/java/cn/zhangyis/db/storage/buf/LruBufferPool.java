@@ -6,156 +6,133 @@ import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.fil.io.PageStore;
-import cn.zhangyis.db.storage.page.PageEnvelopeLayout;
 
-import java.nio.ByteBuffer;
-import java.util.ArrayDeque;
-import java.util.Arrays;
-import java.util.Comparator;
-import java.util.Deque;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.Set;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.Condition;
-import java.util.concurrent.locks.ReentrantLock;
-import java.util.stream.Collectors;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * LRU Buffer Pool 实现。单 poolLock 保护帧表/空闲列表/LRU/帧元数据短临界区；**miss 读盘已移出 poolLock**（per-frame
- * LOADING 占位 + PageLoadFuture，§7.1/§7.3）：owner 锁内装 LOADING 占位后出锁读盘，不同页 miss 可并发读，同页后到者
- * 命中 LOADING 即有界等待该页 load future、醒后重查 residentMap，不持锁阻塞。脏 victim 淘汰亦在锁外经 WAL 管线刷盘。
- * 每帧 page latch 在 poolLock 之外获取，不嵌套；fixCount>0 不可淘汰。
+ * Buffer Pool facade（§5.1）：把 {@link PageId} 经 {@link BufferPoolRouter} 路由到若干 {@link BufferPoolInstance} 分片，
+ * 单页操作（get/new/prefetch/flush/snapshot）直接转发到归属分片；跨切面查询（dirty 候选 / oldest LSN / hasDirty /
+ * residentCount / 截断）逐分片调用本地方法再在锁外合并。
  *
- * <p>同时实现 FrameReleaser：PageGuard.close() 回调 release 在 poolLock 下 OR 脏并 unfix。
+ * <p><b>分片（§5.2，本片单 instance 锁）</b>：默认 {@code instanceCount=1}，行为与原单实例池字节级等价（路由恒 0）。
+ * 总容量按 {@code base=cap/N + 前 r 个各 +1} 切分到各分片（要求 {@code capacity≥instanceCount}）。每分片自有一把
+ * {@code instanceLock}（不拆 §13.1 子锁）；分片间无 work stealing——某分片满即抛 {@link BufferPoolExhaustedException}，
+ * 即便他分片有空闲帧（与 InnoDB 一致）。
+ *
+ * <p><b>并发不变量</b>：facade 的跨切面操作<b>一次只持一把 instance 锁</b>（锁单分片取快照→解锁→下一分片→锁外合并），
+ * 绝不同时持两把 → 无分片间锁序、无死锁。read-ahead 钩子在 {@link #getPage} 路由+取页之后调用（钩子是 pool 级、非分片级）。
+ *
+ * <p>同时提供 {@code attachVictimFlusher}/{@code attachReadAheadHook}（set-once）：victim flusher 传播给每个分片
+ * （flushVictim 经本 facade 路由回归属分片），read-ahead 钩子留在 facade。
  */
-public final class LruBufferPool implements BufferPool, FrameReleaser {
+public final class LruBufferPool implements BufferPool {
 
-    private final PageStore pageStore;
-    private final PageSize pageSize;
-    private final int capacity;
-    private final ReplacementPolicy policy;
-
-    /** 帧状态机：集中执行 BufferFrame.state 的合法转换（§5.7）。所有调用在 poolLock 下串行，故无需自身加锁。 */
-    private final FrameStateMachine stateMachine = new FrameStateMachine();
-
-    /**
-     * 淘汰脏 victim 时委托的 WAL 安全刷盘端口；null 表示独立/测试池，淘汰脏帧退回 legacy {@link #writeBack}。
-     * set-once、bootstrap 注入、热路径只读，故 volatile 即可安全发布。
-     */
-    private volatile DirtyVictimFlusher victimFlusher;
-
-    /**
-     * 可选 read-ahead 钩子；null 表示未启用预取。set-once、bootstrap 注入、热路径只读，故 volatile 即可安全发布。
-     * {@code getPage} 命中/未命中后回调它上报访问；它必须廉价且不抛异常（在 demand read 热路径上）。
-     */
-    private volatile ReadAheadHook readAheadHook;
-
-    /** 保护 residentMap / freeList / policy / 各帧 pageId·dirty·fixCount·state·loadFuture 的短临界区；盘 IO（读盘/刷盘）在锁外。 */
-    private final ReentrantLock poolLock = new ReentrantLock();
-    /** release() 在 fixCount 下降时唤醒截断排空；条件始终由 poolLock 保护。 */
-    private final Condition frameReleased = poolLock.newCondition();
-    private final Map<PageId, BufferFrame> residentMap = new HashMap<>();
-    private final Deque<BufferFrame> freeList = new ArrayDeque<>();
-
-    /** 默认 load 超时：命中 LOADING 页的等待者最长等待时长，避免 IO owner 卡死时无限期阻塞。 */
+    /** 默认 load 超时：命中 LOADING 页的等待者最长等待时长。 */
     private static final Duration DEFAULT_LOAD_TIMEOUT = Duration.ofSeconds(30);
 
-    /** 等待 LOADING 页完成的有界超时（纳秒）；超时抛 {@link BufferPoolLoadTimeoutException}。构造期固定。 */
-    private final long loadTimeoutNanos;
+    /** 分片数组（≥1）。下标即 {@link BufferPoolRouter} 的路由结果；构造期固定。 */
+    private final BufferPoolInstance[] instances;
+    /** PageId→分片下标路由器；与 {@link #instances} 长度一致。 */
+    private final BufferPoolRouter router;
 
+    /**
+     * 淘汰脏页的 WAL 安全刷盘端口（facade 级 set-once）。bootstrap 注入后传播给每个分片；CAS 防运行期被换。
+     */
+    private final AtomicReference<DirtyVictimFlusher> victimFlusher = new AtomicReference<>();
+
+    /**
+     * 可选 read-ahead 钩子（facade 级 set-once）；null 表示未启用预取。{@link #getPage} 命中/未命中后回调它上报访问。
+     * 钩子必须廉价且不抛异常（demand read 热路径）。
+     */
+    private final AtomicReference<ReadAheadHook> readAheadHook = new AtomicReference<>();
+
+    /** 单实例池，默认 midpoint LRU（Phase A）。等价 {@code instanceCount=1}。 */
     public LruBufferPool(PageStore pageStore, PageSize pageSize, int capacity) {
-        // 默认采用 midpoint LRU（Phase A）：读入进 old 子链、提升窗 + youngDistanceThreshold 抗扫描污染。
-        // 生产时钟用墙钟驱动 oldBlocksTime；测试可经 4 参构造注入可控时钟的策略。
-        this(pageStore, pageSize, capacity, new MidpointLruReplacementPolicy(System::currentTimeMillis));
+        this(pageStore, pageSize, capacity, 1);
     }
 
+    /**
+     * 多实例池：把容量分到 {@code instanceCount} 个分片，各用独立默认 midpoint 策略 + 默认 load 超时。
+     * 生产由 {@code StorageEngine} 经 {@code EngineConfig.bufferPoolInstanceCount()} 构造（默认 1）。
+     */
+    public LruBufferPool(PageStore pageStore, PageSize pageSize, int capacity, int instanceCount) {
+        this.instances = buildInstances(pageStore, pageSize, capacity, instanceCount, DEFAULT_LOAD_TIMEOUT);
+        this.router = new BufferPoolRouter(instanceCount);
+    }
+
+    /** 单实例池 + 注入替换策略（测试注入可控时钟）。 */
     LruBufferPool(PageStore pageStore, PageSize pageSize, int capacity, ReplacementPolicy policy) {
         this(pageStore, pageSize, capacity, policy, DEFAULT_LOAD_TIMEOUT);
     }
 
-    /** 全参构造（含 load 超时）：测试可注入短超时以验证 LOADING 等待的有界性。 */
+    /** 单实例池 + 注入替换策略 + load 超时（测试注入短超时验证 LOADING 等待有界）。 */
     LruBufferPool(PageStore pageStore, PageSize pageSize, int capacity, ReplacementPolicy policy,
                   Duration loadTimeout) {
-        if (pageStore == null) {
-            throw new DatabaseValidationException("page store must not be null");
-        }
-        if (pageSize == null) {
-            throw new DatabaseValidationException("page size must not be null");
-        }
-        if (capacity < 1) {
-            throw new DatabaseValidationException("capacity must be >= 1: " + capacity);
-        }
-        if (policy == null) {
-            throw new DatabaseValidationException("replacement policy must not be null");
-        }
-        if (loadTimeout == null || loadTimeout.isZero() || loadTimeout.isNegative()) {
-            throw new DatabaseValidationException("load timeout must be positive: " + loadTimeout);
-        }
-        this.pageStore = pageStore;
-        this.pageSize = pageSize;
-        this.capacity = capacity;
-        this.policy = policy;
-        try {
-            this.loadTimeoutNanos = loadTimeout.toNanos();
-        } catch (ArithmeticException overflow) {
-            throw new DatabaseValidationException("load timeout is too large: " + loadTimeout, overflow);
-        }
-        for (int i = 0; i < capacity; i++) {
-            freeList.add(new BufferFrame(pageSize));
-        }
+        this.instances = new BufferPoolInstance[]{
+                new BufferPoolInstance(pageStore, pageSize, capacity, policy, loadTimeout)};
+        this.router = new BufferPoolRouter(1);
     }
 
-    /**
-     * 注入淘汰脏页的 WAL 安全刷盘端口（set-once）。生产 {@code StorageEngine} 必须在构造 FlushCoordinator 之后、
-     * 任何可能触发淘汰的 page access 之前调用一次；独立/测试池可不注入（脏 victim 退回 legacy writeBack）。
-     */
+    /** 容量切分：base=cap/N、前 r 个分片各 +1；要求 capacity≥instanceCount（每分片至少 1 帧）。 */
+    private static BufferPoolInstance[] buildInstances(PageStore pageStore, PageSize pageSize, int capacity,
+                                                       int instanceCount, Duration loadTimeout) {
+        if (instanceCount < 1) {
+            throw new DatabaseValidationException("buffer pool instance count must be >= 1: " + instanceCount);
+        }
+        if (capacity < instanceCount) {
+            throw new DatabaseValidationException("capacity must be >= instanceCount: capacity=" + capacity
+                    + " instanceCount=" + instanceCount);
+        }
+        BufferPoolInstance[] arr = new BufferPoolInstance[instanceCount];
+        int base = capacity / instanceCount;
+        int remainder = capacity % instanceCount;
+        for (int i = 0; i < instanceCount; i++) {
+            int shardCapacity = base + (i < remainder ? 1 : 0);
+            // 每分片独立 midpoint 策略对象（策略持 per-instance LRU 状态，不能跨分片共享）。
+            arr[i] = new BufferPoolInstance(pageStore, pageSize, shardCapacity,
+                    new MidpointLruReplacementPolicy(System::currentTimeMillis), loadTimeout);
+        }
+        return arr;
+    }
+
+    /** 注入淘汰脏页的 WAL 安全刷盘端口（set-once）并传播给每个分片。 */
     public void attachVictimFlusher(DirtyVictimFlusher flusher) {
         if (flusher == null) {
             throw new DatabaseValidationException("victim flusher must not be null");
         }
-        // set-once：在 poolLock 下校验并发布，防止运行期被换成另一刷盘实现导致淘汰语义不一致。
-        poolLock.lock();
-        try {
-            if (this.victimFlusher != null) {
-                throw new DatabaseValidationException("victim flusher already attached (set-once)");
-            }
-            this.victimFlusher = flusher;
-        } finally {
-            poolLock.unlock();
+        if (!victimFlusher.compareAndSet(null, flusher)) {
+            throw new DatabaseValidationException("victim flusher already attached (set-once)");
+        }
+        for (BufferPoolInstance instance : instances) {
+            instance.attachVictimFlusher(flusher);
         }
     }
 
-    /**
-     * 注入 read-ahead 钩子（set-once）。生产 {@code StorageEngine} 在启动 read-ahead 服务时注入一次；
-     * 独立/测试池可不注入（无预取）。
-     */
+    /** 注入 read-ahead 钩子（set-once）；留在 facade，由 {@link #getPage} 调用。 */
     public void attachReadAheadHook(ReadAheadHook hook) {
         if (hook == null) {
             throw new DatabaseValidationException("read-ahead hook must not be null");
         }
-        poolLock.lock();
-        try {
-            if (this.readAheadHook != null) {
-                throw new DatabaseValidationException("read-ahead hook already attached (set-once)");
-            }
-            this.readAheadHook = hook;
-        } finally {
-            poolLock.unlock();
+        if (!readAheadHook.compareAndSet(null, hook)) {
+            throw new DatabaseValidationException("read-ahead hook already attached (set-once)");
         }
+    }
+
+    private BufferPoolInstance instanceFor(PageId pageId) {
+        return instances[router.route(pageId)];
     }
 
     @Override
     public PageGuard getPage(PageId pageId, PageLatchMode mode) {
-        PageGuard guard = acquire(pageId, mode, true);
-        // demand read 后上报访问，驱动 linear read-ahead 检测。钩子在 poolLock 之外调用，且约定廉价/不抛异常，
-        // 故不影响 getPage 临界区与返回的 guard。newPage（页创建）不上报：read-ahead 只跟踪需求读的顺序模式。
-        ReadAheadHook hook = readAheadHook;
+        PageGuard guard = instanceFor(pageId).getPage(pageId, mode);
+        // demand read 后上报访问，驱动 read-ahead。钩子在分片锁之外调用、约定廉价/不抛异常，不影响返回的 guard。
+        // newPage 不上报：read-ahead 只跟踪需求读模式。
+        ReadAheadHook hook = readAheadHook.get();
         if (hook != null) {
             hook.recordAccess(pageId);
         }
@@ -164,308 +141,23 @@ public final class LruBufferPool implements BufferPool, FrameReleaser {
 
     @Override
     public PageGuard newPage(PageId pageId, PageLatchMode mode) {
-        return acquire(pageId, mode, false);
-    }
-
-    /**
-     * getPage/newPage 公共骨架：poolLock 内取得 target 帧（命中固定 / 未命中取受害者并载入），
-     * 释放 poolLock 后取 page latch，返回 guard。载入失败回收 victim 到空闲列表，不泄漏帧/锁。
-     *
-     * <p>WAL 安全淘汰（设计 §6.1 LRU_FLUSH / §8.3 / §9.2）：选中的 victim 若是脏帧且已注入 {@link #victimFlusher}，
-     * 不能在 poolLock 内直接写盘（既违反 WAL，又违反"持 pool 锁时不取物理文件锁"）。改为在锁内只捕获其 PageId、
-     * 释放 poolLock，出锁经端口做 WAL gate + checksum + doublewrite + 写盘 + completeFlush，再回环重选受害者
-     * （届时该帧已清脏可复用，或被他人再 fix/再脏则另选）。无 flusher 的独立/测试池退回 legacy {@link #writeBack}。
-     *
-     * <p>防空转：本轮维护 {@code cleanSkip}，{@code flushVictim} 返回 false（不脏/redo 未 durable/又变脏）的页本轮
-     * 不再选，至多尝试 capacity 个不同脏页后由 {@link #obtainVictim} 抛 {@link BufferPoolExhaustedException}（fail-safe，
-     * 绝不腐败）。{@code flushVictim} 抛出的真 IO 失败直接向上传播，不进 skip set、不被吞成耗尽。
-     */
-    private PageGuard acquire(PageId pageId, PageLatchMode mode, boolean readFromDisk) {
-        if (pageId == null) {
-            throw new DatabaseValidationException("page id must not be null");
-        }
-        if (mode == null) {
-            throw new DatabaseValidationException("page latch mode must not be null");
-        }
-        // 页创建/重初始化是写操作，必须持 X latch；不允许 newPage(page, SHARED) 走清零语义。
-        if (!readFromDisk && mode != PageLatchMode.EXCLUSIVE) {
-            throw new DatabaseValidationException("newPage requires EXCLUSIVE latch but got " + mode);
-        }
-        BufferFrame chosen;
-        boolean resetAfterLatch = false;
-        Set<PageId> cleanSkip = null;
-        // 每轮在 poolLock 内确定唯一的出锁动作：刷脏 victim / 读盘载入 / 等待他人载入；锁内完成则直接 break。
-        while (true) {
-            PageId victimToClean = null;
-            BufferFrame loadingVictim = null;
-            PageLoadFuture awaitFuture = null;
-            poolLock.lock();
-            try {
-                BufferFrame resident = residentMap.get(pageId);
-                if (resident != null) {
-                    if (resident.state == BufferFrameState.LOADING) {
-                        // 命中正在载入的页：取 load future 出锁有界等待，**绝不缓存帧引用**，醒来回环重查 residentMap。
-                        awaitFuture = resident.loadFuture;
-                    } else {
-                        if (!readFromDisk) {
-                            // 页创建命中驻留页：重初始化（复用帧），对齐 InnoDB buf_page_create。
-                            // 清零延后到取得 X latch 之后做（见方法末尾）——不能在 poolLock 内、未持 page latch 时改页内容，
-                            // 否则会与持锁读者撞车、绕过 page latch 语义。dirty 在 poolLock 下置位（dirty 由 poolLock 保护）。
-                            resident.dirty = true;
-                            stateMachine.transition(resident, BufferFrameState.DIRTY);
-                            resetAfterLatch = true;
-                        }
-                        resident.fixCount++;
-                        policy.onAccess(resident);
-                        chosen = resident;
-                        break;
-                    }
-                } else {
-                    BufferFrame victim = obtainVictim(cleanSkip);
-                    if (victim.dirty && victimFlusher != null) {
-                        // 脏 victim + 已注入 flusher：锁内只记 PageId，出锁刷盘后回环重选，绝不在 poolLock 内写盘。
-                        victimToClean = victim.pageId;
-                    } else {
-                        if (victim.dirty) {
-                            // 无 flusher 的独立/测试池：退回 legacy 直接写回（字节级保持既有行为；不承诺 WAL 安全）。
-                            writeBack(victim);
-                        }
-                        if (victim.pageId != null) {
-                            residentMap.remove(victim.pageId);
-                            policy.onRemove(victim);
-                        }
-                        if (readFromDisk) {
-                            // 装 LOADING 占位（in-lock）：owner 自持 fixCount=1 防载入期被淘汰，建 load future、注册 residentMap；
-                            // **暂不 onInsert**（待读盘成功发布 CLEAN 才入 LRU）。随后出 poolLock 读盘，后到同页者见 LOADING 即等。
-                            victim.pageId = pageId;
-                            clearDirty(victim);
-                            stateMachine.transition(victim, BufferFrameState.LOADING);
-                            victim.fixCount = 1;
-                            victim.loadFuture = new PageLoadFuture();
-                            residentMap.put(pageId, victim);
-                            loadingVictim = victim;
-                        } else {
-                            // newPage miss：无盘 IO，锁内清零并直接发布 CLEAN（清零内容延后到取 X latch 之后，见方法末尾）。
-                            Arrays.fill(victim.data, (byte) 0);
-                            victim.pageId = pageId;
-                            clearDirty(victim);
-                            stateMachine.transition(victim, BufferFrameState.CLEAN);
-                            victim.fixCount = 1;
-                            residentMap.put(pageId, victim);
-                            policy.onInsert(victim);
-                            chosen = victim;
-                            break;
-                        }
-                    }
-                }
-            } finally {
-                poolLock.unlock();
-            }
-            // ===== 出 poolLock 的三类动作，每轮至多一类；其余回环 =====
-            if (awaitFuture != null) {
-                // 有界等待他人载入：成功/失败均返回后回环重查（成功→命中 CLEAN 自 fix；失败/被淘汰→重新成为 owner）。
-                // 超时或中断抛 BufferPoolLoadTimeoutException，绝不悬挂。
-                awaitFuture.await(loadTimeoutNanos, pageId);
-                continue;
-            }
-            if (loadingVictim != null) {
-                // 锁外读盘 + 发布 CLEAN（或失败回收占位并抛）；owner 保留其 fix，返回该帧。
-                chosen = readAndPublish(pageId, loadingVictim);
-                break;
-            }
-            // 出 poolLock：经端口把脏 victim 经 WAL 管线刷干净（内部做 WAL gate/doublewrite/写盘/completeFlush）。
-            // 真 IO 失败抛领域异常并向上传播；返回 false=本轮未清成→计入 skip set 回环重选，避免对未 durable 页空转。
-            boolean cleaned = victimFlusher.flushVictim(victimToClean);
-            if (!cleaned) {
-                if (cleanSkip == null) {
-                    cleanSkip = new HashSet<>();
-                }
-                cleanSkip.add(victimToClean);
-            }
-        }
-        Lock latch = (mode == PageLatchMode.EXCLUSIVE)
-                ? chosen.pageLatch.writeLock()
-                : chosen.pageLatch.readLock();
-        latch.lock();
-        // 驻留页重初始化：在 X latch 保护下清零（不经 PageGuard → 不产 PAGE_BYTES；清零恢复语义由 PAGE_INIT 承担）。
-        if (resetAfterLatch) {
-            Arrays.fill(chosen.data, (byte) 0);
-        }
-        return new PageGuard(this, chosen, mode, latch);
-    }
-
-    /**
-     * 出 poolLock 读盘并发布 CLEAN（设计 §7.1/§7.3）。owner 已在锁内装好 LOADING 占位（fixCount=1、loadFuture）。
-     *
-     * <p><b>载入握手序（评审点 2，杜绝等待者拿到已完成 future 却撞淘汰）</b>：
-     * <ul>
-     *   <li>读盘成功：重取 poolLock，LOADING→CLEAN、{@code onInsert} 入 LRU、清 loadFuture；**owner 保留其 fix=1**
-     *       （它即需该页的调用方，故该帧在 owner 关闭 guard 前不会被淘汰，给等待者重查留出安全窗）。出锁 complete
-     *       future 唤醒等待者——等待者随后重取 poolLock 按 pageId 重查命中 CLEAN 再 fix，不信任任何缓存引用。</li>
-     *   <li>读盘失败：重取 poolLock，移除占位、帧复位 FREE 回 free list、清 loadFuture；出锁以异常 complete future
-     *       唤醒等待者（其 await 返回后回环重试），向上抛根因。绝不留永久 LOADING 占位（§7.3 末条）。</li>
-     * </ul>
-     */
-    private BufferFrame readAndPublish(PageId pageId, BufferFrame frame) {
-        PageLoadFuture future = frame.loadFuture;
-        try {
-            // 锁外读盘：此帧为 LOADING + fixCount=1 且不在 victimOrder，无人能淘汰或改它，data 数组归 owner 独占。
-            pageStore.readPage(pageId, ByteBuffer.wrap(frame.data));
-        } catch (RuntimeException loadError) {
-            poolLock.lock();
-            try {
-                residentMap.remove(pageId);
-                frame.pageId = null;
-                clearDirty(frame);
-                stateMachine.transition(frame, BufferFrameState.FREE);
-                frame.fixCount = 0;
-                frame.loadFuture = null;
-                freeList.add(frame);
-            } finally {
-                poolLock.unlock();
-            }
-            future.failExceptionally(loadError);
-            throw loadError;
-        }
-        poolLock.lock();
-        try {
-            // 发布 CLEAN：此刻才 onInsert 入 LRU；owner 保留 fixCount=1。data 写在前、poolLock 发布在后，
-            // 等待者经 poolLock 重查即获得对 data 的可见性（happens-before），无需依赖 future 传递内容。
-            stateMachine.transition(frame, BufferFrameState.CLEAN);
-            policy.onInsert(frame);
-            frame.loadFuture = null;
-        } finally {
-            poolLock.unlock();
-        }
-        future.complete();
-        return frame;
-    }
-
-    /**
-     * 取受害者帧（调用须持 poolLock）：优先空闲帧；否则 LRU 序首个未 fix 的**干净**帧（可直接复用）；
-     * 若无干净未固定帧，则回首个未在本轮 {@code cleanSkip} 中的脏未固定帧（交由调用方出锁刷干净后复用）；
-     * 全部被固定或已 skip 则抛耗尽。优先干净帧可避免不必要的刷盘。
-     */
-    private BufferFrame obtainVictim(Set<PageId> cleanSkip) {
-        BufferFrame free = freeList.poll();
-        if (free != null) {
-            return free;
-        }
-        BufferFrame firstDirty = null;
-        for (BufferFrame frame : policy.victimOrder()) {
-            if (frame.fixCount != 0) {
-                continue;
-            }
-            if (frame.state == BufferFrameState.FLUSHING) {
-                // 正在刷盘的帧处于 IO 中，不能被淘汰（否则与刷盘写竞争/重复刷）；待 flush 完成转 CLEAN 后再考虑。
-                continue;
-            }
-            if (!frame.dirty) {
-                return frame;
-            }
-            if (firstDirty == null && (cleanSkip == null || !cleanSkip.contains(frame.pageId))) {
-                firstDirty = frame;
-            }
-        }
-        if (firstDirty != null) {
-            return firstDirty;
-        }
-        throw new BufferPoolExhaustedException("buffer pool exhausted: all " + capacity
-                + " frames are fixed or pending durable flush");
-    }
-
-    /** 写回脏帧到 PageStore 并清脏。调用须持 poolLock 且帧 fixCount==0（内容稳定）。 */
-    private void writeBack(BufferFrame frame) {
-        pageStore.writePage(frame.pageId, ByteBuffer.wrap(frame.data));
-        clearDirty(frame);
-        stateMachine.transition(frame, BufferFrameState.CLEAN);
-    }
-
-    @Override
-    public void release(BufferFrame frame, boolean wrote) {
-        poolLock.lock();
-        try {
-            if (wrote) {
-                markDirty(frame);
-            }
-            frame.fixCount--;
-            frameReleased.signalAll();
-        } finally {
-            poolLock.unlock();
-        }
+        return instanceFor(pageId).newPage(pageId, mode);
     }
 
     @Override
     public void prefetch(PageId pageId) {
-        if (pageId == null) {
-            throw new DatabaseValidationException("page id must not be null");
-        }
-        BufferFrame loading;
-        poolLock.lock();
-        try {
-            if (residentMap.containsKey(pageId)) {
-                return; // 已驻留或正在载入（§8.1：目标页已在 page hash 则跳过）。
-            }
-            BufferFrame free = freeList.poll();
-            if (free == null) {
-                return; // 无空闲帧：read-ahead 直接丢弃，绝不淘汰脏页或挤占前台需求读（§8.1）。
-            }
-            // 装 LOADING 占位（同 acquire miss）：自固定防载入期被淘汰，建 load future；暂不 onInsert（待发布 CLEAN）。
-            free.pageId = pageId;
-            clearDirty(free);
-            stateMachine.transition(free, BufferFrameState.LOADING);
-            free.fixCount = 1;
-            free.loadFuture = new PageLoadFuture();
-            residentMap.put(pageId, free);
-            loading = free;
-        } finally {
-            poolLock.unlock();
-        }
-        BufferFrame published;
-        try {
-            // 出 poolLock 读盘并发布 CLEAN + onInsert 进 old 子链；失败时 readAndPublish 已回收占位到 free 并抛根因。
-            published = readAndPublish(pageId, loading);
-        } catch (RuntimeException loadError) {
-            // read-ahead 尽力而为：载入失败丢弃，不向上传播、不留 LOADING（占位已回收）。
-            return;
-        }
-        // 不返回 guard：立即 unfix，使预取页成为 old 子链冷页、最先被淘汰；**不 onAccess**（未被真实访问，不提升，§5.6）。
-        poolLock.lock();
-        try {
-            published.fixCount--;
-            frameReleased.signalAll();
-        } finally {
-            poolLock.unlock();
-        }
+        instanceFor(pageId).prefetch(pageId);
     }
 
     @Override
     public void flush(PageId pageId) {
-        if (pageId == null) {
-            throw new DatabaseValidationException("page id must not be null");
-        }
-        poolLock.lock();
-        try {
-            BufferFrame frame = residentMap.get(pageId);
-            if (frame != null && frame.fixCount == 0 && frame.dirty) {
-                writeBack(frame);
-            }
-        } finally {
-            poolLock.unlock();
-        }
+        instanceFor(pageId).flush(pageId);
     }
 
     @Override
     public void flushAll() {
-        poolLock.lock();
-        try {
-            for (BufferFrame frame : residentMap.values()) {
-                if (frame.fixCount == 0 && frame.dirty) {
-                    writeBack(frame);
-                }
-            }
-        } finally {
-            poolLock.unlock();
+        for (BufferPoolInstance instance : instances) {
+            instance.flushAll();
         }
     }
 
@@ -477,43 +169,22 @@ public final class LruBufferPool implements BufferPool, FrameReleaser {
         if (maxPages < 0) {
             throw new DatabaseValidationException("max pages must not be negative: " + maxPages);
         }
-        poolLock.lock();
-        try {
-            return residentMap.values().stream()
-                    // 跳过 FLUSHING 帧：已有单 IO owner 在刷它，重复入候选会导致重复刷/竞争 snapshot。
-                    .filter(frame -> frame.dirty && frame.state != BufferFrameState.FLUSHING
-                            && frame.oldestModificationLsn.value() <= targetLsn.value())
-                    .sorted(Comparator.comparingLong(frame -> frame.oldestModificationLsn.value()))
-                    .limit(maxPages)
-                    .map(frame -> new DirtyPageCandidate(frame.pageId,
-                            frame.oldestModificationLsn, frame.newestModificationLsn))
-                    .collect(Collectors.toUnmodifiableList());
-        } finally {
-            poolLock.unlock();
+        // 各分片各取本地 ≤maxPages 候选（已按 oldest 升序裁剪），并集再全局按 oldest 升序排序取前 maxPages：
+        // 全局 top-maxPages ⊆ 各分片 top-maxPages 的并集，故合并结果正确。
+        List<DirtyPageCandidate> merged = new ArrayList<>();
+        for (BufferPoolInstance instance : instances) {
+            merged.addAll(instance.localDirtyPageCandidates(targetLsn, maxPages));
         }
+        merged.sort(Comparator.comparingLong(candidate -> candidate.oldestModificationLsn().value()));
+        if (merged.size() > maxPages) {
+            merged = merged.subList(0, maxPages);
+        }
+        return List.copyOf(merged);
     }
 
     @Override
     public Optional<FlushPageSnapshot> snapshotForFlush(PageId pageId) {
-        if (pageId == null) {
-            throw new DatabaseValidationException("page id must not be null");
-        }
-        poolLock.lock();
-        try {
-            BufferFrame frame = residentMap.get(pageId);
-            // 仅 DIRTY 帧可被认领刷盘：FLUSHING 已被另一 IO owner 持有（单 owner，拒二次 snapshot），
-            // CLEAN/LOADING 无需刷；fixCount!=0 时内容不稳定，不取快照。state==DIRTY 蕴含 dirty==true。
-            if (frame == null || frame.state != BufferFrameState.DIRTY || frame.fixCount != 0) {
-                return Optional.empty();
-            }
-            byte[] image = Arrays.copyOf(frame.data, frame.data.length);
-            // DIRTY → FLUSHING：标记单 IO owner 已开始刷盘；dirty 仍为 true（未 durable），故 oldest-dirty 边界仍含本帧。
-            stateMachine.transition(frame, BufferFrameState.FLUSHING);
-            return Optional.of(new FlushPageSnapshot(pageId,
-                    frame.newestModificationLsn, frame.dirtyVersion, image));
-        } finally {
-            poolLock.unlock();
-        }
+        return instanceFor(pageId).snapshotForFlush(pageId);
     }
 
     @Override
@@ -521,44 +192,12 @@ public final class LruBufferPool implements BufferPool, FrameReleaser {
         if (snapshot == null) {
             throw new DatabaseValidationException("flush page snapshot must not be null");
         }
-        poolLock.lock();
-        try {
-            BufferFrame frame = residentMap.get(snapshot.pageId());
-            // 只接受由本次 snapshot 置为 FLUSHING 的帧；若已被淘汰/复用/状态改变则放弃（返回 false，不动状态）。
-            if (frame == null || frame.state != BufferFrameState.FLUSHING) {
-                return false;
-            }
-            if (frame.fixCount == 0
-                    && frame.dirtyVersion == snapshot.dirtyVersion()
-                    && frame.newestModificationLsn.equals(snapshot.pageLsn())) {
-                // snapshot 后未再被修改 → 落盘镜像即当前内容，FLUSHING → CLEAN 清脏。
-                clearDirty(frame);
-                stateMachine.transition(frame, BufferFrameState.CLEAN);
-                return true;
-            }
-            // 刷盘期又被改（dirtyVersion 变）或被重新 fix → 落盘镜像已过期，FLUSHING → DIRTY 保留脏待重刷。
-            stateMachine.transition(frame, BufferFrameState.DIRTY);
-            return false;
-        } finally {
-            poolLock.unlock();
-        }
+        return instanceFor(snapshot.pageId()).completeFlush(snapshot);
     }
 
     @Override
     public void failFlush(PageId pageId) {
-        if (pageId == null) {
-            throw new DatabaseValidationException("page id must not be null");
-        }
-        poolLock.lock();
-        try {
-            // 刷盘 IO 失败：FLUSHING → DIRTY，保留脏页待下一轮重刷（dirty 全程为 true，不丢未落盘修改）。
-            BufferFrame frame = residentMap.get(pageId);
-            if (frame != null && frame.state == BufferFrameState.FLUSHING) {
-                stateMachine.transition(frame, BufferFrameState.DIRTY);
-            }
-        } finally {
-            poolLock.unlock();
-        }
+        instanceFor(pageId).failFlush(pageId);
     }
 
     @Override
@@ -566,31 +205,31 @@ public final class LruBufferPool implements BufferPool, FrameReleaser {
         if (cleanBoundary == null) {
             throw new DatabaseValidationException("clean boundary must not be null");
         }
-        poolLock.lock();
-        try {
-            return residentMap.values().stream()
-                    .filter(frame -> frame.dirty)
-                    .map(frame -> frame.oldestModificationLsn)
-                    .min(Comparator.comparingLong(Lsn::value))
-                    .orElse(cleanBoundary);
-        } finally {
-            poolLock.unlock();
+        Lsn min = null;
+        for (BufferPoolInstance instance : instances) {
+            Lsn local = instance.localOldestDirtyLsnOrNull();
+            if (local != null && (min == null || local.value() < min.value())) {
+                min = local;
+            }
         }
+        return min == null ? cleanBoundary : min;
     }
 
     @Override
     public boolean hasDirtyPages() {
-        poolLock.lock();
-        try {
-            return residentMap.values().stream().anyMatch(frame -> frame.dirty);
-        } finally {
-            poolLock.unlock();
+        for (BufferPoolInstance instance : instances) {
+            if (instance.hasDirtyPages()) {
+                return true;
+            }
         }
+        return false;
     }
 
     /**
-     * 等待目标空间所有 fix 归零，然后原子检查 dirty 并从 resident/LRU 移除。等待期间 Condition 会释放 poolLock，
-     * 允许 PageGuard.close 回调 release；成功路径不做磁盘 IO，调用方必须预先完成安全 flush。
+     * 截断前排空目标表空间（§5.5）：空间的页按 hash 散在各分片，故必须对**所有**分片做。**两阶段**保证 all-or-nothing：
+     * 先逐分片 {@link BufferPoolInstance#awaitDrainedAndCheckClean}（共享 deadline 等 fix=0 + 校验无脏，任一脏帧/超时即抛、
+     * 尚未移除任何帧），全部通过后再逐分片 {@link BufferPoolInstance#removeTablespaceFrames}。调用方须已持该表空间独占
+     * operation lease，阻止新 page fix 与并发 flush，使两阶段之间确认的 fix=0/clean 不变。
      */
     @Override
     public void invalidateTablespace(SpaceId spaceId, Duration timeout) {
@@ -600,119 +239,63 @@ public final class LruBufferPool implements BufferPool, FrameReleaser {
         if (timeout == null || timeout.isZero() || timeout.isNegative()) {
             throw new DatabaseValidationException("invalidate tablespace timeout must be positive");
         }
-        long remaining;
+        long timeoutNanos;
         try {
-            remaining = timeout.toNanos();
+            timeoutNanos = timeout.toNanos();
         } catch (ArithmeticException overflow) {
             throw new DatabaseValidationException("invalidate tablespace timeout is too large", overflow);
         }
-        poolLock.lock();
-        try {
-            while (hasFixedFrame(spaceId)) {
-                if (remaining <= 0) {
-                    throw new BufferPoolInvalidationTimeoutException(
-                            "timed out waiting fixed frames for tablespace " + spaceId.value());
-                }
-                try {
-                    remaining = frameReleased.awaitNanos(remaining);
-                } catch (InterruptedException interrupted) {
-                    Thread.currentThread().interrupt();
-                    throw new BufferPoolInvalidationTimeoutException(
-                            "interrupted waiting fixed frames for tablespace " + spaceId.value(), interrupted);
-                }
-            }
-            List<BufferFrame> targets = new ArrayList<>();
-            for (BufferFrame frame : residentMap.values()) {
-                if (frame.pageId.spaceId().equals(spaceId)) {
-                    if (frame.dirty) {
-                        throw new DirtyTablespaceInvalidationException(
-                                "dirty frame blocks tablespace invalidation: " + frame.pageId);
-                    }
-                    targets.add(frame);
-                }
-            }
-            for (BufferFrame frame : targets) {
-                residentMap.remove(frame.pageId);
-                policy.onRemove(frame);
-                frame.pageId = null;
-                clearDirty(frame);
-                stateMachine.transition(frame, BufferFrameState.FREE);
-                frame.fixCount = 0;
-                freeList.add(frame);
-            }
-        } finally {
-            poolLock.unlock();
+        long deadlineNanos = System.nanoTime() + timeoutNanos;
+        // 阶段 1：全部分片 drain+check 通过（任一失败抛出，未移除任何帧 → 不会出现部分失效）。
+        for (BufferPoolInstance instance : instances) {
+            instance.awaitDrainedAndCheckClean(spaceId, deadlineNanos);
+        }
+        // 阶段 2：全部分片移除该空间帧。
+        for (BufferPoolInstance instance : instances) {
+            instance.removeTablespaceFrames(spaceId);
         }
     }
 
-    /** 调用须持 poolLock。 */
-    private boolean hasFixedFrame(SpaceId spaceId) {
-        for (BufferFrame frame : residentMap.values()) {
-            if (frame.pageId.spaceId().equals(spaceId) && frame.fixCount > 0) {
-                return true;
-            }
+    @Override
+    public int residentCountInRange(SpaceId spaceId, long firstPageNo, int pageCount) {
+        // 各分片本地区间计数求和：每个 PageId 只在其归属分片，故求和=区间内总驻留数。
+        // 参数校验由分片内 PageHashTable.countInRange 完成（spaceId/firstPageNo/pageCount）。
+        int total = 0;
+        for (BufferPoolInstance instance : instances) {
+            total += instance.countResidentInRange(spaceId, firstPageNo, pageCount);
         }
-        return false;
+        return total;
     }
 
     @Override
     public int capacity() {
-        return capacity;
+        int total = 0;
+        for (BufferPoolInstance instance : instances) {
+            total += instance.capacity();
+        }
+        return total;
     }
 
     @Override
     public int residentCount() {
-        poolLock.lock();
-        try {
-            return residentMap.size();
-        } finally {
-            poolLock.unlock();
+        int total = 0;
+        for (BufferPoolInstance instance : instances) {
+            total += instance.residentCount();
         }
+        return total;
     }
 
     @Override
     public List<PageId> residentPageIds() {
-        poolLock.lock();
-        try {
-            return List.copyOf(residentMap.keySet());
-        } finally {
-            poolLock.unlock();
+        List<PageId> all = new ArrayList<>();
+        for (BufferPoolInstance instance : instances) {
+            all.addAll(instance.residentPageIds());
         }
+        return List.copyOf(all);
     }
 
     @Override
     public void close() {
         flushAll();
-    }
-
-    private Lsn pageLsn(BufferFrame frame) {
-        return Lsn.of(ByteBuffer.wrap(frame.data).getLong(PageEnvelopeLayout.PAGE_LSN));
-    }
-
-    /** 调用须持 poolLock。 */
-    private void markDirty(BufferFrame frame) {
-        Lsn pageLsn = pageLsn(frame);
-        // oldestModificationLsn = 自上次刷盘以来最早的修改 LSN：只要当前未设置就设为本次 pageLSN。
-        // 不能用 `!frame.dirty` 作为条件——newPage 对驻留页重初始化时会先在 poolLock 内置 dirty=true（见 acquire
-        // 重初始化路径）而尚未有 LSN；若此处仅在 `!dirty` 时设置，commit 的 markDirty 会因 dirty 已为真而跳过，
-        // 留下 dirty=true 但 oldestModificationLsn=null 的帧，导致 dirtyPageCandidates/checkpoint NPE。
-        if (frame.oldestModificationLsn == null) {
-            frame.oldestModificationLsn = pageLsn;
-        }
-        frame.newestModificationLsn = pageLsn;
-        frame.dirtyVersion++;
-        frame.dirty = true;
-        // 状态：非刷盘中则进 DIRTY；若帧正 FLUSHING（刷盘期被写）则保持 FLUSHING——dirtyVersion 已推进，
-        // completeFlush 会因版本不符判定落盘镜像过期并退回 DIRTY，故此处不抢转，避免丢失"刷盘镜像已陈旧"信号。
-        if (frame.state != BufferFrameState.FLUSHING) {
-            stateMachine.transition(frame, BufferFrameState.DIRTY);
-        }
-    }
-
-    /** 调用须持 poolLock。 */
-    private void clearDirty(BufferFrame frame) {
-        frame.dirty = false;
-        frame.oldestModificationLsn = null;
-        frame.newestModificationLsn = null;
     }
 }

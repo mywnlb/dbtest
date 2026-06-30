@@ -111,6 +111,19 @@ public interface BufferPool extends AutoCloseable {
      */
     void invalidateTablespace(SpaceId spaceId, Duration timeout);
 
+    /**
+     * 统计某连续页区间 {@code [firstPageNo, firstPageNo+pageCount)} 内当前已驻留的页数（含正在载入的占位页）。
+     * 供 random read-ahead（§8.3）判定「同一 extent 已有足够多页驻留」：调用方传入页所在 extent 的起始页 + extent
+     * 页数，命中阈值则补取整 extent。实现在 poolLock 内对区间逐页查 {@code residentMap}（O(pageCount) 次查找，
+     * 与池大小无关），故 random 启用时每次访问引入一次 O(extent) 开销；random 默认禁用时调用方不会调用本方法。
+     *
+     * @param spaceId     目标表空间。
+     * @param firstPageNo 区间起始页号（含，≥0）。
+     * @param pageCount   区间页数（≥1）。
+     * @return 区间内已驻留页数（0..pageCount）。
+     */
+    int residentCountInRange(SpaceId spaceId, long firstPageNo, int pageCount);
+
     /** 帧总容量。 */
     int capacity();
 

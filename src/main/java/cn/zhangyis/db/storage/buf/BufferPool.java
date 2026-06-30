@@ -36,6 +36,15 @@ public interface BufferPool extends AutoCloseable {
      */
     PageGuard newPage(PageId pageId, PageLatchMode mode);
 
+    /**
+     * Read-ahead 预取（§8.1）：若该页未驻留且有空闲帧，则异步语义地把页载入到 LRU old 子链——**不 fix、不记访问
+     * （不提升）**，使未被真实访问的预取页留在 old 子链、最先被淘汰。已驻留/正在载入则跳过；无空闲帧直接丢弃
+     * （read-ahead 不淘汰脏页、不挤占前台需求读）；载入失败尽力而为丢弃，不留 LOADING 占位。
+     *
+     * @param pageId 预取目标页。
+     */
+    void prefetch(PageId pageId);
+
     /** 若该页驻留、未 fix 且为脏，则写回 PageStore 并清脏。 */
     void flush(PageId pageId);
 

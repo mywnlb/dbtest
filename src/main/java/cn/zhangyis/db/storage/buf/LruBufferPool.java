@@ -364,6 +364,50 @@ public final class LruBufferPool implements BufferPool, FrameReleaser {
     }
 
     @Override
+    public void prefetch(PageId pageId) {
+        if (pageId == null) {
+            throw new DatabaseValidationException("page id must not be null");
+        }
+        BufferFrame loading;
+        poolLock.lock();
+        try {
+            if (residentMap.containsKey(pageId)) {
+                return; // 已驻留或正在载入（§8.1：目标页已在 page hash 则跳过）。
+            }
+            BufferFrame free = freeList.poll();
+            if (free == null) {
+                return; // 无空闲帧：read-ahead 直接丢弃，绝不淘汰脏页或挤占前台需求读（§8.1）。
+            }
+            // 装 LOADING 占位（同 acquire miss）：自固定防载入期被淘汰，建 load future；暂不 onInsert（待发布 CLEAN）。
+            free.pageId = pageId;
+            clearDirty(free);
+            stateMachine.transition(free, BufferFrameState.LOADING);
+            free.fixCount = 1;
+            free.loadFuture = new PageLoadFuture();
+            residentMap.put(pageId, free);
+            loading = free;
+        } finally {
+            poolLock.unlock();
+        }
+        BufferFrame published;
+        try {
+            // 出 poolLock 读盘并发布 CLEAN + onInsert 进 old 子链；失败时 readAndPublish 已回收占位到 free 并抛根因。
+            published = readAndPublish(pageId, loading);
+        } catch (RuntimeException loadError) {
+            // read-ahead 尽力而为：载入失败丢弃，不向上传播、不留 LOADING（占位已回收）。
+            return;
+        }
+        // 不返回 guard：立即 unfix，使预取页成为 old 子链冷页、最先被淘汰；**不 onAccess**（未被真实访问，不提升，§5.6）。
+        poolLock.lock();
+        try {
+            published.fixCount--;
+            frameReleased.signalAll();
+        } finally {
+            poolLock.unlock();
+        }
+    }
+
+    @Override
     public void flush(PageId pageId) {
         if (pageId == null) {
             throw new DatabaseValidationException("page id must not be null");

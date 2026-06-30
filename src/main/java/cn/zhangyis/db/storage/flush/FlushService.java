@@ -11,6 +11,7 @@ import cn.zhangyis.db.storage.flush.policy.AdaptiveFlushPolicy;
 import cn.zhangyis.db.storage.flush.policy.FlushAdvice;
 import cn.zhangyis.db.storage.redo.RedoCapacityDecision;
 import cn.zhangyis.db.storage.redo.RedoCapacityPolicy;
+import cn.zhangyis.db.storage.redo.RedoCapacityPressure;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
 
 import java.time.Duration;
@@ -69,7 +70,11 @@ public final class FlushService {
         }
         Lsn before = checkpointCoordinator.lastCheckpointLsn();
         RedoCapacityDecision decision = capacityPolicy.evaluate(redo.currentLsn(), before);
-        FlushAdvice advice = adaptiveFlushPolicy.plan(decision, maxPages);
+        // 比例策略按「需刷出以推进 checkpoint 到 target 的脏页数」自适应批量；NONE 不刷，省去计数。
+        int dirtyPagesBeforeTarget = decision.pressure() == RedoCapacityPressure.NONE
+                ? 0
+                : bufferPool.dirtyPageCandidates(decision.targetCheckpointLsn(), bufferPool.capacity()).size();
+        FlushAdvice advice = adaptiveFlushPolicy.plan(decision, dirtyPagesBeforeTarget, maxPages);
         List<FlushResult> results = advice.shouldFlush()
                 ? flushCoordinator.flushList(advice.targetLsn(), advice.maxPages())
                 : List.of();

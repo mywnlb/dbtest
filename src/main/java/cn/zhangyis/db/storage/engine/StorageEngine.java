@@ -229,7 +229,7 @@ public final class StorageEngine {
                 new CheckpointCoordinator(pool, redo, checkpointStore, redoReclaim);
         this.flushService = new FlushService(pool, flushCoordinator, checkpointCoordinator, redo,
                 RedoCapacityPolicy.fixed(config.redoCapacityBytes()),
-                AdaptiveFlushPolicy.fixed(1, config.bufferPoolCapacityFrames()));
+                AdaptiveFlushPolicy.adaptive(1, 1, config.bufferPoolCapacityFrames()));
         // WAL 安全淘汰：注入淘汰刷盘端口，使脏页淘汰复用 FlushCoordinator 的 WAL gate + checksum + doublewrite
         // 管线。必须在 FlushCoordinator 就绪后、任何可能触发淘汰的 page access（fresh 建系统 undo / recover）之前注入。
         lruPool.attachVictimFlusher(new CoordinatedDirtyVictimFlusher(flushCoordinator));

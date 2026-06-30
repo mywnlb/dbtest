@@ -11,6 +11,14 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
  */
 public record RedoRotationConfig(int fileCount, long fileBytes) {
 
+    /** 默认文件数：教学实现取 8（InnoDB 量级偏小），与单文件容量配合给出有界但宽裕的 redo 上限。 */
+    private static final int DEFAULT_FILE_COUNT = 8;
+    /**
+     * 默认单文件容量：8 MiB。必须远大于引擎任一单个 MTR 批次的 redo 字节数（boot 建库/索引操作均 ≪ 8 MiB），
+     * 否则该批 append 会判为配置错误；同时 8×8 MiB=64 MiB 总上限对一般工作负载不会触发环满。
+     */
+    private static final long DEFAULT_FILE_BYTES = 8L * 1024 * 1024;
+
     public RedoRotationConfig {
         if (fileCount < 2) {
             throw new DatabaseValidationException("redo rotation fileCount must be >= 2: " + fileCount);
@@ -18,5 +26,10 @@ public record RedoRotationConfig(int fileCount, long fileBytes) {
         if (fileBytes <= 0) {
             throw new DatabaseValidationException("redo rotation fileBytes must be positive: " + fileBytes);
         }
+    }
+
+    /** 默认 redo 文件环配置（8 个文件、每文件 8 MiB），作为 {@link EngineConfig} 的默认 redo 后端。 */
+    public static RedoRotationConfig defaults() {
+        return new RedoRotationConfig(DEFAULT_FILE_COUNT, DEFAULT_FILE_BYTES);
     }
 }

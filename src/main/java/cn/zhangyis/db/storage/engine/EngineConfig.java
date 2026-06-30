@@ -66,8 +66,8 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
     }
 
     /**
-     * 兼容旧（无 redo 文件环）签名的便利构造器：redo 沿用单 append-only 文件。新增 0.18b 的 {@code redoRotation} 组件后，
-     * 该构造器让既有 15 参调用点零改动继续编译，默认不启用文件环。
+     * 兼容旧签名的便利构造器：让既有 15 参调用点零改动继续编译。0.18 收口后默认 redo 后端为有界文件环
+     * （{@link RedoRotationConfig#defaults()}）；如需单 append-only 文件，用 {@link #withSingleFileRedo()} 显式回退。
      */
     public EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapacityFrames,
                         SpaceId undoSpaceId, PageNo undoSpaceInitialPages, int slotCapacity,
@@ -79,7 +79,7 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
         this(baseDir, pageSize, bufferPoolCapacityFrames, undoSpaceId, undoSpaceInitialPages,
                 slotCapacity, maxVersionHops, flushTimeout, redoCapacityBytes, recoveryTablespaces,
                 backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
-                backgroundFlushMaxPages, backgroundFlushStopTimeout, null);
+                backgroundFlushMaxPages, backgroundFlushStopTimeout, RedoRotationConfig.defaults());
     }
 
     public EngineConfig {
@@ -142,17 +142,31 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
     }
 
     /**
-     * 派生一个启用 redo 文件环的配置副本（其余字段不变）。便于在不重复罗列全部组件的情况下 opt-in 文件环。
+     * 派生一个使用自定义 redo 文件环的配置副本（其余字段不变）。便于在不重复罗列全部组件的情况下指定文件数/容量。
      *
      * @param fileCount 文件数（≥2）。
      * @param fileBytes 单文件帧容量上限（不含文件头）。
-     * @return 启用文件环的新配置。
+     * @return 使用指定文件环的新配置。
      */
     public EngineConfig withRedoRotation(int fileCount, long fileBytes) {
+        return withRedoRotation(new RedoRotationConfig(fileCount, fileBytes));
+    }
+
+    /**
+     * 派生一个显式回退到单 append-only redo 文件的配置副本（其余字段不变）。0.18 收口后默认是文件环，
+     * 该方法供确实需要单文件语义的场景（如直接检视单 redo 文件的测试）显式 opt-out。
+     *
+     * @return 使用单文件 redo 的新配置。
+     */
+    public EngineConfig withSingleFileRedo() {
+        return withRedoRotation((RedoRotationConfig) null);
+    }
+
+    private EngineConfig withRedoRotation(RedoRotationConfig rotation) {
         return new EngineConfig(baseDir, pageSize, bufferPoolCapacityFrames, undoSpaceId, undoSpaceInitialPages,
                 slotCapacity, maxVersionHops, flushTimeout, redoCapacityBytes, recoveryTablespaces,
                 backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
-                backgroundFlushMaxPages, backgroundFlushStopTimeout, new RedoRotationConfig(fileCount, fileBytes));
+                backgroundFlushMaxPages, backgroundFlushStopTimeout, rotation);
     }
 
     /** redo control（checkpoint label）文件路径。 */

@@ -42,6 +42,18 @@ class EngineConfigTest {
     }
 
     @Test
+    void defaultConfigEnablesRedoRotation() {
+        // 0.18 收口：默认 redo 后端改为有界文件环（不再单 append-only 文件）。
+        EngineConfig c = valid();
+        assertTrue(c.redoRotationEnabled(), "默认配置应启用 redo 文件环");
+        assertEquals(RedoRotationConfig.defaults(), c.redoRotation());
+        assertEquals(dir.resolve("redo"), c.redoDir());
+        // 显式 opt-out 到单文件仍可用（canonical 构造器传 null）。
+        EngineConfig single = c.withSingleFileRedo();
+        assertFalse(single.redoRotationEnabled(), "withSingleFileRedo 显式回退单文件");
+    }
+
+    @Test
     void recoveryTablespacesAreValidatedAndSnapshotted() {
         Path path = dir.resolve("data.ibd");
         EngineTablespaceConfig tablespace = new EngineTablespaceConfig(SpaceId.of(10), path);

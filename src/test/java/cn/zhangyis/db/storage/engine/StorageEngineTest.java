@@ -630,8 +630,16 @@ class StorageEngineTest {
                 new ColumnValue.StringValue(payload)), false, RecordType.CONVENTIONAL);
     }
 
+    /** 打开引擎实际使用的 redo 后端（文件环或单文件），保证注入的 redo 与引擎恢复读取的是同一份。 */
+    private static RedoLogFileRepository openRedoBackend(EngineConfig cfg) {
+        return cfg.redoRotationEnabled()
+                ? RedoLogFileRepository.openRing(cfg.redoDir(), cfg.redoRotation().fileCount(),
+                        cfg.redoRotation().fileBytes())
+                : RedoLogFileRepository.open(cfg.redoFile());
+    }
+
     private static void appendPhysicalRedoAfterCheckpoint(EngineConfig cfg, PageId pageId, int offset, byte[] payload) {
-        try (RedoLogFileRepository repo = RedoLogFileRepository.open(cfg.redoFile());
+        try (RedoLogFileRepository repo = openRedoBackend(cfg);
              RedoCheckpointStore checkpointStore = RedoCheckpointStore.open(cfg.redoControlFile())) {
             RedoCheckpointLabel label = checkpointStore.readLatest();
             RedoRecoveryReader reader = new RedoRecoveryReader(repo, label.checkpointLsn());

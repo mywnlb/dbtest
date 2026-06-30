@@ -265,7 +265,7 @@ flowchart TD
 
 | Package area | Representative classes | Current state | Notes |
 | --- | --- | --- | --- |
-| `storage.redo` core | `RedoLogManager`, `ContiguousLsnTracker`, `RedoLogIo`, batches/ranges/physical records | Partial | 默认 manager 为 memory mode；`StorageEngine`/truncation 测试组合注入 durable manager；支持 recovery boundary 恢复与连续续写；recent written/closed 连续边界已接，append 与 fsync 状态锁已拆分 |
+| `storage.redo` core | `RedoLogManager`, `ContiguousLsnTracker`, `RedoLogIo`, `DurabilityPolicy`, batches/ranges/physical records | Partial | 默认 manager 为 memory mode；`StorageEngine`/truncation 测试组合注入 durable manager；支持 recovery boundary 恢复与连续续写；recent written/closed 连续边界已接，append 与 fsync 状态锁已拆分；三阶段 append→`write()`(OS cache)→`flush()`(fsync) 原语齐备（`writtenToDiskLsn`/`waitWritten`，守 `flushed<=written`）；`DurabilityPolicy`(FLUSH/WRITE/BACKGROUND) 选用原语，但**生产事务提交未消费**（test-wired，待 2.1） |
 | `storage.redo` durable IO | `RedoLogWriter`, `RedoLogFlusher`, `RedoLogFileRepository`(接口), `SingleFileRedoLogRepository`, `RotatingRedoLogRepository`, `RedoBatchFrameCodec` | Implemented | `RedoLogFileRepository` 现为角色接口（append/force/readBatches）；`SingleFileRedoLogRepository`=单 append-only（`StorageEngine` 默认）；`RotatingRedoLogRepository`(0.18a/b)=固定文件环，轮转 + checkpoint 回收 + 跨文件恢复扫描；`StorageEngine.open` **默认**接入文件环（`EngineConfig` 默认 `RedoRotationConfig.defaults()`=8×8MiB；`withSingleFileRedo()` 显式 opt-out），checkpoint 经 `RedoReclaimBoundary`→`CheckpointCoordinator` 驱动回收（0.18b/收口）；frame 编解码抽到 `RedoBatchFrameCodec`，两实现共用（magic + payloadLen + crc32 + payload） |
 | `storage.redo` checkpoint | `RedoCheckpointStore`, `RedoCheckpointLabel` | Implemented | Two-slot fuzzy checkpoint with CRC32；`StorageEngine` 和 tests 打开；`flush.checkpoint.CheckpointCoordinator` 写入 |
 | `storage.redo` recovery | `RedoRecoveryReader`, `RedoApplyDispatcher`, `RedoApplyContext`, `PageRedoApplyHandler` | Implemented; production-wired by `StorageEngine` E2 | `StorageEngine.open(existing)` constructs `pageDispatcher` + `RedoApplyContext(PageStore,pageSize)`；single-handler dispatch (only `PageRedoApplyHandler`)；只恢复已打开/显式配置的表空间 |
@@ -624,7 +624,7 @@ flowchart TD
 | Gap | Current consequence | Preferred resolution |
 | --- | --- | --- |
 | 仅 2 种 redo 记录类型 | 只有 `PAGE_INIT`/`PAGE_BYTES`，无 MLOG 逻辑 redo | 按需添加逻辑 redo 类型 |
-| commit 不等 redo durable | `MiniTransaction.commit` append redo、发布 dirty 并 markClosed 后返回；事务层没有按策略等待 write/fsync | 添加 commit durability policy（`FLUSH_ON_COMMIT`/`WRITE_ON_COMMIT`/后台刷盘策略） |
+| commit durability 未接生产事务 | `DurabilityPolicy`(FLUSH/WRITE/BACKGROUND) + redo `write()`/`waitWritten()`/`writtenToDiskLsn()` 三阶段原语已就绪并单测（0.20a）；但 `MiniTransaction.commit`/`TransactionManager.commit` 仍不按策略等待，无生产 commit 编排消费 | 把 `DurabilityPolicy.awaitCommitDurable` 接进生产事务提交路径（随 2.1 DML facade） |
 | redo 环满只 fail-closed、无 log block 校验 | `RotatingRedoLogRepository`(0.18) 已是引擎默认 redo 后端：轮转 + checkpoint 回收 + 跨文件恢复（748 tests）；但环满直接抛 `RedoLogCapacityExceededException`（无前台分级等待），帧仍只有 batch CRC、无 log block header/trailer | 容量分级 throttle（0.6）；log block header/trailer checksum（0.20） |
 | `RedoApplyDispatcher` 单 handler | 只注册 `PageRedoApplyHandler` | 按需添加多 handler dispatch table |
 

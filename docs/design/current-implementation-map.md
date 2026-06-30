@@ -258,7 +258,7 @@ flowchart TD
 | WAL gate (flush module) | `FlushCoordinator.flushPage` -> `redo.flushedToDiskLsn()` (`FlushCoordinator.java:91`) + `redo.waitFlushed(pageLsn, timeout)` (`:92`) | Implemented；`StorageEngine` durable redo 路径可通过 WAL gate；memory-mode 组合中 durable LSN 恒 0，会跳过脏页 |
 | Checkpoint read | `flush.checkpoint.CheckpointCoordinator.advanceCheckpoint` -> if no dirty: `min(redo.closedLsn(), redo.flushedToDiskLsn())`; if dirty: `min(bufferPool.oldestDirtyLsnOr(...), redo.closedLsn(), redo.flushedToDiskLsn())`; if `checkpointStore != null` -> `RedoCheckpointStore.write(RedoCheckpointLabel.of(...))` | Implemented；`StorageEngine` 和 tests 构造 checkpoint coordinator；checkpoint store 由 `StorageEngine`/tests 打开 |
 | Redo replay (recovery) | `StorageEngine.open(existing)` -> recovery-open system UNDO + configured data spaces -> `CrashRecoveryService.recover` -> checkpoint-aware replay -> `RedoLogManager.restoreRecoveredBoundary(recoveredTo)` -> optional `UndoTablespaceRecoveryParticipant.resumeAfterRedo(recoveredTo)` -> `SPACE_FILE_RECONCILE` -> open traffic | Implemented production path for explicitly configured spaces；恢复边界安装后新 redo 从 recoveredTo 连续追加，durable LSN 不倒退；无 DD/tablespace discovery |
-| Capacity pressure | `StorageEngine.open` starts `PageCleanerWorker` (when enabled) -> periodic `FlushService.flushForCapacity` -> `RedoCapacityPolicy.evaluate(redo.currentLsn(), checkpointLsn)` -> `RedoCapacityDecision(pressure, age, targetLsn)` | Implemented production path；`StorageEngine` 注入 fixed policy并启动单线程 page cleaner；当前仍不 throttle append；**后台 redo flush 已由 `RedoFlushWorker` 接**（独立于 page cleaner，见下） |
+| Capacity pressure | `StorageEngine.open` starts `PageCleanerWorker` (when enabled) -> periodic `FlushService.flushForCapacity` -> `RedoCapacityPolicy.evaluate(redo.currentLsn(), checkpointLsn)` -> `RedoCapacityDecision(pressure, age, targetLsn)` | Implemented production path；`StorageEngine` 注入 §7.4 `adaptive` policy并启动单线程 page cleaner；当前仍不 throttle append（前台反压 = 0.6b）；**后台 redo flush 已由 `RedoFlushWorker` 接**（独立于 page cleaner，见下） |
 | Background redo flush | `StorageEngine.open` starts `RedoFlushWorker` (when `backgroundFlushEnabled`) -> periodic/on-demand `RedoFlushTarget.flush()` (-> `RedoLogManagerFlushTarget` -> `RedoLogManager.flush()`) -> 推进 `flushedToDiskLsn` + 唤醒 `waitFlushed` | Implemented production path；空转跳过（`currentLsn<=flushedToDiskLsn` 不 fsync）；失败即 FAILED；engine 在 page cleaner 前启动、close 时先停（停 page cleaner→停 redo flusher→final flushThrough）；解淘汰/flush WAL gate 因无人 flush 而跳过的根因 |
 
 ### Package Status
@@ -318,7 +318,7 @@ flowchart TD
 | Package area | Representative classes | Current state | Notes |
 | --- | --- | --- | --- |
 | `storage.flush` facade/coordinator | `FlushService`, `FlushCoordinator`, `FlushCycleResult`, `FlushResult`, `FlushResultStatus`, `TablespaceDrainResult`, `CoordinatedDirtyVictimFlusher` | Implemented | Ties redo capacity -> flush -> checkpoint；`StorageEngine` 构造 foreground barrier + E3a background page cleaner path；`CoordinatedDirtyVictimFlusher` 适配 buf 淘汰端口到 `singlePageFlush`（CLEAN→true/skip→false/FAILED→抛），`StorageEngine` 注入 pool |
-| `storage.flush.policy` adaptive policy | `AdaptiveFlushPolicy`, `FlushAdvice` | Implemented | Maps redo capacity pressure to flush batch advice；`StorageEngine` 注入 fixed policy |
+| `storage.flush.policy` adaptive policy | `AdaptiveFlushPolicy`, `FlushAdvice` | Implemented | §7.4 比例版：production(`StorageEngine`) 用 `adaptive`=`clamp(basePages + factor·dirtyPagesBeforeTarget, min, max)`（factor 随压力 0.25/0.5/1.0，NONE→0）；`fixed` 离散档位保留供定向测试；`FlushService` 经 dirty view 计 `dirtyPagesBeforeTarget` 传入 |
 | `storage.flush.checkpoint` checkpoint | `CheckpointCoordinator` | Implemented | Fuzzy checkpoint = min(oldestDirty, current, flushed); optional `RedoCheckpointStore` persistence；`StorageEngine` 注入 checkpoint store |
 | `storage.flush.doublewrite` doublewrite | `DoublewriteStrategy`, `RecoverableDoublewriteStrategy`, `NoDoublewriteStrategy`, `DoublewriteBatch`, `DoublewriteFileRepository`(+`pageIds()`), `DoublewriteRecoveryScanner`, `DoublewriteMode` | Implemented; **recoverable 模式 production-wired（0.2）+ bounded slot reuse（0.5）+ repository batch primitive（test-wired）** | `StorageEngine` 注入 `RecoverableDoublewriteStrategy`（前向，每次 flush 前写整页副本+fsync，data file force 后释放 in-flight slot）+ E2 配 scanner + `DoublewriteFileRepository.pageIds()`（恢复待检查页来源）；`DoublewriteBatch` 可在同一文件锁内连续写 slot 并一次 force，但生产 `FlushCoordinator` 尚未批量 dispatch；`NoDoublewriteStrategy` 仅测试用；`DETECT_ONLY`/flush-list 与 LRU 双文件/全空间 discovery deferred |
 | `storage.flush.cleaner` page cleaner | `PageCleanerWorker`, `PageCleanerState`, `PageCleanerStoppedException` | Implemented; production-wired by `StorageEngine` E3a | Single daemon `Thread` "minimysql-page-cleaner"；bounded explicit queue + periodic idle tick；failure is terminal；no supervisor restart |
@@ -540,7 +540,7 @@ flowchart TD
 | --- | --- | --- | --- |
 | `FlushService` / `FlushCoordinator` / `flush.checkpoint.CheckpointCoordinator` | `StorageEngine` composition root + `PageCleanerWorker` + `UndoTablespaceTruncationService` + tests | Flush facade + per-page WAL/doublewrite executor + checkpoint/lifecycle barrier | Add metrics/backoff policy and unify legacy `BufferPool.flush` path |
 | `flush.doublewrite.NoDoublewriteStrategy` | Tests only（生产已改用 recoverable） | OFF 模式占位 / 不想要 doublewrite 开销的定向测试 | 引入 `DoublewriteMode` 配置开关时作为 OFF 实现；否则保留为测试桩 |
-| `flush.policy.AdaptiveFlushPolicy` | `StorageEngine` + tests | Maps `RedoCapacityDecision` -> `FlushAdvice` | Replace fixed policy with config-driven adaptive policy |
+| `flush.policy.AdaptiveFlushPolicy` | `StorageEngine` + tests | Maps `RedoCapacityDecision` + dirty backlog -> `FlushAdvice` | production 已用 §7.4 proportional adaptive；后续：压力 throttle(0.6b)、config 化 factor/阈值、引入 redo 生成率/IO capacity/idle 输入 |
 
 ### trx 层整包无生产引用
 
@@ -625,7 +625,7 @@ flowchart TD
 | --- | --- | --- |
 | 仅 2 种 redo 记录类型 | 只有 `PAGE_INIT`/`PAGE_BYTES`，无 MLOG 逻辑 redo | 按需添加逻辑 redo 类型 |
 | commit durability 未接生产事务 | `DurabilityPolicy`(FLUSH/WRITE/BACKGROUND) + redo `write()`/`waitWritten()`/`writtenToDiskLsn()` 三阶段原语已就绪并单测（0.20a）；但 `MiniTransaction.commit`/`TransactionManager.commit` 仍不按策略等待，无生产 commit 编排消费 | 把 `DurabilityPolicy.awaitCommitDurable` 接进生产事务提交路径（随 2.1 DML facade） |
-| redo 环满只 fail-closed、无 log block 校验 | `RotatingRedoLogRepository`(0.18) 已是引擎默认 redo 后端：轮转 + checkpoint 回收 + 跨文件恢复（748 tests）；但环满直接抛 `RedoLogCapacityExceededException`（无前台分级等待），帧仍只有 batch CRC、无 log block header/trailer | 容量分级 throttle（0.6）；log block header/trailer checksum（0.20） |
+| redo 环满只 fail-closed、无 log block 校验 | `RotatingRedoLogRepository`(0.18) 已是引擎默认 redo 后端：轮转 + checkpoint 回收 + 跨文件恢复（748 tests）；但环满直接抛 `RedoLogCapacityExceededException`（无前台分级等待），帧仍只有 batch CRC、无 log block header/trailer | 容量分级 throttle（0.6b；0.6a 真 adaptive flush 已落）；log block header/trailer checksum（0.20b） |
 | `RedoApplyDispatcher` 单 handler | 只注册 `PageRedoApplyHandler` | 按需添加多 handler dispatch table |
 
 ### Flush 缺口

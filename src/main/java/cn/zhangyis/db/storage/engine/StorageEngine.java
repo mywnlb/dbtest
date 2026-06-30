@@ -32,6 +32,7 @@ import cn.zhangyis.db.storage.flush.FlushCycleResult;
 import cn.zhangyis.db.storage.flush.FlushService;
 import cn.zhangyis.db.storage.flush.cleaner.PageCleanerState;
 import cn.zhangyis.db.storage.flush.cleaner.PageCleanerWorker;
+import cn.zhangyis.db.storage.buf.ReadAheadService;
 import cn.zhangyis.db.storage.flush.checkpoint.CheckpointCoordinator;
 import cn.zhangyis.db.storage.flush.doublewrite.DoublewriteFileRepository;
 import cn.zhangyis.db.storage.flush.doublewrite.DoublewriteRecoveryScanner;
@@ -149,6 +150,12 @@ public final class StorageEngine {
     private FlushService flushService;
     /** E3a 后台 page cleaner；只由 engine 生命周期启动/停止，所有刷脏仍走 {@link FlushService}。 */
     private PageCleanerWorker pageCleanerWorker;
+    /** 0.10a 后台 linear read-ahead 服务；只由 engine 生命周期启动/停止，预取经 {@code BufferPool.prefetch}（不 fix）。 */
+    private ReadAheadService readAheadService;
+    /** linear read-ahead 触发阈值（同一 extent 连续访问页数，对齐 InnoDB 默认 56）。当前固定常量，按需再升为 config。 */
+    private static final int READ_AHEAD_THRESHOLD = 56;
+    /** read-ahead 预取请求队列容量；队满丢弃，绝不挤占前台需求读。 */
+    private static final int READ_AHEAD_QUEUE_CAPACITY = 64;
     /** E3a 后台 redo flusher；周期驱动 redo.flush() 使 durable LSN 自动前进，解淘汰/flush 的 WAL gate 卡顿。 */
     private RedoFlushWorker redoFlushWorker;
     /** E2 启动恢复门面；仅 existing open 调用，失败时保持 gate fail-closed。 */
@@ -251,6 +258,8 @@ public final class StorageEngine {
         startBackgroundRedoFlusher();
         startBackgroundPageCleaner();
         startBackgroundPurgeDriver();
+        // read-ahead 在 bootstrap/recover 之后启动并接钩子：建库/恢复的 page access 不触发预取；之后普通 getPage 顺序访问才驱动。
+        startBackgroundReadAhead(lruPool);
         if (fresh) {
             recoveryGate.openForUserTraffic();
         }
@@ -451,6 +460,19 @@ public final class StorageEngine {
     }
 
     /**
+     * 0.10a：启动后台 linear read-ahead 服务并接 Buffer Pool 钩子。仅在后台启用时启动；阈值取 InnoDB 默认 56，
+     * 故一般负载（含既有测试）不触发预取、行为不变。必须晚于 bootstrap/recover，使其只跟踪普通 getPage 顺序访问。
+     */
+    private void startBackgroundReadAhead(LruBufferPool lruPool) {
+        if (!config.backgroundFlushEnabled()) {
+            return;
+        }
+        readAheadService = new ReadAheadService(pool, READ_AHEAD_THRESHOLD, READ_AHEAD_QUEUE_CAPACITY);
+        readAheadService.start();
+        lruPool.attachReadAheadHook(readAheadService);
+    }
+
+    /**
      * 显式 checkpoint：按 WAL 顺序把 redo 刷盘、刷出全部 dirty page（oldest≤currentLsn）、持久化 checkpoint label。
      */
     public void checkpoint() {
@@ -469,6 +491,7 @@ public final class StorageEngine {
         if (state != EngineState.OPEN) {
             throw new EngineStateException("close requires OPEN state: " + state);
         }
+        stopBackgroundReadAhead();
         stopBackgroundPageCleaner();
         stopBackgroundRedoFlusher();
         stopBackgroundPurgeDriver();
@@ -500,6 +523,18 @@ public final class StorageEngine {
         boolean stopped = pageCleanerWorker.stop(config.backgroundFlushStopTimeout());
         if (!stopped) {
             throw new DatabaseRuntimeException("page cleaner did not stop within "
+                    + config.backgroundFlushStopTimeout());
+        }
+    }
+
+    /** 在 final flush / 关 store 之前停止后台 read-ahead，避免预取盘 IO 与句柄释放并发；超时则中止关闭。 */
+    private void stopBackgroundReadAhead() {
+        if (readAheadService == null) {
+            return;
+        }
+        boolean stopped = readAheadService.stop(config.backgroundFlushStopTimeout());
+        if (!stopped) {
+            throw new DatabaseRuntimeException("read-ahead service did not stop within "
                     + config.backgroundFlushStopTimeout());
         }
     }

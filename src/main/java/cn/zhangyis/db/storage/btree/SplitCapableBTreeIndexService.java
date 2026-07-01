@@ -326,8 +326,64 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
             throw new DatabaseValidationException(
                     "purgeDeleteMarkedClustered requires a clustered index: " + index.indexId());
         }
+        // 0.13b：乐观优先，与 deleteClustered 同构（唯一区别：purge 不主动 deleteMark，严格校验未标记即 stale no-op）。
+        BTreeDeleteResult optimistic = tryOptimisticPurge(mtr, index, key, expectedTrxId, expectedRollPtr);
+        if (optimistic != null) {
+            return optimistic;
+        }
         List<IndexPageHandle> path = descendPath(mtr, index, key, PageLatchMode.EXCLUSIVE);
         return purgeInLeaf(mtr, index, path, key, expectedTrxId, expectedRollPtr);
+    }
+
+    /**
+     * 乐观 purge 尝试（0.13b）：{@link #descendOptimistic} S-crab 到 leaf(X)。与 {@link #tryOptimisticDelete} 同构，
+     * 但**绝不主动 deleteMark**——严格校验（命中 + 仍 delete-marked + 隐藏列匹配）任一不符即确认 stale、纯读 no-op（safe）。
+     *
+     * <p>命中且严格校验通过 → {@link #deleteWouldUnderflow} 预判：不欠载则 {@link RecordPagePurger#purge} **跳过**
+     * {@link #reclaimAfterRemoval}（仅 leaf 持 X）；欠载=unsafe **写页前**释放 leaf X → 返回 null 交悲观全 X（带 merge）。
+     * root 即 leaf 返回 null 交悲观。
+     */
+    private BTreeDeleteResult tryOptimisticPurge(MiniTransaction mtr, BTreeIndex index, SearchKey key,
+                                                 TransactionId expectedTrxId, RollPointer expectedRollPtr) {
+        IndexPageHandle leafHandle = descendOptimistic(mtr, index, key);
+        if (leafHandle == null) {
+            return null; // root 即 leaf：交悲观
+        }
+        RecordPage leaf = leafHandle.recordPage();
+        PageId leafId = leafHandle.pageId();
+        validateLeafPage(leaf, index, leafId);
+        OptionalInt found = search.findEqual(leaf, key, index.keyDef(), index.schema());
+        if (found.isEmpty()) {
+            optimisticPurgeHits.increment();
+            return BTreeDeleteResult.noChange(index); // 未命中，纯读（safe）
+        }
+        int offset = found.getAsInt();
+        RecordCursor cursor = new RecordCursor(leaf, offset, index.schema(), registry);
+        // purge 严格校验：仍 delete-marked 且隐藏列匹配才移除；未标记/不符=确认 stale，绝不主动 deleteMark。
+        if (!cursor.isDeleted()
+                || !expectedTrxId.equals(cursor.dbTrxId())
+                || !expectedRollPtr.equals(cursor.dbRollPtr())) {
+            optimisticPurgeHits.increment();
+            return BTreeDeleteResult.noChange(index); // stale，纯读（safe）
+        }
+        if (deleteWouldUnderflow(leaf, cursor, index)) {
+            pageAccess.releaseHandle(mtr, leafHandle);
+            pessimisticPurgeFallbacks.increment();
+            return null;
+        }
+        purger.purge(leaf, offset);
+        optimisticPurgeHits.increment();
+        return BTreeDeleteResult.removed(index, List.of());
+    }
+
+    /** 乐观 purge 命中计数（诊断/观测；含 stale no-op 与不欠载物理移除）。 */
+    long optimisticPurgeHitCount() {
+        return optimisticPurgeHits.sum();
+    }
+
+    /** 乐观 purge 回退悲观计数（诊断/观测；移除后欠载需 merge）。 */
+    long pessimisticPurgeFallbackCount() {
+        return pessimisticPurgeFallbacks.sum();
     }
 
     /**

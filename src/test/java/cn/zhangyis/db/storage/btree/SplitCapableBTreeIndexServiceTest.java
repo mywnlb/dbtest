@@ -45,6 +45,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -324,6 +325,117 @@ class SplitCapableBTreeIndexServiceTest {
             ctx.mgr.commit(read);
             assertEquals(expected, ids, "multi-level scan crosses all leaves in key order");
         });
+    }
+
+    /**
+     * 0.13a：写路径乐观下降。一批宽 key 插入既会命中乐观 leaf-only 路径（不撑爆的插入），
+     * 又会在 leaf 溢出时回退悲观全 X split。用诊断计数确认两条路径都真的执行，并断言结果完全正确（有序全查得）。
+     */
+    @Test
+    void bulkInsertExercisesOptimisticAndPessimisticPathsAndStaysCorrect() {
+        onBTreePool((ctx) -> {
+            ctx.createTablespaceAndRoot();
+            BTreeIndex current = new BTreeIndex(INDEX_ID, ctx.rootPageId, 0, payloadKey(), wideSchema(), true,
+                    ctx.leafSegment, ctx.nonLeafSegment);
+            SplitCapableBTreeIndexService service =
+                    new SplitCapableBTreeIndexService(ctx.access, ctx.disk, registry);
+            List<Long> inserted = new ArrayList<>();
+            for (long id = 1; id <= 24; id++) {
+                MiniTransaction m = ctx.mgr.begin();
+                current = service.insert(m, current, payloadKeyRow(id)).indexAfterInsert();
+                ctx.mgr.commit(m);
+                inserted.add(id);
+            }
+
+            assertTrue(current.rootLevel() >= 1, "wide keys grow the tree past a single leaf");
+            assertTrue(service.optimisticInsertHitCount() > 0,
+                    "non-splitting inserts must take the optimistic leaf-only path");
+            assertTrue(service.pessimisticInsertFallbackCount() > 0,
+                    "overflowing inserts must fall back to the pessimistic split path");
+
+            MiniTransaction read = ctx.mgr.begin();
+            List<Long> ids = service.scan(read, current,
+                            new BTreeScanRange(kPayload(1), true, kPayload(9999), true, 200))
+                    .stream().map(SplitCapableBTreeIndexServiceTest::idOf).toList();
+            ctx.mgr.commit(read);
+            assertEquals(inserted, ids);
+        });
+    }
+
+    /**
+     * 0.13a 并发正确性：预建多层树后，两线程各插入一段不相交 key。crab 写路径的正确性依赖
+     * 「结构变更走悲观全路径 X（含 root X 持到 commit）」——因此 split/allocate 在同一棵树上 tree-wide 串行，
+     * 乐观 leaf-only 插入才能安全并发。断言不做时序假设，只验证全部 key（预建 + 两段）有序、无丢无损。
+     */
+    @Test
+    void concurrentInsertsAcrossLeavesStayCorrect() {
+        onBTreePool((ctx) -> {
+            ctx.createTablespaceAndRoot();
+            SplitCapableBTreeIndexService service =
+                    new SplitCapableBTreeIndexService(ctx.access, ctx.disk, registry);
+            BTreeIndex built = new BTreeIndex(INDEX_ID, ctx.rootPageId, 0, payloadKey(), wideSchema(), true,
+                    ctx.leafSegment, ctx.nonLeafSegment);
+            for (long id = 1; id <= 12; id++) {
+                MiniTransaction m = ctx.mgr.begin();
+                built = service.insert(m, built, payloadKeyRow(id)).indexAfterInsert();
+                ctx.mgr.commit(m);
+            }
+            assertTrue(built.rootLevel() >= 1, "pre-built tree is multi-level");
+            final BTreeIndex snapshot = built; // 不可变，供两线程共享导航（页才是树高权威，快照 level 陈旧无妨）
+
+            AtomicReference<Throwable> failure = new AtomicReference<>();
+            Thread a = new Thread(() -> insertRangeCommitting(ctx, service, snapshot, 100, 119, failure), "btree-a");
+            Thread b = new Thread(() -> insertRangeCommitting(ctx, service, snapshot, 200, 219, failure), "btree-b");
+            a.start();
+            b.start();
+            try {
+                a.join();
+                b.join();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError("interrupted while joining insert threads", e);
+            }
+            if (failure.get() != null) {
+                throw new AssertionError("concurrent insert threw", failure.get());
+            }
+
+            List<Long> expected = new ArrayList<>();
+            for (long id = 1; id <= 12; id++) {
+                expected.add(id);
+            }
+            for (long id = 100; id <= 119; id++) {
+                expected.add(id);
+            }
+            for (long id = 200; id <= 219; id++) {
+                expected.add(id);
+            }
+            MiniTransaction read = ctx.mgr.begin();
+            List<Long> ids = service.scan(read, snapshot,
+                            new BTreeScanRange(kPayload(1), true, kPayload(9999), true, 500))
+                    .stream().map(SplitCapableBTreeIndexServiceTest::idOf).toList();
+            ctx.mgr.commit(read);
+            assertEquals(expected, ids);
+        });
+    }
+
+    /** 并发工作线程：逐 key 独立 MTR 插入，失败记录首个异常并回滚当前 MTR。 */
+    private void insertRangeCommitting(BTreeContext ctx, SplitCapableBTreeIndexService service,
+                                       BTreeIndex snapshot, long firstInclusive, long lastInclusive,
+                                       AtomicReference<Throwable> failure) {
+        try {
+            for (long id = firstInclusive; id <= lastInclusive; id++) {
+                MiniTransaction m = ctx.mgr.begin();
+                try {
+                    service.insert(m, snapshot, payloadKeyRow(id));
+                    ctx.mgr.commit(m);
+                } catch (Throwable t) {
+                    ctx.mgr.rollbackUncommitted(m);
+                    throw t;
+                }
+            }
+        } catch (Throwable t) {
+            failure.compareAndSet(null, t);
+        }
     }
 
     private void assertFound(BTreeContext ctx, BTreeIndex index, long id) {

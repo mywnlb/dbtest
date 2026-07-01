@@ -38,6 +38,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
 import java.util.OptionalInt;
+import java.util.concurrent.atomic.LongAdder;
 
 /**
  * B3 split-capable B+Tree 实现。范围严格限制为 root leaf split、level-1 root-to-leaf 路由、
@@ -77,6 +78,18 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
     private final RecordPageReorganizer reorganizer;
     /** 页容量（来自 {@link IndexPageAccess}）；merge 的 underflow 阈值（MERGE_THRESHOLD≈50%）与 fit 判定按它折算。 */
     private final PageSize pageSize;
+
+    // ---- 写路径 latch coupling 诊断计数（0.13a）----
+    // 非权威状态、不影响正确性，仅统计乐观 vs 悲观路径命中，便于测试/观测确认 crab 生效（对齐 InnoDB 的 Innodb_* 计数思路）。
+    // LongAdder：并发写者各自累加、读时求和，避免热点 CAS。
+    /** 乐观 insert 命中数：leaf-only 放得下、仅在 leaf 持 X 完成。 */
+    private final LongAdder optimisticInsertHits = new LongAdder();
+    /** 乐观 insert 回退数：leaf 溢出需 split，释放 leaf X 后改走悲观全 X。 */
+    private final LongAdder pessimisticInsertFallbacks = new LongAdder();
+    /** 乐观 delete 命中数：删后不欠载、仅在 leaf 持 X 完成（跳过 merge）。 */
+    private final LongAdder optimisticDeleteHits = new LongAdder();
+    /** 乐观 delete 回退数：删后欠载需 merge，释放 leaf X 后改走悲观全 X。 */
+    private final LongAdder pessimisticDeleteFallbacks = new LongAdder();
 
     public SplitCapableBTreeIndexService(IndexPageAccess pageAccess, DiskSpaceManager disk,
                                          TypeCodecRegistry registry) {
@@ -447,8 +460,9 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
     }
 
     /**
-     * 插入逻辑记录。level=0 先尝试 root leaf 直接插入，页满则执行 root split；
-     * level=1 先路由到目标 leaf，页满则执行 leaf split 并向 root 插入新 node pointer。
+     * 插入逻辑记录（0.13a：写路径 latch coupling）。<b>乐观优先</b>：多层树先 {@link #tryOptimisticInsert} 走
+     * S-crab 下降 + leaf X，放得下即成（仅 leaf 持 X，放开 root 处写并发）；leaf 溢出需 split（unsafe）或树只有单 root leaf
+     * 时返回 null，回退 {@link #pessimisticInsert} 悲观全路径 X（现有 split 引擎不变）。
      */
     @Override
     public BTreeInsertResult insert(MiniTransaction mtr, BTreeIndex index, LogicalRecord record) {
@@ -456,7 +470,49 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
             throw new DatabaseValidationException("btree insert record must not be null");
         }
         SearchKey key = keyOf(record, index);
-        // 任意树高：X 下降记录 path（root→leaf），叶页放得下直接插，溢出则自底向上 split 传播（必要时原地长高）。
+        BTreeInsertResult optimistic = tryOptimisticInsert(mtr, index, record, key);
+        if (optimistic != null) {
+            return optimistic;
+        }
+        return pessimisticInsert(mtr, index, record, key);
+    }
+
+    /**
+     * 乐观插入尝试：{@link #descendOptimistic} S-crab 到 leaf(X)；leaf 放得下则仅改 leaf 即成（safe，caller commit）。
+     *
+     * <p>safe 判据靠**试错**而非预测：{@link RecordPageInserter#insert} 在页满时于 heap 分配处、任何页字节写入之前抛
+     * {@link RecordPageOverflowException}（leaf 完全未改），故此处直接 try——成功即 leaf-only 安全插入；溢出即 unsafe，
+     * **提前释放 leaf X**（零页修改，可干净重启）后返回 null，交悲观全 X 处理 split。root 即 leaf（单页树）无 crab 收益，
+     * {@code descendOptimistic} 返回 null，本方法同样返回 null 交悲观。唯一性冲突（{@link #ensureUniqueAbsent} 抛
+     * {@link BTreeDuplicateKeyException}）与路径无关，直接上抛（悲观也会抛，语义一致）。
+     */
+    private BTreeInsertResult tryOptimisticInsert(MiniTransaction mtr, BTreeIndex index, LogicalRecord record,
+                                                  SearchKey key) {
+        IndexPageHandle leafHandle = descendOptimistic(mtr, index, key);
+        if (leafHandle == null) {
+            return null; // root 即 leaf：交悲观（单页无并发收益）
+        }
+        RecordPage leaf = leafHandle.recordPage();
+        PageId leafId = leafHandle.pageId();
+        ensureUniqueAbsent(leaf, leafId, index, key);
+        try {
+            RecordRef ref = inserter.insert(leaf, leafId, record, index.keyDef(), index.schema());
+            optimisticInsertHits.increment();
+            return new BTreeInsertResult(index, ref); // safe：仅 leaf 变更
+        } catch (RecordPageOverflowException overflow) {
+            // unsafe：leaf 未改（inserter 溢出前零改动）→ 提前放掉 leaf X → 交悲观全 X 重启做 split。
+            pageAccess.releaseHandle(mtr, leafHandle);
+            pessimisticInsertFallbacks.increment();
+            return null;
+        }
+    }
+
+    /**
+     * 悲观插入：全路径 X 下降（root→leaf 全部 latch 持到 commit），放得下直接插、溢出自底向上 split 传播。
+     * 既是单 root leaf 树的基础路径，也是乐观 unsafe（split）后的重启路径；split 引擎与本次改动无关，行为不变。
+     */
+    private BTreeInsertResult pessimisticInsert(MiniTransaction mtr, BTreeIndex index, LogicalRecord record,
+                                                SearchKey key) {
         List<IndexPageHandle> path = descendPath(mtr, index, key, PageLatchMode.EXCLUSIVE);
         IndexPageHandle leafHandle = path.get(path.size() - 1);
         RecordPage leaf = leafHandle.recordPage();
@@ -469,6 +525,16 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
             requireLeafSegment(index);
             return splitLeafAndPropagate(mtr, index, path, record);
         }
+    }
+
+    /** 乐观 insert 命中计数（诊断/观测）。 */
+    long optimisticInsertHitCount() {
+        return optimisticInsertHits.sum();
+    }
+
+    /** 乐观 insert 回退悲观计数（诊断/观测）。 */
+    long pessimisticInsertFallbackCount() {
+        return pessimisticInsertFallbacks.sum();
     }
 
     /** root leaf 页满时的稳定 root split：旧 root 内容物化到内存，root 重建为 level-1，两个新 leaf 保存旧/新记录。 */
@@ -978,6 +1044,50 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         }
         validateLeafPage(page, index, pageId);
         return path;
+    }
+
+    /**
+     * 乐观下降（0.13a，latch coupling / crab，设计 §10.2）：内部层 S-crab——持父页 S → latch 子页 → 释放父页 S；
+     * 最后一层（leaf）取 X 返回。至多同时持「1 内部父 + 1 子」，越过的祖先立即释放，放开 root 处写并发。
+     * 仅供 {@link #tryOptimisticInsert}/{@link #tryOptimisticDelete}；unsafe（split/merge）时调用方释放 leaf X 后改走
+     * {@link #descendPath} 悲观全 X 重启。
+     *
+     * <p><b>root 即 leaf</b>（level 0，单页树）无 crab 收益：释放 S root 返回 {@code null}，交悲观（悲观重取 root X）。
+     *
+     * <p><b>并发正确性</b>（与悲观路径协作）：结构变更只走悲观全路径 X 且**持到 commit**（含 root X），故任一乐观下降者的
+     * root S 获取会与并发结构变更者的 root X 冲突而串行——不会带陈旧指针穿过正在变更的子树。crab 的 hand-over-hand
+     * 保证「被释放的祖先即使随后被并发 split/merge/free，本线程也已先 latch 到仍有效的子页」（re-parent 只移动指针不移动子页；
+     * 移动 key 的 split/merge 必然冲突在该页 latch 上）。故本设计当前**并发正确**，代价是结构变更 tree-wide 串行于 root
+     * （0.13b 用 SX latch 放松）。释放的内部页均为 S（从不写→非 touched），满足 {@link MiniTransaction#releaseLatch} 防护。
+     */
+    private IndexPageHandle descendOptimistic(MiniTransaction mtr, BTreeIndex index, SearchKey key) {
+        if (key == null) {
+            throw new DatabaseValidationException("btree descend key must not be null");
+        }
+        IndexPageHandle node = openRoot(mtr, index, PageLatchMode.SHARED);
+        RecordPage page = node.recordPage();
+        if (page.header().level() == 0) {
+            // root 即 leaf：乐观无 crab 收益，放掉 S root 交悲观全 X（悲观会重取 root X，不构成 S→X 升级）。
+            pageAccess.releaseHandle(mtr, node);
+            return null;
+        }
+        while (page.header().level() > 0) {
+            PageId childId = chooseChild(page, index, key);
+            // 下一层是否 leaf：当前层 level==1 时子页即 leaf，取 X（将写）；更高层取 S（只导航）。
+            boolean childIsLeaf = page.header().level() == 1;
+            IndexPageHandle child = pageAccess.openIndexPageHandle(mtr, childId,
+                    childIsLeaf ? PageLatchMode.EXCLUSIVE : PageLatchMode.SHARED);
+            // crab：latch 到子页后立即释放父页（父页为内部 S，未写→非 touched，可提前释放）。
+            pageAccess.releaseHandle(mtr, node);
+            page = child.recordPage();
+            if (page.header().indexId() != index.indexId()) {
+                throw new BTreeStructureCorruptedException("child page index id mismatch at " + child.pageId()
+                        + ": page=" + page.header().indexId() + " expected=" + index.indexId());
+            }
+            node = child;
+        }
+        validateLeafPage(page, index, node.pageId());
+        return node;
     }
 
     /** {@link #findLeaf} 定位结果：leaf 句柄（scan 取 sibling 链/header）、leaf 页视图、leaf 物理页号。 */

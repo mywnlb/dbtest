@@ -240,18 +240,37 @@ class MiniTransactionTest {
     }
 
     /**
-     * 已写（touched）页禁止提前释放：commit 需据 touchedPages 给这些页盖 pageLSN，
-     * 若提前放掉 guard，guardFor 将取不到它。releaseLatch 必须像 rollbackToSavepoint 一样拒绝。
+     * 已写（touched）页的 <b>X</b> guard 禁止提前释放：commit 需据 touchedPages 用它盖 pageLSN，
+     * 提前放掉盖戳时 guardFor 取不到。releaseLatch 必须拒绝。
      */
     @Test
-    void releaseLatchOnWrittenPageShouldThrow() {
+    void releaseLatchOnWrittenPageExclusiveGuardShouldThrow() {
         try (PageStore store = openStore(8)) {
             BufferPool pool = new LruBufferPool(store, PS, 4);
             MiniTransaction mtr = activeMtr(1);
             PageGuard g = mtr.getPage(pool, page(2), PageLatchMode.EXCLUSIVE);
-            g.writeInt(0, 0x99); // 该页 touched
+            g.writeInt(0, 0x99); // 该页 touched，X 持有
             assertThrows(MtrStateException.class, () -> mtr.releaseLatch(page(2), g));
             mtr.rollbackUncommitted();
+            pool.close();
+        }
+    }
+
+    /**
+     * 同一 MTR 多算子协作：前一算子已写并 X 持有某页，后一算子的乐观 crab 以 SHARED 可重入重开同页再提前释放该 SHARED guard。
+     * 这是安全的——touched 页的 X guard 仍在 memo，commit 仍能盖 pageLSN。releaseLatch 只拦 X guard，不得误拦 SHARED。
+     */
+    @Test
+    void releaseLatchOfSharedGuardOnWrittenPageShouldSucceed() {
+        try (PageStore store = openStore(8)) {
+            BufferPool pool = new LruBufferPool(store, PS, 4);
+            MiniTransaction mtr = activeMtr(1);
+            PageGuard x = mtr.getPage(pool, page(2), PageLatchMode.EXCLUSIVE);
+            x.writeInt(0, 0x99); // page 2 touched，X 持有
+            PageGuard s = mtr.getPage(pool, page(2), PageLatchMode.SHARED); // 可重入 S 重开同页（模拟多算子 crab）
+            mtr.releaseLatch(page(2), s); // 释放 SHARED guard：安全，X guard 仍在
+            mtr.commit(); // 仍能给 touched 页盖 pageLSN
+            assertEquals(MiniTransactionState.COMMITTED, mtr.state());
             pool.close();
         }
     }

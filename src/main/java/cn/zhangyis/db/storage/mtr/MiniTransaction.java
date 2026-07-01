@@ -148,10 +148,13 @@ public final class MiniTransaction {
      * （crab，设计 §10.2）：下降时持父页 latch 到子页 latch 到手后，立即放掉父页，缩短内部页 latch 持有窗口、
      * 放开 root 处写并发。
      *
-     * <p><b>已写页防护</b>（与 {@link #rollbackToSavepoint} 同一不变量）：commit 需据 {@code collector.touchedPages()}
-     * 给写过的页盖 pageLSN（{@code guardFor}），若提前放掉已写页的 guard，盖 pageLSN 时会取不到它。故对 touched 页
-     * 拒绝提前释放，抛 {@link MtrStateException}。乐观 crab 只对**内部导航页（S，从不写）**早释放，天然不 touched；
-     * 本防护仅拦截误用（例如试图早释放已修改的 leaf）。
+     * <p><b>已写页防护</b>（与 {@link #rollbackToSavepoint} 同族不变量）：commit 需据 {@code collector.touchedPages()}
+     * 给写过的页盖 pageLSN（{@code guardFor} 定位该页的 X guard），若提前放掉这个 X guard，盖 pageLSN 时会取不到它。
+     * 关键在于**只有 X guard 参与盖戳**：touched 页必由某 X guard 写过，只要那个 X guard 仍在 memo，盖戳就成立。
+     * 因此防护精确到「拒绝提前释放 touched 页的 <b>EXCLUSIVE</b> guard」——释放同页的 SHARED guard 永远安全。
+     * 这对同一 MTR 内多算子协作是必要的：后一算子的乐观 crab 会以 SHARED 重开（可重入）前一算子已写并 X 持有的祖先/root 页，
+     * 再 crab 释放该 SHARED guard；此时页虽 touched，但前一算子的 X guard 仍在 memo，释放 SHARED 不破坏盖戳。
+     * 乐观 crab 只释放内部/root 的 SHARED guard（leaf 的 X guard 从不早释放），故永不触发本防护；防护仅拦截「早释放已写页 X guard」的误用。
      *
      * @param pageId 待释放 guard 所在页（用于 touched 判定与诊断）。
      * @param guard  本 MTR memo 仍持有的 page guard（按身份匹配）。
@@ -161,8 +164,8 @@ public final class MiniTransaction {
         if (pageId == null || guard == null) {
             throw new DatabaseValidationException("releaseLatch pageId/guard must not be null");
         }
-        if (collector.touchedPages().contains(pageId)) {
-            throw new MtrStateException("cannot early-release a written (touched) page latch: " + pageId);
+        if (collector.touchedPages().contains(pageId) && memo.isExclusiveGuard(guard)) {
+            throw new MtrStateException("cannot early-release the exclusive latch of a written page: " + pageId);
         }
         memo.release(guard);
     }

@@ -167,6 +167,43 @@ class BTreeReplaceClusteredTest {
         });
     }
 
+    /**
+     * 0.13b：多层树上乐观 replace 走 descendOptimistic（内部 S、leaf X）。replace 永不结构变更 → 恒 safe（无回退）。
+     * 4 宽行 → level-1；替换 id=4（等长）→ 命中乐观路径（诊断计数增）、行整替换、树高不变。
+     */
+    @Test
+    void optimisticReplaceOnMultiLevelHits() {
+        onPool(ctx -> {
+            ctx.createTablespaceAndRoot();
+            SplitCapableBTreeIndexService svc = ctx.service();
+            BTreeIndex current = ctx.clusteredIndex();
+            RollPointer[] rps = new RollPointer[5];
+            for (long id = 1; id <= 4; id++) {
+                MiniTransaction m = ctx.mgr.begin();
+                rps[(int) id] = new RollPointer(true, PageNo.of(65), (int) id);
+                current = svc.insertClustered(m, current, wideRow(id, "x"), TransactionId.of(TRX_A), rps[(int) id])
+                        .indexAfterInsert();
+                ctx.mgr.commit(m);
+            }
+            assertEquals(1, current.rootLevel(), "4 wide rows split the root to level 1");
+
+            RollPointer rpNew = new RollPointer(false, PageNo.of(66), 9);
+            MiniTransaction u = ctx.mgr.begin();
+            BTreeUpdateResult res = svc.replaceClustered(u, current, kId(4),
+                    wideRowWithHidden(4, "z", TRX_B, rpNew), TransactionId.of(TRX_A), rps[4]);
+            ctx.mgr.commit(u);
+
+            assertTrue(res.replaced(), "matching ownership replaced on multi-level tree");
+            assertTrue(svc.optimisticReplaceHitCount() > 0, "multi-level replace takes the optimistic leaf-only path");
+            assertEquals(1, current.rootLevel(), "replace never changes tree height");
+
+            MiniTransaction r = ctx.mgr.begin();
+            BTreeLookupResult found = svc.lookup(r, current, kId(4)).orElseThrow();
+            ctx.mgr.commit(r);
+            assertEquals(TransactionId.of(TRX_B), found.record().hiddenColumns().dbTrxId());
+        });
+    }
+
     // ---- helpers ----
 
     private static TableSchema clusteredSchema() {

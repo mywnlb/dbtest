@@ -107,6 +107,20 @@ final class MtrMemo {
         return false;
     }
 
+    /**
+     * 指定 guard 在 memo 中是否以 EXCLUSIVE 模式持有。供 {@link MiniTransaction#releaseLatch} 判定提前释放是否会
+     * 移除某 touched 页的 pageLSN 盖戳所依赖的 X guard：释放 SHARED guard 永不影响盖戳（touched 页必由某 X guard 写过、
+     * 该 X guard 仍在栈中），只有释放 X guard 才危险。按身份匹配；未找到（不该发生）按非 X 处理，交 {@link #release} 抛未找到。
+     */
+    boolean isExclusiveGuard(PageGuard guard) {
+        for (MemoEntry entry : stack) {
+            if (entry.resource() == guard) {
+                return entry.mode() == PageLatchMode.EXCLUSIVE;
+            }
+        }
+        return false;
+    }
+
     /** 当前栈深，用作 savepoint 标记。 */
     int depth() {
         return stack.size();

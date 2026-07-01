@@ -194,6 +194,44 @@ class BTreeDeleteMarkTest {
         });
     }
 
+    /**
+     * 0.13b：多层树上乐观 delete-mark 走 descendOptimistic（内部 S、leaf X）。等长纯写 → 恒 safe（无回退）。
+     * 4 宽行 → level-1；标记 id=4 → 命中乐观路径（诊断计数增）、lookup 过滤、lookupIncludingDeleted 可见。
+     */
+    @Test
+    void optimisticMarkOnMultiLevelHits() {
+        onPool(ctx -> {
+            ctx.createTablespaceAndRoot();
+            SplitCapableBTreeIndexService svc = ctx.service();
+            BTreeIndex current = ctx.clusteredIndex();
+            RollPointer[] rps = new RollPointer[5];
+            for (long id = 1; id <= 4; id++) {
+                MiniTransaction m = ctx.mgr.begin();
+                rps[(int) id] = new RollPointer(true, PageNo.of(65), (int) id);
+                current = svc.insertClustered(m, current, wideRow(id), TransactionId.of(TRX_A), rps[(int) id])
+                        .indexAfterInsert();
+                ctx.mgr.commit(m);
+            }
+            assertEquals(1, current.rootLevel(), "4 wide rows split the root to level 1");
+
+            MiniTransaction d = ctx.mgr.begin();
+            BTreeDeleteMarkResult res = svc.setClusteredDeleteMark(d, current, kId(4), true,
+                    new HiddenColumns(TransactionId.of(TRX_B), new RollPointer(false, PageNo.of(66), 9)),
+                    TransactionId.of(TRX_A), rps[4]);
+            ctx.mgr.commit(d);
+
+            assertTrue(res.changed(), "matching ownership delete-marked on multi-level tree");
+            assertTrue(svc.optimisticMarkHitCount() > 0, "multi-level delete-mark takes the optimistic leaf-only path");
+
+            MiniTransaction r = ctx.mgr.begin();
+            assertTrue(svc.lookup(r, current, kId(4)).isEmpty(), "marked key filtered from lookup");
+            assertTrue(svc.lookupIncludingDeleted(r, current, kId(4)).orElseThrow().record().deleted(),
+                    "still visible to MVCC read");
+            assertTrue(svc.lookup(r, current, kId(1)).isPresent(), "other keys live");
+            ctx.mgr.commit(r);
+        });
+    }
+
     // ---- helpers ----
 
     private static String payloadOf(BTreeLookupResult r) {

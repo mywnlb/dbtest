@@ -90,6 +90,14 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
     private final LongAdder optimisticDeleteHits = new LongAdder();
     /** 乐观 delete 回退数：删后欠载需 merge，释放 leaf X 后改走悲观全 X。 */
     private final LongAdder pessimisticDeleteFallbacks = new LongAdder();
+    /** 乐观 replace 命中数（0.13b）：replace 永不结构变更，恒 leaf-only；仅 root 即 leaf 时交悲观。 */
+    private final LongAdder optimisticReplaceHits = new LongAdder();
+    /** 乐观 delete-mark 命中数（0.13b）：等长纯写、永不结构变更，恒 leaf-only；仅 root 即 leaf 时交悲观。 */
+    private final LongAdder optimisticMarkHits = new LongAdder();
+    /** 乐观 purge 命中数（0.13b；含 stale no-op 与不欠载物理移除）。 */
+    private final LongAdder optimisticPurgeHits = new LongAdder();
+    /** 乐观 purge 回退数（0.13b）：移除后欠载需 merge，释放 leaf X 后改走悲观全 X。 */
+    private final LongAdder pessimisticPurgeFallbacks = new LongAdder();
 
     public SplitCapableBTreeIndexService(IndexPageAccess pageAccess, DiskSpaceManager disk,
                                          TypeCodecRegistry registry) {
@@ -381,8 +389,38 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         if (newRecord.hiddenColumns() == null) {
             throw new DatabaseValidationException("replaceClustered newRecord must carry hidden columns (clustered)");
         }
+        // 0.13b：乐观优先。replace 永不 split/merge（原地/页内搬迁），故恒 safe——只有 root 即 leaf（单页无 crab 收益）
+        // 才交悲观 findLeaf(X)。改 PK/搬迁页满都是与路径无关的异常，leaf 未改直接上抛（悲观也一样抛）。
+        BTreeUpdateResult optimistic = tryOptimisticReplace(mtr, index, key, newRecord, expectedTrxId, expectedRollPtr);
+        if (optimistic != null) {
+            return optimistic;
+        }
         LeafLocation leaf = findLeaf(mtr, index, key, PageLatchMode.EXCLUSIVE);
         return replaceInLeaf(leaf.page(), leaf.pageId(), index, key, newRecord, expectedTrxId, expectedRollPtr);
+    }
+
+    /**
+     * 乐观替换尝试（0.13b）：{@link #descendOptimistic} S-crab 到 leaf(X) → {@link #replaceInLeaf}。replace 是纯 leaf-only
+     * （原地或页内搬迁），**从不 split/merge** → 恒 safe，无 unsafe 回退分支。{@code descendOptimistic} 返回 null（root 即 leaf）
+     * 时返回 null 交悲观。命中计数在 {@code replaceInLeaf} 正常返回后自增——改 PK（{@link BTreeUnsupportedStructureException}）
+     * 或搬迁页满（{@link RecordPageOverflowException}，updater 溢出前零改动、leaf 未改）抛出时不计数、直接上抛（与悲观同）。
+     */
+    private BTreeUpdateResult tryOptimisticReplace(MiniTransaction mtr, BTreeIndex index, SearchKey key,
+                                                   LogicalRecord newRecord, TransactionId expectedTrxId,
+                                                   RollPointer expectedRollPtr) {
+        IndexPageHandle leafHandle = descendOptimistic(mtr, index, key);
+        if (leafHandle == null) {
+            return null; // root 即 leaf：交悲观
+        }
+        BTreeUpdateResult result = replaceInLeaf(leafHandle.recordPage(), leafHandle.pageId(), index, key,
+                newRecord, expectedTrxId, expectedRollPtr);
+        optimisticReplaceHits.increment();
+        return result;
+    }
+
+    /** 乐观 replace 命中计数（诊断/观测；含所有权不符的 no-op）。 */
+    long optimisticReplaceHitCount() {
+        return optimisticReplaceHits.sum();
     }
 
     /**
@@ -435,8 +473,38 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         if (!index.clustered()) {
             throw new DatabaseValidationException("setClusteredDeleteMark requires a clustered index: " + index.indexId());
         }
+        // 0.13b：乐观优先。delete-mark 是等长纯写（setDeleted+writeHiddenColumns），无 size 变化/无 overflow/无结构变更 → 恒 safe。
+        // 只有 root 即 leaf 交悲观 findLeaf(X)；非法翻转与路径无关，抛出即上抛。
+        BTreeDeleteMarkResult optimistic = tryOptimisticMark(mtr, index, key, deleted, newHidden,
+                expectedTrxId, expectedRollPtr);
+        if (optimistic != null) {
+            return optimistic;
+        }
         LeafLocation leaf = findLeaf(mtr, index, key, PageLatchMode.EXCLUSIVE);
         return markInLeaf(leaf.page(), leaf.pageId(), index, key, deleted, newHidden, expectedTrxId, expectedRollPtr);
+    }
+
+    /**
+     * 乐观 delete-mark 尝试（0.13b）：{@link #descendOptimistic} S-crab 到 leaf(X) → {@link #markInLeaf}。翻转 delete 位 +
+     * 改隐藏列均**等长纯写**，不改记录长度、不 split/merge → 恒 safe，无 unsafe 回退。root 即 leaf 返回 null 交悲观；
+     * 非法翻转（{@link DatabaseValidationException}）抛出时不计数、直接上抛（与悲观同）。
+     */
+    private BTreeDeleteMarkResult tryOptimisticMark(MiniTransaction mtr, BTreeIndex index, SearchKey key,
+                                                    boolean deleted, HiddenColumns newHidden,
+                                                    TransactionId expectedTrxId, RollPointer expectedRollPtr) {
+        IndexPageHandle leafHandle = descendOptimistic(mtr, index, key);
+        if (leafHandle == null) {
+            return null; // root 即 leaf：交悲观
+        }
+        BTreeDeleteMarkResult result = markInLeaf(leafHandle.recordPage(), leafHandle.pageId(), index, key,
+                deleted, newHidden, expectedTrxId, expectedRollPtr);
+        optimisticMarkHits.increment();
+        return result;
+    }
+
+    /** 乐观 delete-mark 命中计数（诊断/观测；含所有权不符的 no-op）。 */
+    long optimisticMarkHitCount() {
+        return optimisticMarkHits.sum();
     }
 
     /**

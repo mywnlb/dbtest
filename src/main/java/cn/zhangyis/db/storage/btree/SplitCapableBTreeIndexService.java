@@ -181,8 +181,86 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
             throw new DatabaseValidationException(
                     "deleteClustered requires a clustered index: " + index.indexId());
         }
+        // 0.13a：乐观优先——多层树 S-crab 到 leaf(X)，删后不欠载则仅改 leaf 即成（跳过 merge）；
+        // 未命中/所有权不符=幂等 no-op（纯读，safe）。删后欠载需 merge（unsafe）或单 root leaf 时返回 null，回退悲观全 X。
+        BTreeDeleteResult optimistic = tryOptimisticDelete(mtr, index, key, expectedTrxId, expectedRollPtr);
+        if (optimistic != null) {
+            return optimistic;
+        }
         List<IndexPageHandle> path = descendPath(mtr, index, key, PageLatchMode.EXCLUSIVE);
         return deleteInLeaf(mtr, index, path, key, expectedTrxId, expectedRollPtr);
+    }
+
+    /**
+     * 乐观删除尝试（0.13a）：{@link #descendOptimistic} S-crab 到 leaf(X)。
+     *
+     * <p>数据流与 safe/unsafe 判据：{@code findEqual} 未命中、或命中但所有权（DB_TRX_ID/DB_ROLL_PTR）不符 → 幂等 no-op
+     * （纯读，safe）；命中且归属本 undo → {@link #deleteWouldUnderflow} 预判物理 purge 后是否欠载：
+     * <ul>
+     *   <li><b>不欠载（safe）</b>：未标记则 {@code deleteMark}、再 {@code purge}，**跳过** {@link #reclaimAfterRemoval}——
+     *       乐观路径已 crab 释放父页、拿不到 merge 所需全路径，而预判保证无需 merge，故仅改 leaf 即安全完成；</li>
+     *   <li><b>欠载（unsafe）</b>：**写页前**提前释放 leaf X（零页修改，可干净重启），返回 null 交悲观全 X 重启（带 merge）。</li>
+     * </ul>
+     * root 即 leaf（单页树）时 {@code descendOptimistic} 返回 null，本方法同样返回 null 交悲观。
+     */
+    private BTreeDeleteResult tryOptimisticDelete(MiniTransaction mtr, BTreeIndex index, SearchKey key,
+                                                  TransactionId expectedTrxId, RollPointer expectedRollPtr) {
+        IndexPageHandle leafHandle = descendOptimistic(mtr, index, key);
+        if (leafHandle == null) {
+            return null; // root 即 leaf：交悲观
+        }
+        RecordPage leaf = leafHandle.recordPage();
+        PageId leafId = leafHandle.pageId();
+        validateLeafPage(leaf, index, leafId);
+        OptionalInt found = search.findEqual(leaf, key, index.keyDef(), index.schema());
+        if (found.isEmpty()) {
+            optimisticDeleteHits.increment();
+            return BTreeDeleteResult.noChange(index); // 幂等：未命中，纯读（safe）
+        }
+        int offset = found.getAsInt();
+        RecordCursor cursor = new RecordCursor(leaf, offset, index.schema(), registry);
+        if (!expectedTrxId.equals(cursor.dbTrxId()) || !expectedRollPtr.equals(cursor.dbRollPtr())) {
+            optimisticDeleteHits.increment();
+            return BTreeDeleteResult.noChange(index); // 幂等：所有权不符，纯读（safe）
+        }
+        if (deleteWouldUnderflow(leaf, cursor, index)) {
+            // unsafe：删后欠载需 merge（须全路径 X）→ 写页前提前放 leaf X → 交悲观重启。
+            pageAccess.releaseHandle(mtr, leafHandle);
+            pessimisticDeleteFallbacks.increment();
+            return null;
+        }
+        // safe：删后不欠载，仅改 leaf，跳过欠载回收（无 merge）。
+        if (!cursor.isDeleted()) {
+            deleter.deleteMark(leaf, offset);
+        }
+        purger.purge(leaf, offset);
+        optimisticDeleteHits.increment();
+        return BTreeDeleteResult.removed(index, List.of());
+    }
+
+    /**
+     * 预判：物理 purge 掉 {@code cursor} 指向的记录后 leaf 是否会欠载（须 merge，走悲观）。用与 {@link #isUnderfull}
+     * 完全一致的阈值公式（{@code reclaimable*2 > pageSize}），但对「删后可回收空闲」取**上界**：freed 估为编码长度 +
+     * {@link #MERGE_ENTRY_MARGIN}，实际释放 ≥ 估值 → 投影 reclaimable 偏大 → 更易判欠载 → 偏向悲观。
+     *
+     * <p><b>为何偏保守</b>：漏判（欠载判成不欠载）会让乐观路径删后不 merge，留下本该回收的欠载页——破坏 0.12 空间回收契约
+     * 与既有 merge 测试；误判（不欠载判成欠载）只是多走一次悲观全 X（悲观 {@code considerMerge} 再按真实占用判定，
+     * 不欠载则 no-op merge，结果正确）。故宁可误判、不可漏判。
+     */
+    private boolean deleteWouldUnderflow(RecordPage leaf, RecordCursor cursor, BTreeIndex index) {
+        int freedUpperBound = recordEncoder.encode(cursor.materialize(), index.schema()).length + MERGE_ENTRY_MARGIN;
+        int reclaimableAfter = leaf.freeSpace() + leaf.header().garbage() + freedUpperBound;
+        return reclaimableAfter * 2 > pageSize.bytes();
+    }
+
+    /** 乐观 delete 命中计数（诊断/观测；含幂等 no-op 与不欠载删除）。 */
+    long optimisticDeleteHitCount() {
+        return optimisticDeleteHits.sum();
+    }
+
+    /** 乐观 delete 回退悲观计数（诊断/观测；删后欠载需 merge）。 */
+    long pessimisticDeleteFallbackCount() {
+        return pessimisticDeleteFallbacks.sum();
     }
 
     /**

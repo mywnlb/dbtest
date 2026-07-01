@@ -102,4 +102,38 @@ class MtrMemoTest {
         MtrMemo memo = new MtrMemo();
         assertThrows(DatabaseValidationException.class, () -> memo.push(null));
     }
+
+    /**
+     * 选择性（非 LIFO）释放：latch coupling crab 需要在持有子页后提前放掉中间父页，
+     * 而它未必在栈顶。release 应按身份摘掉指定槽位、close 之，余下资源仍保持 LIFO 完整。
+     */
+    @Test
+    void releaseShouldSelectivelyRemoveMiddleResourceKeepingLifoForRest() {
+        List<String> log = new ArrayList<>();
+        MtrMemo memo = new MtrMemo();
+        Recorder a = new Recorder("a", log, false);
+        Recorder b = new Recorder("b", log, false);
+        Recorder c = new Recorder("c", log, false);
+        memo.push(a);
+        memo.push(b);
+        memo.push(c);
+
+        memo.release(b); // 释放中间槽（非栈顶）
+
+        assertEquals(List.of("b"), log); // 只关了 b
+        assertEquals(2, memo.depth());
+
+        memo.releaseAll();
+        assertEquals(List.of("b", "c", "a"), log); // 余下仍 LIFO：先 c 后 a
+        assertEquals(0, memo.depth());
+    }
+
+    /** 释放不在本 memo 中的资源视为不变量破坏：调用方只应释放自己仍持有的 guard。 */
+    @Test
+    void releaseUnknownResourceShouldThrow() {
+        MtrMemo memo = new MtrMemo();
+        memo.push(new Recorder("a", new ArrayList<>(), false));
+        assertThrows(MtrStateException.class,
+                () -> memo.release(new Recorder("x", new ArrayList<>(), false)));
+    }
 }

@@ -37,6 +37,14 @@ public final class IndexPageHandle {
         return pageId;
     }
 
+    /**
+     * 包内可见的 guard 访问：仅供同包 {@link IndexPageAccess#releaseHandle} 在 B+Tree 写路径 latch coupling 时
+     * 把 guard 交回 MTR 做选择性提前释放。刻意不 public，保持 btree 等上层只经句柄操作、绝不接触裸 guard/frame。
+     */
+    PageGuard guard() {
+        return guard;
+    }
+
     /** 读取 FIL file page header；不解析 record 区。 */
     public FilePageHeader fileHeader() {
         return PageEnvelope.readHeader(guard);

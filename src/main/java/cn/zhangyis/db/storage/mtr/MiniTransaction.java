@@ -143,6 +143,30 @@ public final class MiniTransaction {
         return guard;
     }
 
+    /**
+     * 选择性提前释放某已固定页的 page latch + buffer fix（不等 commit）。供 B+Tree 写路径 latch coupling
+     * （crab，设计 §10.2）：下降时持父页 latch 到子页 latch 到手后，立即放掉父页，缩短内部页 latch 持有窗口、
+     * 放开 root 处写并发。
+     *
+     * <p><b>已写页防护</b>（与 {@link #rollbackToSavepoint} 同一不变量）：commit 需据 {@code collector.touchedPages()}
+     * 给写过的页盖 pageLSN（{@code guardFor}），若提前放掉已写页的 guard，盖 pageLSN 时会取不到它。故对 touched 页
+     * 拒绝提前释放，抛 {@link MtrStateException}。乐观 crab 只对**内部导航页（S，从不写）**早释放，天然不 touched；
+     * 本防护仅拦截误用（例如试图早释放已修改的 leaf）。
+     *
+     * @param pageId 待释放 guard 所在页（用于 touched 判定与诊断）。
+     * @param guard  本 MTR memo 仍持有的 page guard（按身份匹配）。
+     */
+    public void releaseLatch(PageId pageId, PageGuard guard) {
+        ensureActive();
+        if (pageId == null || guard == null) {
+            throw new DatabaseValidationException("releaseLatch pageId/guard must not be null");
+        }
+        if (collector.touchedPages().contains(pageId)) {
+            throw new MtrStateException("cannot early-release a written (touched) page latch: " + pageId);
+        }
+        memo.release(guard);
+    }
+
     /** 记录当前 memo 深度为保存点。 */
     public MtrSavepoint savepoint() {
         ensureActive();

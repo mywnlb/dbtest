@@ -88,4 +88,19 @@ public final class IndexPageAccess {
         PageGuard g = mtr.getPage(pool, pageId, mode);
         return new IndexPageHandle(pageId, g, pageSize);
     }
+
+    /**
+     * 提前释放句柄的 page latch + buffer fix（B+Tree 写路径 latch coupling / crab，设计 §10.2）：把 guard 交回 MTR
+     * 做选择性（非 LIFO）释放。仅应对**未写过**的内部导航页（S）使用——MTR 会对已 touched 页拒绝，保护 commit
+     * 盖 pageLSN 的不变量。释放后该句柄不得再使用。btree 服务只经本入口早释放，仍不接触裸 guard/frame。
+     *
+     * @param mtr    持有该 guard 的 mini-transaction。
+     * @param handle 待提前释放的 INDEX 页句柄（其 guard 仍在 mtr memo 中）。
+     */
+    public void releaseHandle(MiniTransaction mtr, IndexPageHandle handle) {
+        if (mtr == null || handle == null) {
+            throw new DatabaseValidationException("releaseHandle mtr/handle must not be null");
+        }
+        mtr.releaseLatch(handle.pageId(), handle.guard());
+    }
 }

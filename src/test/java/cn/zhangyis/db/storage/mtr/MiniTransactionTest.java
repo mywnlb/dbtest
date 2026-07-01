@@ -216,4 +216,43 @@ class MiniTransactionTest {
             pool.close();
         }
     }
+
+    /**
+     * 选择性提前释放（latch coupling crab 早释放）：MTR 仍在 ACTIVE 时对某个已固定页调用 releaseLatch，
+     * 应立即放掉它的 page latch + buffer fix（不必等 commit）。用 1 帧池证明：释放后该帧可被另一页复用。
+     */
+    @Test
+    void releaseLatchShouldFreeFrameBeforeCommit() {
+        try (PageStore store = openStore(8)) {
+            BufferPool pool = new LruBufferPool(store, PS, 1); // 仅 1 帧
+            MiniTransaction mtr = activeMtr(1);
+            PageGuard g = mtr.getPage(pool, page(0), PageLatchMode.SHARED);
+            assertThrows(BufferPoolExhaustedException.class,
+                    () -> pool.getPage(page(1), PageLatchMode.SHARED)); // 池满
+            mtr.releaseLatch(page(0), g); // 提前选择性释放
+            try (PageGuard r = pool.getPage(page(1), PageLatchMode.SHARED)) {
+                assertEquals(page(1), r.pageId()); // 帧已复用
+            }
+            mtr.commit(); // memo 已空，正常收尾
+            assertEquals(MiniTransactionState.COMMITTED, mtr.state());
+            pool.close();
+        }
+    }
+
+    /**
+     * 已写（touched）页禁止提前释放：commit 需据 touchedPages 给这些页盖 pageLSN，
+     * 若提前放掉 guard，guardFor 将取不到它。releaseLatch 必须像 rollbackToSavepoint 一样拒绝。
+     */
+    @Test
+    void releaseLatchOnWrittenPageShouldThrow() {
+        try (PageStore store = openStore(8)) {
+            BufferPool pool = new LruBufferPool(store, PS, 4);
+            MiniTransaction mtr = activeMtr(1);
+            PageGuard g = mtr.getPage(pool, page(2), PageLatchMode.EXCLUSIVE);
+            g.writeInt(0, 0x99); // 该页 touched
+            assertThrows(MtrStateException.class, () -> mtr.releaseLatch(page(2), g));
+            mtr.rollbackUncommitted();
+            pool.close();
+        }
+    }
 }

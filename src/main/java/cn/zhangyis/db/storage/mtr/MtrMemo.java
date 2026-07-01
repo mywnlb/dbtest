@@ -10,6 +10,7 @@ import cn.zhangyis.db.domain.SpaceId;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
+import java.util.Iterator;
 import java.util.List;
 
 /**
@@ -144,6 +145,37 @@ final class MtrMemo {
     /** 释放全部资源（LIFO）。 */
     void releaseAll() {
         releaseTo(0);
+    }
+
+    /**
+     * 选择性（非 LIFO）释放单个资源：按**身份**在栈中定位持有该 {@code resource} 的槽位，移除并 {@code close}
+     * （放 page latch + buffer fix）。供 B+Tree 写路径 latch coupling（crab，设计 §10.2）提前放掉已越过的内部页
+     * latch——它未必在栈顶，故不能用 LIFO {@link #releaseTo}。其余槽位次序不变，后续 commit/rollback 仍按 LIFO 释放。
+     *
+     * <p>身份比较（{@code ==}）而非 equals：同一 guard 实例唯一标识一次 fix，避免相等但不同的资源被误摘。
+     * 未在栈中找到即视为不变量破坏（调用方只应释放本 MTR 仍持有的资源），抛 {@link MtrStateException}；
+     * close 失败同样包成 {@link MtrStateException}（资源已移出栈，不会二次释放）。
+     *
+     * @param resource 要提前释放的资源（通常是内部导航页的 page guard），非空。
+     */
+    void release(AutoCloseable resource) {
+        if (resource == null) {
+            throw new DatabaseValidationException("memo release resource must not be null");
+        }
+        Iterator<MemoEntry> it = stack.iterator();
+        while (it.hasNext()) {
+            MemoEntry entry = it.next();
+            if (entry.resource() == resource) {
+                it.remove();
+                try {
+                    entry.resource().close();
+                } catch (Exception e) {
+                    throw new MtrStateException("failed to release memo resource for page " + entry.pageId(), e);
+                }
+                return;
+            }
+        }
+        throw new MtrStateException("resource not held by this mini transaction memo");
     }
 
     /**

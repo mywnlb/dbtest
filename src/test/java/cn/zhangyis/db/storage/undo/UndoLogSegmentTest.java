@@ -1,6 +1,7 @@
 package cn.zhangyis.db.storage.undo;
 
 import cn.zhangyis.db.domain.PageNo;
+import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.RollPointer;
 import cn.zhangyis.db.domain.SpaceId;
@@ -13,6 +14,7 @@ import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.LruBufferPool;
 import cn.zhangyis.db.storage.fil.io.FileChannelPageStore;
 import cn.zhangyis.db.storage.fil.io.PageStore;
+import cn.zhangyis.db.storage.fsp.exception.NoFreeSpaceException;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
 import cn.zhangyis.db.storage.record.schema.ColumnDef;
@@ -27,6 +29,7 @@ import cn.zhangyis.db.storage.record.type.TypeCodecRegistry;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -158,6 +161,96 @@ class UndoLogSegmentTest {
             assertEquals(bigRec(4, bigKey(4), RollPointer.NULL), seg.readRecord(rp4, bigKeyDef(), bigSchema()));
             assertEquals(bigRec(1, bigKey(1), RollPointer.NULL), seg.readRecord(rp1, bigKeyDef(), bigSchema()));
         });
+    }
+
+    /**
+     * 0.14b：undo 页链 grow 是真实多页消费者。第四条大 undo record 放不进 first 页，必须在分配新 undo 页前
+     * 用 UNDO reservation 预扩容量；未接消费者时 grow 会直接从当前 extent 取空闲页，物理大小停在 128。
+     */
+    @Test
+    void growReservesUndoSpaceBeforeAllocatingChainPage() {
+        PageStore store = new FileChannelPageStore();
+        try (PageStore ignored = store; BufferPool pool = new LruBufferPool(store, PS, 128)) {
+            MiniTransactionManager mgr = new MiniTransactionManager();
+            DiskSpaceManager disk = new DiskSpaceManager(pool, store, PS);
+            DiskSpaceUndoAllocator allocator = new DiskSpaceUndoAllocator(disk);
+            UndoLogSegmentAccess access = new UndoLogSegmentAccess(pool, PS, allocator, registry);
+            MiniTransaction boot = mgr.begin();
+            disk.createTablespace(boot, UNDO_SPACE, dir.resolve("undo-reserve.ibu"), PageNo.of(64));
+            mgr.commit(boot);
+
+            MiniTransaction m = mgr.begin();
+            UndoLogSegment seg = access.create(m, UNDO_SPACE, TransactionId.of(7));
+            RollPointer rp1 = seg.append(bigRec(1, bigKey(1), RollPointer.NULL), bigKeyDef(), bigSchema());
+            seg.append(bigRec(2, bigKey(2), RollPointer.NULL), bigKeyDef(), bigSchema());
+            RollPointer rp3 = seg.append(bigRec(3, bigKey(3), RollPointer.NULL), bigKeyDef(), bigSchema());
+            assertEquals(PageNo.of(128), store.currentSizeInPages(UNDO_SPACE),
+                    "first undo segment page allocation autoextends once");
+
+            RollPointer rp4 = seg.append(bigRec(4, bigKey(4), RollPointer.NULL), bigKeyDef(), bigSchema());
+
+            assertEquals(PageNo.of(192), store.currentSizeInPages(UNDO_SPACE),
+                    "0.14b UNDO reservation preextends before grow allocatePage");
+            assertEquals(seg.firstPageId().pageNo(), rp1.pageNo());
+            assertEquals(seg.firstPageId().pageNo(), rp3.pageNo());
+            assertEquals(seg.lastPageId().pageNo(), rp4.pageNo());
+            assertEquals(4L, seg.logRecordCount());
+            mgr.commit(m);
+
+            MiniTransaction read = mgr.begin();
+            assertEquals(PageNo.of(192), disk.usage(read, UNDO_SPACE).currentSizeInPages());
+            mgr.commit(read);
+        }
+    }
+
+    /**
+     * 0.14b：当 undo grow 预留无法扩到下一 extent 时，必须在分配、格式化、FIL 链接和 first 页 header 推进前失败。
+     * 这里把文件上限固定在 128 页；前三条大记录仍在 first 页，第四条本会 grow。正确实现应抛 `NoFreeSpaceException`，
+     * 且 lastPage/log header/遍历结果保持在前三条记录。
+     */
+    @Test
+    void growReservationFailureDoesNotLinkNewUndoPage() {
+        PageStore store = new LimitedPageStore(128);
+        try (PageStore ignored = store; BufferPool pool = new LruBufferPool(store, PS, 128)) {
+            MiniTransactionManager mgr = new MiniTransactionManager();
+            DiskSpaceManager disk = new DiskSpaceManager(pool, store, PS);
+            DiskSpaceUndoAllocator allocator = new DiskSpaceUndoAllocator(disk);
+            UndoLogSegmentAccess access = new UndoLogSegmentAccess(pool, PS, allocator, registry);
+            MiniTransaction boot = mgr.begin();
+            disk.createTablespace(boot, UNDO_SPACE, dir.resolve("undo-grow-limit.ibu"), PageNo.of(64));
+            mgr.commit(boot);
+
+            MiniTransaction m = mgr.begin();
+            boolean committed = false;
+            try {
+                UndoLogSegment seg = access.create(m, UNDO_SPACE, TransactionId.of(7));
+                List<UndoRecord> expected = new ArrayList<>();
+                for (long i = 1; i <= 3; i++) {
+                    UndoRecord rec = bigRec(i, bigKey(i), RollPointer.NULL);
+                    expected.add(rec);
+                    seg.append(rec, bigKeyDef(), bigSchema());
+                }
+                assertEquals(PageNo.of(128), store.currentSizeInPages(UNDO_SPACE));
+
+                assertThrows(NoFreeSpaceException.class,
+                        () -> seg.append(bigRec(4, bigKey(4), RollPointer.NULL), bigKeyDef(), bigSchema()));
+
+                assertEquals(seg.firstPageId(), seg.lastPageId(),
+                        "failed reservation must not allocate or link a chain page");
+                assertEquals(3L, seg.logRecordCount());
+                assertEquals(3L, seg.logLastUndoNo().value());
+                List<UndoRecord> got = new ArrayList<>();
+                seg.forEachRecord(got::add, bigKeyDef(), bigSchema());
+                assertEquals(expected, got);
+                assertEquals(PageNo.of(128), store.currentSizeInPages(UNDO_SPACE));
+                mgr.commit(m);
+                committed = true;
+            } finally {
+                if (!committed) {
+                    mgr.rollbackUncommitted(m);
+                }
+            }
+        }
     }
 
     @Test
@@ -347,6 +440,87 @@ class UndoLogSegmentTest {
             disk.createTablespace(boot, UNDO_SPACE, dir.resolve("undo.ibu"), PageNo.of(64));
             mgr.commit(boot);
             body.run(mgr, access);
+        }
+    }
+
+    /**
+     * 限制 ensureCapacity 上限的测试 PageStore，用来稳定模拟 UNDO reservation 阶段空间不足。
+     */
+    private static final class LimitedPageStore implements PageStore {
+
+        private final PageStore delegate = new FileChannelPageStore();
+        private final long maxPages;
+
+        private LimitedPageStore(long maxPages) {
+            this.maxPages = maxPages;
+        }
+
+        @Override
+        public void create(SpaceId spaceId, Path path, PageSize pageSize, PageNo initialSizeInPages) {
+            delegate.create(spaceId, path, pageSize, initialSizeInPages);
+        }
+
+        @Override
+        public void open(SpaceId spaceId, Path path, PageSize pageSize) {
+            delegate.open(spaceId, path, pageSize);
+        }
+
+        @Override
+        public void readPage(PageId pageId, ByteBuffer dst) {
+            delegate.readPage(pageId, dst);
+        }
+
+        @Override
+        public void writePage(PageId pageId, ByteBuffer src) {
+            delegate.writePage(pageId, src);
+        }
+
+        @Override
+        public PageNo extend(SpaceId spaceId) {
+            return delegate.extend(spaceId);
+        }
+
+        @Override
+        public PageNo currentSizeInPages(SpaceId spaceId) {
+            return delegate.currentSizeInPages(spaceId);
+        }
+
+        @Override
+        public Path pathOf(SpaceId spaceId) {
+            return delegate.pathOf(spaceId);
+        }
+
+        @Override
+        public void force(SpaceId spaceId) {
+            delegate.force(spaceId);
+        }
+
+        @Override
+        public void forceAll() {
+            delegate.forceAll();
+        }
+
+        @Override
+        public void ensureCapacity(SpaceId spaceId, PageNo minSizeInPages) {
+            if (minSizeInPages.value() > maxPages) {
+                throw new NoFreeSpaceException("test store cannot grow to " + minSizeInPages.value());
+            }
+            delegate.ensureCapacity(spaceId, minSizeInPages);
+        }
+
+        @Override
+        public void truncate(SpaceId spaceId, PageNo targetSizeInPages) {
+            delegate.truncate(spaceId, targetSizeInPages);
+        }
+
+        @Override
+        public void close(SpaceId spaceId) {
+            delegate.close(spaceId);
+        }
+
+        @Override
+        public void close() {
+            delegate.close();
         }
     }
 }

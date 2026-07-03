@@ -70,7 +70,7 @@ public final class RandomReadAheadDetector {
     /**
      * 记录一次页访问及其所在 extent 的驻留页数，必要时产出整 extent 预取请求。
      *
-     * <p>数据流：调用方（service）已在 poolLock 内查得被访问页所在 extent 的驻留页数 {@code residentInExtent}，
+     * <p>数据流：调用方（service）已从 Buffer Pool 查询被访问页所在 extent 的驻留页数 {@code residentInExtent}，
      * 连同 pageId 传入。本方法判定驻留数是否达阈值→若达阈值且该 extent 不在 recent 去重窗内，则把它登记入窗
      * （窗满挤出最旧）并产出对整 extent 的请求；否则返回 empty。
      *

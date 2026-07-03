@@ -2,12 +2,17 @@ package cn.zhangyis.db.storage.engine;
 
 import cn.zhangyis.db.common.exception.DatabaseRuntimeException;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
+import cn.zhangyis.db.domain.Lsn;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.RollbackSegmentId;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.domain.TransactionId;
 import cn.zhangyis.db.domain.TransactionNo;
 import cn.zhangyis.db.domain.UndoSlotId;
+import cn.zhangyis.db.server.lockobs.api.DefaultLockObservationService;
+import cn.zhangyis.db.server.lockobs.api.LockObservationService;
+import cn.zhangyis.db.server.lockobs.api.SnapshotRequest;
+import cn.zhangyis.db.server.lockobs.snapshot.LockDiagnosticSnapshot;
 import cn.zhangyis.db.storage.api.DiskSpaceManager;
 import cn.zhangyis.db.storage.api.DiskSpaceUndoAllocator;
 import cn.zhangyis.db.storage.api.index.IndexPageAccess;
@@ -16,6 +21,7 @@ import cn.zhangyis.db.storage.api.undotruncate.UndoTablespaceTruncationRecovery;
 import cn.zhangyis.db.storage.api.undotruncate.UndoTablespaceTruncationService;
 import cn.zhangyis.db.storage.api.undotruncate.UndoTruncationFaultInjector;
 import cn.zhangyis.db.storage.btree.BTreeIndex;
+import cn.zhangyis.db.storage.btree.BTreeCurrentReadService;
 import cn.zhangyis.db.storage.btree.SplitCapableBTreeIndexService;
 import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.LruBufferPool;
@@ -47,6 +53,7 @@ import cn.zhangyis.db.storage.recovery.RecoveryReport;
 import cn.zhangyis.db.storage.recovery.RecoveryRequest;
 import cn.zhangyis.db.storage.recovery.RecoveryState;
 import cn.zhangyis.db.storage.recovery.RecoveryTrafficGate;
+import cn.zhangyis.db.storage.recovery.TransactionUndoRecoveryResult;
 import cn.zhangyis.db.storage.redo.RedoApplyContext;
 import cn.zhangyis.db.storage.redo.RedoApplyDispatcher;
 import cn.zhangyis.db.storage.redo.RedoCapacityPolicy;
@@ -68,6 +75,7 @@ import cn.zhangyis.db.storage.trx.RollbackService;
 import cn.zhangyis.db.storage.trx.TransactionManager;
 import cn.zhangyis.db.storage.trx.TransactionSystem;
 import cn.zhangyis.db.storage.trx.UndoLogManager;
+import cn.zhangyis.db.storage.trx.lock.LockManager;
 import cn.zhangyis.db.storage.undo.RollbackSegmentHeaderRepository;
 import cn.zhangyis.db.storage.undo.RollbackSegmentHeaderSnapshot;
 import cn.zhangyis.db.storage.undo.UndoLogFormatException;
@@ -92,14 +100,15 @@ import java.util.Set;
  *
  * <p><b>生命周期</b>：{@link #open()}（fresh 建 redo/系统 undo 表空间；existing 打开配置表空间并运行
  * {@link CrashRecoveryService}：doublewrite repair、redo replay、安装 redo 边界、UNDO truncate 续作、
- * SPACE_FILE_RECONCILE）→ {@link #checkpoint()}/{@link #close()} 经 {@link FlushService#flushThrough} 按 WAL
- * 顺序持久（先 redo.flush 再刷脏页再持久 checkpoint），close 末关闭 AutoCloseable 句柄。
+ * SPACE_FILE_RECONCILE、UNDO_ROLLBACK、RESUME_PURGE）→ {@link #checkpoint()}/{@link #close()} 经
+ * {@link FlushService#flushThrough} 按 WAL 顺序持久（先 redo.flush 再刷脏页再持久 checkpoint），close 末关闭
+ * AutoCloseable 句柄。
  *
  * <p><b>当前限制</b>：启动后已有后台 redo flusher、单线程 page cleaner；配置单聚簇索引时会启动
  * {@code PurgeCoordinator} + purge driver。后台 worker 失败仍无 supervisor 重启；事务 UNDO_ROLLBACK / RESUME_PURGE
- * 目前是 engine 后恢复步并依赖显式单聚簇索引，尚未成为正式 recovery stage；DDL_RECOVERY 仍未接入。
- * doublewrite 已常开为 {@link RecoverableDoublewriteStrategy}，但恢复页列表来自 doublewrite 文件有效 slot 并过滤到
- * recovery 已打开空间，仍没有全空间 checksum discovery。
+ * 已作为正式 recovery stage 接入，但仍依赖显式单聚簇索引，未接 DD/多索引/prepared transaction；DDL_RECOVERY 仍未
+ * 接入。doublewrite 已常开为 {@link RecoverableDoublewriteStrategy}，但恢复页列表来自 doublewrite 文件有效 slot 并
+ * 过滤到 recovery 已打开空间，仍没有全空间 checksum discovery。
  *
  * <p>访问器暴露已接线的事务/disk/btree/undo/mvcc/rollback 服务，供测试与未来 DML facade（E4）驱动；本类不含 DML 逻辑。
  */
@@ -129,6 +138,12 @@ public final class StorageEngine {
     private TransactionManager transactionManager;
     private UndoLogManager undoLogManager;
     private SplitCapableBTreeIndexService btreeService;
+    /** 0.17 事务锁内核；current-read/DML 后续均共享这一实例。 */
+    private LockManager lockManager;
+    /** server.lockobs row-lock 观测服务；只读消费 LockManager 事实，不参与授锁或 rollback。 */
+    private LockObservationService lockObservationService;
+    /** B+Tree current-read 点查/unique-check 协调器；不自动接事务提交释放锁。 */
+    private BTreeCurrentReadService btreeCurrentReadService;
     private IndexPageAccess indexPageAccess;
     private MvccReader mvccReader;
     private RollbackService rollbackService;
@@ -233,6 +248,10 @@ public final class StorageEngine {
                 rsegHeaderRepo, miniTransactionManager);
         this.indexPageAccess = new IndexPageAccess(pool, config.pageSize());
         this.btreeService = new SplitCapableBTreeIndexService(indexPageAccess, diskSpaceManager, typeRegistry);
+        this.lockObservationService = new DefaultLockObservationService();
+        this.lockManager = new LockManager(lockObservationService);
+        this.btreeCurrentReadService =
+                new BTreeCurrentReadService(miniTransactionManager, btreeService, lockManager);
         this.mvccReader = new MvccReader(miniTransactionManager, btreeService, undoAccess,
                 config.undoSpaceId(), config.maxVersionHops());
         this.rollbackService = new RollbackService(btreeService, undoAccess, rollbackSlots, transactionManager,
@@ -280,12 +299,12 @@ public final class StorageEngine {
      * E2 existing-open 恢复入口。数据流为：先按 recovery 准入打开系统 undo 与显式配置的数据表空间，使
      * {@code PageStore} 拥有 redo apply 所需的物理句柄；再构造不可变 {@link RecoveryRequest}，由
      * {@link CrashRecoveryService} 负责关闭 gate、redo replay、安装 recoveredToLsn、续作 UNDO TRUNCATING、
-     * SPACE_FILE_RECONCILE 和开放 gate。
+     * SPACE_FILE_RECONCILE、事务 UNDO_ROLLBACK/RESUME_PURGE 和开放 gate。
      *
      * <p>简化点：当前引擎已使用 {@link RecoverableDoublewriteStrategy} 并携带
      * {@link DoublewriteRecoveryScanner}/page 列表，但 page 列表只来自 doublewrite 文件中的有效 slot，且仅覆盖启动恢复
      * 已打开的系统 undo 与显式配置数据表空间；没有 data dictionary / 全空间 checksum discovery。事务 UNDO_ROLLBACK
-     * 目前是恢复服务之后的 engine 后恢复步并依赖显式单聚簇索引，PURGE_RESUME、DDL_RECOVERY 仍未接入。
+     * / RESUME_PURGE 已进入恢复服务阶段链，但仍依赖显式单聚簇索引；DDL_RECOVERY 仍未接入。
      */
     private void recoverExisting() {
         diskSpaceManager.openTablespaceForRecovery(config.undoSpaceId(), config.undoFile());
@@ -310,27 +329,35 @@ public final class StorageEngine {
                 .withDoublewriteRepair(doublewriteScanner, doublewritePages)
                 .withRedoBoundaryInstall(redo)
                 .withUndoTablespaceRecovery(buildUndoTablespaceRecovery())
-                .withSpaceFileReconcile(recoverySpaces);
+                .withSpaceFileReconcile(recoverySpaces)
+                .withTransactionUndoRecovery(this::recoverTransactionUndoAfterRedo);
         lastRecoveryReport = crashRecoveryService.recover(request);
-        restoreRollbackSegmentSlots();
     }
 
     /**
-     * 0.3/R 1.2/R 1.3：redo 重放使 page3 物理一致后，扫描 rseg header 重建内存 slot 目录，再逐 slot 读取
-     * undo first 页 header。ACTIVE 段在配置单聚簇索引时执行恢复期 rollback；COMMITTED 段按 {@code COMMIT_NO}
-     * 重建 committed history，并复位事务 id/no 高水位，供启动后的后台 purge driver 续作。
+     * 正式 UNDO_ROLLBACK / RESUME_PURGE 阶段参与者。redo 重放和 UNDO tablespace 续作完成后，page3 与 undo first
+     * 页已经恢复到物理一致状态；本方法扫描 rseg header 重建内存 slot 目录，再逐 slot 读取 undo first 页 header。
+     * ACTIVE 段在配置单聚簇索引时执行恢复期 rollback；COMMITTED 段按 {@code COMMIT_NO} 重建 committed history，
+     * 并复位事务 id/no 高水位，供启动后的后台 purge driver 续作。
      *
-     * <p>简化点：正式 {@code UndoRecoveryService} / {@code RecoveryStageName.UNDO_ROLLBACK} /
-     * {@code RecoveryStageName.RESUME_PURGE} stage 留后续；未配置聚簇索引时 active rollback 和 purge driver 都跳过，
+     * <p>简化点：未引入独立 {@code UndoRecoveryService} 类；当前仍由 engine 组合根作为
+     * {@code TransactionUndoRecoveryParticipant} 实现阶段端口。未配置聚簇索引时 active rollback 跳过并保留 slot，
      * 但 committed history 与计数器仍会从持久 undo header 重建。
+     *
+     * @param recoveredToLsn redo replay 连续恢复边界；当前实现不需要读取该值，但保留在签名中作为阶段诊断和后续
+     *                       recovery journal 扩展点。
+     * @return 事务 undo 恢复摘要。
      */
-    private void restoreRollbackSegmentSlots() {
+    private TransactionUndoRecoveryResult recoverTransactionUndoAfterRedo(Lsn recoveredToLsn) {
+        if (recoveredToLsn == null) {
+            throw new DatabaseValidationException("recoveredToLsn must not be null");
+        }
         MiniTransaction scan = miniTransactionManager.begin();
         RollbackSegmentHeaderSnapshot snapshot = rsegHeaderRepo.read(scan, config.undoSpaceId(),
                 rollbackSlots.rollbackSegmentId(), config.slotCapacity());
         miniTransactionManager.commit(scan);
         snapshot.occupiedSlots().forEach(rollbackSlots::restore);
-        recoverRollbackSegmentTransactions(snapshot.occupiedSlots());
+        return recoverRollbackSegmentTransactions(snapshot.occupiedSlots());
     }
 
     /**
@@ -341,10 +368,12 @@ public final class StorageEngine {
      *
      * @param occupiedSlots page3 扫描得到的 slot->undo first page 映射。
      */
-    private void recoverRollbackSegmentTransactions(Map<UndoSlotId, PageId> occupiedSlots) {
+    private TransactionUndoRecoveryResult recoverRollbackSegmentTransactions(Map<UndoSlotId, PageId> occupiedSlots) {
         List<HistoryEntry> committed = new ArrayList<>();
         long nextTransactionId = 1;
         long nextTransactionNo = 1;
+        int rolledBackActiveSlots = 0;
+        int skippedActiveSlots = 0;
 
         for (Map.Entry<UndoSlotId, PageId> entry : occupiedSlots.entrySet()) {
             RecoveredUndoSlot recovered = readRecoveredUndoSlot(entry.getKey(), entry.getValue());
@@ -356,6 +385,9 @@ public final class StorageEngine {
                 if (clusteredIndex != null) {
                     rollbackService.rollbackRecovered(recovered.firstPageId(), clusteredIndex);
                     rollbackSlots.release(recovered.slotId());
+                    rolledBackActiveSlots++;
+                } else {
+                    skippedActiveSlots++;
                 }
                 continue;
             }
@@ -374,6 +406,8 @@ public final class StorageEngine {
         committed.stream()
                 .sorted(Comparator.comparingLong(entry -> entry.transactionNo().value()))
                 .forEach(history::submitCommitted);
+        return new TransactionUndoRecoveryResult(occupiedSlots.size(), rolledBackActiveSlots,
+                skippedActiveSlots, committed.size());
     }
 
     /**
@@ -598,6 +632,32 @@ public final class StorageEngine {
     public SplitCapableBTreeIndexService btreeService() {
         requireOpen();
         return btreeService;
+    }
+
+    public LockManager lockManager() {
+        requireOpen();
+        return lockManager;
+    }
+
+    public BTreeCurrentReadService btreeCurrentReadService() {
+        requireOpen();
+        return btreeCurrentReadService;
+    }
+
+    /**
+     * 采集当前 row-lock 诊断快照。数据流为：从生产共享 {@link LockManager} 复制只读锁表/等待图快照，
+     * 再交给 server.lockobs 适配成 `data_locks` / `data_lock_waits` 行；本方法不授锁、不释放锁，也不访问
+     * B+Tree page latch 或 BufferFrame。
+     *
+     * @param request 快照请求，不能为 null。
+     * @return 不可变诊断快照。
+     */
+    public LockDiagnosticSnapshot lockDiagnosticSnapshot(SnapshotRequest request) {
+        requireOpen();
+        if (request == null) {
+            throw new DatabaseValidationException("lock diagnostic snapshot request must not be null");
+        }
+        return lockObservationService.captureSnapshot(lockManager.snapshot(), request);
     }
 
     /** 索引页格式化入口（建聚簇/二级索引 root 页用）。E4 DML/DDL 接线前供测试与上层格式化索引页。 */

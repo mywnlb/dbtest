@@ -10,6 +10,7 @@ import cn.zhangyis.db.storage.record.schema.TableSchema;
 import cn.zhangyis.db.storage.record.type.ColumnValue;
 import cn.zhangyis.db.storage.record.type.FieldSlice;
 import cn.zhangyis.db.storage.record.type.FieldWriter;
+import cn.zhangyis.db.storage.record.type.KeyPrefix;
 import cn.zhangyis.db.storage.record.type.TypeCodec;
 import cn.zhangyis.db.storage.record.type.TypeCodecRegistry;
 
@@ -51,8 +52,9 @@ public final class SearchKeyComparator {
                 return desc ? -c : c;
             }
             TypeCodec codec = registry.codecFor(ct);
-            FieldSlice leftSlice = encodeKey(left.value(i), ct, codec);
-            FieldSlice rightSlice = encodeKey(right.value(i), ct, codec);
+            // 前缀索引（prefixBytes>0）只比列的前 N 字节：两侧编码切片同截再比，与 RecordComparator 保持同序。
+            FieldSlice leftSlice = KeyPrefix.apply(encodeKey(left.value(i), ct, codec), ct, part.prefixBytes());
+            FieldSlice rightSlice = KeyPrefix.apply(encodeKey(right.value(i), ct, codec), ct, part.prefixBytes());
             int c = codec.compare(leftSlice, rightSlice, ct);
             if (c != 0) {
                 return desc ? -c : c;

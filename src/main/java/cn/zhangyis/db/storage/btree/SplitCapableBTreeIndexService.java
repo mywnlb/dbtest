@@ -10,6 +10,8 @@ import cn.zhangyis.db.storage.api.DiskSpaceManager;
 import cn.zhangyis.db.storage.api.index.IndexPageAccess;
 import cn.zhangyis.db.storage.api.index.IndexPageHandle;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
+import cn.zhangyis.db.storage.fsp.reservation.SpaceReservation;
+import cn.zhangyis.db.storage.fsp.reservation.SpaceReservationKind;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.page.FilePageHeader;
 import cn.zhangyis.db.storage.record.format.HiddenColumns;
@@ -30,15 +32,22 @@ import cn.zhangyis.db.storage.record.page.RecordRef;
 import cn.zhangyis.db.storage.record.page.SearchKey;
 import cn.zhangyis.db.storage.record.page.UpdateOutcome;
 import cn.zhangyis.db.storage.record.page.UpdateResult;
+import cn.zhangyis.db.storage.record.schema.ColumnType;
 import cn.zhangyis.db.storage.record.type.ColumnValue;
+import cn.zhangyis.db.storage.record.type.TemporalKind;
 import cn.zhangyis.db.storage.record.type.TypeCodecRegistry;
+import cn.zhangyis.db.storage.trx.lock.GapLockKey;
+import cn.zhangyis.db.storage.trx.lock.NextKeyLockKey;
+import cn.zhangyis.db.storage.trx.lock.RecordLockKey;
 
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.function.Predicate;
 
 /**
  * B3 split-capable B+Tree 实现。范围严格限制为 root leaf split、level-1 root-to-leaf 路由、
@@ -98,6 +107,26 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
     private final LongAdder optimisticPurgeHits = new LongAdder();
     /** 乐观 purge 回退数（0.13b）：移除后欠载需 merge，释放 leaf X 后改走悲观全 X。 */
     private final LongAdder pessimisticPurgeFallbacks = new LongAdder();
+    /**
+     * safe-node 早释放的祖先 X latch 计数（0.13d，设计 §10.2 step4-5）：悲观 insert 下降遇到 safe 节点时，
+     * 释放其以上全部祖先（含 root）的 X latch 数累加。非权威状态、不影响正确性，仅供测试/观测确认 root X 不再持到 commit。
+     */
+    private final LongAdder safeNodeAncestorReleases = new LongAdder();
+    /**
+     * delete/purge 悲观 merge 下降的 safe-node 早释放祖先计数（0.13d）：下降遇到「移除一个 pointer 后仍不欠载」的
+     * safe 内部节点时，释放其以上全部祖先 X 的数目累加。与 insert 侧分开计数便于测试定向断言；同为非权威诊断状态。
+     */
+    private final LongAdder safeNodeDeleteAncestorReleases = new LongAdder();
+    /**
+     * root SX 首遍下降计数（0.13d SX+restart，设计 §10.3 ROOT_LATCHED_SX）：快照树高 ≥2 的悲观 SMO 第一遍以 root SX
+     * （与读者 root S 并存）下降的次数。非权威诊断状态。
+     */
+    private final LongAdder rootSxDescents = new LongAdder();
+    /**
+     * root X 重启计数（0.13d SX+restart）：SX 首遍链顶仍是 root（SMO 可能写 root，SX 禁原地升级）→ 零写整链释放、
+     * 以 root X 重启第二遍的次数。restart 越少说明 safe-node 吸收越充分。非权威诊断状态。
+     */
+    private final LongAdder rootXRestarts = new LongAdder();
 
     public SplitCapableBTreeIndexService(IndexPageAccess pageAccess, DiskSpaceManager disk,
                                          TypeCodecRegistry registry) {
@@ -190,12 +219,13 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
                     "deleteClustered requires a clustered index: " + index.indexId());
         }
         // 0.13a：乐观优先——多层树 S-crab 到 leaf(X)，删后不欠载则仅改 leaf 即成（跳过 merge）；
-        // 未命中/所有权不符=幂等 no-op（纯读，safe）。删后欠载需 merge（unsafe）或单 root leaf 时返回 null，回退悲观全 X。
+        // 未命中/所有权不符=幂等 no-op（纯读，safe）。删后欠载需 merge（unsafe）或单 root leaf 时返回 null，
+        // 回退悲观 X 下降 + safe-node 早释放祖先（0.13d，merge 只在保留链内传播、root X 不必持到 commit）。
         BTreeDeleteResult optimistic = tryOptimisticDelete(mtr, index, key, expectedTrxId, expectedRollPtr);
         if (optimistic != null) {
             return optimistic;
         }
-        List<IndexPageHandle> path = descendPath(mtr, index, key, PageLatchMode.EXCLUSIVE);
+        List<IndexPageHandle> path = descendPathDeleteSafeNode(mtr, index, key);
         return deleteInLeaf(mtr, index, path, key, expectedTrxId, expectedRollPtr);
     }
 
@@ -327,11 +357,12 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
                     "purgeDeleteMarkedClustered requires a clustered index: " + index.indexId());
         }
         // 0.13b：乐观优先，与 deleteClustered 同构（唯一区别：purge 不主动 deleteMark，严格校验未标记即 stale no-op）。
+        // 悲观回退同样走 safe-node X 下降（0.13d）。
         BTreeDeleteResult optimistic = tryOptimisticPurge(mtr, index, key, expectedTrxId, expectedRollPtr);
         if (optimistic != null) {
             return optimistic;
         }
-        List<IndexPageHandle> path = descendPath(mtr, index, key, PageLatchMode.EXCLUSIVE);
+        List<IndexPageHandle> path = descendPathDeleteSafeNode(mtr, index, key);
         return purgeInLeaf(mtr, index, path, key, expectedTrxId, expectedRollPtr);
     }
 
@@ -618,8 +649,76 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         if (key == null) {
             throw new DatabaseValidationException("btree lookup key must not be null");
         }
-        LeafLocation leaf = findLeaf(mtr, index, key, PageLatchMode.SHARED);
+        // 0.13c 读路径 crab：S-crab 下降，祖先早释放，仅 leaf S 到 commit。
+        LeafLocation leaf = findLeafSharedCrab(mtr, index, key);
         return lookupInLeaf(leaf.page(), leaf.pageId(), index, key, includeDeleted);
+    }
+
+    /**
+     * current-read 专用点定位。调用方必须在本方法返回后提交/回滚 MTR 释放 page latch/fix，再用返回的
+     * record/gap/next-key 值对象进入 LockManager；返回值不包含任何 cursor 或 page handle。
+     *
+     * @param includeDeleted true 时 delete-marked 同 key 也算命中（unique 物理检查）；false 时按普通当前读视为缺失。
+     */
+    BTreeCurrentReadPosition locatePointForCurrentRead(MiniTransaction mtr, BTreeIndex index, SearchKey key,
+                                                       boolean includeDeleted) {
+        if (index == null || key == null) {
+            throw new DatabaseValidationException("current-read locate index/key must not be null");
+        }
+        // 0.13c 读路径 crab：S-crab 下降定位 record/gap，祖先早释放。
+        LeafLocation leaf = findLeafSharedCrab(mtr, index, key);
+        OptionalInt found = search.findEqual(leaf.page(), key, index.keyDef(), index.schema());
+        if (found.isPresent()) {
+            RecordCursor cursor = new RecordCursor(leaf.page(), found.getAsInt(), index.schema(), registry);
+            if (includeDeleted || !cursor.isDeleted()) {
+                BTreeLookupResult result = materialize(index, leaf.pageId(), cursor);
+                RecordLockKey recordKey = RecordLockKey.from(result.recordRef());
+                GapLockKey gapKey = gapBeforeRecord(leaf.page(), index, found.getAsInt());
+                return new BTreeCurrentReadPosition(Optional.of(result), Optional.of(recordKey), gapKey,
+                        Optional.of(new NextKeyLockKey(recordKey, gapKey)));
+            }
+        }
+        return new BTreeCurrentReadPosition(Optional.empty(), Optional.empty(),
+                gapForSearchKey(leaf.page(), index, key), Optional.empty());
+    }
+
+    /**
+     * current-read 专用范围定位。数据流：按 lower bound 找起始 leaf，沿 sibling 链扫描 legacy scan 相同的
+     * 当前版本记录；对每条返回记录构造 record/preceding-gap/next-key lock key；再按 upper bound 重新定位
+     * 终止 gap。调用方必须在返回后结束 MTR，再进入可能阻塞的事务锁等待。
+     *
+     * <p>简化点：终止 gap 仍使用当前页级 gap 表达，可能比 SQL 谓词略宽；后续 global gap ref 可进一步收窄。
+     */
+    BTreeCurrentReadRangePosition locateRangeForCurrentRead(MiniTransaction mtr, BTreeIndex index,
+                                                            BTreeScanRange range) {
+        if (index == null || range == null) {
+            throw new DatabaseValidationException("current-read range index/range must not be null");
+        }
+        if (range.limit() == 0) {
+            return new BTreeCurrentReadRangePosition(List.of(), Optional.empty());
+        }
+        List<BTreeCurrentReadPosition> positions = new ArrayList<>();
+        // 0.13c 读 crab：S-crab 下降到起始 leaf，沿 sibling 链 hand-over-hand 扫；祖先与前驱 leaf 均早释放。
+        IndexPageHandle leafHandle = descendSharedCrab(mtr, index, range.lowerKey());
+        while (true) {
+            RecordPage leaf = leafHandle.recordPage();
+            PageId leafId = leafHandle.pageId();
+            validateLeafPage(leaf, index, leafId);
+            if (locateRangeLeaf(leaf, leafId, index, range, positions) || positions.size() >= range.limit()) {
+                return new BTreeCurrentReadRangePosition(positions,
+                        Optional.of(terminalGapForRange(mtr, index, range)));
+            }
+            long next = leafHandle.fileHeader().nextPageNo();
+            if (next == FilePageHeader.FIL_NULL) {
+                return new BTreeCurrentReadRangePosition(positions,
+                        Optional.of(terminalGapForRange(mtr, index, range)));
+            }
+            // hand-over-hand：先 latch 后继 leaf，再释放当前 leaf。
+            PageId nextId = PageId.of(index.rootPageId().spaceId(), PageNo.of(next));
+            IndexPageHandle nextHandle = pageAccess.openIndexPageHandle(mtr, nextId, PageLatchMode.SHARED);
+            pageAccess.releaseHandle(mtr, leafHandle);
+            leafHandle = nextHandle;
+        }
     }
 
     /**
@@ -641,12 +740,13 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         if (range.limit() == 0) {
             return List.of();
         }
-        // 任意树高：先 findLeaf 定位 lowerKey 所在起始 leaf，再沿 FIL sibling next 链顺序扫（level 0 时起始 leaf 即 root，无 next）。
-        PageId leafId = findLeaf(mtr, index, range.lowerKey(), PageLatchMode.SHARED).pageId();
+        // 任意树高（0.13c 读 crab）：S-crab 下降到 lowerKey 起始 leaf（祖先早释放），再沿 FIL sibling next 链
+        // hand-over-hand 顺序扫（level 0 时起始 leaf 即 root，无 next）。
+        IndexPageHandle leafHandle = descendSharedCrab(mtr, index, range.lowerKey());
         ScanAccumulator acc = new ScanAccumulator(range.limit());
         while (true) {
-            IndexPageHandle leafHandle = pageAccess.openIndexPageHandle(mtr, leafId, PageLatchMode.SHARED);
             RecordPage leaf = leafHandle.recordPage();
+            PageId leafId = leafHandle.pageId();
             validateLeafPage(leaf, index, leafId);
             boolean stop = scanLeafPage(leaf, leafId, index, range, acc);
             if (stop || acc.full()) {
@@ -656,7 +756,11 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
             if (next == FilePageHeader.FIL_NULL) {
                 break;
             }
-            leafId = PageId.of(index.rootPageId().spaceId(), PageNo.of(next));
+            // hand-over-hand：读出 next 时仍持当前 leaf S；先 latch 后继 leaf，再释放当前 leaf（后继到手前不放手）。
+            PageId nextId = PageId.of(index.rootPageId().spaceId(), PageNo.of(next));
+            IndexPageHandle nextHandle = pageAccess.openIndexPageHandle(mtr, nextId, PageLatchMode.SHARED);
+            pageAccess.releaseHandle(mtr, leafHandle);
+            leafHandle = nextHandle;
         }
         return acc.results();
     }
@@ -710,12 +814,13 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
     }
 
     /**
-     * 悲观插入：全路径 X 下降（root→leaf 全部 latch 持到 commit），放得下直接插、溢出自底向上 split 传播。
+     * 悲观插入：X 下降 + <b>safe-node 早释放祖先</b>（0.13d，{@link #descendPathInsertSafeNode}）——遇到 safe 祖先即释放其
+     * 以上全部 X latch（含 root），保留链收缩为「safe 祖先 … leaf」；放得下直接插、溢出自底向上 split 传播（只在保留链内）。
      * 既是单 root leaf 树的基础路径，也是乐观 unsafe（split）后的重启路径；split 引擎与本次改动无关，行为不变。
      */
     private BTreeInsertResult pessimisticInsert(MiniTransaction mtr, BTreeIndex index, LogicalRecord record,
                                                 SearchKey key) {
-        List<IndexPageHandle> path = descendPath(mtr, index, key, PageLatchMode.EXCLUSIVE);
+        List<IndexPageHandle> path = descendPathInsertSafeNode(mtr, index, key);
         IndexPageHandle leafHandle = path.get(path.size() - 1);
         RecordPage leaf = leafHandle.recordPage();
         PageId leafId = leafHandle.pageId();
@@ -737,6 +842,26 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
     /** 乐观 insert 回退悲观计数（诊断/观测）。 */
     long pessimisticInsertFallbackCount() {
         return pessimisticInsertFallbacks.sum();
+    }
+
+    /** safe-node 早释放的祖先 X latch 计数（0.13d，诊断/观测；&gt;0 表示悲观 split 未把 root X 持到 commit）。 */
+    long safeNodeAncestorReleaseCount() {
+        return safeNodeAncestorReleases.sum();
+    }
+
+    /** delete/purge 悲观 merge 下降的 safe-node 早释放祖先计数（0.13d，诊断/观测；&gt;0 表示 merge 未把 root X 持到 commit）。 */
+    long safeNodeDeleteAncestorReleaseCount() {
+        return safeNodeDeleteAncestorReleases.sum();
+    }
+
+    /** root SX 首遍下降计数（0.13d SX+restart，诊断/观测；&gt;0 表示悲观 SMO 以 root SX 起步、读者不被 root 阻塞）。 */
+    long rootSxDescentCount() {
+        return rootSxDescents.sum();
+    }
+
+    /** root X 重启计数（0.13d SX+restart，诊断/观测；SX 首遍链顶仍是 root 时的第二遍 X 重启次数）。 */
+    long rootXRestartCount() {
+        return rootXRestarts.sum();
     }
 
     /** root leaf 页满时的稳定 root split：旧 root 内容物化到内存，root 重建为 level-1，两个新 leaf 保存旧/新记录。 */
@@ -777,16 +902,45 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
      */
     private BTreeInsertResult splitLeafAndPropagate(MiniTransaction mtr, BTreeIndex index,
                                                     List<IndexPageHandle> path, LogicalRecord inserted) {
-        int depth = path.size() - 1;
-        IndexPageHandle leafHandle = path.get(depth);
-        if (depth == 0) {
-            return splitRootLeaf(mtr, index, leafHandle, inserted);
+        try (SpaceReservation ignored = reserveSplitSpace(mtr, index, path)) {
+            int depth = path.size() - 1;
+            IndexPageHandle leafHandle = path.get(depth);
+            if (depth == 0) {
+                return splitRootLeaf(mtr, index, leafHandle, inserted);
+            }
+            List<PageId> allocated = new ArrayList<>();
+            LeafSplitResult ls = splitNonRootLeaf(mtr, index, leafHandle, inserted, allocated);
+            BTreeNodePointer separator = new BTreeNodePointer(ls.rightLowKey(), ls.newRightId());
+            BTreeIndex after = insertSeparator(mtr, index, path, depth - 1, separator, allocated);
+            return new BTreeInsertResult(index, ls.insertedRef(), after, true, List.copyOf(allocated));
         }
-        List<PageId> allocated = new ArrayList<>();
-        LeafSplitResult ls = splitNonRootLeaf(mtr, index, leafHandle, inserted, allocated);
-        BTreeNodePointer separator = new BTreeNodePointer(ls.rightLowKey(), ls.newRightId());
-        BTreeIndex after = insertSeparator(mtr, index, path, depth - 1, separator, allocated);
-        return new BTreeInsertResult(index, ls.insertedRef(), after, true, List.copyOf(allocated));
+    }
+
+    /**
+     * 0.14b split/root split 空间预留：在任何 split 页内容改写、sibling 链调整或 parent separator 插入前，
+     * 先按本次保留链的最坏传播范围预留可能创建的数据页。MTR 当前没有 content undo，若等到中途
+     * {@code allocatePage} 才发现 ENOSPC，已重写的 leaf/root 无法自动撤回；因此 reserve 必须早于所有结构修改。
+     *
+     * <p>预算是保守上界而非精确页数：root leaf split 需要 2 个 leaf；非 root leaf split 需要 1 个 leaf；
+     * 保留链中的非 root 内部层每层最多 split 出 1 个 sibling；若链顶是真 root，则 root internal split 最多再创建
+     * 2 个 non-leaf child。safe-node 截断链顶不是 root 时，safe 判据保证传播停在该节点，不为已释放祖先预算。
+     */
+    private SpaceReservation reserveSplitSpace(MiniTransaction mtr, BTreeIndex index, List<IndexPageHandle> path) {
+        requireLeafSegment(index);
+        int depth = path.size() - 1;
+        long leafPages = depth == 0 ? 2L : 1L;
+        long nonLeafPages = 0L;
+        if (depth > 0) {
+            nonLeafPages = depth - 1L;
+            if (path.get(0).pageId().equals(index.rootPageId())) {
+                nonLeafPages += 2L;
+            }
+        }
+        if (nonLeafPages > 0L) {
+            requireNonLeafSegment(index);
+        }
+        return disk.reserveSpace(mtr, index.rootPageId().spaceId(), SpaceReservationKind.NORMAL,
+                leafPages + nonLeafPages, 0L);
     }
 
     /** 非 root leaf split：旧 leaf 改写为左半、分配新右兄弟存右半、维护双向 sibling 链；返回新插入 ref + 右半 lowKey + 新右兄弟页号。 */
@@ -890,7 +1044,8 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
     // survivor 恒取相邻对的【左】者、victim 取【右】者，把 victim 条目并入 survivor、从 parent 摘 victim 的 pointer —— survivor
     // 的父 pointer key 不变，故【无 separator 下拉/更新】。叶页额外修 FIL prev/next；内部页不参与 FIL 链。
     //
-    // 锁：悲观全路径 X（descend 已持）+ 额外取 sibling/远兄弟/child 的 X，均入 MTR memo，commit 统一释放（无 latch coupling，0.13）。
+    // 锁：悲观 X 下降（0.13d safe-node：保留链 = 「最近 delete-safe 内部节点 … leaf」，safe 节点以上祖先已早释放）+
+    // 额外取 sibling/远兄弟/child 的 X，均入 MTR memo，commit 统一释放。merge 传播只在保留链内自底向上，safe 链顶必吸收。
     // redo：复用物理 PAGE_BYTES/PAGE_INIT（move 条目 = inserter 写、摘 pointer = purger 写、root.format = PAGE_INIT），无 btree 专用逻辑 redo。
     // =====================================================================
 
@@ -921,7 +1076,8 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
     private BTreeIndex considerMerge(MiniTransaction mtr, BTreeIndex index, List<IndexPageHandle> path,
                                     int depth, List<PageId> freed) {
         if (depth == 0) {
-            return index; // 节点即 root：root 不与兄弟 merge（root 允许欠载）
+            // 链顶：真 root（root 不与兄弟 merge、允许欠载）或 delete-safe 节点（判据保证摘一指针后仍不欠载）。均收工。
+            return index;
         }
         IndexPageHandle nodeHandle = path.get(depth);
         RecordPage node = nodeHandle.recordPage();
@@ -930,7 +1086,9 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         }
         IndexPageHandle parentHandle = path.get(depth - 1);
         RecordPage parent = parentHandle.recordPage();
-        boolean parentIsRoot = (depth - 1 == 0);
+        // 0.13d safe-node 后 path 可能是被截断的保留链（下标 0 = 最近 safe 节点而非 root），root 判定必须按页号
+        // （root 页号跨 split/shrink 恒稳定），不能按链下标——否则会对非 root 的 safe 链顶误做 shrinkRoot（结构损坏）。
+        boolean parentIsRoot = parentHandle.pageId().equals(index.rootPageId());
 
         MergePair pair = chooseMergePair(mtr, index, parent, nodeHandle);
         if (pair == null) {
@@ -1220,8 +1378,9 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
     }
 
     /**
-     * 从 root 逐层下降到 leaf，返回完整路径（root 在 0、leaf 在末尾）。供 insert split 自底向上传播取祖先页；
-     * 读路径只取末项即可（见 {@link #findLeaf}）。每层 latch 由 MTR memo 持有至 commit。
+     * 从 root 逐层下降到 leaf，返回完整路径（root 在 0、leaf 在末尾），全路径 latch 持到 commit（不早释放）。
+     * 0.13d 后 SMO 路径（insert split / delete merge）已改走 {@link #descendPathSafeNode} 的 safe-node 截断保留链；
+     * 本方法仅剩 {@link #findLeaf} 使用（replace/mark 的 root 即 leaf 悲观回退等无 SMO 场景）。
      */
     private List<IndexPageHandle> descendPath(MiniTransaction mtr, BTreeIndex index, SearchKey key,
                                               PageLatchMode mode) {
@@ -1249,18 +1408,207 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
     }
 
     /**
+     * 悲观 <b>insert</b> 的 safe-node 下降（0.13d）：safe 判据 = {@link #insertDescendSafe}（内部节点连续空闲 ≥
+     * {@code maxSeparatorSize} ⟹ 必能容纳其下方 split 上插的那一个 separator、{@link #pointerFits} 必真、自身不会 split）。
+     * 通用协议、正确性与死锁论证见 {@link #descendPathSafeNode}。
+     */
+    private List<IndexPageHandle> descendPathInsertSafeNode(MiniTransaction mtr, BTreeIndex index, SearchKey key) {
+        int maxSeparator = maxSeparatorSize(index);
+        return descendPathSafeNode(mtr, index, key,
+                node -> insertDescendSafe(node, maxSeparator), safeNodeAncestorReleases);
+    }
+
+    /**
+     * 悲观 <b>delete/purge</b> 的 safe-node 下降（0.13d）：safe 判据 = {@link #deleteDescendSafe}（内部节点「被摘走一个
+     * 最大 pointer 后仍不欠载」⟹ 其下方 merge 摘掉它的 victim pointer 后它不会自身 merge/redistribute，传播必然停在它）。
+     * 通用协议、正确性与死锁论证见 {@link #descendPathSafeNode}。
+     */
+    private List<IndexPageHandle> descendPathDeleteSafeNode(MiniTransaction mtr, BTreeIndex index, SearchKey key) {
+        int maxSeparator = maxSeparatorSize(index);
+        return descendPathSafeNode(mtr, index, key,
+                node -> deleteDescendSafe(node, maxSeparator), safeNodeDeleteAncestorReleases);
+    }
+
+    /**
+     * <b>safe-node + SX/restart</b> 悲观下降通用协议（0.13d，设计 §10.2 step4-5 + §10.3 ROOT_LATCHED_SX）。两遍制：
+     * 快照树高 ≥2 时第一遍 root 取 <b>SX</b>（与读者/乐观写者的 root S 并存、排它其它 SMO 的 SX/X），内部 child 与 leaf
+     * 恒 X，每 latch 到一个<b>内部</b> child 按 {@code internalChildSafe} 判 safe——safe 意味着来自其下方的 SMO（split 的
+     * separator 上插 / merge 的 victim pointer 摘除）不会使它自身结构变更、传播必然停在它——safe 即释放其以上全部祖先
+     * （含 root SX），保留链收缩为「safe 内部 child … leaf」；SMO 不达 root 时本 SMO <b>全程未 X 过 root</b>，读者从未被
+     * root 阻塞。若首遍链顶仍是 root（SMO 可能写 root，而 SX 禁原地升级），此刻零页写入，整链干净释放后以 root X 重启
+     * 第二遍（至多一次；level 0/1 树必写 root，跳过 SX 首遍直接 X）。<b>只判内部页，从不判 leaf</b>：leaf 级 safe 判据
+     * 属于叶级算子（乐观路径已判），且 leaf 恒为保留链末项、永不触发释放；leaf 的 SMO 传播到其（被保留的）父页处理。
+     *
+     * <p><b>正确性（无需 B-link / 无需版本重启）</b>：保留链顶恒为「最近一个 safe 内部节点」或真正的 root。split 传播
+     * （{@link #splitLeafAndPropagate}/{@link #insertSeparator}）与 merge 传播（{@link #considerMerge}）都沿保留链自底向上，
+     * 遇到 safe 顶即被吸收（split：{@code pointerFits} 必真；merge：safe 顶摘一指针后不欠载，{@code isUnderfull} 必假），
+     * 绝不越过它去访问已释放的祖先；root 级动作（growRoot/shrinkRoot）只在链顶恰为真 root 时发生（此时 root 从未释放；
+     * {@code considerMerge} 以 rootPageId 判定 root，而非链下标）。每个保留节点至多经历<b>一次</b>来自其唯一在途 child 的
+     * pointer 插入/摘除，故单 separator 上界足矣；保留节点持 X 从下降到传播不放手，下降时测得的空闲到传播时不变。
+     * 下降阶段尚未写任何页（非 touched），故 {@link MiniTransaction#releaseLatch} 放行祖先 X guard 的释放。
+     *
+     * <p><b>死锁自由</b>（insert/delete/purge 并发）：任一悲观下降都在起点短持 root SX/X（遇 safe 即放；SX-SX、SX-X 互斥）
+     * ⟹ 任一时刻只有一个 SMO「在 root 处」，其余 SMO 的保留 X 链两两不相交（若相交，后到者阻塞在交点、不成环）；
+     * restart 在重取 root X 前已释放全链 ⟹ 无 hold-and-wait。跨 SMO 的 latch 等待边只有三类，均无环：① 下降阻塞边——
+     * 等待者只持交点以上的页，被等者绝不回头申请其上方页；② 同父兄弟边（{@link #chooseMergePair} 的左/右兄弟）——
+     * 保留链连续故任意保留节点的父页恒被本 SMO 持有，同父兄弟只可能被「leaf-only 乐观算子」持有，而乐观算子是终结的
+     * （只持单 leaf、绝不再申请任何 latch）；③ FIL 右邻边（split 右兄弟修 prev、merge victim 远邻修 prev）——恒指向
+     * 更靠右的 leaf，按叶序全序无环。
+     */
+    private List<IndexPageHandle> descendPathSafeNode(MiniTransaction mtr, BTreeIndex index, SearchKey key,
+                                                      Predicate<RecordPage> internalChildSafe,
+                                                      LongAdder releaseCounter) {
+        if (key == null) {
+            throw new DatabaseValidationException("btree descend key must not be null");
+        }
+        // 0.13d SX+restart（设计 §10.3 ROOT_LATCHED_SX）：快照树高 ≥2 才做 SX 首遍——level 0/1 树的任何 SMO 必写 root
+        // （leaf 即 root，或 separator/victim pointer 直达 root），SX 禁原地升级、首遍必重启，直接 X 更省一遍。
+        // 快照陈旧只影响模式选择的收益，不影响正确性：链顶判定 + 重启兜底（快照虚高 → SX 首遍多一次重启；
+        // 快照虚低 → root 取 X 偏保守，均正确）。
+        if (index.rootLevel() >= 2) {
+            rootSxDescents.increment();
+            List<IndexPageHandle> chain = descendOnce(mtr, index, key, PageLatchMode.SHARED_EXCLUSIVE,
+                    internalChildSafe, releaseCounter);
+            if (!chain.get(0).pageId().equals(index.rootPageId())) {
+                // safe 节点已使 root（SX）早释放：本 SMO 全程不 X root，读者/乐观写者的 root S 从未被阻塞。
+                return chain;
+            }
+            // 链顶仍是 root：本 SMO 可能要写 root（growRoot/shrinkRoot/root 收 separator），而 SX 禁原地升级。
+            // 此刻**零页写入**（下降只读），整链干净释放后以 root X 重启第二遍（至多一次，重启后按新导航自然正确）。
+            releaseChain(mtr, chain);
+            rootXRestarts.increment();
+        }
+        return descendOnce(mtr, index, key, PageLatchMode.EXCLUSIVE, internalChildSafe, releaseCounter);
+    }
+
+    /**
+     * safe-node 下降的单遍执行：root 按 {@code rootMode}（SX 首遍 / X 重启遍）latch，内部 child 与 leaf 恒 X；
+     * 每 latch 到内部 child 判 safe，safe 即释放其以上全部祖先（含 root，SX/X 均经 {@code releaseHandle} 释放）。
+     * 返回保留链（顶 = 最近 safe 内部节点，或 root——后者表示本遍未找到 safe 节点、SMO 可能触达 root）。
+     */
+    private List<IndexPageHandle> descendOnce(MiniTransaction mtr, BTreeIndex index, SearchKey key,
+                                              PageLatchMode rootMode, Predicate<RecordPage> internalChildSafe,
+                                              LongAdder releaseCounter) {
+        List<IndexPageHandle> retained = new ArrayList<>();
+        IndexPageHandle handle = openRoot(mtr, index, rootMode);
+        retained.add(handle);
+        RecordPage page = handle.recordPage();
+        PageId pageId = index.rootPageId();
+        while (page.header().level() > 0) {
+            PageId childId = chooseChild(page, index, key);
+            IndexPageHandle child = pageAccess.openIndexPageHandle(mtr, childId, PageLatchMode.EXCLUSIVE);
+            RecordPage childPage = child.recordPage();
+            if (childPage.header().indexId() != index.indexId()) {
+                throw new BTreeStructureCorruptedException("child page index id mismatch at " + childId
+                        + ": page=" + childPage.header().indexId() + " expected=" + index.indexId());
+            }
+            // 只对内部 child 判 safe（leaf 不判）：safe 内部节点吸收其下方 SMO 的传播 → 它以上的祖先与本次 SMO 无关，立即释放。
+            if (childPage.header().level() > 0 && internalChildSafe.test(childPage)) {
+                releaseRetainedAncestors(mtr, retained, releaseCounter);
+            }
+            retained.add(child);
+            page = childPage;
+            pageId = childId;
+        }
+        validateLeafPage(page, index, pageId);
+        return retained;
+    }
+
+    /**
+     * restart-in-X 前的整链释放（0.13d SX+restart）：SX 首遍链顶仍是 root 时，下降尚未写任何页（非 touched），
+     * 全链（root SX + 内部/leaf X）经 {@code releaseHandle} 干净释放，随后以 root X 重启。释放顺序沿链自顶向下即可
+     * （非 LIFO 由 {@link cn.zhangyis.db.storage.mtr.MtrMemo} 按身份匹配支持）。
+     */
+    private void releaseChain(MiniTransaction mtr, List<IndexPageHandle> chain) {
+        for (IndexPageHandle handle : chain) {
+            pageAccess.releaseHandle(mtr, handle);
+        }
+    }
+
+    /**
+     * 释放并清空当前保留链中的全部 latch（已找到 safe 内部 child，其全部祖先与本次 SMO 无关）；按早释放的祖先数累加
+     * {@code releaseCounter}（insert 与 delete/purge 分开计数，便于测试定向断言）。释放的祖先在下降阶段未写入（非 touched），
+     * {@link MiniTransaction#releaseLatch} 放行。
+     */
+    private void releaseRetainedAncestors(MiniTransaction mtr, List<IndexPageHandle> retained,
+                                          LongAdder releaseCounter) {
+        for (IndexPageHandle ancestor : retained) {
+            pageAccess.releaseHandle(mtr, ancestor);
+            releaseCounter.increment();
+        }
+        retained.clear();
+    }
+
+    /**
+     * insert 下降 safe 判据（0.13d safe-node）：内部节点连续空闲 ≥ {@code maxSeparatorSize}（本索引任一 node pointer 编码长度的
+     * 严格上界）⟹ 必能再容纳来自其下方 split 的那一个 separator，故它自身不会 split、它以上祖先可提前释放。与 {@link #pointerFits}
+     * 用同一个 {@code freeSpace()} 度量比较（且上界 ≥ 实际），严格保证「判 safe ⟹ 传播时 {@code pointerFits} 必真」。保守（漏判
+     * 只少释放祖先、仍正确），严格（绝不把真会 split 的节点误判 safe）。
+     */
+    private boolean insertDescendSafe(RecordPage node, int maxSeparatorSize) {
+        return node.freeSpace() >= maxSeparatorSize;
+    }
+
+    /**
+     * delete/purge 下降 safe 判据（0.13d safe-node）：内部节点「被摘走一个 pointer 后仍不欠载」⟹ 其下方 merge 摘除 victim
+     * pointer 后它不会自身 merge/redistribute，传播停在它。用与 {@link #isUnderfull} 完全一致的阈值公式（可回收空闲 =
+     * {@code freeSpace + garbage}，欠载 = 可回收 × 2 &gt; 页大小），对被摘 pointer 的释放量取上界 {@code maxSeparatorSize}
+     * （实际释放 ≤ 上界 → 投影可回收偏大 → 更易判不 safe → 偏保守，绝不把真会 merge 的节点误判 safe）。
+     */
+    private boolean deleteDescendSafe(RecordPage node, int maxSeparatorSize) {
+        int reclaimableAfter = node.freeSpace() + node.header().garbage() + maxSeparatorSize;
+        return reclaimableAfter * 2 <= pageSize.bytes();
+    }
+
+    /**
+     * 计算本索引任一可能 separator（上插/摘除的 node pointer）编码长度的<b>严格上界</b>（0.13d safe-node 用）：node pointer 的
+     * key 列按列类型<b>合成</b>最大字节值（变长列填满声明 {@code length}；定长列编码宽度由类型决定、与值无关，任一合法值即最大），
+     * child 定位列为定长 BIGINT。据此编码一个「最大 node pointer」记录取其字节长，再加 {@link #MERGE_ENTRY_MARGIN}
+     * 与 {@link #pointerFits}/{@link #deleteWouldUnderflow} 的目录/对齐余量对齐。合成而非取调用方实际值，使 insert
+     * （有完整记录）与 delete/purge（只有 {@link SearchKey}，可为前缀）共用同一上界。
+     */
+    private int maxSeparatorSize(BTreeIndex index) {
+        BTreeNodePointerSchema ps = BTreeNodePointerSchema.from(index);
+        List<ColumnValue> maxKey = new ArrayList<>(index.keyDef().parts().size());
+        for (var part : index.keyDef().parts()) {
+            maxKey.add(worstCaseKeyValue(index.schema().column(part.columnId().value()).type()));
+        }
+        LogicalRecord maxPointer = pointerCodec.toRecord(
+                new BTreeNodePointer(new SearchKey(maxKey), index.rootPageId()), ps);
+        return recordEncoder.encode(maxPointer, ps.schema()).length + MERGE_ENTRY_MARGIN;
+    }
+
+    /**
+     * 按列类型合成「最大字节编码」取值：变长列（VARCHAR/VARBINARY）填满声明 {@code length}（单字节字符 × length =
+     * 恰好 length 字节，UTF-8 下即编码上界）；定长列（整数/浮点/DECIMAL/CHAR/BINARY/时间）编码宽度由类型决定、与值无关，
+     * 取任一合法值即等价于最大。
+     */
+    private ColumnValue worstCaseKeyValue(ColumnType type) {
+        return switch (type.typeId()) {
+            case TINYINT, SMALLINT, INT, BIGINT -> new ColumnValue.IntValue(0);
+            case FLOAT, DOUBLE -> new ColumnValue.DoubleValue(0);
+            case DECIMAL -> new ColumnValue.DecimalValue(BigDecimal.ZERO);
+            case CHAR, VARCHAR -> new ColumnValue.StringValue("x".repeat(type.length()));
+            case BINARY, VARBINARY -> new ColumnValue.BinaryValue(new byte[type.length()]);
+            case DATE -> new ColumnValue.TemporalValue(TemporalKind.DATE, 0);
+            case DATETIME -> new ColumnValue.TemporalValue(TemporalKind.DATETIME, 0);
+        };
+    }
+
+    /**
      * 乐观下降（0.13a，latch coupling / crab，设计 §10.2）：内部层 S-crab——持父页 S → latch 子页 → 释放父页 S；
      * 最后一层（leaf）取 X 返回。至多同时持「1 内部父 + 1 子」，越过的祖先立即释放，放开 root 处写并发。
-     * 仅供 {@link #tryOptimisticInsert}/{@link #tryOptimisticDelete}；unsafe（split/merge）时调用方释放 leaf X 后改走
-     * {@link #descendPath} 悲观全 X 重启。
+     * 仅供 {@link #tryOptimisticInsert}/{@link #tryOptimisticDelete} 等乐观写算子；unsafe（split/merge）时调用方释放
+     * leaf X 后改走 {@link #descendPathSafeNode} 悲观 X + safe-node 重启。
      *
      * <p><b>root 即 leaf</b>（level 0，单页树）无 crab 收益：释放 S root 返回 {@code null}，交悲观（悲观重取 root X）。
      *
-     * <p><b>并发正确性</b>（与悲观路径协作）：结构变更只走悲观全路径 X 且**持到 commit**（含 root X），故任一乐观下降者的
-     * root S 获取会与并发结构变更者的 root X 冲突而串行——不会带陈旧指针穿过正在变更的子树。crab 的 hand-over-hand
-     * 保证「被释放的祖先即使随后被并发 split/merge/free，本线程也已先 latch 到仍有效的子页」（re-parent 只移动指针不移动子页；
-     * 移动 key 的 split/merge 必然冲突在该页 latch 上）。故本设计当前**并发正确**，代价是结构变更 tree-wide 串行于 root
-     * （0.13b 用 SX latch 放松）。释放的内部页均为 S（从不写→非 touched），满足 {@link MiniTransaction#releaseLatch} 防护。
+     * <p><b>并发正确性</b>（与悲观路径协作）：核心不变量是 <b>crab 的 hand-over-hand</b>——释放某祖先前本线程已先 latch 到
+     * 仍有效的子页，故本线程恒持有「即将使用的那一页」的 latch，该页不会在本线程脚下被结构变更（split/merge 需 X，与本线程
+     * 的 latch 冲突而阻塞；re-parent 只移动指针不移动子页内容）。此不变量<b>不依赖</b>结构变更是否持 root X 到 commit。
+     * 补充：0.13d safe-node 后悲观 <b>insert</b> 不再把 root X 持到 commit（split 不传播到 root 时提前释放），但 merge（delete/purge）
+     * 仍走 {@link #descendPath} 悲观全 X 持到 commit、tree-wide 串行于 root。释放的内部页均为 S（从不写→非 touched），
+     * 满足 {@link MiniTransaction#releaseLatch} 防护。
      */
     private IndexPageHandle descendOptimistic(MiniTransaction mtr, BTreeIndex index, SearchKey key) {
         if (key == null) {
@@ -1290,6 +1638,49 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         }
         validateLeafPage(page, index, node.pageId());
         return node;
+    }
+
+    /**
+     * 读路径乐观下降（0.13c，latch coupling / crab，设计 §10）：全程 S——持父页 S → latch 子页 S → 释放父页 S，
+     * 至多同时持「1 内部父 + 1 子」，越过的祖先立即释放，缩短 root/内部页 latch 持有窗口、放开 root 处写并发。
+     * 读从不结构变更，故无 {@link #descendOptimistic} 的 unsafe/悲观回退分支；root 即 leaf（level 0）直接返回 root（S）。
+     *
+     * <p><b>并发正确性</b>（与悲观写路径协作，同 {@link #descendOptimistic} 论证）：核心不变量是 crab 的 hand-over-hand——
+     * 释放某祖先前本线程已先 latch 到仍有效的子页，故读者恒持有「即将使用的那一页」的 S latch，该页不会在读者脚下被结构变更
+     * （split/merge 需 X，与读者 S 冲突而阻塞；re-parent 只移动指针不移动子页内容；split 不跨子树边界搬 key）。此不变量
+     * <b>不依赖</b>结构变更是否持 root X 到 commit——0.13d safe-node 后悲观 insert 已不再把 root X 持到 commit，读者仍安全。
+     * 释放的内部页均为 S（从不写→非 touched），满足 {@link MiniTransaction#releaseLatch} 防护。返回的 leaf S 由调用方读毕后
+     * 随 MTR commit 释放。
+     */
+    private IndexPageHandle descendSharedCrab(MiniTransaction mtr, BTreeIndex index, SearchKey key) {
+        if (key == null) {
+            throw new DatabaseValidationException("btree descend key must not be null");
+        }
+        IndexPageHandle node = openRoot(mtr, index, PageLatchMode.SHARED);
+        RecordPage page = node.recordPage();
+        while (page.header().level() > 0) {
+            PageId childId = chooseChild(page, index, key);
+            IndexPageHandle child = pageAccess.openIndexPageHandle(mtr, childId, PageLatchMode.SHARED);
+            // crab：latch 到子页后立即释放父页（内部 S，未写→非 touched，可提前释放）。
+            pageAccess.releaseHandle(mtr, node);
+            page = child.recordPage();
+            if (page.header().indexId() != index.indexId()) {
+                throw new BTreeStructureCorruptedException("child page index id mismatch at " + child.pageId()
+                        + ": page=" + page.header().indexId() + " expected=" + index.indexId());
+            }
+            node = child;
+        }
+        validateLeafPage(page, index, node.pageId());
+        return node;
+    }
+
+    /**
+     * 读路径 crab 定位（0.13c）：{@link #descendSharedCrab} S-crab 下降到 leaf(S) 并包成 {@link LeafLocation}；
+     * 返回时 root/内部祖先均已早释放，仅 leaf S 仍在 MTR memo 中（读毕随 commit 释放）。
+     */
+    private LeafLocation findLeafSharedCrab(MiniTransaction mtr, BTreeIndex index, SearchKey key) {
+        IndexPageHandle leaf = descendSharedCrab(mtr, index, key);
+        return new LeafLocation(leaf, leaf.recordPage(), leaf.pageId());
     }
 
     /** {@link #findLeaf} 定位结果：leaf 句柄（scan 取 sibling 链/header）、leaf 页视图、leaf 物理页号。 */
@@ -1359,6 +1750,31 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
             }
             acc.add(materialize(index, leafId, cursor));
             if (acc.full()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean locateRangeLeaf(RecordPage leaf, PageId leafId, BTreeIndex index, BTreeScanRange range,
+                                    List<BTreeCurrentReadPosition> positions) {
+        for (int off : leaf.recordOffsetsInOrder()) {
+            RecordCursor cursor = new RecordCursor(leaf, off, index.schema(), registry);
+            if (cursor.isDeleted()) {
+                continue;
+            }
+            if (belowLower(cursor, index, range)) {
+                continue;
+            }
+            if (aboveUpper(cursor, index, range)) {
+                return true;
+            }
+            BTreeLookupResult result = materialize(index, leafId, cursor);
+            RecordLockKey recordKey = RecordLockKey.from(result.recordRef());
+            GapLockKey gapKey = gapBeforeRecord(leaf, index, off);
+            positions.add(new BTreeCurrentReadPosition(Optional.of(result), Optional.of(recordKey), gapKey,
+                    Optional.of(new NextKeyLockKey(recordKey, gapKey))));
+            if (positions.size() >= range.limit()) {
                 return true;
             }
         }
@@ -1462,6 +1878,39 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
 
     private BTreeLookupResult materialize(BTreeIndex index, PageId pageId, RecordCursor cursor) {
         return new BTreeLookupResult(index, cursor.recordRef(pageId, index.indexId()), cursor.materialize());
+    }
+
+    private GapLockKey gapBeforeRecord(RecordPage leaf, BTreeIndex index, int recordOffset) {
+        SearchKey leftKey = null;
+        for (int off : leaf.recordOffsetsInOrder()) {
+            if (off == recordOffset) {
+                return new GapLockKey(index.indexId(), leftKey, keyAt(leaf, index, off));
+            }
+            leftKey = keyAt(leaf, index, off);
+        }
+        throw new BTreeStructureCorruptedException("record offset not found while building current-read gap: "
+                + recordOffset);
+    }
+
+    private GapLockKey gapForSearchKey(RecordPage leaf, BTreeIndex index, SearchKey key) {
+        int prev = search.findInsertPosition(leaf, key, index.keyDef(), index.schema());
+        SearchKey leftKey = prev == leaf.infimumOffset() ? null : keyAt(leaf, index, prev);
+        int next = leaf.nextRecord(prev);
+        SearchKey rightKey = next == leaf.supremumOffset() ? null : keyAt(leaf, index, next);
+        return new GapLockKey(index.indexId(), leftKey, rightKey);
+    }
+
+    private GapLockKey terminalGapForRange(MiniTransaction mtr, BTreeIndex index, BTreeScanRange range) {
+        LeafLocation upperLeaf = findLeafSharedCrab(mtr, index, range.upperKey());
+        OptionalInt found = search.findEqual(upperLeaf.page(), range.upperKey(), index.keyDef(), index.schema());
+        if (found.isPresent() && !range.upperInclusive()) {
+            return gapBeforeRecord(upperLeaf.page(), index, found.getAsInt());
+        }
+        return gapForSearchKey(upperLeaf.page(), index, range.upperKey());
+    }
+
+    private SearchKey keyAt(RecordPage leaf, BTreeIndex index, int recordOffset) {
+        return keyOf(new RecordCursor(leaf, recordOffset, index.schema(), registry).materialize(), index);
     }
 
     private boolean belowLower(RecordCursor cursor, BTreeIndex index, BTreeScanRange range) {

@@ -35,6 +35,9 @@ import cn.zhangyis.db.storage.fsp.flst.Flst;
 import cn.zhangyis.db.storage.fsp.flst.FlstBase;
 import cn.zhangyis.db.storage.fsp.extent.FreeExtentService;
 import cn.zhangyis.db.storage.fsp.exception.NoFreeSpaceException;
+import cn.zhangyis.db.storage.fsp.reservation.SpaceReservation;
+import cn.zhangyis.db.storage.fsp.reservation.SpaceReservationKind;
+import cn.zhangyis.db.storage.fsp.reservation.SpaceReservationService;
 import cn.zhangyis.db.storage.fsp.segment.SegmentInodeRepository;
 import cn.zhangyis.db.storage.fsp.segment.SegmentPageAllocator;
 import cn.zhangyis.db.storage.fsp.segment.SegmentPurpose;
@@ -72,6 +75,8 @@ public final class DiskSpaceManager {
     private final FreeExtentService freeExtents;
     private final SegmentSpaceService segSpace;
     private final SegmentPageAllocator allocator;
+    /** 多页操作预留服务：在真正分配 page 前预检并预扩容量，避免 split/undo grow 半途 ENOSPC。 */
+    private final SpaceReservationService reservationService;
 
     public DiskSpaceManager(BufferPool pool, PageStore pageStore, PageSize pageSize) {
         this(pool, pageStore, pageSize, defaultRegistry(pageStore, pageSize));
@@ -114,6 +119,7 @@ public final class DiskSpaceManager {
         this.freeExtents = new FreeExtentService(pool, pageSize, headerRepo, xdes, flst);
         this.segSpace = new SegmentSpaceService(pool, pageSize, headerRepo, inodeRepo, xdes, flst, freeExtents);
         this.allocator = new SegmentPageAllocator(pool, inodeRepo, flst, segSpace, new DefaultExtentAllocationPolicy());
+        this.reservationService = new SpaceReservationService(pageStore, pageSize, headerRepo, flst);
     }
 
     private static TablespaceRegistry defaultRegistry(PageStore pageStore, PageSize pageSize) {
@@ -255,6 +261,29 @@ public final class DiskSpaceManager {
     }
 
     /**
+     * 为一次可能创建多个 page 的操作预留表空间容量。数据流为：取得 ordinary access lease 并复核 registry 状态 →
+     * SpaceReservationService 预扩物理文件/page0 currentSize → reservation 挂入 MTR memo 兜底释放。
+     *
+     * <p>调用方仍应使用 try-with-resources 缩短 reservation 生命周期；MTR memo 只负责异常路径和遗漏 close 的兜底。
+     *
+     * @param mtr 当前活动 MTR。
+     * @param spaceId 目标表空间。
+     * @param kind 预留类型。
+     * @param pages 本操作最多创建的数据页数。
+     * @param extents 本操作额外需要保底的完整 extent 数。
+     * @return 可关闭的预留句柄。
+     */
+    public SpaceReservation reserveSpace(MiniTransaction mtr, SpaceId spaceId, SpaceReservationKind kind,
+                                         long pages, long extents) {
+        requireMtr(mtr);
+        requireSpace(spaceId);
+        requireOrdinaryAccess(mtr, spaceId);
+        SpaceReservation reservation = reservationService.reserve(mtr, spaceId, kind, pages, extents);
+        mtr.enlistResource(reservation);
+        return reservation;
+    }
+
+    /**
      * 为 segment 分配一个页；当前空间不足则扩展文件一次再试，仍不足抛 NoFreeSpaceException。
      *
      * <p>分配成功后对该数据页做「页创建」：{@code mtr.newPage(X)} + {@link PageEnvelope#writeHeader}（type=ALLOCATED）
@@ -265,6 +294,7 @@ public final class DiskSpaceManager {
         requireMtr(mtr);
         requireRef(ref);
         requireOrdinaryAccess(mtr, ref.spaceId());
+        reservationService.consumePageIfReserved(mtr, ref.spaceId());
         PageId allocated = doAllocatePage(mtr, ref);
         initAllocatedPage(mtr, allocated);
         return allocated;

@@ -122,7 +122,7 @@ public final class RollbackService {
      *   <li>只读 MTR `open(SHARED)` + `forEachRecordWithPointer` **正向**收集 {@code (rec, rp)}（每条 record 自身地址）；</li>
      *   <li>**反向**（最后写的先撤）逐条独立 MTR `applyUndoRecord`（复用 INSERT/UPDATE/DELETE_MARK 反向命令）。</li>
      * </ol>
-     * 由启动恢复对 `restoreRollbackSegmentSlots` 重建出的、且 undo 段 state=ACTIVE 的 slot 调用；不走 Transaction 状态机
+     * 由正式 UNDO_ROLLBACK 阶段从 page3 重建出的、且 undo 段 state=ACTIVE 的 slot 调用；不走 Transaction 状态机
      * （前台 {@link #rollback} 才走）、不在此释放 slot（恢复编排 release 内存 slot；page3 持久清留后续）。
      *
      * <p><b>单显式聚簇索引假设</b>（无 DD）：用 {@code clusteredIndex} 的 keyDef/schema 解码所有 undo；

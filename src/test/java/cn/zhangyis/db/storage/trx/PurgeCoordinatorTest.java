@@ -39,6 +39,7 @@ import cn.zhangyis.db.storage.record.type.TypeCodecRegistry;
 import cn.zhangyis.db.storage.undo.UndoLogSegmentAccess;
 import cn.zhangyis.db.storage.undo.UndoSegmentHandle;
 import cn.zhangyis.db.storage.undo.UndoSpaceAllocator;
+import cn.zhangyis.db.storage.undo.UndoSpaceReservation;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -243,6 +244,11 @@ class PurgeCoordinatorTest {
         @Override
         public UndoSegmentHandle createUndoSegment(MiniTransaction mtr, SpaceId undoSpace) {
             return delegate.createUndoSegment(mtr, undoSpace);
+        }
+
+        @Override
+        public UndoSpaceReservation reserveGrowPages(MiniTransaction mtr, SpaceId undoSpace, long pages) {
+            return delegate.reserveGrowPages(mtr, undoSpace, pages);
         }
 
         @Override

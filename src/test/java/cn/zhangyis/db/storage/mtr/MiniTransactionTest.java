@@ -101,6 +101,21 @@ class MiniTransactionTest {
     }
 
     @Test
+    void sharedExclusiveToExclusiveUpgradeIsForbidden() {
+        try (PageStore store = openStore(8)) {
+            BufferPool pool = new LruBufferPool(store, PS, 4);
+            MiniTransaction mtr = activeMtr(1);
+            mtr.getPage(pool, page(0), PageLatchMode.SHARED_EXCLUSIVE);
+            // SX 持该页 readLock，同 MTR 再求 X 会在 ReentrantReadWriteLock 上自死锁 → 取 latch 前拦为领域异常。
+            assertThrows(MtrStateException.class,
+                    () -> mtr.getPage(pool, page(0), PageLatchMode.EXCLUSIVE));
+            mtr.rollbackUncommitted();
+            assertEquals(MiniTransactionState.ROLLED_BACK, mtr.state());
+            pool.close();
+        }
+    }
+
+    @Test
     void operationsAfterTerminalShouldThrow() {
         try (PageStore store = openStore(8)) {
             BufferPool pool = new LruBufferPool(store, PS, 4);

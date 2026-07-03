@@ -27,13 +27,13 @@ class PageGuardTest {
     private PageGuard exclusiveGuard(BufferFrame frame, FrameReleaser releaser) {
         Lock latch = frame.pageLatch.writeLock();
         latch.lock();
-        return new PageGuard(releaser, frame, PageLatchMode.EXCLUSIVE, latch);
+        return new PageGuard(releaser, frame, PageLatchMode.EXCLUSIVE, latch, null);
     }
 
     private PageGuard sharedGuard(BufferFrame frame, FrameReleaser releaser) {
         Lock latch = frame.pageLatch.readLock();
         latch.lock();
-        return new PageGuard(releaser, frame, PageLatchMode.SHARED, latch);
+        return new PageGuard(releaser, frame, PageLatchMode.SHARED, latch, null);
     }
 
     @Test

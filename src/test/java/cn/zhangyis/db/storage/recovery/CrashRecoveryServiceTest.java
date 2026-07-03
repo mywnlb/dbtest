@@ -5,6 +5,7 @@ import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.SpaceId;
+import cn.zhangyis.db.common.exception.DatabaseRuntimeException;
 import cn.zhangyis.db.storage.buf.FlushPageSnapshot;
 import cn.zhangyis.db.storage.fil.io.FileChannelPageStore;
 import cn.zhangyis.db.storage.fil.io.PageStore;
@@ -200,6 +201,76 @@ class CrashRecoveryServiceTest {
                             RecoveryStageName.UNDO_TABLESPACE_RESUME,
                             RecoveryStageName.OPEN_TRAFFIC),
                     report.completedStages());
+        }
+    }
+
+    /**
+     * 正式事务恢复阶段必须仍处于 recovery gate 关闭窗口内：redo replay 完成后先执行 recovered active rollback
+     * 与 committed history 重建，再开放普通流量。这里用 fake participant 验证 CrashRecoveryService 的编排边界，
+     * 真实 undo slot 扫描由 StorageEngine 端到端用例覆盖。
+     */
+    @Test
+    void runsTransactionUndoRecoveryStagesBeforeOpeningTraffic() {
+        Path redoPath = dir.resolve("trx-recovery-redo.log");
+        LogRange range;
+        try (RedoLogFileRepository redoRepo = RedoLogFileRepository.open(redoPath)) {
+            RedoLogManager redo = RedoLogManager.durable(redoRepo);
+            range = redo.append(List.of(new PageInitRecord(PAGE, PageType.INDEX)));
+            redo.flush();
+        }
+        try (PageStore store = new FileChannelPageStore();
+             RedoLogFileRepository redoRepo = RedoLogFileRepository.open(redoPath);
+             RedoCheckpointStore checkpointStore = RedoCheckpointStore.open(dir.resolve("trx-recovery-control"))) {
+            store.create(SPACE, dir.resolve("trx-recovery.ibd"), PS, PageNo.of(4));
+            RecoveryTrafficGate gate = new RecoveryTrafficGate();
+            AtomicReference<RecoveryState> gateStateDuringStage = new AtomicReference<>();
+            AtomicReference<Lsn> recoveredBoundarySeen = new AtomicReference<>();
+            TransactionUndoRecoveryParticipant participant = recoveredToLsn -> {
+                gateStateDuringStage.set(gate.state());
+                recoveredBoundarySeen.set(recoveredToLsn);
+                return new TransactionUndoRecoveryResult(3, 1, 0, 2);
+            };
+            RecoveryRequest request = RecoveryRequest.normal(checkpointStore, redoRepo,
+                            RedoApplyDispatcher.pageDispatcher(), new RedoApplyContext(store, PS))
+                    .withTransactionUndoRecovery(participant);
+
+            RecoveryReport report = new CrashRecoveryService(gate).recover(request);
+
+            assertEquals(RecoveryState.RECOVERING, gateStateDuringStage.get(),
+                    "transaction undo recovery must run before user traffic opens");
+            assertEquals(range.end(), recoveredBoundarySeen.get());
+            assertEquals(List.of(RecoveryStageName.TRAFFIC_CLOSED,
+                            RecoveryStageName.DOUBLEWRITE_REPAIR,
+                            RecoveryStageName.REDO_REPLAY,
+                            RecoveryStageName.UNDO_ROLLBACK,
+                            RecoveryStageName.RESUME_PURGE,
+                            RecoveryStageName.OPEN_TRAFFIC),
+                    report.completedStages());
+        }
+    }
+
+    /** 事务恢复阶段失败必须和 redo/doublewrite 失败一样 fail-closed，不能开放普通流量。 */
+    @Test
+    void recoverFailsClosedWhenTransactionUndoRecoveryFails() {
+        Path redoPath = dir.resolve("trx-recovery-fail-redo.log");
+        try (RedoLogFileRepository redoRepo = RedoLogFileRepository.open(redoPath)) {
+            RedoLogManager redo = RedoLogManager.durable(redoRepo);
+            redo.append(List.of(new PageInitRecord(PAGE, PageType.INDEX)));
+            redo.flush();
+        }
+        try (PageStore store = new FileChannelPageStore();
+             RedoLogFileRepository redoRepo = RedoLogFileRepository.open(redoPath);
+             RedoCheckpointStore checkpointStore = RedoCheckpointStore.open(dir.resolve("trx-recovery-fail-control"))) {
+            store.create(SPACE, dir.resolve("trx-recovery-fail.ibd"), PS, PageNo.of(4));
+            RecoveryTrafficGate gate = new RecoveryTrafficGate();
+            RecoveryRequest request = RecoveryRequest.normal(checkpointStore, redoRepo,
+                            RedoApplyDispatcher.pageDispatcher(), new RedoApplyContext(store, PS))
+                    .withTransactionUndoRecovery(recoveredToLsn -> {
+                        throw new DatabaseRuntimeException("synthetic transaction recovery failure");
+                    });
+
+            assertThrows(RecoveryStartupException.class, () -> new CrashRecoveryService(gate).recover(request));
+            assertEquals(RecoveryState.FAILED, gate.state());
         }
     }
 

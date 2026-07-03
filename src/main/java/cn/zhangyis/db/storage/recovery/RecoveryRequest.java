@@ -28,6 +28,7 @@ import java.util.List;
  * @param recoveredRedoManager REDO_BOUNDARY_INSTALL 阶段使用的、本进程将继续 append 的 RedoLogManager；
  *                             为空表示跳过该阶段（仅用于不需要续写 redo 的纯回放测试）。真实重启必须提供，
  *                             否则新 MTR 会从 0 重新分配 LSN 覆盖已有日志。
+ * @param transactionUndoRecovery 可选事务 undo 恢复参与者；负责正式 UNDO_ROLLBACK/RESUME_PURGE 阶段。
  */
 public record RecoveryRequest(RecoveryMode mode,
                               RedoCheckpointStore checkpointStore,
@@ -38,7 +39,8 @@ public record RecoveryRequest(RecoveryMode mode,
                               List<PageId> pagesToRepair,
                               UndoTablespaceRecoveryParticipant undoTablespaceRecovery,
                               List<SpaceId> spacesToReconcile,
-                              RedoLogManager recoveredRedoManager) {
+                              RedoLogManager recoveredRedoManager,
+                              TransactionUndoRecoveryParticipant transactionUndoRecovery) {
 
     public RecoveryRequest {
         if (mode == null || checkpointStore == null || redoRepository == null
@@ -60,7 +62,7 @@ public record RecoveryRequest(RecoveryMode mode,
                                          RedoApplyDispatcher dispatcher,
                                          RedoApplyContext applyContext) {
         return new RecoveryRequest(RecoveryMode.NORMAL, checkpointStore, redoRepository,
-                dispatcher, applyContext, null, List.of(), null, List.of(), null);
+                dispatcher, applyContext, null, List.of(), null, List.of(), null, null);
     }
 
     /**
@@ -71,7 +73,8 @@ public record RecoveryRequest(RecoveryMode mode,
             throw new DatabaseValidationException("doublewrite recovery scanner must not be null");
         }
         return new RecoveryRequest(mode, checkpointStore, redoRepository, dispatcher, applyContext,
-                scanner, pages, undoTablespaceRecovery, spacesToReconcile, recoveredRedoManager);
+                scanner, pages, undoTablespaceRecovery, spacesToReconcile,
+                recoveredRedoManager, transactionUndoRecovery);
     }
 
     /**
@@ -82,7 +85,8 @@ public record RecoveryRequest(RecoveryMode mode,
             throw new DatabaseValidationException("undo tablespace recovery participant must not be null");
         }
         return new RecoveryRequest(mode, checkpointStore, redoRepository, dispatcher, applyContext,
-                doublewriteScanner, pagesToRepair, participant, spacesToReconcile, recoveredRedoManager);
+                doublewriteScanner, pagesToRepair, participant, spacesToReconcile,
+                recoveredRedoManager, transactionUndoRecovery);
     }
 
     /**
@@ -97,7 +101,8 @@ public record RecoveryRequest(RecoveryMode mode,
             throw new DatabaseValidationException("space file reconcile set must not be null");
         }
         return new RecoveryRequest(mode, checkpointStore, redoRepository, dispatcher, applyContext,
-                doublewriteScanner, pagesToRepair, undoTablespaceRecovery, spaces, recoveredRedoManager);
+                doublewriteScanner, pagesToRepair, undoTablespaceRecovery, spaces,
+                recoveredRedoManager, transactionUndoRecovery);
     }
 
     /**
@@ -112,6 +117,23 @@ public record RecoveryRequest(RecoveryMode mode,
             throw new DatabaseValidationException("recovered redo manager must not be null");
         }
         return new RecoveryRequest(mode, checkpointStore, redoRepository, dispatcher, applyContext,
-                doublewriteScanner, pagesToRepair, undoTablespaceRecovery, spacesToReconcile, redoManager);
+                doublewriteScanner, pagesToRepair, undoTablespaceRecovery, spacesToReconcile,
+                redoManager, transactionUndoRecovery);
+    }
+
+    /**
+     * 接入正式事务 undo 恢复阶段：redo replay 和物理空间续作完成后，OPEN_TRAFFIC 前调用该参与者扫描 page3、
+     * rollback recovered ACTIVE 段并重建 committed history。request 保持不可变，避免启动恢复中替换参与者。
+     *
+     * @param participant 事务 undo 恢复参与者。
+     * @return 携带事务 undo 恢复参与者的新请求。
+     */
+    public RecoveryRequest withTransactionUndoRecovery(TransactionUndoRecoveryParticipant participant) {
+        if (participant == null) {
+            throw new DatabaseValidationException("transaction undo recovery participant must not be null");
+        }
+        return new RecoveryRequest(mode, checkpointStore, redoRepository, dispatcher, applyContext,
+                doublewriteScanner, pagesToRepair, undoTablespaceRecovery, spacesToReconcile,
+                recoveredRedoManager, participant);
     }
 }

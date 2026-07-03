@@ -14,7 +14,7 @@ import java.util.concurrent.locks.Lock;
  */
 public final class PageGuard implements AutoCloseable {
 
-    /** 关闭回调，回到 pool 在 instanceLock 下 OR 脏并 unfix。 */
+    /** 关闭回调，回到 pool 在目标 frameMutex 下 OR 脏并 unfix。 */
     private final FrameReleaser releaser;
 
     /** 被访问的帧。 */
@@ -23,8 +23,11 @@ public final class PageGuard implements AutoCloseable {
     /** 本句柄持有的 latch 模式。 */
     private final PageLatchMode mode;
 
-    /** 已锁定、待 close 释放的 page latch（read 或 write lock）。 */
+    /** 已锁定、待 close 释放的 page latch（read 或 write lock；SHARED_EXCLUSIVE 走 readLock）。 */
     private final Lock heldLatch;
+
+    /** SHARED_EXCLUSIVE 额外持有的写意向闩；其它模式为 null。close 时先于 {@link #heldLatch} 释放。 */
+    private final Lock heldIntentLatch;
 
     /** 持有期间是否写过；close 时 OR 进 frame.dirty。 */
     private boolean wrote;
@@ -35,11 +38,12 @@ public final class PageGuard implements AutoCloseable {
     /** 写监听；默认 NO_OP（非 MTR 路径零行为变化）。MTR 在 fix 后挂上 collector 以收集 redo。 */
     private PageWriteListener listener = PageWriteListener.NO_OP;
 
-    PageGuard(FrameReleaser releaser, BufferFrame frame, PageLatchMode mode, Lock heldLatch) {
+    PageGuard(FrameReleaser releaser, BufferFrame frame, PageLatchMode mode, Lock heldLatch, Lock heldIntentLatch) {
         this.releaser = releaser;
         this.frame = frame;
         this.mode = mode;
         this.heldLatch = heldLatch;
+        this.heldIntentLatch = heldIntentLatch;
     }
 
     /** 当前页号。 */
@@ -122,13 +126,17 @@ public final class PageGuard implements AutoCloseable {
         }
     }
 
-    /** 释放：先放 page latch，再回调 pool 在 instanceLock 下 OR 脏并 unfix。幂等。 */
+    /** 释放：先放 page latch，再回调 pool 在目标 frameMutex 下 OR 脏并 unfix。幂等。 */
     @Override
     public void close() {
         if (closed) {
             return;
         }
         closed = true;
+        // 释放顺序为获取的逆序：先放写意向闩（SX 专用），再放 page latch，最后 unfix。
+        if (heldIntentLatch != null) {
+            heldIntentLatch.unlock();
+        }
         heldLatch.unlock();
         releaser.release(frame, wrote);
     }

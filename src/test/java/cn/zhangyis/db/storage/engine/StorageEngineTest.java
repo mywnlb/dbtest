@@ -6,7 +6,10 @@ import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.RollPointer;
 import cn.zhangyis.db.domain.SpaceId;
+import cn.zhangyis.db.domain.TransactionId;
 import cn.zhangyis.db.domain.UndoSlotId;
+import cn.zhangyis.db.server.lockobs.api.SnapshotRequest;
+import cn.zhangyis.db.server.lockobs.snapshot.LockDiagnosticSnapshot;
 import cn.zhangyis.db.storage.api.DiskSpaceManager;
 import cn.zhangyis.db.storage.api.SegmentRef;
 import cn.zhangyis.db.storage.btree.BTreeIndex;
@@ -32,6 +35,8 @@ import cn.zhangyis.db.storage.trx.Transaction;
 import cn.zhangyis.db.storage.trx.TransactionManager;
 import cn.zhangyis.db.storage.trx.TransactionOptions;
 import cn.zhangyis.db.storage.trx.UndoLogManager;
+import cn.zhangyis.db.storage.trx.lock.RecordLockKey;
+import cn.zhangyis.db.storage.trx.lock.TransactionLockMode;
 import cn.zhangyis.db.storage.record.format.HiddenColumns;
 import cn.zhangyis.db.storage.record.format.LogicalRecord;
 import cn.zhangyis.db.storage.record.format.RecordType;
@@ -112,6 +117,29 @@ class StorageEngineTest {
         assertEquals(EngineState.CLOSED, engine.state());
         engine.close(); // 幂等
         assertEquals(EngineState.CLOSED, engine.state());
+    }
+
+    @Test
+    void engineExposesLockDiagnosticSnapshotFromSharedLockManager() {
+        StorageEngine engine = new StorageEngine(config());
+        engine.open();
+        try {
+            TransactionId owner = TransactionId.of(9901);
+            RecordLockKey record = new RecordLockKey(INDEX_ID, PageId.of(DATA_SPACE, PageNo.of(7)), 3);
+            engine.lockManager().acquire(owner, record, TransactionLockMode.REC_X, Duration.ofMillis(200));
+
+            LockDiagnosticSnapshot snapshot = engine.lockDiagnosticSnapshot(SnapshotRequest.defaults());
+
+            assertEquals(1, snapshot.dataLocks().size());
+            assertEquals(owner, snapshot.dataLocks().getFirst().engineTransactionId());
+            assertEquals("GRANTED", snapshot.dataLocks().getFirst().lockStatus());
+            assertTrue(snapshot.dataLocks().getFirst().eventId() > 0,
+                    "engine must wire the real lock observation service, not the no-op observer");
+            assertTrue(snapshot.dataLockWaits().isEmpty());
+            assertEquals(1, engine.lockManager().releaseAll(owner));
+        } finally {
+            engine.close();
+        }
     }
 
     @Test
@@ -458,6 +486,7 @@ class StorageEngineTest {
         StorageEngine e2 = new StorageEngine(cfg);
         e2.configureClusteredIndex(index); // open 前注入恢复回滚索引（无 DD）
         e2.open();
+        assertStageBeforeOpen(e2, RecoveryStageName.UNDO_ROLLBACK);
         MiniTransaction r2 = e2.miniTransactionManager().begin();
         assertTrue(e2.btreeService().lookup(r2, index, search(1)).isEmpty(),
                 "active insert rolled back at recovery (row deleted)");
@@ -555,6 +584,7 @@ class StorageEngineTest {
         StorageEngine e2 = new StorageEngine(cfg);
         e2.configureClusteredIndex(index);
         e2.open();
+        assertStageBeforeOpen(e2, RecoveryStageName.RESUME_PURGE);
         assertTrue(awaitUntil(() -> lookupIncludingDeletedEmpty(e2, index, 1), Duration.ofSeconds(3)),
                 "recovered committed history lets the restarted purge driver remove the delete-marked row");
         e2.close();
@@ -572,6 +602,17 @@ class StorageEngineTest {
         boolean empty = engine.btreeService().lookupIncludingDeleted(r, index, search(id)).isEmpty();
         engine.miniTransactionManager().commit(r);
         return empty;
+    }
+
+    /**
+     * recovery report 中的正式阶段必须出现在 OPEN_TRAFFIC 之前，证明工作发生在 gate 仍关闭的恢复窗口内，
+     * 而不是 engine.open() 之后的普通后置步骤。
+     */
+    private void assertStageBeforeOpen(StorageEngine engine, RecoveryStageName stage) {
+        List<RecoveryStageName> stages = engine.lastRecoveryReport().orElseThrow().completedStages();
+        assertTrue(stages.contains(stage), "recovery report should contain " + stage);
+        assertTrue(stages.indexOf(stage) < stages.indexOf(RecoveryStageName.OPEN_TRAFFIC),
+                stage + " must complete before user traffic opens");
     }
 
     /** 提交一条 delete-mark 事务（lookup 旧 image → beforeDelete → setClusteredDeleteMark → commit + onCommit）。 */

@@ -539,6 +539,62 @@ class BTreeDeleteClusteredTest {
         });
     }
 
+    /**
+     * 0.13d delete/purge safe-node（设计 §10.2 step4-5）：悲观 merge 下降时，一旦 latch 到「移除一个 pointer 后仍不欠载」
+     * 的 safe 内部节点，立即释放其以上全部祖先 X（含 root）。10 宽 key 行 → level-2 树（root 子 [A=2ptr, B=3ptr]）：
+     * B 满 3 指针（free≈1KB）→ 移除 1 指针后仍不欠载 = delete-safe；删 key 10 使 B 下最右 leaf 欠载 → 悲观回退下降
+     * 经过 B（safe）→ 提前释放 root X → merge 只发生在 B 子树内（B 3→2 ptr）、root 不受影响、树高不变。
+     *
+     * <p>RED（未接 delete safe-node 前）：悲观 delete 全路径 X 持到 commit、从不早释放祖先，计数恒 0。
+     */
+    @Test
+    void pessimisticMergeReleasesRootLatchEarlyWhenMergeDoesNotReachRoot() {
+        onPool(ctx -> {
+            ctx.createTablespaceAndRoot();
+            SplitCapableBTreeIndexService svc = ctx.service();
+            BTreeIndex current = new BTreeIndex(INDEX_ID, ctx.rootPageId, 0, wideKeyDef(), wideKeySchema(), true,
+                    ctx.leafSegment, ctx.nonLeafSegment);
+            for (long n = 1; n <= 10; n++) {
+                MiniTransaction m = ctx.mgr.begin();
+                current = svc.insertClustered(m, current, wideKeyRow(n), TransactionId.of(TRX),
+                        new RollPointer(true, PageNo.of(65), (int) n)).indexAfterInsert();
+                ctx.mgr.commit(m);
+            }
+            assertEquals(2, current.rootLevel(), "10 wide-key rows form a level-2 tree");
+            List<Integer> fills = new ArrayList<>();
+            collectFills(ctx, current, fills, new ArrayList<>());
+            assertEquals(List.of(2, 3), fills, "root has a 2-ptr left and a full 3-ptr right level-1 child");
+
+            // 删最大 key：B 下最右 leaf 欠载 → 乐观预判回退悲观 → 下降经过 delete-safe 的 B → 早释放 root（SX 首遍）。
+            long sxBefore = svc.rootSxDescentCount();
+            long restartBefore = svc.rootXRestartCount();
+            MiniTransaction d = ctx.mgr.begin();
+            BTreeDeleteResult res = svc.deleteClustered(d, current, kKey(10), TransactionId.of(TRX),
+                    new RollPointer(true, PageNo.of(65), 10));
+            current = res.indexAfter();
+            ctx.mgr.commit(d);
+
+            assertTrue(res.removed(), "key 10 removed");
+            assertFalse(res.freedPages().isEmpty(), "underfull rightmost leaf merged under B → victim freed");
+            assertTrue(svc.pessimisticDeleteFallbackCount() > 0, "underfull delete takes the pessimistic fallback");
+            assertTrue(svc.safeNodeDeleteAncestorReleaseCount() > 0,
+                    "safe-node must release root latch early when the merge does not propagate to root");
+            // 0.13d SX+restart：快照 level 2 的悲观 merge 下降以 root SX 起步；B delete-safe → 不达 root → 零重启。
+            assertTrue(svc.rootSxDescentCount() > sxBefore,
+                    "snapshot-level>=2 pessimistic merge descends with the root SX first pass");
+            assertEquals(restartBefore, svc.rootXRestartCount(),
+                    "a merge absorbed below root must not restart with root X");
+            assertEquals(2, current.rootLevel(), "merge stays inside B's subtree; tree height unchanged");
+
+            MiniTransaction r = ctx.mgr.begin();
+            List<Long> ids = svc.scan(r, current, new BTreeScanRange(kKey(1), true, kKey(10), true, 50))
+                    .stream().map(BTreeDeleteClusteredTest::vOf).toList();
+            ctx.mgr.commit(r);
+            assertEquals(List.of(1L, 2L, 3L, 4L, 5L, 6L, 7L, 8L, 9L), ids,
+                    "remaining keys intact and ordered after safe-node merge");
+        });
+    }
+
     // ---- helpers ----
 
     /** scan 结果取 payload 列（column1 = int v = id）。 */

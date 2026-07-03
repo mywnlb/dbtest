@@ -47,3 +47,4 @@ bin/
 
 ### Understand-Anything 工具缓存（按需手动运行，不入仓）###
 .understand-anything/
+*.und/

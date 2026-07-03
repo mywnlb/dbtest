@@ -90,9 +90,10 @@ public final class IndexPageAccess {
     }
 
     /**
-     * 提前释放句柄的 page latch + buffer fix（B+Tree 写路径 latch coupling / crab，设计 §10.2）：把 guard 交回 MTR
-     * 做选择性（非 LIFO）释放。仅应对**未写过**的内部导航页（S）使用——MTR 会对已 touched 页拒绝，保护 commit
-     * 盖 pageLSN 的不变量。释放后该句柄不得再使用。btree 服务只经本入口早释放，仍不接触裸 guard/frame。
+     * 提前释放句柄的 page latch + buffer fix（B+Tree latch coupling / crab / safe-node，设计 §10.2）：把 guard 交回
+     * MTR 做选择性（非 LIFO）释放。仅应对**未写过**的页使用——S 导航页恒安全；未写过的 X/SX 祖先在 safe-node 早释放
+     * 或 restart 整链释放时同样合法（MTR 只对已 touched 页的 X guard 拒绝，保护 commit 盖 pageLSN 的不变量）。
+     * 释放后该句柄不得再使用。btree 服务只经本入口早释放，仍不接触裸 guard/frame。
      *
      * @param mtr    持有该 guard 的 mini-transaction。
      * @param handle 待提前释放的 INDEX 页句柄（其 guard 仍在 mtr memo 中）。

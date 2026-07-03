@@ -1,5 +1,6 @@
 package cn.zhangyis.db.storage.record.page;
 
+import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
@@ -29,6 +30,7 @@ import java.nio.file.Path;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -65,6 +67,16 @@ class RecordComparatorTest {
 
     private static SearchKey key(ColumnValue... vs) {
         return new SearchKey(List.of(vs));
+    }
+
+    /** name(VARCHAR) 列上的前缀索引 key def（prefixBytes>0 只比前 N 字节）。 */
+    private static IndexKeyDef namePrefixKeyDef(int prefixBytes) {
+        return new IndexKeyDef(7L, List.of(new KeyPartDef(new ColumnId(1), KeyOrder.ASC, prefixBytes)));
+    }
+
+    /** id(INT) 列上的前缀 key def——数值列指定 prefixBytes 属 schema 误用，用于验证拒绝。 */
+    private static IndexKeyDef idPrefixKeyDef(int prefixBytes) {
+        return new IndexKeyDef(7L, List.of(new KeyPartDef(new ColumnId(0), KeyOrder.ASC, prefixBytes)));
     }
 
     /** 在页上放一条记录并返回其字段级游标。 */
@@ -166,6 +178,46 @@ class RecordComparatorTest {
             assertEquals(0, comparator.compare(rec, key(new ColumnValue.IntValue(5)), kd, schema));
             assertTrue(comparator.compare(rec, key(new ColumnValue.IntValue(6)), kd, schema) < 0);
             assertTrue(comparator.compare(rec, key(new ColumnValue.IntValue(4)), kd, schema) > 0);
+        });
+    }
+
+    @Test
+    void prefixIndexComparesOnlyLeadingBytesOfColumn() {
+        onPage((rp, schema) -> {
+            RecordCursor rec = place(rp, schema, 1, new ColumnValue.StringValue("application"));
+            IndexKeyDef kd = namePrefixKeyDef(3);
+            // 前 3 字节都是 "app" → 与任何同前缀 key 相等，忽略其后差异（整列比会判 'application' > 'apple'）。
+            assertEquals(0, comparator.compare(rec, key(new ColumnValue.StringValue("apple")), kd, schema),
+                    "prefix(3) of 'application' == prefix(3) of 'apple' == 'app'");
+            // 前缀内即有差异 → 按前缀定序。
+            assertTrue(comparator.compare(rec, key(new ColumnValue.StringValue("apricot")), kd, schema) < 0,
+                    "'app' < 'apr'");
+            assertTrue(comparator.compare(rec, key(new ColumnValue.StringValue("abacus")), kd, schema) > 0,
+                    "'app' > 'aba'");
+        });
+    }
+
+    @Test
+    void prefixLongerThanValueComparesAvailableBytes() {
+        onPage((rp, schema) -> {
+            RecordCursor recAb = place(rp, schema, 1, new ColumnValue.StringValue("ab"));
+            IndexKeyDef kd = namePrefixKeyDef(5);
+            assertEquals(0, comparator.compare(recAb, key(new ColumnValue.StringValue("ab")), kd, schema));
+            assertTrue(comparator.compare(recAb, key(new ColumnValue.StringValue("abc")), kd, schema) < 0,
+                    "'ab' sorts before 'abc' sharing its bytes");
+            RecordCursor recAbc = place(rp, schema, 2, new ColumnValue.StringValue("abc"));
+            assertTrue(comparator.compare(recAbc, key(new ColumnValue.StringValue("ab")), kd, schema) > 0);
+        });
+    }
+
+    @Test
+    void prefixLengthRejectedOnNonByteColumn() {
+        onPage((rp, schema) -> {
+            RecordCursor rec = place(rp, schema, 5, new ColumnValue.StringValue("x"));
+            IndexKeyDef kd = idPrefixKeyDef(2); // INT 列不支持前缀
+            assertThrows(DatabaseValidationException.class,
+                    () -> comparator.compare(rec, key(new ColumnValue.IntValue(5)), kd, schema),
+                    "prefix length on a numeric column must be rejected");
         });
     }
 

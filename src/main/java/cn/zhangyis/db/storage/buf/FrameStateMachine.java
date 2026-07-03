@@ -8,7 +8,7 @@ import java.util.Map;
 
 /**
  * 帧状态机（设计 §5.7）：集中校验并执行 {@link BufferFrame#state} 的合法转换，取代多处直接改字段。
- * 所有调用都在 BufferPool 的 poolLock 下串行，故状态机本身无需加锁；它只做"校验 + 赋值"，不持有帧的任何其它字段。
+ * 所有调用都在目标 frame 的 frameMutex 下串行，故状态机本身无需加锁；它只做"校验 + 赋值"，不持有帧的任何其它字段。
  *
  * <p><b>合法转换表</b>（self-transition 恒合法，便于幂等 markDirty/clean 复调）：
  * <ul>
@@ -37,7 +37,7 @@ final class FrameStateMachine {
     }
 
     /**
-     * 校验并执行一次状态转换（调用须持 poolLock）。to 与当前相同（幂等）或在合法后继表中则赋值，否则抛
+     * 校验并执行一次状态转换（调用须持目标 frameMutex）。to 与当前相同（幂等）或在合法后继表中则赋值，否则抛
      * {@link DatabaseValidationException} 且保持原状态不变。
      */
     void transition(BufferFrame frame, BufferFrameState to) {

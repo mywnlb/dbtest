@@ -117,6 +117,17 @@ public final class MiniTransaction {
         }
     }
 
+    /**
+     * 把非 page 的短生命周期资源挂入 MTR memo，随 commit/rollback/savepoint 按 LIFO 释放。
+     * 典型用途是空间预留、短期物理 lease 等与当前 MTR 同生共死的 guard；资源必须自身支持异常安全 close。
+     *
+     * @param resource 需要由 MTR 兜底释放的资源。
+     */
+    public void enlistResource(AutoCloseable resource) {
+        ensureActive();
+        memo.push(resource);
+    }
+
     private PageGuard fix(BufferPool pool, PageId pageId, PageLatchMode mode, boolean existing, PageType pageType) {
         ensureActive();
         if (pool == null) {
@@ -124,13 +135,13 @@ public final class MiniTransaction {
         }
         // lease 先于 page fix/latch 获取并先入 memo，LIFO 下最后释放；truncate 的 X lease 因此不会与旧 frame 访问交叉。
         acquireTablespaceLease(pageId.spaceId());
-        // 同页 S→X 升级防护：page latch 是 ReentrantReadWriteLock，不支持读→写升级，若仍持该页 S latch 时再求 X，
-        // BufferPool.acquire 的阻塞 latch.lock() 会让本线程自死锁。这里在取 latch 前把它转成可观测的领域异常。
-        // X→S 降级与"已持 X 再取 X"放行：已持 X（!holds(X) 为假）说明本线程已是写者，再取 latch 可重入，不会死锁。
+        // 同页 S/SX→X 升级防护：page latch 是 ReentrantReadWriteLock，不支持读→写升级；S 与 SHARED_EXCLUSIVE 都持
+        // 该页 readLock，若仍持时再求 X，BufferPool.acquire 的阻塞 writeLock.lock() 会让本线程自死锁。这里在取 latch
+        // 前转成可观测的领域异常。X→S 降级与"已持 X 再取 X"放行：已持 X 说明本线程已是写者，再取 latch 可重入，不会死锁。
         if (mode == PageLatchMode.EXCLUSIVE
-                && memo.holds(pageId, PageLatchMode.SHARED)
+                && (memo.holds(pageId, PageLatchMode.SHARED) || memo.holds(pageId, PageLatchMode.SHARED_EXCLUSIVE))
                 && !memo.holds(pageId, PageLatchMode.EXCLUSIVE)) {
-            throw new MtrStateException("S to X page latch upgrade is forbidden in one MTR: " + pageId);
+            throw new MtrStateException("S/SX to X page latch upgrade is forbidden in one MTR: " + pageId);
         }
         PageGuard guard = existing ? pool.getPage(pageId, mode) : pool.newPage(pageId, mode);
         // 挂上 redo 收集器：此后该 guard 的物理写经 collector 译成 PAGE_BYTES（commit 时 append）。

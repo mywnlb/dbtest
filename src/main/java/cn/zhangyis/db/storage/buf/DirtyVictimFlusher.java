@@ -4,7 +4,7 @@ import cn.zhangyis.db.domain.PageId;
 
 /**
  * 淘汰端口（buf 侧定义，依赖反转）：当 Buffer Pool 必须淘汰一个脏 victim 帧时，委托本端口把该页经
- * WAL gate + checksum + doublewrite 管线刷干净，从而保证脏页**绝不**在 {@code poolLock} 内、绕过 WAL 直写
+ * WAL gate + checksum + doublewrite 管线刷干净，从而保证脏页**绝不**在 Buffer Pool 内部锁内、绕过 WAL 直写
  * data file（设计 `innodb-flush-checkpoint-doublewrite-design.md` §6.1 LRU_FLUSH、§7.1、§8.3、§9.2）。
  *
  * <p>由 {@code buf} 定义、{@code flush} 实现（{@code CoordinatedDirtyVictimFlusher} 包 {@code FlushCoordinator}），
@@ -20,8 +20,8 @@ import cn.zhangyis.db.domain.PageId;
  * <p><b>失败语义</b>：遇到真正的 IO / doublewrite / force 失败，实现必须抛出领域异常（携带根因），
  * **不能**返回 {@code false} 把盘故障伪装成"可另选"，否则会被上层误当作容量耗尽而掩盖真实故障。
  *
- * <p><b>并发</b>：调用发生在 {@code poolLock} 释放之后；实现内部的 redo 等待、表空间 lease、物理文件锁都不嵌套在
- * {@code poolLock} 之下。当淘汰发生在某 MTR 访问同一表空间期间（调用线程已持该空间共享 lease），实现重入共享
+ * <p><b>并发</b>：调用发生在 Buffer Pool 内部锁释放之后；实现内部的 redo 等待、表空间 lease、物理文件锁都不嵌套在
+ * Buffer Pool 内部锁之下。当淘汰发生在某 MTR 访问同一表空间期间（调用线程已持该空间共享 lease），实现重入共享
  * lease 安全（{@code TablespaceAccessController} 使用可重入读锁）。
  */
 public interface DirtyVictimFlusher {

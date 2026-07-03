@@ -15,8 +15,8 @@ import java.util.Set;
  * 统计驻留页数。命中的 frame 可能处于 CLEAN/DIRTY/FLUSHING/LOADING（LOADING 为载入占位）任一状态——本表只管「键是否
  * 在表」，状态语义由 instance 负责。
  *
- * <p><b>并发</b>：本类<b>不自带锁</b>。所属 {@code BufferPoolInstance} 的 {@code instanceLock} 在外串行保护所有访问
- * （本片采用「单 instance 锁」，不内置 §13.1 的独立 pageHashLock）。single-flight 载入占位（LOADING + {@code PageLoadFuture}）
+ * <p><b>并发</b>：本类<b>不自带锁</b>。所属 {@code BufferPoolInstance} 的 pageHashLock 在外串行保护所有访问。
+ * single-flight 载入占位（LOADING + {@code PageLoadFuture}）
  * 的编排留在 {@code BufferPoolInstance.acquire}，本表只提供 map 原语。
  */
 final class PageHashTable {

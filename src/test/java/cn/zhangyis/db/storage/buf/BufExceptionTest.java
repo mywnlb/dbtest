@@ -20,9 +20,11 @@ class BufExceptionTest {
     }
 
     @Test
-    void pageLatchModeShouldHaveSharedAndExclusive() {
-        assertEquals(2, PageLatchMode.values().length);
+    void pageLatchModeShouldHaveSharedSharedExclusiveAndExclusive() {
+        // 0.13d 引入 SHARED_EXCLUSIVE（SIX），page latch 模式由 2 个增至 3 个。
+        assertEquals(3, PageLatchMode.values().length);
         assertEquals(PageLatchMode.SHARED, PageLatchMode.valueOf("SHARED"));
+        assertEquals(PageLatchMode.SHARED_EXCLUSIVE, PageLatchMode.valueOf("SHARED_EXCLUSIVE"));
         assertEquals(PageLatchMode.EXCLUSIVE, PageLatchMode.valueOf("EXCLUSIVE"));
     }
 }

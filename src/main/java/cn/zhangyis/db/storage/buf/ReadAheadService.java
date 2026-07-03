@@ -29,8 +29,8 @@ import java.util.concurrent.locks.ReentrantLock;
  * 不在前台线程做盘 IO，且**绝不抛异常**（random 检测的任何异常被吞掉、丢弃本次预取）。停止后 {@code recordAccess} 静默忽略。
  *
  * <p><b>并发边界</b>：单 {@code lock} 保护 tracker / detector / 队列 / 状态；{@code recordAccess} 持该 lock 时调
- * {@code residentCountInRange}（取 poolLock），与 worker {@code prefetch}（取 poolLock，不持本 lock）、{@code getPage}
- * （先放 poolLock 再 recordAccess）一致为 service.lock→poolLock 单向，无反向、无环。无 {@code synchronized}，所有等待带
+ * {@code residentCountInRange}（短持 pageHashLock），与 worker {@code prefetch}（进 BufferPool 内部锁、不持本 lock）、{@code getPage}
+ * （先放 BufferPool 内部锁再 recordAccess）一致为 service.lock→BufferPool 单向，无反向、无环。无 {@code synchronized}，所有等待带
  * 条件/超时；停止 join 有超时。
  */
 public final class ReadAheadService implements ReadAheadHook, AutoCloseable {
@@ -142,7 +142,7 @@ public final class ReadAheadService implements ReadAheadHook, AutoCloseable {
     /**
      * random read-ahead 调度（§8.3，默认禁用时为 no-op）。调用方须持 {@code lock}。
      *
-     * <p>数据流：查被访问页所在 extent 的驻留页数（{@code residentCountInRange} 取 poolLock，service.lock→poolLock 单向）
+     * <p>数据流：查被访问页所在 extent 的驻留页数（{@code residentCountInRange} 短持 pageHashLock，service.lock→BufferPool 单向）
      * 喂 {@link RandomReadAheadDetector}；命中且队未满则入队补取整 extent（{@code prefetch} 自身跳过已驻留页）。
      *
      * <p><b>最佳努力</b>：resident count 或 detector 的任何 {@link RuntimeException} 都被吞掉、只丢弃本次 random 预取，

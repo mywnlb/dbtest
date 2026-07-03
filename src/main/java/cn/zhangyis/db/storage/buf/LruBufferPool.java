@@ -19,12 +19,12 @@ import java.util.concurrent.atomic.AtomicReference;
  * 单页操作（get/new/prefetch/flush/snapshot）直接转发到归属分片；跨切面查询（dirty 候选 / oldest LSN / hasDirty /
  * residentCount / 截断）逐分片调用本地方法再在锁外合并。
  *
- * <p><b>分片（§5.2，本片单 instance 锁）</b>：默认 {@code instanceCount=1}，行为与原单实例池字节级等价（路由恒 0）。
- * 总容量按 {@code base=cap/N + 前 r 个各 +1} 切分到各分片（要求 {@code capacity≥instanceCount}）。每分片自有一把
- * {@code instanceLock}（不拆 §13.1 子锁）；分片间无 work stealing——某分片满即抛 {@link BufferPoolExhaustedException}，
+ * <p><b>分片（§5.2）</b>：默认 {@code instanceCount=1}，行为与原单实例池字节级等价（路由恒 0）。
+ * 总容量按 {@code base=cap/N + 前 r 个各 +1} 切分到各分片（要求 {@code capacity≥instanceCount}）。每分片自有
+ * pageHashLock/frameMutex 与一个 list/meta 兼容锁（free/LRU/flush list 真拆留 §13.1d）；分片间无 work stealing——某分片满即抛 {@link BufferPoolExhaustedException}，
  * 即便他分片有空闲帧（与 InnoDB 一致）。
  *
- * <p><b>并发不变量</b>：facade 的跨切面操作<b>一次只持一把 instance 锁</b>（锁单分片取快照→解锁→下一分片→锁外合并），
+ * <p><b>并发不变量</b>：facade 的跨切面操作<b>一次只进入一个 instance</b>（单分片取快照→解锁→下一分片→锁外合并），
  * 绝不同时持两把 → 无分片间锁序、无死锁。read-ahead 钩子在 {@link #getPage} 路由+取页之后调用（钩子是 pool 级、非分片级）。
  *
  * <p>同时提供 {@code attachVictimFlusher}/{@code attachReadAheadHook}（set-once）：victim flusher 传播给每个分片
@@ -39,6 +39,11 @@ public final class LruBufferPool implements BufferPool {
     private final BufferPoolInstance[] instances;
     /** PageId→分片下标路由器；与 {@link #instances} 长度一致。 */
     private final BufferPoolRouter router;
+    /**
+     * Buffer Pool 内部的表空间生命周期时钟。truncate/drop/discard invalidate 期间用它阻止绕过 MTR lease 的直接
+     * page admission，并给 frame 打版本戳，避免旧代际 frame 在维护后重新可见。
+     */
+    private final SpaceLifecycleClock lifecycleClock;
 
     /**
      * 淘汰脏页的 WAL 安全刷盘端口（facade 级 set-once）。bootstrap 注入后传播给每个分片；CAS 防运行期被换。
@@ -61,7 +66,9 @@ public final class LruBufferPool implements BufferPool {
      * 生产由 {@code StorageEngine} 经 {@code EngineConfig.bufferPoolInstanceCount()} 构造（默认 1）。
      */
     public LruBufferPool(PageStore pageStore, PageSize pageSize, int capacity, int instanceCount) {
-        this.instances = buildInstances(pageStore, pageSize, capacity, instanceCount, DEFAULT_LOAD_TIMEOUT);
+        this.lifecycleClock = new SpaceLifecycleClock();
+        this.instances = buildInstances(pageStore, pageSize, capacity, instanceCount,
+                DEFAULT_LOAD_TIMEOUT, lifecycleClock);
         this.router = new BufferPoolRouter(instanceCount);
     }
 
@@ -73,14 +80,16 @@ public final class LruBufferPool implements BufferPool {
     /** 单实例池 + 注入替换策略 + load 超时（测试注入短超时验证 LOADING 等待有界）。 */
     LruBufferPool(PageStore pageStore, PageSize pageSize, int capacity, ReplacementPolicy policy,
                   Duration loadTimeout) {
+        this.lifecycleClock = new SpaceLifecycleClock();
         this.instances = new BufferPoolInstance[]{
-                new BufferPoolInstance(pageStore, pageSize, capacity, policy, loadTimeout)};
+                new BufferPoolInstance(pageStore, pageSize, capacity, policy, loadTimeout, lifecycleClock)};
         this.router = new BufferPoolRouter(1);
     }
 
     /** 容量切分：base=cap/N、前 r 个分片各 +1；要求 capacity≥instanceCount（每分片至少 1 帧）。 */
     private static BufferPoolInstance[] buildInstances(PageStore pageStore, PageSize pageSize, int capacity,
-                                                       int instanceCount, Duration loadTimeout) {
+                                                       int instanceCount, Duration loadTimeout,
+                                                       SpaceLifecycleClock lifecycleClock) {
         if (instanceCount < 1) {
             throw new DatabaseValidationException("buffer pool instance count must be >= 1: " + instanceCount);
         }
@@ -95,7 +104,7 @@ public final class LruBufferPool implements BufferPool {
             int shardCapacity = base + (i < remainder ? 1 : 0);
             // 每分片独立 midpoint 策略对象（策略持 per-instance LRU 状态，不能跨分片共享）。
             arr[i] = new BufferPoolInstance(pageStore, pageSize, shardCapacity,
-                    new MidpointLruReplacementPolicy(System::currentTimeMillis), loadTimeout);
+                    new MidpointLruReplacementPolicy(System::currentTimeMillis), loadTimeout, lifecycleClock);
         }
         return arr;
     }
@@ -246,13 +255,27 @@ public final class LruBufferPool implements BufferPool {
             throw new DatabaseValidationException("invalidate tablespace timeout is too large", overflow);
         }
         long deadlineNanos = System.nanoTime() + timeoutNanos;
-        // 阶段 1：全部分片 drain+check 通过（任一失败抛出，未移除任何帧 → 不会出现部分失效）。
-        for (BufferPoolInstance instance : instances) {
-            instance.awaitDrainedAndCheckClean(spaceId, deadlineNanos);
-        }
-        // 阶段 2：全部分片移除该空间帧。
-        for (BufferPoolInstance instance : instances) {
-            instance.removeTablespaceFrames(spaceId);
+        lifecycleClock.beginInvalidation(spaceId);
+        boolean advanced = false;
+        try {
+            // 阶段 1：维护窗口已打开，新 admission 被拒绝；全部分片 drain+check 通过前不推进版本。
+            for (BufferPoolInstance instance : instances) {
+                instance.awaitDrainedAndCheckClean(spaceId, deadlineNanos);
+            }
+            lifecycleClock.advanceInvalidation(spaceId);
+            advanced = true;
+            // 阶段 2：版本已推进但 admission 仍关闭，移除旧代际 frame 后才重新开放。
+            for (BufferPoolInstance instance : instances) {
+                instance.removeTablespaceFrames(spaceId);
+            }
+            lifecycleClock.finishInvalidation(spaceId);
+        } catch (RuntimeException failure) {
+            if (advanced) {
+                lifecycleClock.finishInvalidation(spaceId);
+            } else {
+                lifecycleClock.abortInvalidation(spaceId);
+            }
+            throw failure;
         }
     }
 

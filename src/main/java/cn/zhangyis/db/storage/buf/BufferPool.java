@@ -12,7 +12,8 @@ import cn.zhangyis.db.domain.SpaceId;
  * Buffer Pool 门面：在 fil.io.PageStore 之上提供受控页访问（fix + S/X page latch + LRU 淘汰 + 脏页写回）。
  * 消费方（未来 fsp）经它拿受控页，不直接接触 PageStore 或文件。
  *
- * <p>简化点：不带 MTR；flush 不做 WAL 门控 / doublewrite；miss/evict/flush 的盘 IO 在内部 poolLock 串行。
+ * <p>简化点：BufferPool 自身的 legacy flush 不做 WAL 门控 / doublewrite；生产 WAL-safe 写盘由 flush 模块
+ * 通过 snapshot/complete 协议负责。miss 读盘、脏 victim flush 与 legacy flush 写盘均不得跨 Buffer Pool 内部锁进入 PageStore。
  */
 public interface BufferPool extends AutoCloseable {
 
@@ -114,7 +115,7 @@ public interface BufferPool extends AutoCloseable {
     /**
      * 统计某连续页区间 {@code [firstPageNo, firstPageNo+pageCount)} 内当前已驻留的页数（含正在载入的占位页）。
      * 供 random read-ahead（§8.3）判定「同一 extent 已有足够多页驻留」：调用方传入页所在 extent 的起始页 + extent
-     * 页数，命中阈值则补取整 extent。实现在 poolLock 内对区间逐页查 {@code residentMap}（O(pageCount) 次查找，
+     * 页数，命中阈值则补取整 extent。实现在 page hash 短锁内对区间逐页查 {@code PageHashTable}（O(pageCount) 次查找，
      * 与池大小无关），故 random 启用时每次访问引入一次 O(extent) 开销；random 默认禁用时调用方不会调用本方法。
      *
      * @param spaceId     目标表空间。

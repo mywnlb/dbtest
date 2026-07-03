@@ -1,7 +1,7 @@
 package cn.zhangyis.db.storage.buf;
 
 /**
- * Buffer Pool 页面替换策略（Strategy）。所有方法由 BufferPool 在 poolLock 下调用，实现无需自身线程安全。
+ * Buffer Pool 页面替换策略（Strategy）。所有方法由 BufferPool 在 list/meta 兼容锁下调用，实现无需自身线程安全。
  */
 interface ReplacementPolicy {
 

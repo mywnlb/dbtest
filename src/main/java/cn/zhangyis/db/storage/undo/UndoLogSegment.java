@@ -148,15 +148,19 @@ public final class UndoLogSegment {
         if (need > freshCapacity) {
             throw overflow;
         }
-        PageId newId = allocator.allocatePage(mtr, handle.spaceId(), handle.inodeSlot(), handle.segmentId());
-        UndoPage newPage = pageAccess.createChainPage(mtr, newId, handle);
-        current.linkNextTo(newId.pageNo());
-        newPage.linkPrevTo(current.pageId().pageNo());
-        firstPage.setLastPageNo(newId.pageNo());
-        handle = handle.withLastPage(newId);
-        heldPages.put(newId.pageNo().value(), newPage);
-        current = newPage;
-        return current.appendRecord(payload, undoNo);
+        // 0.14b：grow 是真实多页消费者。预留必须晚于单条容量 preflight、早于任何分配/格式化/FIL 链接/first header 修改；
+        // 否则 ENOSPC 发生在中途时，MTR 无 content undo，无法撤回半生长的 undo 页链。
+        try (UndoSpaceReservation ignored = allocator.reserveGrowPages(mtr, handle.spaceId(), 1L)) {
+            PageId newId = allocator.allocatePage(mtr, handle.spaceId(), handle.inodeSlot(), handle.segmentId());
+            UndoPage newPage = pageAccess.createChainPage(mtr, newId, handle);
+            current.linkNextTo(newId.pageNo());
+            newPage.linkPrevTo(current.pageId().pageNo());
+            firstPage.setLastPageNo(newId.pageNo());
+            handle = handle.withLastPage(newId);
+            heldPages.put(newId.pageNo().value(), newPage);
+            current = newPage;
+            return current.appendRecord(payload, undoNo);
+        }
     }
 
     /**

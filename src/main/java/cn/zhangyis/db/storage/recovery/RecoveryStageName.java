@@ -20,6 +20,10 @@ public enum RecoveryStageName {
      * 若 reconcile 抢先按旧大尺寸读 page0，会把刚截断的文件重新撑大、甚至磁盘不足阻断截断。
      */
     SPACE_FILE_RECONCILE,
+    /** 回滚 crash 前未提交的 recovered ACTIVE undo 段；当前实现依赖显式单聚簇索引，未接 DD/多索引。 */
+    UNDO_ROLLBACK,
+    /** 从 recovered COMMITTED undo header 重建 history list 和事务提交序水位，供启动后的 purge driver 续作。 */
+    RESUME_PURGE,
     /** R2 必需阶段成功后开放普通用户流量。 */
     OPEN_TRAFFIC
 }

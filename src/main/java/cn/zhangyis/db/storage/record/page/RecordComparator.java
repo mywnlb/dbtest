@@ -9,6 +9,7 @@ import cn.zhangyis.db.storage.record.schema.TableSchema;
 import cn.zhangyis.db.storage.record.type.ColumnValue;
 import cn.zhangyis.db.storage.record.type.FieldSlice;
 import cn.zhangyis.db.storage.record.type.FieldWriter;
+import cn.zhangyis.db.storage.record.type.KeyPrefix;
 import cn.zhangyis.db.storage.record.type.TypeCodec;
 import cn.zhangyis.db.storage.record.type.TypeCodecRegistry;
 import cn.zhangyis.db.storage.record.format.RecordType;
@@ -20,7 +21,7 @@ import cn.zhangyis.db.storage.record.format.RecordType;
  * <p>规则：复合 key 按 part 顺序逐列比；ASC 中 NULL &lt; 非 NULL，DESC 反转；infimum/supremum 系统记录作哨兵
  * （恒小于/大于任何 key），不读其字段。key 短于 key part 数时按前缀比，前缀全相等返回 0。无状态、线程安全。
  *
- * <p>简化：暂不处理 prefix index（KeyPartDef.prefixBytes&gt;0），按整列比较（注释标注，后续片补）。
+ * <p>前缀索引（{@code KeyPartDef.prefixBytes>0}）经 {@link KeyPrefix} 只比列的前 N 字节（字节类型专用，见其文档）。
  */
 public final class RecordComparator {
 
@@ -63,8 +64,9 @@ public final class RecordComparator {
                 return desc ? -c : c;
             }
             TypeCodec codec = registry.codecFor(ct);
-            FieldSlice recordSlice = record.columnSlice(part.columnId());
-            FieldSlice keySlice = encodeKey(key.value(i), ct, codec);
+            // 前缀索引（prefixBytes>0）只比列的前 N 字节：对 record 侧列切片与 key 侧编码切片同截再比。
+            FieldSlice recordSlice = KeyPrefix.apply(record.columnSlice(part.columnId()), ct, part.prefixBytes());
+            FieldSlice keySlice = KeyPrefix.apply(encodeKey(key.value(i), ct, codec), ct, part.prefixBytes());
             int c = codec.compare(recordSlice, keySlice, ct);
             if (c != 0) {
                 return desc ? -c : c;

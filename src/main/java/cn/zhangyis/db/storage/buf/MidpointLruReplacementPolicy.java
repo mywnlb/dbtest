@@ -21,7 +21,7 @@ import java.util.function.LongSupplier;
  * <p><b>淘汰序约定</b>：{@link #victimOrder()} 迭代序 = 淘汰优先序（最易淘汰在前）= old 子链整体先于 new 子链，
  * 每条子链内部 front 最易淘汰、back 最近访问（least evictable）。
  *
- * <p><b>并发归属</b>：所有方法由 BufferPool 在 poolLock 下调用，实现自身无需线程安全（与 {@link ReplacementPolicy} 约定一致）。
+ * <p><b>并发归属</b>：所有方法由 BufferPool 在 list/meta 兼容锁下调用，实现自身无需线程安全（与 {@link ReplacementPolicy} 约定一致）。
  *
  * <p><b>简化点</b>：① 提升窗用注入的毫秒时钟近似 InnoDB 的 freed_page_clock（访问计数），墙钟回拨只影响提升时机、
  * 不破坏正确性；② 暂不强制 old/new 的 {@code oldBlocksPct} 容量配比再平衡（new 不会无界膨胀至挤空 old 由上层容量与
@@ -108,7 +108,7 @@ final class MidpointLruReplacementPolicy implements ReplacementPolicy {
 
     @Override
     public Iterable<BufferFrame> victimOrder() {
-        // 快照拼接 old→new；调用方在 poolLock 下遍历、命中首个未 fix 即 break，快照避免迭代期结构改动风险。
+        // 快照拼接 old→new；调用方在 list/meta 兼容锁下遍历、逐帧加 frameMutex 校验，快照避免迭代期结构改动风险。
         List<BufferFrame> order = new ArrayList<>(oldList.size() + newList.size());
         order.addAll(oldList);
         order.addAll(newList);

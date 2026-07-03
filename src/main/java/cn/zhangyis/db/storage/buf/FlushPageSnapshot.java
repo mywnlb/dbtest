@@ -8,7 +8,7 @@ import java.util.Arrays;
 
 /**
  * Flush 期间写 doublewrite 和 data file 的稳定页镜像。创建 snapshot 后，Flush 模块只操作该副本，
- * 不跨 redo wait、doublewrite fsync 或 data file IO 持有 Buffer Pool 的 poolLock/page latch。
+ * 不跨 redo wait、doublewrite fsync 或 data file IO 持有 Buffer Pool 内部锁/page latch。
  *
  * @param pageId 页定位键。
  * @param pageLsn snapshot 时页头中的 pageLSN。

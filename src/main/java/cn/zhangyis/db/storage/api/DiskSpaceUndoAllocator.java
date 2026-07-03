@@ -5,9 +5,12 @@ import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.SegmentId;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.fsp.segment.SegmentPurpose;
+import cn.zhangyis.db.storage.fsp.reservation.SpaceReservation;
+import cn.zhangyis.db.storage.fsp.reservation.SpaceReservationKind;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.undo.UndoSegmentHandle;
 import cn.zhangyis.db.storage.undo.UndoSpaceAllocator;
+import cn.zhangyis.db.storage.undo.UndoSpaceReservation;
 
 /**
  * {@link UndoSpaceAllocator} 的磁盘空间适配器。它位于 storage.api 层，负责把 undo 自有定位信息转换为
@@ -39,6 +42,17 @@ public final class DiskSpaceUndoAllocator implements UndoSpaceAllocator {
         SegmentRef ref = diskSpaceManager.createSegment(mtr, undoSpace, SegmentPurpose.UNDO);
         PageId first = diskSpaceManager.allocatePage(mtr, ref);
         return new UndoSegmentHandle(undoSpace, ref.inodeSlot(), ref.segmentId(), first, first);
+    }
+
+    /**
+     * 为 undo 页链增长预留容量。适配器把 undo 自有端口映射为 DiskSpaceManager 的 UNDO reservation，
+     * 使真正的 {@link #allocatePage} 在同一 MTR 中消费页额度；返回值只暴露 undo 端口，避免 undo 模块依赖 api/fsp 类型。
+     */
+    @Override
+    public UndoSpaceReservation reserveGrowPages(MiniTransaction mtr, SpaceId undoSpace, long pages) {
+        SpaceReservation reservation = diskSpaceManager.reserveSpace(mtr, undoSpace, SpaceReservationKind.UNDO,
+                pages, 0L);
+        return reservation::close;
     }
 
     /**

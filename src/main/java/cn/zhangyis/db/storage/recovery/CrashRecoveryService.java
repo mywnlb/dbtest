@@ -91,6 +91,19 @@ public final class CrashRecoveryService {
                     stages.add(RecoveryStageName.SPACE_FILE_RECONCILE);
                 }
 
+                if (request.transactionUndoRecovery() != null) {
+                    TransactionUndoRecoveryResult undoResult =
+                            request.transactionUndoRecovery().recoverAfterRedo(reader.recoveredToLsn());
+                    if (undoResult == null) {
+                        throw new DatabaseValidationException("transaction undo recovery result must not be null");
+                    }
+                    stages.add(RecoveryStageName.UNDO_ROLLBACK);
+                    stages.add(RecoveryStageName.RESUME_PURGE);
+                    if (request.recoveredRedoManager() != null) {
+                        request.recoveredRedoManager().flush();
+                    }
+                }
+
                 // durability 屏障：开放流量前 force 全部恢复写。replay/repair/reconcile 都绕过 Buffer Pool dirty 跟踪、
                 // 自身不 fsync；若不在此落盘，一旦后续 checkpoint 越过 recoveredToLsn 并回收 redo，再次崩溃将既无 redo
                 // 也无 durable 页，丢失恢复结果。force 后任何越过 recoveredToLsn 的 checkpoint 都是安全的。

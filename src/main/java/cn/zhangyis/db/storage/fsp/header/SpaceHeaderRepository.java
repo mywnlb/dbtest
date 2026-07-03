@@ -96,6 +96,21 @@ public final class SpaceHeaderRepository {
     }
 
     /**
+     * 以 page0 X latch 读取 header。该入口供“读容量后可能立即改容量”的路径使用，例如空间预留服务：
+     * 先拿 X latch 可以避免同一 MTR 内先 S 后 X 的升级禁令，同时把容量判断和 currentSize 推进放在同一物理临界区。
+     *
+     * @param mtr 当前活动 MTR。
+     * @param spaceId 目标表空间。
+     * @return page0 header 快照。
+     */
+    public SpaceHeaderSnapshot readForUpdate(MiniTransaction mtr, SpaceId spaceId) {
+        requireMtr(mtr);
+        requireSpace(spaceId);
+        mtr.getPage(pool, page0(spaceId), PageLatchMode.EXCLUSIVE);
+        return read(mtr, spaceId);
+    }
+
+    /**
      * 在同一 page-0 X latch 下写完整生命周期头。调用方应把状态转换与相关 FSP 修改放进同一 MTR，
      * 使 redo replay 不会观察到半个 marker。该方法不使用枚举 ordinal，磁盘兼容性由稳定状态码保证。
      *

@@ -25,6 +25,17 @@ public interface UndoSpaceAllocator {
     UndoSegmentHandle createUndoSegment(MiniTransaction mtr, SpaceId undoSpace);
 
     /**
+     * 为既有 undo segment 的页链增长预留若干页容量。调用方必须在任何页链修改前调用该方法，并在 grow 成功、
+     * 失败或 MTR 结束时关闭返回 guard；底层实现可把该请求映射为 UNDO 类型的表空间 reservation。
+     *
+     * @param mtr 当前物理短事务。
+     * @param undoSpace undo 表空间。
+     * @param pages 本次 grow 最多会创建的 undo 页数。
+     * @return undo 模块自有的预留 guard。
+     */
+    UndoSpaceReservation reserveGrowPages(MiniTransaction mtr, SpaceId undoSpace, long pages);
+
+    /**
      * 在既有 undo segment 内续分配一页，供 append 溢出生长页链使用。方法不格式化页、不写 FIL 链；
      * 调用方必须先完成单条记录容量 preflight，避免 MTR 无 content undo 时留下半生长脏链。
      *

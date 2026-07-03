@@ -11,8 +11,10 @@ the operation has already created some pages.
 - Add a storage-internal `SpaceReservationService` owned by `DiskSpaceManager`.
 - Expose `DiskSpaceManager.reserveSpace(mtr, spaceId, kind, pages, extents)` returning `SpaceReservation`.
 - Reservation kinds are `NORMAL`, `UNDO`, `CLEANING`, and `BLOB`, matching the disk-manager design.
-- The first implementation is in-memory and per-process; it pre-extends the physical file and page0 `currentSize`
-  before page allocation, then tracks active quota under an explicit `ReentrantLock`.
+- The implementation is in-memory and per-process; it pre-extends the physical file and page0 `currentSize`
+  before page allocation, tracks capacity counters under an explicit `ReentrantLock`, and consumes per-MTR page
+  quota through atomic fields on `SpaceReservation` so B+Tree split does not wait on the global counter lock while
+  holding index page latches.
 - `allocatePage` remains source-compatible for existing callers. If an active reservation exists for the same
   MTR and space, it must consume one reserved page; if quota is exhausted, allocation fails with a reservation
   domain exception.

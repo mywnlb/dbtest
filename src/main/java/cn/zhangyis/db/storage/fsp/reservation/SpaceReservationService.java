@@ -12,11 +12,11 @@ import cn.zhangyis.db.storage.fsp.header.SpaceHeaderRepository;
 import cn.zhangyis.db.storage.fsp.header.SpaceHeaderSnapshot;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 
-import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -27,9 +27,10 @@ import java.util.concurrent.locks.ReentrantLock;
  * reservation 的时刻，page0 currentSize 和物理文件已经足以材料化所需完整 extent。真正的页/extent 归属仍由
  * {@code SegmentPageAllocator} 按 FSP 元数据决定。
  *
- * <p>并发边界：{@link #lock} 保护全部 reservation 账本；它只在 reserve/consume/release 的短路径内持有。
- * reserve 会在该锁内读取并可能更新 page0 currentSize，从而保证“检查容量 → 发布 reservation”不可被其它
- * reservation 穿插。该锁不回调 Buffer Pool 以外的上层模块，也不参与事务锁等待。
+ * <p>并发边界：{@link #lock} 只保护按表空间聚合的容量承诺计数。它不得包住任何可能进入 Buffer Pool 或等待
+ * page latch 的调用；否则 B+Tree split 线程可能一边持 index page latch 等 reservation lock，另一边持
+ * reservation lock 等 page0 latch，形成物理 latch 死锁。活动 reservation 索引用并发集合维护，allocatePage
+ * 消费页额度只修改当前 MTR 的 reservation 原子字段，不等待全局账本锁。
  */
 public final class SpaceReservationService {
 
@@ -45,14 +46,14 @@ public final class SpaceReservationService {
     /** FLST 原语；用于读取全局 FSP_FREE 链长度，估算可承诺的完整 extent。 */
     private final Flst flst;
 
-    /** reservation 账本锁。不得在持有该锁时进入事务锁等待或执行上层 SQL/session 回调。 */
+    /** 容量承诺账本锁。不得在持有该锁时进入 Buffer Pool、page latch、事务锁等待或上层 SQL/session 回调。 */
     private final ReentrantLock lock = new ReentrantLock();
 
     /** 按表空间聚合的容量账本。 */
     private final Map<SpaceId, ReservationCounter> countersBySpace = new HashMap<>();
 
-    /** 按 MTR id 索引的活动 reservation，allocatePage 消费时据此找到当前操作的页额度。 */
-    private final Map<Long, List<SpaceReservation>> reservationsByMtr = new HashMap<>();
+    /** 按 MTR id 索引的活动 reservation；consume 路径无全局锁读取，避免持 data page latch 时阻塞在账本锁。 */
+    private final Map<Long, CopyOnWriteArrayList<SpaceReservation>> reservationsByMtr = new ConcurrentHashMap<>();
 
     public SpaceReservationService(PageStore pageStore, PageSize pageSize,
                                    SpaceHeaderRepository headerRepo, Flst flst) {
@@ -66,8 +67,13 @@ public final class SpaceReservationService {
     }
 
     /**
-     * 创建一次表空间预留。数据流为：校验调用方预算 → 读取 page0 容量快照 → 计算已可材料化 extent 与已承诺 extent
-     * 的差额 → 如不足先扩物理文件并推进 page0 currentSize → 把 reservation 登记到内存账本。
+     * 创建一次表空间预留。数据流为：校验调用方预算 → 在不持账本锁的情况下读取 page0/FLST 容量快照 → 读取
+     * 内存承诺计数 → 如不足先扩物理文件并推进 page0 currentSize → 最后用账本锁发布 reservation。
+     *
+     * <p>这里刻意不用账本锁包住 page0/FLST 访问。B+Tree split 可能在持 index page latch 时消费 reservation；
+     * 若并发 reserve 线程持账本锁再等待 page0，而 split 线程持 page latch 再等待账本锁，会形成物理 latch 环。
+     * 同一表空间的 reserve 之间由 page0 X latch 串行；release 只会降低已承诺容量，因此用稍旧的 committed 计数最多
+     * 导致保守扩容，不会承诺不足。
      *
      * @param mtr 当前活动 MTR；reservation 会按 mtr id 绑定，供后续 allocatePage 消费。
      * @param spaceId 目标表空间。
@@ -80,21 +86,24 @@ public final class SpaceReservationService {
                                     long pages, long extents) {
         requireReservationArgs(mtr, spaceId, kind, pages, extents);
         long capacityExtents = capacityExtents(pages, extents);
+        SpaceHeaderSnapshot header = headerRepo.readForUpdate(mtr, spaceId);
+        long freeExtents = flst.length(mtr, spaceId, headerRepo.freeExtentListBaseAddr(spaceId));
+        long reservedCapacityExtents = reservedCapacityExtents(spaceId);
+        long currentSize = header.currentSizeInPages().value();
+        long targetSize = targetSizeForCapacity(spaceId, header, capacityExtents,
+                freeExtents, reservedCapacityExtents);
+        if (targetSize > currentSize) {
+            PageNo target = PageNo.of(targetSize);
+            pageStore.ensureCapacity(spaceId, target);
+            headerRepo.setCurrentSizeInPages(mtr, spaceId, target);
+        }
+        SpaceReservation reservation = new SpaceReservation(this, mtr.id(), spaceId, kind,
+                pages, extents, capacityExtents);
         lock.lock();
         try {
-            SpaceHeaderSnapshot header = headerRepo.readForUpdate(mtr, spaceId);
-            long currentSize = header.currentSizeInPages().value();
-            long targetSize = targetSizeForCapacity(mtr, spaceId, header, capacityExtents);
-            if (targetSize > currentSize) {
-                PageNo target = PageNo.of(targetSize);
-                pageStore.ensureCapacity(spaceId, target);
-                headerRepo.setCurrentSizeInPages(mtr, spaceId, target);
-            }
-            SpaceReservation reservation = new SpaceReservation(this, mtr.id(), spaceId, kind,
-                    pages, extents, capacityExtents);
             countersBySpace.computeIfAbsent(spaceId, ignored -> new ReservationCounter())
                     .reserve(capacityExtents);
-            reservationsByMtr.computeIfAbsent(mtr.id(), ignored -> new ArrayList<>()).add(reservation);
+            reservationsByMtr.computeIfAbsent(mtr.id(), ignored -> new CopyOnWriteArrayList<>()).add(reservation);
             return reservation;
         } finally {
             lock.unlock();
@@ -112,28 +121,23 @@ public final class SpaceReservationService {
         if (mtr == null || spaceId == null) {
             throw new DatabaseValidationException("reservation consume mtr/space id must not be null");
         }
-        lock.lock();
-        try {
-            List<SpaceReservation> reservations = reservationsByMtr.get(mtr.id());
-            if (reservations == null) {
+        List<SpaceReservation> reservations = reservationsByMtr.get(mtr.id());
+        if (reservations == null) {
+            return;
+        }
+        boolean exhaustedForSpace = false;
+        for (SpaceReservation reservation : reservations) {
+            SpaceReservation.ConsumeResult result = reservation.consumePageQuota(spaceId);
+            if (result == SpaceReservation.ConsumeResult.CONSUMED) {
                 return;
             }
-            boolean activeForSpace = false;
-            for (SpaceReservation reservation : reservations) {
-                if (!reservation.closed && reservation.spaceId.equals(spaceId)) {
-                    activeForSpace = true;
-                    if (reservation.remainingPages > 0) {
-                        reservation.remainingPages--;
-                        return;
-                    }
-                }
+            if (result == SpaceReservation.ConsumeResult.EXHAUSTED) {
+                exhaustedForSpace = true;
             }
-            if (activeForSpace) {
-                throw new SpaceReservationExceededException("space reservation page quota exhausted: mtr="
-                        + mtr.id() + " space=" + spaceId.value());
-            }
-        } finally {
-            lock.unlock();
+        }
+        if (exhaustedForSpace) {
+            throw new SpaceReservationExceededException("space reservation page quota exhausted: mtr="
+                    + mtr.id() + " space=" + spaceId.value());
         }
     }
 
@@ -146,12 +150,11 @@ public final class SpaceReservationService {
         if (reservation == null) {
             throw new DatabaseValidationException("space reservation must not be null");
         }
+        if (!reservation.markClosed()) {
+            return;
+        }
         lock.lock();
         try {
-            if (reservation.closed) {
-                return;
-            }
-            reservation.closed = true;
             ReservationCounter counter = countersBySpace.get(reservation.spaceId);
             if (counter != null) {
                 counter.release(reservation.reservedCapacityExtents);
@@ -159,14 +162,9 @@ public final class SpaceReservationService {
                     countersBySpace.remove(reservation.spaceId);
                 }
             }
-            List<SpaceReservation> reservations = reservationsByMtr.get(reservation.mtrId);
+            CopyOnWriteArrayList<SpaceReservation> reservations = reservationsByMtr.get(reservation.mtrId);
             if (reservations != null) {
-                for (Iterator<SpaceReservation> it = reservations.iterator(); it.hasNext(); ) {
-                    if (it.next() == reservation) {
-                        it.remove();
-                        break;
-                    }
-                }
+                reservations.remove(reservation);
                 if (reservations.isEmpty()) {
                     reservationsByMtr.remove(reservation.mtrId);
                 }
@@ -176,18 +174,25 @@ public final class SpaceReservationService {
         }
     }
 
-    private long targetSizeForCapacity(MiniTransaction mtr, SpaceId spaceId,
-                                       SpaceHeaderSnapshot header, long neededCapacityExtents) {
+    private long reservedCapacityExtents(SpaceId spaceId) {
+        lock.lock();
+        try {
+            ReservationCounter counter = countersBySpace.get(spaceId);
+            return counter == null ? 0L : counter.reservedCapacityExtents;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private long targetSizeForCapacity(SpaceId spaceId, SpaceHeaderSnapshot header, long neededCapacityExtents,
+                                       long freeExtents, long reservedCapacityExtents) {
         long currentSize = header.currentSizeInPages().value();
         long freeLimit = header.freeLimitPageNo().value();
         if (freeLimit > currentSize) {
             throw new FspMetadataException("freeLimit exceeds current size: freeLimit="
                     + freeLimit + " currentSize=" + currentSize + " space=" + spaceId.value());
         }
-        long freeExtents = flst.length(mtr, spaceId, headerRepo.freeExtentListBaseAddr(spaceId));
-        ReservationCounter counter = countersBySpace.get(spaceId);
-        long reserved = counter == null ? 0L : counter.reservedCapacityExtents;
-        long available = freeExtents - reserved;
+        long available = freeExtents - reservedCapacityExtents;
         long targetSize = currentSize;
         long probeFreeLimit = freeLimit;
         long pagesPerExtent = pageSize.pagesPerExtent();

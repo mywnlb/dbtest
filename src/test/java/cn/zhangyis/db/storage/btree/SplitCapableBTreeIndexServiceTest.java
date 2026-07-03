@@ -45,6 +45,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -542,15 +543,12 @@ class SplitCapableBTreeIndexServiceTest {
             AtomicReference<Throwable> failure = new AtomicReference<>();
             Thread a = new Thread(() -> insertRangeCommitting(ctx, service, snapshot, 100, 119, failure), "btree-a");
             Thread b = new Thread(() -> insertRangeCommitting(ctx, service, snapshot, 200, 219, failure), "btree-b");
+            a.setDaemon(true);
+            b.setDaemon(true);
             a.start();
             b.start();
-            try {
-                a.join();
-                b.join();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new AssertionError("interrupted while joining insert threads", e);
-            }
+            joinWorkerOrFail(a, Duration.ofSeconds(10));
+            joinWorkerOrFail(b, Duration.ofSeconds(10));
             if (failure.get() != null) {
                 throw new AssertionError("concurrent insert threw", failure.get());
             }
@@ -572,6 +570,17 @@ class SplitCapableBTreeIndexServiceTest {
             ctx.mgr.commit(read);
             assertEquals(expected, ids);
         });
+    }
+
+    /** 并发 split 回归测试必须在有限时间内失败；否则真实死锁会把 Gradle worker 永久挂住。 */
+    private static void joinWorkerOrFail(Thread thread, Duration timeout) {
+        try {
+            thread.join(timeout.toMillis());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError("interrupted while joining " + thread.getName(), e);
+        }
+        assertFalse(thread.isAlive(), thread.getName() + " did not finish within " + timeout);
     }
 
     /** 并发工作线程：逐 key 独立 MTR 插入，失败记录首个异常并回滚当前 MTR。 */

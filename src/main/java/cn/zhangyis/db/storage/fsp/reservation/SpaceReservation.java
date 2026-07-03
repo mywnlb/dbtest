@@ -2,6 +2,9 @@ package cn.zhangyis.db.storage.fsp.reservation;
 
 import cn.zhangyis.db.domain.SpaceId;
 
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+
 /**
  * 表空间预留句柄。它是一次多页操作的 RAII guard：创建时占住内存态预留额度，操作成功、失败或 MTR 结束时
  * {@link #close()} 释放未消费额度。
@@ -11,7 +14,7 @@ import cn.zhangyis.db.domain.SpaceId;
  */
 public final class SpaceReservation implements AutoCloseable {
 
-    /** 归属服务；所有可变状态都在服务锁下读写。 */
+    /** 归属服务；容量账本仍由服务锁保护，页额度消费只改本对象原子字段。 */
     private final SpaceReservationService owner;
 
     /** 创建该 reservation 的 MTR id，用于 allocatePage 消费时定位当前操作上下文。 */
@@ -32,11 +35,11 @@ public final class SpaceReservation implements AutoCloseable {
     /** 本 reservation 在全局容量账本中占用的完整 extent 数，直到 close 才整体释放。 */
     final long reservedCapacityExtents;
 
-    /** 尚未被 allocatePage 消费的数据页额度；只允许 owner 在服务锁下修改。 */
-    long remainingPages;
+    /** 尚未被 allocatePage 消费的数据页额度；allocate 路径可能持有 B+Tree page latch，不能等待全局账本锁。 */
+    private final AtomicLong remainingPages;
 
-    /** 是否已释放；只允许 owner 在服务锁下修改。 */
-    boolean closed;
+    /** 是否已释放；try-with-resources 与 MTR memo 兜底释放会并存，必须幂等。 */
+    private final AtomicBoolean closed = new AtomicBoolean();
 
     SpaceReservation(SpaceReservationService owner, long mtrId, SpaceId spaceId, SpaceReservationKind kind,
                      long requestedPages, long requestedExtents, long reservedCapacityExtents) {
@@ -47,7 +50,7 @@ public final class SpaceReservation implements AutoCloseable {
         this.requestedPages = requestedPages;
         this.requestedExtents = requestedExtents;
         this.reservedCapacityExtents = reservedCapacityExtents;
-        this.remainingPages = requestedPages;
+        this.remainingPages = new AtomicLong(requestedPages);
     }
 
     /**
@@ -84,5 +87,47 @@ public final class SpaceReservation implements AutoCloseable {
     @Override
     public void close() {
         owner.release(this);
+    }
+
+    /**
+     * 尝试为当前 MTR 的一次 page allocation 消费一个页额度。该方法不获取全局 reservation 账本锁，避免
+     * B+Tree split 在持有 index page latch 时与并发 reserve 的 page0 latch 等待形成环。
+     *
+     * @param targetSpace 待分配页所属表空间。
+     * @return 消费结果：不匹配、已消费或匹配但额度耗尽。
+     */
+    ConsumeResult consumePageQuota(SpaceId targetSpace) {
+        if (closed.get() || !spaceId.equals(targetSpace)) {
+            return ConsumeResult.NOT_MATCHED;
+        }
+        while (true) {
+            if (closed.get()) {
+                return ConsumeResult.NOT_MATCHED;
+            }
+            long current = remainingPages.get();
+            if (current <= 0L) {
+                return ConsumeResult.EXHAUSTED;
+            }
+            if (remainingPages.compareAndSet(current, current - 1L)) {
+                return ConsumeResult.CONSUMED;
+            }
+        }
+    }
+
+    /**
+     * 标记 reservation 已关闭。返回 false 表示此前已经关闭，本次 close 不应再扣减容量计数。
+     */
+    boolean markClosed() {
+        return closed.compareAndSet(false, true);
+    }
+
+    /** 页额度消费结果。 */
+    enum ConsumeResult {
+        /** 该 reservation 已关闭或属于其它表空间。 */
+        NOT_MATCHED,
+        /** 成功消费一个 page quota。 */
+        CONSUMED,
+        /** reservation 匹配该表空间，但调用方声明的页额度已经耗尽。 */
+        EXHAUSTED
     }
 }

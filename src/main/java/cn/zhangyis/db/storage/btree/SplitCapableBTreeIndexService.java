@@ -7,6 +7,7 @@ import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.RollPointer;
 import cn.zhangyis.db.domain.TransactionId;
 import cn.zhangyis.db.storage.api.DiskSpaceManager;
+import cn.zhangyis.db.storage.api.SegmentRef;
 import cn.zhangyis.db.storage.api.index.IndexPageAccess;
 import cn.zhangyis.db.storage.api.index.IndexPageHandle;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
@@ -715,7 +716,8 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
             }
             // hand-over-hand：先 latch 后继 leaf，再释放当前 leaf。
             PageId nextId = PageId.of(index.rootPageId().spaceId(), PageNo.of(next));
-            IndexPageHandle nextHandle = pageAccess.openIndexPageHandle(mtr, nextId, PageLatchMode.SHARED);
+            IndexPageHandle nextHandle = openBTreePageOutOfOrder(mtr, nextId, PageLatchMode.SHARED,
+                    "btree range current-read sibling hand-over-hand: next leaf is latched before predecessor release");
             pageAccess.releaseHandle(mtr, leafHandle);
             leafHandle = nextHandle;
         }
@@ -758,7 +760,8 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
             }
             // hand-over-hand：读出 next 时仍持当前 leaf S；先 latch 后继 leaf，再释放当前 leaf（后继到手前不放手）。
             PageId nextId = PageId.of(index.rootPageId().spaceId(), PageNo.of(next));
-            IndexPageHandle nextHandle = pageAccess.openIndexPageHandle(mtr, nextId, PageLatchMode.SHARED);
+            IndexPageHandle nextHandle = openBTreePageOutOfOrder(mtr, nextId, PageLatchMode.SHARED,
+                    "btree scan sibling hand-over-hand: next leaf is latched before predecessor release");
             pageAccess.releaseHandle(mtr, leafHandle);
             leafHandle = nextHandle;
         }
@@ -829,8 +832,24 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
             RecordRef ref = inserter.insert(leaf, leafId, record, index.keyDef(), index.schema());
             return new BTreeInsertResult(index, ref);
         } catch (RecordPageOverflowException overflow) {
-            requireLeafSegment(index);
-            return splitLeafAndPropagate(mtr, index, path, record);
+            SplitReservationBudget budget = splitReservationBudget(index, path);
+            // overflow 前 leaf 未写，整条悲观下降链仍是干净 latch；先释放它再进入 FSP page0 reservation，
+            // 避免持 index page latch 等待更低层空间管理页。
+            releaseChain(mtr, path);
+            try (SpaceReservation ignored = reserveSplitSpace(mtr, index, budget)) {
+                List<IndexPageHandle> splitPath = descendPathInsertSafeNode(mtr, index, key);
+                IndexPageHandle splitLeafHandle = splitPath.get(splitPath.size() - 1);
+                RecordPage splitLeaf = splitLeafHandle.recordPage();
+                PageId splitLeafId = splitLeafHandle.pageId();
+                ensureUniqueAbsent(splitLeaf, splitLeafId, index, key);
+                try {
+                    RecordRef ref = inserter.insert(splitLeaf, splitLeafId, record, index.keyDef(), index.schema());
+                    return new BTreeInsertResult(index, ref);
+                } catch (RecordPageOverflowException stillOverflow) {
+                    requireLeafSegment(index);
+                    return splitLeafAndPropagate(mtr, index, splitPath, record);
+                }
+            }
         }
     }
 
@@ -871,10 +890,10 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         List<LogicalRecord> records = sortedWithInserted(materializeLeafRecords(oldRootLeaf, index), inserted, index);
         SplitRows split = splitRows(records);
 
-        PageId leftId = disk.allocatePage(mtr, index.leafSegment());
-        RecordPage leftPage = pageAccess.createIndexPage(mtr, leftId, index.indexId(), 0);
-        PageId rightId = disk.allocatePage(mtr, index.leafSegment());
-        RecordPage rightPage = pageAccess.createIndexPage(mtr, rightId, index.indexId(), 0);
+        PageId leftId = allocateSmoPage(mtr, index.leafSegment());
+        RecordPage leftPage = createSmoIndexPage(mtr, leftId, index.indexId(), 0);
+        PageId rightId = allocateSmoPage(mtr, index.leafSegment());
+        RecordPage rightPage = createSmoIndexPage(mtr, rightId, index.indexId(), 0);
         IndexPageHandle leftHandle = pageAccess.openIndexPageHandle(mtr, leftId, PageLatchMode.EXCLUSIVE);
         IndexPageHandle rightHandle = pageAccess.openIndexPageHandle(mtr, rightId, PageLatchMode.EXCLUSIVE);
         leftHandle.writeSiblingLinks(FilePageHeader.FIL_NULL, rightId.pageNo().value());
@@ -896,36 +915,34 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
     }
 
     /**
-     * leaf 溢出后的 split 传播入口（任意树高）。leaf 即 root（path 仅 root）→ 原地长高（level 0→1，复用
+     * leaf 溢出后的 split 传播入口（任意树高）。调用方已经在不持 index latch 时完成 space reservation。leaf 即 root（path 仅 root）→ 原地长高（level 0→1，复用
      * {@link #splitRootLeaf}）；否则 leaf=左半、新右兄弟=右半，separator 经 {@link #insertSeparator} 上插父页，
      * 父满则递归内部 split，直至某层放下或根原地长高。
      */
     private BTreeInsertResult splitLeafAndPropagate(MiniTransaction mtr, BTreeIndex index,
                                                     List<IndexPageHandle> path, LogicalRecord inserted) {
-        try (SpaceReservation ignored = reserveSplitSpace(mtr, index, path)) {
-            int depth = path.size() - 1;
-            IndexPageHandle leafHandle = path.get(depth);
-            if (depth == 0) {
-                return splitRootLeaf(mtr, index, leafHandle, inserted);
-            }
-            List<PageId> allocated = new ArrayList<>();
-            LeafSplitResult ls = splitNonRootLeaf(mtr, index, leafHandle, inserted, allocated);
-            BTreeNodePointer separator = new BTreeNodePointer(ls.rightLowKey(), ls.newRightId());
-            BTreeIndex after = insertSeparator(mtr, index, path, depth - 1, separator, allocated);
-            return new BTreeInsertResult(index, ls.insertedRef(), after, true, List.copyOf(allocated));
+        int depth = path.size() - 1;
+        IndexPageHandle leafHandle = path.get(depth);
+        if (depth == 0) {
+            return splitRootLeaf(mtr, index, leafHandle, inserted);
         }
+        List<PageId> allocated = new ArrayList<>();
+        LeafSplitResult ls = splitNonRootLeaf(mtr, index, leafHandle, inserted, allocated);
+        BTreeNodePointer separator = new BTreeNodePointer(ls.rightLowKey(), ls.newRightId());
+        BTreeIndex after = insertSeparator(mtr, index, path, depth - 1, separator, allocated);
+        return new BTreeInsertResult(index, ls.insertedRef(), after, true, List.copyOf(allocated));
     }
 
     /**
-     * 0.14b split/root split 空间预留：在任何 split 页内容改写、sibling 链调整或 parent separator 插入前，
-     * 先按本次保留链的最坏传播范围预留可能创建的数据页。MTR 当前没有 content undo，若等到中途
+     * 0.14b/0.23a split/root split 空间预留：在任何 split 页内容改写、sibling 链调整或 parent separator 插入前，
+     * 且不持 index page latch 时，先按本次保留链的最坏传播范围预留可能创建的数据页。MTR 当前没有 content undo，若等到中途
      * {@code allocatePage} 才发现 ENOSPC，已重写的 leaf/root 无法自动撤回；因此 reserve 必须早于所有结构修改。
      *
      * <p>预算是保守上界而非精确页数：root leaf split 需要 2 个 leaf；非 root leaf split 需要 1 个 leaf；
      * 保留链中的非 root 内部层每层最多 split 出 1 个 sibling；若链顶是真 root，则 root internal split 最多再创建
      * 2 个 non-leaf child。safe-node 截断链顶不是 root 时，safe 判据保证传播停在该节点，不为已释放祖先预算。
      */
-    private SpaceReservation reserveSplitSpace(MiniTransaction mtr, BTreeIndex index, List<IndexPageHandle> path) {
+    private SplitReservationBudget splitReservationBudget(BTreeIndex index, List<IndexPageHandle> path) {
         requireLeafSegment(index);
         int depth = path.size() - 1;
         long leafPages = depth == 0 ? 2L : 1L;
@@ -939,8 +956,64 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         if (nonLeafPages > 0L) {
             requireNonLeafSegment(index);
         }
+        // 0.23a：overflow 后会先释放干净的 index latch，再 reserve，再重新下降。释放窗口内并发 SMO 可能改变树高
+        // 或 safe-node 截断点；capacity 本就按完整 extent 承诺，因此页 quota 也保守给到单 extent，避免重进后
+        // 合法 split 因旧路径预算过窄在中途触发 SpaceReservationExceeded。
+        return new SplitReservationBudget(Math.max(leafPages + nonLeafPages, pageSize.pagesPerExtent()));
+    }
+
+    private SpaceReservation reserveSplitSpace(MiniTransaction mtr, BTreeIndex index, SplitReservationBudget budget) {
         return disk.reserveSpace(mtr, index.rootPageId().spaceId(), SpaceReservationKind.NORMAL,
-                leafPages + nonLeafPages, 0L);
+                budget.pages(), 0L);
+    }
+
+    /**
+     * B+Tree SMO 新页分配的 page-latch-order 例外。split/root split 已在不持 index latch 时完成容量 reservation；
+     * 真正 allocatePage 仍需在持保留链 X latch 时触碰 FSP page0/page2。该逆序不会形成等待环，因为 FSP/DiskSpaceManager
+     * 不反向获取 B+Tree index page latch，且 SMO 的 index latch 等待边已由 safe-node/SX 协议证明无环。
+     */
+    private PageId allocateSmoPage(MiniTransaction mtr, SegmentRef segment) {
+        try (var ignored = mtr.allowOutOfOrderPageLatch(
+                "btree SMO page allocation: FSP metadata never waits for B+Tree index latches")) {
+            return disk.allocatePage(mtr, segment);
+        }
+    }
+
+    /**
+     * 格式化刚分配的 SMO 新页。该页尚未挂入 parent pointer 或 leaf sibling 链，即使物理页号低于当前保留链，
+     * 也不会有其它线程先持有它再回等当前 index latch；因此与 allocation 使用同一类局部越序证明。
+     */
+    private RecordPage createSmoIndexPage(MiniTransaction mtr, PageId pageId, long indexId, int level) {
+        try (var ignored = mtr.allowOutOfOrderPageLatch(
+                "btree SMO page format: freshly allocated index page is not visible to other btree readers yet")) {
+            return pageAccess.createIndexPage(mtr, pageId, indexId, level);
+        }
+    }
+
+    /**
+     * B+Tree SMO 回收 victim/child 页的 page-latch-order 例外。调用方已持有 parent/survivor/root 等 index X latch，
+     * {@code freePage} 会访问 FSP page0/page2 等低页号元数据；FSP 不会反向等待 index latch，因此不会形成等待环。
+     */
+    private void freeSmoPage(MiniTransaction mtr, SegmentRef segment, PageId pageId) {
+        try (var ignored = mtr.allowOutOfOrderPageLatch(
+                "btree SMO page free: FSP metadata never waits for B+Tree index latches")) {
+            disk.freePage(mtr, segment, pageId);
+        }
+    }
+
+    /**
+     * B+Tree 导航/兄弟页维护的 page-latch-order 例外入口。B+Tree 的正确性依赖 hand-over-hand：释放父页或前驱页之前，
+     * 必须先 latch 到即将使用的子页/后继页；物理页号与 key 顺序无关，不能用 PageId 升序替代 B+Tree 的局部无环证明。
+     */
+    private IndexPageHandle openBTreePageOutOfOrder(MiniTransaction mtr, PageId pageId,
+                                                    PageLatchMode mode, String reason) {
+        try (var ignored = mtr.allowOutOfOrderPageLatch(reason)) {
+            return pageAccess.openIndexPageHandle(mtr, pageId, mode);
+        }
+    }
+
+    /** split/root split 预留预算。 */
+    private record SplitReservationBudget(long pages) {
     }
 
     /** 非 root leaf split：旧 leaf 改写为左半、分配新右兄弟存右半、维护双向 sibling 链；返回新插入 ref + 右半 lowKey + 新右兄弟页号。 */
@@ -952,9 +1025,9 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         List<LogicalRecord> records = sortedWithInserted(materializeLeafRecords(oldLeaf, index), inserted, index);
         SplitRows split = splitRows(records);
 
-        PageId newLeafId = disk.allocatePage(mtr, index.leafSegment());
+        PageId newLeafId = allocateSmoPage(mtr, index.leafSegment());
         allocated.add(newLeafId);
-        RecordPage newLeaf = pageAccess.createIndexPage(mtr, newLeafId, index.indexId(), 0);
+        RecordPage newLeaf = createSmoIndexPage(mtr, newLeafId, index.indexId(), 0);
         IndexPageHandle newLeafHandle = pageAccess.openIndexPageHandle(mtr, newLeafId, PageLatchMode.EXCLUSIVE);
 
         oldLeaf.format(index.indexId(), 0);
@@ -962,7 +1035,8 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         newLeafHandle.writeSiblingLinks(oldLeafId.pageNo().value(), oldLeafHeader.nextPageNo());
         if (oldLeafHeader.nextPageNo() != FilePageHeader.FIL_NULL) {
             PageId rightSiblingId = PageId.of(oldLeafId.spaceId(), PageNo.of(oldLeafHeader.nextPageNo()));
-            IndexPageHandle rightSibling = pageAccess.openIndexPageHandle(mtr, rightSiblingId, PageLatchMode.EXCLUSIVE);
+            IndexPageHandle rightSibling = openBTreePageOutOfOrder(mtr, rightSiblingId, PageLatchMode.EXCLUSIVE,
+                    "btree split FIL right sibling repair: right links are followed in one direction");
             rightSibling.writeSiblingLinks(newLeafId.pageNo().value(), rightSibling.fileHeader().nextPageNo());
         }
 
@@ -1004,12 +1078,12 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
     private BTreeIndex growRootWithInternal(MiniTransaction mtr, BTreeIndex index, IndexPageHandle rootHandle,
                                             SplitPointers split, List<PageId> allocated) {
         int oldLevel = index.rootLevel();
-        PageId leftId = disk.allocatePage(mtr, index.nonLeafSegment());
+        PageId leftId = allocateSmoPage(mtr, index.nonLeafSegment());
         allocated.add(leftId);
-        RecordPage leftPage = pageAccess.createIndexPage(mtr, leftId, index.indexId(), oldLevel);
-        PageId rightId = disk.allocatePage(mtr, index.nonLeafSegment());
+        RecordPage leftPage = createSmoIndexPage(mtr, leftId, index.indexId(), oldLevel);
+        PageId rightId = allocateSmoPage(mtr, index.nonLeafSegment());
         allocated.add(rightId);
-        RecordPage rightPage = pageAccess.createIndexPage(mtr, rightId, index.indexId(), oldLevel);
+        RecordPage rightPage = createSmoIndexPage(mtr, rightId, index.indexId(), oldLevel);
         writePointers(leftPage, leftId, split.left(), index);
         writePointers(rightPage, rightId, split.right(), index);
 
@@ -1027,9 +1101,9 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
                                         SplitPointers split, List<PageId> allocated) {
         RecordPage node = nodeHandle.recordPage();
         int level = node.header().level();
-        PageId newSiblingId = disk.allocatePage(mtr, index.nonLeafSegment());
+        PageId newSiblingId = allocateSmoPage(mtr, index.nonLeafSegment());
         allocated.add(newSiblingId);
-        RecordPage newSibling = pageAccess.createIndexPage(mtr, newSiblingId, index.indexId(), level);
+        RecordPage newSibling = createSmoIndexPage(mtr, newSiblingId, index.indexId(), level);
         node.format(index.indexId(), level);
         writePointers(node, nodeHandle.pageId(), split.left(), index);
         writePointers(newSibling, newSiblingId, split.right(), index);
@@ -1111,7 +1185,7 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         }
         removePointerFromParent(parent, parentHandle.pageId(), index, pair.victimId());
         freed.add(pair.victimId());
-        disk.freePage(mtr, leaf ? index.leafSegment() : index.nonLeafSegment(), pair.victimId());
+        freeSmoPage(mtr, leaf ? index.leafSegment() : index.nonLeafSegment(), pair.victimId());
 
         if (parentIsRoot) {
             // 摘 pointer 后 root 剩 1 pointer → 原地 shrink；否则 root 允许任意 ≥2 pointer（含欠载），收工。
@@ -1163,12 +1237,14 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         }
         if (i > 0) {
             PageId leftId = pointers.get(i - 1).childPageId();
-            IndexPageHandle left = pageAccess.openIndexPageHandle(mtr, leftId, PageLatchMode.EXCLUSIVE);
+            IndexPageHandle left = openBTreePageOutOfOrder(mtr, leftId, PageLatchMode.EXCLUSIVE,
+                    "btree merge same-parent sibling: parent X latch is held and sibling holder cannot request ancestors");
             return new MergePair(left, nodeHandle, leftId, nodeId);
         }
         if (i + 1 < pointers.size()) {
             PageId rightId = pointers.get(i + 1).childPageId();
-            IndexPageHandle right = pageAccess.openIndexPageHandle(mtr, rightId, PageLatchMode.EXCLUSIVE);
+            IndexPageHandle right = openBTreePageOutOfOrder(mtr, rightId, PageLatchMode.EXCLUSIVE,
+                    "btree merge same-parent sibling: parent X latch is held and sibling holder cannot request ancestors");
             return new MergePair(nodeHandle, right, nodeId, rightId);
         }
         return null; // parent 仅 1 child，无同父兄弟
@@ -1214,7 +1290,8 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         survivorHandle.writeSiblingLinks(survivorHandle.fileHeader().prevPageNo(), victimNext);
         if (victimNext != FilePageHeader.FIL_NULL) {
             PageId farId = PageId.of(pair.victimId().spaceId(), PageNo.of(victimNext));
-            IndexPageHandle far = pageAccess.openIndexPageHandle(mtr, farId, PageLatchMode.EXCLUSIVE);
+            IndexPageHandle far = openBTreePageOutOfOrder(mtr, farId, PageLatchMode.EXCLUSIVE,
+                    "btree merge FIL right sibling repair: right links are followed in one direction");
             far.writeSiblingLinks(pair.survivorId().pageNo().value(), far.fileHeader().nextPageNo());
         }
     }
@@ -1308,7 +1385,8 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         PageId childId = pointerCodec.fromRecord(
                 new RecordCursor(root, off, ps.schema(), registry).materialize(), ps).childPageId();
         int childLevel = index.rootLevel() - 1;
-        IndexPageHandle childHandle = pageAccess.openIndexPageHandle(mtr, childId, PageLatchMode.EXCLUSIVE);
+        IndexPageHandle childHandle = openBTreePageOutOfOrder(mtr, childId, PageLatchMode.EXCLUSIVE,
+                "btree root shrink child absorption: root X is held and child cannot request ancestors");
         RecordPage child = childHandle.recordPage();
 
         if (childLevel == 0) {
@@ -1320,7 +1398,7 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
                 inserter.insert(root, index.rootPageId(), row, index.keyDef(), index.schema());
             }
             freed.add(childId);
-            disk.freePage(mtr, index.leafSegment(), childId);
+            freeSmoPage(mtr, index.leafSegment(), childId);
             return index.withRootLevel(0);
         }
         List<BTreeNodePointer> pointers = materializePointers(child, index);
@@ -1328,7 +1406,7 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         rootHandle.writeSiblingLinks(FilePageHeader.FIL_NULL, FilePageHeader.FIL_NULL);
         writePointers(root, index.rootPageId(), pointers, index);
         freed.add(childId);
-        disk.freePage(mtr, index.nonLeafSegment(), childId);
+        freeSmoPage(mtr, index.nonLeafSegment(), childId);
         BTreeIndex after = index.withRootLevel(childLevel);
         if (userRecordCount(root) == 1) {
             return shrinkRoot(mtr, after, rootHandle, freed);
@@ -1357,7 +1435,8 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         if (mtr == null || index == null || mode == null) {
             throw new DatabaseValidationException("btree mtr/index/mode must not be null");
         }
-        IndexPageHandle root = pageAccess.openIndexPageHandle(mtr, index.rootPageId(), mode);
+        IndexPageHandle root = openBTreePageOutOfOrder(mtr, index.rootPageId(), mode,
+                "btree root entry: index operation may legally follow undo writes in the same MTR");
         IndexPageHeader header = root.recordPage().header();
         if (header.indexId() != index.indexId()) {
             throw new BTreeStructureCorruptedException("root page index id mismatch: page="
@@ -1394,7 +1473,8 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         PageId pageId = index.rootPageId();
         while (page.header().level() > 0) {
             PageId childId = chooseChild(page, index, key);
-            handle = pageAccess.openIndexPageHandle(mtr, childId, mode);
+            handle = openBTreePageOutOfOrder(mtr, childId, mode,
+                    "btree full-path descent: child is latched while parent remains held");
             page = handle.recordPage();
             pageId = childId;
             if (page.header().indexId() != index.indexId()) {
@@ -1496,7 +1576,8 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         PageId pageId = index.rootPageId();
         while (page.header().level() > 0) {
             PageId childId = chooseChild(page, index, key);
-            IndexPageHandle child = pageAccess.openIndexPageHandle(mtr, childId, PageLatchMode.EXCLUSIVE);
+            IndexPageHandle child = openBTreePageOutOfOrder(mtr, childId, PageLatchMode.EXCLUSIVE,
+                    "btree safe-node descent: child X is latched before ancestor release");
             RecordPage childPage = child.recordPage();
             if (childPage.header().indexId() != index.indexId()) {
                 throw new BTreeStructureCorruptedException("child page index id mismatch at " + childId
@@ -1625,8 +1706,9 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
             PageId childId = chooseChild(page, index, key);
             // 下一层是否 leaf：当前层 level==1 时子页即 leaf，取 X（将写）；更高层取 S（只导航）。
             boolean childIsLeaf = page.header().level() == 1;
-            IndexPageHandle child = pageAccess.openIndexPageHandle(mtr, childId,
-                    childIsLeaf ? PageLatchMode.EXCLUSIVE : PageLatchMode.SHARED);
+            IndexPageHandle child = openBTreePageOutOfOrder(mtr, childId,
+                    childIsLeaf ? PageLatchMode.EXCLUSIVE : PageLatchMode.SHARED,
+                    "btree optimistic crab descent: child is latched before parent S release");
             // crab：latch 到子页后立即释放父页（父页为内部 S，未写→非 touched，可提前释放）。
             pageAccess.releaseHandle(mtr, node);
             page = child.recordPage();
@@ -1660,7 +1742,8 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         RecordPage page = node.recordPage();
         while (page.header().level() > 0) {
             PageId childId = chooseChild(page, index, key);
-            IndexPageHandle child = pageAccess.openIndexPageHandle(mtr, childId, PageLatchMode.SHARED);
+            IndexPageHandle child = openBTreePageOutOfOrder(mtr, childId, PageLatchMode.SHARED,
+                    "btree shared crab descent: child S is latched before parent S release");
             // crab：latch 到子页后立即释放父页（内部 S，未写→非 touched，可提前释放）。
             pageAccess.releaseHandle(mtr, node);
             page = child.recordPage();

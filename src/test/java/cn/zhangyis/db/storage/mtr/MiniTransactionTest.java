@@ -212,6 +212,67 @@ class MiniTransactionTest {
     }
 
     /**
+     * 0.23a：普通多页获取必须按 PageId 升序。先持有高页号再获取低页号会形成与其它线程的低→高路径相反的等待边，
+     * 因此应在 MTR 层直接转成领域异常，而不是让线程进入可能永久阻塞的 page latch 等待。
+     */
+    @Test
+    void independentPageLatchMustBeAscending() {
+        try (PageStore store = openStore(8)) {
+            BufferPool pool = new LruBufferPool(store, PS, 4);
+            MiniTransaction mtr = activeMtr(1);
+            mtr.getPage(pool, page(5), PageLatchMode.SHARED);
+            assertThrows(MtrStateException.class, () -> mtr.getPage(pool, page(4), PageLatchMode.SHARED));
+            mtr.rollbackUncommitted();
+            pool.close();
+        }
+    }
+
+    /**
+     * 0.23a：顺序守卫只约束“当前仍持有的不同页”之间的新增 latch。重复获取同一页是重入；高页释放后，
+     * memo 中已没有该页，后续再获取较低页不构成 hold-and-wait 环。
+     */
+    @Test
+    void samePageAndReleasedPageDoNotViolateOrder() {
+        try (PageStore store = openStore(8)) {
+            BufferPool pool = new LruBufferPool(store, PS, 4);
+            MiniTransaction same = activeMtr(1);
+            same.getPage(pool, page(4), PageLatchMode.SHARED);
+            same.getPage(pool, page(4), PageLatchMode.SHARED);
+            same.rollbackUncommitted();
+
+            MiniTransaction released = activeMtr(2);
+            PageGuard high = released.getPage(pool, page(5), PageLatchMode.SHARED);
+            released.releaseLatch(page(5), high);
+            released.getPage(pool, page(4), PageLatchMode.SHARED);
+            released.rollbackUncommitted();
+            pool.close();
+        }
+    }
+
+    /**
+     * 0.23a：B+Tree sibling/FIL 右邻等已有局部死锁证明的路径可以显式进入 out-of-order scope；
+     * scope 关闭后 MTR 立即恢复默认升序约束，避免例外泄漏到后续普通页访问。
+     */
+    @Test
+    void outOfOrderScopeAllowsProvenLocalExceptionOnlyInsideScope() {
+        try (PageStore store = openStore(8)) {
+            BufferPool pool = new LruBufferPool(store, PS, 6);
+            MiniTransaction scoped = activeMtr(1);
+            try (var ignored = scoped.allowOutOfOrderPageLatch("test-proven-sibling-path")) {
+                scoped.getPage(pool, page(5), PageLatchMode.SHARED);
+                scoped.getPage(pool, page(4), PageLatchMode.SHARED);
+            }
+            scoped.rollbackUncommitted();
+
+            MiniTransaction normal = activeMtr(2);
+            normal.getPage(pool, page(5), PageLatchMode.SHARED);
+            assertThrows(MtrStateException.class, () -> normal.getPage(pool, page(4), PageLatchMode.SHARED));
+            normal.rollbackUncommitted();
+            pool.close();
+        }
+    }
+
+    /**
      * 用 savepoint 提前释放 S guard 后，再对同一页取 X 应被允许（不是真正的 S→X 升级）。
      *
      * <p>rollbackToSavepoint 已把 S guard 弹出 memo 并 close，memo 不再持有该页 S latch，

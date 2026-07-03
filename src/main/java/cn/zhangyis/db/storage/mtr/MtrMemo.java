@@ -107,6 +107,35 @@ final class MtrMemo {
         return false;
     }
 
+    /** 当前 MTR 是否仍持有该页的任意 page latch。用于同页重入豁免 page latch 全序检查。 */
+    boolean holdsAnyPageLatch(PageId pageId) {
+        for (MemoEntry entry : stack) {
+            if (entry.pageId() != null && entry.pageId().equals(pageId)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 返回当前 memo 中仍持有的最大 PageId（按 spaceId、pageNo 升序比较）。非 page 资源不参与。
+     *
+     * <p>MTR 层用它在获取新 page latch 前执行“独立多页默认升序”守卫；被 releaseLatch/savepoint 移除的页已不在
+     * stack 中，因此不会误拦释放后的重新导航。
+     */
+    PageId highestHeldPageId() {
+        PageId highest = null;
+        for (MemoEntry entry : stack) {
+            if (entry.pageId() == null) {
+                continue;
+            }
+            if (highest == null || comparePageId(entry.pageId(), highest) > 0) {
+                highest = entry.pageId();
+            }
+        }
+        return highest;
+    }
+
     /**
      * 指定 guard 在 memo 中是否以 EXCLUSIVE 模式持有。供 {@link MiniTransaction#releaseLatch} 判定提前释放是否会
      * 移除某 touched 页的 pageLSN 盖戳所依赖的 X guard：释放 SHARED guard 永不影响盖戳（touched 页必由某 X guard 写过、
@@ -220,5 +249,14 @@ final class MtrMemo {
             }
         }
         return result;
+    }
+
+    /** PageId 全序：先表空间，后页号。 */
+    static int comparePageId(PageId left, PageId right) {
+        int bySpace = Integer.compare(left.spaceId().value(), right.spaceId().value());
+        if (bySpace != 0) {
+            return bySpace;
+        }
+        return Long.compare(left.pageNo().value(), right.pageNo().value());
     }
 }

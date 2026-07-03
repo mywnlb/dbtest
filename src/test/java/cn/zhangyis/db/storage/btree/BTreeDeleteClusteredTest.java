@@ -658,7 +658,11 @@ class BTreeDeleteClusteredTest {
 
     private void walk(Ctx ctx, BTreeIndex index, PageId pageId, int level, boolean isRoot,
                       List<Integer> internalNonRoot, List<Integer> leaves, MiniTransaction r) {
-        RecordPage page = ctx.access.openIndexPage(r, pageId, PageLatchMode.SHARED);
+        RecordPage page;
+        try (var ignored = r.allowOutOfOrderPageLatch(
+                "btree test structural walk follows child pointers while retaining ancestors")) {
+            page = ctx.access.openIndexPage(r, pageId, PageLatchMode.SHARED);
+        }
         if (level == 0) {
             leaves.add(page.header().nRecs());
             return;
@@ -685,11 +689,19 @@ class BTreeDeleteClusteredTest {
         BTreeNodePointerSchema ps = BTreeNodePointerSchema.from(index);
         BTreeNodePointerCodec codec = new BTreeNodePointerCodec();
         try {
-            RecordPage root = ctx.access.openIndexPage(r, index.rootPageId(), PageLatchMode.SHARED);
+            RecordPage root;
+            try (var ignored = r.allowOutOfOrderPageLatch(
+                    "btree test leaf fill walk follows root pointers while retaining root")) {
+                root = ctx.access.openIndexPage(r, index.rootPageId(), PageLatchMode.SHARED);
+            }
             for (int off : root.recordOffsetsInOrder()) {
                 BTreeNodePointer p = codec.fromRecord(
                         new RecordCursor(root, off, ps.schema(), registry).materialize(), ps);
-                RecordPage leaf = ctx.access.openIndexPage(r, p.childPageId(), PageLatchMode.SHARED);
+                RecordPage leaf;
+                try (var ignored = r.allowOutOfOrderPageLatch(
+                        "btree test leaf fill walk follows root pointers while retaining root")) {
+                    leaf = ctx.access.openIndexPage(r, p.childPageId(), PageLatchMode.SHARED);
+                }
                 counts.add((long) leaf.header().nRecs());
             }
             ctx.mgr.commit(r);

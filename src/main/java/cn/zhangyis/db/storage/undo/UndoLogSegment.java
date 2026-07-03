@@ -150,9 +150,9 @@ public final class UndoLogSegment {
         }
         // 0.14b：grow 是真实多页消费者。预留必须晚于单条容量 preflight、早于任何分配/格式化/FIL 链接/first header 修改；
         // 否则 ENOSPC 发生在中途时，MTR 无 content undo，无法撤回半生长的 undo 页链。
-        try (UndoSpaceReservation ignored = allocator.reserveGrowPages(mtr, handle.spaceId(), 1L)) {
-            PageId newId = allocator.allocatePage(mtr, handle.spaceId(), handle.inodeSlot(), handle.segmentId());
-            UndoPage newPage = pageAccess.createChainPage(mtr, newId, handle);
+        try (UndoSpaceReservation ignored = reserveGrowPagesForChainAppend()) {
+            PageId newId = allocateChainPageForAppend();
+            UndoPage newPage = createChainPageForAppend(newId);
             current.linkNextTo(newId.pageNo());
             newPage.linkPrevTo(current.pageId().pageNo());
             firstPage.setLastPageNo(newId.pageNo());
@@ -160,6 +160,43 @@ public final class UndoLogSegment {
             heldPages.put(newId.pageNo().value(), newPage);
             current = newPage;
             return current.appendRecord(payload, undoNo);
+        }
+    }
+
+    /**
+     * 为 undo 页链生长申请 FSP 预留。调用点通常已经持有 current undo 页 X latch，且该页可能在同一 MTR
+     * 中已被写过，不能为了满足 PageId 升序而提前释放；否则 commit 盖 pageLSN 时会丢失 touched 页的 X guard。
+     *
+     * <p>这里允许局部越序的并发证明是：undo segment 当前实现是单 writer，外部事务不会同时以 X 写同一条
+     * undo 页链；FSP 预留只获取表空间元页 latch，从不反向等待 undo 页 latch，因此不会形成
+     * “Undo 页 ↔ FSP 元页”等待环。
+     */
+    private UndoSpaceReservation reserveGrowPagesForChainAppend() {
+        try (var ignored = mtr.allowOutOfOrderPageLatch(
+                "undo grow reservation: single-writer undo chain, FSP never waits for undo page latches")) {
+            return allocator.reserveGrowPages(mtr, handle.spaceId(), 1L);
+        }
+    }
+
+    /**
+     * 在既有 undo segment 内续分配一张 chain 页。分配过程会访问 page0/page2/XDES 等较低 FSP 元页，
+     * 但不会读取或等待 undo 页内容；局部越序证明与 {@link #reserveGrowPagesForChainAppend()} 相同。
+     */
+    private PageId allocateChainPageForAppend() {
+        try (var ignored = mtr.allowOutOfOrderPageLatch(
+                "undo grow allocation: single-writer undo chain, FSP never waits for undo page latches")) {
+            return allocator.allocatePage(mtr, handle.spaceId(), handle.inodeSlot(), handle.segmentId());
+        }
+    }
+
+    /**
+     * 把刚分配的裸页格式化为 UNDO chain 页。该页尚未链接进任何可见 undo 链，若物理页号低于 current 页，
+     * 也不存在其它线程持有它并回等 current 页的环。
+     */
+    private UndoPage createChainPageForAppend(PageId newId) {
+        try (var ignored = mtr.allowOutOfOrderPageLatch(
+                "undo grow format: freshly allocated chain page is not visible to other undo readers yet")) {
+            return pageAccess.createChainPage(mtr, newId, handle);
         }
     }
 
@@ -312,9 +349,23 @@ public final class UndoLogSegment {
         if (held != null) {
             return held;
         }
-        UndoPage page = pageAccess.openUndoPage(mtr, PageId.of(handle.spaceId(), pageNo), PageLatchMode.SHARED);
+        UndoPage page = openChainPageForRead(pageNo);
         heldPages.put(pageNo.value(), page);
         return page;
+    }
+
+    /**
+     * 按页号打开 undo 链上的历史页。undo 链的逻辑顺序由 FIL NEXT/PREV 和 RollPointer 决定，不能假设物理
+     * PageNo 单调；append MTR 也可能在持有最新尾页 X latch 后，为校验旧 RollPointer 再读更小页号的历史页。
+     *
+     * <p>越序只限本段句柄内的 SHARED 打开：同一 segment 仍是单 writer，MVCC 跨事务直读应走
+     * {@link UndoLogSegmentAccess#readRecordByRollPointer} 的短只读 MTR，而不是在别的 segment 写 MTR 中长持页链。
+     */
+    private UndoPage openChainPageForRead(PageNo pageNo) {
+        try (var ignored = mtr.allowOutOfOrderPageLatch(
+                "undo chain read: logical roll-pointer/page-chain order is independent from physical PageId order")) {
+            return pageAccess.openUndoPage(mtr, PageId.of(handle.spaceId(), pageNo), PageLatchMode.SHARED);
+        }
     }
 
     private void requireSameSegment(UndoPage page, String what) {

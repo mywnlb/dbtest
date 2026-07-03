@@ -275,7 +275,7 @@ public final class UndoLogManager {
             access.open(commitMtr, ctx.undoFirstPageId(), PageLatchMode.EXCLUSIVE)
                     .markCommitted(txn.transactionNo());
             if (!ctx.hasUpdateUndo() && headerRepo != null) {
-                headerRepo.writeSlot(commitMtr, undoSpace, ctx.slotId(), null);
+                writeRsegSlotAfterUndoPage(commitMtr, ctx.slotId(), null);
             }
             mtrManager.commit(commitMtr);
         }
@@ -322,10 +322,25 @@ public final class UndoLogManager {
         // 0.3：在**同一 MTR** 内把 slot 登记持久化到 page3 rseg header——与 undo segment 创建同批 redo，crash-safe；
         // 任一失败由 MTR rollback 一并不发布（避免 page3 引用不存在的段，或段不被任何 slot 引用）。
         if (headerRepo != null) {
-            headerRepo.writeSlot(mtr, undoSpace, slot, firstPageId);
+            writeRsegSlotAfterUndoPage(mtr, slot, firstPageId);
         }
         UndoContext ctx = new UndoContext(slotManager.rollbackSegmentId(), slot, firstPageId);
         txn.setUndoContext(ctx);
         return seg;
+    }
+
+    /**
+     * 持久化 rseg slot 的 page-latch-order 例外。首写和提交清理都已经在同一 MTR 持有 undo first 页 X latch；
+     * 该页可能被格式化、append 或 markCommitted 写过，不能提前释放，否则 MTR commit 盖 pageLSN 会失去 X guard。
+     *
+     * <p>局部无环前提：rseg header(page3) 只记录 slot->firstPageNo 映射，不会读取/等待 undo 页内容；undo
+     * segment 的普通写路径也不会在持 page3 latch 时反向请求 undo page latch。因此该例外只放在 UndoLogManager
+     * 的事务 undo 编排层，不下沉到 repository 的所有调用。
+     */
+    private void writeRsegSlotAfterUndoPage(MiniTransaction mtr, UndoSlotId slot, PageId firstPage) {
+        try (var ignored = mtr.allowOutOfOrderPageLatch(
+                "undo rseg slot update: page3 metadata never waits for undo page latches")) {
+            headerRepo.writeSlot(mtr, undoSpace, slot, firstPage);
+        }
     }
 }

@@ -46,6 +46,12 @@ public final class MiniTransaction {
     /** 与截断服务共享的表空间 operation lease 控制器。 */
     private final TablespaceAccessController accessController;
 
+    /**
+     * page latch 全序例外嵌套深度。默认 MTR 获取不同页必须按 PageId 升序；B+Tree 已证明的 sibling/右邻局部路径
+     * 可短暂进入例外作用域，作用域关闭后立即恢复默认守卫。
+     */
+    private int outOfOrderPageLatchScopeDepth;
+
     MiniTransaction(long id, RedoLogManager redoLogManager, TablespaceAccessController accessController) {
         this.id = id;
         this.redoLogManager = redoLogManager;
@@ -128,13 +134,41 @@ public final class MiniTransaction {
         memo.push(resource);
     }
 
+    /**
+     * 开启一个 page latch 全序例外作用域。该入口只用于已有局部死锁证明的路径，例如 B+Tree 同父 sibling merge
+     * 或 FIL 右邻链维护；普通多页获取必须依赖默认 PageId 升序守卫。
+     *
+     * @param reason 例外理由，必须写清调用方依赖的无环不变量，便于 review 和诊断。
+     * @return 必须用 try-with-resources 关闭的作用域 guard。
+     */
+    public MtrLatchOrderScope allowOutOfOrderPageLatch(String reason) {
+        ensureActive();
+        if (reason == null || reason.isBlank()) {
+            throw new DatabaseValidationException("out-of-order page latch reason must not be blank");
+        }
+        outOfOrderPageLatchScopeDepth++;
+        return new MtrLatchOrderScope(this, reason);
+    }
+
+    /** 关闭由 {@link #allowOutOfOrderPageLatch(String)} 创建的作用域。 */
+    void closeOutOfOrderPageLatchScope(String reason) {
+        if (outOfOrderPageLatchScopeDepth <= 0) {
+            throw new MtrStateException("out-of-order page latch scope underflow: " + reason);
+        }
+        outOfOrderPageLatchScopeDepth--;
+    }
+
     private PageGuard fix(BufferPool pool, PageId pageId, PageLatchMode mode, boolean existing, PageType pageType) {
         ensureActive();
         if (pool == null) {
             throw new DatabaseValidationException("buffer pool must not be null");
         }
+        if (pageId == null || mode == null) {
+            throw new DatabaseValidationException("page id/mode must not be null");
+        }
         // lease 先于 page fix/latch 获取并先入 memo，LIFO 下最后释放；truncate 的 X lease 因此不会与旧 frame 访问交叉。
         acquireTablespaceLease(pageId.spaceId());
+        enforcePageLatchOrder(pageId);
         // 同页 S/SX→X 升级防护：page latch 是 ReentrantReadWriteLock，不支持读→写升级；S 与 SHARED_EXCLUSIVE 都持
         // 该页 readLock，若仍持时再求 X，BufferPool.acquire 的阻塞 writeLock.lock() 会让本线程自死锁。这里在取 latch
         // 前转成可观测的领域异常。X→S 降级与"已持 X 再取 X"放行：已持 X 说明本线程已是写者，再取 latch 可重入，不会死锁。
@@ -152,6 +186,21 @@ public final class MiniTransaction {
             collector.recordInit(pageId, pageType);
         }
         return guard;
+    }
+
+    /**
+     * 独立多页 page latch 默认全序守卫。若当前 MTR 仍持有更大的 PageId，又请求一个尚未持有的更小 PageId，
+     * 两个线程按相反顺序获取相同页集时会形成 hold-and-wait 环；这里在进入 page latch 等待前快速失败。
+     */
+    private void enforcePageLatchOrder(PageId pageId) {
+        if (outOfOrderPageLatchScopeDepth > 0 || memo.holdsAnyPageLatch(pageId)) {
+            return;
+        }
+        PageId highest = memo.highestHeldPageId();
+        if (highest != null && MtrMemo.comparePageId(highest, pageId) > 0) {
+            throw new MtrStateException("page latch order violation: held highest " + highest
+                    + " before requesting lower " + pageId);
+        }
     }
 
     /**

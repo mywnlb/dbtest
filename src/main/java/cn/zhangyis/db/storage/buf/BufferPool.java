@@ -53,14 +53,25 @@ public interface BufferPool extends AutoCloseable {
     void flushAll();
 
     /**
-     * 返回 flush list 候选快照，按 oldestModificationLsn 升序排列，只包含 oldest <= targetLsn 的脏页。
-     * Flush 模块不能通过该视图持有 frame 或 latch；真正写盘前必须再调用 {@link #snapshotForFlush(PageId)} 重新确认。
+     * 返回 flush list 候选快照，按 oldestModificationLsn 升序排列，只包含 oldest <= targetLsn 的脏页。候选表达 dirty
+     * view，不等于当前一定可写盘：仍被前台 fixed 的 dirty 页也必须可见，真正写盘前必须再调用
+     * {@link #snapshotForFlush(PageId)} 重新确认。
      *
      * @param targetLsn flush 目标 LSN。
      * @param maxPages 最多返回页数，0 表示只探测不返回。
      * @return 不可变候选列表。
      */
     List<DirtyPageCandidate> dirtyPageCandidates(Lsn targetLsn, int maxPages);
+
+    /**
+     * 等待 dirty view 可能发生变化。该方法不承诺返回时已经没有脏页；调用方醒来后必须重新查询
+     * {@link #dirtyPageCandidates(Lsn, int)} 或其它 dirty view 谓词。FlushService 的 tablespace drain 使用它避免
+     * 固定间隔轮询，同时保持 Flush 层不读取 Buffer Pool 内部 frame/hash/list。
+     *
+     * @param timeout 本次最多等待时间；0 表示只检查中断状态并立即返回。
+     * @return true 表示被 dirty-state signal 唤醒；false 表示本次等待超时或等待前已被中断。
+     */
+    boolean awaitDirtyStateChange(Duration timeout);
 
     /**
      * 尝试复制一个未 fixed 的脏页镜像。返回 empty 表示页不存在、已 clean、仍被前台 guard fixed 或不适合本轮 flush。

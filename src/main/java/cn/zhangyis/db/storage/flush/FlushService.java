@@ -126,7 +126,12 @@ public final class FlushService {
             }
             checkpointCoordinator.advanceCheckpoint();
             if (cleanCount(results) == cleanCountBefore && !dirtyPagesInSpace(spaceId).isEmpty()) {
-                parkBriefly(deadline);
+                if (!awaitDirtyStateChange(deadline)) {
+                    if (!dirtyPagesInSpace(spaceId).isEmpty()) {
+                        return new TablespaceDrainResult(spaceId, results, true,
+                                checkpointCoordinator.lastCheckpointLsn());
+                    }
+                }
             }
         }
     }
@@ -185,6 +190,14 @@ public final class FlushService {
         return count;
     }
 
+    private boolean awaitDirtyStateChange(long deadline) {
+        long remaining = remainingNanos(deadline);
+        if (remaining <= 0) {
+            return false;
+        }
+        return bufferPool.awaitDirtyStateChange(Duration.ofNanos(remaining));
+    }
+
     private static void parkBriefly(long deadline) {
         if (deadline == Long.MAX_VALUE) {
             LockSupport.parkNanos(1_000_000L);
@@ -194,6 +207,13 @@ public final class FlushService {
         if (remaining > 0) {
             LockSupport.parkNanos(Math.min(remaining, 1_000_000L));
         }
+    }
+
+    private static long remainingNanos(long deadline) {
+        if (deadline == Long.MAX_VALUE) {
+            return Long.MAX_VALUE;
+        }
+        return deadline - System.nanoTime();
     }
 
     private static boolean deadlineReached(long deadline) {

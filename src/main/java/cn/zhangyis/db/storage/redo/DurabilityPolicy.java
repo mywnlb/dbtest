@@ -11,8 +11,9 @@ import java.time.Duration;
  * <p>三阶段语义：<b>append</b>（分配 LSN、写内存 log buffer）→ <b>write</b>（写到 OS page cache，进程崩溃不丢、
  * 但宕机/断电可能丢）→ <b>flush</b>（fsync 到磁盘，真正 durable）。各策略在 commit 处停在不同阶段，换取持久性 vs 延迟。
  *
- * <p>简化点：生产 {@code TransactionManager.commit}/DML facade 接线属 2.1，本枚举目前由测试与未来 commit 编排消费；
- * {@code SYNC_EVERY_N_MS} 暂不单列，等价于 {@link #BACKGROUND_FLUSH} + 现有周期性 {@link RedoFlushWorker}。
+ * <p>简化点：2.1 起 storage 层 {@code ClusteredDmlService.commit} 已消费本策略；生产
+ * {@code TransactionManager.commit} 仍保持纯内存状态机，不直接等待 redo。{@code SYNC_EVERY_N_MS}
+ * 暂不单列，等价于 {@link #BACKGROUND_FLUSH} + 现有周期性 {@link RedoFlushWorker}。
  */
 public enum DurabilityPolicy {
 

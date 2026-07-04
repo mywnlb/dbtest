@@ -228,6 +228,11 @@ class ReadAheadServiceTest {
         }
 
         @Override
+        public boolean awaitDirtyStateChange(Duration timeout) {
+            return delegate.awaitDirtyStateChange(timeout);
+        }
+
+        @Override
         public Optional<FlushPageSnapshot> snapshotForFlush(PageId pageId) {
             return delegate.snapshotForFlush(pageId);
         }

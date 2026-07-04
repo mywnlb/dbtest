@@ -30,7 +30,7 @@ import java.util.concurrent.locks.ReentrantLock;
  */
 public final class LockManager {
 
-    /** 默认分片数；当前教学实现生产未接 DML，保守选择 16 个索引级分片。 */
+    /** 默认分片数；当前单聚簇 DML 已接入，16 个索引级分片足以表达教学版锁表并发边界。 */
     private static final int DEFAULT_SHARD_COUNT = 16;
 
     /** 默认死锁搜索步数上限，避免异常长链在持 graph mutex 时无界遍历。 */
@@ -52,7 +52,7 @@ public final class LockManager {
     private final int deadlockSearchLimit;
 
     /**
-     * 创建默认配置的 LockManager。当前仍未接生产 DML facade，默认值只影响单测和后续接线前的内存行为。
+     * 创建默认配置的 LockManager。生产组合根通常使用带观测端口的构造器；本构造器保留给无观测需求的测试和嵌入式使用。
      */
     public LockManager() {
         this(DEFAULT_SHARD_COUNT, DEFAULT_DEADLOCK_SEARCH_LIMIT, RowLockEventSink.noop());
@@ -196,8 +196,9 @@ public final class LockManager {
     }
 
     /**
-     * 释放某事务在所有分片上已经授予的锁，并取消该事务尚在等待队列中的请求。该方法是后续
-     * TransactionManager/DML facade 在 commit/rollback 收尾时要调用的入口；当前切片不自动接现有事务生命周期。
+     * 释放某事务在所有分片上已经授予的锁，并取消该事务尚在等待队列中的请求。2.1 起
+     * {@code ClusteredDmlService.commit/rollback} 会在事务结束收尾调用本入口；{@code TransactionManager}
+     * 自身仍保持纯内存状态机，不自动持有本锁管理器依赖。
      *
      * @param owner 要清理的事务 id。
      * @return 实际释放的已授予锁数量；被取消的等待请求不计入该数量。

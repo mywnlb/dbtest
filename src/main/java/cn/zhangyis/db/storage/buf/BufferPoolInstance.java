@@ -27,10 +27,9 @@ import java.util.stream.Collectors;
  * free list + {@link ReplacementPolicy} LRU + {@link FrameStateMachine}。它承接原单实例池的全部 per-pool 逻辑——
  * fix/new/prefetch/淘汰/写回/标脏/snapshot 刷盘/截断排空——只服务于路由到本分片的页（{@code hash(PageId)%N==thisIndex}）。
  *
- * <p><b>分片范围（13.1c）</b>：page hash 映射由 {@code pageHashLock} 保护，单帧元数据由
- * {@link BufferFrame#frameMutex} 保护；free list、LRU 与跨 frame 扫描暂时仍由兼容短锁保护，待 13.1d 拆
- * {@code freeListLock/lruListLock/flushListLock}。miss 读盘、future wait、脏 victim 刷盘和 legacy page write 都必须在
- * 不持任何 Buffer Pool 内部锁时进入。
+ * <p><b>分片范围（13.1d）</b>：page hash 映射由 {@code pageHashLock} 保护，单帧元数据由
+ * {@link BufferFrame#frameMutex} 保护；free list、LRU 与 flush list 由各自 list 锁保护。miss 读盘、future wait、
+ * 脏 victim 刷盘和 legacy page write 都必须在不持任何 Buffer Pool 内部锁时进入。
  *
  * <p><b>跨切面查询由 facade 聚合</b>：dirty 候选/oldest LSN/hasDirty/residentCount/截断等需跨全部分片的操作，由
  * {@code LruBufferPool} facade 逐分片调用本类的 {@code local*} 方法并在锁外合并；facade 一次只持一把 instance 锁，
@@ -57,18 +56,27 @@ final class BufferPoolInstance implements FrameReleaser {
      */
     private volatile DirtyVictimFlusher victimFlusher;
 
-    /** 13.1c 子锁集合；free/LRU/flush list 的进一步拆分留 13.1d。 */
+    /** 13.1d 子锁集合；page hash、frame、free/LRU/flush list 均有独立短锁边界。 */
     private final BufferPoolInstanceLatchSet latches = new BufferPoolInstanceLatchSet();
     /** 本分片 page hash：PageId→帧（含 LOADING 占位）。由 pageHashLock 在外保护。 */
     private final PageHashTable pageHash = new PageHashTable();
-    /** 空闲 frame 队列。由 list/meta 兼容锁保护；真正拆 freeListLock 前不得裸访问。 */
+    /** 空闲 frame 队列。由 freeListLock 保护；frame 出队后才可被 miss/newPage 线程重新绑定。 */
     private final Deque<BufferFrame> freeList = new ArrayDeque<>();
+    /** 本分片真实 flush list。由 flushListLock 保护，只保存 dirty 页定位与 LSN 边界，不保存 frame 引用。 */
+    private final DirtyPageList dirtyPageList = new DirtyPageList();
 
     /** 命中 LOADING 页的等待者最长等待时长（纳秒），避免 IO owner 卡死时无限期阻塞。构造期固定。 */
     private final long loadTimeoutNanos;
+    /** dirty view 变化通知回调；由 facade 注入，用于 FlushService drain 等待谓词重查。 */
+    private final Runnable dirtyStateChangeListener;
 
     BufferPoolInstance(PageStore pageStore, PageSize pageSize, int capacity, ReplacementPolicy policy,
-                       Duration loadTimeout, SpaceLifecycleClock lifecycleClock) {
+                        Duration loadTimeout, SpaceLifecycleClock lifecycleClock) {
+        this(pageStore, pageSize, capacity, policy, loadTimeout, lifecycleClock, () -> { });
+    }
+
+    BufferPoolInstance(PageStore pageStore, PageSize pageSize, int capacity, ReplacementPolicy policy,
+                       Duration loadTimeout, SpaceLifecycleClock lifecycleClock, Runnable dirtyStateChangeListener) {
         if (pageStore == null) {
             throw new DatabaseValidationException("page store must not be null");
         }
@@ -87,11 +95,15 @@ final class BufferPoolInstance implements FrameReleaser {
         if (lifecycleClock == null) {
             throw new DatabaseValidationException("space lifecycle clock must not be null");
         }
+        if (dirtyStateChangeListener == null) {
+            throw new DatabaseValidationException("dirty-state change listener must not be null");
+        }
         this.pageStore = pageStore;
         this.pageSize = pageSize;
         this.capacity = capacity;
         this.policy = policy;
         this.lifecycleClock = lifecycleClock;
+        this.dirtyStateChangeListener = dirtyStateChangeListener;
         try {
             this.loadTimeoutNanos = loadTimeout.toNanos();
         } catch (ArithmeticException overflow) {
@@ -107,15 +119,10 @@ final class BufferPoolInstance implements FrameReleaser {
         if (flusher == null) {
             throw new DatabaseValidationException("victim flusher must not be null");
         }
-        latches.lockMetadata();
-        try {
-            if (this.victimFlusher != null) {
-                throw new DatabaseValidationException("victim flusher already attached (set-once)");
-            }
-            this.victimFlusher = flusher;
-        } finally {
-            latches.unlockMetadata();
+        if (this.victimFlusher != null) {
+            throw new DatabaseValidationException("victim flusher already attached (set-once)");
         }
+        this.victimFlusher = flusher;
     }
 
     /** 取页（命中或读穿），固定并取 page latch，返回 guard。**不上报 read-ahead 钩子**——钩子由 facade.getPage 路由后调。 */
@@ -129,7 +136,7 @@ final class BufferPoolInstance implements FrameReleaser {
     }
 
     /**
-     * getPage/newPage 公共骨架：page hash 锁内查映射，frameMutex 内固定/检查状态；miss 时短持 list/meta 兼容锁取得
+     * getPage/newPage 公共骨架：page hash 锁内查映射，frameMutex 内固定/检查状态；miss 时短持 free/LRU 子锁取得
      * victim。任何 PageStore IO、PageLoadFuture 等待、dirty victim flush 都在锁外执行。
      */
     private PageGuard acquire(PageId pageId, PageLatchMode mode, boolean readFromDisk) {
@@ -177,11 +184,11 @@ final class BufferPoolInstance implements FrameReleaser {
                             }
                             resident.spaceVersion = admittedVersion;
                             resident.fixCount++;
-                            latches.lockMetadata();
+                            latches.lockLruList();
                             try {
                                 policy.onAccess(resident);
                             } finally {
-                                latches.unlockMetadata();
+                                latches.unlockLruList();
                             }
                             chosen = resident;
                             break;
@@ -190,7 +197,6 @@ final class BufferPoolInstance implements FrameReleaser {
                         latches.unlockFrame(resident);
                     }
                 } else {
-                    latches.lockMetadata();
                     BufferFrame victim = null;
                     try {
                         victim = obtainVictim(cleanSkip);
@@ -200,7 +206,7 @@ final class BufferPoolInstance implements FrameReleaser {
                         } else {
                             if (victim.pageId != null) {
                                 pageHash.remove(victim.pageId);
-                                policy.onRemove(victim);
+                                removeFromLru(victim);
                             }
                             if (readFromDisk) {
                                 // 装 LOADING 占位：owner 自持 fixCount=1，建 load future、注册 pageHash；出锁读盘。
@@ -222,7 +228,7 @@ final class BufferPoolInstance implements FrameReleaser {
                                 stateMachine.transition(victim, BufferFrameState.CLEAN);
                                 victim.fixCount = 1;
                                 pageHash.put(pageId, victim);
-                                policy.onInsert(victim);
+                                insertIntoLru(victim);
                                 chosen = victim;
                                 break;
                             }
@@ -231,7 +237,6 @@ final class BufferPoolInstance implements FrameReleaser {
                         if (victim != null) {
                             latches.unlockFrame(victim);
                         }
-                        latches.unlockMetadata();
                     }
                 }
             } finally {
@@ -299,12 +304,7 @@ final class BufferPoolInstance implements FrameReleaser {
                 latches.lockFrame(frame);
                 try {
                     pageHash.remove(pageId);
-                    latches.lockMetadata();
-                    try {
-                        resetFrameToFree(frame);
-                    } finally {
-                        latches.unlockMetadata();
-                    }
+                    resetFrameToFree(frame);
                 } finally {
                     latches.unlockFrame(frame);
                 }
@@ -322,22 +322,12 @@ final class BufferPoolInstance implements FrameReleaser {
                     BufferPoolStalePageException stale = new BufferPoolStalePageException(
                             "page load became stale before publish: " + pageId);
                     pageHash.remove(pageId);
-                    latches.lockMetadata();
-                    try {
-                        resetFrameToFree(frame);
-                    } finally {
-                        latches.unlockMetadata();
-                    }
+                    resetFrameToFree(frame);
                     future.failExceptionally(stale);
                     throw stale;
                 }
                 stateMachine.transition(frame, BufferFrameState.CLEAN);
-                latches.lockMetadata();
-                try {
-                    policy.onInsert(frame);
-                } finally {
-                    latches.unlockMetadata();
-                }
+                insertIntoLru(frame);
                 frame.loadFuture = null;
             } finally {
                 latches.unlockFrame(frame);
@@ -350,20 +340,21 @@ final class BufferPoolInstance implements FrameReleaser {
     }
 
     /**
-     * 取受害者帧（调用须持 list/meta 兼容锁）：优先空闲帧；否则 LRU 序首个未 fix 的干净帧；若无干净未固定帧则回首个
-     * 未在本轮 {@code cleanSkip} 中的脏未固定帧（交调用方出锁刷干净后复用）。返回时目标 frameMutex 仍由当前线程持有，
-     * 调用方负责释放。
+     * 取受害者帧：优先空闲帧；否则复制 LRU victim 顺序后释放 LRU 锁，再逐帧持 frameMutex 复核，避免在持
+     * {@code lruListLock} 时等待单帧锁。若无干净未固定帧则返回首个未在本轮 {@code cleanSkip} 中的脏未固定帧，
+     * 交调用方出锁刷干净后复用。返回时目标 frameMutex 仍由当前线程持有，调用方负责释放。
      */
     private BufferFrame obtainVictim(Set<PageId> cleanSkip) {
-        BufferFrame free = freeList.poll();
+        BufferFrame free = pollFreeFrame();
         if (free != null) {
             latches.lockFrame(free);
             return free;
         }
         BufferFrame firstDirty = null;
-        for (BufferFrame frame : policy.victimOrder()) {
+        for (BufferFrame frame : victimOrderSnapshot()) {
             latches.lockFrame(frame);
-            if (frame.fixCount != 0) {
+            if (frame.pageId == null || frame.state == BufferFrameState.FREE
+                    || frame.state == BufferFrameState.LOADING || frame.fixCount != 0) {
                 latches.unlockFrame(frame);
                 continue;
             }
@@ -402,6 +393,7 @@ final class BufferPoolInstance implements FrameReleaser {
             }
             frame.fixCount--;
             latches.signalFrameReleased();
+            dirtyStateChangeListener.run();
         } finally {
             latches.unlockFrame(frame);
         }
@@ -435,28 +427,22 @@ final class BufferPoolInstance implements FrameReleaser {
             if (!lifecycleClock.isCurrentAndOpen(pageId.spaceId(), admittedVersion)) {
                 return;
             }
-            latches.lockMetadata();
-            try {
-                BufferFrame free = freeList.poll();
-                if (free == null) {
-                    return; // 无空闲帧：read-ahead 直接丢弃，绝不淘汰脏页或挤占前台需求读。
-                }
-                latches.lockFrame(free);
-                try {
-                    free.pageId = pageId;
-                    free.spaceVersion = admittedVersion;
-                    clearDirty(free);
-                    stateMachine.transition(free, BufferFrameState.LOADING);
-                    free.fixCount = 1;
-                    free.loadFuture = new PageLoadFuture();
-                    pageHash.put(pageId, free);
-                    loading = free;
-                } finally {
-                    latches.unlockFrame(free);
-                }
+            BufferFrame free = pollFreeFrame();
+            if (free == null) {
+                return; // 无空闲帧：read-ahead 直接丢弃，绝不淘汰脏页或挤占前台需求读。
             }
-            finally {
-                latches.unlockMetadata();
+            latches.lockFrame(free);
+            try {
+                free.pageId = pageId;
+                free.spaceVersion = admittedVersion;
+                clearDirty(free);
+                stateMachine.transition(free, BufferFrameState.LOADING);
+                free.fixCount = 1;
+                free.loadFuture = new PageLoadFuture();
+                pageHash.put(pageId, free);
+                loading = free;
+            } finally {
+                latches.unlockFrame(free);
             }
         } finally {
             latches.unlockPageHash();
@@ -552,13 +538,26 @@ final class BufferPoolInstance implements FrameReleaser {
         return candidates;
     }
 
-    /** 本分片的 flush list 候选（oldest≤targetLsn，按 oldest 升序，≤maxPages）。facade 跨分片合并后再裁剪。 */
+    /**
+     * 本分片的 flush list 候选（oldest≤targetLsn，按 oldest 升序，≤maxPages）。候选表达 dirty view，不承诺当前可
+     * snapshot；fixed 页也必须暴露给 drain，真正能否写盘由 {@link #snapshotForFlush(PageId)} 在短锁内复核。
+     */
     List<DirtyPageCandidate> localDirtyPageCandidates(Lsn targetLsn, int maxPages) {
         List<DirtyPageCandidate> candidates = new ArrayList<>();
-        for (BufferFrame frame : snapshotFrames()) {
-            latches.lockFrame(frame);
+        for (DirtyPageCandidate candidate : dirtyCandidateSnapshot(targetLsn, capacity)) {
+            BufferFrame frame;
+            latches.lockPageHash();
             try {
-                if (frame.dirty && frame.state != BufferFrameState.FLUSHING
+                frame = pageHash.get(candidate.pageId());
+                if (frame == null) {
+                    continue;
+                }
+                latches.lockFrame(frame);
+            } finally {
+                latches.unlockPageHash();
+            }
+            try {
+                if (frame.dirty && frame.state == BufferFrameState.DIRTY
                         && frame.oldestModificationLsn != null
                         && frame.oldestModificationLsn.value() <= targetLsn.value()) {
                     candidates.add(new DirtyPageCandidate(frame.pageId,
@@ -623,9 +622,11 @@ final class BufferPoolInstance implements FrameReleaser {
                         && frame.newestModificationLsn.equals(snapshot.pageLsn())) {
                     clearDirty(frame);
                     stateMachine.transition(frame, BufferFrameState.CLEAN);
+                    dirtyStateChangeListener.run();
                     return true;
                 }
                 stateMachine.transition(frame, BufferFrameState.DIRTY);
+                dirtyStateChangeListener.run();
                 return false;
             } finally {
                 latches.unlockFrame(frame);
@@ -648,6 +649,7 @@ final class BufferPoolInstance implements FrameReleaser {
                 try {
                     if (frame.state == BufferFrameState.FLUSHING) {
                         stateMachine.transition(frame, BufferFrameState.DIRTY);
+                        dirtyStateChangeListener.run();
                     }
                 } finally {
                     latches.unlockFrame(frame);
@@ -660,34 +662,22 @@ final class BufferPoolInstance implements FrameReleaser {
 
     /** 本分片最老 dirty LSN；无脏页返回 null（facade 跨分片取全局 min）。 */
     Lsn localOldestDirtyLsnOrNull() {
-        Lsn oldest = null;
-        for (BufferFrame frame : snapshotFrames()) {
-            latches.lockFrame(frame);
-            try {
-                if (frame.dirty && frame.oldestModificationLsn != null
-                        && (oldest == null || frame.oldestModificationLsn.value() < oldest.value())) {
-                    oldest = frame.oldestModificationLsn;
-                }
-            } finally {
-                latches.unlockFrame(frame);
-            }
+        latches.lockFlushList();
+        try {
+            return dirtyPageList.oldestDirtyLsnOrNull();
+        } finally {
+            latches.unlockFlushList();
         }
-        return oldest;
     }
 
     /** 本分片是否存在任何 dirty frame。 */
     boolean hasDirtyPages() {
-        for (BufferFrame frame : snapshotFrames()) {
-            latches.lockFrame(frame);
-            try {
-                if (frame.dirty) {
-                    return true;
-                }
-            } finally {
-                latches.unlockFrame(frame);
-            }
+        latches.lockFlushList();
+        try {
+            return dirtyPageList.hasDirtyPages();
+        } finally {
+            latches.unlockFlushList();
         }
-        return false;
     }
 
     /**
@@ -749,13 +739,8 @@ final class BufferPoolInstance implements FrameReleaser {
                 latches.lockFrame(frame);
                 try {
                     pageHash.remove(frame.pageId);
-                    latches.lockMetadata();
-                    try {
-                        policy.onRemove(frame);
-                        resetFrameToFree(frame);
-                    } finally {
-                        latches.unlockMetadata();
-                    }
+                    removeFromLru(frame);
+                    resetFrameToFree(frame);
                 } finally {
                     latches.unlockFrame(frame);
                 }
@@ -825,6 +810,93 @@ final class BufferPoolInstance implements FrameReleaser {
         }
     }
 
+    /** 从 free list 取一个空闲 frame；不持有 frameMutex 返回，调用方随后独占重新绑定。 */
+    private BufferFrame pollFreeFrame() {
+        latches.lockFreeList();
+        try {
+            return freeList.poll();
+        } finally {
+            latches.unlockFreeList();
+        }
+    }
+
+    /** 把已清空绑定关系的 frame 放回 free list；调用方必须已持 frameMutex 并完成状态复位。 */
+    private void addFreeFrame(BufferFrame frame) {
+        latches.lockFreeList();
+        try {
+            freeList.add(frame);
+        } finally {
+            latches.unlockFreeList();
+        }
+    }
+
+    /** LRU 插入短临界区；调用方已完成 page hash 注册和 frame 状态初始化。 */
+    private void insertIntoLru(BufferFrame frame) {
+        latches.lockLruList();
+        try {
+            policy.onInsert(frame);
+        } finally {
+            latches.unlockLruList();
+        }
+    }
+
+    /** LRU 移除短临界区；调用方已持 frameMutex，确保 frame 不会被并发重绑定。 */
+    private void removeFromLru(BufferFrame frame) {
+        latches.lockLruList();
+        try {
+            policy.onRemove(frame);
+        } finally {
+            latches.unlockLruList();
+        }
+    }
+
+    /** 复制 LRU victim 顺序；释放 LRU 锁后再逐帧加 frameMutex 复核，避免 list 锁等待 frame 锁。 */
+    private List<BufferFrame> victimOrderSnapshot() {
+        latches.lockLruList();
+        try {
+            List<BufferFrame> order = new ArrayList<>();
+            for (BufferFrame frame : policy.victimOrder()) {
+                order.add(frame);
+            }
+            return order;
+        } finally {
+            latches.unlockLruList();
+        }
+    }
+
+    /** 复制 flush list 候选；调用方随后必须重新通过 page hash + frameMutex 复核。 */
+    private List<DirtyPageCandidate> dirtyCandidateSnapshot(Lsn targetLsn, int maxPages) {
+        latches.lockFlushList();
+        try {
+            return dirtyPageList.candidatesUpTo(targetLsn, maxPages);
+        } finally {
+            latches.unlockFlushList();
+        }
+    }
+
+    /** 调用须持目标 frameMutex；把 frame 当前 dirty LSN 边界发布到 flush list。 */
+    private void updateDirtyList(BufferFrame frame) {
+        latches.lockFlushList();
+        try {
+            dirtyPageList.upsert(frame.pageId, frame.oldestModificationLsn, frame.newestModificationLsn);
+        } finally {
+            latches.unlockFlushList();
+        }
+    }
+
+    /** 从 flush list 摘除指定页；pageId 为 null 说明 frame 已经是 FREE 或尚未绑定，直接忽略。 */
+    private void removeFromDirtyList(PageId pageId) {
+        if (pageId == null) {
+            return;
+        }
+        latches.lockFlushList();
+        try {
+            dirtyPageList.remove(pageId);
+        } finally {
+            latches.unlockFlushList();
+        }
+    }
+
     private Lsn pageLsn(BufferFrame frame) {
         return Lsn.of(ByteBuffer.wrap(frame.data).getLong(PageEnvelopeLayout.PAGE_LSN));
     }
@@ -841,6 +913,7 @@ final class BufferPoolInstance implements FrameReleaser {
         frame.newestModificationLsn = pageLsn;
         frame.dirtyVersion++;
         frame.dirty = true;
+        updateDirtyList(frame);
         if (frame.state != BufferFrameState.FLUSHING) {
             stateMachine.transition(frame, BufferFrameState.DIRTY);
         }
@@ -848,6 +921,7 @@ final class BufferPoolInstance implements FrameReleaser {
 
     /** 调用须持目标 frameMutex。 */
     private void clearDirty(BufferFrame frame) {
+        removeFromDirtyList(frame.pageId);
         frame.dirty = false;
         frame.oldestModificationLsn = null;
         frame.newestModificationLsn = null;
@@ -859,26 +933,22 @@ final class BufferPoolInstance implements FrameReleaser {
             throw new BufferPoolStalePageException("stale frame is still fixed or dirty: " + frame.pageId);
         }
         pageHash.remove(frame.pageId);
-        latches.lockMetadata();
-        try {
-            policy.onRemove(frame);
-            resetFrameToFree(frame);
-        } finally {
-            latches.unlockMetadata();
-        }
+        removeFromLru(frame);
+        resetFrameToFree(frame);
     }
 
-    /** 调用须持目标 frameMutex 与 list/meta 兼容锁。把 clean/LOADING frame 复位回 free list，供载入失败、stale 和 invalidate 复用。 */
+    /** 调用须持目标 frameMutex。把 clean/LOADING frame 复位回 free list，供载入失败、stale 和 invalidate 复用。 */
     private void resetFrameToFree(BufferFrame frame) {
+        clearDirty(frame);
         frame.pageId = null;
         frame.spaceVersion = null;
-        clearDirty(frame);
         if (frame.state != BufferFrameState.FREE) {
             stateMachine.transition(frame, BufferFrameState.FREE);
         }
         frame.fixCount = 0;
         frame.loadFuture = null;
-        freeList.add(frame);
+        addFreeFrame(frame);
         latches.signalFrameReleased();
+        dirtyStateChangeListener.run();
     }
 }

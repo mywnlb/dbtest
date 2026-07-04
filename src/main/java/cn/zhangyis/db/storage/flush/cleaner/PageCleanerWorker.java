@@ -20,7 +20,7 @@ import java.util.concurrent.locks.ReentrantLock;
  * 两种路径都只调用 {@link FlushService#flushForCapacity(int)}，不直接访问 Buffer Pool frame 或 PageStore，
  * 因此不会在后台线程中引入新的页锁顺序。
  */
-public final class PageCleanerWorker implements AutoCloseable {
+public final class PageCleanerWorker implements PageCleanerWorkerHandle {
 
     /** 关闭周期 tick 的内部哨兵；显式请求模式保持 F2 既有行为。 */
     private static final int PERIODIC_DISABLED = -1;
@@ -55,6 +55,8 @@ public final class PageCleanerWorker implements AutoCloseable {
     private Thread thread;
     /** 最近一轮 flush cycle 结果，用于诊断和测试。 */
     private FlushCycleResult lastCycle;
+    /** 当前 worker 生命周期内成功完成的 flush cycle 数；由 lock 保护，供 supervisor 按差值汇总。 */
+    private long completedCycles;
     /** worker 失败根因。 */
     private DatabaseRuntimeException failure;
 
@@ -230,6 +232,21 @@ public final class PageCleanerWorker implements AutoCloseable {
         }
     }
 
+    /**
+     * 生成 worker 当前状态快照。快照只暴露诊断信息，不携带可唤醒线程的锁或 Condition 引用。
+     *
+     * @return 当前 worker 生命周期内的只读诊断快照。
+     */
+    public PageCleanerWorkerSnapshot snapshot() {
+        lock.lock();
+        try {
+            return new PageCleanerWorkerSnapshot(state, inFlight, requests.size(), completedCycles,
+                    lastCycle != null, failure == null ? "" : failure.getMessage());
+        } finally {
+            lock.unlock();
+        }
+    }
+
     /** close 默认等待 5 秒，测试和生产 shutdown 可显式调用 stop(timeout) 使用更短边界。 */
     @Override
     public void close() {
@@ -309,6 +326,7 @@ public final class PageCleanerWorker implements AutoCloseable {
         lock.lock();
         try {
             lastCycle = cycle;
+            completedCycles++;
             inFlight = false;
             if (state != PageCleanerState.STOPPING) {
                 state = requests.isEmpty() ? PageCleanerState.IDLE : PageCleanerState.RUNNING;

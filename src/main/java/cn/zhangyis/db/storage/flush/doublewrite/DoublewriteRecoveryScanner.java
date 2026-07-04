@@ -35,6 +35,16 @@ public final class DoublewriteRecoveryScanner {
      * @return true 表示执行了修复；false 表示页原本有效或没有可用副本。
      */
     public boolean repairPageIfNeeded(PageId pageId) {
+        return scanPageIfNeeded(pageId).repaired();
+    }
+
+    /**
+     * 检查单页并返回结构化结果。full-copy 命中时执行修复；detect-only metadata 命中时只报告，绝不写回 data file。
+     *
+     * @param pageId 目标页。
+     * @return 单页检查结果。
+     */
+    public DoublewriteRecoveryResult scanPageIfNeeded(PageId pageId) {
         if (pageId == null) {
             throw new DatabaseValidationException("page id must not be null");
         }
@@ -42,19 +52,24 @@ public final class DoublewriteRecoveryScanner {
         // 越界读取或用 doublewrite 复活它（doublewrite 在 redo 之前执行，文件可能仍短）。交给 redo replay 的
         // extend-on-demand 与 SPACE_FILE_RECONCILE 重建，故跳过。
         if (pageId.pageNo().value() >= pageStore.currentSizeInPages(pageId.spaceId()).value()) {
-            return false;
+            return new DoublewriteRecoveryResult(pageId, DoublewriteRecoveryOutcome.CLEAN_OR_NOT_COVERED);
         }
         byte[] current = new byte[pageSize.bytes()];
         pageStore.readPage(pageId, ByteBuffer.wrap(current));
         if (PageImageChecksum.verify(current, pageSize)) {
-            return false;
+            return new DoublewriteRecoveryResult(pageId, DoublewriteRecoveryOutcome.CLEAN_OR_NOT_COVERED);
         }
         Optional<byte[]> copy = repository.latestCopy(pageId);
-        if (copy.isEmpty()) {
-            return false;
+        if (copy.isPresent()) {
+            pageStore.writePage(pageId, ByteBuffer.wrap(copy.get()));
+            pageStore.force(pageId.spaceId());
+            return new DoublewriteRecoveryResult(pageId, DoublewriteRecoveryOutcome.REPAIRED_FROM_COPY);
         }
-        pageStore.writePage(pageId, ByteBuffer.wrap(copy.get()));
-        pageStore.force(pageId.spaceId());
-        return true;
+        boolean coveredByDetectOnly = repository.scanEntries().stream()
+                .anyMatch(entry -> pageId.equals(entry.pageId()) && !entry.hasFullCopy());
+        if (coveredByDetectOnly) {
+            return new DoublewriteRecoveryResult(pageId, DoublewriteRecoveryOutcome.DETECTED_ONLY);
+        }
+        return new DoublewriteRecoveryResult(pageId, DoublewriteRecoveryOutcome.CLEAN_OR_NOT_COVERED);
     }
 }

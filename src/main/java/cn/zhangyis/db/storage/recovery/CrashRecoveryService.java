@@ -10,6 +10,7 @@ import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.fil.io.PageStore;
+import cn.zhangyis.db.storage.flush.doublewrite.DoublewriteRecoveryResult;
 import cn.zhangyis.db.storage.fsp.header.SpaceHeaderPhysical;
 import cn.zhangyis.db.storage.fsp.header.SpaceHeaderRawCodec;
 import cn.zhangyis.db.storage.redo.RedoCheckpointLabel;
@@ -64,7 +65,7 @@ public final class CrashRecoveryService {
                 gate.closeForRecovery();
                 stages.add(RecoveryStageName.TRAFFIC_CLOSED);
 
-                int repaired = repairDoublewritePages(request);
+                DoublewriteRepairSummary doublewriteSummary = repairDoublewritePages(request);
                 stages.add(RecoveryStageName.DOUBLEWRITE_REPAIR);
 
                 RedoCheckpointLabel checkpoint = request.checkpointStore().readLatest();
@@ -113,7 +114,8 @@ public final class CrashRecoveryService {
                 stages.add(RecoveryStageName.OPEN_TRAFFIC);
                 state = RecoveryState.OPEN;
                 RecoveryReport report = new RecoveryReport(request.mode(), state, checkpoint.checkpointLsn(),
-                        reader.recoveredToLsn(), repaired, batches.size(), stages);
+                        reader.recoveredToLsn(), doublewriteSummary.repairedPageCount(),
+                        doublewriteSummary.detectedOnlyPageCount(), batches.size(), stages);
                 lastReport = report;
                 lastError = null;
                 return report;
@@ -207,24 +209,28 @@ public final class CrashRecoveryService {
         }
     }
 
-    private int repairDoublewritePages(RecoveryRequest request) {
+    private DoublewriteRepairSummary repairDoublewritePages(RecoveryRequest request) {
         int repaired = 0;
+        int detectedOnly = 0;
         if (request.undoTablespaceRecovery() != null) {
             repaired += request.undoTablespaceRecovery().prepareDoublewrite(request.doublewriteScanner());
         }
         if (request.doublewriteScanner() == null) {
-            return repaired;
+            return new DoublewriteRepairSummary(repaired, detectedOnly);
         }
         for (PageId pageId : request.pagesToRepair()) {
             if (request.undoTablespaceRecovery() != null
                     && !request.undoTablespaceRecovery().shouldRepairDoublewritePage(pageId)) {
                 continue;
             }
-            if (request.doublewriteScanner().repairPageIfNeeded(pageId)) {
+            DoublewriteRecoveryResult result = request.doublewriteScanner().scanPageIfNeeded(pageId);
+            if (result.repaired()) {
                 repaired++;
+            } else if (result.detectedOnly()) {
+                detectedOnly++;
             }
         }
-        return repaired;
+        return new DoublewriteRepairSummary(repaired, detectedOnly);
     }
 
     /**
@@ -236,6 +242,9 @@ public final class CrashRecoveryService {
         state = RecoveryState.FAILED;
         lastError = error;
         lastReport = new RecoveryReport(mode, RecoveryState.FAILED,
-                Lsn.of(0), Lsn.of(0), 0, 0, List.of());
+                Lsn.of(0), Lsn.of(0), 0, 0, 0, List.of());
+    }
+
+    private record DoublewriteRepairSummary(int repairedPageCount, int detectedOnlyPageCount) {
     }
 }

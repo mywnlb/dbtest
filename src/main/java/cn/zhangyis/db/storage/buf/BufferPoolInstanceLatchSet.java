@@ -8,20 +8,26 @@ import java.util.concurrent.locks.ReentrantLock;
 /**
  * 单个 {@link BufferPoolInstance} 的内部锁集合。
  *
- * <p>13.1c 已拆出第一组真实子锁：{@code pageHashLock} 只保护 page hash 映射，{@link BufferFrame#frameMutex}
- * 保护单帧元数据。旧 {@code metadataLock} 暂时降级为 list/meta compatibility lock，用于 free list、LRU 和跨帧扫描，
- * 后续 13.1d 再拆成 {@code freeListLock/lruListLock/flushListLock}。
+ * <p>13.1d 已拆出 free/LRU/flush 三条 list 锁：{@code pageHashLock} 只保护 page hash 映射，
+ * {@link BufferFrame#frameMutex} 保护单帧元数据，list 锁只保护各自链表结构。旧 {@code lockMetadata} 方法保留为
+ * 包内测试兼容入口，生产路径应使用更具体的 list 锁方法。
  *
- * <p><b>锁顺序</b>：{@code pageHashLock -> frameMutex -> metadataLock(compat) -> pageLatch}。进入 PageStore 物理
- * IO、DirtyVictimFlusher、PageLoadFuture 等可能阻塞路径前必须释放上述所有 Buffer Pool 内部锁。
+ * <p><b>锁顺序</b>：{@code pageHashLock -> frameMutex -> freeListLock/lruListLock/flushListLock -> pageLatch}。
+ * 进入 PageStore 物理 IO、DirtyVictimFlusher、PageLoadFuture 等可能阻塞路径前必须释放上述所有 Buffer Pool 内部锁。
  */
 final class BufferPoolInstanceLatchSet {
 
     /** 保护本分片 PageId→frame/loading 映射的短锁；不得跨物理 IO 或 future wait 持有。 */
     private final ReentrantLock pageHashLock = new ReentrantLock();
 
-    /** 兼容锁：13.1c 暂时保护 free list、LRU replacement policy 和跨 frame 扫描。13.1d 会继续拆分。 */
-    private final ReentrantLock metadataLock = new ReentrantLock();
+    /** 保护 free frame 队列的短锁；不得跨 frame 等待、PageStore IO 或 victim flush 持有。 */
+    private final ReentrantLock freeListLock = new ReentrantLock();
+
+    /** 保护 midpoint LRU old/new 子链的短锁；调用 ReplacementPolicy 必须持有它。 */
+    private final ReentrantLock lruListLock = new ReentrantLock();
+
+    /** 保护真实 flush list 的短锁；只维护 dirty 页定位与 LSN 边界，不保护页体。 */
+    private final ReentrantLock flushListLock = new ReentrantLock();
 
     /** drain 等待专用锁；不保护 frame 元数据，只承载 Condition，避免复用 metadata 大锁。 */
     private final ReentrantLock drainWaitLock = new ReentrantLock();
@@ -64,17 +70,60 @@ final class BufferPoolInstanceLatchSet {
         frame.frameMutex.unlock();
     }
 
-    /** 进入 list/meta 兼容临界区。调用方必须用 try/finally 调用 {@link #unlockMetadata()}。 */
+    /** 进入 free list 临界区。调用方必须用 try/finally 调用 {@link #unlockFreeList()}。 */
+    void lockFreeList() {
+        freeListLock.lock();
+        HOLD_COUNTS.get().freeListDepth++;
+    }
+
+    /** 退出 free list 临界区。 */
+    void unlockFreeList() {
+        HoldCounts counts = HOLD_COUNTS.get();
+        counts.freeListDepth--;
+        freeListLock.unlock();
+    }
+
+    /** 进入 LRU list 临界区。调用方必须用 try/finally 调用 {@link #unlockLruList()}。 */
+    void lockLruList() {
+        lruListLock.lock();
+        HOLD_COUNTS.get().lruListDepth++;
+    }
+
+    /** 退出 LRU list 临界区。 */
+    void unlockLruList() {
+        HoldCounts counts = HOLD_COUNTS.get();
+        counts.lruListDepth--;
+        lruListLock.unlock();
+    }
+
+    /** 进入 flush list 临界区。调用方必须用 try/finally 调用 {@link #unlockFlushList()}。 */
+    void lockFlushList() {
+        flushListLock.lock();
+        HOLD_COUNTS.get().flushListDepth++;
+    }
+
+    /** 退出 flush list 临界区。 */
+    void unlockFlushList() {
+        HoldCounts counts = HOLD_COUNTS.get();
+        counts.flushListDepth--;
+        flushListLock.unlock();
+    }
+
+    /** 兼容入口：一次性持有三条 list 锁，仅供旧测试验证“list 锁未释放不能进 IO”的总守卫。 */
     void lockMetadata() {
-        metadataLock.lock();
+        lockFreeList();
+        lockLruList();
+        lockFlushList();
         HOLD_COUNTS.get().metadataDepth++;
     }
 
-    /** 退出 list/meta 兼容临界区。 */
+    /** 退出兼容 list/meta 临界区。 */
     void unlockMetadata() {
         HoldCounts counts = HOLD_COUNTS.get();
         counts.metadataDepth--;
-        metadataLock.unlock();
+        unlockFlushList();
+        unlockLruList();
+        unlockFreeList();
     }
 
     /**
@@ -113,7 +162,8 @@ final class BufferPoolInstanceLatchSet {
      */
     void assertMetadataUnlocked(String operation) {
         HoldCounts counts = HOLD_COUNTS.get();
-        if (counts.pageHashDepth > 0 || counts.frameDepth > 0 || counts.metadataDepth > 0) {
+        if (counts.pageHashDepth > 0 || counts.frameDepth > 0 || counts.metadataDepth > 0
+                || counts.freeListDepth > 0 || counts.lruListDepth > 0 || counts.flushListDepth > 0) {
             throw new BufferPoolLatchViolationException(
                     "buffer pool internal lock held while entering " + operation);
         }
@@ -130,5 +180,8 @@ final class BufferPoolInstanceLatchSet {
         private int pageHashDepth;
         private int frameDepth;
         private int metadataDepth;
+        private int freeListDepth;
+        private int lruListDepth;
+        private int flushListDepth;
     }
 }

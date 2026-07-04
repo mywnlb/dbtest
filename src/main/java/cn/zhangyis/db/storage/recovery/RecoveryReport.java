@@ -13,6 +13,7 @@ import java.util.List;
  * @param checkpointLsn 本次恢复使用的 checkpoint LSN。
  * @param recoveredToLsn redo reader 扫描到的最后完整 LSN。
  * @param repairedPageCount doublewrite 实际修复页数。
+ * @param detectedOnlyPageCount doublewrite detect-only 发现但未修复的可疑页数。
  * @param appliedBatchCount 交给 redo dispatcher 的批次数。
  * @param completedStages 已完成阶段顺序。
  */
@@ -21,6 +22,7 @@ public record RecoveryReport(RecoveryMode mode,
                              Lsn checkpointLsn,
                              Lsn recoveredToLsn,
                              int repairedPageCount,
+                             int detectedOnlyPageCount,
                              int appliedBatchCount,
                              List<RecoveryStageName> completedStages) {
 
@@ -29,7 +31,7 @@ public record RecoveryReport(RecoveryMode mode,
                 || recoveredToLsn == null || completedStages == null) {
             throw new DatabaseValidationException("recovery report fields must not be null");
         }
-        if (repairedPageCount < 0 || appliedBatchCount < 0) {
+        if (repairedPageCount < 0 || detectedOnlyPageCount < 0 || appliedBatchCount < 0) {
             throw new DatabaseValidationException("recovery report counts must not be negative");
         }
         completedStages = List.copyOf(completedStages);

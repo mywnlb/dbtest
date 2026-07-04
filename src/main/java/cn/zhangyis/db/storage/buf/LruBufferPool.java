@@ -13,6 +13,8 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Buffer Pool facade（§5.1）：把 {@link PageId} 经 {@link BufferPoolRouter} 路由到若干 {@link BufferPoolInstance} 分片，
@@ -21,7 +23,7 @@ import java.util.concurrent.atomic.AtomicReference;
  *
  * <p><b>分片（§5.2）</b>：默认 {@code instanceCount=1}，行为与原单实例池字节级等价（路由恒 0）。
  * 总容量按 {@code base=cap/N + 前 r 个各 +1} 切分到各分片（要求 {@code capacity≥instanceCount}）。每分片自有
- * pageHashLock/frameMutex 与一个 list/meta 兼容锁（free/LRU/flush list 真拆留 §13.1d）；分片间无 work stealing——某分片满即抛 {@link BufferPoolExhaustedException}，
+ * pageHashLock/frameMutex 以及 free/LRU/flush list 专用短锁；分片间无 work stealing——某分片满即抛 {@link BufferPoolExhaustedException}，
  * 即便他分片有空闲帧（与 InnoDB 一致）。
  *
  * <p><b>并发不变量</b>：facade 的跨切面操作<b>一次只进入一个 instance</b>（单分片取快照→解锁→下一分片→锁外合并），
@@ -44,6 +46,10 @@ public final class LruBufferPool implements BufferPool {
      * page admission，并给 frame 打版本戳，避免旧代际 frame 在维护后重新可见。
      */
     private final SpaceLifecycleClock lifecycleClock;
+    /** dirty view 变化等待锁；只承载 Condition，不保护 BufferFrame 元数据或 page hash。 */
+    private final ReentrantLock dirtyStateWaitLock = new ReentrantLock();
+    /** flush/drain 等待 dirty view 可能变化的通知点；谓词由调用方醒来后重新扫描。 */
+    private final Condition dirtyStateChanged = dirtyStateWaitLock.newCondition();
 
     /**
      * 淘汰脏页的 WAL 安全刷盘端口（facade 级 set-once）。bootstrap 注入后传播给每个分片；CAS 防运行期被换。
@@ -68,7 +74,7 @@ public final class LruBufferPool implements BufferPool {
     public LruBufferPool(PageStore pageStore, PageSize pageSize, int capacity, int instanceCount) {
         this.lifecycleClock = new SpaceLifecycleClock();
         this.instances = buildInstances(pageStore, pageSize, capacity, instanceCount,
-                DEFAULT_LOAD_TIMEOUT, lifecycleClock);
+                DEFAULT_LOAD_TIMEOUT, lifecycleClock, this::signalDirtyStateChanged);
         this.router = new BufferPoolRouter(instanceCount);
     }
 
@@ -82,14 +88,16 @@ public final class LruBufferPool implements BufferPool {
                   Duration loadTimeout) {
         this.lifecycleClock = new SpaceLifecycleClock();
         this.instances = new BufferPoolInstance[]{
-                new BufferPoolInstance(pageStore, pageSize, capacity, policy, loadTimeout, lifecycleClock)};
+                new BufferPoolInstance(pageStore, pageSize, capacity, policy, loadTimeout, lifecycleClock,
+                        this::signalDirtyStateChanged)};
         this.router = new BufferPoolRouter(1);
     }
 
     /** 容量切分：base=cap/N、前 r 个分片各 +1；要求 capacity≥instanceCount（每分片至少 1 帧）。 */
     private static BufferPoolInstance[] buildInstances(PageStore pageStore, PageSize pageSize, int capacity,
-                                                       int instanceCount, Duration loadTimeout,
-                                                       SpaceLifecycleClock lifecycleClock) {
+                                                        int instanceCount, Duration loadTimeout,
+                                                        SpaceLifecycleClock lifecycleClock,
+                                                        Runnable dirtyStateChangeListener) {
         if (instanceCount < 1) {
             throw new DatabaseValidationException("buffer pool instance count must be >= 1: " + instanceCount);
         }
@@ -104,7 +112,8 @@ public final class LruBufferPool implements BufferPool {
             int shardCapacity = base + (i < remainder ? 1 : 0);
             // 每分片独立 midpoint 策略对象（策略持 per-instance LRU 状态，不能跨分片共享）。
             arr[i] = new BufferPoolInstance(pageStore, pageSize, shardCapacity,
-                    new MidpointLruReplacementPolicy(System::currentTimeMillis), loadTimeout, lifecycleClock);
+                    new MidpointLruReplacementPolicy(System::currentTimeMillis), loadTimeout, lifecycleClock,
+                    dirtyStateChangeListener);
         }
         return arr;
     }
@@ -196,6 +205,37 @@ public final class LruBufferPool implements BufferPool {
         return instanceFor(pageId).snapshotForFlush(pageId);
     }
 
+    /**
+     * 等待任一分片的 dirty 状态变化通知。Condition 不保护 dirty 谓词，调用方必须在返回后重新查询 dirty view。
+     */
+    @Override
+    public boolean awaitDirtyStateChange(Duration timeout) {
+        if (timeout == null) {
+            throw new DatabaseValidationException("dirty-state wait timeout must not be null");
+        }
+        if (timeout.isNegative()) {
+            throw new DatabaseValidationException("dirty-state wait timeout must not be negative: " + timeout);
+        }
+        long nanos;
+        try {
+            nanos = timeout.toNanos();
+        } catch (ArithmeticException overflow) {
+            throw new DatabaseValidationException("dirty-state wait timeout is too large: " + timeout, overflow);
+        }
+        if (nanos == 0) {
+            return !Thread.currentThread().isInterrupted();
+        }
+        dirtyStateWaitLock.lock();
+        try {
+            return dirtyStateChanged.awaitNanos(nanos) > 0;
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return false;
+        } finally {
+            dirtyStateWaitLock.unlock();
+        }
+    }
+
     @Override
     public boolean completeFlush(FlushPageSnapshot snapshot) {
         if (snapshot == null) {
@@ -207,6 +247,16 @@ public final class LruBufferPool implements BufferPool {
     @Override
     public void failFlush(PageId pageId) {
         instanceFor(pageId).failFlush(pageId);
+    }
+
+    /** 唤醒等待 dirty view 变化的 flush/drain 调用方；不表示 dirty 谓词已经满足。 */
+    private void signalDirtyStateChanged() {
+        dirtyStateWaitLock.lock();
+        try {
+            dirtyStateChanged.signalAll();
+        } finally {
+            dirtyStateWaitLock.unlock();
+        }
     }
 
     @Override

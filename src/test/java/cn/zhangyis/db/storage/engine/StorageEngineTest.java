@@ -17,6 +17,7 @@ import cn.zhangyis.db.storage.btree.BTreeLookupResult;
 import cn.zhangyis.db.storage.btree.SplitCapableBTreeIndexService;
 import cn.zhangyis.db.storage.fsp.segment.SegmentPurpose;
 import cn.zhangyis.db.storage.flush.cleaner.PageCleanerState;
+import cn.zhangyis.db.storage.flush.cleaner.PageCleanerMetricsSnapshot;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
 import cn.zhangyis.db.storage.page.PageEnvelopeLayout;
@@ -326,9 +327,13 @@ class StorageEngineTest {
                     "periodic page cleaner tick should advance checkpoint even when no data page flush is needed");
             assertTrue(engine.awaitBackgroundFlushIdle(Duration.ofSeconds(2)));
             assertEquals(PageCleanerState.IDLE, engine.pageCleanerState());
+            PageCleanerMetricsSnapshot metrics = engine.pageCleanerMetrics();
+            assertEquals(PageCleanerState.IDLE, metrics.state());
+            assertTrue(metrics.successfulCycles() > 0);
 
             engine.close();
             assertEquals(PageCleanerState.STOPPED, engine.pageCleanerState());
+            assertEquals(PageCleanerState.STOPPED, engine.pageCleanerMetrics().state());
         } finally {
             if (engine.state() == EngineState.OPEN) {
                 engine.close();

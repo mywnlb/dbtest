@@ -11,6 +11,7 @@ import cn.zhangyis.db.domain.UndoSlotId;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
+import cn.zhangyis.db.storage.mtr.MiniTransactionState;
 import cn.zhangyis.db.storage.record.format.HiddenColumns;
 import cn.zhangyis.db.storage.record.schema.IndexKeyDef;
 import cn.zhangyis.db.storage.record.schema.TableSchema;
@@ -23,21 +24,23 @@ import cn.zhangyis.db.storage.undo.UndoRecord;
 import java.util.List;
 
 /**
- * 事务 undo 门面（设计 §5.2/§7.1/§7.2，T1.3c 首次接事务语义）。在 {@code storage.trx} 持事务语义，调
- * {@code storage.undo} 物理设施（{@link UndoLogSegmentAccess}）写 INSERT undo record，返回真
- * {@link RollPointer} 供聚簇记录盖 {@code DB_ROLL_PTR}。
+ * 事务 undo 门面（设计 §5.2/§7.1/§7.2）。在 {@code storage.trx} 持事务语义，调用
+ * {@code storage.undo} 物理设施（{@link UndoLogSegmentAccess}）写 INSERT/UPDATE/DELETE_MARK undo record，
+ * 返回真 {@link RollPointer} 供聚簇记录盖 {@code DB_ROLL_PTR}，并在 commit/rollback/recovery/purge
+ * 流程中维护 undo slot 与 history list。
  *
  * <p><b>依赖方向</b>：{@code storage.trx → storage.undo}。本类 import {@link MiniTransaction}（物理短事务）、
  * {@link UndoLogSegmentAccess}/{@link UndoRecord}（undo 物理设施）与 record schema/type；不反向暴露
  * {@link Transaction} 内部给 undo。{@code storage.undo} 不 import 本类或 {@code Transaction}。
  *
- * <p><b>本片范围</b>：仅 {@code beforeInsert}（INSERT undo）。UPDATE/DELETE undo、rollback 反向走链、
- * savepoint、commit 标 insert undo REUSABLE、slot 回收、持久 rseg header、恢复期 active slot 扫描全部留
- * T1.3d+（见 current map 缺口）。
+ * <p><b>当前范围</b>：支持 {@code beforeInsert}/{@code beforeUpdate}/{@code beforeDelete}、
+ * {@code onCommit}、持久 rseg header 以及恢复期 active slot 扫描的基础编排；savepoint、statement rollback、
+ * prepared transaction 与多 rseg 调度仍留后续切片。
  *
- * <p><b>WAL</b>（§7.2）：{@code beforeInsert} 在调用方传入的 MTR 内追加 undo record；调用方随后在同一 MTR
+ * <p><b>WAL</b>（§7.2）：{@code beforeX} 在调用方传入的 MTR 内追加 undo record；调用方随后在同一 MTR
  * 写聚簇记录，commit 时 undo page redo 与 index page redo 同批 durable。由于 MTR rollback 不撤销页内容，
- * 本片只保证成功插入路径；失败插入的原子清理（orphan undo）留 DML facade/rollback 片，并在 current map 标缺口。
+ * 已写 undo 但聚簇修改失败的边界由事务级 {@link RollbackService} 幂等回滚兜底；statement/savepoint
+ * 级别原子性仍留后续。
  *
  * <p><b>并发</b>：slot 认领由 {@link RollbackSegmentSlotManager} 的 {@code ReentrantLock} 串行，锁内不分配页、
  * 不访问 BufferPool、不等待 IO；页分配（{@link UndoLogSegmentAccess#create}）在 slot 锁外完成。本片单 writer
@@ -45,7 +48,7 @@ import java.util.List;
  */
 public final class UndoLogManager {
 
-    /** undo 物理设施入口；{@code beforeInsert} 经它 create/open insert undo segment 并 append。 */
+    /** undo 物理设施入口；{@code beforeX} 经它 create/open undo segment 并 append 对应版本记录。 */
     private final UndoLogSegmentAccess access;
     /** 内存 rseg slot 目录；首写时认领 slot 登记 insert undo 首页。固定单一默认 rseg。 */
     private final RollbackSegmentSlotManager slotManager;
@@ -253,9 +256,10 @@ public final class UndoLogManager {
      *       T1.4 MVCC 旧版本读 / purge 需要，不能在 commit 即回收。其回收留 purge/undo truncation 片（已知缺口）。</li>
      * </ul>
      *
-     * <p><b>commit 编排</b>：{@code TransactionManager.commit()} 保持纯内存状态、**不**自动调用本方法；调用方
-     * （当前 test-wired，未来 DML facade）在 commit 流程中显式调 {@code onCommit(txn)}，与 {@code txnMgr.commit(txn)}
-     * 无状态依赖、顺序不敏感。本片只回收内存 slot，不回收 undo record/page/segment（物理回收留 purge/truncation 片）。
+     * <p><b>commit 编排</b>：{@code TransactionManager.commit()} 保持纯内存状态、**不**自动调用本方法；2.1 起
+     * {@code ClusteredDmlService.commit} 先通过 {@code TransactionManager.prepareCommit(txn)} 预留提交号，
+     * 再调用本方法持久化 undo commit marker，最后才 {@code commit(txn)} 移出 active table。本方法只处理
+     * slot/history 状态，undo record/page/segment 的物理回收留 purge/truncation 片。
      *
      * @param txn 提交中的事务，不能为 null。
      */
@@ -271,13 +275,18 @@ public final class UndoLogManager {
         // 清 page3 槽（0.3 release）。mtrManager 为 null（纯内存 fixture）时不持久——既有 test-only 行为不变。
         if (mtrManager != null) {
             MiniTransaction commitMtr = mtrManager.begin();
-            // R 1.3：标 COMMITTED 同时写提交序号（txn.transactionNo()，commit 已分配），供恢复重建 committed history
-            access.open(commitMtr, ctx.undoFirstPageId(), PageLatchMode.EXCLUSIVE)
-                    .markCommitted(txn.transactionNo());
-            if (!ctx.hasUpdateUndo() && headerRepo != null) {
-                writeRsegSlotAfterUndoPage(commitMtr, ctx.slotId(), null);
+            try {
+                // R 1.3：标 COMMITTED 同时写提交序号（txn.transactionNo()，commit 前已预留），供恢复重建 committed history。
+                access.open(commitMtr, ctx.undoFirstPageId(), PageLatchMode.EXCLUSIVE)
+                        .markCommitted(txn.transactionNo());
+                if (!ctx.hasUpdateUndo() && headerRepo != null) {
+                    writeRsegSlotAfterUndoPage(commitMtr, ctx.slotId(), null);
+                }
+                mtrManager.commit(commitMtr);
+            } catch (RuntimeException e) {
+                rollbackCommitMtr(commitMtr, e);
+                throw e;
             }
-            mtrManager.commit(commitMtr);
         }
         if (ctx.hasUpdateUndo()) {
             // 含 update/delete undo：挂入 history list 供 purge 按 TransactionNo boundary 回收（slot/段由 purge 释放，
@@ -286,7 +295,7 @@ public final class UndoLogManager {
             if (no.isNone()) {
                 throw new TransactionStateException(
                         "onCommit requires an assigned TransactionNo for an update-undo transaction; "
-                                + "call TransactionManager.commit before onCommit");
+                                + "call TransactionManager.prepareCommit before onCommit");
             }
             history.submitCommitted(new HistoryEntry(no, txn.transactionId(), undoSpace,
                     ctx.undoFirstPageId(), ctx.slotId()));
@@ -294,6 +303,17 @@ public final class UndoLogManager {
             // 纯 insert undo：提交即不再服务一致性读（§7.2）。持久清 page3 已在上面同 MTR 完成，提交成功后才释放内存 slot。
             slotManager.release(ctx.slotId());
             history.submitInsertReclaim(new InsertReclaimEntry(undoSpace, ctx.undoFirstPageId()));
+        }
+    }
+
+    private void rollbackCommitMtr(MiniTransaction commitMtr, RuntimeException original) {
+        if (commitMtr.state() != MiniTransactionState.ACTIVE) {
+            return;
+        }
+        try {
+            mtrManager.rollbackUncommitted(commitMtr);
+        } catch (RuntimeException rollbackError) {
+            original.addSuppressed(rollbackError);
         }
     }
 

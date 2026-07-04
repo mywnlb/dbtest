@@ -19,8 +19,9 @@ import java.util.Optional;
  * B+Tree current-read 协调器。它把物理短 MTR 定位和事务逻辑锁等待拆开：先定位 record/gap 并提交 MTR 释放
  * page latch/buffer fix，再进入 LockManager 等待；锁授予后重新定位校验，避免持旧 RecordRef 继续访问。
  *
- * <p>当前支持 point current-read、unique insert 物理检查，以及批量 range current-read。SQL/session DML facade
- * 与事务生命周期自动释放仍在上层后续切片完成。
+ * <p>当前支持 point current-read、unique insert 物理检查，以及批量 range current-read。2.1 起单聚簇
+ * {@code ClusteredDmlService} 已调用 point/unique 路径并在 facade commit/rollback 释放锁；SQL/session/executor
+ * 与 range DML 仍在上层后续切片完成。
  */
 public final class BTreeCurrentReadService {
 

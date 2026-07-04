@@ -68,6 +68,23 @@ public final class TransactionManager {
     }
 
     /**
+     * 为提交预留 {@code TransactionNo}，但事务仍保持 ACTIVE 且留在活跃表。DML facade 需要先把
+     * {@code UndoLogManager.onCommit} 的 undo header/slot 状态持久化，再真正移出 active table；否则
+     * onCommit 失败后崩溃恢复会把已暴露为 COMMITTED 的事务误判为 ACTIVE undo 并回滚。
+     *
+     * <p>该方法只做提交序号的幂等预分配，不释放 ReadView、不释放事务锁、不进入 COMMITTING。调用方若后续
+     * onCommit 失败，仍可按 ACTIVE 事务执行 rollback；若成功，再调用 {@link #commit(Transaction)} 完成状态转换。
+     *
+     * @param txn 仍处于 ACTIVE 的事务。
+     */
+    public void prepareCommit(Transaction txn) {
+        requireActive(txn);
+        if (!txn.transactionId().isNone() && txn.transactionNo().isNone()) {
+            txn.setTransactionNo(system.allocateTransactionNo());
+        }
+    }
+
+    /**
      * 提交：ACTIVE→COMMITTING→COMMITTED。读写事务分配提交序号并移出活跃表；只读事务（id 仍 NONE）
      * 不分配序号、无需移出。不刷数据页、不撤销记录。
      */
@@ -75,7 +92,9 @@ public final class TransactionManager {
         requireActive(txn);
         txn.transitionTo(TransactionState.COMMITTING);
         if (!txn.transactionId().isNone()) {
-            txn.setTransactionNo(system.allocateTransactionNo());
+            if (txn.transactionNo().isNone()) {
+                txn.setTransactionNo(system.allocateTransactionNo());
+            }
             system.removeActive(txn.transactionId().value());
         }
         // 移出活跃表后、进入终态前释放事务级 ReadView（T1.4；RC/未开 ReadView 时为 no-op）

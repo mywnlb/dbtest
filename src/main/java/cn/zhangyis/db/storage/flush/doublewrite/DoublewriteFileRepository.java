@@ -35,8 +35,10 @@ import java.util.zip.CRC32;
 public final class DoublewriteFileRepository implements AutoCloseable {
 
     private static final int MAGIC = 0x44574231; // "DWB1"
-    private static final int FORMAT_VERSION = 1;
+    private static final int LEGACY_FULL_COPY_FORMAT_VERSION = 1;
+    private static final int FORMAT_VERSION = 2;
     private static final int SLOT_HEADER_BYTES = 36;
+    private static final int DETECT_ONLY_METADATA_BYTES = Integer.BYTES + Long.BYTES + Integer.BYTES;
     private static final int DEFAULT_SLOT_COUNT = 1024;
 
     /** 文件路径；仅用于诊断。 */
@@ -116,6 +118,35 @@ public final class DoublewriteFileRepository implements AutoCloseable {
             throw new DatabaseValidationException("flush page snapshot must not be null");
         }
         appendBatch(DoublewriteBatch.single(snapshot));
+    }
+
+    /**
+     * 写入 detect-only metadata slot。该 slot 只用于恢复期发现可疑页，不能作为完整页副本写回 data file。
+     *
+     * @param snapshot 页镜像快照；仓储只持久化 pageId/pageLSN/page checksum 摘要。
+     */
+    public void appendDetectOnly(FlushPageSnapshot snapshot) {
+        if (snapshot == null) {
+            throw new DatabaseValidationException("flush page snapshot must not be null");
+        }
+        ioLock.lock();
+        int startSlot = -1;
+        try {
+            DoublewriteBatch batch = DoublewriteBatch.single(snapshot);
+            startSlot = reserveBatch(batch);
+            ByteBuffer slot = encodeDetectOnlySlot(snapshot);
+            channel.position(slotOffset(startSlot));
+            while (slot.hasRemaining()) {
+                channel.write(slot);
+            }
+        } catch (IOException e) {
+            if (startSlot >= 0) {
+                clearReservationRange(startSlot, 1);
+            }
+            throw new FlushWriteException("failed to append detect-only doublewrite slot: " + path, e);
+        } finally {
+            ioLock.unlock();
+        }
     }
 
     /**
@@ -221,7 +252,8 @@ public final class DoublewriteFileRepository implements AutoCloseable {
             long size = channel.size();
             for (long position = 0; position + SLOT_HEADER_BYTES <= size; position += slotSize()) {
                 ValidSlot slot = readValidSlotAt(position);
-                if (slot != null && pageId.equals(slot.pageId()) && slot.pageLsn() >= latestPageLsn) {
+                if (slot != null && slot.kind() == DoublewriteSlotKind.FULL_COPY
+                        && pageId.equals(slot.pageId()) && slot.pageLsn() >= latestPageLsn) {
                     latestPageLsn = slot.pageLsn();
                     byte[] bytes = slot.payload();
                     latest = Optional.of(bytes.clone());
@@ -236,8 +268,8 @@ public final class DoublewriteFileRepository implements AutoCloseable {
     }
 
     /**
-     * 枚举 doublewrite 文件中所有有效 slot 的去重页号（恢复期"待检查页列表"来源）。有效定义同 {@link #latestCopy}：
-     * slot CRC 匹配且页镜像自身 checksum/trailer 校验通过；无效/尾部截断 slot 跳过。返回首见顺序的去重列表。
+     * 枚举 doublewrite 文件中所有有效 slot 的去重页号（恢复期"待检查页列表"来源）。full-copy 有效要求页镜像自身
+     * checksum/trailer 通过；detect-only 有效要求 metadata payload CRC 通过。返回首见顺序的去重列表。
      *
      * @return 有有效副本的去重 {@link PageId} 列表。
      */
@@ -255,6 +287,31 @@ public final class DoublewriteFileRepository implements AutoCloseable {
             return List.copyOf(ids);
         } catch (IOException e) {
             throw new FlushWriteException("failed to scan doublewrite file: " + path, e);
+        } finally {
+            ioLock.unlock();
+        }
+    }
+
+    /**
+     * 枚举 doublewrite 文件中的有效 slot 摘要。该方法是恢复诊断入口：调用方可区分 full-copy 与 detect-only，
+     * 避免把 detect-only metadata 误当作可写回 data file 的完整页副本。
+     *
+     * @return 有效 slot 摘要列表，按文件位置顺序返回。
+     */
+    public List<DoublewriteSlotEntry> scanEntries() {
+        ioLock.lock();
+        try {
+            java.util.ArrayList<DoublewriteSlotEntry> entries = new java.util.ArrayList<>();
+            long size = channel.size();
+            for (long position = 0; position + SLOT_HEADER_BYTES <= size; position += slotSize()) {
+                ValidSlot slot = readValidSlotAt(position);
+                if (slot != null) {
+                    entries.add(new DoublewriteSlotEntry(slot.pageId(), slot.pageLsn(), slot.kind(), slot.checksum()));
+                }
+            }
+            return List.copyOf(entries);
+        } catch (IOException e) {
+            throw new FlushWriteException("failed to scan doublewrite entries: " + path, e);
         } finally {
             ioLock.unlock();
         }
@@ -356,6 +413,27 @@ public final class DoublewriteFileRepository implements AutoCloseable {
         return slot;
     }
 
+    private ByteBuffer encodeDetectOnlySlot(FlushPageSnapshot snapshot) {
+        byte[] source = snapshot.pageImage();
+        requirePageImage(source);
+        byte[] payload = new byte[pageSize.bytes()];
+        ByteBuffer metadata = ByteBuffer.wrap(payload);
+        metadata.putInt(DETECT_ONLY_METADATA_BYTES);
+        metadata.putLong(snapshot.pageLsn().value());
+        metadata.putInt(crc32(source));
+        ByteBuffer slot = ByteBuffer.allocate(slotSize());
+        slot.putInt(MAGIC);
+        slot.putInt(FORMAT_VERSION);
+        slot.putInt(snapshot.pageId().spaceId().value());
+        slot.putLong(snapshot.pageId().pageNo().value());
+        slot.putLong(snapshot.pageLsn().value());
+        slot.putInt(pageSize.bytes());
+        slot.putInt(crc32(payload));
+        slot.put(payload);
+        slot.flip();
+        return slot;
+    }
+
     private ValidSlot readValidSlotAt(long position) throws IOException {
         channel.position(position);
         ByteBuffer header = ByteBuffer.allocate(SLOT_HEADER_BYTES);
@@ -373,7 +451,8 @@ public final class DoublewriteFileRepository implements AutoCloseable {
         long pageLsn = header.getLong();
         int pageBytes = header.getInt();
         int expectedCrc = header.getInt();
-        if (format != FORMAT_VERSION || pageBytes != pageSize.bytes()) {
+        if ((format != LEGACY_FULL_COPY_FORMAT_VERSION && format != FORMAT_VERSION)
+                || pageBytes != pageSize.bytes()) {
             return null;
         }
         ByteBuffer payload = ByteBuffer.allocate(pageBytes);
@@ -381,10 +460,33 @@ public final class DoublewriteFileRepository implements AutoCloseable {
             return null;
         }
         byte[] bytes = payload.array();
-        if (crc32(bytes) != expectedCrc || !PageImageChecksum.verify(bytes, pageSize)) {
+        if (crc32(bytes) != expectedCrc) {
             return null;
         }
-        return new ValidSlot(PageId.of(SpaceId.of(space), PageNo.of(pageNo)), pageLsn, bytes);
+        if (format == LEGACY_FULL_COPY_FORMAT_VERSION) {
+            if (!PageImageChecksum.verify(bytes, pageSize)) {
+                return null;
+            }
+            return new ValidSlot(PageId.of(SpaceId.of(space), PageNo.of(pageNo)), pageLsn,
+                    DoublewriteSlotKind.FULL_COPY, expectedCrc, bytes);
+        }
+        if (PageImageChecksum.verify(bytes, pageSize)) {
+            return new ValidSlot(PageId.of(SpaceId.of(space), PageNo.of(pageNo)), pageLsn,
+                    DoublewriteSlotKind.FULL_COPY, expectedCrc, bytes);
+        }
+        if (!isValidDetectOnlyPayload(bytes, pageLsn)) {
+            return null;
+        }
+        return new ValidSlot(PageId.of(SpaceId.of(space), PageNo.of(pageNo)), pageLsn,
+                DoublewriteSlotKind.DETECT_ONLY_METADATA, expectedCrc, bytes);
+    }
+
+    private boolean isValidDetectOnlyPayload(byte[] bytes, long pageLsn) {
+        ByteBuffer metadata = ByteBuffer.wrap(bytes);
+        int metadataBytes = metadata.getInt();
+        long metadataLsn = metadata.getLong();
+        metadata.getInt();
+        return metadataBytes == DETECT_ONLY_METADATA_BYTES && metadataLsn == pageLsn;
     }
 
     private boolean readFullyOrTail(ByteBuffer dst) throws IOException {
@@ -414,7 +516,7 @@ public final class DoublewriteFileRepository implements AutoCloseable {
         }
     }
 
-    private record ValidSlot(PageId pageId, long pageLsn, byte[] payload) {
+    private record ValidSlot(PageId pageId, long pageLsn, DoublewriteSlotKind kind, int checksum, byte[] payload) {
     }
 
     private static int crc32(byte[] bytes) {

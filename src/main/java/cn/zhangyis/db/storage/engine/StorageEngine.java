@@ -16,6 +16,7 @@ import cn.zhangyis.db.server.lockobs.snapshot.LockDiagnosticSnapshot;
 import cn.zhangyis.db.storage.api.DiskSpaceManager;
 import cn.zhangyis.db.storage.api.DiskSpaceUndoAllocator;
 import cn.zhangyis.db.storage.api.index.IndexPageAccess;
+import cn.zhangyis.db.storage.api.dml.ClusteredDmlService;
 import cn.zhangyis.db.storage.api.tablespace.PageZeroTablespaceMetadataLoader;
 import cn.zhangyis.db.storage.api.undotruncate.UndoTablespaceTruncationRecovery;
 import cn.zhangyis.db.storage.api.undotruncate.UndoTablespaceTruncationService;
@@ -36,7 +37,9 @@ import cn.zhangyis.db.storage.flush.CoordinatedDirtyVictimFlusher;
 import cn.zhangyis.db.storage.flush.FlushCoordinator;
 import cn.zhangyis.db.storage.flush.FlushCycleResult;
 import cn.zhangyis.db.storage.flush.FlushService;
+import cn.zhangyis.db.storage.flush.cleaner.PageCleanerMetricsSnapshot;
 import cn.zhangyis.db.storage.flush.cleaner.PageCleanerState;
+import cn.zhangyis.db.storage.flush.cleaner.PageCleanerSupervisor;
 import cn.zhangyis.db.storage.flush.cleaner.PageCleanerWorker;
 import cn.zhangyis.db.storage.buf.ReadAheadService;
 import cn.zhangyis.db.storage.buf.BufferPoolWarmupService;
@@ -110,7 +113,8 @@ import java.util.Set;
  * 接入。doublewrite 已常开为 {@link RecoverableDoublewriteStrategy}，但恢复页列表来自 doublewrite 文件有效 slot 并
  * 过滤到 recovery 已打开空间，仍没有全空间 checksum discovery。
  *
- * <p>访问器暴露已接线的事务/disk/btree/undo/mvcc/rollback 服务，供测试与未来 DML facade（E4）驱动；本类不含 DML 逻辑。
+ * <p>访问器暴露已接线的事务/disk/btree/undo/mvcc/rollback/DML facade 服务；本类只负责组合根与生命周期，
+ * 普通 DML 语义由 {@link ClusteredDmlService} 编排。
  */
 public final class StorageEngine {
 
@@ -138,12 +142,14 @@ public final class StorageEngine {
     private TransactionManager transactionManager;
     private UndoLogManager undoLogManager;
     private SplitCapableBTreeIndexService btreeService;
-    /** 0.17 事务锁内核；current-read/DML 后续均共享这一实例。 */
+    /** 0.17 事务锁内核；current-read 与单聚簇 DML 共享这一实例。 */
     private LockManager lockManager;
     /** server.lockobs row-lock 观测服务；只读消费 LockManager 事实，不参与授锁或 rollback。 */
     private LockObservationService lockObservationService;
-    /** B+Tree current-read 点查/unique-check 协调器；不自动接事务提交释放锁。 */
+    /** B+Tree current-read 点查/unique-check 协调器；授予的锁由 DML/上层事务结束入口释放。 */
     private BTreeCurrentReadService btreeCurrentReadService;
+    /** 单聚簇索引 DML facade；只做 storage 内事务/undo/B+Tree/redo 编排，不包含 SQL/DD/session 语义。 */
+    private ClusteredDmlService dmlService;
     private IndexPageAccess indexPageAccess;
     private MvccReader mvccReader;
     private RollbackService rollbackService;
@@ -165,7 +171,7 @@ public final class StorageEngine {
     private PurgeDriverWorker purgeDriverWorker;
     private FlushService flushService;
     /** E3a 后台 page cleaner；只由 engine 生命周期启动/停止，所有刷脏仍走 {@link FlushService}。 */
-    private PageCleanerWorker pageCleanerWorker;
+    private PageCleanerSupervisor pageCleanerSupervisor;
     /** 0.10a 后台 linear read-ahead 服务；只由 engine 生命周期启动/停止，预取经 {@code BufferPool.prefetch}（不 fix）。 */
     private ReadAheadService readAheadService;
     /** linear read-ahead 触发阈值（同一 extent 连续访问页数，对齐 InnoDB 默认 56）。当前固定常量，按需再升为 config。 */
@@ -256,6 +262,8 @@ public final class StorageEngine {
                 config.undoSpaceId(), config.maxVersionHops());
         this.rollbackService = new RollbackService(btreeService, undoAccess, rollbackSlots, transactionManager,
                 miniTransactionManager);
+        this.dmlService = new ClusteredDmlService(transactionManager, undoLogManager, miniTransactionManager,
+                btreeService, btreeCurrentReadService, rollbackService, lockManager, redo, recoveryGate);
 
         FlushCoordinator flushCoordinator = new FlushCoordinator(pool, store, redo, config.pageSize(),
                 new RecoverableDoublewriteStrategy(doublewriteRepo), config.flushTimeout(), accessController);
@@ -476,9 +484,11 @@ public final class StorageEngine {
         if (!config.backgroundFlushEnabled()) {
             return;
         }
-        pageCleanerWorker = new PageCleanerWorker(flushService, config.pageCleanerQueueCapacity(),
-                config.backgroundFlushInterval(), config.backgroundFlushMaxPages());
-        pageCleanerWorker.start();
+        pageCleanerSupervisor = new PageCleanerSupervisor(
+                () -> new PageCleanerWorker(flushService, config.pageCleanerQueueCapacity(),
+                        config.backgroundFlushInterval(), config.backgroundFlushMaxPages()),
+                1, config.backgroundFlushInterval(), config.backgroundFlushInterval());
+        pageCleanerSupervisor.start();
     }
 
     private void startBackgroundRedoFlusher() {
@@ -565,10 +575,10 @@ public final class StorageEngine {
      * 超时不继续关闭 page store/buffer pool，避免后台 IO 与句柄释放并发。
      */
     private void stopBackgroundPageCleaner() {
-        if (pageCleanerWorker == null) {
+        if (pageCleanerSupervisor == null) {
             return;
         }
-        boolean stopped = pageCleanerWorker.stop(config.backgroundFlushStopTimeout());
+        boolean stopped = pageCleanerSupervisor.stop(config.backgroundFlushStopTimeout());
         if (!stopped) {
             throw new DatabaseRuntimeException("page cleaner did not stop within "
                     + config.backgroundFlushStopTimeout());
@@ -645,6 +655,15 @@ public final class StorageEngine {
     }
 
     /**
+     * 单聚簇索引 DML facade。当前无 SQL executor/DD/session，调用方必须显式传入事务、索引快照和行值；
+     * 本入口保证生产代码通过同一套 transaction/undo/current-read/B+Tree/redo/lock 实例完成编排。
+     */
+    public ClusteredDmlService dmlService() {
+        requireOpen();
+        return dmlService;
+    }
+
+    /**
      * 采集当前 row-lock 诊断快照。数据流为：从生产共享 {@link LockManager} 复制只读锁表/等待图快照，
      * 再交给 server.lockobs 适配成 `data_locks` / `data_lock_waits` 行；本方法不授锁、不释放锁，也不访问
      * B+Tree page latch 或 BufferFrame。
@@ -660,7 +679,7 @@ public final class StorageEngine {
         return lockObservationService.captureSnapshot(lockManager.snapshot(), request);
     }
 
-    /** 索引页格式化入口（建聚簇/二级索引 root 页用）。E4 DML/DDL 接线前供测试与上层格式化索引页。 */
+    /** 索引页格式化入口（建聚簇/二级索引 root 页用）。无 DD 前仍由测试与上层显式格式化索引页。 */
     public IndexPageAccess indexPageAccess() {
         requireOpen();
         return indexPageAccess;
@@ -725,7 +744,7 @@ public final class StorageEngine {
      * 如果配置禁用了后台 worker，则返回 NEW 表示未构造线程。
      */
     public PageCleanerState pageCleanerState() {
-        return pageCleanerWorker == null ? PageCleanerState.NEW : pageCleanerWorker.state();
+        return pageCleanerSupervisor == null ? PageCleanerState.NEW : pageCleanerSupervisor.state();
     }
 
     /** 后台 redo flusher 状态（诊断用）；未启动返回 NEW。 */
@@ -735,7 +754,15 @@ public final class StorageEngine {
 
     /** 最近一轮后台 flush/checkpoint tick 结果；禁用后台 worker 或尚未执行过 tick 时为空。 */
     public Optional<FlushCycleResult> lastBackgroundFlushCycle() {
-        return pageCleanerWorker == null ? Optional.empty() : pageCleanerWorker.lastCycle();
+        return pageCleanerSupervisor == null ? Optional.empty() : pageCleanerSupervisor.lastCycle();
+    }
+
+    /** 后台 page cleaner supervisor metrics；未启动时返回 NEW 状态的空快照。 */
+    public PageCleanerMetricsSnapshot pageCleanerMetrics() {
+        if (pageCleanerSupervisor == null) {
+            return new PageCleanerMetricsSnapshot(PageCleanerState.NEW, 0, 0, 0, false, "", 0, 0);
+        }
+        return pageCleanerSupervisor.metricsSnapshot();
     }
 
     /**
@@ -746,7 +773,7 @@ public final class StorageEngine {
         if (timeout == null) {
             throw new DatabaseValidationException("background flush await timeout must not be null");
         }
-        return pageCleanerWorker == null || pageCleanerWorker.awaitIdle(timeout);
+        return pageCleanerSupervisor == null || pageCleanerSupervisor.awaitIdle(timeout);
     }
 
     private void requireOpen() {

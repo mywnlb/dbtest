@@ -11,6 +11,7 @@ import cn.zhangyis.db.storage.fil.io.FileChannelPageStore;
 import cn.zhangyis.db.storage.fil.io.PageStore;
 import cn.zhangyis.db.storage.flush.doublewrite.DoublewriteFileRepository;
 import cn.zhangyis.db.storage.flush.doublewrite.DoublewriteRecoveryScanner;
+import cn.zhangyis.db.storage.flush.doublewrite.DetectOnlyDoublewriteStrategy;
 import cn.zhangyis.db.storage.flush.doublewrite.RecoverableDoublewriteStrategy;
 import cn.zhangyis.db.storage.page.PageEnvelopeLayout;
 import cn.zhangyis.db.storage.page.PageImageChecksum;
@@ -100,6 +101,34 @@ class CrashRecoveryServiceTest {
                             RecoveryStageName.REDO_REPLAY,
                             RecoveryStageName.OPEN_TRAFFIC),
                     report.completedStages());
+        }
+    }
+
+    @Test
+    void recoverReportsDetectOnlyPagesSeparatelyFromRepairedPages() {
+        Path redoPath = dir.resolve("detect-only-redo.log");
+        try (RedoLogFileRepository redoRepo = RedoLogFileRepository.open(redoPath)) {
+            RedoLogManager redo = RedoLogManager.durable(redoRepo);
+            redo.append(List.of(new PageInitRecord(PAGE, PageType.INDEX)));
+            redo.flush();
+        }
+
+        try (PageStore store = new FileChannelPageStore();
+             DoublewriteFileRepository doublewriteRepo = DoublewriteFileRepository.open(dir.resolve("detect-only-dw.dat"), PS);
+             RedoLogFileRepository redoRepo = RedoLogFileRepository.open(redoPath);
+             RedoCheckpointStore checkpointStore = RedoCheckpointStore.open(dir.resolve("detect-only-control"))) {
+            store.create(SPACE, dir.resolve("detect-only.ibd"), PS, PageNo.of(4));
+            writeDetectOnlyMetadataAndBrokenDataPage(store, doublewriteRepo, Lsn.of(10));
+            DoublewriteRecoveryScanner scanner = new DoublewriteRecoveryScanner(doublewriteRepo, store, PS);
+
+            RecoveryRequest request = RecoveryRequest.normal(checkpointStore, redoRepo,
+                            RedoApplyDispatcher.pageDispatcher(), new RedoApplyContext(store, PS))
+                    .withDoublewriteRepair(scanner, List.of(PAGE));
+
+            RecoveryReport report = new CrashRecoveryService(new RecoveryTrafficGate()).recover(request);
+
+            assertEquals(0, report.repairedPageCount());
+            assertEquals(1, report.detectedOnlyPageCount());
         }
     }
 
@@ -289,6 +318,28 @@ class CrashRecoveryServiceTest {
         PageImageChecksum.stamp(image, PS);
         new RecoverableDoublewriteStrategy(doublewriteRepo)
                 .beforeDataFileWrite(new FlushPageSnapshot(PAGE, pageLsn, 1, image));
+
+        byte[] broken = image.clone();
+        broken[FIRST_OFFSET] = 1;
+        store.writePage(PAGE, ByteBuffer.wrap(broken));
+        store.force(SPACE);
+    }
+
+    private void writeDetectOnlyMetadataAndBrokenDataPage(PageStore store,
+                                                          DoublewriteFileRepository doublewriteRepo,
+                                                          Lsn pageLsn) {
+        byte[] image = new byte[PS.bytes()];
+        ByteBuffer page = ByteBuffer.wrap(image);
+        page.putInt(PageEnvelopeLayout.SPACE_ID, SPACE.value());
+        page.putInt(PageEnvelopeLayout.PAGE_NO, (int) PAGE.pageNo().value());
+        page.putLong(PageEnvelopeLayout.PAGE_LSN, pageLsn.value());
+        page.putInt(PageEnvelopeLayout.PAGE_TYPE, PageType.INDEX.code());
+        image[FIRST_OFFSET] = 7;
+        PageImageChecksum.stamp(image, PS);
+        FlushPageSnapshot snapshot = new FlushPageSnapshot(PAGE, pageLsn, 1, image);
+        DetectOnlyDoublewriteStrategy strategy = new DetectOnlyDoublewriteStrategy(doublewriteRepo);
+        strategy.beforeDataFileWrite(snapshot);
+        strategy.afterDataFileWrite(snapshot);
 
         byte[] broken = image.clone();
         broken[FIRST_OFFSET] = 1;

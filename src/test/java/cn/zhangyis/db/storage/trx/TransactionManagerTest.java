@@ -36,6 +36,24 @@ class TransactionManagerTest {
     }
 
     @Test
+    void prepareCommitAssignsNoWithoutRemovingActiveTransaction() {
+        TransactionManager mgr = newManager();
+        Transaction t = mgr.begin(TransactionOptions.defaults());
+        TransactionId id = mgr.assignWriteId(t);
+
+        mgr.prepareCommit(t);
+
+        assertEquals(TransactionState.ACTIVE, t.state(), "prepareCommit 只预留提交序号，不进入 COMMITTING");
+        assertFalse(t.transactionNo().isNone(), "读写事务在持久化 undo commit 前需要先预留 TransactionNo");
+        assertTrue(mgr.system().snapshotActiveReadWriteIds().contains(id.value()),
+                "undo onCommit 失败时仍必须能按 active 事务恢复/回滚");
+
+        mgr.commit(t);
+        assertEquals(TransactionState.COMMITTED, t.state());
+        assertFalse(mgr.system().snapshotActiveReadWriteIds().contains(id.value()));
+    }
+
+    @Test
     void readOnlyCommitAssignsNoTransactionNo() {
         TransactionManager mgr = newManager();
         Transaction t = mgr.begin(new TransactionOptions(IsolationLevel.REPEATABLE_READ, true, true));

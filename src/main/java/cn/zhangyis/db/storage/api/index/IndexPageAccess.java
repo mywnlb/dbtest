@@ -3,9 +3,11 @@ package cn.zhangyis.db.storage.api.index;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageSize;
+import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.PageGuard;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
+import cn.zhangyis.db.storage.fil.meta.TablespaceRegistry;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.page.FilePageHeader;
 import cn.zhangyis.db.storage.page.PageEnvelope;
@@ -24,13 +26,34 @@ public final class IndexPageAccess {
 
     private final BufferPool pool;
     private final PageSize pageSize;
+    /**
+     * 可选运行时表空间 registry。生产组合根注入共享 registry 后，本类会在 MTR 持有表空间 S lease 后复核状态；
+     * 两参构造保留给低层页格式单测，不做 lifecycle 状态准入。
+     */
+    private final TablespaceRegistry tablespaceRegistry;
 
     public IndexPageAccess(BufferPool pool, PageSize pageSize) {
+        this(pool, pageSize, null);
+    }
+
+    /**
+     * 创建带运行时表空间状态准入的 INDEX 页访问器。数据流为：调用方传入 MTR 和 PageId →
+     * 本类先通过 {@link MiniTransaction#acquireTablespaceLease(SpaceId)} 获取共享 operation lease →
+     * 再调用 {@link TablespaceRegistry#require(SpaceId)} 复核 NORMAL/ACTIVE 状态 →
+     * 最后进入 Buffer Pool fix/newPage。这样若 truncate/drop/discard 在调用前后切换状态，醒来的线程会看到新状态，
+     * 不会绕过 {@code DiskSpaceManager} 的准入边界直接访问旧页。
+     *
+     * @param pool Buffer Pool。
+     * @param pageSize 页大小。
+     * @param tablespaceRegistry 运行时表空间 registry；可为 null，表示只做 MTR/页类型边界校验。
+     */
+    public IndexPageAccess(BufferPool pool, PageSize pageSize, TablespaceRegistry tablespaceRegistry) {
         if (pool == null || pageSize == null) {
             throw new DatabaseValidationException("index page access pool/pageSize must not be null");
         }
         this.pool = pool;
         this.pageSize = pageSize;
+        this.tablespaceRegistry = tablespaceRegistry;
     }
 
     /**
@@ -61,6 +84,7 @@ public final class IndexPageAccess {
         if (level < 0) {
             throw new DatabaseValidationException("level must be non-negative: " + level);
         }
+        requireOrdinaryAccess(mtr, pageId.spaceId());
         PageGuard g = mtr.newPage(pool, pageId, PageLatchMode.EXCLUSIVE, PageType.INDEX);
         PageEnvelope.writeHeader(g, new FilePageHeader(pageId.spaceId(), pageId.pageNo().value(),
                 FilePageHeader.FIL_NULL, FilePageHeader.FIL_NULL, 0L, PageType.INDEX));
@@ -85,6 +109,7 @@ public final class IndexPageAccess {
         if (mtr == null || pageId == null || mode == null) {
             throw new DatabaseValidationException("openIndexPage mtr/pageId/mode must not be null");
         }
+        requireOrdinaryAccess(mtr, pageId.spaceId());
         PageGuard g = mtr.getPage(pool, pageId, mode);
         return new IndexPageHandle(pageId, g, pageSize);
     }
@@ -103,5 +128,13 @@ public final class IndexPageAccess {
             throw new DatabaseValidationException("releaseHandle mtr/handle must not be null");
         }
         mtr.releaseLatch(handle.pageId(), handle.guard());
+    }
+
+    private void requireOrdinaryAccess(MiniTransaction mtr, SpaceId spaceId) {
+        if (tablespaceRegistry == null) {
+            return;
+        }
+        mtr.acquireTablespaceLease(spaceId);
+        tablespaceRegistry.require(spaceId);
     }
 }

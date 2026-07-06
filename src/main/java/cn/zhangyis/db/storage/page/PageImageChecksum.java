@@ -50,19 +50,51 @@ public final class PageImageChecksum {
     }
 
     /**
-     * 校验页镜像 header checksum 与 trailer checksum 是否都等于当前页体 CRC32。
+     * 校验页镜像 header checksum、trailer checksum 与 trailer low32 LSN 是否都匹配当前页体。
+     * checksum 证明页体没有被撕裂；trailer low32 LSN 额外固定尾部 trailer 与 header pageLSN 的对应关系，
+     * 防止尾部来自另一轮写入但 checksum 字段尚未损坏的 partial page write 被误认为合法。
      *
      * @param page 整页镜像。
      * @param pageSize 页大小。
-     * @return true 表示 checksum 匹配。
+     * @return true 表示 checksum 与 trailer 均匹配。
      */
     public static boolean verify(byte[] page, PageSize pageSize) {
         requireArgs(page, pageSize);
         ByteBuffer view = ByteBuffer.wrap(page);
         int checksum = compute(page, pageSize);
         int trailerOffset = PageEnvelopeLayout.trailerOffset(pageSize);
+        long pageLsn = view.getLong(PageEnvelopeLayout.PAGE_LSN);
         return checksum == view.getInt(PageEnvelopeLayout.CHECKSUM)
-                && checksum == view.getInt(trailerOffset + PageEnvelopeLayout.TRAILER_CHECKSUM);
+                && checksum == view.getInt(trailerOffset + PageEnvelopeLayout.TRAILER_CHECKSUM)
+                && (int) pageLsn == view.getInt(trailerOffset + PageEnvelopeLayout.TRAILER_LOW32_LSN);
+    }
+
+    /**
+     * 校验 raw ByteBuffer 页镜像。该入口不改变传入 buffer 的 position/limit，
+     * 供 page0 metadata loader 在解码 FSP 物理字段前做页信封级校验。
+     *
+     * @param page 整页镜像缓冲。
+     * @param pageSize 页大小。
+     * @return true 表示 checksum 与 trailer 均匹配。
+     */
+    public static boolean verify(ByteBuffer page, PageSize pageSize) {
+        return verify(copyPage(page, pageSize), pageSize);
+    }
+
+    /**
+     * 判断页镜像是否属于历史版本未盖 checksum 的兼容格式：header checksum 与 trailer checksum 都为 0。
+     * 这不是校验通过，只能由明确兼容旧文件的调用方在页型、页号、spaceId 等强校验之后决定是否接受。
+     *
+     * @param page 整页镜像缓冲。
+     * @param pageSize 页大小。
+     * @return 两个 checksum 派生字段均为 0 时返回 true。
+     */
+    public static boolean hasLegacyZeroChecksums(ByteBuffer page, PageSize pageSize) {
+        requireBufferArgs(page, pageSize);
+        ByteBuffer view = page.asReadOnlyBuffer();
+        int trailerOffset = PageEnvelopeLayout.trailerOffset(pageSize);
+        return view.getInt(PageEnvelopeLayout.CHECKSUM) == 0
+                && view.getInt(trailerOffset + PageEnvelopeLayout.TRAILER_CHECKSUM) == 0;
     }
 
     private static void requireArgs(byte[] page, PageSize pageSize) {
@@ -73,5 +105,25 @@ public final class PageImageChecksum {
             throw new DatabaseValidationException("page image length must equal page size: expected "
                     + pageSize.bytes() + " got " + page.length);
         }
+    }
+
+    private static void requireBufferArgs(ByteBuffer page, PageSize pageSize) {
+        if (page == null || pageSize == null) {
+            throw new DatabaseValidationException("page buffer/page size must not be null");
+        }
+        if (page.capacity() < pageSize.bytes()) {
+            throw new DatabaseValidationException("page buffer capacity must be at least page size: expected "
+                    + pageSize.bytes() + " got " + page.capacity());
+        }
+    }
+
+    private static byte[] copyPage(ByteBuffer page, PageSize pageSize) {
+        requireBufferArgs(page, pageSize);
+        ByteBuffer view = page.asReadOnlyBuffer();
+        byte[] copy = new byte[pageSize.bytes()];
+        for (int i = 0; i < copy.length; i++) {
+            copy[i] = view.get(i);
+        }
+        return copy;
     }
 }

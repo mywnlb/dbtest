@@ -296,10 +296,10 @@ public final class StorageEngine {
         this.rsegHeaderRepo = new RollbackSegmentHeaderRepository(pool, config.pageSize());
         this.history = new HistoryList();
         this.undoAllocator = new DiskSpaceUndoAllocator(diskSpaceManager);
-        this.undoAccess = new UndoLogSegmentAccess(pool, config.pageSize(), undoAllocator, typeRegistry);
+        this.undoAccess = new UndoLogSegmentAccess(pool, config.pageSize(), undoAllocator, typeRegistry, registry);
         this.undoLogManager = new UndoLogManager(undoAccess, rollbackSlots, config.undoSpaceId(), history,
                 rsegHeaderRepo, miniTransactionManager);
-        this.indexPageAccess = new IndexPageAccess(pool, config.pageSize());
+        this.indexPageAccess = new IndexPageAccess(pool, config.pageSize(), registry);
         this.btreeService = new SplitCapableBTreeIndexService(indexPageAccess, diskSpaceManager, typeRegistry);
         this.lockObservationService = new DefaultLockObservationService();
         this.lockManager = new LockManager(lockObservationService);

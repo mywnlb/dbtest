@@ -10,8 +10,17 @@ import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.LruBufferPool;
 import cn.zhangyis.db.storage.buf.PageGuard;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
+import cn.zhangyis.db.storage.fil.exception.TablespaceUnavailableException;
+import cn.zhangyis.db.storage.fil.io.DataFileDescriptor;
 import cn.zhangyis.db.storage.fil.io.FileChannelPageStore;
 import cn.zhangyis.db.storage.fil.io.PageStore;
+import cn.zhangyis.db.storage.fil.meta.CachingTablespaceRegistry;
+import cn.zhangyis.db.storage.fil.meta.TablespaceMetadata;
+import cn.zhangyis.db.storage.fil.meta.TablespaceRegistry;
+import cn.zhangyis.db.storage.fil.state.SpaceFlags;
+import cn.zhangyis.db.storage.fil.state.TablespaceState;
+import cn.zhangyis.db.storage.fil.state.TablespaceType;
+import cn.zhangyis.db.storage.fil.state.TablespaceTypeFlags;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
 import cn.zhangyis.db.storage.page.PageEnvelope;
@@ -174,5 +183,37 @@ class IndexPageAccessTest {
             assertTrue(mgr.redoLogManager().bufferedRecords().isEmpty(), "no redo produced on validation failure");
             mgr.rollbackUncommitted(m);
         });
+    }
+
+    /**
+     * registry-aware INDEX access 必须在 MTR 取得表空间 S lease 后复核运行时状态。INACTIVE 时不能继续进入
+     * Buffer Pool，也不能执行破坏性的 newPage 重初始化，否则绕过 DiskSpaceManager 的调用方会访问截断/下线空间。
+     */
+    @Test
+    void registryAwareIndexAccessRejectsInactiveTablespaceBeforeTouchingPage() {
+        PageStore store = new FileChannelPageStore();
+        store.create(SPACE, dir.resolve("inactive-index.ibd"), PS, PageNo.of(8));
+        try (PageStore ignored = store; BufferPool pool = new LruBufferPool(store, PS, 8)) {
+            TablespaceRegistry tablespaces = registryFor(TablespaceState.NORMAL);
+            tablespaces.markInactive(SPACE);
+            IndexPageAccess access = new IndexPageAccess(pool, PS, tablespaces);
+            MiniTransactionManager mgr = new MiniTransactionManager();
+            MiniTransaction m = mgr.begin();
+
+            assertThrows(TablespaceUnavailableException.class, () -> access.createIndexPage(m, P, 7L, 0));
+            assertThrows(TablespaceUnavailableException.class,
+                    () -> access.openIndexPage(m, P, PageLatchMode.SHARED));
+            assertTrue(mgr.redoLogManager().bufferedRecords().isEmpty(), "inactive access must not touch the page");
+            mgr.rollbackUncommitted(m);
+        }
+    }
+
+    private TablespaceRegistry registryFor(TablespaceState state) {
+        TablespaceMetadata metadata = new TablespaceMetadata(SPACE, "space-" + SPACE.value(),
+                TablespaceType.GENERAL, PS, state,
+                List.of(DataFileDescriptor.single(dir.resolve("registry.ibd"), PageNo.of(0), PageNo.of(8))),
+                new SpaceFlags(TablespaceTypeFlags.encode(TablespaceType.GENERAL)), PageNo.of(8), PageNo.of(0), 1L);
+        return new CachingTablespaceRegistry(spaceId -> SPACE.equals(spaceId)
+                ? java.util.Optional.of(metadata) : java.util.Optional.empty());
     }
 }

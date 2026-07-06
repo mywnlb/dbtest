@@ -11,7 +11,8 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * <p>它是物理文件锁，不进入数据库事务锁系统，也不进死锁检测；等待只靠 timeout/IO error/drain。
  * 基于 {@link ReentrantReadWriteLock}（禁用 synchronized，AGENTS.md）。
  *
- * <p>加锁顺序（设计 §8.1/§18）：Lifecycle → DataFileHandle(#2,预留) → FileSize → PageIoRange(#4,预留) → Fsync(#5,预留)。
+ * <p>当前物理文件锁顺序：Lifecycle → FileSize → Fsync。句柄替换锁和页范围锁尚无生产 owner，
+ * 已在 0.16a 清理中删除，避免把不存在的锁顺序误当作实现事实。
  */
 public final class TablespaceLifecycleLatch {
 

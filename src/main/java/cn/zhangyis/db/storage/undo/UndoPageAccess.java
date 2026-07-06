@@ -3,10 +3,12 @@ package cn.zhangyis.db.storage.undo;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageSize;
+import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.domain.TransactionId;
 import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.PageGuard;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
+import cn.zhangyis.db.storage.fil.meta.TablespaceRegistry;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.page.FilePageHeader;
 import cn.zhangyis.db.storage.page.PageEnvelope;
@@ -28,12 +30,32 @@ public final class UndoPageAccess {
      */
     private final PageSize pageSize;
 
+    /**
+     * 可选运行时表空间 registry。生产 undo 路径注入后，open/create 会在 MTR 取得共享 operation lease 后复核状态；
+     * 两参构造保留给低层 undo 页格式测试，不做 registry 准入。
+     */
+    private final TablespaceRegistry tablespaceRegistry;
+
     public UndoPageAccess(BufferPool pool, PageSize pageSize) {
+        this(pool, pageSize, null);
+    }
+
+    /**
+     * 创建带运行时表空间状态准入的 UNDO 页访问器。数据流与 INDEX 页访问一致：先持表空间 S lease，再复核
+     * registry NORMAL/ACTIVE 状态，最后进入 Buffer Pool fix/newPage。这样上层若绕过 DiskSpaceManager，也不能在
+     * UNDO 表空间被标记 INACTIVE/CORRUPTED/DISCARDED 后继续打开旧 undo 页或重初始化新 undo 页。
+     *
+     * @param pool Buffer Pool。
+     * @param pageSize 页大小。
+     * @param tablespaceRegistry 运行时表空间 registry；可为 null，表示仅做页类型守门。
+     */
+    public UndoPageAccess(BufferPool pool, PageSize pageSize, TablespaceRegistry tablespaceRegistry) {
         if (pool == null || pageSize == null) {
             throw new DatabaseValidationException("undo page access pool/pageSize must not be null");
         }
         this.pool = pool;
         this.pageSize = pageSize;
+        this.tablespaceRegistry = tablespaceRegistry;
     }
 
     /**
@@ -74,6 +96,7 @@ public final class UndoPageAccess {
         if (mtr == null || pageId == null || mode == null) {
             throw new DatabaseValidationException("openUndoPage args must not be null");
         }
+        requireOrdinaryAccess(mtr, pageId.spaceId());
         PageGuard g = mtr.getPage(pool, pageId, mode);
         FilePageHeader h = PageEnvelope.readHeader(g);
         if (h.pageType() != PageType.UNDO) {
@@ -83,9 +106,18 @@ public final class UndoPageAccess {
     }
 
     private PageGuard newUndoEnvelope(MiniTransaction mtr, PageId pageId) {
+        requireOrdinaryAccess(mtr, pageId.spaceId());
         PageGuard g = mtr.newPage(pool, pageId, PageLatchMode.EXCLUSIVE, PageType.UNDO);
         PageEnvelope.writeHeader(g, new FilePageHeader(pageId.spaceId(), pageId.pageNo().value(),
                 FilePageHeader.FIL_NULL, FilePageHeader.FIL_NULL, 0L, PageType.UNDO));
         return g;
+    }
+
+    private void requireOrdinaryAccess(MiniTransaction mtr, SpaceId spaceId) {
+        if (tablespaceRegistry == null) {
+            return;
+        }
+        mtr.acquireTablespaceLease(spaceId);
+        tablespaceRegistry.require(spaceId);
     }
 }

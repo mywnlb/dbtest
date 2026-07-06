@@ -9,6 +9,7 @@ import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.domain.TransactionId;
 import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
+import cn.zhangyis.db.storage.fil.meta.TablespaceRegistry;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.record.schema.IndexKeyDef;
 import cn.zhangyis.db.storage.record.schema.TableSchema;
@@ -43,13 +44,23 @@ public final class UndoLogSegmentAccess {
 
     public UndoLogSegmentAccess(BufferPool pool, PageSize pageSize, UndoSpaceAllocator allocator,
                                 TypeCodecRegistry registry) {
+        this(pool, pageSize, allocator, registry, null);
+    }
+
+    /**
+     * 创建带运行时表空间状态准入的 undo segment access。生产组合根注入共享 {@link TablespaceRegistry}，
+     * 使所有 undo first/chain 页打开和新建都先经 operation lease + registry require；低层测试仍可用四参构造
+     * 专注页格式和链路行为。
+     */
+    public UndoLogSegmentAccess(BufferPool pool, PageSize pageSize, UndoSpaceAllocator allocator,
+                                TypeCodecRegistry registry, TablespaceRegistry tablespaceRegistry) {
         if (pool == null || pageSize == null || allocator == null || registry == null) {
             throw new DatabaseValidationException("undo log segment access args must not be null");
         }
         this.pageSize = pageSize;
         this.allocator = allocator;
         this.codec = new UndoRecordCodec(registry);
-        this.pageAccess = new UndoPageAccess(pool, pageSize);
+        this.pageAccess = new UndoPageAccess(pool, pageSize, tablespaceRegistry);
     }
 
     /**

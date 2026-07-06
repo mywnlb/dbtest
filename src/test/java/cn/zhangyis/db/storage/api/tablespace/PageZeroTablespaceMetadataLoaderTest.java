@@ -117,6 +117,60 @@ class PageZeroTablespaceMetadataLoaderTest {
         }
     }
 
+    /**
+     * page0 raw loader 必须在解 FSP 物理字段前校验 checksum。这里只翻转 body 中一个不会被信封校验拦截的字节：
+     * 没有 checksum 校验时 loader 会继续按损坏 page0 注册表空间，后续空间管理会读到被污染的权威元数据。
+     */
+    @Test
+    void rejectsPageZeroWithChecksumMismatch() {
+        Path path = dir.resolve("bad-checksum.ibu");
+        writeValidUndoPageZero(path);
+        try (PageStore store = new FileChannelPageStore()) {
+            store.open(SPACE, path, PS);
+            corruptPageZeroByte(store, 256, (byte) 0x5A);
+            PageZeroTablespaceMetadataLoader loader = new PageZeroTablespaceMetadataLoader(store, PS);
+            assertThrows(TablespaceCorruptedException.class, () -> loader.load(SPACE));
+        }
+    }
+
+    /**
+     * file trailer 的 low32 LSN 是 partial-write 判定的一部分：checksum 本身仍匹配但 trailer LSN 不匹配时，
+     * loader 也必须拒绝 page0，否则会把撕裂写伪装成合法页。
+     */
+    @Test
+    void rejectsPageZeroWithTrailerLsnMismatch() {
+        Path path = dir.resolve("bad-trailer-lsn.ibu");
+        writeValidUndoPageZero(path);
+        try (PageStore store = new FileChannelPageStore()) {
+            store.open(SPACE, path, PS);
+            int trailerLow32Lsn = PageEnvelopeLayout.trailerOffset(PS) + PageEnvelopeLayout.TRAILER_LOW32_LSN;
+            corruptPageZeroInt(store, trailerLow32Lsn, 0x12345678);
+            PageZeroTablespaceMetadataLoader loader = new PageZeroTablespaceMetadataLoader(store, PS);
+            assertThrows(TablespaceCorruptedException.class, () -> loader.load(SPACE));
+        }
+    }
+
+    /**
+     * 兼容旧数据文件：历史切片在 FlushCoordinator 统一接管前可能存在 checksum/trailer checksum 均为 0 的合法 page0。
+     * 这类页仍先通过 FSP_HDR 信封校验，再按 legacy unstamped 处理；一旦任一 checksum 非 0，就必须严格校验。
+     */
+    @Test
+    void acceptsLegacyUnstampedPageZeroWithZeroChecksums() {
+        Path path = dir.resolve("legacy-unstamped.ibu");
+        writeValidUndoPageZero(path);
+        try (PageStore store = new FileChannelPageStore()) {
+            store.open(SPACE, path, PS);
+            zeroPageZeroChecksums(store);
+            PageZeroTablespaceMetadataLoader loader = new PageZeroTablespaceMetadataLoader(store, PS);
+
+            TablespaceMetadata metadata = loader.load(SPACE).orElseThrow();
+
+            assertEquals(SPACE, metadata.spaceId());
+            assertEquals(TablespaceType.UNDO, metadata.type());
+            assertEquals(TablespaceState.ACTIVE, metadata.state());
+        }
+    }
+
     @Test
     void returnsEmptyForUnopenedSpace() {
         try (PageStore store = new FileChannelPageStore()) {
@@ -189,6 +243,28 @@ class PageZeroTablespaceMetadataLoaderTest {
         ByteBuffer buf = ByteBuffer.allocate(PS.bytes());
         store.readPage(page0, buf);
         buf.putInt(offset, value);
+        buf.rewind();
+        store.writePage(page0, buf);
+    }
+
+    /** 翻转 page0 指定字节但不重算 checksum，用来模拟落盘页体损坏。 */
+    private static void corruptPageZeroByte(PageStore store, int offset, byte xorMask) {
+        PageId page0 = PageId.of(SPACE, PageNo.of(0));
+        ByteBuffer buf = ByteBuffer.allocate(PS.bytes());
+        store.readPage(page0, buf);
+        byte old = buf.get(offset);
+        buf.put(offset, (byte) (old ^ xorMask));
+        buf.rewind();
+        store.writePage(page0, buf);
+    }
+
+    /** 构造旧格式 page0：保留 header/body/FIL trailer 其它字段，只把 checksum 派生字段清零。 */
+    private static void zeroPageZeroChecksums(PageStore store) {
+        PageId page0 = PageId.of(SPACE, PageNo.of(0));
+        ByteBuffer buf = ByteBuffer.allocate(PS.bytes());
+        store.readPage(page0, buf);
+        buf.putInt(PageEnvelopeLayout.CHECKSUM, 0);
+        buf.putInt(PageEnvelopeLayout.trailerOffset(PS) + PageEnvelopeLayout.TRAILER_CHECKSUM, 0);
         buf.rewind();
         store.writePage(page0, buf);
     }

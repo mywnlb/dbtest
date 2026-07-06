@@ -4,6 +4,7 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
+import cn.zhangyis.db.domain.SegmentId;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.domain.TransactionId;
 import cn.zhangyis.db.domain.UndoNo;
@@ -13,8 +14,17 @@ import cn.zhangyis.db.storage.api.SegmentRef;
 import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.LruBufferPool;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
+import cn.zhangyis.db.storage.fil.exception.TablespaceUnavailableException;
+import cn.zhangyis.db.storage.fil.io.DataFileDescriptor;
 import cn.zhangyis.db.storage.fil.io.FileChannelPageStore;
 import cn.zhangyis.db.storage.fil.io.PageStore;
+import cn.zhangyis.db.storage.fil.meta.CachingTablespaceRegistry;
+import cn.zhangyis.db.storage.fil.meta.TablespaceMetadata;
+import cn.zhangyis.db.storage.fil.meta.TablespaceRegistry;
+import cn.zhangyis.db.storage.fil.state.SpaceFlags;
+import cn.zhangyis.db.storage.fil.state.TablespaceState;
+import cn.zhangyis.db.storage.fil.state.TablespaceType;
+import cn.zhangyis.db.storage.fil.state.TablespaceTypeFlags;
 import cn.zhangyis.db.storage.fsp.segment.SegmentPurpose;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
@@ -23,6 +33,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -173,6 +184,32 @@ class UndoPageTest {
         });
     }
 
+    /**
+     * registry-aware UNDO access 与 INDEX access 一样必须复核运行时表空间状态。INACTIVE 时不能继续打开旧 undo 页，
+     * 也不能把已分配页破坏性重初始化成 UNDO first 页。
+     */
+    @Test
+    void registryAwareUndoAccessRejectsInactiveTablespaceBeforeTouchingPage() {
+        PageStore store = new FileChannelPageStore();
+        store.create(UNDO_SPACE, dir.resolve("inactive-undo.ibu"), PS, PageNo.of(64));
+        try (PageStore ignored = store; BufferPool pool = new LruBufferPool(store, PS, 16)) {
+            TablespaceRegistry tablespaces = registryFor(TablespaceState.ACTIVE);
+            tablespaces.markInactive(UNDO_SPACE);
+            UndoPageAccess undoAccess = new UndoPageAccess(pool, PS, tablespaces);
+            MiniTransactionManager mgr = new MiniTransactionManager();
+            MiniTransaction m = mgr.begin();
+            PageId pageId = PageId.of(UNDO_SPACE, PageNo.of(5));
+            UndoSegmentHandle handle = new UndoSegmentHandle(UNDO_SPACE, 0, SegmentId.of(1), pageId, pageId);
+
+            assertThrows(TablespaceUnavailableException.class,
+                    () -> undoAccess.createFirstPage(m, pageId, UndoLogKind.INSERT, TransactionId.of(7), handle));
+            assertThrows(TablespaceUnavailableException.class,
+                    () -> undoAccess.openUndoPage(m, pageId, PageLatchMode.SHARED));
+            assertTrue(mgr.redoLogManager().bufferedRecords().isEmpty(), "inactive access must not touch undo page");
+            mgr.rollbackUncommitted(m);
+        }
+    }
+
     private interface FirstPageBody {
         void run(UndoPage page, UndoSegmentHandle handle);
     }
@@ -204,5 +241,14 @@ class UndoPageTest {
             mgr.commit(boot);
             body.run(mgr, disk, undoAccess, pool);
         }
+    }
+
+    private TablespaceRegistry registryFor(TablespaceState state) {
+        TablespaceMetadata metadata = new TablespaceMetadata(UNDO_SPACE, "space-" + UNDO_SPACE.value(),
+                TablespaceType.UNDO, PS, state,
+                List.of(DataFileDescriptor.single(dir.resolve("registry-undo.ibu"), PageNo.of(0), PageNo.of(64))),
+                new SpaceFlags(TablespaceTypeFlags.encode(TablespaceType.UNDO)), PageNo.of(64), PageNo.of(0), 1L);
+        return new CachingTablespaceRegistry(spaceId -> UNDO_SPACE.equals(spaceId)
+                ? java.util.Optional.of(metadata) : java.util.Optional.empty());
     }
 }

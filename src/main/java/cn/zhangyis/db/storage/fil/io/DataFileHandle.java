@@ -4,6 +4,7 @@ import cn.zhangyis.db.storage.fil.exception.DataFilePhysicalException;
 import cn.zhangyis.db.storage.fil.exception.PageOutOfBoundsException;
 import cn.zhangyis.db.storage.fil.exception.TablespaceNotOpenException;
 import cn.zhangyis.db.storage.fil.lock.FileSizeLock;
+import cn.zhangyis.db.storage.fil.lock.FsyncLock;
 import cn.zhangyis.db.storage.fil.lock.ResourceGuard;
 import cn.zhangyis.db.storage.fil.lock.TablespaceLifecycleLatch;
 
@@ -30,7 +31,7 @@ import java.nio.file.StandardOpenOption;
  * currentSizeInPages 用 volatile 发布，保证扩展后零填充的新页"发布前对读不可见"。同页并发写不在本层串行化，
  * 由上层 Buffer Pool page latch 负责（设计 §8.1）。
  *
- * <p>简化点：单文件；句柄不替换（#2 预留）。
+ * <p>简化点：单文件；句柄不替换，物理层不做 page-range 合并锁。
  */
 final class DataFileHandle implements AutoCloseable {
 
@@ -63,6 +64,12 @@ final class DataFileHandle implements AutoCloseable {
      * #3 文件大小锁。
      */
     private final FileSizeLock fileSizeLock = new FileSizeLock();
+
+    /**
+     * #5 data-file fsync 限流锁。只保护 {@link FileChannel#force(boolean)} 调用本身，不回调 Buffer Pool/Redo，
+     * 避免物理 fsync 等待反向进入上层锁域。
+     */
+    private final FsyncLock fsyncLock = new FsyncLock();
 
     /**
      * 权威物理大小（页数）。读路径读该 volatile 快照做越界检查；autoExtend 在 fileSizeLock 下零填充后再发布。
@@ -229,11 +236,12 @@ final class DataFileHandle implements AutoCloseable {
     }
 
     /**
-     * 对数据文件执行 fsync/force。持 Lifecycle(S) 表示与普通 page IO 同级；close/drop/truncate 需要 Lifecycle(X)，
-     * 会等待本次 force 离开。force 不回调 Buffer Pool 或 redo，避免物理文件锁反向进入上层等待。
+     * 对数据文件执行 fsync/force。持 Lifecycle(S) 表示与普通 page IO 同级；再持 per-file FsyncLock 限制同一文件
+     * 并发 force 为 1。close/drop/truncate 需要 Lifecycle(X)，会等待本次 force 离开。force 不回调 Buffer Pool 或 redo，
+     * 避免物理文件锁反向进入上层等待。
      */
     void force() {
-        try (ResourceGuard ignored = lifecycleLatch.acquireShared()) {
+        try (ResourceGuard lifecycle = lifecycleLatch.acquireShared(); ResourceGuard fsync = fsyncLock.acquire()) {
             ensureOpen();
             try {
                 channel.force(true);
@@ -256,7 +264,9 @@ final class DataFileHandle implements AutoCloseable {
         if (targetSizeInPages == null || targetSizeInPages.value() < 1) {
             throw new DatabaseValidationException("truncate target size must be positive");
         }
-        try (ResourceGuard lifecycle = lifecycleLatch.acquireExclusive(); ResourceGuard size = fileSizeLock.acquire()) {
+        try (ResourceGuard lifecycle = lifecycleLatch.acquireExclusive();
+             ResourceGuard size = fileSizeLock.acquire();
+             ResourceGuard fsync = fsyncLock.acquire()) {
             ensureOpen();
             long target = targetSizeInPages.value();
             long current = currentSizeInPages;

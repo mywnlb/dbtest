@@ -14,6 +14,7 @@ import cn.zhangyis.db.storage.fil.exception.TablespaceCorruptedException;
 import cn.zhangyis.db.storage.fil.io.DataFileDescriptor;
 import cn.zhangyis.db.storage.fil.io.PageStore;
 import cn.zhangyis.db.storage.fil.state.SpaceFlags;
+import cn.zhangyis.db.storage.page.PageImageChecksum;
 import cn.zhangyis.db.storage.page.PageEnvelopeLayout;
 import cn.zhangyis.db.storage.page.PageType;
 import cn.zhangyis.db.storage.fil.meta.TablespaceMetadata;
@@ -42,8 +43,9 @@ import java.util.Optional;
  * spaceId 与请求一致。任一不符表示物理页被覆盖/绑定错误，抛 {@link TablespaceCorruptedException} 阻止注册。
  * 新建 UNDO 从生命周期头恢复 state；旧 UNDO 没有该头时仍以 NORMAL 打开，但后续截断服务会拒绝它，避免猜测初始尺寸。
  *
- * <p>简化点：暂不校验 checksum/trailer。当前写回/淘汰路径不盖 {@code PageImageChecksum}（只有 FlushCoordinator 盖），
- * 而本 loader raw 直读，合法 page0 的 checksum 仍为 0，现在校验会误判损坏；待写盘统一盖 checksum 后再单独接入。
+ * <p>checksum/trailer 语义：新写盘页必须通过 {@link PageImageChecksum} 校验；为兼容早期切片写出的 page0，
+ * header checksum 与 trailer checksum 同为 0 的页在通过 FSP_HDR 信封校验后按 legacy unstamped 接受。这个兼容点只保护
+ * 历史文件打开，不表示 checksum=0 的任意损坏页可被检测出来；后续文件经 FlushCoordinator 刷出后会进入严格校验路径。
  */
 public final class PageZeroTablespaceMetadataLoader implements TablespaceMetadataLoader {
 
@@ -109,6 +111,7 @@ public final class PageZeroTablespaceMetadataLoader implements TablespaceMetadat
         ByteBuffer page = ByteBuffer.allocate(pageSize.bytes());
         pageStore.readPage(PageId.of(spaceId, PageNo.of(0)), page);
         validateFspHdrEnvelope(spaceId, page);
+        validateChecksumOrLegacyUnstamped(spaceId, page);
         SpaceHeaderPhysical physical = SpaceHeaderRawCodec.readPhysical(page);
         if (!physical.spaceId().equals(spaceId)) {
             throw new DatabaseValidationException("page0 space id mismatch: expected " + spaceId.value()
@@ -148,5 +151,24 @@ public final class PageZeroTablespaceMetadataLoader implements TablespaceMetadat
             throw new TablespaceCorruptedException("page0 envelope pageNo is not 0 for space "
                     + spaceId.value() + ": pageNo=" + pageNo);
         }
+    }
+
+    /**
+     * page0 checksum/trailer 校验。新格式落盘页必须通过 CRC32 + trailer low32 LSN 校验；旧格式未盖 checksum
+     * 的 page0 仅在 header/trailer checksum 均为 0 时兼容放行。兼容判断放在 FSP_HDR 信封之后，避免把全零页或错位页
+     * 当成历史合法页。
+     *
+     * @param spaceId 请求打开的表空间编号，仅用于错误信息。
+     * @param page 已读入的 page0 raw 字节缓冲。
+     * @throws TablespaceCorruptedException checksum 或 FIL trailer 不匹配。
+     */
+    private void validateChecksumOrLegacyUnstamped(SpaceId spaceId, ByteBuffer page) {
+        if (PageImageChecksum.verify(page, pageSize)) {
+            return;
+        }
+        if (PageImageChecksum.hasLegacyZeroChecksums(page, pageSize)) {
+            return;
+        }
+        throw new TablespaceCorruptedException("page0 checksum/trailer mismatch for space " + spaceId.value());
     }
 }

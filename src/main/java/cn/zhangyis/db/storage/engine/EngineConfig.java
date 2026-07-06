@@ -4,6 +4,7 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.SpaceId;
+import cn.zhangyis.db.storage.recovery.RecoveryMode;
 
 import java.nio.file.Path;
 import java.time.Duration;
@@ -34,6 +35,9 @@ import java.util.Set;
  * @param redoRotation             redo 文件环配置（0.18b）；{@code null}=单 append-only redo 文件，非空=启用文件环 + checkpoint 回收。
  * @param bufferPoolInstanceCount  buffer pool 分片数（0.10d，≥1 且 ≤ bufferPoolCapacityFrames）；默认 1（生产保守，对齐
  *                                 单实例池行为），由 {@link StorageEngine} 经本访问器构造 {@code LruBufferPool}。
+ * @param recoveryMode             existing-open 使用的 crash recovery 模式；默认 NORMAL。READ_ONLY_VALIDATE 只做扫描诊断，
+ *                                 不发布普通 OPEN，也不启动会写文件的后台路径。recovery progress 文件路径由
+ *                                 {@link #recoveryProgressFile()} 从 {@code baseDir} 派生。
  */
 public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapacityFrames,
                            SpaceId undoSpaceId, PageNo undoSpaceInitialPages, int slotCapacity,
@@ -42,7 +46,7 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                            boolean backgroundFlushEnabled, int pageCleanerQueueCapacity,
                            Duration backgroundFlushInterval, int backgroundFlushMaxPages,
                            Duration backgroundFlushStopTimeout, RedoRotationConfig redoRotation,
-                           int bufferPoolInstanceCount) {
+                           int bufferPoolInstanceCount, RecoveryMode recoveryMode) {
 
     /** 默认启动后台 page cleaner，使 engine open 后具备持续 checkpoint tick 能力。 */
     private static final boolean DEFAULT_BACKGROUND_FLUSH_ENABLED = true;
@@ -85,13 +89,14 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 slotCapacity, maxVersionHops, flushTimeout, redoCapacityBytes, recoveryTablespaces,
                 backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, RedoRotationConfig.defaults(),
-                DEFAULT_BUFFER_POOL_INSTANCE_COUNT);
+                DEFAULT_BUFFER_POOL_INSTANCE_COUNT, RecoveryMode.NORMAL);
     }
 
     public EngineConfig {
         if (baseDir == null || pageSize == null || undoSpaceId == null
                 || undoSpaceInitialPages == null || flushTimeout == null || recoveryTablespaces == null
-                || backgroundFlushInterval == null || backgroundFlushStopTimeout == null) {
+                || backgroundFlushInterval == null || backgroundFlushStopTimeout == null
+                || recoveryMode == null) {
             throw new DatabaseValidationException("engine config object fields must not be null");
         }
         if (bufferPoolCapacityFrames <= 0) {
@@ -180,7 +185,7 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
         return new EngineConfig(baseDir, pageSize, bufferPoolCapacityFrames, undoSpaceId, undoSpaceInitialPages,
                 slotCapacity, maxVersionHops, flushTimeout, redoCapacityBytes, recoveryTablespaces,
                 backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
-                backgroundFlushMaxPages, backgroundFlushStopTimeout, rotation, bufferPoolInstanceCount);
+                backgroundFlushMaxPages, backgroundFlushStopTimeout, rotation, bufferPoolInstanceCount, recoveryMode);
     }
 
     /**
@@ -194,7 +199,21 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
         return new EngineConfig(baseDir, pageSize, bufferPoolCapacityFrames, undoSpaceId, undoSpaceInitialPages,
                 slotCapacity, maxVersionHops, flushTimeout, redoCapacityBytes, recoveryTablespaces,
                 backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
-                backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, instanceCount);
+                backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, instanceCount, recoveryMode);
+    }
+
+    /**
+     * 派生一个使用指定 existing-open recovery 模式的配置副本（其余字段不变）。READ_ONLY_VALIDATE 只用于灾难诊断：
+     * 它读取 checkpoint/redo/doublewrite 并返回报告，但 StorageEngine 不会发布普通 OPEN。
+     *
+     * @param mode 恢复模式，不能为 null。
+     * @return 使用指定恢复模式的新配置。
+     */
+    public EngineConfig withRecoveryMode(RecoveryMode mode) {
+        return new EngineConfig(baseDir, pageSize, bufferPoolCapacityFrames, undoSpaceId, undoSpaceInitialPages,
+                slotCapacity, maxVersionHops, flushTimeout, redoCapacityBytes, recoveryTablespaces,
+                backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
+                backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, bufferPoolInstanceCount, mode);
     }
 
     /** redo control（checkpoint label）文件路径。 */
@@ -210,6 +229,11 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
     /** doublewrite buffer 文件路径（崩溃后修复 torn data page 的整页副本）。 */
     public Path doublewriteFile() {
         return baseDir.resolve("doublewrite.dwb");
+    }
+
+    /** recovery progress JSONL 文件路径。它只记录启动恢复阶段诊断，不作为恢复输入或跳过阶段依据。 */
+    public Path recoveryProgressFile() {
+        return baseDir.resolve("recovery-progress.jsonl");
     }
 
     /** buffer pool warmup dump 文件路径（close 保存热页定位、open 预取）。不参与 crash recovery，损坏可丢弃。 */

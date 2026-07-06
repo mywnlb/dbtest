@@ -168,18 +168,6 @@ public final class LruBufferPool implements BufferPool {
     }
 
     @Override
-    public void flush(PageId pageId) {
-        instanceFor(pageId).flush(pageId);
-    }
-
-    @Override
-    public void flushAll() {
-        for (BufferPoolInstance instance : instances) {
-            instance.flushAll();
-        }
-    }
-
-    @Override
     public List<DirtyPageCandidate> dirtyPageCandidates(Lsn targetLsn, int maxPages) {
         if (targetLsn == null) {
             throw new DatabaseValidationException("target LSN must not be null");
@@ -369,6 +357,7 @@ public final class LruBufferPool implements BufferPool {
 
     @Override
     public void close() {
-        flushAll();
+        // BufferPool 不拥有 PageStore 生命周期，也不再提供 legacy flushAll 直写路径。
+        // 调用方若需要 shutdown flush，必须先通过 FlushService/FlushCoordinator 完成 WAL-safe 写盘。
     }
 }

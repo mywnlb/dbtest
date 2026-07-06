@@ -33,6 +33,8 @@ public final class CrashRecoveryService {
     private final ReentrantLock serviceLock = new ReentrantLock();
     /** 用户流量门控。 */
     private final RecoveryTrafficGate gate;
+    /** recovery 进度 journal；只记录阶段生命周期事实，不参与恢复决策。 */
+    private final RecoveryProgressJournal progressJournal;
     /** 最近一次恢复状态。 */
     private RecoveryState state = RecoveryState.CLOSED;
     /** 最近一次成功恢复报告。 */
@@ -41,10 +43,18 @@ public final class CrashRecoveryService {
     private Throwable lastError;
 
     public CrashRecoveryService(RecoveryTrafficGate gate) {
+        this(gate, new RecoveryProgressJournal());
+    }
+
+    public CrashRecoveryService(RecoveryTrafficGate gate, RecoveryProgressJournal progressJournal) {
         if (gate == null) {
             throw new DatabaseValidationException("recovery traffic gate must not be null");
         }
+        if (progressJournal == null) {
+            throw new DatabaseValidationException("recovery progress journal must not be null");
+        }
         this.gate = gate;
+        this.progressJournal = progressJournal;
     }
 
     /**
@@ -60,46 +70,63 @@ public final class CrashRecoveryService {
         serviceLock.lock();
         try {
             List<RecoveryStageName> stages = new ArrayList<>();
+            RecoveryStageTracker tracker = new RecoveryStageTracker(request.mode(), progressJournal, stages);
             try {
+                tracker.begin(RecoveryStageName.TRAFFIC_CLOSED);
                 state = RecoveryState.RECOVERING;
                 gate.closeForRecovery();
-                stages.add(RecoveryStageName.TRAFFIC_CLOSED);
+                tracker.complete(state, Lsn.of(0));
 
+                if (request.mode() == RecoveryMode.FORCE_SKIP_CORRUPT_TABLESPACE) {
+                    throw new DatabaseValidationException(
+                            "FORCE_SKIP_CORRUPT_TABLESPACE is reserved and not implemented");
+                }
+                if (request.mode() == RecoveryMode.READ_ONLY_VALIDATE) {
+                    return recoverReadOnlyValidate(request, tracker);
+                }
+
+                tracker.begin(RecoveryStageName.DOUBLEWRITE_REPAIR);
                 DoublewriteRepairSummary doublewriteSummary = repairDoublewritePages(request);
-                stages.add(RecoveryStageName.DOUBLEWRITE_REPAIR);
+                tracker.complete(state, Lsn.of(0));
 
                 RedoCheckpointLabel checkpoint = request.checkpointStore().readLatest();
                 RedoRecoveryReader reader = new RedoRecoveryReader(request.redoRepository(), checkpoint.checkpointLsn());
+                tracker.begin(RecoveryStageName.REDO_REPLAY);
                 List<RedoLogBatch> batches = reader.readBatches();
                 request.dispatcher().applyAll(batches, request.applyContext());
-                stages.add(RecoveryStageName.REDO_REPLAY);
+                tracker.complete(state, reader.recoveredToLsn());
 
                 // 先安装恢复边界，使后续 undo 续作（会 append marker/rebuild redo）从 recoveredToLsn 连续追加。
                 // 与 undo 参与者内部对同一 recoveredToLsn 的安装幂等共存（RedoLogManager 同值再装为 no-op）。
                 if (request.recoveredRedoManager() != null) {
+                    tracker.begin(RecoveryStageName.REDO_BOUNDARY_INSTALL);
                     request.recoveredRedoManager().restoreRecoveredBoundary(reader.recoveredToLsn());
-                    stages.add(RecoveryStageName.REDO_BOUNDARY_INSTALL);
+                    tracker.complete(state, reader.recoveredToLsn());
                 }
 
                 if (request.undoTablespaceRecovery() != null) {
+                    tracker.begin(RecoveryStageName.UNDO_TABLESPACE_RESUME);
                     request.undoTablespaceRecovery().resumeAfterRedo(reader.recoveredToLsn());
-                    stages.add(RecoveryStageName.UNDO_TABLESPACE_RESUME);
+                    tracker.complete(state, reader.recoveredToLsn());
                 }
 
                 // reconcile 必须晚于 undo 续作：续作把被截断 undo 表空间的 page0 重建为新小尺寸后，reconcile 才读到正确大小。
                 if (!request.spacesToReconcile().isEmpty()) {
+                    tracker.begin(RecoveryStageName.SPACE_FILE_RECONCILE);
                     reconcileSpaceFiles(request);
-                    stages.add(RecoveryStageName.SPACE_FILE_RECONCILE);
+                    tracker.complete(state, reader.recoveredToLsn());
                 }
 
                 if (request.transactionUndoRecovery() != null) {
+                    tracker.begin(RecoveryStageName.UNDO_ROLLBACK);
                     TransactionUndoRecoveryResult undoResult =
                             request.transactionUndoRecovery().recoverAfterRedo(reader.recoveredToLsn());
                     if (undoResult == null) {
                         throw new DatabaseValidationException("transaction undo recovery result must not be null");
                     }
-                    stages.add(RecoveryStageName.UNDO_ROLLBACK);
-                    stages.add(RecoveryStageName.RESUME_PURGE);
+                    tracker.complete(state, reader.recoveredToLsn());
+                    tracker.begin(RecoveryStageName.RESUME_PURGE);
+                    tracker.complete(state, reader.recoveredToLsn());
                     if (request.recoveredRedoManager() != null) {
                         request.recoveredRedoManager().flush();
                     }
@@ -110,9 +137,10 @@ public final class CrashRecoveryService {
                 // 也无 durable 页，丢失恢复结果。force 后任何越过 recoveredToLsn 的 checkpoint 都是安全的。
                 request.applyContext().pageStore().forceAll();
 
+                tracker.begin(RecoveryStageName.OPEN_TRAFFIC);
                 gate.openForUserTraffic();
-                stages.add(RecoveryStageName.OPEN_TRAFFIC);
                 state = RecoveryState.OPEN;
+                tracker.complete(state, reader.recoveredToLsn());
                 RecoveryReport report = new RecoveryReport(request.mode(), state, checkpoint.checkpointLsn(),
                         reader.recoveredToLsn(), doublewriteSummary.repairedPageCount(),
                         doublewriteSummary.detectedOnlyPageCount(), batches.size(), stages);
@@ -120,15 +148,45 @@ public final class CrashRecoveryService {
                 lastError = null;
                 return report;
             } catch (DatabaseRuntimeException e) {
+                recordFailureProgress(tracker, e);
                 failClosed(request.mode(), e);
                 throw new RecoveryStartupException("crash recovery failed before user traffic opened", e);
             } catch (RuntimeException e) {
+                recordFailureProgress(tracker, e);
                 failClosed(request.mode(), e);
                 throw new RecoveryStartupException("crash recovery failed with unexpected runtime error", e);
             }
         } finally {
             serviceLock.unlock();
         }
+    }
+
+    /**
+     * READ_ONLY_VALIDATE 恢复分支：只扫描 doublewrite 与 redo 边界，并发布只读诊断态。该路径故意跳过
+     * {@code RedoApplyDispatcher.applyAll}、redo 边界安装、undo 续作、空间 reconcile、事务 rollback 和
+     * {@code PageStore.forceAll}，确保调用方可以用同一份文件做灾难诊断而不改变磁盘内容。
+     */
+    private RecoveryReport recoverReadOnlyValidate(RecoveryRequest request, RecoveryStageTracker tracker) {
+        tracker.begin(RecoveryStageName.DOUBLEWRITE_REPAIR);
+        DoublewriteRepairSummary doublewriteSummary = validateDoublewritePages(request);
+        tracker.complete(state, Lsn.of(0));
+
+        RedoCheckpointLabel checkpoint = request.checkpointStore().readLatest();
+        RedoRecoveryReader reader = new RedoRecoveryReader(request.redoRepository(), checkpoint.checkpointLsn());
+        tracker.begin(RecoveryStageName.REDO_REPLAY);
+        reader.readBatches();
+        tracker.complete(state, reader.recoveredToLsn());
+
+        tracker.begin(RecoveryStageName.READ_ONLY_DIAGNOSTIC_OPEN);
+        gate.enterReadOnlyDiagnostic();
+        state = RecoveryState.READ_ONLY;
+        tracker.complete(state, reader.recoveredToLsn());
+        RecoveryReport report = new RecoveryReport(request.mode(), state, checkpoint.checkpointLsn(),
+                reader.recoveredToLsn(), 0, doublewriteSummary.detectedOnlyPageCount(), 0,
+                tracker.completedStages());
+        lastReport = report;
+        lastError = null;
+        return report;
     }
 
     /** 当前 service 状态。 */
@@ -234,6 +292,25 @@ public final class CrashRecoveryService {
     }
 
     /**
+     * READ_ONLY_VALIDATE 的 doublewrite 阶段：只调用 scanner 的只读校验入口，统计 full-copy 可修复页和 detect-only
+     * 可疑页，但绝不调用 undo participant、PageStore.writePage 或 force。这样诊断报告能暴露 torn-page 风险，同时
+     * 保持原 data file 字节不变，便于后续人工或 force-recovery 策略决策。
+     */
+    private DoublewriteRepairSummary validateDoublewritePages(RecoveryRequest request) {
+        int detectedOnly = 0;
+        if (request.doublewriteScanner() == null) {
+            return new DoublewriteRepairSummary(0, detectedOnly);
+        }
+        for (PageId pageId : request.pagesToRepair()) {
+            DoublewriteRecoveryResult result = request.doublewriteScanner().scanPageForValidation(pageId);
+            if (result.diagnosticOnly()) {
+                detectedOnly++;
+            }
+        }
+        return new DoublewriteRepairSummary(0, detectedOnly);
+    }
+
+    /**
      * 任意阶段失败时保持 gate 关闭并记录失败快照。透传发起恢复时的 {@code mode}，避免失败诊断报告把非 NORMAL 模式
      * 误记为 NORMAL。报告里的 LSN/计数填 0：失败可能发生在尚未读出 checkpoint 或扫描 redo 之前，无可信进度可报。
      */
@@ -245,6 +322,61 @@ public final class CrashRecoveryService {
                 Lsn.of(0), Lsn.of(0), 0, 0, 0, List.of());
     }
 
+    /**
+     * 尝试记录失败阶段。progress journal 自身也可能因为诊断文件 IO 失败而抛异常，此时仍必须继续
+     * {@link #failClosed(RecoveryMode, Throwable)}，否则 recovery gate 会停在不确定状态；二次失败作为
+     * suppressed cause 保留给调用方诊断。
+     */
+    private static void recordFailureProgress(RecoveryStageTracker tracker, RuntimeException cause) {
+        try {
+            tracker.fail(cause);
+        } catch (RuntimeException progressFailure) {
+            cause.addSuppressed(progressFailure);
+        }
+    }
+
     private record DoublewriteRepairSummary(int repairedPageCount, int detectedOnlyPageCount) {
+    }
+
+    /**
+     * 单次 recover 调用内的阶段追踪器。它把“阶段进入/完成/失败”的记录与原有 completedStages 列表保持一致；
+     * 完成后清空 currentStage，避免阶段之间的异常被误记到已经完成的阶段。
+     */
+    private static final class RecoveryStageTracker {
+        private final RecoveryMode mode;
+        private final RecoveryProgressJournal journal;
+        private final List<RecoveryStageName> completedStages;
+        private RecoveryStageName currentStage;
+
+        private RecoveryStageTracker(RecoveryMode mode, RecoveryProgressJournal journal,
+                                     List<RecoveryStageName> completedStages) {
+            this.mode = mode;
+            this.journal = journal;
+            this.completedStages = completedStages;
+        }
+
+        private void begin(RecoveryStageName stageName) {
+            currentStage = stageName;
+            journal.stageStarted(mode, stageName);
+        }
+
+        private void complete(RecoveryState state, Lsn recoveredToLsn) {
+            if (currentStage == null) {
+                throw new DatabaseValidationException("recovery stage completion without active stage");
+            }
+            completedStages.add(currentStage);
+            journal.stageCompleted(mode, currentStage, state, recoveredToLsn);
+            currentStage = null;
+        }
+
+        private void fail(Throwable cause) {
+            if (currentStage != null) {
+                journal.stageFailed(mode, currentStage, cause);
+            }
+        }
+
+        private List<RecoveryStageName> completedStages() {
+            return completedStages;
+        }
     }
 }

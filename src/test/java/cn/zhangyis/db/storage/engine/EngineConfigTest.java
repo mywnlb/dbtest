@@ -4,6 +4,7 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.SpaceId;
+import cn.zhangyis.db.storage.recovery.RecoveryMode;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -33,6 +34,7 @@ class EngineConfigTest {
         assertEquals(dir.resolve("redo.log"), c.redoFile());
         assertEquals(dir.resolve("redo-control"), c.redoControlFile());
         assertEquals(dir.resolve("undo_5.ibu"), c.undoFile());
+        assertEquals(dir.resolve("recovery-progress.jsonl"), c.recoveryProgressFile());
         assertEquals(List.of(), c.recoveryTablespaces());
         assertTrue(c.backgroundFlushEnabled());
         assertEquals(4, c.pageCleanerQueueCapacity());
@@ -67,6 +69,22 @@ class EngineConfigTest {
         // valid() 容量 256 帧；分片数不能超过帧数（否则有分片分到 0 帧）。
         assertThrows(DatabaseValidationException.class, () -> c.withBufferPoolInstanceCount(257),
                 "分片数须 <= bufferPoolCapacityFrames");
+    }
+
+    @Test
+    void recoveryModeDefaultsToNormalAndIsConfigurable() {
+        EngineConfig c = valid();
+        assertEquals(RecoveryMode.NORMAL, c.recoveryMode(),
+                "默认启动路径保持普通 crash recovery，不改变既有生产行为");
+
+        EngineConfig readOnly = c.withRecoveryMode(RecoveryMode.READ_ONLY_VALIDATE);
+        assertEquals(RecoveryMode.READ_ONLY_VALIDATE, readOnly.recoveryMode());
+        assertEquals(RecoveryMode.NORMAL, c.recoveryMode(), "wither 保持 EngineConfig 不可变");
+        assertEquals(c.bufferPoolInstanceCount(), readOnly.bufferPoolInstanceCount());
+        assertEquals(c.redoRotation(), readOnly.redoRotation());
+
+        assertThrows(DatabaseValidationException.class, () -> c.withRecoveryMode(null),
+                "recovery mode 必须显式非空，避免启动时落入未定义恢复语义");
     }
 
     @Test

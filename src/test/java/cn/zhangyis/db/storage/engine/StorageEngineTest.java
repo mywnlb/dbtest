@@ -1,5 +1,6 @@
 package cn.zhangyis.db.storage.engine;
 
+import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.Lsn;
 import cn.zhangyis.db.domain.PageNo;
@@ -22,9 +23,14 @@ import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
 import cn.zhangyis.db.storage.page.PageEnvelopeLayout;
 import cn.zhangyis.db.storage.page.PageImageChecksum;
+import cn.zhangyis.db.storage.recovery.RecoveryDiagnosticsSnapshot;
+import cn.zhangyis.db.storage.recovery.RecoveryProgressEventKind;
+import cn.zhangyis.db.storage.recovery.RecoveryProgressJournal;
 import cn.zhangyis.db.storage.recovery.RecoveryReport;
+import cn.zhangyis.db.storage.recovery.RecoveryMode;
 import cn.zhangyis.db.storage.recovery.RecoveryStageName;
 import cn.zhangyis.db.storage.recovery.RecoveryState;
+import cn.zhangyis.db.storage.recovery.RecoveryTrafficGate;
 import cn.zhangyis.db.storage.redo.LogRange;
 import cn.zhangyis.db.storage.redo.PageBytesRecord;
 import cn.zhangyis.db.storage.redo.RedoCheckpointLabel;
@@ -342,7 +348,7 @@ class StorageEngineTest {
     }
 
     @Test
-    void existingOpenRunsCrashRecoveryAndReplaysRedoIntoConfiguredTablespace() {
+    void existingOpenRunsCrashRecoveryAndReplaysRedoIntoConfiguredTablespace() throws Exception {
         Path dataPath = dir.resolve("data-recovery.ibd");
         EngineConfig cfg = configWithRecoveryTablespace(dataPath);
 
@@ -367,8 +373,91 @@ class StorageEngineTest {
         assertTrue(report.completedStages().contains(RecoveryStageName.SPACE_FILE_RECONCILE),
                 "configured tablespaces must be reconciled to page0 current size after redo replay");
         assertArrayEquals(payload, readPhysicalSlice(dataPath, target, RECOVERY_OFFSET, payload.length));
+        String progress = Files.readString(cfg.recoveryProgressFile());
+        assertTrue(progress.contains("\"stageName\":\"REDO_REPLAY\""),
+                "existing-open recovery must persist progress events under the engine baseDir");
+        assertTrue(progress.contains("\"stageName\":\"OPEN_TRAFFIC\""));
 
         recovered.close();
+    }
+
+    @Test
+    void existingOpenWithReadOnlyValidatePublishesReadOnlyEngineAndRejectsAccessors() {
+        Path dataPath = dir.resolve("data-readonly-validate.ibd");
+        EngineConfig cfg = configWithRecoveryTablespace(dataPath);
+
+        StorageEngine clean = new StorageEngine(cfg);
+        clean.open();
+        createClusteredIndex(clean, dataPath);
+        clean.close();
+
+        StorageEngine readOnly = new StorageEngine(cfg.withRecoveryMode(RecoveryMode.READ_ONLY_VALIDATE));
+        readOnly.open();
+
+        RecoveryReport report = readOnly.lastRecoveryReport().orElseThrow();
+        assertEquals(EngineState.READ_ONLY, readOnly.state(),
+                "READ_ONLY_VALIDATE existing-open must not publish the ordinary writable OPEN lifecycle");
+        assertEquals(RecoveryState.READ_ONLY, readOnly.recoveryState());
+        assertEquals(RecoveryMode.READ_ONLY_VALIDATE, report.mode());
+        assertEquals(RecoveryState.READ_ONLY, report.state());
+        assertTrue(report.completedStages().contains(RecoveryStageName.READ_ONLY_DIAGNOSTIC_OPEN));
+        assertThrows(EngineStateException.class, readOnly::dmlService,
+                "只读诊断态只暴露恢复报告和 gate 状态，普通 DML facade 仍必须拒绝访问");
+        RecoveryDiagnosticsSnapshot diagnostics = readOnly.recoveryDiagnostics();
+        assertEquals(RecoveryState.READ_ONLY, diagnostics.gateState());
+        assertTrue(diagnostics.lastReport().isPresent());
+        assertTrue(diagnostics.progressEvents().stream().anyMatch(event ->
+                event.kind() == RecoveryProgressEventKind.COMPLETED
+                        && event.stageName() == RecoveryStageName.READ_ONLY_DIAGNOSTIC_OPEN
+                        && event.state() == RecoveryState.READ_ONLY));
+
+        readOnly.close();
+        assertEquals(EngineState.CLOSED, readOnly.state());
+    }
+
+    @Test
+    void ordinaryAccessorsRejectWhenRecoveryGateLeavesOpenAfterStartup() {
+        RecoveryTrafficGate gate = new RecoveryTrafficGate();
+        RecoveryProgressJournal journal = new RecoveryProgressJournal();
+        StorageEngine engine = new StorageEngine(config(), gate, journal);
+        engine.open();
+        try {
+            gate.closeForRecovery();
+
+            assertThrows(EngineStateException.class, engine::miniTransactionManager);
+            assertThrows(EngineStateException.class, engine::diskSpaceManager);
+            assertThrows(EngineStateException.class, engine::btreeService);
+            assertThrows(EngineStateException.class, engine::undoLogManager);
+            assertThrows(EngineStateException.class, engine::dmlService);
+
+            RecoveryDiagnosticsSnapshot diagnostics = engine.recoveryDiagnostics();
+            assertEquals(RecoveryState.RECOVERING, diagnostics.gateState());
+            assertTrue(diagnostics.lastReport().isEmpty());
+            assertTrue(diagnostics.lastFailureMessage().isEmpty());
+        } finally {
+            if (engine.state() == EngineState.OPEN) {
+                gate.openForUserTraffic();
+                engine.close();
+            }
+        }
+    }
+
+    @Test
+    void freshOpenWithReadOnlyValidateIsRejectedBeforeFormattingFiles() {
+        EngineConfig cfg = config().withRecoveryMode(RecoveryMode.READ_ONLY_VALIDATE);
+        StorageEngine engine = new StorageEngine(cfg);
+        try {
+            assertThrows(DatabaseValidationException.class, engine::open,
+                    "READ_ONLY_VALIDATE 只能诊断 existing recovery，不能隐式创建新实例文件");
+        } finally {
+            if (engine.state() == EngineState.OPEN || engine.state() == EngineState.READ_ONLY) {
+                engine.close();
+            }
+        }
+
+        assertFalse(Files.exists(cfg.redoDir()));
+        assertFalse(Files.exists(cfg.undoFile()));
+        assertFalse(Files.exists(cfg.doublewriteFile()));
     }
 
     /**

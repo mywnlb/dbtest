@@ -25,5 +25,7 @@ public enum RecoveryStageName {
     /** 从 recovered COMMITTED undo header 重建 history list 和事务提交序水位，供启动后的 purge driver 续作。 */
     RESUME_PURGE,
     /** R2 必需阶段成功后开放普通用户流量。 */
-    OPEN_TRAFFIC
+    OPEN_TRAFFIC,
+    /** READ_ONLY_VALIDATE 扫描完成后进入只读诊断态；不开放普通用户流量。 */
+    READ_ONLY_DIAGNOSTIC_OPEN
 }

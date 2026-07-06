@@ -8,11 +8,17 @@ import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.fil.io.FileChannelPageStore;
 import cn.zhangyis.db.storage.fil.io.PageStore;
+import cn.zhangyis.db.storage.flush.CoordinatedDirtyVictimFlusher;
+import cn.zhangyis.db.storage.flush.FlushCoordinator;
+import cn.zhangyis.db.storage.flush.FlushResultStatus;
+import cn.zhangyis.db.storage.flush.doublewrite.NoDoublewriteStrategy;
+import cn.zhangyis.db.storage.redo.RedoLogManager;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.api.Test;
 
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
@@ -27,12 +33,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * LruBufferPool 集成测试：用 FileChannelPageStore + 临时文件真实驱动，固定读写往返、LRU 淘汰+脏页写回+读穿、
- * 帧耗尽、newPage、flush 落盘。
+ * 帧耗尽、newPage、FlushCoordinator 落盘。
  */
 class LruBufferPoolTest {
 
     private static final PageSize PS = PageSize.ofBytes(16 * 1024);
     private static final SpaceId SPACE = SpaceId.of(1);
+    private static final int PAYLOAD_OFFSET = 100;
 
     @TempDir
     Path dir;
@@ -87,18 +94,19 @@ class LruBufferPoolTest {
     void shouldEvictLruWriteBackDirtyAndReReadFromDisk() {
         try (PageStore store = openStore(8)) {
             LruBufferPool pool = new LruBufferPool(store, PS, 2);
+            attachNoDoublewriteFlusher(pool, store);
             try (PageGuard g = pool.getPage(page(0), PageLatchMode.EXCLUSIVE)) {
-                g.writeInt(0, 0xAA);
+                g.writeInt(PAYLOAD_OFFSET, 0xAA);
             }
             try (PageGuard g = pool.getPage(page(1), PageLatchMode.EXCLUSIVE)) {
-                g.writeInt(0, 0xBB);
+                g.writeInt(PAYLOAD_OFFSET, 0xBB);
             }
             try (PageGuard g = pool.getPage(page(2), PageLatchMode.EXCLUSIVE)) {
-                g.writeInt(0, 0xCC);
+                g.writeInt(PAYLOAD_OFFSET, 0xCC);
             }
             assertEquals(2, pool.residentCount());
             try (PageGuard g = pool.getPage(page(0), PageLatchMode.SHARED)) {
-                assertEquals(0xAA, g.readInt(0));
+                assertEquals(0xAA, g.readInt(PAYLOAD_OFFSET));
             }
             pool.close();
         }
@@ -206,17 +214,17 @@ class LruBufferPoolTest {
     }
 
     @Test
-    void newPageShouldNotReadDiskAndPersistAfterFlush() {
+    void newPageShouldNotReadDiskAndPersistThroughFlushCoordinator() {
         try (PageStore store = openStore(8)) {
             LruBufferPool pool = new LruBufferPool(store, PS, 4);
             try (PageGuard g = pool.newPage(page(3), PageLatchMode.EXCLUSIVE)) {
-                assertEquals(0, g.readInt(0));
-                g.writeInt(0, 0x1234);
+                assertEquals(0, g.readInt(PAYLOAD_OFFSET));
+                g.writeInt(PAYLOAD_OFFSET, 0x1234);
             }
-            pool.flush(page(3));
+            flushPage(pool, store, page(3));
             LruBufferPool pool2 = new LruBufferPool(store, PS, 4);
             try (PageGuard g = pool2.getPage(page(3), PageLatchMode.SHARED)) {
-                assertEquals(0x1234, g.readInt(0));
+                assertEquals(0x1234, g.readInt(PAYLOAD_OFFSET));
             }
             pool.close();
             pool2.close();
@@ -298,26 +306,27 @@ class LruBufferPoolTest {
     }
 
     @Test
-    void flushShouldSkipFixedPageAndPersistAfterRelease() {
+    void flushCoordinatorShouldSkipFixedPageAndPersistAfterRelease() {
         try (PageStore store = openStore(8)) {
             LruBufferPool pool = new LruBufferPool(store, PS, 4);
             PageGuard g = pool.getPage(page(2), PageLatchMode.EXCLUSIVE);
-            g.writeInt(0, 0x77);
-            pool.flush(page(2)); // 帧仍 fix → 跳过，不写回
+            g.writeInt(PAYLOAD_OFFSET, 0x77);
+            assertEquals(FlushResultStatus.SKIPPED_NOT_DIRTY,
+                    flushPage(pool, store, page(2))); // 帧仍 fix → snapshot empty，不写回
 
             // 另一个池经同一 PageStore 读盘：page2 仍是 0，证明 flush 跳过了 fixed 帧
             LruBufferPool probe = new LruBufferPool(store, PS, 4);
             try (PageGuard r = probe.getPage(page(2), PageLatchMode.SHARED)) {
-                assertEquals(0, r.readInt(0));
+                assertEquals(0, r.readInt(PAYLOAD_OFFSET));
             }
             probe.close();
 
             g.close(); // 释放 → 未 fix（此时帧才被置脏）
-            pool.flush(page(2)); // 现在写回
+            assertEquals(FlushResultStatus.CLEAN, flushPage(pool, store, page(2))); // 现在写回
 
             LruBufferPool probe2 = new LruBufferPool(store, PS, 4);
             try (PageGuard r = probe2.getPage(page(2), PageLatchMode.SHARED)) {
-                assertEquals(0x77, r.readInt(0));
+                assertEquals(0x77, r.readInt(PAYLOAD_OFFSET));
             }
             probe2.close();
             pool.close();
@@ -330,6 +339,26 @@ class LruBufferPoolTest {
             assertThrows(DatabaseValidationException.class, () -> new LruBufferPool(store, PS, 0));
             assertThrows(DatabaseValidationException.class, () -> new LruBufferPool(null, PS, 1));
         }
+    }
+
+    /**
+     * 测试 helper：通过生产 flush 协调器写单页，覆盖 WAL gate、checksum、data-file write/force 与 completeFlush。
+     * 本测试类的手写脏页没有分配 redo LSN，pageLSN 为 0，内存 redo 的 durable 边界 0 可满足 WAL gate。
+     */
+    private FlushResultStatus flushPage(BufferPool pool, PageStore store, PageId pageId) {
+        FlushCoordinator coordinator = new FlushCoordinator(pool, store, new RedoLogManager(), PS,
+                new NoDoublewriteStrategy(), Duration.ofMillis(50));
+        return coordinator.singlePageFlush(pageId).status();
+    }
+
+    /**
+     * 给真实淘汰路径注入 FlushCoordinator 适配器，使测试覆盖 WAL gate/checksum/data-file force 后再复用脏 victim。
+     * 手写脏页没有 MTR pageLSN，内存 redo 的 durable LSN=0 足以放行。
+     */
+    private void attachNoDoublewriteFlusher(LruBufferPool pool, PageStore store) {
+        FlushCoordinator coordinator = new FlushCoordinator(pool, store, new RedoLogManager(), PS,
+                new NoDoublewriteStrategy(), Duration.ofMillis(50));
+        pool.attachVictimFlusher(new CoordinatedDirtyVictimFlusher(coordinator));
     }
 
     /**

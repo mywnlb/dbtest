@@ -38,6 +38,20 @@ public final class RecoveryTrafficGate {
     }
 
     /**
+     * 只读校验成功后进入诊断态。该状态不同于 {@link RecoveryState#OPEN}：它表示恢复输入已完成扫描，
+     * 但本进程没有执行 redo apply、doublewrite repair、undo rollback 等会修改文件的阶段，因此普通流量仍不可进入。
+     */
+    public void enterReadOnlyDiagnostic() {
+        lock.lock();
+        try {
+            state = RecoveryState.READ_ONLY;
+            failure = null;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
      * 恢复失败时保持 gate 关闭，并保存根因。
      *
      * @param cause 恢复失败根因。

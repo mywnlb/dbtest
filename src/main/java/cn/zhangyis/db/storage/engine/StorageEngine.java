@@ -52,6 +52,9 @@ import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
 import cn.zhangyis.db.storage.record.type.TypeCodecRegistry;
 import cn.zhangyis.db.storage.recovery.CrashRecoveryService;
+import cn.zhangyis.db.storage.recovery.RecoveryMode;
+import cn.zhangyis.db.storage.recovery.RecoveryDiagnosticsSnapshot;
+import cn.zhangyis.db.storage.recovery.RecoveryProgressJournal;
 import cn.zhangyis.db.storage.recovery.RecoveryReport;
 import cn.zhangyis.db.storage.recovery.RecoveryRequest;
 import cn.zhangyis.db.storage.recovery.RecoveryState;
@@ -133,7 +136,9 @@ public final class StorageEngine {
     /** 每个表空间的 operation lease 控制器；同一实例注入 MTR、page0 loader、flush 和 undo truncate recovery。 */
     private TablespaceAccessController accessController;
     /** 启动恢复流量门控；fresh open 直接打开，existing open 由 {@link CrashRecoveryService} 驱动状态转换。 */
-    private final RecoveryTrafficGate recoveryGate = new RecoveryTrafficGate();
+    private final RecoveryTrafficGate recoveryGate;
+    /** 本进程内 recovery 阶段进度 journal；fresh open 为空，existing open 由 CrashRecoveryService 写入。 */
+    private final RecoveryProgressJournal recoveryProgressJournal;
 
     // 接线的服务
     private RedoLogManager redo;
@@ -191,10 +196,26 @@ public final class StorageEngine {
     private RecoveryReport lastRecoveryReport;
 
     public StorageEngine(EngineConfig config) {
+        this(config, new RecoveryTrafficGate(), defaultRecoveryProgressJournal(config));
+    }
+
+    StorageEngine(EngineConfig config, RecoveryTrafficGate recoveryGate, RecoveryProgressJournal recoveryProgressJournal) {
         if (config == null) {
             throw new DatabaseValidationException("engine config must not be null");
         }
+        if (recoveryGate == null || recoveryProgressJournal == null) {
+            throw new DatabaseValidationException("engine recovery gate/journal must not be null");
+        }
         this.config = config;
+        this.recoveryGate = recoveryGate;
+        this.recoveryProgressJournal = recoveryProgressJournal;
+    }
+
+    private static RecoveryProgressJournal defaultRecoveryProgressJournal(EngineConfig config) {
+        if (config == null) {
+            throw new DatabaseValidationException("engine config must not be null");
+        }
+        return RecoveryProgressJournal.persistent(config.recoveryProgressFile());
     }
 
     /**
@@ -218,12 +239,14 @@ public final class StorageEngine {
         boolean fresh;
         if (config.redoRotationEnabled()) {
             fresh = !Files.exists(config.redoDir());
+            rejectFreshRecoveryMode(fresh);
             RotatingRedoLogRepository ring = RedoLogFileRepository.openRing(
                     config.redoDir(), config.redoRotation().fileCount(), config.redoRotation().fileBytes());
             this.redoRepo = ring;
             redoReclaim = ring;
         } else {
             fresh = !Files.exists(config.redoFile());
+            rejectFreshRecoveryMode(fresh);
             this.redoRepo = RedoLogFileRepository.open(config.redoFile());
             redoReclaim = null;
         }
@@ -275,7 +298,7 @@ public final class StorageEngine {
         // WAL 安全淘汰：注入淘汰刷盘端口，使脏页淘汰复用 FlushCoordinator 的 WAL gate + checksum + doublewrite
         // 管线。必须在 FlushCoordinator 就绪后、任何可能触发淘汰的 page access（fresh 建系统 undo / recover）之前注入。
         lruPool.attachVictimFlusher(new CoordinatedDirtyVictimFlusher(flushCoordinator));
-        this.crashRecoveryService = new CrashRecoveryService(recoveryGate);
+        this.crashRecoveryService = new CrashRecoveryService(recoveryGate, recoveryProgressJournal);
 
         if (fresh) {
             // 建系统 undo 表空间（page0/inode 经 MTR 写入，redo 累积，close 时随 flushThrough durable）
@@ -289,6 +312,13 @@ public final class StorageEngine {
         } else {
             recoverExisting();
         }
+        if (recoveryGate.state() == RecoveryState.READ_ONLY) {
+            // READ_ONLY_VALIDATE 是灾难诊断启动：前面已经打开文件句柄并扫描 recovery 输入，但没有应用 redo、
+            // 没有修复 doublewrite、也没有安装可续写 redo 边界。此处不能启动后台 worker 或 warmup，因为它们会
+            // 触发普通读写生命周期；发布 EngineState.READ_ONLY 后只允许读取恢复报告/gate 状态再 close 释放句柄。
+            this.state = EngineState.READ_ONLY;
+            return;
+        }
         // redo flusher 早于 page cleaner 启动：先让 durable LSN 能自动前进，page cleaner 的 WAL gate 才不空等。
         startBackgroundRedoFlusher();
         startBackgroundPageCleaner();
@@ -301,6 +331,17 @@ public final class StorageEngine {
             recoveryGate.openForUserTraffic();
         }
         this.state = EngineState.OPEN;
+    }
+
+    /**
+     * recoveryMode 只定义 existing-open 的恢复语义。fresh open 会格式化 redo、doublewrite 和系统 undo 文件，
+     * 因此不能接受 READ_ONLY_VALIDATE / force recovery 这类诊断模式；在打开 redo repo 之前拒绝，避免留下半初始化文件。
+     */
+    private void rejectFreshRecoveryMode(boolean fresh) {
+        if (fresh && config.recoveryMode() != RecoveryMode.NORMAL) {
+            throw new DatabaseValidationException("recovery mode " + config.recoveryMode()
+                    + " requires existing engine files");
+        }
     }
 
     /**
@@ -332,13 +373,20 @@ public final class StorageEngine {
                 doublewritePages.add(pageId);
             }
         }
-        RecoveryRequest request = RecoveryRequest.normal(checkpointStore, redoRepo,
-                        RedoApplyDispatcher.pageDispatcher(), new RedoApplyContext(store, config.pageSize()))
-                .withDoublewriteRepair(doublewriteScanner, doublewritePages)
-                .withRedoBoundaryInstall(redo)
-                .withUndoTablespaceRecovery(buildUndoTablespaceRecovery())
-                .withSpaceFileReconcile(recoverySpaces)
-                .withTransactionUndoRecovery(this::recoverTransactionUndoAfterRedo);
+        RecoveryRequest request = switch (config.recoveryMode()) {
+            case NORMAL -> RecoveryRequest.normal(checkpointStore, redoRepo,
+                            RedoApplyDispatcher.pageDispatcher(), new RedoApplyContext(store, config.pageSize()))
+                    .withDoublewriteRepair(doublewriteScanner, doublewritePages)
+                    .withRedoBoundaryInstall(redo)
+                    .withUndoTablespaceRecovery(buildUndoTablespaceRecovery())
+                    .withSpaceFileReconcile(recoverySpaces)
+                    .withTransactionUndoRecovery(this::recoverTransactionUndoAfterRedo);
+            case READ_ONLY_VALIDATE -> RecoveryRequest.readOnlyValidate(checkpointStore, redoRepo,
+                            RedoApplyDispatcher.pageDispatcher(), new RedoApplyContext(store, config.pageSize()))
+                    .withDoublewriteRepair(doublewriteScanner, doublewritePages);
+            case FORCE_SKIP_CORRUPT_TABLESPACE -> throw new DatabaseValidationException(
+                    "FORCE_SKIP_CORRUPT_TABLESPACE recovery mode is reserved and not implemented");
+        };
         lastRecoveryReport = crashRecoveryService.recover(request);
     }
 
@@ -544,6 +592,10 @@ public final class StorageEngine {
         if (state == EngineState.CLOSED) {
             return;
         }
+        if (state == EngineState.READ_ONLY) {
+            closeOpenedHandles();
+            return;
+        }
         if (state != EngineState.OPEN) {
             throw new EngineStateException("close requires OPEN state: " + state);
         }
@@ -554,6 +606,14 @@ public final class StorageEngine {
         flushService.flushThrough(redo.currentLsn(), config.flushTimeout());
         // warmup dump：后台 worker 已停、dirty 已刷，residentMap 稳定，保存热页定位供下次 open 预取。最佳努力（IO 失败不抛）。
         new BufferPoolWarmupService().dump(pool, config.bufferPoolDumpFile());
+        closeOpenedHandles();
+    }
+
+    /**
+     * 释放引擎打开的底层句柄。普通 OPEN close 在调用前已经停后台 worker、flushThrough 并写 warmup dump；
+     * READ_ONLY_VALIDATE close 则直接走这里，避免把诊断实例的关闭动作变成隐式刷盘或预热状态写入。
+     */
+    private void closeOpenedHandles() {
         List<RuntimeException> errors = new ArrayList<>();
         closeQuietly(pool, errors);
         closeQuietly(store, errors);
@@ -740,6 +800,23 @@ public final class StorageEngine {
     }
 
     /**
+     * 生成 recovery control-plane 诊断快照。该入口不要求引擎处于 OPEN：READ_ONLY_VALIDATE、FAILED recovery
+     * 或启动失败后的上层诊断都需要读取 gate/report/progress。快照只复制不可变值，不暴露 gate/journal 可变对象。
+     */
+    public RecoveryDiagnosticsSnapshot recoveryDiagnostics() {
+        Optional<RecoveryReport> report = Optional.ofNullable(lastRecoveryReport);
+        if (report.isEmpty() && crashRecoveryService != null) {
+            report = crashRecoveryService.lastReport();
+        }
+        Optional<String> failure = recoveryGate.lastFailure().map(StorageEngine::describeFailure);
+        if (failure.isEmpty() && crashRecoveryService != null) {
+            failure = crashRecoveryService.lastError().map(StorageEngine::describeFailure);
+        }
+        return new RecoveryDiagnosticsSnapshot(recoveryGate.state(), report,
+                failure, recoveryProgressJournal.snapshot());
+    }
+
+    /**
      * 后台 page cleaner 当前状态。该查询不要求 engine OPEN：close 后测试/诊断需要确认 worker 已 STOPPED；
      * 如果配置禁用了后台 worker，则返回 NEW 表示未构造线程。
      */
@@ -780,6 +857,10 @@ public final class StorageEngine {
         if (state != EngineState.OPEN) {
             throw new EngineStateException("engine not OPEN: " + state);
         }
+        RecoveryState recoveryState = recoveryGate.state();
+        if (recoveryState != RecoveryState.OPEN) {
+            throw new EngineStateException("engine recovery gate not OPEN: " + recoveryState);
+        }
     }
 
     private static void closeQuietly(AutoCloseable handle, List<RuntimeException> errors) {
@@ -793,5 +874,11 @@ public final class StorageEngine {
         } catch (Exception e) {
             errors.add(new DatabaseRuntimeException("close handle failed", e));
         }
+    }
+
+    private static String describeFailure(Throwable failure) {
+        return failure.getClass().getSimpleName()
+                + (failure.getMessage() == null || failure.getMessage().isBlank()
+                ? "" : ": " + failure.getMessage());
     }
 }

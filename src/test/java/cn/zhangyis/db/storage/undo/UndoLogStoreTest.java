@@ -1,6 +1,7 @@
 package cn.zhangyis.db.storage.undo;
 
 import cn.zhangyis.db.domain.PageId;
+import cn.zhangyis.db.domain.Lsn;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.RollPointer;
@@ -11,8 +12,11 @@ import cn.zhangyis.db.storage.api.DiskSpaceManager;
 import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.LruBufferPool;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
+import cn.zhangyis.db.storage.fil.access.TablespaceAccessController;
 import cn.zhangyis.db.storage.fil.io.FileChannelPageStore;
 import cn.zhangyis.db.storage.fil.io.PageStore;
+import cn.zhangyis.db.storage.flush.FlushCoordinator;
+import cn.zhangyis.db.storage.flush.doublewrite.NoDoublewriteStrategy;
 import cn.zhangyis.db.storage.fsp.segment.SegmentPurpose;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
@@ -25,10 +29,13 @@ import cn.zhangyis.db.storage.record.schema.KeyPartDef;
 import cn.zhangyis.db.storage.record.schema.TableSchema;
 import cn.zhangyis.db.storage.record.type.ColumnValue;
 import cn.zhangyis.db.storage.record.type.TypeCodecRegistry;
+import cn.zhangyis.db.storage.redo.RedoLogFileRepository;
+import cn.zhangyis.db.storage.redo.RedoLogManager;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -124,8 +131,10 @@ class UndoLogStoreTest {
         RollPointer rp;
 
         try (PageStore store = new FileChannelPageStore();
-             BufferPool pool = new LruBufferPool(store, PS, 128)) {
-            MiniTransactionManager mgr = new MiniTransactionManager();
+             BufferPool pool = new LruBufferPool(store, PS, 128);
+             RedoLogFileRepository repo = RedoLogFileRepository.open(dir.resolve("undo-reopen-redo.log"))) {
+            RedoLogManager redo = RedoLogManager.durable(repo);
+            MiniTransactionManager mgr = new MiniTransactionManager(new TablespaceAccessController(), redo);
             DiskSpaceManager disk = new DiskSpaceManager(pool, store, PS);
             UndoPageAccess access = new UndoPageAccess(pool, PS);
 
@@ -138,6 +147,7 @@ class UndoLogStoreTest {
             pid = page.pageId();
             rp = undoLog.append(page, expected, keyDef(), schema());
             mgr.commit(m);
+            flushAllDirty(pool, store, redo);
         }
 
         try (PageStore store = new FileChannelPageStore();
@@ -176,5 +186,15 @@ class UndoLogStoreTest {
             mgr.commit(boot);
             body.run(mgr, disk, access);
         }
+    }
+
+    /**
+     * 跨 store reopen 测试显式执行 redo fsync + FlushCoordinator data-file 写出，不再借 BufferPool.close 的旧副作用。
+     */
+    private static void flushAllDirty(BufferPool pool, PageStore store, RedoLogManager redo) {
+        redo.flush();
+        FlushCoordinator coordinator = new FlushCoordinator(pool, store, redo, PS,
+                new NoDoublewriteStrategy(), Duration.ofMillis(50));
+        coordinator.flushList(Lsn.of(Long.MAX_VALUE), pool.capacity());
     }
 }

@@ -2,10 +2,12 @@ package cn.zhangyis.db.storage.api;
 import cn.zhangyis.db.storage.fil.exception.TablespaceCorruptedException;
 import cn.zhangyis.db.storage.fil.exception.TablespaceNotFoundException;
 import cn.zhangyis.db.storage.fil.exception.TablespaceUnavailableException;
+import cn.zhangyis.db.storage.fil.access.TablespaceAccessController;
 import cn.zhangyis.db.storage.fil.state.TablespaceState;
 import cn.zhangyis.db.storage.fil.state.TablespaceType;
 
 
+import cn.zhangyis.db.domain.Lsn;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.SpaceId;
@@ -13,13 +15,18 @@ import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.LruBufferPool;
 import cn.zhangyis.db.storage.fil.io.FileChannelPageStore;
 import cn.zhangyis.db.storage.fil.io.PageStore;
+import cn.zhangyis.db.storage.flush.FlushCoordinator;
+import cn.zhangyis.db.storage.flush.doublewrite.NoDoublewriteStrategy;
 import cn.zhangyis.db.storage.fsp.segment.SegmentPurpose;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
+import cn.zhangyis.db.storage.redo.RedoLogFileRepository;
+import cn.zhangyis.db.storage.redo.RedoLogManager;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.time.Duration;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -67,12 +74,16 @@ class DiskSpaceManagerTablespaceAdmissionTest {
     void openTablespaceForRecoveryReopensNormalFromDisk() {
         Path path = dir.resolve("rec.ibu");
         SpaceId space = SpaceId.of(52);
-        try (PageStore store = new FileChannelPageStore(); BufferPool pool = new LruBufferPool(store, PS, 128)) {
-            MiniTransactionManager mgr = new MiniTransactionManager();
+        try (PageStore store = new FileChannelPageStore();
+             BufferPool pool = new LruBufferPool(store, PS, 128);
+             RedoLogFileRepository repo = RedoLogFileRepository.open(dir.resolve("rec-redo.log"))) {
+            RedoLogManager redo = RedoLogManager.durable(repo);
+            MiniTransactionManager mgr = new MiniTransactionManager(new TablespaceAccessController(), redo);
             DiskSpaceManager disk = new DiskSpaceManager(pool, store, PS);
             MiniTransaction boot = mgr.begin();
             disk.createTablespace(boot, space, path, PageNo.of(64), TablespaceType.GENERAL);
             mgr.commit(boot);
+            flushAllDirty(pool, store, redo);
         }
         try (PageStore store = new FileChannelPageStore(); BufferPool pool = new LruBufferPool(store, PS, 128)) {
             DiskSpaceManager disk = new DiskSpaceManager(pool, store, PS);
@@ -137,12 +148,16 @@ class DiskSpaceManagerTablespaceAdmissionTest {
     void reopenViaDirectStoreOpenLazyLoadsViaLoader() {
         Path path = dir.resolve("re.ibu");
         SpaceId space = SpaceId.of(63);
-        try (PageStore store = new FileChannelPageStore(); BufferPool pool = new LruBufferPool(store, PS, 128)) {
-            MiniTransactionManager mgr = new MiniTransactionManager();
+        try (PageStore store = new FileChannelPageStore();
+             BufferPool pool = new LruBufferPool(store, PS, 128);
+             RedoLogFileRepository repo = RedoLogFileRepository.open(dir.resolve("re-redo.log"))) {
+            RedoLogManager redo = RedoLogManager.durable(repo);
+            MiniTransactionManager mgr = new MiniTransactionManager(new TablespaceAccessController(), redo);
             DiskSpaceManager disk = new DiskSpaceManager(pool, store, PS);
             MiniTransaction boot = mgr.begin();
             disk.createTablespace(boot, space, path, PageNo.of(64), TablespaceType.UNDO);
             mgr.commit(boot);
+            flushAllDirty(pool, store, redo);
         }
         try (PageStore store = new FileChannelPageStore(); BufferPool pool = new LruBufferPool(store, PS, 128)) {
             store.open(space, path, PS);
@@ -168,5 +183,15 @@ class DiskSpaceManagerTablespaceAdmissionTest {
             DiskSpaceManager disk = new DiskSpaceManager(pool, store, PS);
             body.run(mgr, disk, store);
         }
+    }
+
+    /**
+     * 重开类用例不再依赖 BufferPool.close 的旧 flushAll 副作用；显式等待 redo durable 后由 FlushCoordinator 写出脏页。
+     */
+    private static void flushAllDirty(BufferPool pool, PageStore store, RedoLogManager redo) {
+        redo.flush();
+        FlushCoordinator coordinator = new FlushCoordinator(pool, store, redo, PS,
+                new NoDoublewriteStrategy(), Duration.ofMillis(50));
+        coordinator.flushList(Lsn.of(Long.MAX_VALUE), pool.capacity());
     }
 }

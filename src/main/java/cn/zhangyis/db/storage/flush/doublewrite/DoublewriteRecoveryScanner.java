@@ -45,6 +45,26 @@ public final class DoublewriteRecoveryScanner {
      * @return 单页检查结果。
      */
     public DoublewriteRecoveryResult scanPageIfNeeded(PageId pageId) {
+        return scanPage(pageId, true);
+    }
+
+    /**
+     * 只读校验单页并返回结构化结果。该路径与普通 recovery 使用同样的 checksum/full-copy/detect-only 判定，
+     * 但即使命中 full-copy 也只报告 {@link DoublewriteRecoveryOutcome#REPAIRABLE_FROM_COPY}，绝不写回 data file。
+     *
+     * @param pageId 目标页。
+     * @return 单页只读校验结果。
+     */
+    public DoublewriteRecoveryResult scanPageForValidation(PageId pageId) {
+        return scanPage(pageId, false);
+    }
+
+    /**
+     * doublewrite 单页判定的共享数据流：先拒绝 null 页号，再跳过物理文件尾外页，随后读取当前 data page
+     * 并校验 checksum；只有 checksum 无效时才查 doublewrite full-copy / detect-only metadata。`repairAllowed`
+     * 是唯一写盘开关，保证 READ_ONLY_VALIDATE 和 NORMAL 走同一判定但不会误用同一写回副作用。
+     */
+    private DoublewriteRecoveryResult scanPage(PageId pageId, boolean repairAllowed) {
         if (pageId == null) {
             throw new DatabaseValidationException("page id must not be null");
         }
@@ -61,6 +81,9 @@ public final class DoublewriteRecoveryScanner {
         }
         Optional<byte[]> copy = repository.latestCopy(pageId);
         if (copy.isPresent()) {
+            if (!repairAllowed) {
+                return new DoublewriteRecoveryResult(pageId, DoublewriteRecoveryOutcome.REPAIRABLE_FROM_COPY);
+            }
             pageStore.writePage(pageId, ByteBuffer.wrap(copy.get()));
             pageStore.force(pageId.spaceId());
             return new DoublewriteRecoveryResult(pageId, DoublewriteRecoveryOutcome.REPAIRED_FROM_COPY);

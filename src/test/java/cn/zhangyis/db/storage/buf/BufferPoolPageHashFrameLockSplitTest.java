@@ -6,11 +6,15 @@ import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.fil.io.FileChannelPageStore;
 import cn.zhangyis.db.storage.fil.io.PageStore;
+import cn.zhangyis.db.storage.flush.FlushCoordinator;
+import cn.zhangyis.db.storage.flush.doublewrite.NoDoublewriteStrategy;
+import cn.zhangyis.db.storage.redo.RedoLogManager;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -67,7 +71,7 @@ class BufferPoolPageHashFrameLockSplitTest {
     }
 
     @Test
-    void legacyFlushWriteDoesNotHoldPageHashOrFrameMutex() {
+    void flushCoordinatorWriteDoesNotHoldPageHashOrFrameMutex() {
         PageId page = page(1);
         try (ObservingPageStore store = openObservingStore("flush-observe.ibu");
              BufferPool pool = new LruBufferPool(store, PS, 2)) {
@@ -75,10 +79,12 @@ class BufferPoolPageHashFrameLockSplitTest {
                 guard.writeInt(0, 0x13_1C);
             }
 
-            pool.flush(page);
+            FlushCoordinator coordinator = new FlushCoordinator(pool, store, new RedoLogManager(), PS,
+                    new NoDoublewriteStrategy(), Duration.ofMillis(50));
+            coordinator.singlePageFlush(page);
 
             assertFalse(store.criticalLockDuringWrite.get(),
-                    "legacy PageStore.writePage must run after releasing pageHashLock/frameMutex");
+                    "FlushCoordinator PageStore.writePage must run after releasing pageHashLock/frameMutex");
         }
     }
 

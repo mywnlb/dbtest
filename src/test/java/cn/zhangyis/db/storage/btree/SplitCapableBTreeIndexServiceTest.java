@@ -12,8 +12,12 @@ import cn.zhangyis.db.storage.api.SegmentRef;
 import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.LruBufferPool;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
+import cn.zhangyis.db.storage.fil.access.TablespaceAccessController;
 import cn.zhangyis.db.storage.fil.io.FileChannelPageStore;
 import cn.zhangyis.db.storage.fil.io.PageStore;
+import cn.zhangyis.db.storage.flush.CoordinatedDirtyVictimFlusher;
+import cn.zhangyis.db.storage.flush.FlushCoordinator;
+import cn.zhangyis.db.storage.flush.doublewrite.NoDoublewriteStrategy;
 import cn.zhangyis.db.storage.fsp.exception.NoFreeSpaceException;
 import cn.zhangyis.db.storage.fsp.segment.SegmentPurpose;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
@@ -40,6 +44,7 @@ import cn.zhangyis.db.storage.redo.RedoApplyDispatcher;
 import cn.zhangyis.db.storage.redo.RedoLogBatch;
 import cn.zhangyis.db.storage.redo.RedoLogFileRepository;
 import cn.zhangyis.db.storage.redo.RedoRecoveryReader;
+import cn.zhangyis.db.storage.redo.RedoLogManager;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -183,8 +188,11 @@ class SplitCapableBTreeIndexServiceTest {
     @Test
     void rootLeafSplitReservationFailureLeavesExistingTreeUnchanged() {
         PageStore store = new LimitedPageStore(128);
-        try (PageStore ignored = store; BufferPool pool = new LruBufferPool(store, PS, 128)) {
-            BTreeContext ctx = new BTreeContext(store, pool);
+        try (PageStore ignored = store;
+             BufferPool pool = new LruBufferPool(store, PS, 128);
+             RedoLogFileRepository repo = RedoLogFileRepository.open(dir.resolve("btree-limited-redo.log"))) {
+            RedoLogManager redo = RedoLogManager.durable(repo);
+            BTreeContext ctx = new BTreeContext(store, pool, redo);
             ctx.createTablespaceAndRoot();
             BTreeIndex current = ctx.splitIndex();
             BTreeIndexService service = ctx.service();
@@ -840,8 +848,18 @@ class SplitCapableBTreeIndexServiceTest {
      */
     private void onBTreePool(int capacity, Body body) {
         PageStore store = new FileChannelPageStore();
-        try (PageStore ignored = store; BufferPool pool = new LruBufferPool(store, PS, capacity)) {
-            BTreeContext ctx = new BTreeContext(store, pool);
+        try (PageStore ignored = store;
+             LruBufferPool pool = new LruBufferPool(store, PS, capacity);
+             RedoLogFileRepository repo = RedoLogFileRepository.open(dir.resolve("btree-context-redo.log"))) {
+            RedoLogManager redo = RedoLogManager.durable(repo);
+            FlushCoordinator coordinator = new FlushCoordinator(pool, store, redo, PS,
+                    new NoDoublewriteStrategy(), Duration.ofMillis(50));
+            CoordinatedDirtyVictimFlusher flusher = new CoordinatedDirtyVictimFlusher(coordinator);
+            pool.attachVictimFlusher(pageId -> {
+                redo.flush();
+                return flusher.flushVictim(pageId);
+            });
+            BTreeContext ctx = new BTreeContext(store, pool, redo);
             body.run(ctx);
         }
     }
@@ -853,16 +871,17 @@ class SplitCapableBTreeIndexServiceTest {
     private final class BTreeContext {
         private final PageStore store;
         private final BufferPool pool;
-        private final MiniTransactionManager mgr = new MiniTransactionManager();
+        private final MiniTransactionManager mgr;
         private final DiskSpaceManager disk;
         private final IndexPageAccess access;
         private SegmentRef leafSegment;
         private SegmentRef nonLeafSegment;
         private PageId rootPageId;
 
-        private BTreeContext(PageStore store, BufferPool pool) {
+        private BTreeContext(PageStore store, BufferPool pool, RedoLogManager redo) {
             this.store = store;
             this.pool = pool;
+            this.mgr = new MiniTransactionManager(new TablespaceAccessController(), redo);
             this.disk = new DiskSpaceManager(pool, store, PS);
             this.access = new IndexPageAccess(pool, PS);
         }

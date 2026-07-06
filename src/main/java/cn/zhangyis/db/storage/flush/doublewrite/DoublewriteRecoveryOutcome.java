@@ -9,6 +9,8 @@ public enum DoublewriteRecoveryOutcome {
     CLEAN_OR_NOT_COVERED,
     /** 使用 full-copy slot 写回并 force 了 data file。 */
     REPAIRED_FROM_COPY,
+    /** data page checksum 无效且命中 full-copy slot，但当前扫描处于只读校验路径，未写回 data file。 */
+    REPAIRABLE_FROM_COPY,
     /** data page checksum 无效且只命中 detect-only metadata，未写回 data file。 */
     DETECTED_ONLY
 }

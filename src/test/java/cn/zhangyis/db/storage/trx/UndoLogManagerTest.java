@@ -1,5 +1,6 @@
 package cn.zhangyis.db.storage.trx;
 
+import cn.zhangyis.db.domain.Lsn;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
@@ -13,8 +14,11 @@ import cn.zhangyis.db.storage.api.DiskSpaceUndoAllocator;
 import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.LruBufferPool;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
+import cn.zhangyis.db.storage.fil.access.TablespaceAccessController;
 import cn.zhangyis.db.storage.fil.io.FileChannelPageStore;
 import cn.zhangyis.db.storage.fil.io.PageStore;
+import cn.zhangyis.db.storage.flush.FlushCoordinator;
+import cn.zhangyis.db.storage.flush.doublewrite.NoDoublewriteStrategy;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
 import cn.zhangyis.db.storage.record.schema.ColumnDef;
@@ -32,10 +36,13 @@ import cn.zhangyis.db.storage.undo.UndoLogSegmentAccess;
 import cn.zhangyis.db.storage.undo.UndoPageOverflowException;
 import cn.zhangyis.db.storage.undo.UndoRecord;
 import cn.zhangyis.db.storage.undo.UndoRecordType;
+import cn.zhangyis.db.storage.redo.RedoLogFileRepository;
+import cn.zhangyis.db.storage.redo.RedoLogManager;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -157,10 +164,12 @@ class UndoLogManagerTest {
         PageId[] firstPageHolder = new PageId[1];
         TransactionId[] widHolder = new TransactionId[1];
 
-        // build session：建 undo 表空间 + 一个事务一次 insert + commit，然后关闭 store/pool（close 触发 flushAll）
+        // build session：建 undo 表空间 + 一个事务一次 insert + commit，然后显式 flush 脏页供新 store 重开。
         try (PageStore store = new FileChannelPageStore();
-             BufferPool pool = new LruBufferPool(store, PS, 128)) {
-            MiniTransactionManager mgr = new MiniTransactionManager();
+             BufferPool pool = new LruBufferPool(store, PS, 128);
+             RedoLogFileRepository repo = RedoLogFileRepository.open(dir.resolve("undo-manager-reload-redo.log"))) {
+            RedoLogManager redo = RedoLogManager.durable(repo);
+            MiniTransactionManager mgr = new MiniTransactionManager(new TablespaceAccessController(), redo);
             DiskSpaceManager disk = new DiskSpaceManager(pool, store, PS);
             DiskSpaceUndoAllocator allocator = new DiskSpaceUndoAllocator(disk);
             UndoLogSegmentAccess access = new UndoLogSegmentAccess(pool, PS, allocator, registry);
@@ -179,6 +188,7 @@ class UndoLogManagerTest {
             firstPageHolder[0] = txn.undoContext().undoFirstPageId();
             mgr.commit(m);
             txnMgr.commit(txn);
+            flushAllDirty(pool, store, redo);
         }
 
         // reload session：全新 PageStore/BufferPool，仅靠 roll pointer + undo first page 读回（不依赖持久 rseg header）
@@ -384,8 +394,10 @@ class UndoLogManagerTest {
         TransactionId[] widHolder = new TransactionId[1];
 
         try (PageStore store = new FileChannelPageStore();
-             BufferPool pool = new LruBufferPool(store, PS, 128)) {
-            MiniTransactionManager mgr = new MiniTransactionManager();
+             BufferPool pool = new LruBufferPool(store, PS, 128);
+             RedoLogFileRepository repo = RedoLogFileRepository.open(dir.resolve("undo-manager-mixed-redo.log"))) {
+            RedoLogManager redo = RedoLogManager.durable(repo);
+            MiniTransactionManager mgr = new MiniTransactionManager(new TablespaceAccessController(), redo);
             DiskSpaceManager disk = new DiskSpaceManager(pool, store, PS);
             UndoLogSegmentAccess access = new UndoLogSegmentAccess(pool, PS, new DiskSpaceUndoAllocator(disk), registry);
             RollbackSegmentSlotManager slots = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), SLOT_CAPACITY);
@@ -405,6 +417,7 @@ class UndoLogManagerTest {
             firstPage[0] = txn.undoContext().undoFirstPageId();
             mgr.commit(m);
             txnMgr.commit(txn);
+            flushAllDirty(pool, store, redo);
         }
 
         try (PageStore store = new FileChannelPageStore();
@@ -472,6 +485,16 @@ class UndoLogManagerTest {
 
             body.run(new H(mgr, access, slots, undoMgr, txnMgr));
         }
+    }
+
+    /**
+     * 跨 BufferPool/PageStore reload 的测试需要 data file 中真实存在 undo 页；这里显式走 WAL gate 后 flush。
+     */
+    private static void flushAllDirty(BufferPool pool, PageStore store, RedoLogManager redo) {
+        redo.flush();
+        FlushCoordinator coordinator = new FlushCoordinator(pool, store, redo, PS,
+                new NoDoublewriteStrategy(), Duration.ofMillis(50));
+        coordinator.flushList(Lsn.of(Long.MAX_VALUE), pool.capacity());
     }
 
     private static final class H {

@@ -7,7 +7,11 @@ import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.fil.io.FileChannelPageStore;
 import cn.zhangyis.db.storage.fil.io.PageStore;
+import cn.zhangyis.db.storage.flush.CoordinatedDirtyVictimFlusher;
+import cn.zhangyis.db.storage.flush.FlushCoordinator;
+import cn.zhangyis.db.storage.flush.doublewrite.NoDoublewriteStrategy;
 import cn.zhangyis.db.storage.page.PageEnvelopeLayout;
+import cn.zhangyis.db.storage.redo.RedoLogManager;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -36,6 +40,7 @@ class LruBufferPoolMultiInstanceTest {
 
     private static final PageSize PS = PageSize.ofBytes(16 * 1024);
     private static final SpaceId SPACE = SpaceId.of(1);
+    private static final int PAYLOAD_OFFSET = 100;
 
     @TempDir
     Path dir;
@@ -71,13 +76,13 @@ class LruBufferPoolMultiInstanceTest {
 
     private static void writeInt(BufferPool pool, PageId pageId, int value) {
         try (PageGuard g = pool.getPage(pageId, PageLatchMode.EXCLUSIVE)) {
-            g.writeInt(0, value);
+            g.writeInt(PAYLOAD_OFFSET, value);
         }
     }
 
     private static int readInt(BufferPool pool, PageId pageId) {
         try (PageGuard g = pool.getPage(pageId, PageLatchMode.SHARED)) {
-            return g.readInt(0);
+            return g.readInt(PAYLOAD_OFFSET);
         }
     }
 
@@ -271,6 +276,7 @@ class LruBufferPoolMultiInstanceTest {
     void concurrentGetsOnDifferentInstancesSucceed() throws InterruptedException {
         try (PageStore store = openStore(512)) {
             LruBufferPool pool = new LruBufferPool(store, PS, 64, 4);
+            attachNoDoublewriteFlusher(pool, store);
             int threads = 4;
             int perThread = 40;
             CountDownLatch start = new CountDownLatch(1);
@@ -300,6 +306,16 @@ class LruBufferPoolMultiInstanceTest {
             assertNull(failure.get(), "并发不同 instance get 不应抛异常或内容错乱");
             pool.close();
         }
+    }
+
+    /**
+     * 多线程写入会让每个分片产生脏页淘汰压力；测试注入真实协调刷盘端口，固定 N>1 facade 下也不回退到
+     * Buffer Pool 直接写 PageStore 的旧路径。
+     */
+    private static void attachNoDoublewriteFlusher(LruBufferPool pool, PageStore store) {
+        FlushCoordinator coordinator = new FlushCoordinator(pool, store, new RedoLogManager(), PS,
+                new NoDoublewriteStrategy(), Duration.ofMillis(50));
+        pool.attachVictimFlusher(new CoordinatedDirtyVictimFlusher(coordinator));
     }
 
     /** 统计每页 readPage 次数的 PageStore 装饰器（仅测试用）。 */

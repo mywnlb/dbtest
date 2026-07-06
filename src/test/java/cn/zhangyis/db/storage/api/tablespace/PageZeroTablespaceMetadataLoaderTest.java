@@ -4,6 +4,7 @@ import cn.zhangyis.db.storage.fil.state.TablespaceType;
 import cn.zhangyis.db.storage.fil.state.TablespaceTypeFlags;
 
 
+import cn.zhangyis.db.domain.Lsn;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
@@ -16,6 +17,8 @@ import cn.zhangyis.db.storage.fil.io.PageStore;
 import cn.zhangyis.db.storage.fil.meta.TablespaceMetadata;
 import cn.zhangyis.db.storage.fil.access.TablespaceAccessController;
 import cn.zhangyis.db.storage.fil.access.TablespaceAccessLease;
+import cn.zhangyis.db.storage.flush.FlushCoordinator;
+import cn.zhangyis.db.storage.flush.doublewrite.NoDoublewriteStrategy;
 import cn.zhangyis.db.storage.fsp.flst.FlstBase;
 import cn.zhangyis.db.storage.fsp.header.SpaceHeaderRepository;
 import cn.zhangyis.db.storage.fsp.header.SpaceHeaderSnapshot;
@@ -24,6 +27,8 @@ import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
 import cn.zhangyis.db.storage.page.PageEnvelopeLayout;
 import cn.zhangyis.db.storage.page.PageType;
+import cn.zhangyis.db.storage.redo.RedoLogFileRepository;
+import cn.zhangyis.db.storage.redo.RedoLogManager;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -52,9 +57,12 @@ class PageZeroTablespaceMetadataLoaderTest {
     @Test
     void rebuildsMetadataFromDiskPageZero() {
         Path path = dir.resolve("loader.ibu");
-        try (PageStore store = new FileChannelPageStore(); BufferPool pool = new LruBufferPool(store, PS, 128)) {
+        try (PageStore store = new FileChannelPageStore();
+             BufferPool pool = new LruBufferPool(store, PS, 128);
+             RedoLogFileRepository redoRepo = RedoLogFileRepository.open(dir.resolve("loader-redo.log"))) {
+            RedoLogManager redo = RedoLogManager.durable(redoRepo);
             store.create(SPACE, path, PS, PageNo.of(64));
-            MiniTransactionManager mgr = new MiniTransactionManager();
+            MiniTransactionManager mgr = new MiniTransactionManager(new TablespaceAccessController(), redo);
             SpaceHeaderRepository headerRepo = new SpaceHeaderRepository(pool);
             MiniTransaction mtr = mgr.begin();
             headerRepo.initialize(mtr, new SpaceHeaderSnapshot(SPACE, PS,
@@ -63,6 +71,7 @@ class PageZeroTablespaceMetadataLoaderTest {
             headerRepo.writeLifecycle(mtr, SPACE, new TablespaceLifecycleHeader(
                     TablespaceState.ACTIVE, PageNo.of(64), 0L, PageNo.of(64), TablespaceState.ACTIVE));
             mgr.commit(mtr);
+            flushAllDirty(pool, store, redo);
         }
 
         try (PageStore store = new FileChannelPageStore()) {
@@ -120,16 +129,19 @@ class PageZeroTablespaceMetadataLoaderTest {
     @Test
     void loaderWaitsBehindExclusiveTablespaceLease() throws Exception {
         Path path = dir.resolve("lease-loader.ibu");
-        try (PageStore store = new FileChannelPageStore(); BufferPool pool = new LruBufferPool(store, PS, 8)) {
+        try (PageStore store = new FileChannelPageStore();
+             BufferPool pool = new LruBufferPool(store, PS, 8);
+             RedoLogFileRepository redoRepo = RedoLogFileRepository.open(dir.resolve("lease-loader-redo.log"))) {
+            RedoLogManager redo = RedoLogManager.durable(redoRepo);
             store.create(SPACE, path, PS, PageNo.of(64));
-            MiniTransactionManager manager = new MiniTransactionManager();
+            MiniTransactionManager manager = new MiniTransactionManager(new TablespaceAccessController(), redo);
             SpaceHeaderRepository repository = new SpaceHeaderRepository(pool);
             MiniTransaction mtr = manager.begin();
             repository.initialize(mtr, new SpaceHeaderSnapshot(SPACE, PS,
                     TablespaceTypeFlags.encode(TablespaceType.GENERAL), PageNo.of(64), PageNo.of(0), 1L,
                     FlstBase.EMPTY, FlstBase.EMPTY, FlstBase.EMPTY, PageNo.of(2), 0L, 80046, 1L));
             manager.commit(mtr);
-            pool.flushAll();
+            flushAllDirty(pool, store, redo);
 
             TablespaceAccessController controller = new TablespaceAccessController(Duration.ofSeconds(2));
             PageZeroTablespaceMetadataLoader loader = new PageZeroTablespaceMetadataLoader(store, PS, controller);
@@ -145,9 +157,12 @@ class PageZeroTablespaceMetadataLoaderTest {
 
     /** 建一个合法的 UNDO page0（经 initialize 盖 FSP_HDR 信封 + ACTIVE lifecycle），关闭时刷盘。 */
     private void writeValidUndoPageZero(Path path) {
-        try (PageStore store = new FileChannelPageStore(); BufferPool pool = new LruBufferPool(store, PS, 128)) {
+        try (PageStore store = new FileChannelPageStore();
+             BufferPool pool = new LruBufferPool(store, PS, 128);
+             RedoLogFileRepository redoRepo = RedoLogFileRepository.open(dir.resolve(path.getFileName() + ".redo"))) {
+            RedoLogManager redo = RedoLogManager.durable(redoRepo);
             store.create(SPACE, path, PS, PageNo.of(64));
-            MiniTransactionManager mgr = new MiniTransactionManager();
+            MiniTransactionManager mgr = new MiniTransactionManager(new TablespaceAccessController(), redo);
             SpaceHeaderRepository headerRepo = new SpaceHeaderRepository(pool);
             MiniTransaction mtr = mgr.begin();
             headerRepo.initialize(mtr, new SpaceHeaderSnapshot(SPACE, PS,
@@ -156,7 +171,16 @@ class PageZeroTablespaceMetadataLoaderTest {
             headerRepo.writeLifecycle(mtr, SPACE, new TablespaceLifecycleHeader(
                     TablespaceState.ACTIVE, PageNo.of(64), 0L, PageNo.of(64), TablespaceState.ACTIVE));
             mgr.commit(mtr);
+            flushAllDirty(pool, store, redo);
         }
+    }
+
+    /** 通过 flush 模块写出当前 dirty view；调用前 MTR 已发布 pageLSN，先 fsync redo 满足 WAL gate。 */
+    private static void flushAllDirty(BufferPool pool, PageStore store, RedoLogManager redo) {
+        redo.flush();
+        FlushCoordinator coordinator = new FlushCoordinator(pool, store, redo, PS,
+                new NoDoublewriteStrategy(), Duration.ofMillis(50));
+        coordinator.flushList(Lsn.of(Long.MAX_VALUE), pool.capacity());
     }
 
     /** 直接对磁盘 page0 的指定偏移写入 int，模拟物理损坏；rewind 后 remaining==pageSize 满足 writePage 约束。 */

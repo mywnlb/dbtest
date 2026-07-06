@@ -213,16 +213,6 @@ class ReadAheadServiceTest {
         }
 
         @Override
-        public void flush(PageId pageId) {
-            delegate.flush(pageId);
-        }
-
-        @Override
-        public void flushAll() {
-            delegate.flushAll();
-        }
-
-        @Override
         public List<DirtyPageCandidate> dirtyPageCandidates(Lsn targetLsn, int maxPages) {
             return delegate.dirtyPageCandidates(targetLsn, maxPages);
         }

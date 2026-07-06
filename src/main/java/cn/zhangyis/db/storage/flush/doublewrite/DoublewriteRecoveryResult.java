@@ -26,4 +26,14 @@ public record DoublewriteRecoveryResult(PageId pageId, DoublewriteRecoveryOutcom
     public boolean detectedOnly() {
         return outcome == DoublewriteRecoveryOutcome.DETECTED_ONLY;
     }
+
+    /** @return true 表示只读校验发现 full-copy 可修复页，但本次扫描按设计没有写 data file。 */
+    public boolean repairableFromCopy() {
+        return outcome == DoublewriteRecoveryOutcome.REPAIRABLE_FROM_COPY;
+    }
+
+    /** @return true 表示本次检查发现可疑页但没有修改 data file，可纳入只读诊断计数。 */
+    public boolean diagnosticOnly() {
+        return repairableFromCopy() || detectedOnly();
+    }
 }

@@ -14,6 +14,8 @@ import cn.zhangyis.db.storage.buf.LruBufferPool;
 import cn.zhangyis.db.storage.fil.io.FileChannelPageStore;
 import cn.zhangyis.db.storage.fil.io.PageStore;
 import cn.zhangyis.db.storage.fil.access.TablespaceAccessController;
+import cn.zhangyis.db.storage.flush.FlushCoordinator;
+import cn.zhangyis.db.storage.flush.doublewrite.NoDoublewriteStrategy;
 import cn.zhangyis.db.storage.fsp.segment.SegmentPurpose;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
@@ -30,6 +32,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -70,8 +73,9 @@ class SpaceFileReconcileRecoveryTest {
         try (PageStore store = new FileChannelPageStore();
              BufferPool pool = new LruBufferPool(store, PS, 256);
              RedoLogFileRepository redoRepo = RedoLogFileRepository.open(redoPath)) {
+            RedoLogManager redo = RedoLogManager.durable(redoRepo);
             MiniTransactionManager mgr =
-                    new MiniTransactionManager(new TablespaceAccessController(), RedoLogManager.durable(redoRepo));
+                    new MiniTransactionManager(new TablespaceAccessController(), redo);
             DiskSpaceManager disk = new DiskSpaceManager(pool, store, PS);
 
             MiniTransaction boot = mgr.begin();
@@ -83,6 +87,7 @@ class SpaceFileReconcileRecoveryTest {
             assertEquals(INITIAL_PAGES, before, "tablespace must start at exactly one extent");
 
             for (int i = 0; i < 4096; i++) {
+                flushAllDirty(pool, store, redo);
                 Lsn beforeThisAllocate = mgr.redoLogManager().currentLsn();
                 MiniTransaction mtr = mgr.begin();
                 PageId p = disk.allocatePage(mtr, segment);
@@ -94,7 +99,7 @@ class SpaceFileReconcileRecoveryTest {
                     allocatedPageId = p;
                     preExtendPages = before;
                     postExtendPages = after;
-                    mgr.redoLogManager().flush();
+                    redo.flush();
                     finalLsn = mgr.redoLogManager().currentLsn();
                     break;
                 }
@@ -154,5 +159,15 @@ class SpaceFileReconcileRecoveryTest {
                             RecoveryStageName.OPEN_TRAFFIC),
                     report.completedStages());
         }
+    }
+
+    /**
+     * 为 checkpoint 候选 LSN 建立真实数据页前像：先 fsync redo，再让 FlushCoordinator 写出当前 dirty view。
+     */
+    private static void flushAllDirty(BufferPool pool, PageStore store, RedoLogManager redo) {
+        redo.flush();
+        FlushCoordinator coordinator = new FlushCoordinator(pool, store, redo, PS,
+                new NoDoublewriteStrategy(), Duration.ofMillis(50));
+        coordinator.flushList(Lsn.of(Long.MAX_VALUE), pool.capacity());
     }
 }

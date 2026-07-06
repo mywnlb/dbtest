@@ -1,5 +1,6 @@
 package cn.zhangyis.db.storage.btree;
 
+import cn.zhangyis.db.domain.Lsn;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
@@ -12,9 +13,12 @@ import cn.zhangyis.db.storage.api.index.IndexPageAccess;
 import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.LruBufferPool;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
+import cn.zhangyis.db.storage.fil.access.TablespaceAccessController;
 import cn.zhangyis.db.storage.fil.exception.TablespaceNotOpenException;
 import cn.zhangyis.db.storage.fil.io.FileChannelPageStore;
 import cn.zhangyis.db.storage.fil.io.PageStore;
+import cn.zhangyis.db.storage.flush.FlushCoordinator;
+import cn.zhangyis.db.storage.flush.doublewrite.NoDoublewriteStrategy;
 import cn.zhangyis.db.storage.fsp.segment.SegmentPurpose;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
@@ -40,6 +44,8 @@ import cn.zhangyis.db.storage.trx.lock.LockWaitTimeoutException;
 import cn.zhangyis.db.storage.trx.lock.NextKeyLockKey;
 import cn.zhangyis.db.storage.trx.lock.RecordLockKey;
 import cn.zhangyis.db.storage.trx.lock.TransactionLockMode;
+import cn.zhangyis.db.storage.redo.RedoLogFileRepository;
+import cn.zhangyis.db.storage.redo.RedoLogManager;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -323,7 +329,7 @@ class BTreeCurrentReadServiceTest {
                             BTreeCurrentReadMode.FOR_UPDATE));
             awaitUntil(() -> hasWaitEdge(ctx.lockManager, waiter, blocker));
 
-            ctx.pool.flushAll();
+            ctx.flushAllDirty();
             ctx.pool.invalidateTablespace(SPACE, Duration.ofMillis(500));
             ctx.store.close(SPACE);
             assertEquals(1, ctx.lockManager.releaseAll(blocker));
@@ -701,8 +707,11 @@ class BTreeCurrentReadServiceTest {
 
     private void onPool(Body body) {
         PageStore store = new FileChannelPageStore();
-        try (PageStore ignored = store; BufferPool pool = new LruBufferPool(store, PS, 128)) {
-            body.run(new Ctx(store, pool));
+        try (PageStore ignored = store;
+             BufferPool pool = new LruBufferPool(store, PS, 128);
+             RedoLogFileRepository redoRepo = RedoLogFileRepository.open(dir.resolve("current-read-redo.log"))) {
+            RedoLogManager redo = RedoLogManager.durable(redoRepo);
+            body.run(new Ctx(store, pool, redo));
         }
     }
 
@@ -711,9 +720,10 @@ class BTreeCurrentReadServiceTest {
     }
 
     private final class Ctx {
-        private final MiniTransactionManager mgr = new MiniTransactionManager();
+        private final MiniTransactionManager mgr;
         private final PageStore store;
         private final BufferPool pool;
+        private final RedoLogManager redo;
         private final DiskSpaceManager disk;
         private final IndexPageAccess access;
         private final LockManager lockManager = new LockManager(4, 32);
@@ -721,9 +731,11 @@ class BTreeCurrentReadServiceTest {
         private SegmentRef nonLeafSegment;
         private PageId rootPageId;
 
-        private Ctx(PageStore store, BufferPool pool) {
+        private Ctx(PageStore store, BufferPool pool, RedoLogManager redo) {
             this.store = store;
             this.pool = pool;
+            this.redo = redo;
+            this.mgr = new MiniTransactionManager(new TablespaceAccessController(), redo);
             this.disk = new DiskSpaceManager(pool, store, PS);
             this.access = new IndexPageAccess(pool, PS);
         }
@@ -744,6 +756,13 @@ class BTreeCurrentReadServiceTest {
             rootPageId = disk.allocatePage(m, leafSegment);
             access.createIndexPage(m, rootPageId, INDEX_ID, 0);
             mgr.commit(m);
+        }
+
+        private void flushAllDirty() {
+            redo.flush();
+            FlushCoordinator coordinator = new FlushCoordinator(pool, store, redo, PS,
+                    new NoDoublewriteStrategy(), Duration.ofMillis(50));
+            coordinator.flushList(Lsn.of(Long.MAX_VALUE), pool.capacity());
         }
 
         private BTreeIndex clusteredIndex() {

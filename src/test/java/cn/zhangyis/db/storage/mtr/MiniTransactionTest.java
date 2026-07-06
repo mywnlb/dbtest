@@ -12,12 +12,17 @@ import cn.zhangyis.db.storage.buf.PageGuard;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
 import cn.zhangyis.db.storage.fil.io.FileChannelPageStore;
 import cn.zhangyis.db.storage.fil.io.PageStore;
+import cn.zhangyis.db.storage.flush.FlushCoordinator;
+import cn.zhangyis.db.storage.flush.FlushResultStatus;
+import cn.zhangyis.db.storage.flush.doublewrite.NoDoublewriteStrategy;
 import cn.zhangyis.db.storage.page.PageType;
+import cn.zhangyis.db.storage.redo.RedoLogFileRepository;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.api.Test;
 
 import java.nio.file.Path;
+import java.time.Duration;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -29,6 +34,7 @@ class MiniTransactionTest {
 
     private static final PageSize PS = PageSize.ofBytes(16 * 1024);
     private static final SpaceId SPACE = SpaceId.of(1);
+    private static final int PAYLOAD_OFFSET = 100;
 
     @TempDir
     Path dir;
@@ -45,6 +51,12 @@ class MiniTransactionTest {
 
     private MiniTransaction activeMtr(long id) {
         MiniTransaction mtr = new MiniTransaction(id, new RedoLogManager());
+        mtr.activate();
+        return mtr;
+    }
+
+    private MiniTransaction activeMtr(long id, RedoLogManager redo) {
+        MiniTransaction mtr = new MiniTransaction(id, redo);
         mtr.activate();
         return mtr;
     }
@@ -130,17 +142,20 @@ class MiniTransactionTest {
 
     @Test
     void writesShouldBeDirtyAndPersistAfterCommitAndFlush() {
-        try (PageStore store = openStore(8)) {
+        try (PageStore store = openStore(8);
+             RedoLogFileRepository repo = RedoLogFileRepository.open(dir.resolve("mtr-write.log"))) {
+            RedoLogManager redo = RedoLogManager.durable(repo);
             BufferPool pool = new LruBufferPool(store, PS, 4);
-            MiniTransaction mtr = activeMtr(1);
+            MiniTransaction mtr = activeMtr(1, redo);
             PageGuard g = mtr.getPage(pool, page(2), PageLatchMode.EXCLUSIVE);
-            g.writeInt(0, 0x99);
+            g.writeInt(PAYLOAD_OFFSET, 0x99);
             mtr.commit();
-            pool.flush(page(2));
+            redo.flush();
+            assertEquals(FlushResultStatus.CLEAN, flushPage(pool, store, redo, page(2)));
 
             BufferPool pool2 = new LruBufferPool(store, PS, 4);
             try (PageGuard r = pool2.getPage(page(2), PageLatchMode.SHARED)) {
-                assertEquals(0x99, r.readInt(0));
+                assertEquals(0x99, r.readInt(PAYLOAD_OFFSET));
             }
             pool.close();
             pool2.close();
@@ -163,18 +178,21 @@ class MiniTransactionTest {
 
     @Test
     void newPageShouldHoldZeroFrameAndPersistAfterCommit() {
-        try (PageStore store = openStore(8)) {
+        try (PageStore store = openStore(8);
+             RedoLogFileRepository repo = RedoLogFileRepository.open(dir.resolve("mtr-new-page.log"))) {
+            RedoLogManager redo = RedoLogManager.durable(repo);
             BufferPool pool = new LruBufferPool(store, PS, 4);
-            MiniTransaction mtr = activeMtr(1);
+            MiniTransaction mtr = activeMtr(1, redo);
             PageGuard g = mtr.newPage(pool, page(3), PageLatchMode.EXCLUSIVE, PageType.INDEX);
-            assertEquals(0, g.readInt(0)); // 新页为零，未读盘
-            g.writeInt(0, 0x55);
+            assertEquals(0, g.readInt(PAYLOAD_OFFSET)); // 新页为零，未读盘
+            g.writeInt(PAYLOAD_OFFSET, 0x55);
             mtr.commit();
-            pool.flush(page(3));
+            redo.flush();
+            assertEquals(FlushResultStatus.CLEAN, flushPage(pool, store, redo, page(3)));
 
             BufferPool pool2 = new LruBufferPool(store, PS, 4);
             try (PageGuard r = pool2.getPage(page(3), PageLatchMode.SHARED)) {
-                assertEquals(0x55, r.readInt(0));
+                assertEquals(0x55, r.readInt(PAYLOAD_OFFSET));
             }
             pool.close();
             pool2.close();
@@ -190,6 +208,13 @@ class MiniTransactionTest {
             mtr.commit();
             pool.close();
         }
+    }
+
+    /** 通过生产 flush 协调器写出 MTR 修改页；调用方必须先 flush 对应 redo 以满足 WAL gate。 */
+    private FlushResultStatus flushPage(BufferPool pool, PageStore store, RedoLogManager redo, PageId pageId) {
+        FlushCoordinator coordinator = new FlushCoordinator(pool, store, redo, PS,
+                new NoDoublewriteStrategy(), Duration.ofMillis(50));
+        return coordinator.singlePageFlush(pageId).status();
     }
 
     /**

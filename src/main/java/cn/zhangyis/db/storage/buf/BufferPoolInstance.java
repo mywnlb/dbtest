@@ -253,9 +253,11 @@ final class BufferPoolInstance implements FrameReleaser {
             }
             if (victimToClean != null) {
                 latches.assertMetadataUnlocked("dirty victim flush");
-                boolean cleaned = (victimCleaner == null)
-                        ? flushLegacyPage(victimToClean)
-                        : victimCleaner.flushVictim(victimToClean);
+                if (victimCleaner == null) {
+                    throw new BufferPoolExhaustedException("dirty victim requires WAL-safe DirtyVictimFlusher: "
+                            + victimToClean);
+                }
+                boolean cleaned = victimCleaner.flushVictim(victimToClean);
                 if (!cleaned) {
                     if (cleanSkip == null) {
                         cleanSkip = new HashSet<>();
@@ -460,82 +462,6 @@ final class BufferPoolInstance implements FrameReleaser {
         } finally {
             latches.unlockFrame(published);
         }
-    }
-
-    /**
-     * 若该页驻留、未 fix 且为脏，则经 snapshot 协议写回 PageStore。
-     *
-     * <p>这是 legacy API：不提供 WAL gate / doublewrite 承诺；生产 WAL-safe flush 仍由 flush 模块调用
-     * {@link #snapshotForFlush(PageId)} 后完成。本方法只保证不在 Buffer Pool 内部锁下进入物理 IO，且通过
-     * dirtyVersion 防止 snapshot 后的新修改被误清。
-     */
-    void flush(PageId pageId) {
-        if (pageId == null) {
-            throw new DatabaseValidationException("page id must not be null");
-        }
-        flushLegacyPage(pageId);
-    }
-
-    /**
-     * 写回本分片所有当前可刷的 legacy 脏页。
-     *
-     * <p>每轮只在短锁内复制一批 {@code DIRTY && fixCount==0} 的 page id，随后逐页出锁 snapshot
-     * 和写盘。若写盘期间页面再次变脏，{@link #completeFlush(FlushPageSnapshot)} 会保留 dirty，下一轮重新尝试。
-     */
-    void flushAll() {
-        while (true) {
-            List<PageId> candidates = localLegacyFlushCandidates();
-            if (candidates.isEmpty()) {
-                return;
-            }
-            boolean attempted = false;
-            for (PageId candidate : candidates) {
-                attempted |= flushLegacyPage(candidate);
-            }
-            if (!attempted) {
-                return;
-            }
-        }
-    }
-
-    /**
-     * legacy 同步 flush 的页写出 helper。数据流：先通过 {@link #snapshotForFlush(PageId)} 在短 metadata
-     * 临界区内复制稳定页镜像并把 frame 标为 FLUSHING；随后释放所有 Buffer Pool metadata 锁进入 PageStore；
-     * 成功后用 dirtyVersion/pageLSN 回调 {@link #completeFlush(FlushPageSnapshot)}，失败时用 {@link #failFlush(PageId)}
-     * 复位为 DIRTY 并原样抛出领域异常。
-     *
-     * @return true 表示本轮确实拿到 snapshot 并写出；false 表示页不存在、已 clean、fixed、FLUSHING 或写出期间又变脏。
-     */
-    private boolean flushLegacyPage(PageId pageId) {
-        Optional<FlushPageSnapshot> snapshot = snapshotForFlush(pageId);
-        if (snapshot.isEmpty()) {
-            return false;
-        }
-        FlushPageSnapshot image = snapshot.orElseThrow();
-        try {
-            latches.assertMetadataUnlocked("legacy page write");
-            pageStore.writePage(image.pageId(), ByteBuffer.wrap(image.pageImage()));
-            return completeFlush(image);
-        } catch (RuntimeException writeError) {
-            failFlush(image.pageId());
-            throw writeError;
-        }
-    }
-
-    /** 短锁复制当前可刷 legacy dirty 页定位；不携带 frame 引用，不跨 IO 持锁。 */
-    private List<PageId> localLegacyFlushCandidates() {
-        List<PageId> candidates = new ArrayList<>();
-        for (BufferFrame frame : snapshotFrames()) {
-            latches.lockFrame(frame);
-            try {
-                if (frame.state == BufferFrameState.DIRTY && frame.fixCount == 0) {
-                    candidates.add(frame.pageId);
-                }
-            } finally {
-                latches.unlockFrame(frame);
-            }
-        }
-        return candidates;
     }
 
     /**

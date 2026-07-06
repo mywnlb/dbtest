@@ -12,8 +12,9 @@ import cn.zhangyis.db.domain.SpaceId;
  * Buffer Pool 门面：在 fil.io.PageStore 之上提供受控页访问（fix + S/X page latch + LRU 淘汰 + 脏页写回）。
  * 消费方（未来 fsp）经它拿受控页，不直接接触 PageStore 或文件。
  *
- * <p>简化点：BufferPool 自身的 legacy flush 不做 WAL 门控 / doublewrite；生产 WAL-safe 写盘由 flush 模块
- * 通过 snapshot/complete 协议负责。miss 读盘、脏 victim flush 与 legacy flush 写盘均不得跨 Buffer Pool 内部锁进入 PageStore。
+ * <p>BufferPool 不直接写出 dirty data page。生产 WAL-safe 写盘由 flush 模块通过 snapshot/complete 协议负责：
+ * BufferPool 提供 dirty view 与稳定页镜像，FlushCoordinator 负责 WAL gate、checksum、doublewrite、data-file write/force。
+ * miss 读盘、脏 victim flush 和 flush 模块写盘均不得跨 Buffer Pool 内部锁进入 PageStore。
  */
 public interface BufferPool extends AutoCloseable {
 
@@ -45,12 +46,6 @@ public interface BufferPool extends AutoCloseable {
      * @param pageId 预取目标页。
      */
     void prefetch(PageId pageId);
-
-    /** 若该页驻留、未 fix 且为脏，则写回 PageStore 并清脏。 */
-    void flush(PageId pageId);
-
-    /** 写回所有未 fix 的脏页。 */
-    void flushAll();
 
     /**
      * 返回 flush list 候选快照，按 oldestModificationLsn 升序排列，只包含 oldest <= targetLsn 的脏页。候选表达 dirty
@@ -150,7 +145,7 @@ public interface BufferPool extends AutoCloseable {
      */
     List<PageId> residentPageIds();
 
-    /** 关闭：flushAll 后释放（假设无活跃句柄）。 */
+    /** 关闭 Buffer Pool 视图；不隐式 flush dirty page，写盘必须由 FlushCoordinator/FlushService 先完成。 */
     @Override
     void close();
 }

@@ -37,6 +37,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * R2 crash recovery startup 测试：恢复总控只编排 doublewrite repair 与 redo replay，成功后开放 gate，失败时 fail closed。
@@ -133,6 +134,138 @@ class CrashRecoveryServiceTest {
     }
 
     @Test
+    void recoverRecordsProgressForNormalStages() throws Exception {
+        Path redoPath = dir.resolve("progress-redo.log");
+        LogRange range;
+        try (RedoLogFileRepository redoRepo = RedoLogFileRepository.open(redoPath)) {
+            RedoLogManager redo = RedoLogManager.durable(redoRepo);
+            range = redo.append(List.of(new PageInitRecord(PAGE, PageType.INDEX)));
+            redo.flush();
+        }
+
+        try (PageStore store = new FileChannelPageStore();
+            RedoLogFileRepository redoRepo = RedoLogFileRepository.open(redoPath);
+             RedoCheckpointStore checkpointStore = RedoCheckpointStore.open(dir.resolve("progress-control"))) {
+            store.create(SPACE, dir.resolve("progress.ibd"), PS, PageNo.of(4));
+            Path progressPath = dir.resolve("progress.jsonl");
+            RecoveryProgressJournal journal = RecoveryProgressJournal.persistent(progressPath);
+            RecoveryTrafficGate gate = new RecoveryTrafficGate();
+            RecoveryRequest request = RecoveryRequest.normal(checkpointStore, redoRepo,
+                    RedoApplyDispatcher.pageDispatcher(), new RedoApplyContext(store, PS));
+
+            RecoveryReport report = new CrashRecoveryService(gate, journal).recover(request);
+
+            List<RecoveryProgressEvent> events = journal.snapshot();
+            assertTrue(hasProgress(events, RecoveryProgressEventKind.STARTED,
+                    RecoveryStageName.TRAFFIC_CLOSED, RecoveryState.RECOVERING));
+            assertTrue(hasProgress(events, RecoveryProgressEventKind.COMPLETED,
+                    RecoveryStageName.REDO_REPLAY, RecoveryState.RECOVERING));
+            assertTrue(events.stream().anyMatch(event ->
+                            event.kind() == RecoveryProgressEventKind.COMPLETED
+                                    && event.stageName() == RecoveryStageName.OPEN_TRAFFIC
+                                    && event.state() == RecoveryState.OPEN
+                                    && event.recoveredToLsn().equals(report.recoveredToLsn())),
+                    "OPEN_TRAFFIC completion should publish the final recovered LSN");
+            assertEquals(range.end(), report.recoveredToLsn());
+            String persisted = Files.readString(progressPath);
+            assertTrue(persisted.contains("\"kind\":\"STARTED\""));
+            assertTrue(persisted.contains("\"stageName\":\"TRAFFIC_CLOSED\""));
+            assertTrue(persisted.contains("\"kind\":\"COMPLETED\""));
+            assertTrue(persisted.contains("\"stageName\":\"OPEN_TRAFFIC\""));
+        }
+    }
+
+    @Test
+    void readOnlyValidateReportsRecoverableDoublewriteCopyWithoutRepairingDataPage() {
+        Path redoPath = dir.resolve("readonly-dw-redo.log");
+        LogRange range;
+        try (RedoLogFileRepository redoRepo = RedoLogFileRepository.open(redoPath)) {
+            RedoLogManager redo = RedoLogManager.durable(redoRepo);
+            range = redo.append(List.of(new PageInitRecord(PAGE, PageType.INDEX)));
+            redo.flush();
+        }
+
+        try (PageStore store = new FileChannelPageStore();
+             DoublewriteFileRepository doublewriteRepo = DoublewriteFileRepository.open(dir.resolve("readonly-dw.dat"), PS);
+             RedoLogFileRepository redoRepo = RedoLogFileRepository.open(redoPath);
+             RedoCheckpointStore checkpointStore = RedoCheckpointStore.open(dir.resolve("readonly-dw-control"))) {
+            store.create(SPACE, dir.resolve("readonly-dw.ibd"), PS, PageNo.of(4));
+            writeDoublewriteCopyAndBrokenDataPage(store, doublewriteRepo, range.end());
+            DoublewriteRecoveryScanner scanner = new DoublewriteRecoveryScanner(doublewriteRepo, store, PS);
+
+            RecoveryTrafficGate gate = new RecoveryTrafficGate();
+            RecoveryProgressJournal journal = new RecoveryProgressJournal();
+            RecoveryRequest request = RecoveryRequest.readOnlyValidate(checkpointStore, redoRepo,
+                            RedoApplyDispatcher.pageDispatcher(), new RedoApplyContext(store, PS))
+                    .withDoublewriteRepair(scanner, List.of(PAGE));
+
+            RecoveryReport report = new CrashRecoveryService(gate, journal).recover(request);
+
+            byte[] current = readPage(store);
+            assertEquals(1, current[FIRST_OFFSET],
+                    "READ_ONLY_VALIDATE must report the recoverable copy without writing it back");
+            assertEquals(RecoveryMode.READ_ONLY_VALIDATE, report.mode());
+            assertEquals(RecoveryState.READ_ONLY, report.state());
+            assertEquals(RecoveryState.READ_ONLY, gate.state());
+            assertEquals(0, report.repairedPageCount());
+            assertEquals(1, report.detectedOnlyPageCount());
+            assertEquals(0, report.appliedBatchCount());
+            assertEquals(List.of(RecoveryStageName.TRAFFIC_CLOSED,
+                            RecoveryStageName.DOUBLEWRITE_REPAIR,
+                            RecoveryStageName.REDO_REPLAY,
+                            RecoveryStageName.READ_ONLY_DIAGNOSTIC_OPEN),
+                    report.completedStages());
+            assertTrue(hasProgress(journal.snapshot(), RecoveryProgressEventKind.COMPLETED,
+                    RecoveryStageName.READ_ONLY_DIAGNOSTIC_OPEN, RecoveryState.READ_ONLY));
+        }
+    }
+
+    @Test
+    void readOnlyValidateScansRedoWithoutApplyingPageChanges() {
+        Path redoPath = dir.resolve("readonly-redo.log");
+        LogRange range;
+        try (RedoLogFileRepository redoRepo = RedoLogFileRepository.open(redoPath)) {
+            RedoLogManager redo = RedoLogManager.durable(redoRepo);
+            range = redo.append(List.of(
+                    new PageInitRecord(PAGE, PageType.INDEX),
+                    new PageBytesRecord(PAGE, SECOND_OFFSET, new byte[]{4, 5, 6})));
+            redo.flush();
+        }
+
+        try (PageStore store = new FileChannelPageStore();
+             RedoLogFileRepository redoRepo = RedoLogFileRepository.open(redoPath);
+             RedoCheckpointStore checkpointStore = RedoCheckpointStore.open(dir.resolve("readonly-redo-control"))) {
+            store.create(SPACE, dir.resolve("readonly-redo.ibd"), PS, PageNo.of(4));
+            RecoveryTrafficGate gate = new RecoveryTrafficGate();
+            RecoveryRequest request = RecoveryRequest.readOnlyValidate(checkpointStore, redoRepo,
+                    RedoApplyDispatcher.pageDispatcher(), new RedoApplyContext(store, PS));
+
+            RecoveryReport report = new CrashRecoveryService(gate).recover(request);
+
+            byte[] current = readPage(store);
+            assertArrayEquals(new byte[]{0, 0, 0}, slice(current, SECOND_OFFSET, 3),
+                    "READ_ONLY_VALIDATE must scan redo batches without applying page bytes");
+            assertEquals(0L, ByteBuffer.wrap(current).getLong(PageEnvelopeLayout.PAGE_LSN));
+            assertEquals(range.end(), report.recoveredToLsn());
+            assertEquals(RecoveryMode.READ_ONLY_VALIDATE, report.mode());
+            assertEquals(RecoveryState.READ_ONLY, report.state());
+            assertEquals(0, report.appliedBatchCount());
+        }
+    }
+
+    @Test
+    void recoveryGateCanEnterReadOnlyDiagnosticAfterFailure() {
+        RecoveryTrafficGate gate = new RecoveryTrafficGate();
+        gate.failClosed(new DatabaseRuntimeException("synthetic failure"));
+
+        gate.enterReadOnlyDiagnostic();
+
+        assertEquals(RecoveryState.READ_ONLY, gate.state());
+        assertTrue(gate.lastFailure().isEmpty(),
+                "read-only diagnostic is a successful validation state and must clear stale failure");
+    }
+
+    @Test
     void recoverFailsClosedWhenRedoIsCorrupted() throws Exception {
         Path redoPath = dir.resolve("bad-redo.log");
         Files.write(redoPath, new byte[]{0x12, 0x34, 0x56, 0x78, 0, 0, 0, 1, 0, 0, 0, 0});
@@ -142,13 +275,24 @@ class CrashRecoveryServiceTest {
              RedoCheckpointStore checkpointStore = RedoCheckpointStore.open(dir.resolve("redo-control"))) {
             store.create(SPACE, dir.resolve("s.ibd"), PS, PageNo.of(4));
             RecoveryTrafficGate gate = new RecoveryTrafficGate();
-            CrashRecoveryService service = new CrashRecoveryService(gate);
+            Path progressPath = dir.resolve("bad-redo-progress.jsonl");
+            RecoveryProgressJournal journal = RecoveryProgressJournal.persistent(progressPath);
+            CrashRecoveryService service = new CrashRecoveryService(gate, journal);
             RecoveryRequest request = RecoveryRequest.normal(checkpointStore, redoRepo,
                     RedoApplyDispatcher.pageDispatcher(), new RedoApplyContext(store, PS));
 
             assertThrows(RecoveryStartupException.class, () -> service.recover(request));
             assertEquals(RecoveryState.FAILED, gate.state());
             assertEquals(RecoveryState.FAILED, service.state());
+            assertTrue(journal.snapshot().stream().anyMatch(event ->
+                            event.kind() == RecoveryProgressEventKind.FAILED
+                                    && event.stageName() == RecoveryStageName.REDO_REPLAY
+                                    && event.state() == RecoveryState.FAILED
+                                    && !event.detail().isBlank()),
+                    "corrupted redo should be visible in recovery progress diagnostics");
+            String persisted = Files.readString(progressPath);
+            assertTrue(persisted.contains("\"kind\":\"FAILED\""));
+            assertTrue(persisted.contains("\"stageName\":\"REDO_REPLAY\""));
         }
     }
 
@@ -357,5 +501,13 @@ class CrashRecoveryServiceTest {
         byte[] out = new byte[length];
         System.arraycopy(bytes, offset, out, 0, length);
         return out;
+    }
+
+    private static boolean hasProgress(List<RecoveryProgressEvent> events,
+                                       RecoveryProgressEventKind kind,
+                                       RecoveryStageName stageName,
+                                       RecoveryState state) {
+        return events.stream().anyMatch(event ->
+                event.kind() == kind && event.stageName() == stageName && event.state() == state);
     }
 }

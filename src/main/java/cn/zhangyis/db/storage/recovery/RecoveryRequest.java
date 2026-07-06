@@ -66,6 +66,18 @@ public record RecoveryRequest(RecoveryMode mode,
     }
 
     /**
+     * 创建 READ_ONLY_VALIDATE 模式请求。该模式复用 redo reader 和 doublewrite scanner 输入，但恢复服务只能扫描并报告，
+     * 不能执行 page apply、redo 边界安装、undo 续作、空间 reconcile 或事务 rollback。
+     */
+    public static RecoveryRequest readOnlyValidate(RedoCheckpointStore checkpointStore,
+                                                   RedoLogFileRepository redoRepository,
+                                                   RedoApplyDispatcher dispatcher,
+                                                   RedoApplyContext applyContext) {
+        return new RecoveryRequest(RecoveryMode.READ_ONLY_VALIDATE, checkpointStore, redoRepository,
+                dispatcher, applyContext, null, List.of(), null, List.of(), null, null);
+    }
+
+    /**
      * 返回带 doublewrite repair 阶段输入的新请求。保持请求不可变，避免启动恢复过程中外部修改页列表。
      */
     public RecoveryRequest withDoublewriteRepair(DoublewriteRecoveryScanner scanner, List<PageId> pages) {

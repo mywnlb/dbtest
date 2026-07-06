@@ -1,6 +1,7 @@
 package cn.zhangyis.db.storage.mtr;
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
+import cn.zhangyis.db.storage.redo.RedoCapacityThrottle;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
 import cn.zhangyis.db.storage.fil.access.TablespaceAccessController;
 
@@ -24,6 +25,14 @@ public final class MiniTransactionManager {
     /** 全局 redo 日志管理器（D3 内存版）；注入每个 MTR，测试经 {@link #redoLogManager()} 检视。 */
     private final RedoLogManager redoLogManager;
 
+    /** redo 预算申请前的容量反压；默认 no-op，生产引擎可注入真实 throttle。 */
+    private final RedoCapacityThrottle redoCapacityThrottle;
+    /**
+     * 每个前台 MTR 在 begin 时申请的 redo 预算。该预算只参与 capacity log-free-check，不分配真实 LSN；
+     * 真实 LSN 仍在 commit append 时按实际 record 长度分配。生产引擎按 redo capacity 配置保守估算，测试默认 0。
+     */
+    private final long foregroundRedoReservationBytes;
+
     public MiniTransactionManager() {
         this(new TablespaceAccessController(), new RedoLogManager());
     }
@@ -37,11 +46,38 @@ public final class MiniTransactionManager {
      * 从而让 commit 返回的 end LSN 能在物理缩短前 fsync。
      */
     public MiniTransactionManager(TablespaceAccessController accessController, RedoLogManager redoLogManager) {
-        if (accessController == null || redoLogManager == null) {
-            throw new DatabaseValidationException("MTR access controller/redo manager must not be null");
+        this(accessController, redoLogManager, RedoCapacityThrottle.NO_OP);
+    }
+
+    /**
+     * 创建带 redo capacity throttle 的 MTR 管理器。三参构造不申请额外预算，只保留 begin-time 当前压力检查；
+     * 生产引擎应使用四参构造传入前台预算，避免多个 MTR 在低水位 begin 后集中 append。
+     */
+    public MiniTransactionManager(TablespaceAccessController accessController,
+                                  RedoLogManager redoLogManager,
+                                  RedoCapacityThrottle redoCapacityThrottle) {
+        this(accessController, redoLogManager, redoCapacityThrottle, 0);
+    }
+
+    /**
+     * 创建带前台 redo 预算的 MTR 管理器。预算在 {@link #begin()} 时申请并挂入 MTR memo，保证容量等待发生在
+     * page latch、buffer fix 和 tablespace lease 之前；commit 只做真实 append 与 pageLSN 盖戳，不再等待 checkpoint。
+     */
+    public MiniTransactionManager(TablespaceAccessController accessController,
+                                  RedoLogManager redoLogManager,
+                                  RedoCapacityThrottle redoCapacityThrottle,
+                                  long foregroundRedoReservationBytes) {
+        if (accessController == null || redoLogManager == null || redoCapacityThrottle == null) {
+            throw new DatabaseValidationException("MTR access controller/redo manager/throttle must not be null");
+        }
+        if (foregroundRedoReservationBytes < 0) {
+            throw new DatabaseValidationException("foreground redo reservation bytes must not be negative: "
+                    + foregroundRedoReservationBytes);
         }
         this.accessController = accessController;
         this.redoLogManager = redoLogManager;
+        this.redoCapacityThrottle = redoCapacityThrottle;
+        this.foregroundRedoReservationBytes = foregroundRedoReservationBytes;
     }
 
     /**
@@ -53,10 +89,21 @@ public final class MiniTransactionManager {
         if (current.get() != null) {
             throw new MtrStateException("nested mini transaction not allowed on this thread; create an explicit child");
         }
-        MiniTransaction mtr = new MiniTransaction(idSequence.incrementAndGet(), redoLogManager, accessController);
-        mtr.activate();
-        current.set(mtr);
-        return mtr;
+        // redo capacity reservation 必须发生在 MTR 取得任何 page latch、buffer fix 或 tablespace lease 之前。
+        // 若在 commit 阶段等待，调用方通常已持有页锁与 FIL/FSP lease，会把 redo/checkpoint 压力放大成页锁等待链。
+        RedoCapacityThrottle.Reservation reservation =
+                redoCapacityThrottle.reserveAppendBytes(foregroundRedoReservationBytes);
+        try {
+            MiniTransaction mtr = new MiniTransaction(idSequence.incrementAndGet(), redoLogManager,
+                    accessController);
+            mtr.activate();
+            mtr.enlistResource(reservation);
+            current.set(mtr);
+            return mtr;
+        } catch (RuntimeException e) {
+            reservation.close();
+            throw e;
+        }
     }
 
     /** 本管理器的 redo 日志管理器（D3 内存版）。 */

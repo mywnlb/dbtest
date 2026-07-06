@@ -62,6 +62,7 @@ import cn.zhangyis.db.storage.recovery.RecoveryTrafficGate;
 import cn.zhangyis.db.storage.recovery.TransactionUndoRecoveryResult;
 import cn.zhangyis.db.storage.redo.RedoApplyContext;
 import cn.zhangyis.db.storage.redo.RedoApplyDispatcher;
+import cn.zhangyis.db.storage.redo.RedoCapacityThrottle;
 import cn.zhangyis.db.storage.redo.RedoCapacityPolicy;
 import cn.zhangyis.db.storage.redo.RedoCheckpointStore;
 import cn.zhangyis.db.storage.redo.RedoFlushWorker;
@@ -262,8 +263,31 @@ public final class StorageEngine {
         this.pool = lruPool;
         this.registry = new CachingTablespaceRegistry(
                 new PageZeroTablespaceMetadataLoader(store, config.pageSize(), accessController));
-        this.miniTransactionManager = new MiniTransactionManager(accessController, redo);
         this.diskSpaceManager = new DiskSpaceManager(pool, store, config.pageSize(), registry);
+
+        FlushCoordinator flushCoordinator = new FlushCoordinator(pool, store, redo, config.pageSize(),
+                new RecoverableDoublewriteStrategy(doublewriteRepo), config.flushTimeout(), accessController);
+        CheckpointCoordinator checkpointCoordinator =
+                new CheckpointCoordinator(pool, redo, checkpointStore, redoReclaim);
+        this.flushService = new FlushService(pool, flushCoordinator, checkpointCoordinator, redo,
+                RedoCapacityPolicy.fixed(config.redoCapacityBytes()),
+                AdaptiveFlushPolicy.adaptive(1, 1, config.bufferPoolCapacityFrames()));
+        RedoCapacityThrottle redoCapacityThrottle = new RedoCapacityThrottle(
+                RedoCapacityPolicy.fixed(config.redoCapacityBytes()),
+                redo::currentLsn,
+                checkpointCoordinator::lastCheckpointLsn,
+                () -> requestBackgroundFlush(config.backgroundFlushMaxPages()),
+                () -> {
+                    // 前台容量反压在进入 redo append 之前执行：先推进 redo durable 边界，再让 FlushService
+                    // 通过 WAL gate 刷脏并持久 checkpoint。这里不持 page latch/frame lock/FSP lease。
+                    // 不能复用 backgroundFlushMaxPages：该值允许为 0，表示后台 tick 不主动刷脏；前台
+                    // SYNC/HARD 等待必须有自己的刷页预算，否则 dirty page 会永久挡住 checkpoint。
+                    redo.flush();
+                    flushService.flushForCapacity(foregroundCapacityFlushMaxPages());
+                },
+                config.flushTimeout());
+        this.miniTransactionManager = new MiniTransactionManager(accessController, redo, redoCapacityThrottle,
+                foregroundRedoReservationBytes());
 
         TypeCodecRegistry typeRegistry = new TypeCodecRegistry();
         this.txnSystem = new TransactionSystem();
@@ -288,13 +312,6 @@ public final class StorageEngine {
         this.dmlService = new ClusteredDmlService(transactionManager, undoLogManager, miniTransactionManager,
                 btreeService, btreeCurrentReadService, rollbackService, lockManager, redo, recoveryGate);
 
-        FlushCoordinator flushCoordinator = new FlushCoordinator(pool, store, redo, config.pageSize(),
-                new RecoverableDoublewriteStrategy(doublewriteRepo), config.flushTimeout(), accessController);
-        CheckpointCoordinator checkpointCoordinator =
-                new CheckpointCoordinator(pool, redo, checkpointStore, redoReclaim);
-        this.flushService = new FlushService(pool, flushCoordinator, checkpointCoordinator, redo,
-                RedoCapacityPolicy.fixed(config.redoCapacityBytes()),
-                AdaptiveFlushPolicy.adaptive(1, 1, config.bufferPoolCapacityFrames()));
         // WAL 安全淘汰：注入淘汰刷盘端口，使脏页淘汰复用 FlushCoordinator 的 WAL gate + checksum + doublewrite
         // 管线。必须在 FlushCoordinator 就绪后、任何可能触发淘汰的 page access（fresh 建系统 undo / recover）之前注入。
         lruPool.attachVictimFlusher(new CoordinatedDirtyVictimFlusher(flushCoordinator));
@@ -537,6 +554,39 @@ public final class StorageEngine {
                         config.backgroundFlushInterval(), config.backgroundFlushMaxPages()),
                 1, config.backgroundFlushInterval(), config.backgroundFlushInterval());
         pageCleanerSupervisor.start();
+    }
+
+    /**
+     * ASYNC_FLUSH 前台只唤醒后台 page cleaner，不在调用线程执行 IO。后台禁用或 worker 尚未启动时保持 no-op，
+     * 因为真正需要阻塞的 SYNC_FLUSH/HARD_LIMIT 会走 {@code blockingFlushOnce}。
+     */
+    private void requestBackgroundFlush(int maxPages) {
+        if (pageCleanerSupervisor != null) {
+            pageCleanerSupervisor.requestFlush(maxPages);
+        }
+    }
+
+    /**
+     * 前台 capacity throttle 的同步刷页上限。后台 maxPages=0 是合法配置，含义是后台只推进 checkpoint；
+     * 但前台 SYNC_FLUSH/HARD_LIMIT 已经在阻塞用户写入，必须允许刷出足够 dirty page 来推动 oldest dirty LSN。
+     */
+    private int foregroundCapacityFlushMaxPages() {
+        return Math.max(1, config.bufferPoolCapacityFrames());
+    }
+
+    /**
+     * 前台 MTR begin 时的 redo 预算。它只用于 log-free-check 的保守压力计算，不分配真实 LSN。
+     *
+     * <p>当前教学实现没有 per-operation 精确 redo 预估，因此采用「redo capacity 的 1/8，且不超过单个 redo ring
+     * 文件容量」作为默认预算：足以让并发前台在接近 SYNC/HARD 水位前被反压，又不会像整段 capacity reservation
+     * 那样把所有写入完全串行化。单文件模式没有 ring 文件上限，直接取 capacity 的 1/8。
+     */
+    private long foregroundRedoReservationBytes() {
+        long byCapacity = Math.max(1L, config.redoCapacityBytes() / 8L);
+        if (!config.redoRotationEnabled()) {
+            return byCapacity;
+        }
+        return Math.max(1L, Math.min(byCapacity, config.redoRotation().fileBytes()));
     }
 
     private void startBackgroundRedoFlusher() {

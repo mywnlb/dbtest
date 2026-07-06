@@ -315,6 +315,60 @@ class StorageEngineTest {
     }
 
     @Test
+    void foregroundRedoCapacityThrottleAdvancesCheckpointBeforeNextAppend() {
+        EngineConfig cfg = new EngineConfig(dir, PS, 256, SpaceId.of(5), PageNo.of(64), 64, 100,
+                Duration.ofSeconds(2), 100L, List.of(), false, 4, Duration.ofSeconds(1), 256,
+                Duration.ofSeconds(2));
+        StorageEngine engine = new StorageEngine(cfg);
+        engine.open();
+        try {
+            RedoLogManager redo = engine.miniTransactionManager().redoLogManager();
+            for (int i = 0; i < 8; i++) {
+                LogRange range = redo.append(List.of(new PageBytesRecord(PageId.of(cfg.undoSpaceId(), PageNo.of(7)),
+                        RECOVERY_OFFSET + i, new byte[]{(byte) i})));
+                redo.markClosed(range);
+            }
+            Lsn checkpointBefore = readCheckpoint(cfg);
+
+            MiniTransaction empty = engine.miniTransactionManager().begin();
+            engine.miniTransactionManager().commit(empty);
+
+            Lsn checkpointAfter = readCheckpoint(cfg);
+            assertTrue(checkpointAfter.value() > checkpointBefore.value(),
+                    "foreground throttle should advance checkpoint before allowing the next redo append");
+        } finally {
+            engine.close();
+        }
+    }
+
+    @Test
+    void foregroundRedoCapacityThrottleFlushesDirtyPagesWhenBackgroundMaxPagesIsZero() {
+        EngineConfig cfg = new EngineConfig(dir, PS, 256, SpaceId.of(5), PageNo.of(64), 64, 100,
+                Duration.ofMillis(300), 1_000_000L, List.of(), false, 4,
+                Duration.ofSeconds(1), 0, Duration.ofSeconds(2));
+        StorageEngine engine = new StorageEngine(cfg);
+        engine.open();
+        try {
+            createClusteredIndex(engine, dir.resolve("dirty-budget.ibd"));
+            RedoLogManager redo = engine.miniTransactionManager().redoLogManager();
+            LogRange pressure = redo.append(List.of(new PageBytesRecord(
+                    PageId.of(cfg.undoSpaceId(), PageNo.of(7)), RECOVERY_OFFSET, new byte[900_000])));
+            redo.markClosed(pressure);
+            Lsn checkpointBefore = readCheckpoint(cfg);
+
+            MiniTransaction empty = engine.miniTransactionManager().begin();
+            engine.miniTransactionManager().commit(empty);
+
+            assertTrue(readCheckpoint(cfg).value() > checkpointBefore.value(),
+                    "foreground throttle must use its own flush budget; background maxPages=0 means no background dirty flush only");
+        } finally {
+            if (engine.state() == EngineState.OPEN) {
+                engine.close();
+            }
+        }
+    }
+
+    @Test
     void backgroundPageCleanerAdvancesCheckpointTickAndStopsOnClose() {
         StorageEngine engine = new StorageEngine(configWithBackgroundTick(Duration.ofMillis(50)));
         engine.open();
@@ -828,6 +882,12 @@ class StorageEngineTest {
             redo.restoreRecoveredBoundary(reader.recoveredToLsn());
             redo.append(List.of(new PageBytesRecord(pageId, offset, payload)));
             redo.flush();
+        }
+    }
+
+    private static Lsn readCheckpoint(EngineConfig cfg) {
+        try (RedoCheckpointStore checkpointStore = RedoCheckpointStore.open(cfg.redoControlFile())) {
+            return checkpointStore.readLatest().checkpointLsn();
         }
     }
 

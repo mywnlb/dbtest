@@ -1,7 +1,14 @@
 package cn.zhangyis.db.storage.mtr;
 
+import cn.zhangyis.db.domain.Lsn;
+import cn.zhangyis.db.storage.fil.access.TablespaceAccessController;
+import cn.zhangyis.db.storage.redo.RedoCapacityPolicy;
+import cn.zhangyis.db.storage.redo.RedoCapacityThrottle;
+import cn.zhangyis.db.storage.redo.RedoLogManager;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -80,6 +87,28 @@ class MiniTransactionManagerTest {
         other.start();
         other.join();
         assertInstanceOf(MtrStateException.class, error.get());
+        mgr.commit(mtr);
+    }
+
+    @Test
+    void beginReservesForegroundRedoBytesBeforePageLatch() {
+        AtomicInteger flushRequests = new AtomicInteger();
+        AtomicReference<Lsn> checkpoint = new AtomicReference<>(Lsn.of(0));
+        RedoCapacityThrottle throttle = new RedoCapacityThrottle(
+                RedoCapacityPolicy.fixed(100), () -> Lsn.of(70), checkpoint::get,
+                flushRequests::incrementAndGet,
+                () -> {
+                    flushRequests.incrementAndGet();
+                    checkpoint.set(Lsn.of(10));
+                },
+                Duration.ofMillis(1));
+        MiniTransactionManager mgr = new MiniTransactionManager(new TablespaceAccessController(),
+                new RedoLogManager(), throttle, 10);
+
+        MiniTransaction mtr = mgr.begin();
+        assertEquals(1, flushRequests.get(),
+                "begin must check current LSN plus reserved foreground bytes before any page latch is acquired");
+
         mgr.commit(mtr);
     }
 }

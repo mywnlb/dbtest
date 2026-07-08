@@ -10,6 +10,7 @@ import cn.zhangyis.db.storage.page.PageEnvelopeLayout;
 import java.nio.ByteBuffer;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -19,7 +20,25 @@ import java.util.Set;
  * <p>这个顺序很关键：D3/D4 的 MTR commit 语义是“批内所有修改共享 endLsn”。若 PAGE_INIT 后立即盖 pageLSN，
  * 同批后续 PAGE_BYTES 会被 pageLSN 幂等判断误跳过，导致恢复页半成品。
  */
-public final class PageRedoApplyHandler {
+public final class PageRedoApplyHandler implements RedoApplyHandler {
+
+    @Override
+    public boolean supports(RedoRecord record) {
+        return record instanceof PageInitRecord || record instanceof PageBytesRecord;
+    }
+
+    @Override
+    public List<PageId> affectedPages(RedoRecord record) {
+        return List.of(pageIdOf(record));
+    }
+
+    @Override
+    public RedoApplyBatchHandler openBatch(LogRange range, RedoApplyContext context) {
+        if (range == null || context == null) {
+            throw new DatabaseValidationException("page redo apply range/context must not be null");
+        }
+        return new Batch(range, context);
+    }
 
     /** 应用一个完整 redo 批次；每个页只在批次末尾写回一次。 */
     public void apply(RedoLogBatch batch, RedoApplyContext context) {
@@ -42,12 +61,37 @@ public final class PageRedoApplyHandler {
         if (batch == null || context == null) {
             throw new DatabaseValidationException("page redo apply batch/context must not be null");
         }
-        Map<PageId, ReplayPage> pages = new LinkedHashMap<>();
-        Set<PageId> skippedPages = new HashSet<>();
+        RedoApplyBatchHandler session = openBatch(batch.range(), context);
         for (RedoRecord record : batch.records()) {
+            session.apply(record);
+        }
+        session.finish();
+    }
+
+    private static final class Batch implements RedoApplyBatchHandler {
+
+        /** 原始 batch range，finish 时作为所有 touched 页的 pageLSN 幂等边界。 */
+        private final LogRange range;
+
+        /** recovery apply 上下文；page handler 只通过 PageStore 读写物理页，不依赖 BufferPool/MTR。 */
+        private final RedoApplyContext context;
+
+        /** 本 batch 已装入并可能修改的页，保持首次触达顺序，finish 时逐页写回。 */
+        private final Map<PageId, ReplayPage> pages = new LinkedHashMap<>();
+
+        /** pageLSN 已覆盖本 batch 的页；同 batch 后续同页 record 必须整体跳过。 */
+        private final Set<PageId> skippedPages = new HashSet<>();
+
+        private Batch(LogRange range, RedoApplyContext context) {
+            this.range = range;
+            this.context = context;
+        }
+
+        @Override
+        public void apply(RedoRecord record) {
             PageId pageId = pageIdOf(record);
             if (skippedPages.contains(pageId)) {
-                continue;
+                return;
             }
             ReplayPage page = pages.get(pageId);
             if (page == null) {
@@ -62,9 +106,9 @@ public final class PageRedoApplyHandler {
                             "redo PAGE_BYTES targets uninitialized page beyond data file size: " + pageId);
                 }
                 byte[] current = readPage(context, pageId);
-                if (pageLsn(current).value() >= batch.range().end().value()) {
+                if (pageLsn(current).value() >= range.end().value()) {
                     skippedPages.add(pageId);
-                    continue;
+                    return;
                 }
                 page = new ReplayPage(pageId, current);
                 pages.put(pageId, page);
@@ -78,10 +122,14 @@ public final class PageRedoApplyHandler {
                 throw new RedoLogCorruptedException("unsupported redo record type: " + record.getClass().getName());
             }
         }
-        for (ReplayPage page : pages.values()) {
-            if (page.touched) {
-                stampPageLsn(page.bytes, batch.range().end());
-                context.pageStore().writePage(page.pageId, ByteBuffer.wrap(page.bytes));
+
+        @Override
+        public void finish() {
+            for (ReplayPage page : pages.values()) {
+                if (page.touched) {
+                    stampPageLsn(page.bytes, range.end());
+                    context.pageStore().writePage(page.pageId, ByteBuffer.wrap(page.bytes));
+                }
             }
         }
     }

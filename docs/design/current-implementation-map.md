@@ -57,7 +57,7 @@ flowchart TD
 | Typed INDEX/UNDO access | production `StorageEngine` 注入共享 `TablespaceRegistry`：`api.index.IndexPageAccess` / `UndoPageAccess` -> `MiniTransaction.acquireTablespaceLease(S)` -> `TablespaceRegistry.require` -> `MiniTransaction.getPage/newPage` -> `BufferPool` -> `PageStore` | Implemented；生产 typed access 在 lease 后拒绝稳定 INACTIVE/CORRUPTED/DISCARDED；两参构造仍保留给低层页格式测试，不做 registry 准入 |
 | Dirty page flush | `FlushCoordinator` 持同 space S lease -> snapshot -> WAL gate -> doublewrite -> `PageStore.writePage/force` -> `DataFileHandle.force` 持 per-file `FsyncLock` -> complete | Implemented；与 truncate X 互斥；同一 data file 并发 force 经 `FsyncLock` 串行化 |
 | UNDO truncate | `UndoTablespaceTruncationService.truncate` (`UndoTablespaceTruncationService.java:105`) -> X lease/校验/marker -> `FlushService.flushThrough` (`FlushService.java:127`) -> `LruBufferPool.invalidateTablespace` (`LruBufferPool.java:320`) -> `DataFileHandle.truncateTo` (`DataFileHandle.java:247`) -> `UndoTablespaceFspRebuilder.rebuild` (`UndoTablespaceFspRebuilder.java:45`) -> final state/Registry publish | Implemented (test-wired)；同 epoch 可故障续作；旧 UNDO/GENERAL/活动 inode 明确拒绝；`FlushService.drainTablespace` 的目标 space dirty drain 已通过 `BufferPool.awaitDirtyStateChange` 等待 dirty-state signal，不再固定 1ms 轮询 |
-| Redo replay | `RedoApplyDispatcher` -> `PageRedoApplyHandler` -> `PageStore.readPage/writePage` | Implemented physical replay path; recovery discovery is not fully wired to registry |
+| Redo replay | `RedoApplyDispatcher registry` -> `RedoApplyHandler` batch sessions -> default `PageRedoApplyHandler` -> `PageStore.readPage/writePage` | Implemented physical replay path；0.19a registry/session 已接，生产默认仍只有 page handler；recovery discovery is not fully wired to registry |
 
 ### Package Status
 
@@ -263,9 +263,10 @@ flowchart TD
   Checkpoint["CheckpointCoordinator"] -->|currentLsn / flushedToDiskLsn| Mgr
   Recovery["CrashRecoveryService (StorageEngine E2 + tests)"] --> Reader["RedoRecoveryReader"]
   Reader --> Repo
-  Recovery --> Dispatcher["RedoApplyDispatcher"]
-  Dispatcher --> Handler["PageRedoApplyHandler"]
-  Handler -->|readPage / writePage| PageStore["PageStore"]
+  Recovery --> Dispatcher["RedoApplyDispatcher registry"]
+  Dispatcher --> Handler["RedoApplyHandler sessions"]
+  Handler --> PageHandler["PageRedoApplyHandler (default physical handler)"]
+  PageHandler -->|readPage / writePage| PageStore["PageStore"]
   Checkpoint -->|write label| CkptStore["RedoCheckpointStore"]
 ```
 
@@ -278,7 +279,7 @@ flowchart TD
 | Durable write | `RedoLogManager.write()` / `flush()` -> `ioLock` serializes repository append/force -> 单调推进 written/flushed LSN; append only holds state lock and can reserve LSN while write/fsync is blocked | Implemented；`DurabilityPolicy` 可选择 wait-written、wait-flushed 或后台策略；2.1 起 `ClusteredDmlService.commit` 在 `UndoLogManager.onCommit` 后用 policy 等待 `redo.currentLsn()`；`StorageEngine.checkpoint/close` 与 `UndoTablespaceTruncationService` 主动驱动；默认 test helpers 仍可用 memory mode |
 | WAL gate (flush module) | `FlushCoordinator.flushPage` -> `redo.flushedToDiskLsn()` (`FlushCoordinator.java:91`) + `redo.waitFlushed(pageLsn, timeout)` (`:92`) | Implemented；`StorageEngine` durable redo 路径可通过 WAL gate；memory-mode 组合中 durable LSN 恒 0，会跳过脏页 |
 | Checkpoint read | `flush.checkpoint.CheckpointCoordinator.advanceCheckpoint` -> if no dirty: `min(redo.closedLsn(), redo.flushedToDiskLsn())`; if dirty: `min(bufferPool.oldestDirtyLsnOr(...), redo.closedLsn(), redo.flushedToDiskLsn())`; if `checkpointStore != null` -> `RedoCheckpointStore.write(RedoCheckpointLabel.of(...))` | Implemented；`StorageEngine` 和 tests 构造 checkpoint coordinator；checkpoint store 由 `StorageEngine`/tests 打开 |
-| Redo replay (recovery) | `StorageEngine.open(existing)` -> recovery-open system UNDO + configured data spaces -> `CrashRecoveryService.recover` -> checkpoint-aware replay -> `RedoLogManager.restoreRecoveredBoundary(recoveredTo)` -> optional `UndoTablespaceRecoveryParticipant.resumeAfterRedo(recoveredTo)` -> `SPACE_FILE_RECONCILE` -> open traffic | Implemented production path for explicitly configured spaces；恢复边界安装后新 redo 从 recoveredTo 连续追加，durable LSN 不倒退；无 DD/tablespace discovery |
+| Redo replay (recovery) | `StorageEngine.open(existing)` -> recovery-open system UNDO + configured data spaces -> `CrashRecoveryService.recover` -> `RedoApplyDispatcher.pageDispatcher()`（registry 默认只注册 `PageRedoApplyHandler`）-> checkpoint-aware replay -> `RedoLogManager.restoreRecoveredBoundary(recoveredTo)` -> optional `UndoTablespaceRecoveryParticipant.resumeAfterRedo(recoveredTo)` -> `SPACE_FILE_RECONCILE` -> open traffic | Implemented production path for explicitly configured spaces；0.19a 起 dispatcher 已支持多 handler batch session，按原始 record 顺序分发并在 batch 末尾 finish；恢复边界安装后新 redo 从 recoveredTo 连续追加，durable LSN 不倒退；无 DD/tablespace discovery |
 | Capacity pressure | `StorageEngine.open` constructs `RedoCapacityThrottle(policy, redo::currentLsn, checkpoint::lastCheckpointLsn, asyncRequest, blockingFlush, timeout)` -> `MiniTransactionManager.begin` reserves foreground redo budget before any MTR page latch/lease; ASYNC_FLUSH -> `PageCleanerSupervisor.requestFlush`; SYNC_FLUSH/HARD_LIMIT -> `redo.flush()` + `FlushService.flushForCapacity(foregroundCapacityFlushMaxPages)` loop until pressure drops or timeout | Implemented production path；`StorageEngine` 注入 §7.4 `adaptive` policy并启动 supervisor 托管的单线程 page cleaner；worker FAILED 后 supervisor 有有限重启和 `PageCleanerMetricsSnapshot`；0.6b 前台 reservation throttle 已接，timeout 仍 fail-closed 抛 `RedoCapacityThrottleTimeoutException`；前台同步刷页预算独立于 `backgroundFlushMaxPages`（后者可为 0）；**后台 redo flush 已由 `RedoFlushWorker` 接**（独立于 page cleaner，见下） |
 | Background redo flush | `StorageEngine.open` starts `RedoFlushWorker` (when `backgroundFlushEnabled`) -> periodic/on-demand `RedoFlushTarget.flush()` (-> `RedoLogManagerFlushTarget` -> `RedoLogManager.flush()`) -> 推进 `flushedToDiskLsn` + 唤醒 `waitFlushed` | Implemented production path；空转跳过（`currentLsn<=flushedToDiskLsn` 不 fsync）；失败即 FAILED；engine 在 page cleaner 前启动、close 时先停（停 page cleaner→停 redo flusher→final flushThrough）；解淘汰/flush WAL gate 因无人 flush 而跳过的根因 |
 
@@ -289,7 +290,7 @@ flowchart TD
 | `storage.redo` core | `RedoLogManager`, `ContiguousLsnTracker`, `RedoLogIo`, `DurabilityPolicy`, batches/ranges/physical records | Partial | 默认 manager 为 memory mode；`StorageEngine`/truncation/DML facade 组合注入 durable manager；支持 recovery boundary 恢复与连续续写；recent written/closed 连续边界已接，append 与 fsync 状态锁已拆分；三阶段 append→`write()`(OS cache)→`flush()`(fsync) 原语齐备（`writtenToDiskLsn`/`waitWritten`，守 `flushed<=written`）；2.1 `ClusteredDmlService.commit` 已消费 `DurabilityPolicy`，但 `TransactionManager.commit` 本身仍保持纯内存状态机 |
 | `storage.redo` durable IO | `RedoLogWriter`, `RedoLogFlusher`, `RedoLogFileRepository`(接口), `SingleFileRedoLogRepository`, `RotatingRedoLogRepository`, `RedoBatchFrameCodec` | Implemented | `RedoLogFileRepository` 现为角色接口（append/force/readBatches）；`SingleFileRedoLogRepository`=单 append-only legacy/opt-out；`RotatingRedoLogRepository`(0.18a/b)=固定文件环，轮转 + checkpoint 回收 + 跨文件恢复扫描；`StorageEngine.open` **默认**接入文件环（`EngineConfig` 默认 `RedoRotationConfig.defaults()`=8×8MiB；`withSingleFileRedo()` 显式 opt-out），checkpoint 经 `RedoReclaimBoundary`→`CheckpointCoordinator` 驱动回收（0.18b/收口）；frame 编解码抽到 `RedoBatchFrameCodec`，两实现共用（magic + payloadLen + crc32 + payload） |
 | `storage.redo` checkpoint | `RedoCheckpointStore`, `RedoCheckpointLabel` | Implemented | Two-slot fuzzy checkpoint with CRC32；`StorageEngine` 和 tests 打开；`flush.checkpoint.CheckpointCoordinator` 写入 |
-| `storage.redo` recovery | `RedoRecoveryReader`, `RedoApplyDispatcher`, `RedoApplyContext`, `PageRedoApplyHandler` | Implemented; production-wired by `StorageEngine` E2 | `StorageEngine.open(existing)` constructs `pageDispatcher` + `RedoApplyContext(PageStore,pageSize)`；single-handler dispatch (only `PageRedoApplyHandler`)；只恢复已打开/显式配置的表空间 |
+| `storage.redo` recovery | `RedoRecoveryReader`, `RedoApplyDispatcher`, `RedoApplyHandler`, `RedoApplyBatchHandler`, `RedoApplyContext`, `PageRedoApplyHandler` | Implemented; production-wired by `StorageEngine` E2 | `StorageEngine.open(existing)` constructs `pageDispatcher` + `RedoApplyContext(PageStore,pageSize)`；0.19a 起 dispatcher 是多 handler registry，但默认生产仍只有 `PageRedoApplyHandler`；dispatcher 按原始 record 顺序调用 batch session，FORCE_SKIP 在打开 handler session 和触碰 PageStore 前基于 affected pages 过滤；只恢复已打开/显式配置的表空间 |
 | `storage.redo` capacity | `RedoCapacityPolicy`, `RedoCapacityPressure`, `RedoCapacityDecision`, `RedoCapacityThrottle`, `RedoCapacityThrottle.Reservation`, `RedoCapacityThrottleTimeoutException` | Implemented | `StorageEngine` 和 tests 使用 fixed capacity；4 pressure levels NONE/ASYNC_FLUSH/SYNC_FLUSH/HARD_LIMIT; consumed by `FlushService` and foreground MTR begin reservation throttle；reservation tracks outstanding foreground budgets only, not authoritative LSN ranges |
 | `storage.redo` background flush | `RedoFlushWorker`, `RedoFlushWorkerState`, `RedoFlushTarget`, `RedoLogManagerFlushTarget` | Implemented; production-wired by `StorageEngine` | 单 daemon 线程周期/on-demand 驱动 `redo.flush()`，空转跳过、失败即 FAILED；worker 依赖 `RedoFlushTarget` 端口（生产用 `RedoLogManagerFlushTarget` 适配，便于测试注入 fake）；`RedoLogManager` 已拆 state lock 与 `ioLock` |
 | `storage.redo` exceptions | `RedoLogIoException` (runtime), `RedoLogCorruptedException` (fatal) | Implemented | `RedoLogCorruptedException` extends `DatabaseFatalException`; thrown by repo/reader/handler on corruption |
@@ -428,8 +429,9 @@ flowchart TD
   Svc -->|3. readLatest| CkptStore["RedoCheckpointStore (redo)"]
   Svc -->|3. new RedoRecoveryReader| Reader["RedoRecoveryReader (redo)"]
   Svc -->|3. readBatches| Reader
-  Svc -->|3. applyAll batches, ctx| Dispatcher["RedoApplyDispatcher (redo)"]
-  Dispatcher --> Handler["PageRedoApplyHandler -> extend-on-demand (PAGE_INIT only) + PageStore"]
+  Svc -->|3. applyAll batches, ctx| Dispatcher["RedoApplyDispatcher registry (redo)"]
+  Dispatcher --> Handler["RedoApplyHandler batch sessions"]
+  Handler --> PageHandler["PageRedoApplyHandler -> extend-on-demand (PAGE_INIT only) + PageStore"]
   Svc -->|"4. restoreRecoveredBoundary (if recoveredRedoManager)"| Boundary["REDO_BOUNDARY_INSTALL"]
   Svc -->|"5. resumeAfterRedo (if undo participant)"| UndoResume["UNDO_TABLESPACE_RESUME"]
   Svc -->|"6. reconcileSpaceFiles (if spacesToReconcile)"| Reconcile["SPACE_FILE_RECONCILE: validate+page0 size -> PageStore.ensureCapacity"]
@@ -567,7 +569,7 @@ flowchart TD
 | --- | --- | --- | --- |
 | `RedoLogWriter` / `RedoLogFlusher` / `RedoLogFileRepository`(接口) / `SingleFileRedoLogRepository` / `RotatingRedoLogRepository` / `RedoBatchFrameCodec` / `RedoReclaimBoundary` | `StorageEngine` + tests | Durable redo write/flush/file IO（**文件环默认** + 单文件 opt-out，checkpoint 经 `RedoReclaimBoundary` 驱动回收）；后台 flush 已由 `RedoFlushWorker` 生产接线；前台 capacity reservation 已由 `RedoCapacityThrottle` 在 MTR begin 前接线 | log block checksum(0.20b) |
 | `RedoCheckpointStore` / `RedoCheckpointLabel` | `StorageEngine` + tests | Fuzzy checkpoint control file | Add redo recycling integration and richer checkpoint diagnostics |
-| `RedoRecoveryReader` / `RedoApplyDispatcher` / `RedoApplyContext` / `PageRedoApplyHandler` / `RedoApplySummary` | `StorageEngine.open(existing)` + tests | Redo replay path for configured/opened tablespaces；FORCE_SKIP 模式下 dispatcher 在进入 page handler 前按 `PageId` 过滤 skipped space，并用内部 batch view 保留原始 batch end LSN | Add tablespace discovery and more redo handlers as formats expand |
+| `RedoRecoveryReader` / `RedoApplyDispatcher` / `RedoApplyHandler` / `RedoApplyBatchHandler` / `RedoApplyContext` / `PageRedoApplyHandler` / `RedoApplySummary` | `StorageEngine.open(existing)` + tests | Redo replay path for configured/opened tablespaces；0.19a 多 handler registry 已接，默认 page handler 保留原始 batch end LSN；FORCE_SKIP 在进入 handler session 前按 affected `PageId` 过滤 skipped space | Add tablespace discovery and persistent logical redo record types as formats expand |
 | `RedoCapacityPolicy` / `RedoCapacityPressure` / `RedoCapacityDecision` / `RedoCapacityThrottle` | `StorageEngine` + tests | Redo capacity pressure evaluation + foreground reservation throttle | Add config-driven thresholds / richer diagnostics if needed |
 
 ### flush 层部分未接线能力
@@ -652,7 +654,7 @@ flowchart TD
 
 | Gap | Current consequence | Preferred resolution |
 | --- | --- | --- |
-| 写路径 + 读路径 latch coupling 全覆盖（0.13a/0.13b/0.13c），仍缺 SX / 通用版本重定位 | **写：全部聚簇写算子乐观 S-crab 下降 + 悲观回退（0.13a/0.13b）**；**读：`lookup`/`scan`/current-read 定位经 `descendSharedCrab` 全 S hand-over-hand 下降 + scan sibling hand-over-hand（0.13c），不再持 root/全部已扫 leaf 到 commit**；仍无 SX latch；2.7a/2.7b current-read 已有授锁后重定位，但不是通用 root/version retry | 0.13d 补 SX latch、root/version retry、safe node 精判 |
+| 0.13d 主体已完成，仍缺 B-link/OLC 通用版本重定位 | **写：全部聚簇写算子乐观 S-crab 下降 + 悲观回退（0.13a/0.13b）**；**读：`lookup`/`scan`/current-read 定位经 `descendSharedCrab` 全 S hand-over-hand 下降 + scan sibling hand-over-hand（0.13c）**；**0.13d 已接 SX latch、safe-node 早释放祖先、root SX 下降 + restart-in-X**。当前仍无 B-link/OLC 版本页重定位，2.7a/2.7b current-read 只有授锁后重定位 | B-link/OLC 版本重启长期 deferred；除非并发性能目标明确，否则优先做 DD/session/redo/MVCC 辅助字段 |
 | B+Tree current-read 已接 point/unique/range，但 SQL/session range DML 未接 | `BTreeCurrentReadService` 已支持 point `FOR_SHARE/FOR_UPDATE`、RC/RR miss gap 策略、unique insert `INSERT_INTENTION`、RC/RR range 锁策略；2.1 `ClusteredDmlService` 已调用 unique/point current-read；SQL/session/executor 尚未调用，terminal gap 仍是页级简化，非长期 cursor | 接 executor/DD/session locking read 与 range DML；后续 global gap ref 精确化和 cursor 化 |
 | 唯一检查仍是物理语义 | 2.7a unique check 会等待 record/gap 锁，但 delete-marked key 仍被视为重复；不沿 undo 判断逻辑可见性 | 接入 MVCC 逻辑唯一检查后区分 delete-marked 可见性 |
 | `nonLeafSegment` 已用于分配（0.11） | 内部页/root-split 子页经 `index.nonLeafSegment()` 分配（`requireNonLeafSegment` 校验）；root 仍页号稳定原地重建 | — |
@@ -661,10 +663,10 @@ flowchart TD
 
 | Gap | Current consequence | Preferred resolution |
 | --- | --- | --- |
-| 仅 2 种持久 redo 记录类型 | 只有 `PAGE_INIT`/`PAGE_BYTES`；0.23b 的 `MtrRedoCategory` 只是 collector 本地诊断，不是持久 MLOG | 按需添加逻辑 redo 类型与多 apply handler |
+| 仅 2 种持久 redo 记录类型 | 只有 `PAGE_INIT`/`PAGE_BYTES`；0.19a 已有多 handler dispatcher 框架，0.23b 的 `MtrRedoCategory` 仍只是 collector 本地诊断，不是持久 MLOG | 按需添加逻辑 redo 类型与对应 handler |
 | commit durability 只由 storage DML facade 消费 | `DurabilityPolicy`(FLUSH/WRITE/BACKGROUND) + redo `write()`/`waitWritten()`/`writtenToDiskLsn()` 三阶段原语已就绪并单测（0.20a）；2.1 `ClusteredDmlService.commit` 已等待策略目标；`MiniTransaction.commit`/`TransactionManager.commit` 仍不按策略等待，避免底层 MTR/事务状态机携带上层提交语义 | session/executor 接事务结束时复用 DML facade 或更高层 transaction facade |
 | redo 环满仍保留最终 fail-closed、无 log block 校验 | `RotatingRedoLogRepository`(0.18) 已是引擎默认 redo 后端：轮转 + checkpoint 回收 + 跨文件恢复；0.6b 已在 MTR begin 前用 foreground reservation 按 ASYNC_FLUSH/SYNC_FLUSH/HARD_LIMIT 分级请求/等待 flush+checkpoint；若 timeout、预算低估或文件环仍无可回收区间，仍 fail-closed，不覆盖未 checkpoint redo；帧仍只有 batch CRC、无 log block header/trailer | log block header/trailer checksum（0.20b）；按需补更细 capacity diagnostics / per-operation exact redo budget |
-| `RedoApplyDispatcher` 单 handler | 只注册 `PageRedoApplyHandler` | 按需添加多 handler dispatch table |
+| 生产默认仍只注册 page redo handler | `RedoApplyDispatcher` 已支持多 handler registry，但 `pageDispatcher()` 生产路径仍只注册 `PageRedoApplyHandler`；没有新的持久逻辑 redo record 可触发其它 handler | 随 FSP/BTree/Undo 持久 record type 增加对应 handler 注册 |
 
 ### Flush 缺口
 

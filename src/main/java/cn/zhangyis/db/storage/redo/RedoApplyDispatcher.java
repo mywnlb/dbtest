@@ -3,25 +3,49 @@ package cn.zhangyis.db.storage.redo;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageId;
 
-import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.function.Predicate;
 
 /**
- * Redo apply 分发器（R1 简化版）。当前只注册 page 物理 handler，负责 PAGE_INIT/PAGE_BYTES。
+ * Redo apply 分发器。0.19a 起支持多 handler registry，但默认生产入口仍只注册 PAGE_INIT/PAGE_BYTES
+ * 物理页 handler；新增持久逻辑 redo 类型时只需注册新的 {@link RedoApplyHandler}。
+ *
+ * <p>分发器必须保持 batch 内 record 的原始顺序：page handler 依赖批末统一 pageLSN，未来 FSP/BTree
+ * handler 也可能依赖同一 MTR 内的先后关系。因此这里按 record 顺序解析 handler 并调用 batch session，
+ * 只在 batch 末尾调用各 handler 的 {@link RedoApplyBatchHandler#finish()}。
  */
 public final class RedoApplyDispatcher {
 
-    /** PAGE_INIT/PAGE_BYTES 物理页 handler。 */
-    private final PageRedoApplyHandler pageHandler;
+    /** 已注册 handler，顺序用于诊断与批末 finish 的首次出现顺序；构造后不可变。 */
+    private final List<RedoApplyHandler> handlers;
 
-    private RedoApplyDispatcher(PageRedoApplyHandler pageHandler) {
-        this.pageHandler = pageHandler;
+    private RedoApplyDispatcher(List<RedoApplyHandler> handlers) {
+        if (handlers == null) {
+            throw new DatabaseValidationException("redo apply handlers must not be null");
+        }
+        for (RedoApplyHandler handler : handlers) {
+            if (handler == null) {
+                throw new DatabaseValidationException("redo apply handler must not be null");
+            }
+        }
+        this.handlers = List.copyOf(handlers);
     }
 
-    /** 创建只包含 page handler 的恢复分发器。后续逻辑 redo handler 可在此扩展注册表。 */
+    /** 创建只包含 page handler 的恢复分发器。 */
     public static RedoApplyDispatcher pageDispatcher() {
-        return new RedoApplyDispatcher(new PageRedoApplyHandler());
+        return withHandlers(List.of(new PageRedoApplyHandler()));
+    }
+
+    /**
+     * 创建自定义 handler registry 的恢复分发器。每个 record 在 apply 时必须恰好匹配一个 handler。
+     *
+     * @param handlers handler 列表；允许为空，但实际 apply 会因没有匹配 handler 而失败。
+     * @return dispatcher。
+     */
+    public static RedoApplyDispatcher withHandlers(List<RedoApplyHandler> handlers) {
+        return new RedoApplyDispatcher(handlers);
     }
 
     /**
@@ -54,13 +78,24 @@ public final class RedoApplyDispatcher {
         if (shouldSkipPage == null) {
             throw new DatabaseValidationException("redo apply skip predicate must not be null");
         }
-        RedoApplyBatchView view = filter(batch, shouldSkipPage);
-        int skipped = batch.records().size() - view.records().size();
-        if (view.isEmpty()) {
-            return new RedoApplySummary(1, 0, skipped);
+        Map<RedoApplyHandler, RedoApplyBatchHandler> sessions = new LinkedHashMap<>();
+        int skipped = 0;
+        int appliedRecords = 0;
+        for (RedoRecord record : batch.records()) {
+            RedoApplyHandler handler = resolveHandler(record);
+            if (shouldSkip(record, handler, shouldSkipPage)) {
+                skipped++;
+                continue;
+            }
+            RedoApplyBatchHandler session = sessions.computeIfAbsent(handler,
+                    h -> openSession(h, batch.range(), context));
+            session.apply(record);
+            appliedRecords++;
         }
-        pageHandler.apply(view, context);
-        return new RedoApplySummary(1, 1, skipped);
+        for (RedoApplyBatchHandler session : sessions.values()) {
+            session.finish();
+        }
+        return new RedoApplySummary(1, appliedRecords > 0 ? 1 : 0, skipped);
     }
 
     /**
@@ -102,14 +137,50 @@ public final class RedoApplyDispatcher {
         return new RedoApplySummary(scanned, applied, skipped);
     }
 
-    private static RedoApplyBatchView filter(RedoLogBatch batch, Predicate<PageId> shouldSkipPage) {
-        List<RedoRecord> records = new ArrayList<>(batch.records().size());
-        for (RedoRecord record : batch.records()) {
-            PageId pageId = PageRedoApplyHandler.pageIdOf(record);
-            if (!shouldSkipPage.test(pageId)) {
-                records.add(record);
+    private RedoApplyHandler resolveHandler(RedoRecord record) {
+        RedoApplyHandler matched = null;
+        for (RedoApplyHandler handler : handlers) {
+            if (handler.supports(record)) {
+                if (matched != null) {
+                    throw new DatabaseValidationException("multiple redo apply handlers support record: "
+                            + record.getClass().getName());
+                }
+                matched = handler;
             }
         }
-        return new RedoApplyBatchView(batch.range(), records);
+        if (matched == null) {
+            throw new DatabaseValidationException("no redo apply handler supports record: "
+                    + record.getClass().getName());
+        }
+        return matched;
+    }
+
+    private static boolean shouldSkip(RedoRecord record,
+                                      RedoApplyHandler handler,
+                                      Predicate<PageId> shouldSkipPage) {
+        List<PageId> affectedPages = handler.affectedPages(record);
+        if (affectedPages == null) {
+            throw new DatabaseValidationException("redo apply handler affected pages must not be null");
+        }
+        for (PageId pageId : affectedPages) {
+            if (pageId == null) {
+                throw new DatabaseValidationException("redo apply handler affected page must not be null");
+            }
+            if (shouldSkipPage.test(pageId)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static RedoApplyBatchHandler openSession(RedoApplyHandler handler,
+                                                     LogRange range,
+                                                     RedoApplyContext context) {
+        RedoApplyBatchHandler session = handler.openBatch(range, context);
+        if (session == null) {
+            throw new DatabaseValidationException("redo apply handler opened null batch session: "
+                    + handler.getClass().getName());
+        }
+        return session;
     }
 }

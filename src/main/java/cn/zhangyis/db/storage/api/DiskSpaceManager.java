@@ -29,6 +29,7 @@ import cn.zhangyis.db.storage.page.FilePageHeader;
 import cn.zhangyis.db.storage.page.PageEnvelope;
 import cn.zhangyis.db.storage.page.PageType;
 import cn.zhangyis.db.storage.fsp.extent.DefaultExtentAllocationPolicy;
+import cn.zhangyis.db.storage.fsp.extent.ExtentAllocationDirection;
 import cn.zhangyis.db.storage.fsp.extent.ExtentDescriptorRepository;
 import cn.zhangyis.db.storage.fsp.flst.FileAddress;
 import cn.zhangyis.db.storage.fsp.flst.Flst;
@@ -118,7 +119,8 @@ public final class DiskSpaceManager {
         this.flst = new Flst(pool);
         this.freeExtents = new FreeExtentService(pool, pageSize, headerRepo, xdes, flst);
         this.segSpace = new SegmentSpaceService(pool, pageSize, headerRepo, inodeRepo, xdes, flst, freeExtents);
-        this.allocator = new SegmentPageAllocator(pool, inodeRepo, flst, segSpace, new DefaultExtentAllocationPolicy());
+        this.allocator = new SegmentPageAllocator(pool, pageSize, headerRepo, inodeRepo, flst, segSpace,
+                new DefaultExtentAllocationPolicy());
         this.reservationService = new SpaceReservationService(pageStore, pageSize, headerRepo, flst);
     }
 
@@ -163,6 +165,9 @@ public final class DiskSpaceManager {
         if (type == TablespaceType.UNDO) {
             headerRepo.writeLifecycle(mtr, spaceId, new TablespaceLifecycleHeader(
                     initialState, initialSizePages, 0L, initialSizePages, TablespaceState.ACTIVE));
+        } else if (type == TablespaceType.GENERAL) {
+            headerRepo.writeLifecycle(mtr, spaceId, new TablespaceLifecycleHeader(
+                    TablespaceState.NORMAL, initialSizePages, 0L, initialSizePages, TablespaceState.NORMAL));
         }
         xdes.reserveSystemExtent(mtr, spaceId);
         registry.replace(tablespaceMetadata(spaceId, path, type, initialState, initialSizePages));
@@ -222,9 +227,44 @@ public final class DiskSpaceManager {
         registry.markInactive(spaceId);
     }
 
-    /** 标记表空间 CORRUPTED（运行时）：后续空间管理 API require 抛 {@link TablespaceCorruptedException}。 */
+    /**
+     * 标记表空间 CORRUPTED（运行时）：后续空间管理 API require 抛 {@link TablespaceCorruptedException}。
+     * 该入口只发布当前进程 registry 状态，不写 page0 lifecycle marker；重启后是否仍损坏取决于权威 metadata。
+     */
     public void markTablespaceCorrupted(SpaceId spaceId, String reason) {
         requireSpace(spaceId);
+        registry.markCorrupted(spaceId, reason);
+    }
+
+    /**
+     * 持久标记 GENERAL 表空间 CORRUPTED。数据流为：先在当前 MTR 内取得 ordinary access lease 并复核 registry 状态，
+     * 再以 page0 X latch 读取 FSP header，校验该空间确为 GENERAL，写入 lifecycle marker(CORRUPTED)，最后发布
+     * registry CORRUPTED。重启后 page0 loader 会恢复该状态，普通 require 继续拒绝访问；recovery open 仍可读取。
+     *
+     * @param mtr 当前活动 MTR，负责 page0 latch、redo 收集和异常路径资源释放。
+     * @param spaceId 目标表空间。
+     * @param reason 损坏原因，必须非空，进入 registry 诊断日志。
+     */
+    public void markTablespaceCorrupted(MiniTransaction mtr, SpaceId spaceId, String reason) {
+        requireMtr(mtr);
+        requireSpace(spaceId);
+        if (reason == null || reason.isBlank()) {
+            throw new DatabaseValidationException("corruption reason must not be blank");
+        }
+        requireOrdinaryAccess(mtr, spaceId);
+        // 直接用 X latch 读取 page0，避免同一 MTR 内先 S 后 X 的升级禁令；随后 marker 与状态发布同属一个临界区。
+        SpaceHeaderSnapshot snapshot = headerRepo.readForUpdate(mtr, spaceId);
+        TablespaceType type = TablespaceTypeFlags.decode(snapshot.spaceFlags());
+        if (type != TablespaceType.GENERAL) {
+            throw new DatabaseValidationException(
+                    "persistent corrupted marker is only supported for GENERAL tablespace: " + type);
+        }
+        headerRepo.writeLifecycle(mtr, spaceId, new TablespaceLifecycleHeader(
+                TablespaceState.CORRUPTED,
+                snapshot.currentSizeInPages(),
+                0L,
+                snapshot.currentSizeInPages(),
+                TablespaceState.NORMAL));
         registry.markCorrupted(spaceId, reason);
     }
 
@@ -291,29 +331,56 @@ public final class DiskSpaceManager {
      * （commit 才盖 pageLSN，需其 guard）；故单 MTR 内批量分配 N 页会同时占 N 个数据页帧。
      */
     public PageId allocatePage(MiniTransaction mtr, SegmentRef ref) {
+        return allocatePage(mtr, ref, PageAllocationHint.none());
+    }
+
+    /**
+     * 为 segment 分配一个页，并把方向 hint 传给 FSP extent 策略。旧无 hint 调用通过 {@link PageAllocationHint#none()}
+     * 进入这里，保持 fragment→segment extent→autoextend 的既有行为。
+     *
+     * @param mtr 当前活动 MTR。
+     * @param ref segment 句柄。
+     * @param hint 页分配 hint；只影响“需要新 extent 时”选择和批量挂段，不直接指定返回页。
+     * @return 已初始化为 ALLOCATED 的新页。
+     */
+    public PageId allocatePage(MiniTransaction mtr, SegmentRef ref, PageAllocationHint hint) {
         requireMtr(mtr);
         requireRef(ref);
+        if (hint == null) {
+            throw new DatabaseValidationException("page allocation hint must not be null");
+        }
         requireOrdinaryAccess(mtr, ref.spaceId());
         reservationService.consumePageIfReserved(mtr, ref.spaceId());
-        PageId allocated = doAllocatePage(mtr, ref);
+        PageId allocated = doAllocatePage(mtr, ref, hint);
         initAllocatedPage(mtr, allocated);
         return allocated;
     }
 
     /** 现有分配逻辑（fragment→extent，autoextend 一次重试），只决定页号、不碰数据页帧。 */
-    private PageId doAllocatePage(MiniTransaction mtr, SegmentRef ref) {
-        Optional<PageId> first = allocator.allocatePage(mtr, ref.spaceId(), ref.inodeSlot());
+    private PageId doAllocatePage(MiniTransaction mtr, SegmentRef ref, PageAllocationHint hint) {
+        ExtentAllocationDirection direction = toFspDirection(hint.direction());
+        Optional<PageId> first = allocator.allocatePage(mtr, ref.spaceId(), ref.inodeSlot(),
+                direction, hint.hintPageNo(), hint.pagesNeeded());
         if (first.isPresent()) {
             return first.get();
         }
         PageNo newSize = pageStore.extend(ref.spaceId());
         headerRepo.setCurrentSizeInPages(mtr, ref.spaceId(), newSize);
-        Optional<PageId> second = allocator.allocatePage(mtr, ref.spaceId(), ref.inodeSlot());
+        Optional<PageId> second = allocator.allocatePage(mtr, ref.spaceId(), ref.inodeSlot(),
+                direction, hint.hintPageNo(), hint.pagesNeeded());
         if (second.isPresent()) {
             return second.get();
         }
         throw new NoFreeSpaceException("no free space for segment " + ref.segmentId().value()
                 + " in tablespace " + ref.spaceId().value());
+    }
+
+    private static ExtentAllocationDirection toFspDirection(PageAllocationHint.Direction direction) {
+        return switch (direction) {
+            case NO_DIRECTION -> ExtentAllocationDirection.NO_DIRECTION;
+            case UP -> ExtentAllocationDirection.UP;
+            case DOWN -> ExtentAllocationDirection.DOWN;
+        };
     }
 
     /**

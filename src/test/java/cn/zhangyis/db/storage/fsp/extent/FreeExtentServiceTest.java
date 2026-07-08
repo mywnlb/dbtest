@@ -100,6 +100,35 @@ class FreeExtentServiceTest {
     }
 
     @Test
+    void acquireWithDirectionChoosesNearestFreeExtentAroundHint() {
+        withSvc(320, (header, xdes, flst, svc, mgr, pool) -> {
+            MiniTransaction m = mgr.begin();
+            for (int i = 0; i < 4; i++) {
+                svc.fillFreeListStep(m, SPACE);
+            }
+
+            assertEquals(Optional.of(ExtentId.of(SPACE, 2)),
+                    svc.acquireFreeExtent(m, SPACE, ExtentAllocationDirection.UP, Optional.of(PageNo.of(128))));
+            assertEquals(Optional.of(ExtentId.of(SPACE, 3)),
+                    svc.acquireFreeExtent(m, SPACE, ExtentAllocationDirection.DOWN, Optional.of(PageNo.of(255))));
+            assertEquals(Optional.of(ExtentId.of(SPACE, 1)),
+                    svc.acquireFreeExtent(m, SPACE, ExtentAllocationDirection.NO_DIRECTION, Optional.of(PageNo.of(255))));
+            mgr.commit(m);
+        });
+    }
+
+    @Test
+    void upDirectionCanMaterializeHigherExtentBeforeFallingBack() {
+        withSvc(256, (header, xdes, flst, svc, mgr, pool) -> {
+            MiniTransaction m = mgr.begin();
+            assertEquals(Optional.of(ExtentId.of(SPACE, 1)), svc.acquireFreeExtent(m, SPACE));
+            assertEquals(Optional.of(ExtentId.of(SPACE, 3)),
+                    svc.acquireFreeExtent(m, SPACE, ExtentAllocationDirection.UP, Optional.of(PageNo.of(192))));
+            mgr.commit(m);
+        });
+    }
+
+    @Test
     void allocateFragmentPagesFromFreeFragThenFull() {
         withSvc(128, (header, xdes, flst, svc, mgr, pool) -> {
             MiniTransaction m = mgr.begin();

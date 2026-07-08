@@ -90,22 +90,103 @@ public final class FreeExtentService {
 
     /** 取一个可用 FREE extent：弹 FSP_FREE 头；空则先 fill 再弹；真满返回 empty。 */
     public Optional<ExtentId> acquireFreeExtent(MiniTransaction mtr, SpaceId spaceId) {
+        return acquireFreeExtent(mtr, spaceId, ExtentAllocationDirection.NO_DIRECTION, Optional.empty());
+    }
+
+    /**
+     * 按方向 hint 取一个 FREE extent。NO_DIRECTION 完全复用旧链头语义；UP/DOWN 先在已材料化的 FSP_FREE 链中寻找
+     * hint 所属 extent 附近的最近候选。UP 如果右侧尚未材料化，会按 freeLimit 继续填充直到找到不小于 hint 的 extent
+     * 或物理空间耗尽；DOWN 不会通过向右填充制造更小候选，找不到即回退链头。
+     *
+     * @param mtr 当前 MTR。
+     * @param spaceId 目标表空间。
+     * @param direction 分配方向。
+     * @param hintPageNo 邻近页号；方向为 UP/DOWN 但缺失 hint 时按 NO_DIRECTION 处理。
+     * @return 被摘出 FSP_FREE 的 extent，或空间耗尽。
+     */
+    public Optional<ExtentId> acquireFreeExtent(MiniTransaction mtr, SpaceId spaceId,
+                                                ExtentAllocationDirection direction,
+                                                Optional<PageNo> hintPageNo) {
         requireArgs(mtr, spaceId);
+        if (direction == null || hintPageNo == null) {
+            throw new DatabaseValidationException("extent allocation direction/hint must not be null");
+        }
         latchPage0(mtr, spaceId);
         FileAddress freeBase = headerRepo.freeExtentListBaseAddr(spaceId);
-        FileAddress head = flst.getFirst(mtr, spaceId, freeBase);
-        if (!head.isNull()) {
-            ExtentId ext = xdes.extentIdOfNode(spaceId, head);
-            flst.remove(mtr, spaceId, freeBase, head);
-            return Optional.of(ext);
+        if (direction != ExtentAllocationDirection.NO_DIRECTION && hintPageNo.isPresent()) {
+            Optional<ExtentId> directional = acquireDirectional(mtr, spaceId, freeBase, direction, hintPageNo.get());
+            if (directional.isPresent()) {
+                return directional;
+            }
         }
-        Optional<ExtentId> filled = fillFreeListStep(mtr, spaceId);
-        if (filled.isEmpty()) {
+        return acquireFreeExtentFromHead(mtr, spaceId, freeBase);
+    }
+
+    private Optional<ExtentId> acquireDirectional(MiniTransaction mtr, SpaceId spaceId, FileAddress freeBase,
+                                                  ExtentAllocationDirection direction, PageNo hintPageNo) {
+        long hintExtentNo = Math.floorDiv(hintPageNo.value(), pageSize.pagesPerExtent());
+        Optional<FileAddress> candidate = nearestCandidate(mtr, spaceId, freeBase, direction, hintExtentNo);
+        if (candidate.isPresent()) {
+            return removeFreeExtent(mtr, spaceId, freeBase, candidate.get());
+        }
+        while (direction == ExtentAllocationDirection.UP) {
+            Optional<ExtentId> filled = fillFreeListStep(mtr, spaceId);
+            if (filled.isEmpty()) {
+                break;
+            }
+            candidate = nearestCandidate(mtr, spaceId, freeBase, direction, hintExtentNo);
+            if (candidate.isPresent()) {
+                return removeFreeExtent(mtr, spaceId, freeBase, candidate.get());
+            }
+        }
+        return Optional.empty();
+    }
+
+    private Optional<ExtentId> acquireFreeExtentFromHead(MiniTransaction mtr, SpaceId spaceId, FileAddress freeBase) {
+        FileAddress head = flst.getFirst(mtr, spaceId, freeBase);
+        if (head.isNull()) {
+            Optional<ExtentId> filled = fillFreeListStep(mtr, spaceId);
+            if (filled.isEmpty()) {
+                return Optional.empty();
+            }
+            head = flst.getFirst(mtr, spaceId, freeBase);
+        }
+        return removeFreeExtent(mtr, spaceId, freeBase, head);
+    }
+
+    private Optional<ExtentId> removeFreeExtent(MiniTransaction mtr, SpaceId spaceId, FileAddress freeBase,
+                                                FileAddress node) {
+        if (node.isNull()) {
             return Optional.empty();
         }
-        FileAddress head2 = flst.getFirst(mtr, spaceId, freeBase);
-        flst.remove(mtr, spaceId, freeBase, head2);
-        return filled;
+        ExtentId ext = xdes.extentIdOfNode(spaceId, node);
+        flst.remove(mtr, spaceId, freeBase, node);
+        return Optional.of(ext);
+    }
+
+    private Optional<FileAddress> nearestCandidate(MiniTransaction mtr, SpaceId spaceId, FileAddress freeBase,
+                                                   ExtentAllocationDirection direction, long hintExtentNo) {
+        FileAddress cur = flst.getFirst(mtr, spaceId, freeBase);
+        FileAddress best = FileAddress.NULL;
+        long bestDistance = Long.MAX_VALUE;
+        while (!cur.isNull()) {
+            ExtentId ext = xdes.extentIdOfNode(spaceId, cur);
+            long extentNo = ext.extentNo();
+            boolean matches = switch (direction) {
+                case UP -> extentNo >= hintExtentNo;
+                case DOWN -> extentNo <= hintExtentNo;
+                case NO_DIRECTION -> true;
+            };
+            if (matches) {
+                long distance = Math.abs(extentNo - hintExtentNo);
+                if (distance < bestDistance) {
+                    best = cur;
+                    bestDistance = distance;
+                }
+            }
+            cur = flst.getNext(mtr, spaceId, cur);
+        }
+        return best.isNull() ? Optional.empty() : Optional.of(best);
     }
 
     /** 回收一个 extent 为 FREE（initFree：state FREE/owner 0/bitmap 清/prev-next NULL）并入 FSP_FREE。调用方须先把它移出原链。 */

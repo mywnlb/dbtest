@@ -37,19 +37,29 @@ public final class FileChannelPageStore implements PageStore {
     private final AutoExtendPolicy autoExtendPolicy;
 
     /**
+     * data-file 物理范围初始化网关。默认零填充；测试可注入 recording/failing gateway 验证发布边界。
+     */
+    private final DataFileGateway dataFileGateway;
+
+    /**
      * 已登记物理句柄。key 为表空间编号。
      */
     private final ConcurrentMap<SpaceId, DataFileHandle> handles = new ConcurrentHashMap<>();
 
     public FileChannelPageStore() {
-        this(new DefaultIbdAutoExtendPolicy());
+        this(new DefaultIbdAutoExtendPolicy(), new ZeroFillDataFileGateway());
     }
 
     public FileChannelPageStore(AutoExtendPolicy autoExtendPolicy) {
-        if (autoExtendPolicy == null) {
-            throw new DatabaseValidationException("auto extend policy must not be null");
+        this(autoExtendPolicy, new ZeroFillDataFileGateway());
+    }
+
+    FileChannelPageStore(AutoExtendPolicy autoExtendPolicy, DataFileGateway dataFileGateway) {
+        if (autoExtendPolicy == null || dataFileGateway == null) {
+            throw new DatabaseValidationException("page store dependencies must not be null");
         }
         this.autoExtendPolicy = autoExtendPolicy;
+        this.dataFileGateway = dataFileGateway;
     }
 
     @Override
@@ -59,7 +69,7 @@ public final class FileChannelPageStore implements PageStore {
         if (handles.containsKey(spaceId)) {
             throw new DatabaseValidationException("tablespace already registered: " + spaceId.value());
         }
-        DataFileHandle handle = DataFileHandle.create(spaceId, path, pageSize, initialSizeInPages);
+        DataFileHandle handle = DataFileHandle.create(spaceId, path, pageSize, initialSizeInPages, dataFileGateway);
         if (handles.putIfAbsent(spaceId, handle) != null) {
             // 输给并发 create 的一方：关闭句柄并删除自己刚 CREATE_NEW 出来的孤儿文件，避免磁盘残留无人登记的 .ibd。
             // 删除失败不掩盖“重复登记”根因，仅告警。
@@ -81,7 +91,7 @@ public final class FileChannelPageStore implements PageStore {
         if (handles.containsKey(spaceId)) {
             throw new DatabaseValidationException("tablespace already registered: " + spaceId.value());
         }
-        DataFileHandle handle = DataFileHandle.open(spaceId, path, pageSize);
+        DataFileHandle handle = DataFileHandle.open(spaceId, path, pageSize, dataFileGateway);
         if (handles.putIfAbsent(spaceId, handle) != null) {
             handle.close();
             throw new DatabaseValidationException("tablespace already registered: " + spaceId.value());

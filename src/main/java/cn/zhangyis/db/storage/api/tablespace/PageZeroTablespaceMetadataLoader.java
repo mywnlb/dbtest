@@ -41,6 +41,7 @@ import java.util.Optional;
  * <p>page0 携带统一 FilePageHeader 信封（由 {@code SpaceHeaderRepository.initialize} 盖），本 loader 在按 FSP
  * header 解读前先做信封校验：pageType 必须为 {@link PageType#FSP_HDR}、pageNo 必须为 0，再叠加 page0 自描述
  * spaceId 与请求一致。任一不符表示物理页被覆盖/绑定错误，抛 {@link TablespaceCorruptedException} 阻止注册。
+ * GENERAL 从 lifecycle marker 恢复 NORMAL/CORRUPTED；旧 GENERAL 没有 marker 时仍按 NORMAL 兼容打开。
  * 新建 UNDO 从生命周期头恢复 state；旧 UNDO 没有该头时仍以 NORMAL 打开，但后续截断服务会拒绝它，避免猜测初始尺寸。
  *
  * <p>checksum/trailer 语义：新写盘页必须通过 {@link PageImageChecksum} 校验；为兼容早期切片写出的 page0，
@@ -119,16 +120,40 @@ public final class PageZeroTablespaceMetadataLoader implements TablespaceMetadat
         }
         TablespaceType type = TablespaceTypeFlags.decode(physical.spaceFlags());
         Optional<TablespaceLifecycleHeader> lifecycle = TablespaceLifecycleRawCodec.read(page);
-        if (type != TablespaceType.UNDO && lifecycle.isPresent()) {
-            throw new DatabaseValidationException("non-UNDO tablespace contains UNDO lifecycle header: "
-                    + spaceId.value());
-        }
         TablespaceState state = lifecycle.map(TablespaceLifecycleHeader::state).orElse(TablespaceState.NORMAL);
+        validateLifecycleState(spaceId, type, state, lifecycle.isPresent());
         DataFileDescriptor dataFile = DataFileDescriptor.single(path, PageNo.of(0), physical.currentSizeInPages());
         TablespaceMetadata metadata = new TablespaceMetadata(spaceId, "space-" + spaceId.value(), type,
                 physical.pageSize(), state, List.of(dataFile), new SpaceFlags(physical.spaceFlags()),
                 physical.currentSizeInPages(), physical.freeLimitPageNo(), physical.spaceVersion());
         return Optional.of(metadata);
+    }
+
+    /**
+     * 根据表空间类型校验 page0 lifecycle 状态。GENERAL 只接受稳定 NORMAL/CORRUPTED；UNDO 只接受 ACTIVE/
+     * INACTIVE/TRUNCATING；其它类型首版不支持 lifecycle marker。这样避免把一个模块的生命周期协议误解释成另一个模块的状态。
+     */
+    private void validateLifecycleState(SpaceId spaceId, TablespaceType type,
+                                        TablespaceState state, boolean lifecyclePresent) {
+        if (type == TablespaceType.GENERAL) {
+            if (state != TablespaceState.NORMAL && state != TablespaceState.CORRUPTED) {
+                throw new DatabaseValidationException("invalid GENERAL lifecycle state for space "
+                        + spaceId.value() + ": " + state);
+            }
+            return;
+        }
+        if (type == TablespaceType.UNDO) {
+            if (lifecyclePresent && state != TablespaceState.ACTIVE
+                    && state != TablespaceState.INACTIVE
+                    && state != TablespaceState.TRUNCATING) {
+                throw new DatabaseValidationException("invalid UNDO lifecycle state for space "
+                        + spaceId.value() + ": " + state);
+            }
+            return;
+        }
+        if (lifecyclePresent) {
+            throw new DatabaseValidationException("unsupported lifecycle marker for tablespace type: " + type);
+        }
     }
 
     /**

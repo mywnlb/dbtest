@@ -53,4 +53,20 @@ class RecoveryProgressJournalTest {
         assertTrue(line.contains("\"kind\":\"FAILED\""));
         assertTrue(line.contains("bad \\\"redo\\\"\\nline"));
     }
+
+    @Test
+    void persistentJournalWritesCompletedDetail() throws Exception {
+        Path path = dir.resolve("force-skip-progress.jsonl");
+        RecoveryProgressJournal journal = RecoveryProgressJournal.persistent(path);
+
+        journal.stageCompleted(RecoveryMode.FORCE_SKIP_CORRUPT_TABLESPACE,
+                RecoveryStageName.OPEN_TRAFFIC, RecoveryState.OPEN, Lsn.of(77),
+                "skippedSpaces=[7], skippedRedoRecords=3");
+
+        String line = Files.readString(path);
+        assertTrue(line.contains("\"kind\":\"COMPLETED\""));
+        assertTrue(line.contains("\"mode\":\"FORCE_SKIP_CORRUPT_TABLESPACE\""));
+        assertTrue(line.contains("skippedSpaces=[7]"));
+        assertTrue(line.contains("skippedRedoRecords=3"));
+    }
 }

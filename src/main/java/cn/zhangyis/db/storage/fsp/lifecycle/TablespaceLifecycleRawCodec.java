@@ -12,7 +12,7 @@ import java.nio.ByteBuffer;
 import java.util.Optional;
 
 /**
- * 从 raw page-0 读取 undo 生命周期头。启动期 loader 不经 Buffer Pool/MTR，故与仓储共享同一布局协议，
+ * 从 raw page-0 读取表空间 lifecycle marker。启动期 loader 不经 Buffer Pool/MTR，故与仓储共享同一布局协议，
  * 但只做无副作用解码；magic 为零代表旧格式，其它未知值一律按元数据损坏处理。
  */
 public final class TablespaceLifecycleRawCodec {

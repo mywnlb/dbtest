@@ -38,6 +38,7 @@ import java.util.Set;
  * @param recoveryMode             existing-open 使用的 crash recovery 模式；默认 NORMAL。READ_ONLY_VALIDATE 只做扫描诊断，
  *                                 不发布普通 OPEN，也不启动会写文件的后台路径。recovery progress 文件路径由
  *                                 {@link #recoveryProgressFile()} 从 {@code baseDir} 派生。
+ * @param forceSkippedSpaces       FORCE_SKIP_CORRUPT_TABLESPACE 模式下管理员显式隔离的表空间集合；普通模式必须为空。
  */
 public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapacityFrames,
                            SpaceId undoSpaceId, PageNo undoSpaceInitialPages, int slotCapacity,
@@ -46,7 +47,8 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                            boolean backgroundFlushEnabled, int pageCleanerQueueCapacity,
                            Duration backgroundFlushInterval, int backgroundFlushMaxPages,
                            Duration backgroundFlushStopTimeout, RedoRotationConfig redoRotation,
-                           int bufferPoolInstanceCount, RecoveryMode recoveryMode) {
+                           int bufferPoolInstanceCount, RecoveryMode recoveryMode,
+                           Set<SpaceId> forceSkippedSpaces) {
 
     /** 默认启动后台 page cleaner，使 engine open 后具备持续 checkpoint tick 能力。 */
     private static final boolean DEFAULT_BACKGROUND_FLUSH_ENABLED = true;
@@ -89,14 +91,32 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 slotCapacity, maxVersionHops, flushTimeout, redoCapacityBytes, recoveryTablespaces,
                 backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, RedoRotationConfig.defaults(),
-                DEFAULT_BUFFER_POOL_INSTANCE_COUNT, RecoveryMode.NORMAL);
+                DEFAULT_BUFFER_POOL_INSTANCE_COUNT, RecoveryMode.NORMAL, Set.of());
+    }
+
+    /**
+     * 兼容 0.18 之前的全量构造器签名；force-skip 配置默认空，避免既有调用点被迫关心灾难恢复模式。
+     */
+    public EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapacityFrames,
+                        SpaceId undoSpaceId, PageNo undoSpaceInitialPages, int slotCapacity,
+                        int maxVersionHops, Duration flushTimeout, long redoCapacityBytes,
+                        List<EngineTablespaceConfig> recoveryTablespaces,
+                        boolean backgroundFlushEnabled, int pageCleanerQueueCapacity,
+                        Duration backgroundFlushInterval, int backgroundFlushMaxPages,
+                        Duration backgroundFlushStopTimeout, RedoRotationConfig redoRotation,
+                        int bufferPoolInstanceCount, RecoveryMode recoveryMode) {
+        this(baseDir, pageSize, bufferPoolCapacityFrames, undoSpaceId, undoSpaceInitialPages,
+                slotCapacity, maxVersionHops, flushTimeout, redoCapacityBytes, recoveryTablespaces,
+                backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
+                backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation,
+                bufferPoolInstanceCount, recoveryMode, Set.of());
     }
 
     public EngineConfig {
         if (baseDir == null || pageSize == null || undoSpaceId == null
                 || undoSpaceInitialPages == null || flushTimeout == null || recoveryTablespaces == null
                 || backgroundFlushInterval == null || backgroundFlushStopTimeout == null
-                || recoveryMode == null) {
+                || recoveryMode == null || forceSkippedSpaces == null) {
             throw new DatabaseValidationException("engine config object fields must not be null");
         }
         if (bufferPoolCapacityFrames <= 0) {
@@ -143,6 +163,8 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
         }
         validateRecoveryTablespaces(undoSpaceId, recoveryTablespaces);
         recoveryTablespaces = List.copyOf(recoveryTablespaces);
+        validateForceSkippedSpaces(forceSkippedSpaces);
+        forceSkippedSpaces = Set.copyOf(forceSkippedSpaces);
     }
 
     /** redo 日志文件路径（单文件模式）。 */
@@ -185,7 +207,8 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
         return new EngineConfig(baseDir, pageSize, bufferPoolCapacityFrames, undoSpaceId, undoSpaceInitialPages,
                 slotCapacity, maxVersionHops, flushTimeout, redoCapacityBytes, recoveryTablespaces,
                 backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
-                backgroundFlushMaxPages, backgroundFlushStopTimeout, rotation, bufferPoolInstanceCount, recoveryMode);
+                backgroundFlushMaxPages, backgroundFlushStopTimeout, rotation, bufferPoolInstanceCount, recoveryMode,
+                forceSkippedSpaces);
     }
 
     /**
@@ -199,7 +222,8 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
         return new EngineConfig(baseDir, pageSize, bufferPoolCapacityFrames, undoSpaceId, undoSpaceInitialPages,
                 slotCapacity, maxVersionHops, flushTimeout, redoCapacityBytes, recoveryTablespaces,
                 backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
-                backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, instanceCount, recoveryMode);
+                backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, instanceCount, recoveryMode,
+                forceSkippedSpaces);
     }
 
     /**
@@ -213,7 +237,43 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
         return new EngineConfig(baseDir, pageSize, bufferPoolCapacityFrames, undoSpaceId, undoSpaceInitialPages,
                 slotCapacity, maxVersionHops, flushTimeout, redoCapacityBytes, recoveryTablespaces,
                 backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
-                backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, bufferPoolInstanceCount, mode);
+                backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, bufferPoolInstanceCount, mode,
+                forceSkippedSpaces);
+    }
+
+    /**
+     * 派生一个携带 force-skip 表空间集合的配置副本。该方法只保存管理员显式诊断输入，不改变 recovery mode；
+     * {@link StorageEngine#open()} 会拒绝 NORMAL/READ_ONLY_VALIDATE 携带非空集合，避免普通启动隐式跳过数据。
+     *
+     * @param skippedSpaces 管理员明确要隔离的表空间集合。
+     * @return 携带跳过集合的新配置。
+     */
+    public EngineConfig withForceSkippedSpaces(Set<SpaceId> skippedSpaces) {
+        validateForceSkippedSpaces(skippedSpaces);
+        return new EngineConfig(baseDir, pageSize, bufferPoolCapacityFrames, undoSpaceId, undoSpaceInitialPages,
+                slotCapacity, maxVersionHops, flushTimeout, redoCapacityBytes, recoveryTablespaces,
+                backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
+                backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, bufferPoolInstanceCount,
+                recoveryMode, skippedSpaces);
+    }
+
+    /**
+     * 便利地同时启用 FORCE_SKIP_CORRUPT_TABLESPACE 与非空 skipped space 集合，避免调用方先设置 mode 后因空集合
+     * 进入不可执行配置。系统 undo 和单聚簇索引保护校验仍在 {@link StorageEngine#open()} 结合运行时配置执行。
+     *
+     * @param skippedSpaces 管理员明确要隔离的表空间集合，必须非空。
+     * @return FORCE_SKIP_CORRUPT_TABLESPACE 模式的新配置。
+     */
+    public EngineConfig withForceSkipRecovery(Set<SpaceId> skippedSpaces) {
+        validateForceSkippedSpaces(skippedSpaces);
+        if (skippedSpaces.isEmpty()) {
+            throw new DatabaseValidationException("force-skip recovery requires skipped spaces");
+        }
+        return new EngineConfig(baseDir, pageSize, bufferPoolCapacityFrames, undoSpaceId, undoSpaceInitialPages,
+                slotCapacity, maxVersionHops, flushTimeout, redoCapacityBytes, recoveryTablespaces,
+                backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
+                backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, bufferPoolInstanceCount,
+                RecoveryMode.FORCE_SKIP_CORRUPT_TABLESPACE, skippedSpaces);
     }
 
     /** redo control（checkpoint label）文件路径。 */
@@ -270,6 +330,21 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
             if (!seen.add(tablespace.spaceId())) {
                 throw new DatabaseValidationException("duplicate engine recovery tablespace space id: "
                         + tablespace.spaceId().value());
+            }
+        }
+    }
+
+    /**
+     * 校验 force-skip 表空间集合本身的结构完整性；模式与系统空间保护由 {@link StorageEngine} 在恢复前结合
+     * existing/fresh、系统 undo 和单聚簇索引配置统一判断。
+     */
+    private static void validateForceSkippedSpaces(Set<SpaceId> forceSkippedSpaces) {
+        if (forceSkippedSpaces == null) {
+            throw new DatabaseValidationException("force skipped spaces must not be null");
+        }
+        for (SpaceId spaceId : forceSkippedSpaces) {
+            if (spaceId == null) {
+                throw new DatabaseValidationException("force skipped space must not be null");
             }
         }
     }

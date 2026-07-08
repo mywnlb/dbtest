@@ -21,8 +21,24 @@ import java.util.Set;
  */
 public final class PageRedoApplyHandler {
 
-    /** 应用一个批次；每个页只在批次末尾写回一次。 */
+    /** 应用一个完整 redo 批次；每个页只在批次末尾写回一次。 */
     public void apply(RedoLogBatch batch, RedoApplyContext context) {
+        if (batch == null || context == null) {
+            throw new DatabaseValidationException("page redo apply batch/context must not be null");
+        }
+        apply(new RedoApplyBatchView(batch.range(), batch.records()), context);
+    }
+
+    /**
+     * 应用一个 redo apply view；每个页只在批次末尾写回一次。
+     *
+     * <p>view 可能只包含原 batch 的部分记录（例如 recovery force-skip 坏表空间），但 {@code range.end()}
+     * 必须保持原始 batch end LSN。该 LSN 是 MTR 的幂等边界，写低会导致下一次 recovery 重放已处理记录。
+     *
+     * @param batch 原始 range 加过滤后记录的内部视图。
+     * @param context 页重放上下文。
+     */
+    void apply(RedoApplyBatchView batch, RedoApplyContext context) {
         if (batch == null || context == null) {
             throw new DatabaseValidationException("page redo apply batch/context must not be null");
         }
@@ -121,7 +137,7 @@ public final class PageRedoApplyHandler {
         ByteBuffer.wrap(page).putLong(PageEnvelopeLayout.PAGE_LSN, lsn.value());
     }
 
-    private static PageId pageIdOf(RedoRecord record) {
+    static PageId pageIdOf(RedoRecord record) {
         if (record instanceof PageInitRecord pir) {
             return pir.pageId();
         }

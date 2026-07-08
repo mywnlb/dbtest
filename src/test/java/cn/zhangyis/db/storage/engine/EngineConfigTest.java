@@ -11,6 +11,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -85,6 +86,23 @@ class EngineConfigTest {
 
         assertThrows(DatabaseValidationException.class, () -> c.withRecoveryMode(null),
                 "recovery mode 必须显式非空，避免启动时落入未定义恢复语义");
+    }
+
+    @Test
+    void forceSkippedSpacesAreSnapshottedAndCanEnableForceSkipMode() {
+        EngineConfig c = valid();
+        EngineConfig withSkipped = c.withForceSkippedSpaces(Set.of(SpaceId.of(10)));
+        assertEquals(Set.of(SpaceId.of(10)), withSkipped.forceSkippedSpaces());
+        assertEquals(Set.of(), c.forceSkippedSpaces(), "wither 保持 EngineConfig 不可变");
+        assertThrows(UnsupportedOperationException.class,
+                () -> withSkipped.forceSkippedSpaces().add(SpaceId.of(11)));
+
+        EngineConfig force = c.withForceSkipRecovery(Set.of(SpaceId.of(10)));
+        assertEquals(RecoveryMode.FORCE_SKIP_CORRUPT_TABLESPACE, force.recoveryMode());
+        assertEquals(Set.of(SpaceId.of(10)), force.forceSkippedSpaces());
+        assertThrows(DatabaseValidationException.class, () -> c.withForceSkippedSpaces(null));
+        assertThrows(DatabaseValidationException.class, () -> c.withForceSkippedSpaces(
+                new java.util.HashSet<>(java.util.Arrays.asList(SpaceId.of(10), null))));
     }
 
     @Test

@@ -56,6 +56,11 @@ final class DataFileHandle implements AutoCloseable {
     private final FileChannel channel;
 
     /**
+     * 物理页范围初始化/分配网关。DataFileHandle 仍负责锁顺序和 size 发布，gateway 只负责 FileChannel 范围写入。
+     */
+    private final DataFileGateway gateway;
+
+    /**
      * #1 生命周期闩。
      */
     private final TablespaceLifecycleLatch lifecycleLatch = new TablespaceLifecycleLatch();
@@ -81,12 +86,14 @@ final class DataFileHandle implements AutoCloseable {
      */
     private volatile boolean closed;
 
-    private DataFileHandle(SpaceId spaceId, Path path, PageSize pageSize, FileChannel channel, long currentSizeInPages) {
+    private DataFileHandle(SpaceId spaceId, Path path, PageSize pageSize, FileChannel channel,
+                           long currentSizeInPages, DataFileGateway gateway) {
         this.spaceId = spaceId;
         this.path = path;
         this.pageSize = pageSize;
         this.channel = channel;
         this.currentSizeInPages = currentSizeInPages;
+        this.gateway = gateway;
     }
 
     /**
@@ -99,9 +106,20 @@ final class DataFileHandle implements AutoCloseable {
      * @return 已登记物理大小的句柄。
      */
     static DataFileHandle create(SpaceId spaceId, Path path, PageSize pageSize, PageNo initialSizeInPages) {
+        return create(spaceId, path, pageSize, initialSizeInPages, new ZeroFillDataFileGateway());
+    }
+
+    /**
+     * 创建新数据文件并通过指定 gateway 初始化 initialSizeInPages 页。测试可注入 gateway 验证锁内委托与失败发布边界。
+     */
+    static DataFileHandle create(SpaceId spaceId, Path path, PageSize pageSize, PageNo initialSizeInPages,
+                                 DataFileGateway gateway) {
         validate(spaceId, path, pageSize);
         if (initialSizeInPages == null) {
             throw new DatabaseValidationException("initial size must not be null");
+        }
+        if (gateway == null) {
+            throw new DatabaseValidationException("data file gateway must not be null");
         }
         if (Files.exists(path)) {
             throw new DataFilePhysicalException("data file already exists: " + path);
@@ -110,11 +128,14 @@ final class DataFileHandle implements AutoCloseable {
         try {
             channel = FileChannel.open(path, StandardOpenOption.CREATE_NEW, StandardOpenOption.READ, StandardOpenOption.WRITE);
             long pages = initialSizeInPages.value();
-            zeroFill(channel, 0, pages, pageSize.bytes());
-            return new DataFileHandle(spaceId, path, pageSize, channel, pages);
+            gateway.initialize(channel, 0, pages, pageSize, path);
+            return new DataFileHandle(spaceId, path, pageSize, channel, pages, gateway);
         } catch (IOException e) {
             closeQuietly(channel);
             throw new DataFilePhysicalException("create data file failed: " + path, e);
+        } catch (RuntimeException e) {
+            closeQuietly(channel);
+            throw e;
         }
     }
 
@@ -127,7 +148,17 @@ final class DataFileHandle implements AutoCloseable {
      * @return 已登记物理大小的句柄。
      */
     static DataFileHandle open(SpaceId spaceId, Path path, PageSize pageSize) {
+        return open(spaceId, path, pageSize, new ZeroFillDataFileGateway());
+    }
+
+    /**
+     * 打开已存在数据文件并绑定指定 gateway。gateway 不参与已有字节读取，只服务后续 extend/ensureCapacity。
+     */
+    static DataFileHandle open(SpaceId spaceId, Path path, PageSize pageSize, DataFileGateway gateway) {
         validate(spaceId, path, pageSize);
+        if (gateway == null) {
+            throw new DatabaseValidationException("data file gateway must not be null");
+        }
         if (!Files.exists(path)) {
             throw new DataFilePhysicalException("data file not found: " + path);
         }
@@ -140,10 +171,13 @@ final class DataFileHandle implements AutoCloseable {
                 closeQuietly(channel);
                 throw new DataFileCorruptedException("data file not page-aligned: " + path + " length=" + length);
             }
-            return new DataFileHandle(spaceId, path, pageSize, channel, length / pageBytes);
+            return new DataFileHandle(spaceId, path, pageSize, channel, length / pageBytes, gateway);
         } catch (IOException e) {
             closeQuietly(channel);
             throw new DataFilePhysicalException("open data file failed: " + path, e);
+        } catch (RuntimeException e) {
+            closeQuietly(channel);
+            throw e;
         }
     }
 
@@ -208,7 +242,7 @@ final class DataFileHandle implements AutoCloseable {
             if (inc < 1) {
                 throw new DatabaseValidationException("auto extend increment must be >= 1: " + inc);
             }
-            zeroFill(channel, oldSize, oldSize + inc, pageSize.bytes());
+            gateway.ensureAllocated(channel, oldSize, oldSize + inc, pageSize, path);
             currentSizeInPages = oldSize + inc;
             return currentSizeInPages;
         }
@@ -314,7 +348,7 @@ final class DataFileHandle implements AutoCloseable {
             if (target <= current) {
                 return;
             }
-            zeroFill(channel, current, target, pageSize.bytes());
+            gateway.ensureAllocated(channel, current, target, pageSize, path);
             currentSizeInPages = target;
         }
     }
@@ -390,21 +424,6 @@ final class DataFileHandle implements AutoCloseable {
             }
         } catch (IOException e) {
             throw new DataFilePhysicalException("write page failed at offset " + offset + " of " + path, e);
-        }
-    }
-
-    private static void zeroFill(FileChannel channel, long fromPage, long toPage, int pageBytes) {
-        ByteBuffer zero = ByteBuffer.allocate(pageBytes);
-        try {
-            for (long page = fromPage; page < toPage; page++) {
-                zero.clear();
-                long pos = Math.multiplyExact(page, (long) pageBytes);
-                while (zero.hasRemaining()) {
-                    pos += channel.write(zero, pos);
-                }
-            }
-        } catch (IOException e) {
-            throw new DataFilePhysicalException("zero-fill failed [" + fromPage + "," + toPage + ")", e);
         }
     }
 

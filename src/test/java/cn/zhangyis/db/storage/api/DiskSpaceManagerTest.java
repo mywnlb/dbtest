@@ -101,6 +101,18 @@ class DiskSpaceManagerTest {
     }
 
     @Test
+    void allocatePageAcceptsDirectionalHintWithoutChangingLegacyPageInitialization() {
+        withDsm((dsm, mgr) -> {
+            MiniTransaction m = mgr.begin();
+            dsm.createTablespace(m, SPACE, dir.resolve("s.ibd"), PageNo.of(128));
+            SegmentRef ref = dsm.createSegment(m, SPACE, SegmentPurpose.INDEX_LEAF);
+            PageId p = dsm.allocatePage(m, ref, PageAllocationHint.up(PageNo.of(64), 1L));
+            assertEquals(PageId.of(SPACE, PageNo.of(64)), p);
+            mgr.commit(m);
+        });
+    }
+
+    @Test
     void allocateThrowsNoFreeSpaceOnTinyTablespace() {
         withDsm((dsm, mgr) -> {
             MiniTransaction m = mgr.begin();
@@ -176,4 +188,5 @@ class DiskSpaceManagerTest {
             }
         }
     }
+
 }

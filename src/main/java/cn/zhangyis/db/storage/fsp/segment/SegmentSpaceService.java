@@ -1,5 +1,6 @@
 package cn.zhangyis.db.storage.fsp.segment;
 import cn.zhangyis.db.storage.fsp.exception.FspMetadataException;
+import cn.zhangyis.db.storage.fsp.extent.ExtentAllocationDirection;
 import cn.zhangyis.db.storage.fsp.extent.ExtentDescriptor;
 import cn.zhangyis.db.storage.fsp.extent.ExtentDescriptorRepository;
 import cn.zhangyis.db.storage.fsp.extent.ExtentState;
@@ -95,10 +96,31 @@ public final class SegmentSpaceService {
 
     /** 给 segment 分配一个完整 extent：acquire FREE extent → 置 FSEG/owner=segId → 入该段 SEG_FREE 链。无空间 → empty。 */
     public Optional<ExtentId> assignExtentToSegment(MiniTransaction mtr, SpaceId spaceId, int inodeSlot) {
+        return assignExtentToSegment(mtr, spaceId, inodeSlot,
+                ExtentAllocationDirection.NO_DIRECTION, Optional.empty());
+    }
+
+    /**
+     * 给 segment 分配一个完整 extent，并把方向 hint 透传到全局 FREE extent 选择。该方法只决定 extent 归属，
+     * 不分配具体数据页；新 extent 入 SEG_FREE 链后由 {@link #allocatePageFromSegmentExtents} 消费。
+     *
+     * @param mtr 当前 MTR。
+     * @param spaceId 目标表空间。
+     * @param inodeSlot segment inode 槽。
+     * @param direction 选择 FREE extent 的方向偏好。
+     * @param hintPageNo 邻近页号。
+     * @return 新归属该 segment 的 extent，或空间耗尽。
+     */
+    public Optional<ExtentId> assignExtentToSegment(MiniTransaction mtr, SpaceId spaceId, int inodeSlot,
+                                                    ExtentAllocationDirection direction,
+                                                    Optional<PageNo> hintPageNo) {
         requireArgs(mtr, spaceId);
+        if (direction == null || hintPageNo == null) {
+            throw new DatabaseValidationException("extent allocation direction/hint must not be null");
+        }
         latchSpaceThenInode(mtr, spaceId);
         SegmentId segId = inodeRepo.read(mtr, spaceId, inodeSlot).segmentId();
-        Optional<ExtentId> acq = freeExtents.acquireFreeExtent(mtr, spaceId);
+        Optional<ExtentId> acq = freeExtents.acquireFreeExtent(mtr, spaceId, direction, hintPageNo);
         if (acq.isEmpty()) {
             return Optional.empty();
         }

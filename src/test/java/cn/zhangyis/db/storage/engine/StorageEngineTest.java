@@ -64,6 +64,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
+import java.util.Set;
 import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -512,6 +513,72 @@ class StorageEngineTest {
         assertFalse(Files.exists(cfg.redoDir()));
         assertFalse(Files.exists(cfg.undoFile()));
         assertFalse(Files.exists(cfg.doublewriteFile()));
+    }
+
+    @Test
+    void existingOpenForceSkipDoesNotOpenSkippedRecoveryTablespace() {
+        EngineConfig cleanCfg = config();
+        StorageEngine clean = new StorageEngine(cleanCfg);
+        clean.open();
+        clean.close();
+
+        Path missingSkippedFile = dir.resolve("missing-skipped.ibd");
+        EngineConfig forceCfg = new EngineConfig(dir, PS, 256, SpaceId.of(5), PageNo.of(64), 64, 100,
+                Duration.ofSeconds(10), 64L * 1024 * 1024,
+                List.of(new EngineTablespaceConfig(DATA_SPACE, missingSkippedFile)))
+                .withForceSkipRecovery(Set.of(DATA_SPACE));
+
+        StorageEngine recovered = new StorageEngine(forceCfg);
+        recovered.open();
+        RecoveryReport report = recovered.lastRecoveryReport().orElseThrow();
+        assertEquals(EngineState.OPEN, recovered.state());
+        assertEquals(RecoveryMode.FORCE_SKIP_CORRUPT_TABLESPACE, report.mode());
+        assertEquals(Set.of(DATA_SPACE), report.skippedSpaces());
+        assertEquals(1, report.skippedReconcileSpaceCount(),
+                "configured but skipped recovery tablespace still appears in reconcile diagnostics");
+        assertFalse(Files.exists(missingSkippedFile),
+                "skipped recovery tablespace must not be opened or created during recovery");
+        recovered.close();
+    }
+
+    @Test
+    void existingOpenForceSkipRequiresExplicitNonEmptySkipSet() {
+        EngineConfig cleanCfg = config();
+        StorageEngine clean = new StorageEngine(cleanCfg);
+        clean.open();
+        clean.close();
+
+        StorageEngine recovered = new StorageEngine(cleanCfg.withRecoveryMode(
+                RecoveryMode.FORCE_SKIP_CORRUPT_TABLESPACE));
+        assertThrows(DatabaseValidationException.class, recovered::open,
+                "force-skip mode must not start without an explicit skipped space set");
+    }
+
+    @Test
+    void existingOpenForceSkipRejectsSystemUndoSpace() {
+        EngineConfig cleanCfg = config();
+        StorageEngine clean = new StorageEngine(cleanCfg);
+        clean.open();
+        clean.close();
+
+        StorageEngine recovered = new StorageEngine(cleanCfg.withForceSkipRecovery(Set.of(SpaceId.of(5))));
+        assertThrows(DatabaseValidationException.class, recovered::open,
+                "system undo space cannot be skipped because undo rollback/purge recovery depends on it");
+    }
+
+    @Test
+    void existingOpenForceSkipRejectsConfiguredClusteredIndexSpace() {
+        Path dataPath = dir.resolve("clustered-skip.ibd");
+        EngineConfig cfg = configWithRecoveryTablespace(dataPath);
+        StorageEngine clean = new StorageEngine(cfg);
+        clean.open();
+        BTreeIndex index = createClusteredIndex(clean, dataPath);
+        clean.close();
+
+        StorageEngine recovered = new StorageEngine(cfg.withForceSkipRecovery(Set.of(DATA_SPACE)));
+        recovered.configureClusteredIndex(index);
+        assertThrows(DatabaseValidationException.class, recovered::open,
+                "当前单聚簇 undo rollback 没有对象级 skip 语义，不能跳过该 index 所在 space");
     }
 
     /**

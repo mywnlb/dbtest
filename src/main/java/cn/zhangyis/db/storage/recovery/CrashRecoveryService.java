@@ -13,6 +13,7 @@ import cn.zhangyis.db.storage.fil.io.PageStore;
 import cn.zhangyis.db.storage.flush.doublewrite.DoublewriteRecoveryResult;
 import cn.zhangyis.db.storage.fsp.header.SpaceHeaderPhysical;
 import cn.zhangyis.db.storage.fsp.header.SpaceHeaderRawCodec;
+import cn.zhangyis.db.storage.redo.RedoApplySummary;
 import cn.zhangyis.db.storage.redo.RedoCheckpointLabel;
 import cn.zhangyis.db.storage.redo.RedoLogBatch;
 import cn.zhangyis.db.storage.redo.RedoRecoveryReader;
@@ -77,24 +78,23 @@ public final class CrashRecoveryService {
                 gate.closeForRecovery();
                 tracker.complete(state, Lsn.of(0));
 
-                if (request.mode() == RecoveryMode.FORCE_SKIP_CORRUPT_TABLESPACE) {
-                    throw new DatabaseValidationException(
-                            "FORCE_SKIP_CORRUPT_TABLESPACE is reserved and not implemented");
-                }
                 if (request.mode() == RecoveryMode.READ_ONLY_VALIDATE) {
                     return recoverReadOnlyValidate(request, tracker);
                 }
 
                 tracker.begin(RecoveryStageName.DOUBLEWRITE_REPAIR);
                 DoublewriteRepairSummary doublewriteSummary = repairDoublewritePages(request);
-                tracker.complete(state, Lsn.of(0));
+                tracker.complete(state, Lsn.of(0), skipDetail("skippedDoublewritePages",
+                        doublewriteSummary.skippedPageCount(), request.skipPolicy()));
 
                 RedoCheckpointLabel checkpoint = request.checkpointStore().readLatest();
                 RedoRecoveryReader reader = new RedoRecoveryReader(request.redoRepository(), checkpoint.checkpointLsn());
                 tracker.begin(RecoveryStageName.REDO_REPLAY);
                 List<RedoLogBatch> batches = reader.readBatches();
-                request.dispatcher().applyAll(batches, request.applyContext());
-                tracker.complete(state, reader.recoveredToLsn());
+                RedoApplySummary redoSummary = request.dispatcher().applyAll(batches, request.applyContext(),
+                        request.skipPolicy()::shouldSkip);
+                tracker.complete(state, reader.recoveredToLsn(), skipDetail("skippedRedoRecords",
+                        redoSummary.skippedRecordCount(), request.skipPolicy()));
 
                 // 先安装恢复边界，使后续 undo 续作（会 append marker/rebuild redo）从 recoveredToLsn 连续追加。
                 // 与 undo 参与者内部对同一 recoveredToLsn 的安装幂等共存（RedoLogManager 同值再装为 no-op）。
@@ -111,10 +111,12 @@ public final class CrashRecoveryService {
                 }
 
                 // reconcile 必须晚于 undo 续作：续作把被截断 undo 表空间的 page0 重建为新小尺寸后，reconcile 才读到正确大小。
+                int skippedReconcileSpaceCount = 0;
                 if (!request.spacesToReconcile().isEmpty()) {
                     tracker.begin(RecoveryStageName.SPACE_FILE_RECONCILE);
-                    reconcileSpaceFiles(request);
-                    tracker.complete(state, reader.recoveredToLsn());
+                    skippedReconcileSpaceCount = reconcileSpaceFiles(request);
+                    tracker.complete(state, reader.recoveredToLsn(), skipDetail("skippedReconcileSpaces",
+                            skippedReconcileSpaceCount, request.skipPolicy()));
                 }
 
                 if (request.transactionUndoRecovery() != null) {
@@ -143,17 +145,19 @@ public final class CrashRecoveryService {
                 tracker.complete(state, reader.recoveredToLsn());
                 RecoveryReport report = new RecoveryReport(request.mode(), state, checkpoint.checkpointLsn(),
                         reader.recoveredToLsn(), doublewriteSummary.repairedPageCount(),
-                        doublewriteSummary.detectedOnlyPageCount(), batches.size(), stages);
+                        doublewriteSummary.detectedOnlyPageCount(), redoSummary.appliedBatchCount(), stages,
+                        request.skipPolicy().skippedSpaces(), doublewriteSummary.skippedPageCount(),
+                        redoSummary.skippedRecordCount(), skippedReconcileSpaceCount);
                 lastReport = report;
                 lastError = null;
                 return report;
             } catch (DatabaseRuntimeException e) {
                 recordFailureProgress(tracker, e);
-                failClosed(request.mode(), e);
+                failClosed(request, e);
                 throw new RecoveryStartupException("crash recovery failed before user traffic opened", e);
             } catch (RuntimeException e) {
                 recordFailureProgress(tracker, e);
-                failClosed(request.mode(), e);
+                failClosed(request, e);
                 throw new RecoveryStartupException("crash recovery failed with unexpected runtime error", e);
             }
         } finally {
@@ -225,16 +229,22 @@ public final class CrashRecoveryService {
      * 尾部零页——这些页无 redo 描述，只能据 page0 权威逻辑大小补齐。page0（pageNo 0）恒在界内，读出后用
      * {@link SpaceHeaderRawCodec} 解出 currentSize，再调用幂等的 {@link PageStore#ensureCapacity}。
      */
-    private void reconcileSpaceFiles(RecoveryRequest request) {
+    private int reconcileSpaceFiles(RecoveryRequest request) {
         PageStore pageStore = request.applyContext().pageStore();
         PageSize pageSize = request.applyContext().pageSize();
+        int skipped = 0;
         for (SpaceId spaceId : request.spacesToReconcile()) {
+            if (request.skipPolicy().shouldSkip(spaceId)) {
+                skipped++;
+                continue;
+            }
             byte[] page0 = new byte[pageSize.bytes()];
             pageStore.readPage(PageId.of(spaceId, PageNo.of(0)), ByteBuffer.wrap(page0));
             SpaceHeaderPhysical header = SpaceHeaderRawCodec.readPhysical(ByteBuffer.wrap(page0));
             validateReconcileHeader(spaceId, pageSize, header);
             pageStore.ensureCapacity(spaceId, header.currentSizeInPages());
         }
+        return skipped;
     }
 
     /**
@@ -270,13 +280,18 @@ public final class CrashRecoveryService {
     private DoublewriteRepairSummary repairDoublewritePages(RecoveryRequest request) {
         int repaired = 0;
         int detectedOnly = 0;
+        int skipped = 0;
         if (request.undoTablespaceRecovery() != null) {
             repaired += request.undoTablespaceRecovery().prepareDoublewrite(request.doublewriteScanner());
         }
         if (request.doublewriteScanner() == null) {
-            return new DoublewriteRepairSummary(repaired, detectedOnly);
+            return new DoublewriteRepairSummary(repaired, detectedOnly, skipped);
         }
         for (PageId pageId : request.pagesToRepair()) {
+            if (request.skipPolicy().shouldSkip(pageId)) {
+                skipped++;
+                continue;
+            }
             if (request.undoTablespaceRecovery() != null
                     && !request.undoTablespaceRecovery().shouldRepairDoublewritePage(pageId)) {
                 continue;
@@ -288,7 +303,7 @@ public final class CrashRecoveryService {
                 detectedOnly++;
             }
         }
-        return new DoublewriteRepairSummary(repaired, detectedOnly);
+        return new DoublewriteRepairSummary(repaired, detectedOnly, skipped);
     }
 
     /**
@@ -299,7 +314,7 @@ public final class CrashRecoveryService {
     private DoublewriteRepairSummary validateDoublewritePages(RecoveryRequest request) {
         int detectedOnly = 0;
         if (request.doublewriteScanner() == null) {
-            return new DoublewriteRepairSummary(0, detectedOnly);
+            return new DoublewriteRepairSummary(0, detectedOnly, 0);
         }
         for (PageId pageId : request.pagesToRepair()) {
             DoublewriteRecoveryResult result = request.doublewriteScanner().scanPageForValidation(pageId);
@@ -307,19 +322,18 @@ public final class CrashRecoveryService {
                 detectedOnly++;
             }
         }
-        return new DoublewriteRepairSummary(0, detectedOnly);
+        return new DoublewriteRepairSummary(0, detectedOnly, 0);
     }
 
     /**
      * 任意阶段失败时保持 gate 关闭并记录失败快照。透传发起恢复时的 {@code mode}，避免失败诊断报告把非 NORMAL 模式
      * 误记为 NORMAL。报告里的 LSN/计数填 0：失败可能发生在尚未读出 checkpoint 或扫描 redo 之前，无可信进度可报。
      */
-    private void failClosed(RecoveryMode mode, Throwable error) {
+    private void failClosed(RecoveryRequest request, Throwable error) {
         gate.failClosed(error);
         state = RecoveryState.FAILED;
         lastError = error;
-        lastReport = new RecoveryReport(mode, RecoveryState.FAILED,
-                Lsn.of(0), Lsn.of(0), 0, 0, 0, List.of());
+        lastReport = RecoveryReport.failed(request.mode(), request.skipPolicy().skippedSpaces());
     }
 
     /**
@@ -335,7 +349,14 @@ public final class CrashRecoveryService {
         }
     }
 
-    private record DoublewriteRepairSummary(int repairedPageCount, int detectedOnlyPageCount) {
+    private static String skipDetail(String label, int count, RecoverySkipPolicy skipPolicy) {
+        if (count == 0) {
+            return "";
+        }
+        return label + "=" + count + " skippedSpaces=" + skipPolicy.describeSkippedSpaces();
+    }
+
+    private record DoublewriteRepairSummary(int repairedPageCount, int detectedOnlyPageCount, int skippedPageCount) {
     }
 
     /**
@@ -361,11 +382,15 @@ public final class CrashRecoveryService {
         }
 
         private void complete(RecoveryState state, Lsn recoveredToLsn) {
+            complete(state, recoveredToLsn, "");
+        }
+
+        private void complete(RecoveryState state, Lsn recoveredToLsn, String detail) {
             if (currentStage == null) {
                 throw new DatabaseValidationException("recovery stage completion without active stage");
             }
             completedStages.add(currentStage);
-            journal.stageCompleted(mode, currentStage, state, recoveredToLsn);
+            journal.stageCompleted(mode, currentStage, state, recoveredToLsn, detail);
             currentStage = null;
         }
 

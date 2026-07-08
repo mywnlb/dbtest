@@ -241,6 +241,7 @@ public final class StorageEngine {
         if (config.redoRotationEnabled()) {
             fresh = !Files.exists(config.redoDir());
             rejectFreshRecoveryMode(fresh);
+            validateRecoverySkipConfiguration();
             RotatingRedoLogRepository ring = RedoLogFileRepository.openRing(
                     config.redoDir(), config.redoRotation().fileCount(), config.redoRotation().fileBytes());
             this.redoRepo = ring;
@@ -248,6 +249,7 @@ public final class StorageEngine {
         } else {
             fresh = !Files.exists(config.redoFile());
             rejectFreshRecoveryMode(fresh);
+            validateRecoverySkipConfiguration();
             this.redoRepo = RedoLogFileRepository.open(config.redoFile());
             redoReclaim = null;
         }
@@ -362,6 +364,34 @@ public final class StorageEngine {
     }
 
     /**
+     * 校验 force-skip 的组合根不变量。该校验必须早于任何 data/undo tablespace 打开：
+     * <ul>
+     *   <li>普通模式不能携带 skipped set，避免配置残留导致静默跳过数据；</li>
+     *   <li>force-skip 必须显式非空，不能由引擎猜测损坏空间；</li>
+     *   <li>系统 undo 不能跳过，否则 UNDO_ROLLBACK/RESUME_PURGE 没有安全语义；</li>
+     *   <li>当前单聚簇索引所在空间不能跳过，否则恢复期 rollback 会访问被隔离对象。</li>
+     * </ul>
+     */
+    private void validateRecoverySkipConfiguration() {
+        Set<SpaceId> skipped = config.forceSkippedSpaces();
+        if (config.recoveryMode() != RecoveryMode.FORCE_SKIP_CORRUPT_TABLESPACE && !skipped.isEmpty()) {
+            throw new DatabaseValidationException(
+                    "force skipped spaces are only allowed in FORCE_SKIP_CORRUPT_TABLESPACE mode");
+        }
+        if (config.recoveryMode() == RecoveryMode.FORCE_SKIP_CORRUPT_TABLESPACE && skipped.isEmpty()) {
+            throw new DatabaseValidationException("FORCE_SKIP_CORRUPT_TABLESPACE requires skipped spaces");
+        }
+        if (skipped.contains(config.undoSpaceId())) {
+            throw new DatabaseValidationException("system undo tablespace cannot be force-skipped: "
+                    + config.undoSpaceId().value());
+        }
+        if (clusteredIndex != null && skipped.contains(clusteredIndex.rootPageId().spaceId())) {
+            throw new DatabaseValidationException("configured clustered index space cannot be force-skipped: "
+                    + clusteredIndex.rootPageId().spaceId().value());
+        }
+    }
+
+    /**
      * E2 existing-open 恢复入口。数据流为：先按 recovery 准入打开系统 undo 与显式配置的数据表空间，使
      * {@code PageStore} 拥有 redo apply 所需的物理句柄；再构造不可变 {@link RecoveryRequest}，由
      * {@link CrashRecoveryService} 负责关闭 gate、redo replay、安装 recoveredToLsn、续作 UNDO TRUNCATING、
@@ -375,6 +405,9 @@ public final class StorageEngine {
     private void recoverExisting() {
         diskSpaceManager.openTablespaceForRecovery(config.undoSpaceId(), config.undoFile());
         for (EngineTablespaceConfig tablespace : config.recoveryTablespaces()) {
+            if (config.forceSkippedSpaces().contains(tablespace.spaceId())) {
+                continue;
+            }
             diskSpaceManager.openTablespaceForRecovery(tablespace.spaceId(), tablespace.path());
         }
 
@@ -401,8 +434,14 @@ public final class StorageEngine {
             case READ_ONLY_VALIDATE -> RecoveryRequest.readOnlyValidate(checkpointStore, redoRepo,
                             RedoApplyDispatcher.pageDispatcher(), new RedoApplyContext(store, config.pageSize()))
                     .withDoublewriteRepair(doublewriteScanner, doublewritePages);
-            case FORCE_SKIP_CORRUPT_TABLESPACE -> throw new DatabaseValidationException(
-                    "FORCE_SKIP_CORRUPT_TABLESPACE recovery mode is reserved and not implemented");
+            case FORCE_SKIP_CORRUPT_TABLESPACE -> RecoveryRequest.forceSkip(checkpointStore, redoRepo,
+                            RedoApplyDispatcher.pageDispatcher(), new RedoApplyContext(store, config.pageSize()),
+                            config.forceSkippedSpaces())
+                    .withDoublewriteRepair(doublewriteScanner, doublewritePages)
+                    .withRedoBoundaryInstall(redo)
+                    .withUndoTablespaceRecovery(buildUndoTablespaceRecovery())
+                    .withSpaceFileReconcile(recoverySpaces)
+                    .withTransactionUndoRecovery(this::recoverTransactionUndoAfterRedo);
         };
         lastRecoveryReport = crashRecoveryService.recover(request);
     }

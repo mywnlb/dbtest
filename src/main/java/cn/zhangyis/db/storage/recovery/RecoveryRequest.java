@@ -11,6 +11,7 @@ import cn.zhangyis.db.storage.redo.RedoLogFileRepository;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
 
 import java.util.List;
+import java.util.Set;
 
 /**
  * R2 crash recovery 输入。它显式携带 redo、checkpoint、doublewrite 和 page apply 依赖，避免 Recovery 模块读取各模块内部状态。
@@ -29,6 +30,7 @@ import java.util.List;
  *                             为空表示跳过该阶段（仅用于不需要续写 redo 的纯回放测试）。真实重启必须提供，
  *                             否则新 MTR 会从 0 重新分配 LSN 覆盖已有日志。
  * @param transactionUndoRecovery 可选事务 undo 恢复参与者；负责正式 UNDO_ROLLBACK/RESUME_PURGE 阶段。
+ * @param skipPolicy force-skip 恢复策略；NORMAL/READ_ONLY_VALIDATE 必须为空，避免普通启动隐式跳过数据。
  */
 public record RecoveryRequest(RecoveryMode mode,
                               RedoCheckpointStore checkpointStore,
@@ -40,12 +42,23 @@ public record RecoveryRequest(RecoveryMode mode,
                               UndoTablespaceRecoveryParticipant undoTablespaceRecovery,
                               List<SpaceId> spacesToReconcile,
                               RedoLogManager recoveredRedoManager,
-                              TransactionUndoRecoveryParticipant transactionUndoRecovery) {
+                              TransactionUndoRecoveryParticipant transactionUndoRecovery,
+                              RecoverySkipPolicy skipPolicy) {
 
     public RecoveryRequest {
         if (mode == null || checkpointStore == null || redoRepository == null
                 || dispatcher == null || applyContext == null) {
             throw new DatabaseValidationException("recovery request core dependencies must not be null");
+        }
+        if (skipPolicy == null) {
+            skipPolicy = RecoverySkipPolicy.none();
+        }
+        if (mode != RecoveryMode.FORCE_SKIP_CORRUPT_TABLESPACE && !skipPolicy.isEmpty()) {
+            throw new DatabaseValidationException(
+                    "skip policy is only allowed in FORCE_SKIP_CORRUPT_TABLESPACE mode");
+        }
+        if (mode == RecoveryMode.FORCE_SKIP_CORRUPT_TABLESPACE && skipPolicy.isEmpty()) {
+            throw new DatabaseValidationException("FORCE_SKIP_CORRUPT_TABLESPACE requires skipped spaces");
         }
         pagesToRepair = pagesToRepair == null ? List.of() : List.copyOf(pagesToRepair);
         if (doublewriteScanner == null && !pagesToRepair.isEmpty()) {
@@ -62,7 +75,8 @@ public record RecoveryRequest(RecoveryMode mode,
                                          RedoApplyDispatcher dispatcher,
                                          RedoApplyContext applyContext) {
         return new RecoveryRequest(RecoveryMode.NORMAL, checkpointStore, redoRepository,
-                dispatcher, applyContext, null, List.of(), null, List.of(), null, null);
+                dispatcher, applyContext, null, List.of(), null, List.of(), null, null,
+                RecoverySkipPolicy.none());
     }
 
     /**
@@ -74,7 +88,30 @@ public record RecoveryRequest(RecoveryMode mode,
                                                    RedoApplyDispatcher dispatcher,
                                                    RedoApplyContext applyContext) {
         return new RecoveryRequest(RecoveryMode.READ_ONLY_VALIDATE, checkpointStore, redoRepository,
-                dispatcher, applyContext, null, List.of(), null, List.of(), null, null);
+                dispatcher, applyContext, null, List.of(), null, List.of(), null, null,
+                RecoverySkipPolicy.none());
+    }
+
+    /**
+     * 创建 FORCE_SKIP_CORRUPT_TABLESPACE 请求。该模式必须由调用方显式传入非空 skippedSpaces；
+     * 具体哪些系统空间不可跳过由 StorageEngine 结合实例配置校验。
+     *
+     * @param checkpointStore redo checkpoint 仓储。
+     * @param redoRepository redo 文件仓储。
+     * @param dispatcher redo apply 分发器。
+     * @param applyContext page apply 上下文。
+     * @param skippedSpaces 管理员显式声明要跳过的表空间集合。
+     * @return force-skip 恢复请求。
+     */
+    public static RecoveryRequest forceSkip(RedoCheckpointStore checkpointStore,
+                                            RedoLogFileRepository redoRepository,
+                                            RedoApplyDispatcher dispatcher,
+                                            RedoApplyContext applyContext,
+                                            Set<SpaceId> skippedSpaces) {
+        return new RecoveryRequest(RecoveryMode.FORCE_SKIP_CORRUPT_TABLESPACE,
+                checkpointStore, redoRepository, dispatcher, applyContext,
+                null, List.of(), null, List.of(), null, null,
+                RecoverySkipPolicy.of(skippedSpaces));
     }
 
     /**
@@ -86,7 +123,7 @@ public record RecoveryRequest(RecoveryMode mode,
         }
         return new RecoveryRequest(mode, checkpointStore, redoRepository, dispatcher, applyContext,
                 scanner, pages, undoTablespaceRecovery, spacesToReconcile,
-                recoveredRedoManager, transactionUndoRecovery);
+                recoveredRedoManager, transactionUndoRecovery, skipPolicy);
     }
 
     /**
@@ -98,7 +135,7 @@ public record RecoveryRequest(RecoveryMode mode,
         }
         return new RecoveryRequest(mode, checkpointStore, redoRepository, dispatcher, applyContext,
                 doublewriteScanner, pagesToRepair, participant, spacesToReconcile,
-                recoveredRedoManager, transactionUndoRecovery);
+                recoveredRedoManager, transactionUndoRecovery, skipPolicy);
     }
 
     /**
@@ -114,7 +151,7 @@ public record RecoveryRequest(RecoveryMode mode,
         }
         return new RecoveryRequest(mode, checkpointStore, redoRepository, dispatcher, applyContext,
                 doublewriteScanner, pagesToRepair, undoTablespaceRecovery, spaces,
-                recoveredRedoManager, transactionUndoRecovery);
+                recoveredRedoManager, transactionUndoRecovery, skipPolicy);
     }
 
     /**
@@ -130,7 +167,7 @@ public record RecoveryRequest(RecoveryMode mode,
         }
         return new RecoveryRequest(mode, checkpointStore, redoRepository, dispatcher, applyContext,
                 doublewriteScanner, pagesToRepair, undoTablespaceRecovery, spacesToReconcile,
-                redoManager, transactionUndoRecovery);
+                redoManager, transactionUndoRecovery, skipPolicy);
     }
 
     /**
@@ -146,6 +183,6 @@ public record RecoveryRequest(RecoveryMode mode,
         }
         return new RecoveryRequest(mode, checkpointStore, redoRepository, dispatcher, applyContext,
                 doublewriteScanner, pagesToRepair, undoTablespaceRecovery, spacesToReconcile,
-                recoveredRedoManager, participant);
+                recoveredRedoManager, participant, skipPolicy);
     }
 }

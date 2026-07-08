@@ -7,6 +7,7 @@ import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.RollPointer;
 import cn.zhangyis.db.domain.TransactionId;
 import cn.zhangyis.db.storage.api.DiskSpaceManager;
+import cn.zhangyis.db.storage.api.PageAllocationHint;
 import cn.zhangyis.db.storage.api.SegmentRef;
 import cn.zhangyis.db.storage.api.index.IndexPageAccess;
 import cn.zhangyis.db.storage.api.index.IndexPageHandle;
@@ -887,12 +888,16 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
     private BTreeInsertResult splitRootLeaf(MiniTransaction mtr, BTreeIndex index, IndexPageHandle rootHandle,
                                            LogicalRecord inserted) {
         RecordPage oldRootLeaf = rootHandle.recordPage();
-        List<LogicalRecord> records = sortedWithInserted(materializeLeafRecords(oldRootLeaf, index), inserted, index);
+        FilePageHeader oldRootHeader = rootHandle.fileHeader();
+        List<LogicalRecord> existing = materializeLeafRecords(oldRootLeaf, index);
+        PageAllocationHint leafHint = leafSplitAllocationHint(index.rootPageId(), oldRootHeader, index,
+                existing, inserted, 2L);
+        List<LogicalRecord> records = sortedWithInserted(existing, inserted, index);
         SplitRows split = splitRows(records);
 
-        PageId leftId = allocateSmoPage(mtr, index.leafSegment());
+        PageId leftId = allocateSmoPage(mtr, index.leafSegment(), leafHint);
         RecordPage leftPage = createSmoIndexPage(mtr, leftId, index.indexId(), 0);
-        PageId rightId = allocateSmoPage(mtr, index.leafSegment());
+        PageId rightId = allocateSmoPage(mtr, index.leafSegment(), leafHint);
         RecordPage rightPage = createSmoIndexPage(mtr, rightId, index.indexId(), 0);
         IndexPageHandle leftHandle = pageAccess.openIndexPageHandle(mtr, leftId, PageLatchMode.EXCLUSIVE);
         IndexPageHandle rightHandle = pageAccess.openIndexPageHandle(mtr, rightId, PageLatchMode.EXCLUSIVE);
@@ -973,9 +978,17 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
      * 不反向获取 B+Tree index page latch，且 SMO 的 index latch 等待边已由 safe-node/SX 协议证明无环。
      */
     private PageId allocateSmoPage(MiniTransaction mtr, SegmentRef segment) {
+        return allocateSmoPage(mtr, segment, PageAllocationHint.none());
+    }
+
+    /**
+     * B+Tree SMO 新页分配的 page-latch-order 例外，带可选分配 hint。hint 只用于 leaf split 的物理邻近性和批量
+     * extent 策略；internal/root split 继续传 none，避免把元数据页增长误判为 leaf 顺序写入。
+     */
+    private PageId allocateSmoPage(MiniTransaction mtr, SegmentRef segment, PageAllocationHint hint) {
         try (var ignored = mtr.allowOutOfOrderPageLatch(
                 "btree SMO page allocation: FSP metadata never waits for B+Tree index latches")) {
-            return disk.allocatePage(mtr, segment);
+            return disk.allocatePage(mtr, segment, hint);
         }
     }
 
@@ -1022,10 +1035,12 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         RecordPage oldLeaf = oldLeafHandle.recordPage();
         PageId oldLeafId = oldLeafHandle.pageId();
         FilePageHeader oldLeafHeader = oldLeafHandle.fileHeader();
-        List<LogicalRecord> records = sortedWithInserted(materializeLeafRecords(oldLeaf, index), inserted, index);
+        List<LogicalRecord> existing = materializeLeafRecords(oldLeaf, index);
+        PageAllocationHint leafHint = leafSplitAllocationHint(oldLeafId, oldLeafHeader, index, existing, inserted, 1L);
+        List<LogicalRecord> records = sortedWithInserted(existing, inserted, index);
         SplitRows split = splitRows(records);
 
-        PageId newLeafId = allocateSmoPage(mtr, index.leafSegment());
+        PageId newLeafId = allocateSmoPage(mtr, index.leafSegment(), leafHint);
         allocated.add(newLeafId);
         RecordPage newLeaf = createSmoIndexPage(mtr, newLeafId, index.indexId(), 0);
         IndexPageHandle newLeafHandle = pageAccess.openIndexPageHandle(mtr, newLeafId, PageLatchMode.EXCLUSIVE);
@@ -1957,6 +1972,31 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
             throw new BTreeStructureCorruptedException("split child must not be empty");
         }
         return keyOf(rows.get(0), index);
+    }
+
+    private SearchKey highKey(List<LogicalRecord> rows, BTreeIndex index) {
+        if (rows.isEmpty()) {
+            throw new BTreeStructureCorruptedException("split child must not be empty");
+        }
+        return keyOf(rows.get(rows.size() - 1), index);
+    }
+
+    private PageAllocationHint leafSplitAllocationHint(PageId leafId, FilePageHeader header, BTreeIndex index,
+                                                       List<LogicalRecord> existing, LogicalRecord inserted,
+                                                       long pagesNeeded) {
+        if (existing.isEmpty()) {
+            return PageAllocationHint.none();
+        }
+        return BTreeAllocationHintPlanner.leafSplitHint(
+                leafId,
+                keyOf(inserted, index),
+                lowKey(existing, index),
+                highKey(existing, index),
+                header.prevPageNo() != FilePageHeader.FIL_NULL,
+                header.nextPageNo() != FilePageHeader.FIL_NULL,
+                pagesNeeded,
+                index,
+                keyComparator);
     }
 
     private BTreeLookupResult materialize(BTreeIndex index, PageId pageId, RecordCursor cursor) {

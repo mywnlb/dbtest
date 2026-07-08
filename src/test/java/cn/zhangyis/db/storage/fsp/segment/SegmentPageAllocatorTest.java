@@ -1,5 +1,6 @@
 package cn.zhangyis.db.storage.fsp.segment;
 import cn.zhangyis.db.storage.fsp.extent.DefaultExtentAllocationPolicy;
+import cn.zhangyis.db.storage.fsp.extent.ExtentAllocationDirection;
 import cn.zhangyis.db.storage.fsp.extent.ExtentAllocationPolicy;
 import cn.zhangyis.db.storage.fsp.extent.ExtentDescriptorRepository;
 import cn.zhangyis.db.storage.fsp.extent.FreeExtentService;
@@ -9,6 +10,7 @@ import cn.zhangyis.db.storage.fsp.header.SpaceHeaderRepository;
 import cn.zhangyis.db.storage.fsp.header.SpaceHeaderSnapshot;
 
 
+import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
@@ -27,6 +29,7 @@ import java.nio.file.Path;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -62,7 +65,7 @@ class SegmentPageAllocatorTest {
             Flst flst = new Flst(pool);
             FreeExtentService free = new FreeExtentService(pool, PS, header, xdes, flst);
             SegmentSpaceService seg = new SegmentSpaceService(pool, PS, header, inode, xdes, flst, free);
-            SegmentPageAllocator alloc = new SegmentPageAllocator(pool, inode, flst, seg, policy);
+            SegmentPageAllocator alloc = new SegmentPageAllocator(pool, PS, header, inode, flst, seg, policy);
             MiniTransactionManager mgr = new MiniTransactionManager();
             MiniTransaction init = mgr.begin();
             header.initialize(init, fresh(sizePages));
@@ -102,8 +105,22 @@ class SegmentPageAllocatorTest {
     }
 
     @Test
+    void directionalAllocationRequiresHintBeforeFragmentPath() {
+        withAlloc(192, new DefaultExtentAllocationPolicy(), (header, inode, flst, alloc, mgr) -> {
+            MiniTransaction a = mgr.begin();
+            int slot = inode.allocateSlot(a, SPACE, SegmentId.of(1), SegmentPurpose.INDEX_LEAF);
+            mgr.commit(a);
+
+            MiniTransaction m = mgr.begin();
+            assertThrows(DatabaseValidationException.class,
+                    () -> alloc.allocatePage(m, SPACE, slot, ExtentAllocationDirection.UP, Optional.empty(), 1L));
+            mgr.rollbackUncommitted(m);
+        });
+    }
+
+    @Test
     void honorsPolicyAcquiringMultipleExtents() {
-        ExtentAllocationPolicy two = ownedExtentCount -> 2;
+        ExtentAllocationPolicy two = request -> 2;
         withAlloc(256, two, (header, inode, flst, alloc, mgr) -> {
             MiniTransaction a = mgr.begin();
             int slot = inode.allocateSlot(a, SPACE, SegmentId.of(1), SegmentPurpose.INDEX_LEAF);
@@ -114,6 +131,45 @@ class SegmentPageAllocatorTest {
                 alloc.allocatePage(m, SPACE, slot);
             }
             assertEquals(Optional.of(PageId.of(SPACE, PageNo.of(128))), alloc.allocatePage(m, SPACE, slot));
+            assertEquals(1L, flst.length(m, SPACE, inode.notFullExtentListBaseAddr(SPACE, slot)));
+            assertEquals(1L, flst.length(m, SPACE, inode.freeExtentListBaseAddr(SPACE, slot)));
+            mgr.commit(m);
+        });
+    }
+
+    @Test
+    void noHintKeepsDefaultPolicyToSingleExtentEvenForLargeLeafSegment() {
+        withAlloc(384, new DefaultExtentAllocationPolicy(), (header, inode, flst, alloc, mgr) -> {
+            MiniTransaction a = mgr.begin();
+            int slot = inode.allocateSlot(a, SPACE, SegmentId.of(1), SegmentPurpose.INDEX_LEAF);
+            mgr.commit(a);
+
+            MiniTransaction m = mgr.begin();
+            for (int i = 0; i < 32 + 64 + 64; i++) {
+                alloc.allocatePage(m, SPACE, slot);
+            }
+            assertEquals(Optional.of(PageId.of(SPACE, PageNo.of(256))), alloc.allocatePage(m, SPACE, slot));
+            assertEquals(1L, flst.length(m, SPACE, inode.notFullExtentListBaseAddr(SPACE, slot)));
+            assertEquals(0L, flst.length(m, SPACE, inode.freeExtentListBaseAddr(SPACE, slot)));
+            mgr.commit(m);
+        });
+    }
+
+    @Test
+    void directionalLeafGrowthCanAssignMultipleExtents() {
+        withAlloc(384, new DefaultExtentAllocationPolicy(), (header, inode, flst, alloc, mgr) -> {
+            MiniTransaction a = mgr.begin();
+            int slot = inode.allocateSlot(a, SPACE, SegmentId.of(1), SegmentPurpose.INDEX_LEAF);
+            mgr.commit(a);
+
+            MiniTransaction m = mgr.begin();
+            for (int i = 0; i < 32 + 64 + 64; i++) {
+                alloc.allocatePage(m, SPACE, slot, ExtentAllocationDirection.UP,
+                        Optional.of(PageNo.of(128)), 1L);
+            }
+            assertEquals(Optional.of(PageId.of(SPACE, PageNo.of(256))),
+                    alloc.allocatePage(m, SPACE, slot, ExtentAllocationDirection.UP,
+                            Optional.of(PageNo.of(192)), PS.pagesPerExtent() * 2L));
             assertEquals(1L, flst.length(m, SPACE, inode.notFullExtentListBaseAddr(SPACE, slot)));
             assertEquals(1L, flst.length(m, SPACE, inode.freeExtentListBaseAddr(SPACE, slot)));
             mgr.commit(m);

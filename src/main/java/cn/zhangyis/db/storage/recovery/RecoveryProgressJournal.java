@@ -71,7 +71,23 @@ public final class RecoveryProgressJournal {
      */
     public void stageCompleted(RecoveryMode mode, RecoveryStageName stageName,
                                RecoveryState state, Lsn recoveredToLsn) {
-        append(mode, stageName, RecoveryProgressEventKind.COMPLETED, state, recoveredToLsn, "");
+        stageCompleted(mode, stageName, state, recoveredToLsn, "");
+    }
+
+    /**
+     * 记录带诊断明细的阶段成功完成。force-skip 会在 OPEN_TRAFFIC 阶段写入 skipped space 和跳过计数，
+     * 便于启动日志说明本次恢复为何没有触达某些表空间。
+     *
+     * @param mode recovery 模式。
+     * @param stageName 完成的阶段。
+     * @param state 完成时的 recovery 状态。
+     * @param recoveredToLsn 当前已知 redo 恢复边界。
+     * @param detail 诊断明细；null 按空串记录。
+     */
+    public void stageCompleted(RecoveryMode mode, RecoveryStageName stageName,
+                               RecoveryState state, Lsn recoveredToLsn, String detail) {
+        append(mode, stageName, RecoveryProgressEventKind.COMPLETED, state, recoveredToLsn,
+                detail == null ? "" : detail);
     }
 
     /**

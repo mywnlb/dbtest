@@ -25,6 +25,7 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertIterableEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -131,6 +132,135 @@ class MtrRedoAppendTest {
             g.writeBytes(100, new byte[]{1}); // touched，且 guard 在保存点之上
             assertThrows(MtrStateException.class, () -> mtr.rollbackToSavepoint(sp));
             mgr.rollbackUncommitted(mtr); // 清理
+        });
+    }
+
+    @Test
+    void touchedPageBeforeSavepointStillStampsBatchEndLsn() {
+        onPool((pool, mgr) -> {
+            MiniTransaction mtr = mgr.begin();
+            PageId before = PageId.of(SPACE, PageNo.of(3));
+            PageId after = PageId.of(SPACE, PageNo.of(4));
+            mtr.getPage(pool, before, PageLatchMode.EXCLUSIVE).writeBytes(100, new byte[]{1});
+            MtrSavepoint sp = mtr.savepoint();
+            mtr.getPage(pool, after, PageLatchMode.SHARED);
+            mtr.rollbackToSavepoint(sp);
+
+            Lsn committed = mgr.commit(mtr);
+
+            try (PageGuard g = pool.getPage(before, PageLatchMode.SHARED)) {
+                assertEquals(committed, PageEnvelope.readPageLsn(g),
+                        "savepoint 之前已 touched 的页仍要在 commit 时盖 batch end LSN");
+            }
+        });
+    }
+
+    @Test
+    void readOnlyMtrDoesNotCloseExternalUnpublishedRedoRange() {
+        onPool((pool, mgr) -> {
+            mgr.redoLogManager().append(List.of(new PageBytesRecord(PID, 200, new byte[]{9})));
+            assertEquals(0L, mgr.redoLogManager().closedLsn().value(), "外部 append 尚未 dirty publish");
+
+            MiniTransaction readOnly = mgr.begin();
+            readOnly.getPage(pool, PageId.of(SPACE, PageNo.of(4)), PageLatchMode.SHARED);
+            mgr.commit(readOnly);
+
+            assertEquals(0L, mgr.redoLogManager().closedLsn().value(),
+                    "read-only MTR 的空 redo range 不能关闭前面未发布的 redo gap");
+        });
+    }
+
+    @Test
+    void multiPageCommitStampsSameBatchEndLsn() {
+        onPool((pool, mgr) -> {
+            PageId left = PageId.of(SPACE, PageNo.of(3));
+            PageId right = PageId.of(SPACE, PageNo.of(4));
+            MiniTransaction mtr = mgr.begin();
+            mtr.getPage(pool, left, PageLatchMode.EXCLUSIVE).writeBytes(100, new byte[]{1});
+            mtr.getPage(pool, right, PageLatchMode.EXCLUSIVE).writeBytes(100, new byte[]{2});
+
+            Lsn committed = mgr.commit(mtr);
+
+            try (PageGuard l = pool.getPage(left, PageLatchMode.SHARED);
+                 PageGuard r = pool.getPage(right, PageLatchMode.SHARED)) {
+                assertEquals(committed, PageEnvelope.readPageLsn(l));
+                assertEquals(committed, PageEnvelope.readPageLsn(r));
+            }
+        });
+    }
+
+    @Test
+    void redoEntriesTrackDefaultAndPageInitCategoriesWithoutChangingRecords() {
+        onPool((pool, mgr) -> {
+            PageId fresh = PageId.of(SPACE, PageNo.of(5));
+            MiniTransaction mtr = mgr.begin();
+            mtr.newPage(pool, fresh, PageLatchMode.EXCLUSIVE, PageType.INDEX).writeBytes(100, new byte[]{1});
+
+            List<MtrRedoEntry> entries = mtr.redoEntries();
+
+            assertIterableEquals(List.of(MtrRedoCategory.PAGE_INIT, MtrRedoCategory.PAGE_BYTES_GENERIC),
+                    entries.stream().map(MtrRedoEntry::category).toList());
+            assertTrue(entries.get(0).record() instanceof PageInitRecord);
+            assertTrue(entries.get(1).record() instanceof PageBytesRecord);
+            mgr.rollbackUncommitted(mtr);
+        });
+    }
+
+    @Test
+    void redoCategoryScopeIsNestedAndRestoredByLifo() {
+        onPool((pool, mgr) -> {
+            MiniTransaction mtr = mgr.begin();
+            PageGuard recordPage = mtr.getPage(pool, PageId.of(SPACE, PageNo.of(3)), PageLatchMode.EXCLUSIVE);
+            PageGuard btreePage = mtr.getPage(pool, PageId.of(SPACE, PageNo.of(4)), PageLatchMode.EXCLUSIVE);
+            PageGuard genericPage = mtr.getPage(pool, PageId.of(SPACE, PageNo.of(5)), PageLatchMode.EXCLUSIVE);
+
+            try (MtrRedoCategoryScope ignored =
+                         mtr.enterRedoCategory(MtrRedoCategory.RECORD_PAGE_BYTES, "record insert bytes")) {
+                recordPage.writeBytes(100, new byte[]{1});
+                try (MtrRedoCategoryScope ignored2 =
+                             mtr.enterRedoCategory(MtrRedoCategory.BTREE_STRUCTURE_BYTES, "btree split bytes")) {
+                    btreePage.writeBytes(100, new byte[]{2});
+                }
+                recordPage.writeBytes(101, new byte[]{3});
+            }
+            genericPage.writeBytes(100, new byte[]{4});
+
+            assertIterableEquals(List.of(
+                            MtrRedoCategory.RECORD_PAGE_BYTES,
+                            MtrRedoCategory.BTREE_STRUCTURE_BYTES,
+                            MtrRedoCategory.RECORD_PAGE_BYTES,
+                            MtrRedoCategory.PAGE_BYTES_GENERIC),
+                    mtr.redoEntries().stream().map(MtrRedoEntry::category).toList());
+            mgr.rollbackUncommitted(mtr);
+        });
+    }
+
+    @Test
+    void redoCategoryScopeOutOfOrderCloseDoesNotPoisonLaterLifoRecovery() {
+        onPool((pool, mgr) -> {
+            MiniTransaction mtr = mgr.begin();
+            PageGuard first = mtr.getPage(pool, PageId.of(SPACE, PageNo.of(3)), PageLatchMode.EXCLUSIVE);
+            PageGuard second = mtr.getPage(pool, PageId.of(SPACE, PageNo.of(4)), PageLatchMode.EXCLUSIVE);
+            PageGuard third = mtr.getPage(pool, PageId.of(SPACE, PageNo.of(5)), PageLatchMode.EXCLUSIVE);
+
+            MtrRedoCategoryScope outer =
+                    mtr.enterRedoCategory(MtrRedoCategory.RECORD_PAGE_BYTES, "record bytes");
+            MtrRedoCategoryScope inner =
+                    mtr.enterRedoCategory(MtrRedoCategory.BTREE_STRUCTURE_BYTES, "btree bytes");
+            first.writeBytes(100, new byte[]{1});
+
+            assertThrows(MtrStateException.class, outer::close);
+            inner.close();
+            outer.close();
+            second.writeBytes(100, new byte[]{2});
+            third.writeBytes(100, new byte[]{3});
+
+            assertIterableEquals(List.of(
+                            MtrRedoCategory.BTREE_STRUCTURE_BYTES,
+                            MtrRedoCategory.PAGE_BYTES_GENERIC,
+                            MtrRedoCategory.PAGE_BYTES_GENERIC),
+                    mtr.redoEntries().stream().map(MtrRedoEntry::category).toList());
+            mgr.rollbackUncommitted(mtr);
         });
     }
 }

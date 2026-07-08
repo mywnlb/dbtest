@@ -10,7 +10,7 @@
 > `innodb-redo-log-design.md`(Redo)。
 > 其余模块（DD/DDL、lock observability）只在作为依赖出现时引用。
 >
-> 最近校对：2026-07-08（基于当前源码与 `current-implementation-map.md`：0.16b GENERAL NORMAL/CORRUPTED lifecycle 持久化、0.16c `DataFileGateway`/`PreallocationStrategy` seam、0.7 FORCE_SKIP_CORRUPT_TABLESPACE 显式 SpaceId 集合同步；清理已落地项旧表述）。
+> 最近校对：2026-07-08（基于当前源码与 `current-implementation-map.md`：0.16b GENERAL NORMAL/CORRUPTED lifecycle 持久化、0.16c `DataFileGateway`/`PreallocationStrategy` seam、0.7 FORCE_SKIP_CORRUPT_TABLESPACE 显式 SpaceId 集合、0.23b MTR/Redo 剩余纪律同步；清理已落地项旧表述）。
 
 ## 九份文档的当前完成度（粗估，表达"核心在、外围缺"）
 
@@ -62,7 +62,7 @@
 | 0.20 | ✅ **0.20a DurabilityPolicy 已落**（2026-06-30）：`DurabilityPolicy`(FLUSH/WRITE/BACKGROUND，Strategy via enum) + `RedoLogManager` 三阶段 write 原语（`write()` 写 OS cache、`writtenToDiskLsn`/`waitWritten`，`flush` 复用同一 drain；守 `flushed<=written`）；6 单测。✅ **生产事务提交接线已由 2.1 storage DML facade 消费**（2026-07-04：onCommit 后以 `redo.currentLsn()` 为等待边界）。**剩余 0.20b LogBlock checksum**：当前 redo 为 batch-frame(`magic+len+crc32+payload`，已有 batch 级 torn 检测)，§5.8 的 512B log block + header/trailer 是较大的格式重写（会改 `RedoBatchFrameCodec`、churn 0.18 文件环），单列为独立 epic | Redo | 0.20a 小-中 / 0.20b 大 | commit 刷盘策略已抽象并接入 storage DML；0.20b ROI 偏低（batch CRC 已检 torn），按需再做 |
 | 0.21 | **Record 层补齐包**：类型系统扩展（TIME/TIMESTAMP/YEAR/TEXT/BLOB/ENUM/SET/JSON/bitstring）、charset/collation、ASC/DESC/NULL 排序、PageDirectory/record header 校验增强、overflow/BLOB chain | Rec/B | 中-大 | record 已能支撑当前 btree/undo；这些是更贴近 MySQL/InnoDB 的页内格式与比较语义 |
 | 0.22 | ✅ **BufferPool truncate/drop stale-frame 版本语义已落**（2026-07-02）：`TablespaceVersion` / `SpaceLifecycleClock` 接入 `LruBufferPool.invalidateTablespace` 与 `BufferPoolInstance` admission/lookup/load/prefetch；前台 get/new 在 invalidation 窗口抛 `BufferPoolStalePageException`，prefetch 跳过，LOADING 发布前复核版本并清占位，旧版本 clean unfixed frame 被隔离不复活。**剩余**：完整 DROP/DISCARD DDL、文件删除/重建编排 | BP/D | — | Buffer Pool 侧陈旧帧边界已闭合；后续 DDL/Disk Manager lifecycle 接线复用该准入边界 |
-| 0.23 | ✅ **0.23a MTR page latch ordering 已落（2026-07-03）**：`MiniTransaction.fix` 在进入 Buffer Pool latch 等待前执行独立多页 `(spaceId,pageNo)` 升序守卫；同页重入、已释放页放行；`MtrLatchOrderScope` / `allowOutOfOrderPageLatch(reason)` 只给 B+Tree root/child/sibling/SMO allocation-format-free、Undo grow/chain-read/rseg page3 slot 等有局部无环证明的路径短暂例外。**剩余**：savepoint 使用边界测试、commit ordering/closed LSN 协议、redo collector 命令分类（从 PAGE_BYTES 过渡到更细 MLOG） | BP/MTR/Redo | 中 | 跨页 latch 默认无序风险已收敛到 MTR 守卫；剩余项与 recent written/closed tracker、`DurabilityPolicy` 消费边界和后续逻辑 redo 关联 |
+| 0.23 | ✅ **0.23a MTR page latch ordering 已落（2026-07-03）**：`MiniTransaction.fix` 在进入 Buffer Pool latch 等待前执行独立多页 `(spaceId,pageNo)` 升序守卫；同页重入、已释放页放行；`MtrLatchOrderScope` / `allowOutOfOrderPageLatch(reason)` 只给 B+Tree root/child/sibling/SMO allocation-format-free、Undo grow/chain-read/rseg page3 slot 等有局部无环证明的路径短暂例外。✅ **0.23b MTR/Redo 剩余纪律已落（2026-07-08）**：补 savepoint touched-page 边界、commit dirty/pageLSN 发布后再 `markClosed` 的测试保护、read-only MTR 空 range 不关闭外部 gap、`MtrRedoCategory`/`MtrRedoEntry` 本地分类接缝（不改变持久 `PAGE_INIT`/`PAGE_BYTES`）。后续完整逻辑 MLOG/多 handler 仍归 0.19 | BP/MTR/Redo | — | 跨页 latch、savepoint、closed LSN 与 collector 分类纪律已闭合；完整 MLOG 仍独立推进 |
 
 ## Tier 1 — 依赖 Tier 0 的 storage 件，但仍不碰 DD/DML
 
@@ -101,10 +101,10 @@ R 1.2 ROLLBACK_TRX ✅（恢复回滚，显式配置索引）→ 0.4 后台 purg
 重建 committed history、复位事务计数、后台自动 purge）；**formal UNDO_ROLLBACK/RESUME_PURGE stage 也已接入**。
 下一步不要再做 1.3；可在 crash-safety 主线上继续补
 多索引/DD/prepared txn、DDL_RECOVERY 或 worker-lock recovery diagnostics，或切回 Tier 0 独立项（
-0.21 Record、0.23 剩余 MTR/Redo 纪律等）。
+0.21 Record、0.19 逻辑 redo handler、0.20b LogBlock checksum 等）。
 
 **btree / buffer-pool / record 的 Tier 0 项（0.8–0.13、0.21–0.23）与上面这条路线并行、互不阻塞**，但不是当前 crash-safety 主线，按需挑：
-若转向"让 buffer pool 更接近生产质量"，0.8/0.9、0.10a/b/c/d（linear + warmup + random read-ahead + 多 instance 分片）、0.22 stale-frame 版本语义、13.1a/13.1b-pre/13.1c/13.1d 锁边界与真实 flush list、legacy `BufferPool.flush/flushAll` API 移除、0.23a MTR page latch ordering 已落；下一步可处理 warmup IO 速率控制、random read-ahead 生产 config，或继续细化 `DIRTY_PENDING`/`EVICTING`/`STALE` 状态；
+若转向"让 buffer pool 更接近生产质量"，0.8/0.9、0.10a/b/c/d（linear + warmup + random read-ahead + 多 instance 分片）、0.22 stale-frame 版本语义、13.1a/13.1b-pre/13.1c/13.1d 锁边界与真实 flush list、legacy `BufferPool.flush/flushAll` API 移除、0.23a MTR page latch ordering 与 0.23b MTR/Redo 剩余纪律已落；下一步可处理 warmup IO 速率控制、random read-ahead 生产 config，或继续细化 `DIRTY_PENDING`/`EVICTING`/`STALE` 状态；
 B+Tree 多层结构（**0.11 parent split ✅**）、删后收缩（**0.12 merge + root shrink ✅**）、**0.12b redistribute ✅**、**写路径 latch coupling 全覆盖（0.13a insert+deleteClustered、0.13b 其余聚簇写算子 replace/mark/purge）✅** 与 **读路径 latch coupling（0.13c lookup/scan/current-read S-crab + sibling hand-over-hand）✅** 已落；**0.13d 分阶段推进**：prefix key 比较 ✅、**SX（SHARED_EXCLUSIVE / SIX）page latch 模式 + 兼容矩阵 ✅**（`PageLatchMode` 第三态、帧内 read latch + per-frame intent lock 分层实现、`PageGuard`/`BufferPoolInstance`/MTR 升级防护，尚未接入任何 btree 写路径）、**safe-node 早释放祖先 ✅ 全覆盖**（设计 §10.2 step4-5：通用 `descendPathSafeNode` 谓词参数化——insert=`freeSpace≥maxSeparatorSize`、delete/purge=「摘一最大指针后仍不欠载」；SMO 不传播到 root 时 root X 不再持到 commit；`considerMerge` root 判定改按 rootPageId 页号防止对 safe 链顶误 shrinkRoot；`maxSeparatorSize` 按类型合成 worst-case、13 TypeId 全覆盖）；**root SX 下降 + restart-in-X ✅**（§10.3 ROOT_LATCHED_SX：快照树高 ≥2 的悲观 SMO 首遍 root 取 SX 与读者 S 并存，safe 节点吸收则全程不 X root；链顶仍是 root 则零写整链释放、root X 重启至多一次；level 0/1 树直取 X；SX latch 首次接入 btree 生产路径）——**0.13d 的 SX latch + root retry 主体完成**；剩余=① B-link 右链 / OLC 版本重启（设计未规定，最重，ROI 低）② btree 专用 redo / MVCC 辅助字段（页头 `PAGE_MAX_TRX_ID`/`PAGE_BTR_SEG_*`）。
 B+Tree 的 point/unique/range current-read 已有 storage 内闭环（2.7a/2.7b），其中 point/unique 已由 2.1 storage DML facade 调用；executor/DD/session 上层接线（2.8）仍未落。
 

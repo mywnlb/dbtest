@@ -1,6 +1,4 @@
 package cn.zhangyis.db.storage.mtr;
-import cn.zhangyis.db.storage.fil.io.PageStore;
-
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.Lsn;
@@ -9,18 +7,21 @@ import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.PageGuard;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
+import cn.zhangyis.db.storage.fil.access.TablespaceAccessController;
 import cn.zhangyis.db.storage.page.PageEnvelope;
 import cn.zhangyis.db.storage.page.PageType;
 import cn.zhangyis.db.storage.redo.LogRange;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
-import cn.zhangyis.db.storage.fil.access.TablespaceAccessController;
+
+import java.util.List;
 
 /**
  * mini-transaction：短物理临界区的一致性边界（设计 §9）。memo 收集 page latch + buffer fix，
  * commit/rollback 时 LIFO 释放；savepoint 提前释放局部资源。
  *
- * <p>单线程拥有，非线程安全。简化点：commit 暂不产 redo / LSN / pageLSN / WAL 排序；
- * rollback 不撤销已写入 buffer 的页内容（MTR 无 content undo，留 redo/recovery 切片）。
+ * <p>单线程拥有，非线程安全。commit 会把 collector 中的物理 redo append 到 {@link RedoLogManager}、
+ * 取得 batch end LSN、给 touched 页盖 pageLSN，并在 dirty 发布后关闭 redo range；rollback 仍不撤销
+ * 已写入 buffer 的页内容（MTR 无 content undo，依赖事务 undo/恢复路径兜底）。
  *
  * <p>并发约束：同页禁 S→X 锁升级（ReentrantReadWriteLock 无升级，会自死锁）；将写的页直接取 EXCLUSIVE。
  *
@@ -156,6 +157,27 @@ public final class MiniTransaction {
             throw new MtrStateException("out-of-order page latch scope underflow: " + reason);
         }
         outOfOrderPageLatchScopeDepth--;
+    }
+
+    /**
+     * 进入 redo 分类作用域。该分类只标记本 MTR 后续 {@code PAGE_BYTES} 的语义来源，不改变持久 redo 格式；
+     * 调用方必须用 try-with-resources 关闭，使嵌套分类按 LIFO 恢复。
+     *
+     * @param category scope 内普通页字节写的分类，不能为 {@link MtrRedoCategory#PAGE_INIT}。
+     * @param reason   分类理由，需说明调用方的数据库语义，便于 review 和诊断。
+     * @return 分类作用域 guard。
+     */
+    public MtrRedoCategoryScope enterRedoCategory(MtrRedoCategory category, String reason) {
+        ensureActive();
+        return collector.enterCategory(category, reason);
+    }
+
+    /**
+     * 返回当前 MTR 已收集 redo 的诊断快照。该入口只暴露 collector 的本地分类信息，提交时仍只把
+     * {@link cn.zhangyis.db.storage.redo.RedoRecord} 交给 redo manager，避免测试误认为分类已进入持久格式。
+     */
+    List<MtrRedoEntry> redoEntries() {
+        return collector.entries();
     }
 
     private PageGuard fix(BufferPool pool, PageId pageId, PageLatchMode mode, boolean existing, PageType pageType) {

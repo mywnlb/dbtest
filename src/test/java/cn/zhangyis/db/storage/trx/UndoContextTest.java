@@ -22,7 +22,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * 「刚建段、尚未 append」的惰性初值：{@code lastRollPointer=NULL}、{@code lastUndoNo=NONE}、
  * {@code insertUndoFirstPageId} 为刚分配的 insert undo segment 首页。
  *
- * <p>不测试 rollback/savepoint/update undo（非目标，留 T1.3d+）。
+ * <p>1.4 起补充保存点边界语义：partial rollback 可退回逻辑链头，但 append 高水位不能倒回。
  */
 class UndoContextTest {
 
@@ -64,6 +64,38 @@ class UndoContextTest {
 
         assertEquals(rp, ctx.lastRollPointer());
         assertNotNull(ctx.lastRollPointer());
+    }
+
+    @Test
+    void savepointRestoreMovesLogicalBoundaryWithoutReusingAppendUndoNo() {
+        Transaction txn = new Transaction(TransactionOptions.defaults(), 1L);
+        UndoContext ctx = new UndoContext(RSEG, SLOT, FIRST_PAGE);
+        RollPointer first = new RollPointer(true, PageNo.of(65), 97);
+        RollPointer second = new RollPointer(true, PageNo.of(65), 128);
+        ctx.setLastUndoNo(UndoNo.of(1));
+        ctx.setLastRollPointer(first);
+
+        TransactionSavepoint savepoint = ctx.createSavepoint(txn);
+        ctx.setLastUndoNo(UndoNo.of(2));
+        ctx.setLastRollPointer(second);
+        ctx.completeRollbackToSavepoint(savepoint);
+
+        assertEquals(UndoNo.of(2), ctx.lastUndoNo(),
+                "partial rollback must not rewind append high-water or the next append would reuse undoNo");
+        assertEquals(UndoNo.of(1), ctx.logicalLastUndoNo(),
+                "logical chain head returns to the savepoint boundary");
+        assertEquals(first, ctx.lastRollPointer(), "rollback chain head returns to the savepoint roll pointer");
+        assertEquals(1, ctx.savepointCount(), "target savepoint remains valid for repeated rollback-to");
+    }
+
+    @Test
+    void createSavepointRejectsTransactionBoundToAnotherUndoContext() {
+        Transaction txn = new Transaction(TransactionOptions.defaults(), 1L);
+        UndoContext owned = new UndoContext(RSEG, SLOT, FIRST_PAGE);
+        UndoContext other = new UndoContext(RSEG, UndoSlotId.of(4), PageId.of(SpaceId.of(77), PageNo.of(66)));
+        txn.setUndoContext(owned);
+
+        assertThrows(DatabaseValidationException.class, () -> other.createSavepoint(txn));
     }
 
     @Test

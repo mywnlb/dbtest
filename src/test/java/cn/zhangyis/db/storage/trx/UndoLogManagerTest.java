@@ -36,8 +36,12 @@ import cn.zhangyis.db.storage.undo.UndoLogSegmentAccess;
 import cn.zhangyis.db.storage.undo.UndoPageOverflowException;
 import cn.zhangyis.db.storage.undo.UndoRecord;
 import cn.zhangyis.db.storage.undo.UndoRecordType;
+import cn.zhangyis.db.storage.redo.RedoRecord;
 import cn.zhangyis.db.storage.redo.RedoLogFileRepository;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
+import cn.zhangyis.db.storage.redo.TransactionStateDeltaReason;
+import cn.zhangyis.db.storage.redo.TransactionStateDeltaRecord;
+import cn.zhangyis.db.storage.redo.TransactionStateDeltaState;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -382,6 +386,31 @@ class UndoLogManagerTest {
             h.undoMgr.onCommit(txn);
             assertEquals(1, h.slots.activeSlotCount(),
                     "slot retained when txn wrote UPDATE undo (T1.4 MVCC/purge needs it)");
+        });
+    }
+
+    @Test
+    void onCommitWritesTransactionStateRedoInCommitMtr() {
+        onPool(h -> {
+            UndoLogManager durableUndo = new UndoLogManager(h.access, h.slots, UNDO_SPACE,
+                    new HistoryList(), null, h.mgr);
+            Transaction txn = h.txnMgr.begin(TransactionOptions.defaults());
+            h.txnMgr.assignWriteId(txn);
+            MiniTransaction m = h.mgr.begin();
+            durableUndo.beforeInsert(txn, m, TABLE_ID, INDEX_ID, keyOf(100), keyDef(), schema());
+            h.mgr.commit(m);
+
+            h.txnMgr.prepareCommit(txn);
+            durableUndo.onCommit(txn);
+
+            List<RedoRecord> records = h.mgr.redoLogManager().bufferedRecords();
+            assertTrue(records.stream().anyMatch(record -> record instanceof TransactionStateDeltaRecord delta
+                            && delta.transactionId().equals(txn.transactionId())
+                            && delta.toState() == TransactionStateDeltaState.COMMITTED
+                            && delta.transactionNo().equals(txn.transactionNo())
+                            && delta.reason() == TransactionStateDeltaReason.COMMIT),
+                    "commit MTR must include diagnostic trx state redo");
+            h.txnMgr.commit(txn);
         });
     }
 

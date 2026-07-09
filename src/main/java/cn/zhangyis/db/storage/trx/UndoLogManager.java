@@ -282,6 +282,7 @@ public final class UndoLogManager {
                 if (!ctx.hasUpdateUndo() && headerRepo != null) {
                     writeRsegSlotAfterUndoPage(commitMtr, ctx.slotId(), null);
                 }
+                TransactionStateRedoDeltas.appendCommit(commitMtr, txn);
                 mtrManager.commit(commitMtr);
             } catch (RuntimeException e) {
                 rollbackCommitMtr(commitMtr, e);

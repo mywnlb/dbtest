@@ -6,7 +6,7 @@ import cn.zhangyis.db.domain.SegmentId;
 
 /**
  * FSP 页释放意图 redo。它记录某个 segment 在本 MTR 中释放了一个物理页号；恢复期不重新执行 free-list
- * 或 segment 状态机，真实账本变化由同批 {@link FspMetadataDeltaRecord} 或兼容期 {@link PageBytesRecord} 承载。
+ * 或 segment 状态机，真实账本字段变化由同批 {@link FspMetadataDeltaRecord} 承载。
  *
  * @param freedPageId 被释放的数据页。
  * @param inodeSlot   segment inode 槽位，用于诊断和与 metadata delta 对齐。

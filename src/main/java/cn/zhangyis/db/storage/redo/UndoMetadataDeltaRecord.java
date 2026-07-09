@@ -6,23 +6,23 @@ import cn.zhangyis.db.domain.PageId;
 import java.util.Arrays;
 
 /**
- * FSP metadata 字段 after-image redo。它把“哪个 FSP 元数据对象发生了哪类字段变化”编码为稳定值，
- * 恢复期只按 pageId/offset/afterImage 执行页内 patch，不重新运行 allocator、FLST 或 segment 策略。
+ * Undo/rseg metadata 字段 after-image redo。它把 rollback segment slot、undo page header 和 undo log header 的
+ * 字段变化编码为稳定值；恢复期只执行页内 patch，不重新运行事务提交、slot claim/release、undo append 或 purge 逻辑。
  *
- * <p>0.19d 起生产 MTR 仍通过 PageGuard 写真实页内容和维护 touched-page/pageLSN 语义，但提交给 redo manager
- * 的持久 record 会过滤掉被本 record after-image 精确覆盖的 FSP metadata {@link PageBytesRecord}。因此恢复期
- * 以本 record 作为账本字段的权威 redo，同时继续允许未迁移的物理字节 redo 与它混合回放。
+ * <p>0.19f 起生产 MTR 仍通过 PageGuard 写真实页内容以维持 dirty/pageLSN 语义，但提交视图会过滤掉被本 record
+ * after-image 精确覆盖的 undo metadata {@link PageBytesRecord}。完整 undo record payload 尚未逻辑化，仍继续保留
+ * 物理 {@code PAGE_BYTES}。
  *
- * @param pageId     被 patch 的 FSP 元数据页，当前主要是 page0 或 page2。
+ * @param pageId     被 patch 的 undo/rseg 页。
  * @param kind       稳定磁盘分类，用于审计和边界校验。
- * @param subjectId  extentNo、inodeSlot 或 0，避免恢复依赖 Java 对象图。
- * @param subIndex   bitmap byte、fragment slot 或字段内序号；无子索引时为 0。
+ * @param subjectId  rsegId、segmentId 或 0，避免恢复依赖 Java 对象图。
+ * @param subIndex   slot index、inode slot 或字段内序号；无子索引时为 0。
  * @param offset     页内起始偏移。
  * @param afterImage 要覆盖的 after image；防御性复制。
  */
-public record FspMetadataDeltaRecord(
+public record UndoMetadataDeltaRecord(
         PageId pageId,
-        FspMetadataDeltaKind kind,
+        UndoMetadataDeltaKind kind,
         long subjectId,
         int subIndex,
         int offset,
@@ -31,23 +31,23 @@ public record FspMetadataDeltaRecord(
     /** tag(1)+pageId(12)+kind(1)+subjectId(8)+subIndex(4)+offset(4)+payloadLen(4)。 */
     private static final int HEADER_BYTES = 34;
 
-    public FspMetadataDeltaRecord {
+    public UndoMetadataDeltaRecord {
         if (pageId == null || kind == null) {
-            throw new DatabaseValidationException("FSP metadata delta pageId/kind must not be null");
+            throw new DatabaseValidationException("undo metadata delta pageId/kind must not be null");
         }
         if (subjectId < 0) {
-            throw new DatabaseValidationException("FSP metadata delta subject id must be non-negative: "
+            throw new DatabaseValidationException("undo metadata delta subject id must be non-negative: "
                     + subjectId);
         }
         if (subIndex < 0) {
-            throw new DatabaseValidationException("FSP metadata delta sub-index must be non-negative: "
+            throw new DatabaseValidationException("undo metadata delta sub-index must be non-negative: "
                     + subIndex);
         }
         if (offset < 0) {
-            throw new DatabaseValidationException("FSP metadata delta offset must be non-negative: " + offset);
+            throw new DatabaseValidationException("undo metadata delta offset must be non-negative: " + offset);
         }
         if (afterImage == null || afterImage.length == 0) {
-            throw new DatabaseValidationException("FSP metadata delta after image must not be null or empty");
+            throw new DatabaseValidationException("undo metadata delta after image must not be null or empty");
         }
         afterImage = afterImage.clone();
     }
@@ -71,7 +71,7 @@ public record FspMetadataDeltaRecord(
         if (this == obj) {
             return true;
         }
-        if (!(obj instanceof FspMetadataDeltaRecord that)) {
+        if (!(obj instanceof UndoMetadataDeltaRecord that)) {
             return false;
         }
         return subjectId == that.subjectId

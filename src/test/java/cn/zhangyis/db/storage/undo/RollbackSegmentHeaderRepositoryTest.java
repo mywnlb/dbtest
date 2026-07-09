@@ -13,10 +13,16 @@ import cn.zhangyis.db.storage.fil.io.FileChannelPageStore;
 import cn.zhangyis.db.storage.fil.io.PageStore;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
+import cn.zhangyis.db.storage.redo.RedoRecord;
+import cn.zhangyis.db.storage.redo.UndoMetadataDeltaKind;
+import cn.zhangyis.db.storage.redo.UndoMetadataDeltaRecord;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.ByteBuffer;
 import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -65,6 +71,28 @@ class RollbackSegmentHeaderRepositoryTest {
             mgr.commit(r);
 
             assertEquals(Map.of(UndoSlotId.of(2), firstPage), snap.occupiedSlots());
+        });
+    }
+
+    @Test
+    void writeSlotAppendsUndoMetadataDeltaRedo() {
+        withRepo((repo, mgr) -> {
+            PageId firstPage = PageId.of(UNDO, PageNo.of(7));
+            MiniTransaction w = mgr.begin();
+            repo.format(w, UNDO, RSEG, 8);
+            repo.writeSlot(w, UNDO, UndoSlotId.of(2), firstPage);
+            mgr.commit(w);
+
+            List<RedoRecord> records = mgr.redoLogManager().bufferedRecords();
+            byte[] expected = longBytes(firstPage.pageNo().value());
+            assertTrue(records.stream().anyMatch(record -> record instanceof UndoMetadataDeltaRecord delta
+                            && delta.pageId().equals(RollbackSegmentHeaderRepository.headerPage(UNDO))
+                            && delta.kind() == UndoMetadataDeltaKind.RSEG_SLOT
+                            && delta.subjectId() == RSEG.value()
+                            && delta.subIndex() == 2
+                            && delta.offset() == RollbackSegmentHeaderLayout.slotOffset(2)
+                            && Arrays.equals(expected, delta.afterImage())),
+                    "rseg slot pageNo after-image must have a logical undo metadata redo record");
         });
     }
 
@@ -133,6 +161,10 @@ class RollbackSegmentHeaderRepositoryTest {
             RollbackSegmentHeaderRepository repo = new RollbackSegmentHeaderRepository(pool, PS);
             body.run(repo, new MiniTransactionManager());
         }
+    }
+
+    private static byte[] longBytes(long value) {
+        return ByteBuffer.allocate(Long.BYTES).putLong(value).array();
     }
 
     @FunctionalInterface

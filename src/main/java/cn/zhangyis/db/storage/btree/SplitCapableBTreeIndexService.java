@@ -901,8 +901,10 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         RecordPage rightPage = createSmoIndexPage(mtr, rightId, index.indexId(), 0);
         IndexPageHandle leftHandle = pageAccess.openIndexPageHandle(mtr, leftId, PageLatchMode.EXCLUSIVE);
         IndexPageHandle rightHandle = pageAccess.openIndexPageHandle(mtr, rightId, PageLatchMode.EXCLUSIVE);
-        leftHandle.writeSiblingLinks(FilePageHeader.FIL_NULL, rightId.pageNo().value());
-        rightHandle.writeSiblingLinks(leftId.pageNo().value(), FilePageHeader.FIL_NULL);
+        BTreeRedoDeltas.writeSiblingLinks(mtr, leftHandle, index.indexId(),
+                FilePageHeader.FIL_NULL, rightId.pageNo().value(), "btree root leaf split left sibling link");
+        BTreeRedoDeltas.writeSiblingLinks(mtr, rightHandle, index.indexId(),
+                leftId.pageNo().value(), FilePageHeader.FIL_NULL, "btree root leaf split right sibling link");
 
         RecordRef insertedRef = insertAll(leftPage, leftId, split.left(), index, inserted);
         RecordRef rightInsertedRef = insertAll(rightPage, rightId, split.right(), index, inserted);
@@ -912,7 +914,8 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
 
         RecordPage root = rootHandle.recordPage();
         root.format(index.indexId(), 1);
-        rootHandle.writeSiblingLinks(FilePageHeader.FIL_NULL, FilePageHeader.FIL_NULL);
+        BTreeRedoDeltas.writeSiblingLinks(mtr, rootHandle, index.indexId(),
+                FilePageHeader.FIL_NULL, FilePageHeader.FIL_NULL, "btree root leaf split root sibling reset");
         BTreeIndex after = index.withRootLevel(1);
         insertPointer(root, index.rootPageId(), after, new BTreeNodePointer(lowKey(split.left(), index), leftId));
         insertPointer(root, index.rootPageId(), after, new BTreeNodePointer(lowKey(split.right(), index), rightId));
@@ -1046,13 +1049,17 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         IndexPageHandle newLeafHandle = pageAccess.openIndexPageHandle(mtr, newLeafId, PageLatchMode.EXCLUSIVE);
 
         oldLeaf.format(index.indexId(), 0);
-        oldLeafHandle.writeSiblingLinks(oldLeafHeader.prevPageNo(), newLeafId.pageNo().value());
-        newLeafHandle.writeSiblingLinks(oldLeafId.pageNo().value(), oldLeafHeader.nextPageNo());
+        BTreeRedoDeltas.writeSiblingLinks(mtr, oldLeafHandle, index.indexId(),
+                oldLeafHeader.prevPageNo(), newLeafId.pageNo().value(), "btree non-root leaf split left link");
+        BTreeRedoDeltas.writeSiblingLinks(mtr, newLeafHandle, index.indexId(),
+                oldLeafId.pageNo().value(), oldLeafHeader.nextPageNo(), "btree non-root leaf split new right link");
         if (oldLeafHeader.nextPageNo() != FilePageHeader.FIL_NULL) {
             PageId rightSiblingId = PageId.of(oldLeafId.spaceId(), PageNo.of(oldLeafHeader.nextPageNo()));
             IndexPageHandle rightSibling = openBTreePageOutOfOrder(mtr, rightSiblingId, PageLatchMode.EXCLUSIVE,
                     "btree split FIL right sibling repair: right links are followed in one direction");
-            rightSibling.writeSiblingLinks(newLeafId.pageNo().value(), rightSibling.fileHeader().nextPageNo());
+            BTreeRedoDeltas.writeSiblingLinks(mtr, rightSibling, index.indexId(),
+                    newLeafId.pageNo().value(), rightSibling.fileHeader().nextPageNo(),
+                    "btree non-root leaf split far right repair");
         }
 
         RecordRef insertedRef = insertAll(oldLeaf, oldLeafId, split.left(), index, inserted);
@@ -1104,7 +1111,8 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
 
         RecordPage root = rootHandle.recordPage();
         root.format(index.indexId(), oldLevel + 1);
-        rootHandle.writeSiblingLinks(FilePageHeader.FIL_NULL, FilePageHeader.FIL_NULL);
+        BTreeRedoDeltas.writeSiblingLinks(mtr, rootHandle, index.indexId(),
+                FilePageHeader.FIL_NULL, FilePageHeader.FIL_NULL, "btree internal root split sibling reset");
         BTreeIndex after = index.withRootLevel(oldLevel + 1);
         insertPointer(root, index.rootPageId(), index, new BTreeNodePointer(split.left().get(0).lowKey(), leftId));
         insertPointer(root, index.rootPageId(), index, new BTreeNodePointer(split.right().get(0).lowKey(), rightId));
@@ -1302,12 +1310,15 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
             inserter.insert(survivor, pair.survivorId(), row, index.keyDef(), index.schema());
         }
         long victimNext = victimHandle.fileHeader().nextPageNo();
-        survivorHandle.writeSiblingLinks(survivorHandle.fileHeader().prevPageNo(), victimNext);
+        BTreeRedoDeltas.writeSiblingLinks(mtr, survivorHandle, index.indexId(),
+                survivorHandle.fileHeader().prevPageNo(), victimNext, "btree leaf merge survivor link");
         if (victimNext != FilePageHeader.FIL_NULL) {
             PageId farId = PageId.of(pair.victimId().spaceId(), PageNo.of(victimNext));
             IndexPageHandle far = openBTreePageOutOfOrder(mtr, farId, PageLatchMode.EXCLUSIVE,
                     "btree merge FIL right sibling repair: right links are followed in one direction");
-            far.writeSiblingLinks(pair.survivorId().pageNo().value(), far.fileHeader().nextPageNo());
+            BTreeRedoDeltas.writeSiblingLinks(mtr, far, index.indexId(),
+                    pair.survivorId().pageNo().value(), far.fileHeader().nextPageNo(),
+                    "btree leaf merge far right repair");
         }
     }
 
@@ -1408,7 +1419,8 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
             // 先物化 child 行，再 format(0) 清空 root 重灌（format 重置 nRecs/infimum/supremum）。
             List<LogicalRecord> rows = materializeLeafRecords(child, index);
             root.format(index.indexId(), 0);
-            rootHandle.writeSiblingLinks(FilePageHeader.FIL_NULL, FilePageHeader.FIL_NULL);
+            BTreeRedoDeltas.writeSiblingLinks(mtr, rootHandle, index.indexId(),
+                    FilePageHeader.FIL_NULL, FilePageHeader.FIL_NULL, "btree root shrink to leaf sibling reset");
             for (LogicalRecord row : rows) {
                 inserter.insert(root, index.rootPageId(), row, index.keyDef(), index.schema());
             }
@@ -1418,7 +1430,8 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         }
         List<BTreeNodePointer> pointers = materializePointers(child, index);
         root.format(index.indexId(), childLevel);
-        rootHandle.writeSiblingLinks(FilePageHeader.FIL_NULL, FilePageHeader.FIL_NULL);
+        BTreeRedoDeltas.writeSiblingLinks(mtr, rootHandle, index.indexId(),
+                FilePageHeader.FIL_NULL, FilePageHeader.FIL_NULL, "btree root shrink internal sibling reset");
         writePointers(root, index.rootPageId(), pointers, index);
         freed.add(childId);
         freeSmoPage(mtr, index.nonLeafSegment(), childId);

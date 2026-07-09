@@ -13,16 +13,18 @@ import cn.zhangyis.db.storage.redo.FspMetadataDeltaRecord;
 import java.nio.ByteBuffer;
 
 /**
- * FSP 元数据逻辑 redo 收集小工具。FSP 仓储仍通过 {@link PageGuard} 改页并保留兼容期 {@code PAGE_BYTES}；
- * 本类负责把同一次写入登记为 {@link FspMetadataDeltaRecord}，并在写入期间把物理字节 redo 标成
- * {@link MtrRedoCategory#FSP_METADATA_BYTES} 便于审计。
+ * FSP 元数据逻辑 redo 收集小工具。FSP 仓储仍通过 {@link PageGuard} 改真实页内容，本类把同一次写入登记为
+ * {@link FspMetadataDeltaRecord}，并在写入期间把物理字节监听标成 {@link MtrRedoCategory#FSP_METADATA_BYTES}。
+ *
+ * <p>0.19d 起提交边界会删除被 metadata delta after-image 精确覆盖的 FSP {@code PAGE_BYTES}，从而让逻辑 delta
+ * 成为这些账本字段的持久 redo 来源；未被 delta 覆盖的页信封、生命周期 marker 等物理字节仍保留 {@code PAGE_BYTES}。
  */
 public final class FspRedoDeltas {
 
     private FspRedoDeltas() {
     }
 
-    /** 在 FSP metadata 分类 scope 内执行一段页写入，确保 PageGuard listener 生成的 PAGE_BYTES 带本地分类。 */
+    /** 在 FSP metadata 分类 scope 内执行页写入，使提交过滤器能区分可被逻辑 delta 替代的物理字节。 */
     public static void withFspCategory(MiniTransaction mtr, String reason, Runnable action) {
         requireMtr(mtr);
         if (action == null) {

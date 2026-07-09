@@ -2,13 +2,17 @@ package cn.zhangyis.db.storage.redo;
 
 /**
  * 持久 redo 记录。基础物理记录包括页初始化 {@link PageInitRecord} 与页内字节覆盖 {@link PageBytesRecord}；
- * 0.19b 起增加 FSP 页分配意图 {@link FspPageAllocationRecord}；0.19c 起增加 FSP metadata delta 与 page-free intent。
+ * 0.19b 起增加 FSP 页分配意图 {@link FspPageAllocationRecord}；0.19c 起增加 FSP metadata delta 与 page-free intent；
+ * 0.19d 起 FSP metadata delta 可替代被其 after-image 精确覆盖的物理 {@code PAGE_BYTES}；0.19e 起增加
+ * undo/rseg metadata delta；0.19g/0.19h/0.19i 起分别增加 undo record payload、B+Tree 结构页 delta 与
+ * non-page transaction state logical redo。
  * record 定义保持纯值，不依赖 repository/PageGuard 或恢复编排实现。
  *
  * <p>记录本身不带 LSN 字段；LSN 由 {@link RedoLogManager#append} 以 batch 区间分配，per-record LSN 元数据留后续切片。
  */
-public sealed interface RedoRecord permits FspMetadataDeltaRecord, FspPageAllocationRecord, FspPageFreeRecord,
-        PageBytesRecord, PageInitRecord {
+public sealed interface RedoRecord permits BTreePageDeltaRecord, FspMetadataDeltaRecord, FspPageAllocationRecord,
+        FspPageFreeRecord, PageBytesRecord, PageInitRecord, TransactionStateDeltaRecord, UndoMetadataDeltaRecord,
+        UndoRecordPayloadRecord {
 
     /**
      * 落盘字节数（权威值，非估算）。R1 之后该值必须精确等于 {@code RedoLogFileRepository} 的文件编码长度

@@ -31,7 +31,7 @@ public final class UndoLog {
             throw new DatabaseValidationException("undo append page must not be null");
         }
         byte[] payload = codec.encode(rec, keyDef, schema);
-        int offset = page.appendRecord(payload, rec.undoNo());
+        int offset = page.appendRecord(payload, rec.transactionId(), rec.undoNo());
         return new RollPointer(true, page.pageId().pageNo(), offset);
     }
 

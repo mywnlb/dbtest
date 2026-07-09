@@ -1,9 +1,9 @@
 package cn.zhangyis.db.storage.mtr;
 
 /**
- * MTR 本地 redo 分类。它不是持久 redo type，也不会写入 redo 文件；当前持久格式仍只有
- * {@code PAGE_INIT}/{@code PAGE_BYTES}。分类只用于约束调用方在收集物理字节 redo 时说明语义来源，
- * 方便测试、诊断以及后续逐步迁移到更细的 MLOG 命令。
+ * MTR 本地 redo 分类。它不是持久 redo type，也不会写入 redo 文件；持久格式由
+ * {@link cn.zhangyis.db.storage.redo.RedoRecord} 子类型决定。分类只用于约束调用方在收集物理字节 redo
+ * 或追加逻辑 redo 时说明语义来源，方便测试、诊断以及后续逐步迁移到更细的 MLOG 命令。
  */
 public enum MtrRedoCategory {
 
@@ -22,6 +22,9 @@ public enum MtrRedoCategory {
     /** FSP space header、XDES、segment inode 等空间管理元数据产生的字节写。 */
     FSP_METADATA_BYTES,
 
-    /** Undo 页头、undo record、undo FIL 链维护等 undo 子系统产生的字节写。 */
-    UNDO_PAGE_BYTES
+    /** Undo 页头、undo record、undo FIL 链维护等 undo 子系统产生的字节写；只有被逻辑 delta 精确覆盖的字节可替代。 */
+    UNDO_PAGE_BYTES,
+
+    /** Non-page 事务状态 logical redo；用于 commit/rollback 边界诊断，不对应任何 PageGuard 字节写。 */
+    TRX_STATE
 }

@@ -6,8 +6,8 @@ import cn.zhangyis.db.domain.SegmentId;
 
 /**
  * FSP 页分配意图 redo。它记录某个 segment 在本 MTR 中获得了一个物理页号，恢复阶段只据此确保物理
- * 文件至少覆盖该页；page0/page2/XDES/INODE 的权威元数据仍由同一 batch 内的 {@link PageBytesRecord}
- * 重放。
+ * 文件至少覆盖该页；page0/page2/XDES/INODE 的账本字段由同一 batch 内的 {@link FspMetadataDeltaRecord}
+ * 重放，未迁移的页信封或生命周期字节仍可由 {@link PageBytesRecord} 保护。
  *
  * <p>该 record 不携带 Java allocator 决策对象，也不要求 recovery 重新选择 free-list 或 segment extent。
  * 这样可以把 0.19b 控制在“持久逻辑 record + handler 接线”的范围内，同时避免恢复期重新执行前台分配策略。

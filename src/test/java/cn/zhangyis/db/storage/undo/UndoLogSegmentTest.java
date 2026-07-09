@@ -17,6 +17,11 @@ import cn.zhangyis.db.storage.fil.io.PageStore;
 import cn.zhangyis.db.storage.fsp.exception.NoFreeSpaceException;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
+import cn.zhangyis.db.storage.redo.PageBytesRecord;
+import cn.zhangyis.db.storage.redo.RedoRecord;
+import cn.zhangyis.db.storage.redo.UndoMetadataDeltaKind;
+import cn.zhangyis.db.storage.redo.UndoMetadataDeltaRecord;
+import cn.zhangyis.db.storage.redo.UndoRecordPayloadRecord;
 import cn.zhangyis.db.storage.record.schema.ColumnDef;
 import cn.zhangyis.db.storage.record.schema.ColumnId;
 import cn.zhangyis.db.storage.record.schema.ColumnType;
@@ -32,6 +37,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -124,6 +130,54 @@ class UndoLogSegmentTest {
             assertTrue(seg.isCommitted());
             assertEquals(TransactionNo.of(42), seg.committedTransactionNo(),
                     "COMMIT_NO is the recovery-time history ordering key");
+        });
+    }
+
+    @Test
+    void markCommittedAppendsUndoMetadataDeltaRedoForStateAndCommitNo() {
+        onAccess((mgr, access) -> {
+            MiniTransaction m = mgr.begin();
+            UndoLogSegment seg = access.create(m, UNDO_SPACE, TransactionId.of(7));
+            seg.markCommitted(TransactionNo.of(42));
+            mgr.commit(m);
+
+            List<RedoRecord> records = mgr.redoLogManager().bufferedRecords();
+            PageId firstPage = seg.firstPageId();
+            assertTrue(records.stream().anyMatch(record -> record instanceof UndoMetadataDeltaRecord delta
+                            && delta.pageId().equals(firstPage)
+                            && delta.kind() == UndoMetadataDeltaKind.UNDO_LOG_HEADER_FIELD
+                            && delta.offset() == UndoPageLayout.STATE
+                            && Arrays.equals(new byte[]{UndoPageLayout.STATE_COMMITTED}, delta.afterImage())),
+                    "STATE=COMMITTED must have logical undo metadata redo");
+            assertTrue(records.stream().anyMatch(record -> record instanceof UndoMetadataDeltaRecord delta
+                            && delta.pageId().equals(firstPage)
+                            && delta.kind() == UndoMetadataDeltaKind.UNDO_LOG_HEADER_FIELD
+                            && delta.offset() == UndoPageLayout.COMMIT_NO
+                            && Arrays.equals(longBytes(42L), delta.afterImage())),
+                    "COMMIT_NO after-image must have logical undo metadata redo");
+        });
+    }
+
+    @Test
+    void appendRecordPayloadUsesLogicalRedoWithoutPhysicalSlotBytes() {
+        onAccess((mgr, access) -> {
+            MiniTransaction m = mgr.begin();
+            UndoLogSegment seg = access.create(m, UNDO_SPACE, TransactionId.of(7));
+            RollPointer rp = seg.append(rec(1, 100, RollPointer.NULL), keyDef(), schema());
+            PageId firstPage = seg.firstPageId();
+            mgr.commit(m);
+
+            List<RedoRecord> records = mgr.redoLogManager().bufferedRecords();
+            assertTrue(records.stream().anyMatch(record -> record instanceof UndoRecordPayloadRecord payload
+                            && payload.pageId().equals(firstPage)
+                            && payload.transactionId().equals(TransactionId.of(7))
+                            && payload.undoNo().equals(UndoNo.of(1))
+                            && payload.recordOffset() == rp.offset()),
+                    "ordinary undo record slot must have dedicated logical redo");
+            assertFalse(records.stream().anyMatch(record -> record instanceof PageBytesRecord bytes
+                            && bytes.pageId().equals(firstPage)
+                            && bytes.offset() == rp.offset()),
+                    "covered undo record slot PAGE_BYTES should be filtered at commit");
         });
     }
 
@@ -441,6 +495,10 @@ class UndoLogSegmentTest {
             mgr.commit(boot);
             body.run(mgr, access);
         }
+    }
+
+    private static byte[] longBytes(long value) {
+        return ByteBuffer.allocate(Long.BYTES).putLong(value).array();
     }
 
     /**

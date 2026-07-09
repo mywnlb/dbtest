@@ -15,8 +15,9 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * PAGE_INIT/PAGE_BYTES/FSP metadata delta 的物理页回放 handler。它按批次缓存同页修改，先应用批内所有记录，
- * 再把 pageLSN 盖到 batch endLsn。
+ * PAGE_INIT/PAGE_BYTES/FSP metadata delta/undo metadata delta/undo payload/B+Tree page delta 的物理页回放 handler。
+ * 它按批次缓存同页修改，
+ * 先应用批内所有记录，再把 pageLSN 盖到 batch endLsn。
  *
  * <p>这个顺序很关键：D3/D4 的 MTR commit 语义是“批内所有修改共享 endLsn”。若 PAGE_INIT 后立即盖 pageLSN，
  * 同批后续 PAGE_BYTES 会被 pageLSN 幂等判断误跳过，导致恢复页半成品。
@@ -27,7 +28,10 @@ public final class PageRedoApplyHandler implements RedoApplyHandler {
     public boolean supports(RedoRecord record) {
         return record instanceof PageInitRecord
                 || record instanceof PageBytesRecord
-                || record instanceof FspMetadataDeltaRecord;
+                || record instanceof FspMetadataDeltaRecord
+                || record instanceof UndoMetadataDeltaRecord
+                || record instanceof UndoRecordPayloadRecord
+                || record instanceof BTreePageDeltaRecord;
     }
 
     @Override
@@ -102,11 +106,11 @@ public final class PageRedoApplyHandler implements RedoApplyHandler {
                     // PAGE_INIT 是唯一的建页记录：崩溃后物理文件可能被截短到该页之前，按需扩容使其可写。
                     ensureReplayCapacity(context, pageId);
                 } else if (isBeyondFileEnd(context, pageId)) {
-                    // 首触是 PAGE_BYTES 却越过物理文件尾：该页从未经 PAGE_INIT 建立，凭空造页属于 redo 损坏，
+                    // 首触是页 patch 却越过物理文件尾：该页从未经 PAGE_INIT 建立，凭空造页属于 redo 损坏，
                     // 不得静默扩容补一个半成品页。正确的 fuzzy checkpoint 下不会出现该情形（未刷的建页 redo 不会被
                     // checkpoint 越过），故判损坏而非容忍。
                     throw new RedoLogCorruptedException(
-                            "redo PAGE_BYTES targets uninitialized page beyond data file size: " + pageId);
+                            "redo page patch targets uninitialized page beyond data file size: " + pageId);
                 }
                 byte[] current = readPage(context, pageId);
                 if (pageLsn(current).value() >= range.end().value()) {
@@ -123,6 +127,12 @@ public final class PageRedoApplyHandler implements RedoApplyHandler {
                 applyBytes(context, page, pbr);
             } else if (record instanceof FspMetadataDeltaRecord fmd) {
                 applyMetadataDelta(context, page, fmd);
+            } else if (record instanceof UndoMetadataDeltaRecord umd) {
+                applyUndoMetadataDelta(context, page, umd);
+            } else if (record instanceof UndoRecordPayloadRecord urp) {
+                applyUndoRecordPayload(context, page, urp);
+            } else if (record instanceof BTreePageDeltaRecord btd) {
+                applyBTreePageDelta(context, page, btd);
             } else {
                 throw new RedoLogCorruptedException("unsupported redo record type: " + record.getClass().getName());
             }
@@ -144,11 +154,38 @@ public final class PageRedoApplyHandler implements RedoApplyHandler {
     }
 
     /**
-     * FSP metadata delta 与 PAGE_BYTES 共用同一个 batch page cache。这样同一 MTR 内 metadata delta 和兼容期
-     * PAGE_BYTES 指向同一 page0/page2 时，恢复只会读一次、批末写一次，避免两个 handler 各自缓存并覆盖彼此修改。
+     * FSP metadata delta 与 PAGE_BYTES 共用同一个 batch page cache。这样同一 MTR 内 metadata delta 和仍需物理
+     * 保护的 PAGE_BYTES 指向同一 page0/page2 时，恢复只会读一次、批末写一次，避免两个 handler 各自缓存并覆盖彼此修改。
      */
     private static void applyMetadataDelta(RedoApplyContext context, ReplayPage page, FspMetadataDeltaRecord record) {
         applyPatch(context, page, record.offset(), record.afterImage(), "redo FSP metadata delta");
+    }
+
+    /**
+     * Undo/rseg metadata delta 同样只做页内 after-image patch。恢复期不能重新执行事务提交、slot release 或 undo append
+     * 状态机，否则会把 crash recovery 变成普通运行时逻辑并破坏幂等边界。
+     */
+    private static void applyUndoMetadataDelta(RedoApplyContext context, ReplayPage page,
+                                               UndoMetadataDeltaRecord record) {
+        applyPatch(context, page, record.offset(), record.afterImage(), "redo undo metadata delta");
+    }
+
+    /**
+     * 完整 undo record payload 只做页内槽 after-image patch。恢复期不能重新执行 appendRecord，否则会重复推进
+     * undo page header 和 first-page log header。
+     */
+    private static void applyUndoRecordPayload(RedoApplyContext context, ReplayPage page,
+                                               UndoRecordPayloadRecord record) {
+        applyPatch(context, page, record.recordOffset(), record.slotImage(), "redo undo record payload");
+    }
+
+    /**
+     * B+Tree 结构 delta 同样只做页内 after-image patch。恢复期不重新运行 split/merge/root shrink 算法，
+     * 避免把 redo replay 变成普通运行时结构调整。
+     */
+    private static void applyBTreePageDelta(RedoApplyContext context, ReplayPage page,
+                                            BTreePageDeltaRecord record) {
+        applyPatch(context, page, record.offset(), record.afterImage(), "redo B+Tree page delta");
     }
 
     private static void applyPatch(RedoApplyContext context, ReplayPage page, int offset, byte[] patch, String what) {
@@ -210,6 +247,15 @@ public final class PageRedoApplyHandler implements RedoApplyHandler {
         }
         if (record instanceof FspMetadataDeltaRecord fmd) {
             return fmd.pageId();
+        }
+        if (record instanceof UndoMetadataDeltaRecord umd) {
+            return umd.pageId();
+        }
+        if (record instanceof UndoRecordPayloadRecord urp) {
+            return urp.pageId();
+        }
+        if (record instanceof BTreePageDeltaRecord btd) {
+            return btd.pageId();
         }
         throw new RedoLogCorruptedException("unsupported redo record type: " + record.getClass().getName());
     }

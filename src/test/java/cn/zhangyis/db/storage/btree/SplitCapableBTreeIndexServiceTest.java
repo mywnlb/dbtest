@@ -39,12 +39,16 @@ import cn.zhangyis.db.storage.record.schema.KeyPartDef;
 import cn.zhangyis.db.storage.record.schema.TableSchema;
 import cn.zhangyis.db.storage.record.type.ColumnValue;
 import cn.zhangyis.db.storage.record.type.TypeCodecRegistry;
+import cn.zhangyis.db.storage.redo.BTreePageDeltaKind;
+import cn.zhangyis.db.storage.redo.BTreePageDeltaRecord;
+import cn.zhangyis.db.storage.redo.PageBytesRecord;
 import cn.zhangyis.db.storage.redo.RedoApplyContext;
 import cn.zhangyis.db.storage.redo.RedoApplyDispatcher;
 import cn.zhangyis.db.storage.redo.RedoLogBatch;
 import cn.zhangyis.db.storage.redo.RedoLogFileRepository;
 import cn.zhangyis.db.storage.redo.RedoRecoveryReader;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
+import cn.zhangyis.db.storage.redo.RedoRecord;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -234,6 +238,58 @@ class SplitCapableBTreeIndexServiceTest {
             assertEquals(List.of(1L, 2L, 3L, 4L), ids);
             assertLeafLinksAreBidirectional(ctx, current);
         });
+    }
+
+    @Test
+    void rootSplitEmitsBtreeSiblingLinkDeltasWithoutPhysicalSiblingBytes() {
+        onBTreePool((ctx) -> {
+            BTreeIndex current = ctx.insertWideRows(1, 4);
+
+            List<RedoRecord> records = ctx.mgr.redoLogManager().bufferedRecords();
+            List<BTreePageDeltaRecord> siblingDeltas = records.stream()
+                    .filter(BTreePageDeltaRecord.class::isInstance)
+                    .map(BTreePageDeltaRecord.class::cast)
+                    .filter(delta -> delta.indexId() == INDEX_ID)
+                    .filter(delta -> delta.kind() == BTreePageDeltaKind.SIBLING_LINKS)
+                    .toList();
+
+            assertFalse(siblingDeltas.isEmpty(), "root split must log B+Tree sibling-link logical deltas");
+            for (RedoLogBatch batch : ctx.mgr.redoLogManager().bufferedBatches()) {
+                for (BTreePageDeltaRecord delta : batch.records().stream()
+                        .filter(BTreePageDeltaRecord.class::isInstance)
+                        .map(BTreePageDeltaRecord.class::cast)
+                        .filter(delta -> delta.indexId() == INDEX_ID)
+                        .filter(delta -> delta.kind() == BTreePageDeltaKind.SIBLING_LINKS)
+                        .toList()) {
+                    assertFalse(batch.records().stream().anyMatch(record -> record instanceof PageBytesRecord bytes
+                                    && isCoveredBy(delta, bytes)),
+                            "covered sibling-link PAGE_BYTES should be filtered for " + delta.pageId());
+                }
+            }
+            assertLeafLinksAreBidirectional(ctx, current);
+        });
+    }
+
+    private static boolean isCoveredBy(BTreePageDeltaRecord delta, PageBytesRecord bytes) {
+        if (!bytes.pageId().equals(delta.pageId())) {
+            return false;
+        }
+        long physicalStart = bytes.offset();
+        long physicalEnd = physicalStart + bytes.bytes().length;
+        long logicalStart = delta.offset();
+        long logicalEnd = logicalStart + delta.afterImage().length;
+        if (physicalStart < logicalStart || physicalEnd > logicalEnd) {
+            return false;
+        }
+        byte[] physical = bytes.bytes();
+        byte[] logical = delta.afterImage();
+        int deltaOffset = (int) (physicalStart - logicalStart);
+        for (int i = 0; i < physical.length; i++) {
+            if (physical[i] != logical[deltaOffset + i]) {
+                return false;
+            }
+        }
+        return true;
     }
 
     @Test

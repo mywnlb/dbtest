@@ -1,5 +1,6 @@
 package cn.zhangyis.db.storage.trx;
 
+import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
@@ -7,6 +8,7 @@ import cn.zhangyis.db.domain.RollPointer;
 import cn.zhangyis.db.domain.RollbackSegmentId;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.domain.TransactionId;
+import cn.zhangyis.db.domain.UndoNo;
 import cn.zhangyis.db.storage.api.DiskSpaceManager;
 import cn.zhangyis.db.storage.api.DiskSpaceUndoAllocator;
 import cn.zhangyis.db.storage.api.index.IndexPageAccess;
@@ -36,6 +38,10 @@ import cn.zhangyis.db.storage.record.schema.KeyPartDef;
 import cn.zhangyis.db.storage.record.schema.TableSchema;
 import cn.zhangyis.db.storage.record.type.ColumnValue;
 import cn.zhangyis.db.storage.record.type.TypeCodecRegistry;
+import cn.zhangyis.db.storage.redo.RedoRecord;
+import cn.zhangyis.db.storage.redo.TransactionStateDeltaReason;
+import cn.zhangyis.db.storage.redo.TransactionStateDeltaRecord;
+import cn.zhangyis.db.storage.redo.TransactionStateDeltaState;
 import cn.zhangyis.db.storage.undo.UndoLogSegmentAccess;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -44,6 +50,8 @@ import java.nio.file.Path;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -51,7 +59,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * （assignWriteId → beforeInsert → insertClustered → rollback），无生产组合根。覆盖：单行/多行 full rollback、
  * orphan undo 幂等、只读/未写事务仅翻状态。
  *
- * <p><b>非目标</b>（T1.3e+）：UPDATE/DELETE undo、savepoint/statement rollback、恢复期 rollback、undo 页回收。
+ * <p><b>当前覆盖</b>：完整 rollback、INSERT/UPDATE/DELETE_MARK 反向命令、storage 内部 savepoint rollback。
+ * <b>非目标</b>：SQL/session statement 入口、多索引 rollback、undo 页回收。
  */
 class RollbackServiceTest {
 
@@ -86,6 +95,12 @@ class RollbackServiceTest {
 
             assertEquals(1, summary.undoRecordsApplied(), "one INSERT undo applied");
             assertEquals(TransactionState.ROLLED_BACK, txn.state());
+            List<RedoRecord> records = ctx.mgr.redoLogManager().bufferedRecords();
+            assertTrue(records.stream().anyMatch(record -> record instanceof TransactionStateDeltaRecord delta
+                            && delta.transactionId().equals(wid)
+                            && delta.toState() == TransactionStateDeltaState.ROLLED_BACK
+                            && delta.reason() == TransactionStateDeltaReason.ROLLBACK),
+                    "rollback completion must write diagnostic trx state redo before finishRollback");
             assertEquals(0, ctx.slots.activeSlotCount(), "slot released after rollback");
             MiniTransaction r = ctx.mgr.begin();
             assertTrue(svc.lookup(r, index, search(1)).isEmpty(), "inserted row removed by rollback");
@@ -119,6 +134,199 @@ class RollbackServiceTest {
             for (int i = 1; i <= 3; i++) {
                 assertTrue(svc.lookup(r, index, search(i)).isEmpty(), "row " + i + " removed");
             }
+            ctx.mgr.commit(r);
+        });
+    }
+
+    @Test
+    void rollbackToSavepointRemovesOnlyLaterInsertAndKeepsTransactionActive() {
+        onPool(ctx -> {
+            ctx.boot();
+            SplitCapableBTreeIndexService svc = ctx.service();
+            BTreeIndex index = ctx.clusteredIndex();
+
+            Transaction txn = ctx.txnMgr.begin(TransactionOptions.defaults());
+            TransactionId wid = ctx.txnMgr.assignWriteId(txn);
+            MiniTransaction first = ctx.mgr.begin();
+            RollPointer rp1 = ctx.undoMgr.beforeInsert(txn, first, TABLE_ID, INDEX_ID,
+                    key(1), index.keyDef(), index.schema());
+            svc.insertClustered(first, index, row(1), wid, rp1);
+            ctx.mgr.commit(first);
+            TransactionSavepoint savepoint = ctx.rollbackService.createSavepoint(txn);
+
+            MiniTransaction second = ctx.mgr.begin();
+            RollPointer rp2 = ctx.undoMgr.beforeInsert(txn, second, TABLE_ID, INDEX_ID,
+                    key(2), index.keyDef(), index.schema());
+            svc.insertClustered(second, index, row(2), wid, rp2);
+            ctx.mgr.commit(second);
+
+            RollbackSummary summary = ctx.rollbackService.rollbackToSavepoint(txn, index, savepoint);
+
+            assertEquals(1, summary.undoRecordsApplied(), "only undo after the savepoint is applied");
+            assertEquals(TransactionState.ACTIVE, txn.state(), "savepoint rollback must not finish the transaction");
+            assertEquals(1, ctx.slots.activeSlotCount(), "partial rollback keeps the undo slot owned by the transaction");
+            assertFalse(ctx.mgr.redoLogManager().bufferedRecords().stream()
+                            .anyMatch(record -> record instanceof TransactionStateDeltaRecord),
+                    "partial rollback must not emit transaction terminal-state redo");
+            MiniTransaction r = ctx.mgr.begin();
+            assertTrue(svc.lookup(r, index, search(1)).isPresent(), "row before savepoint remains visible");
+            assertTrue(svc.lookup(r, index, search(2)).isEmpty(), "row after savepoint is removed");
+            ctx.mgr.commit(r);
+        });
+    }
+
+    @Test
+    void rollbackToSavepointRejectsForeignSavepointBeforeApplyingUndo() {
+        onPool(ctx -> {
+            ctx.boot();
+            SplitCapableBTreeIndexService svc = ctx.service();
+            BTreeIndex index = ctx.clusteredIndex();
+            Transaction txn = ctx.txnMgr.begin(TransactionOptions.defaults());
+            TransactionId wid = ctx.txnMgr.assignWriteId(txn);
+            MiniTransaction m = ctx.mgr.begin();
+            RollPointer rp = ctx.undoMgr.beforeInsert(txn, m, TABLE_ID, INDEX_ID,
+                    key(1), index.keyDef(), index.schema());
+            svc.insertClustered(m, index, row(1), wid, rp);
+            ctx.mgr.commit(m);
+            TransactionSavepoint foreign = new TransactionSavepoint(txn, UndoNo.NONE, RollPointer.NULL, 99);
+
+            assertThrows(DatabaseValidationException.class,
+                    () -> ctx.rollbackService.rollbackToSavepoint(txn, index, foreign));
+
+            assertEquals(TransactionState.ACTIVE, txn.state(), "failed partial rollback keeps transaction ACTIVE");
+            MiniTransaction r = ctx.mgr.begin();
+            assertTrue(svc.lookup(r, index, search(1)).isPresent(),
+                    "foreign savepoint must be rejected before any undo record is applied");
+            ctx.mgr.commit(r);
+        });
+    }
+
+    @Test
+    void rollbackToLatestSavepointIsNoopAndDoesNotWriteTransactionStateRedo() {
+        onPool(ctx -> {
+            ctx.boot();
+            SplitCapableBTreeIndexService svc = ctx.service();
+            BTreeIndex index = ctx.clusteredIndex();
+            Transaction txn = ctx.txnMgr.begin(TransactionOptions.defaults());
+            TransactionId wid = ctx.txnMgr.assignWriteId(txn);
+            MiniTransaction m = ctx.mgr.begin();
+            RollPointer rp = ctx.undoMgr.beforeInsert(txn, m, TABLE_ID, INDEX_ID,
+                    key(1), index.keyDef(), index.schema());
+            svc.insertClustered(m, index, row(1), wid, rp);
+            ctx.mgr.commit(m);
+            TransactionSavepoint savepoint = txn.undoContext().createSavepoint(txn);
+
+            RollbackSummary summary = ctx.rollbackService.rollbackToSavepoint(txn, index, savepoint);
+
+            assertEquals(0, summary.undoRecordsApplied());
+            assertEquals(TransactionState.ACTIVE, txn.state());
+            assertFalse(ctx.mgr.redoLogManager().bufferedRecords().stream()
+                            .anyMatch(record -> record instanceof TransactionStateDeltaRecord),
+                    "no-op savepoint rollback must not emit terminal transaction redo");
+            MiniTransaction r = ctx.mgr.begin();
+            assertTrue(svc.lookup(r, index, search(1)).isPresent());
+            ctx.mgr.commit(r);
+        });
+    }
+
+    @Test
+    void rollbackToSavepointRestoresUpdatedRowAndNextUndoNoDoesNotReuseRolledBackRecord() {
+        onPool(ctx -> {
+            ctx.boot();
+            SplitCapableBTreeIndexService svc = ctx.service();
+            BTreeIndex index = ctx.clusteredIndex();
+            Transaction txn = ctx.txnMgr.begin(TransactionOptions.defaults());
+            TransactionId wid = ctx.txnMgr.assignWriteId(txn);
+            MiniTransaction insert = ctx.mgr.begin();
+            RollPointer insRp = ctx.undoMgr.beforeInsert(txn, insert, TABLE_ID, INDEX_ID,
+                    key(1), index.keyDef(), index.schema());
+            svc.insertClustered(insert, index, row(1), wid, insRp);
+            ctx.mgr.commit(insert);
+            TransactionSavepoint savepoint = txn.undoContext().createSavepoint(txn);
+            updateRow(ctx, svc, index, txn, wid, 1, "v2");
+
+            RollbackSummary summary = ctx.rollbackService.rollbackToSavepoint(txn, index, savepoint);
+
+            assertEquals(1, summary.undoRecordsApplied());
+            MiniTransaction chk = ctx.mgr.begin();
+            assertEquals("payload-1", payloadOf(svc.lookup(chk, index, search(1)).orElseThrow()));
+            ctx.mgr.commit(chk);
+            assertEquals(UndoNo.of(2), txn.undoContext().lastUndoNo(),
+                    "rolled-back update undo remains part of append history");
+            assertEquals(UndoNo.of(1), txn.undoContext().logicalLastUndoNo(),
+                    "logical chain returns to the insert boundary");
+
+            updateRow(ctx, svc, index, txn, wid, 1, "v3");
+
+            assertEquals(UndoNo.of(3), txn.undoContext().lastUndoNo(),
+                    "next write must allocate a fresh undoNo instead of reusing the rolled-back update undoNo");
+            assertEquals(UndoNo.of(3), txn.undoContext().logicalLastUndoNo());
+        });
+    }
+
+    @Test
+    void rollbackToSavepointRestoresDeleteMarkedRow() {
+        onPool(ctx -> {
+            ctx.boot();
+            SplitCapableBTreeIndexService svc = ctx.service();
+            BTreeIndex index = ctx.clusteredIndex();
+            Transaction txn = ctx.txnMgr.begin(TransactionOptions.defaults());
+            TransactionId wid = ctx.txnMgr.assignWriteId(txn);
+            MiniTransaction insert = ctx.mgr.begin();
+            RollPointer insRp = ctx.undoMgr.beforeInsert(txn, insert, TABLE_ID, INDEX_ID,
+                    key(1), index.keyDef(), index.schema());
+            svc.insertClustered(insert, index, row(1), wid, insRp);
+            ctx.mgr.commit(insert);
+            TransactionSavepoint savepoint = txn.undoContext().createSavepoint(txn);
+            deleteMarkRow(ctx, svc, index, txn, wid, 1);
+
+            RollbackSummary summary = ctx.rollbackService.rollbackToSavepoint(txn, index, savepoint);
+
+            assertEquals(1, summary.undoRecordsApplied());
+            assertEquals(TransactionState.ACTIVE, txn.state());
+            MiniTransaction r = ctx.mgr.begin();
+            BTreeLookupResult found = svc.lookup(r, index, search(1)).orElseThrow();
+            ctx.mgr.commit(r);
+            assertEquals("payload-1", payloadOf(found), "delete-mark after savepoint is undone");
+            assertEquals(insRp, found.record().hiddenColumns().dbRollPtr(),
+                    "hidden columns return to the savepoint-era version chain head");
+        });
+    }
+
+    @Test
+    void fullRollbackAfterPartialRollbackWalksOnlyCurrentLogicalChain() {
+        onPool(ctx -> {
+            ctx.boot();
+            SplitCapableBTreeIndexService svc = ctx.service();
+            BTreeIndex index = ctx.clusteredIndex();
+            Transaction txn = ctx.txnMgr.begin(TransactionOptions.defaults());
+            TransactionId wid = ctx.txnMgr.assignWriteId(txn);
+            MiniTransaction first = ctx.mgr.begin();
+            RollPointer rp1 = ctx.undoMgr.beforeInsert(txn, first, TABLE_ID, INDEX_ID,
+                    key(1), index.keyDef(), index.schema());
+            svc.insertClustered(first, index, row(1), wid, rp1);
+            ctx.mgr.commit(first);
+            TransactionSavepoint savepoint = txn.undoContext().createSavepoint(txn);
+            MiniTransaction second = ctx.mgr.begin();
+            RollPointer rp2 = ctx.undoMgr.beforeInsert(txn, second, TABLE_ID, INDEX_ID,
+                    key(2), index.keyDef(), index.schema());
+            svc.insertClustered(second, index, row(2), wid, rp2);
+            ctx.mgr.commit(second);
+            ctx.rollbackService.rollbackToSavepoint(txn, index, savepoint);
+            MiniTransaction third = ctx.mgr.begin();
+            RollPointer rp3 = ctx.undoMgr.beforeInsert(txn, third, TABLE_ID, INDEX_ID,
+                    key(3), index.keyDef(), index.schema());
+            svc.insertClustered(third, index, row(3), wid, rp3);
+            ctx.mgr.commit(third);
+
+            RollbackSummary summary = ctx.rollbackService.rollback(txn, index);
+
+            assertEquals(2, summary.undoRecordsApplied(),
+                    "full rollback walks row3 -> row1; row2 was detached by partial rollback");
+            MiniTransaction r = ctx.mgr.begin();
+            assertTrue(svc.lookupIncludingDeleted(r, index, search(1)).isEmpty());
+            assertTrue(svc.lookupIncludingDeleted(r, index, search(2)).isEmpty());
+            assertTrue(svc.lookupIncludingDeleted(r, index, search(3)).isEmpty());
             ctx.mgr.commit(r);
         });
     }

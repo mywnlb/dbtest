@@ -15,6 +15,7 @@ import cn.zhangyis.db.storage.page.FilePageHeader;
 import cn.zhangyis.db.storage.page.PageEnvelope;
 import cn.zhangyis.db.storage.page.PageEnvelopeLayout;
 import cn.zhangyis.db.storage.page.PageType;
+import cn.zhangyis.db.storage.redo.UndoMetadataDeltaKind;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -63,15 +64,26 @@ public final class RollbackSegmentHeaderRepository {
             throw new DatabaseValidationException("rollback segment id must not be null");
         }
         validateCapacity(slotCapacity);
-        PageGuard g = mtr.newPage(pool, headerPage(spaceId), PageLatchMode.EXCLUSIVE, PageType.RSEG_HEADER);
+        PageId pageId = headerPage(spaceId);
+        PageGuard g = mtr.newPage(pool, pageId, PageLatchMode.EXCLUSIVE, PageType.RSEG_HEADER);
         PageEnvelope.writeHeader(g, new FilePageHeader(spaceId, RollbackSegmentHeaderLayout.RSEG_HEADER_PAGE_NO,
                 FilePageHeader.FIL_NULL, FilePageHeader.FIL_NULL, 0L, PageType.RSEG_HEADER));
-        g.writeInt(RollbackSegmentHeaderLayout.MAGIC, RollbackSegmentHeaderLayout.MAGIC_VALUE);
-        g.writeInt(RollbackSegmentHeaderLayout.FORMAT, RollbackSegmentHeaderLayout.FORMAT_VERSION);
-        g.writeInt(RollbackSegmentHeaderLayout.RSEG_ID, rsegId.value());
-        g.writeInt(RollbackSegmentHeaderLayout.SLOT_CAPACITY, slotCapacity);
+        UndoRedoDeltas.writeInt(mtr, g, pageId, UndoMetadataDeltaKind.RSEG_HEADER_FIELD,
+                rsegId.value(), 0, RollbackSegmentHeaderLayout.MAGIC,
+                RollbackSegmentHeaderLayout.MAGIC_VALUE, "format rseg header magic");
+        UndoRedoDeltas.writeInt(mtr, g, pageId, UndoMetadataDeltaKind.RSEG_HEADER_FIELD,
+                rsegId.value(), 0, RollbackSegmentHeaderLayout.FORMAT,
+                RollbackSegmentHeaderLayout.FORMAT_VERSION, "format rseg header version");
+        UndoRedoDeltas.writeInt(mtr, g, pageId, UndoMetadataDeltaKind.RSEG_HEADER_FIELD,
+                rsegId.value(), 0, RollbackSegmentHeaderLayout.RSEG_ID,
+                rsegId.value(), "format rseg header id");
+        UndoRedoDeltas.writeInt(mtr, g, pageId, UndoMetadataDeltaKind.RSEG_HEADER_FIELD,
+                rsegId.value(), 0, RollbackSegmentHeaderLayout.SLOT_CAPACITY,
+                slotCapacity, "format rseg slot capacity");
         for (int i = 0; i < slotCapacity; i++) {
-            g.writeLong(RollbackSegmentHeaderLayout.slotOffset(i), FilePageHeader.FIL_NULL);
+            UndoRedoDeltas.writeLong(mtr, g, pageId, UndoMetadataDeltaKind.RSEG_SLOT,
+                    rsegId.value(), i, RollbackSegmentHeaderLayout.slotOffset(i),
+                    FilePageHeader.FIL_NULL, "format empty rseg slot");
         }
     }
 
@@ -97,7 +109,9 @@ public final class RollbackSegmentHeaderRepository {
             throw new UndoLogFormatException("rseg slot out of range: " + idx + " capacity=" + capacity);
         }
         long pageNo = firstPage == null ? FilePageHeader.FIL_NULL : firstPage.pageNo().value();
-        g.writeLong(RollbackSegmentHeaderLayout.slotOffset(idx), pageNo);
+        long rsegId = g.readInt(RollbackSegmentHeaderLayout.RSEG_ID) & 0xFFFFFFFFL;
+        UndoRedoDeltas.writeLong(mtr, g, g.pageId(), UndoMetadataDeltaKind.RSEG_SLOT,
+                rsegId, idx, RollbackSegmentHeaderLayout.slotOffset(idx), pageNo, "write rseg slot first page");
     }
 
     /**

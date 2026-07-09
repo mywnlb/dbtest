@@ -6,6 +6,9 @@ import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.SegmentId;
 import cn.zhangyis.db.domain.SpaceId;
+import cn.zhangyis.db.domain.TransactionId;
+import cn.zhangyis.db.domain.TransactionNo;
+import cn.zhangyis.db.domain.UndoNo;
 import cn.zhangyis.db.storage.page.PageType;
 
 import java.io.ByteArrayInputStream;
@@ -38,7 +41,7 @@ final class RedoBatchFrameCodec {
     static final int MAX_PAYLOAD_BYTES = 32 * 1024 * 1024;
     /** payload 内层头：startLsn(8) + endLsn(8) + recordCount(4)。 */
     private static final int PAYLOAD_HEADER_BYTES = 20;
-    /** 最小 record：tag(1) + pageId(space 4 + pageNo 8) + type(4)。 */
+    /** 最小 record：PAGE_INIT，tag(1) + pageId(space 4 + pageNo 8) + type(4)。 */
     private static final int MIN_RECORD_BYTES = 17;
 
     private RedoBatchFrameCodec() {
@@ -153,27 +156,26 @@ final class RedoBatchFrameCodec {
     }
 
     private static void writeRecord(DataOutputStream out, RedoRecord r) throws IOException {
-        PageId pageId = pageIdOf(r);
         if (r instanceof PageInitRecord pir) {
             out.writeByte(RedoRecordType.PAGE_INIT.tag());
-            writePageId(out, pageId);
+            writePageId(out, pir.pageId());
             out.writeInt(pir.pageType().code());
         } else if (r instanceof PageBytesRecord pbr) {
             out.writeByte(RedoRecordType.PAGE_BYTES.tag());
-            writePageId(out, pageId);
+            writePageId(out, pbr.pageId());
             out.writeInt(pbr.offset());
             byte[] bytes = pbr.bytes();
             out.writeInt(bytes.length);
             out.write(bytes);
         } else if (r instanceof FspPageAllocationRecord far) {
             out.writeByte(RedoRecordType.FSP_PAGE_ALLOC.tag());
-            writePageId(out, pageId);
+            writePageId(out, far.allocatedPageId());
             out.writeInt(far.inodeSlot());
             out.writeLong(far.segmentId().value());
             out.writeBoolean(far.autoExtendRetry());
         } else if (r instanceof FspMetadataDeltaRecord fmd) {
             out.writeByte(RedoRecordType.FSP_METADATA_DELTA.tag());
-            writePageId(out, pageId);
+            writePageId(out, fmd.pageId());
             out.writeByte(fmd.kind().code());
             out.writeLong(fmd.subjectId());
             out.writeInt(fmd.subIndex());
@@ -183,9 +185,45 @@ final class RedoBatchFrameCodec {
             out.write(payload);
         } else if (r instanceof FspPageFreeRecord fpf) {
             out.writeByte(RedoRecordType.FSP_PAGE_FREE.tag());
-            writePageId(out, pageId);
+            writePageId(out, fpf.freedPageId());
             out.writeInt(fpf.inodeSlot());
             out.writeLong(fpf.segmentId().value());
+        } else if (r instanceof UndoMetadataDeltaRecord umd) {
+            out.writeByte(RedoRecordType.UNDO_METADATA_DELTA.tag());
+            writePageId(out, umd.pageId());
+            out.writeByte(umd.kind().code());
+            out.writeLong(umd.subjectId());
+            out.writeInt(umd.subIndex());
+            out.writeInt(umd.offset());
+            byte[] payload = umd.afterImage();
+            out.writeInt(payload.length);
+            out.write(payload);
+        } else if (r instanceof UndoRecordPayloadRecord urp) {
+            out.writeByte(RedoRecordType.UNDO_RECORD_PAYLOAD.tag());
+            writePageId(out, urp.pageId());
+            out.writeLong(urp.transactionId().value());
+            out.writeLong(urp.undoNo().value());
+            out.writeInt(urp.recordOffset());
+            byte[] payload = urp.slotImage();
+            out.writeInt(payload.length);
+            out.write(payload);
+        } else if (r instanceof BTreePageDeltaRecord btd) {
+            out.writeByte(RedoRecordType.BTREE_PAGE_DELTA.tag());
+            writePageId(out, btd.pageId());
+            out.writeLong(btd.indexId());
+            out.writeByte(btd.kind().code());
+            out.writeLong(btd.subjectId());
+            out.writeInt(btd.offset());
+            byte[] payload = btd.afterImage();
+            out.writeInt(payload.length);
+            out.write(payload);
+        } else if (r instanceof TransactionStateDeltaRecord tsd) {
+            out.writeByte(RedoRecordType.TRX_STATE_DELTA.tag());
+            out.writeLong(tsd.transactionId().value());
+            out.writeByte(tsd.fromState().code());
+            out.writeByte(tsd.toState().code());
+            out.writeLong(tsd.transactionNo().value());
+            out.writeByte(tsd.reason().code());
         } else {
             throw new RedoLogCorruptedException("unsupported redo record type: " + r.getClass().getName());
         }
@@ -193,10 +231,10 @@ final class RedoBatchFrameCodec {
 
     private static RedoRecord readRecord(DataInputStream in) throws IOException {
         RedoRecordType type = RedoRecordType.fromTag(in.readByte());
-        PageId pageId = readPageId(in);
         return switch (type) {
-            case PAGE_INIT -> new PageInitRecord(pageId, PageType.fromCode(in.readInt()));
+            case PAGE_INIT -> new PageInitRecord(readPageId(in), PageType.fromCode(in.readInt()));
             case PAGE_BYTES -> {
+                PageId pageId = readPageId(in);
                 int offset = in.readInt();
                 int len = in.readInt();
                 if (len < 0 || len > MAX_PAYLOAD_BYTES) {
@@ -209,8 +247,9 @@ final class RedoBatchFrameCodec {
                 yield new PageBytesRecord(pageId, offset, payload);
             }
             case FSP_PAGE_ALLOC -> new FspPageAllocationRecord(
-                    pageId, in.readInt(), SegmentId.of(in.readLong()), in.readBoolean());
+                    readPageId(in), in.readInt(), SegmentId.of(in.readLong()), in.readBoolean());
             case FSP_METADATA_DELTA -> {
+                PageId pageId = readPageId(in);
                 FspMetadataDeltaKind kind = FspMetadataDeltaKind.fromCode(in.readByte());
                 long subjectId = in.readLong();
                 int subIndex = in.readInt();
@@ -225,7 +264,60 @@ final class RedoBatchFrameCodec {
                 }
                 yield new FspMetadataDeltaRecord(pageId, kind, subjectId, subIndex, offset, payload);
             }
-            case FSP_PAGE_FREE -> new FspPageFreeRecord(pageId, in.readInt(), SegmentId.of(in.readLong()));
+            case FSP_PAGE_FREE -> new FspPageFreeRecord(readPageId(in), in.readInt(), SegmentId.of(in.readLong()));
+            case UNDO_METADATA_DELTA -> {
+                PageId pageId = readPageId(in);
+                UndoMetadataDeltaKind kind = UndoMetadataDeltaKind.fromCode(in.readByte());
+                long subjectId = in.readLong();
+                int subIndex = in.readInt();
+                int offset = in.readInt();
+                int len = in.readInt();
+                if (len < 0 || len > MAX_PAYLOAD_BYTES) {
+                    throw new RedoLogCorruptedException("undo metadata delta payload length invalid: " + len);
+                }
+                byte[] payload = in.readNBytes(len);
+                if (payload.length != len) {
+                    throw new RedoLogCorruptedException("undo metadata delta payload truncated");
+                }
+                yield new UndoMetadataDeltaRecord(pageId, kind, subjectId, subIndex, offset, payload);
+            }
+            case UNDO_RECORD_PAYLOAD -> {
+                PageId pageId = readPageId(in);
+                TransactionId transactionId = TransactionId.of(in.readLong());
+                UndoNo undoNo = UndoNo.of(in.readLong());
+                int offset = in.readInt();
+                int len = in.readInt();
+                if (len < 0 || len > MAX_PAYLOAD_BYTES) {
+                    throw new RedoLogCorruptedException("undo record payload length invalid: " + len);
+                }
+                byte[] payload = in.readNBytes(len);
+                if (payload.length != len) {
+                    throw new RedoLogCorruptedException("undo record payload truncated");
+                }
+                yield new UndoRecordPayloadRecord(pageId, transactionId, undoNo, offset, payload);
+            }
+            case BTREE_PAGE_DELTA -> {
+                PageId pageId = readPageId(in);
+                long indexId = in.readLong();
+                BTreePageDeltaKind kind = BTreePageDeltaKind.fromCode(in.readByte());
+                long subjectId = in.readLong();
+                int offset = in.readInt();
+                int len = in.readInt();
+                if (len < 0 || len > MAX_PAYLOAD_BYTES) {
+                    throw new RedoLogCorruptedException("B+Tree page delta payload length invalid: " + len);
+                }
+                byte[] payload = in.readNBytes(len);
+                if (payload.length != len) {
+                    throw new RedoLogCorruptedException("B+Tree page delta payload truncated");
+                }
+                yield new BTreePageDeltaRecord(pageId, indexId, kind, subjectId, offset, payload);
+            }
+            case TRX_STATE_DELTA -> new TransactionStateDeltaRecord(
+                    TransactionId.of(in.readLong()),
+                    TransactionStateDeltaState.fromCode(in.readByte()),
+                    TransactionStateDeltaState.fromCode(in.readByte()),
+                    TransactionNo.of(in.readLong()),
+                    TransactionStateDeltaReason.fromCode(in.readByte()));
         };
     }
 
@@ -253,6 +345,15 @@ final class RedoBatchFrameCodec {
         }
         if (r instanceof FspPageFreeRecord fpf) {
             return fpf.freedPageId();
+        }
+        if (r instanceof UndoMetadataDeltaRecord umd) {
+            return umd.pageId();
+        }
+        if (r instanceof UndoRecordPayloadRecord urp) {
+            return urp.pageId();
+        }
+        if (r instanceof BTreePageDeltaRecord btd) {
+            return btd.pageId();
         }
         throw new RedoLogCorruptedException("unsupported redo record type: " + r.getClass().getName());
     }

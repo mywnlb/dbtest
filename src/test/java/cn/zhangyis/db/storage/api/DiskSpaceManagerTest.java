@@ -254,7 +254,7 @@ class DiskSpaceManagerTest {
                             && free.freedPageId().equals(p)
                             && free.inodeSlot() == ref.inodeSlot()
                             && free.segmentId().equals(ref.segmentId())),
-                    "freePage must persist a page free intent before metadata bytes remain the recovery authority");
+                    "freePage must persist a page free intent before metadata delta carries the account changes");
         }
     }
 

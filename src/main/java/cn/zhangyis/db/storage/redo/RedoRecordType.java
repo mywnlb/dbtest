@@ -13,7 +13,15 @@ public enum RedoRecordType {
     /** FSP 元数据字段 after-image record，对应 {@link FspMetadataDeltaRecord}。 */
     FSP_METADATA_DELTA((byte) 4),
     /** FSP 页释放意图 record，对应 {@link FspPageFreeRecord}。 */
-    FSP_PAGE_FREE((byte) 5);
+    FSP_PAGE_FREE((byte) 5),
+    /** Undo/rseg 元数据字段 after-image record，对应 {@link UndoMetadataDeltaRecord}。 */
+    UNDO_METADATA_DELTA((byte) 6),
+    /** 完整 undo record 槽 after-image record，对应 {@link UndoRecordPayloadRecord}。 */
+    UNDO_RECORD_PAYLOAD((byte) 7),
+    /** B+Tree 结构页 after-image record，对应 {@link BTreePageDeltaRecord}。 */
+    BTREE_PAGE_DELTA((byte) 8),
+    /** Non-page 事务状态 logical redo，对应 {@link TransactionStateDeltaRecord}。 */
+    TRX_STATE_DELTA((byte) 9);
 
     private final byte tag;
 

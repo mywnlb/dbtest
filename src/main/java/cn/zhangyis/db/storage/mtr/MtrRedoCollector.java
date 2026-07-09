@@ -3,10 +3,14 @@ package cn.zhangyis.db.storage.mtr;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.storage.buf.PageWriteListener;
+import cn.zhangyis.db.storage.redo.BTreePageDeltaRecord;
 import cn.zhangyis.db.storage.page.PageType;
+import cn.zhangyis.db.storage.redo.FspMetadataDeltaRecord;
 import cn.zhangyis.db.storage.redo.PageBytesRecord;
 import cn.zhangyis.db.storage.redo.PageInitRecord;
 import cn.zhangyis.db.storage.redo.RedoRecord;
+import cn.zhangyis.db.storage.redo.UndoMetadataDeltaRecord;
+import cn.zhangyis.db.storage.redo.UndoRecordPayloadRecord;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -126,15 +130,160 @@ final class MtrRedoCollector implements PageWriteListener {
         enabled = false;
     }
 
+    /**
+     * 返回真正交给 redo manager 的持久 record 视图。0.19d 起 FSP metadata 写点已经有
+     * {@link FspMetadataDeltaRecord} 表达 after-image；如果同一 MTR 内仍由 PageGuard listener 捕获到完全相同的
+     * FSP 分类 {@link PageBytesRecord}，这里在提交边界做精确去重。去重只影响 redo 文件内容，不影响
+     * {@link #touchedPages}：物理写仍会让 commit 给页面盖 batch end LSN，并在 guard 释放时发布 dirty page。
+     *
+     * <p>不能按分类粗暴删除所有 FSP {@code PAGE_BYTES}：page0 FSP_HDR 信封、生命周期 truncate marker 等路径仍可能
+     * 只由物理字节 redo 保护。只有被某条逻辑 delta 的 pageId、offset 和 after-image 完整覆盖的物理字节才可删除。
+     * 0.19f 起 undo/rseg metadata 也走同一精确规则；0.19g 起完整 undo record payload 可以替代对应槽字节；
+     * 0.19h 起 B+Tree structure delta v1 可以替代 sibling-link 等结构字段字节。B+Tree 新页初始化会先写
+     * FIL prev/next 初值再写最终 sibling link；只要字节被 delta 精确覆盖，同一 MTR 内的 generic header 字节也可删除，
+     * 因为 PAGE_INIT 与 B+Tree delta 已携带恢复所需的最终页头状态。
+     */
     List<RedoRecord> records() {
-        return records;
+        return persistedEntries().stream().map(MtrRedoEntry::record).toList();
     }
 
     List<MtrRedoEntry> entries() {
-        return List.copyOf(entries);
+        return List.copyOf(persistedEntries());
     }
 
     Set<PageId> touchedPages() {
         return touchedPages;
+    }
+
+    private List<MtrRedoEntry> persistedEntries() {
+        List<FspMetadataDeltaRecord> fspMetadataDeltas = entries.stream()
+                .map(MtrRedoEntry::record)
+                .filter(FspMetadataDeltaRecord.class::isInstance)
+                .map(FspMetadataDeltaRecord.class::cast)
+                .toList();
+        List<UndoMetadataDeltaRecord> undoMetadataDeltas = entries.stream()
+                .map(MtrRedoEntry::record)
+                .filter(UndoMetadataDeltaRecord.class::isInstance)
+                .map(UndoMetadataDeltaRecord.class::cast)
+                .toList();
+        List<UndoRecordPayloadRecord> undoPayloadDeltas = entries.stream()
+                .map(MtrRedoEntry::record)
+                .filter(UndoRecordPayloadRecord.class::isInstance)
+                .map(UndoRecordPayloadRecord.class::cast)
+                .toList();
+        List<BTreePageDeltaRecord> btreePageDeltas = entries.stream()
+                .map(MtrRedoEntry::record)
+                .filter(BTreePageDeltaRecord.class::isInstance)
+                .map(BTreePageDeltaRecord.class::cast)
+                .toList();
+        if (fspMetadataDeltas.isEmpty() && undoMetadataDeltas.isEmpty()
+                && undoPayloadDeltas.isEmpty() && btreePageDeltas.isEmpty()) {
+            return List.copyOf(entries);
+        }
+        List<MtrRedoEntry> retained = new ArrayList<>(entries.size());
+        for (MtrRedoEntry entry : entries) {
+            if (!isCoveredFspMetadataBytes(entry, fspMetadataDeltas)
+                    && !isCoveredUndoMetadataBytes(entry, undoMetadataDeltas)
+                    && !isCoveredUndoRecordPayloadBytes(entry, undoPayloadDeltas)
+                    && !isCoveredBTreeStructureBytes(entry, btreePageDeltas)) {
+                retained.add(entry);
+            }
+        }
+        return retained;
+    }
+
+    private static boolean isCoveredFspMetadataBytes(MtrRedoEntry entry,
+                                                     List<FspMetadataDeltaRecord> metadataDeltas) {
+        if (entry.category() != MtrRedoCategory.FSP_METADATA_BYTES
+                || !(entry.record() instanceof PageBytesRecord pageBytes)) {
+            return false;
+        }
+        for (FspMetadataDeltaRecord delta : metadataDeltas) {
+            if (covers(delta, pageBytes)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isCoveredUndoMetadataBytes(MtrRedoEntry entry,
+                                                      List<UndoMetadataDeltaRecord> metadataDeltas) {
+        if (entry.category() != MtrRedoCategory.UNDO_PAGE_BYTES
+                || !(entry.record() instanceof PageBytesRecord pageBytes)) {
+            return false;
+        }
+        for (UndoMetadataDeltaRecord delta : metadataDeltas) {
+            if (covers(delta, pageBytes)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isCoveredUndoRecordPayloadBytes(MtrRedoEntry entry,
+                                                           List<UndoRecordPayloadRecord> payloadDeltas) {
+        if (entry.category() != MtrRedoCategory.UNDO_PAGE_BYTES
+                || !(entry.record() instanceof PageBytesRecord pageBytes)) {
+            return false;
+        }
+        for (UndoRecordPayloadRecord delta : payloadDeltas) {
+            if (covers(delta, pageBytes)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isCoveredBTreeStructureBytes(MtrRedoEntry entry,
+                                                        List<BTreePageDeltaRecord> pageDeltas) {
+        if ((entry.category() != MtrRedoCategory.BTREE_STRUCTURE_BYTES
+                && entry.category() != MtrRedoCategory.PAGE_BYTES_GENERIC)
+                || !(entry.record() instanceof PageBytesRecord pageBytes)) {
+            return false;
+        }
+        for (BTreePageDeltaRecord delta : pageDeltas) {
+            if (covers(delta, pageBytes)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean covers(FspMetadataDeltaRecord delta, PageBytesRecord pageBytes) {
+        return covers(delta.pageId(), delta.offset(), delta.afterImage(), pageBytes);
+    }
+
+    private static boolean covers(UndoMetadataDeltaRecord delta, PageBytesRecord pageBytes) {
+        return covers(delta.pageId(), delta.offset(), delta.afterImage(), pageBytes);
+    }
+
+    private static boolean covers(UndoRecordPayloadRecord delta, PageBytesRecord pageBytes) {
+        return covers(delta.pageId(), delta.recordOffset(), delta.slotImage(), pageBytes);
+    }
+
+    private static boolean covers(BTreePageDeltaRecord delta, PageBytesRecord pageBytes) {
+        return covers(delta.pageId(), delta.offset(), delta.afterImage(), pageBytes);
+    }
+
+    private static boolean covers(PageId logicalPageId, int logicalOffset, byte[] logicalBytes,
+                                  PageBytesRecord pageBytes) {
+        if (!logicalPageId.equals(pageBytes.pageId())) {
+            return false;
+        }
+        byte[] physicalBytes = pageBytes.bytes();
+        long physicalStart = pageBytes.offset();
+        long physicalEnd = physicalStart + physicalBytes.length;
+        long logicalStart = logicalOffset;
+        long logicalEnd = logicalStart + logicalBytes.length;
+        if (physicalStart < logicalStart || physicalEnd > logicalEnd) {
+            return false;
+        }
+        int deltaOffset = (int) (physicalStart - logicalStart);
+        for (int i = 0; i < physicalBytes.length; i++) {
+            if (physicalBytes[i] != logicalBytes[deltaOffset + i]) {
+                return false;
+            }
+        }
+        return true;
     }
 }

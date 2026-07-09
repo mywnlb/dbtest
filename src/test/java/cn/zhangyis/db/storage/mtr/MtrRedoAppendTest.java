@@ -11,18 +11,29 @@ import cn.zhangyis.db.storage.buf.PageGuard;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
 import cn.zhangyis.db.storage.fil.io.FileChannelPageStore;
 import cn.zhangyis.db.storage.fil.io.PageStore;
+import cn.zhangyis.db.storage.fsp.FspRedoDeltas;
+import cn.zhangyis.db.storage.fsp.header.SpaceHeaderLayout;
 import cn.zhangyis.db.storage.page.PageEnvelope;
 import cn.zhangyis.db.storage.page.PageEnvelopeLayout;
 import cn.zhangyis.db.storage.page.PageType;
+import cn.zhangyis.db.storage.redo.BTreePageDeltaKind;
+import cn.zhangyis.db.storage.redo.BTreePageDeltaRecord;
+import cn.zhangyis.db.storage.redo.FspMetadataDeltaKind;
+import cn.zhangyis.db.storage.redo.FspMetadataDeltaRecord;
 import cn.zhangyis.db.storage.redo.PageBytesRecord;
 import cn.zhangyis.db.storage.redo.PageInitRecord;
 import cn.zhangyis.db.storage.redo.RedoRecord;
+import cn.zhangyis.db.storage.redo.UndoMetadataDeltaKind;
+import cn.zhangyis.db.storage.redo.UndoMetadataDeltaRecord;
+import cn.zhangyis.db.storage.redo.UndoRecordPayloadRecord;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.List;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertIterableEquals;
@@ -203,6 +214,127 @@ class MtrRedoAppendTest {
             assertTrue(entries.get(0).record() instanceof PageInitRecord);
             assertTrue(entries.get(1).record() instanceof PageBytesRecord);
             mgr.rollbackUncommitted(mtr);
+        });
+    }
+
+    @Test
+    void fspMetadataDeltaSuppressesCoveredPageBytesButStillStampsPage() {
+        onPool((pool, mgr) -> {
+            PageId page0 = PageId.of(SPACE, PageNo.of(0));
+            MiniTransaction mtr = mgr.begin();
+            PageGuard guard = mtr.getPage(pool, page0, PageLatchMode.EXCLUSIVE);
+
+            FspRedoDeltas.writeLong(mtr, guard, page0, FspMetadataDeltaKind.SPACE_HEADER_FIELD,
+                    0L, SpaceHeaderLayout.CURRENT_SIZE, SpaceHeaderLayout.CURRENT_SIZE, 128L,
+                    "test FSP current size logical redo replacement");
+            Lsn committed = mgr.commit(mtr);
+
+            List<RedoRecord> recs = mgr.redoLogManager().bufferedRecords();
+            assertEquals(1, recs.size(), "covered FSP metadata bytes should be replaced by the logical delta");
+            assertTrue(recs.get(0) instanceof FspMetadataDeltaRecord);
+            assertFalse(recs.stream().anyMatch(PageBytesRecord.class::isInstance));
+            try (PageGuard read = pool.getPage(page0, PageLatchMode.SHARED)) {
+                assertEquals(128L, read.readLong(SpaceHeaderLayout.CURRENT_SIZE));
+                assertEquals(committed, PageEnvelope.readPageLsn(read),
+                        "metadata-only logical redo must still mark the page dirty at the batch end LSN");
+            }
+        });
+    }
+
+    @Test
+    void undoMetadataDeltaSuppressesOnlyCoveredUndoPageBytes() {
+        onPool((pool, mgr) -> {
+            PageId undoPage = PageId.of(SPACE, PageNo.of(4));
+            int metadataOffset = 128;
+            int payloadOffset = 256;
+            byte[] metadataImage = new byte[]{0, 0, 0, 42};
+            byte[] payloadBytes = new byte[]{9, 8, 7};
+            MiniTransaction mtr = mgr.begin();
+            PageGuard guard = mtr.getPage(pool, undoPage, PageLatchMode.EXCLUSIVE);
+
+            try (MtrRedoCategoryScope ignored =
+                         mtr.enterRedoCategory(MtrRedoCategory.UNDO_PAGE_BYTES, "test undo metadata bytes")) {
+                guard.writeBytes(metadataOffset, metadataImage);
+                guard.writeBytes(payloadOffset, payloadBytes);
+            }
+            mtr.appendLogicalRedo(new UndoMetadataDeltaRecord(undoPage,
+                            UndoMetadataDeltaKind.UNDO_PAGE_HEADER_FIELD, 0L, 0, metadataOffset, metadataImage),
+                    MtrRedoCategory.UNDO_PAGE_BYTES, "test undo metadata logical redo replacement");
+
+            Lsn committed = mgr.commit(mtr);
+
+            List<RedoRecord> recs = mgr.redoLogManager().bufferedRecords();
+            assertEquals(2, recs.size(),
+                    "covered undo metadata bytes should be replaced while record payload bytes stay physical");
+            assertTrue(recs.stream().anyMatch(UndoMetadataDeltaRecord.class::isInstance));
+            assertFalse(recs.stream().anyMatch(r -> r instanceof PageBytesRecord pbr
+                    && pbr.pageId().equals(undoPage) && pbr.offset() == metadataOffset),
+                    "metadata PAGE_BYTES covered by UndoMetadataDeltaRecord must be filtered");
+            assertTrue(recs.stream().anyMatch(r -> r instanceof PageBytesRecord pbr
+                    && pbr.pageId().equals(undoPage) && pbr.offset() == payloadOffset
+                    && Arrays.equals(payloadBytes, pbr.bytes())),
+                    "ordinary undo record payload bytes are not covered by metadata delta and must remain physical");
+            try (PageGuard read = pool.getPage(undoPage, PageLatchMode.SHARED)) {
+                assertArrayEquals(metadataImage, read.readBytes(metadataOffset, metadataImage.length));
+                assertArrayEquals(payloadBytes, read.readBytes(payloadOffset, payloadBytes.length));
+                assertEquals(committed, PageEnvelope.readPageLsn(read),
+                        "metadata-only logical replacement still relies on the physical write to dirty/stamp page");
+            }
+        });
+    }
+
+    @Test
+    void undoRecordPayloadDeltaSuppressesCoveredUndoPageBytes() {
+        onPool((pool, mgr) -> {
+            PageId undoPage = PageId.of(SPACE, PageNo.of(4));
+            int recordOffset = 256;
+            byte[] slotImage = new byte[]{0, 3, 9, 8, 7};
+            MiniTransaction mtr = mgr.begin();
+            PageGuard guard = mtr.getPage(pool, undoPage, PageLatchMode.EXCLUSIVE);
+
+            try (MtrRedoCategoryScope ignored =
+                         mtr.enterRedoCategory(MtrRedoCategory.UNDO_PAGE_BYTES, "test undo record payload bytes")) {
+                guard.writeBytes(recordOffset, slotImage);
+            }
+            mtr.appendLogicalRedo(new UndoRecordPayloadRecord(undoPage,
+                            cn.zhangyis.db.domain.TransactionId.of(11),
+                            cn.zhangyis.db.domain.UndoNo.of(4), recordOffset, slotImage),
+                    MtrRedoCategory.UNDO_PAGE_BYTES, "test undo record payload logical redo replacement");
+
+            mgr.commit(mtr);
+
+            List<RedoRecord> recs = mgr.redoLogManager().bufferedRecords();
+            assertEquals(1, recs.size(),
+                    "undo payload logical redo should replace the covered physical slot bytes");
+            assertTrue(recs.get(0) instanceof UndoRecordPayloadRecord);
+            assertFalse(recs.stream().anyMatch(PageBytesRecord.class::isInstance));
+        });
+    }
+
+    @Test
+    void btreePageDeltaSuppressesCoveredStructureBytes() {
+        onPool((pool, mgr) -> {
+            PageId indexPage = PageId.of(SPACE, PageNo.of(4));
+            int offset = PageEnvelopeLayout.PREV_PAGE_NO;
+            byte[] links = new byte[]{0, 0, 0, 3, 0, 0, 0, 5};
+            MiniTransaction mtr = mgr.begin();
+            PageGuard guard = mtr.getPage(pool, indexPage, PageLatchMode.EXCLUSIVE);
+
+            try (MtrRedoCategoryScope ignored =
+                         mtr.enterRedoCategory(MtrRedoCategory.BTREE_STRUCTURE_BYTES, "test btree sibling bytes")) {
+                guard.writeBytes(offset, links);
+            }
+            mtr.appendLogicalRedo(new BTreePageDeltaRecord(
+                            indexPage, 7L, BTreePageDeltaKind.SIBLING_LINKS, 5L, offset, links),
+                    MtrRedoCategory.BTREE_STRUCTURE_BYTES, "test btree sibling logical redo replacement");
+
+            mgr.commit(mtr);
+
+            List<RedoRecord> recs = mgr.redoLogManager().bufferedRecords();
+            assertEquals(1, recs.size(),
+                    "B+Tree structure delta should replace the covered physical structure bytes");
+            assertTrue(recs.get(0) instanceof BTreePageDeltaRecord);
+            assertFalse(recs.stream().anyMatch(PageBytesRecord.class::isInstance));
         });
     }
 

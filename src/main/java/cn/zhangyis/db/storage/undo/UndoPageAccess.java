@@ -69,7 +69,7 @@ public final class UndoPageAccess {
             throw new DatabaseValidationException("createFirstPage args must not be null");
         }
         PageGuard g = newUndoEnvelope(mtr, pageId);
-        UndoPage page = new UndoPage(g, pageSize);
+        UndoPage page = new UndoPage(mtr, g, pageSize);
         page.formatFirstPage(kind, txnId, handle);
         return page;
     }
@@ -83,7 +83,7 @@ public final class UndoPageAccess {
             throw new DatabaseValidationException("createChainPage args must not be null");
         }
         PageGuard g = newUndoEnvelope(mtr, pageId);
-        UndoPage page = new UndoPage(g, pageSize);
+        UndoPage page = new UndoPage(mtr, g, pageSize);
         page.formatChainPage(handle);
         return page;
     }
@@ -102,7 +102,7 @@ public final class UndoPageAccess {
         if (h.pageType() != PageType.UNDO) {
             throw new UndoLogFormatException("page " + pageId + " is not an UNDO page: " + h.pageType());
         }
-        return new UndoPage(g, pageSize);
+        return new UndoPage(mtr, g, pageSize);
     }
 
     private PageGuard newUndoEnvelope(MiniTransaction mtr, PageId pageId) {

@@ -8,9 +8,11 @@ import cn.zhangyis.db.domain.SegmentId;
 import cn.zhangyis.db.domain.TransactionId;
 import cn.zhangyis.db.domain.UndoNo;
 import cn.zhangyis.db.storage.buf.PageGuard;
+import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.page.FilePageHeader;
 import cn.zhangyis.db.storage.page.PageEnvelope;
 import cn.zhangyis.db.storage.page.PageEnvelopeLayout;
+import cn.zhangyis.db.storage.redo.UndoMetadataDeltaKind;
 
 /**
  * undo 页视图（PageGuard 之上）。所有状态都在页字节中，写入经 MTR 持有的 X latch guard 产生
@@ -22,6 +24,11 @@ import cn.zhangyis.db.storage.page.PageEnvelopeLayout;
 public final class UndoPage {
 
     /**
+     * 当前物理短事务。UndoPage 不拥有提交/回滚，只用它把页头/log header after-image 追加成 undo metadata redo。
+     */
+    private final MiniTransaction mtr;
+
+    /**
      * MTR-owned 页访问 guard。UndoPage 不拥有释放职责，生命周期由 MiniTransaction commit/rollback 统一释放。
      */
     private final PageGuard guard;
@@ -31,10 +38,11 @@ public final class UndoPage {
      */
     private final PageSize pageSize;
 
-    UndoPage(PageGuard guard, PageSize pageSize) {
-        if (guard == null || pageSize == null) {
-            throw new DatabaseValidationException("undo page guard/pageSize must not be null");
+    UndoPage(MiniTransaction mtr, PageGuard guard, PageSize pageSize) {
+        if (mtr == null || guard == null || pageSize == null) {
+            throw new DatabaseValidationException("undo page mtr/guard/pageSize must not be null");
         }
+        this.mtr = mtr;
         this.guard = guard;
         this.pageSize = pageSize;
     }
@@ -53,15 +61,15 @@ public final class UndoPage {
         }
         requireHandleSpace(handle);
         writePageHeader(handle, true);
-        guard.writeLong(UndoPageLayout.TRANSACTION_ID, txnId.value());
-        setU8(UndoPageLayout.UNDO_KIND, kind.ordinal());
-        setU8(UndoPageLayout.STATE, UndoPageLayout.STATE_ACTIVE);
+        writeLogHeaderLong(handle, UndoPageLayout.TRANSACTION_ID, txnId.value(), "format undo transaction id");
+        writeLogHeaderU8(handle, UndoPageLayout.UNDO_KIND, kind.ordinal(), "format undo log kind");
+        writeLogHeaderU8(handle, UndoPageLayout.STATE, UndoPageLayout.STATE_ACTIVE, "format undo log active state");
         long self = guard.pageId().pageNo().value();
-        setU32(UndoPageLayout.FIRST_PAGE_NO, self);
-        setU32(UndoPageLayout.LAST_PAGE_NO, self);
-        guard.writeLong(UndoPageLayout.LOG_RECORD_COUNT, 0L);
-        guard.writeLong(UndoPageLayout.LOG_LAST_UNDO_NO, 0L);
-        guard.writeLong(UndoPageLayout.COMMIT_NO, 0L); // ACTIVE：尚未提交，commit 时写入提交序号
+        writeLogHeaderU32(handle, UndoPageLayout.FIRST_PAGE_NO, self, "format undo first page no");
+        writeLogHeaderU32(handle, UndoPageLayout.LAST_PAGE_NO, self, "format undo last page no");
+        writeLogHeaderLong(handle, UndoPageLayout.LOG_RECORD_COUNT, 0L, "format undo log record count");
+        writeLogHeaderLong(handle, UndoPageLayout.LOG_LAST_UNDO_NO, 0L, "format undo log last undo no");
+        writeLogHeaderLong(handle, UndoPageLayout.COMMIT_NO, 0L, "format undo commit no");
     }
 
     /**
@@ -76,24 +84,27 @@ public final class UndoPage {
         }
         requireHandleSpace(handle);
         writePageHeader(handle, false);
-        guard.writeBytes(UndoPageLayout.TRANSACTION_ID,
-                new byte[UndoPageLayout.LOG_HEADER_END - UndoPageLayout.TRANSACTION_ID]);
+        UndoRedoDeltas.withUndoCategory(mtr, "clear undo chain page log header reservation",
+                () -> guard.writeBytes(UndoPageLayout.TRANSACTION_ID,
+                        new byte[UndoPageLayout.LOG_HEADER_END - UndoPageLayout.TRANSACTION_ID]));
     }
 
     /**
      * 追加一条页内 undo record。数据流：校验 undoNo 合法 → 在任何写入前做页内容量判断 →
-     * 写 record 槽 {@code [len u16][payload]} → 推进本页 header 的 free/count/pageLastUndoNo。
+     * 写 record 槽 {@code [len u16][payload]} 并登记 payload logical redo →
+     * 推进本页 header 的 free/count/pageLastUndoNo。
      *
      * <p>本方法只维护 page header，不更新 first 页 log header；整链计数由 {@link UndoLogSegment} 在 append
      * 成功后统一更新，从而能覆盖单页与跨页两种路径。
      *
      * @param payload 已编码 undo record payload。
+     * @param txnId   生成该 undo record 的事务写 id，用于 redo 诊断和后续恢复阶段关联。
      * @param undoNo  事务内 undo 序号，不能是 NONE。
      * @return record 槽起始 offset，供 RollPointer 编码。
      */
-    int appendRecord(byte[] payload, UndoNo undoNo) {
-        if (payload == null || undoNo == null) {
-            throw new DatabaseValidationException("undo append payload/undoNo must not be null");
+    int appendRecord(byte[] payload, TransactionId txnId, UndoNo undoNo) {
+        if (payload == null || txnId == null || undoNo == null) {
+            throw new DatabaseValidationException("undo append payload/txnId/undoNo must not be null");
         }
         if (undoNo.isNone()) {
             throw new DatabaseValidationException("undo append undoNo must be > 0 (not NONE)");
@@ -105,11 +116,12 @@ public final class UndoPage {
             throw new UndoPageOverflowException("undo record (" + need + "B) does not fit at free="
                     + free + " limit=" + limit);
         }
-        setU16(free, payload.length);
-        guard.writeBytes(free + 2, payload);
-        setU16(UndoPageLayout.FREE_OFFSET, free + need);
-        setU16(UndoPageLayout.RECORD_COUNT, getU16(UndoPageLayout.RECORD_COUNT) + 1);
-        guard.writeLong(UndoPageLayout.PAGE_LAST_UNDO_NO, undoNo.value());
+        UndoRedoDeltas.writeRecordPayload(mtr, guard, guard.pageId(), txnId, undoNo, free, payload,
+                "append undo record payload");
+        writePageHeaderU16(UndoPageLayout.FREE_OFFSET, free + need, "advance undo page free offset");
+        writePageHeaderU16(UndoPageLayout.RECORD_COUNT, getU16(UndoPageLayout.RECORD_COUNT) + 1,
+                "advance undo page record count");
+        writePageHeaderLong(UndoPageLayout.PAGE_LAST_UNDO_NO, undoNo.value(), "advance undo page last undo no");
         return free;
     }
 
@@ -165,7 +177,7 @@ public final class UndoPage {
         if (last == null) {
             throw new DatabaseValidationException("undo last page no must not be null");
         }
-        setU32(UndoPageLayout.LAST_PAGE_NO, last.value());
+        writeLogHeaderU32(UndoPageLayout.LAST_PAGE_NO, last.value(), "advance undo log last page no");
     }
 
     /**
@@ -177,7 +189,7 @@ public final class UndoPage {
         if (count < 0) {
             throw new DatabaseValidationException("undo log record count must be non-negative: " + count);
         }
-        guard.writeLong(UndoPageLayout.LOG_RECORD_COUNT, count);
+        writeLogHeaderLong(UndoPageLayout.LOG_RECORD_COUNT, count, "advance undo log record count");
     }
 
     /**
@@ -188,7 +200,7 @@ public final class UndoPage {
         if (undoNo < 0) {
             throw new DatabaseValidationException("undo log last undo no must be non-negative: " + undoNo);
         }
-        guard.writeLong(UndoPageLayout.LOG_LAST_UNDO_NO, undoNo);
+        writeLogHeaderLong(UndoPageLayout.LOG_LAST_UNDO_NO, undoNo, "advance undo log last undo no");
     }
 
     /** 当前页 id。 */
@@ -267,7 +279,7 @@ public final class UndoPage {
     /** 写 first 页 log header 状态（X，R 1.2）。commit 时标 COMMITTED，使恢复期能据此跳过已提交事务回滚。 */
     void setLogState(int state) {
         requireFirstPage();
-        setU8(UndoPageLayout.STATE, state);
+        writeLogHeaderU8(UndoPageLayout.STATE, state, "write undo log state");
     }
 
     /** first 页 log header 中的提交序号 TransactionNo（R 1.3）；0 表尚未提交。 */
@@ -279,7 +291,7 @@ public final class UndoPage {
     /** 写 first 页 log header 提交序号（X，R 1.3）。commit 时与 STATE=COMMITTED 同 MTR 写，恢复重建 history 用。 */
     void setCommitNo(long commitNo) {
         requireFirstPage();
-        guard.writeLong(UndoPageLayout.COMMIT_NO, commitNo);
+        writeLogHeaderLong(UndoPageLayout.COMMIT_NO, commitNo, "write undo commit no");
     }
 
     /** first 页 log header 中的链首页号。 */
@@ -307,12 +319,77 @@ public final class UndoPage {
     }
 
     private void writePageHeader(UndoSegmentHandle handle, boolean first) {
-        setU16(UndoPageLayout.FREE_OFFSET, UndoPageLayout.RECORD_AREA_START);
-        setU16(UndoPageLayout.RECORD_COUNT, 0);
-        guard.writeLong(UndoPageLayout.PAGE_LAST_UNDO_NO, 0L);
-        guard.writeLong(UndoPageLayout.SEGMENT_ID, handle.segmentId().value());
-        setU32(UndoPageLayout.INODE_SLOT, handle.inodeSlot());
-        setU8(UndoPageLayout.PAGE_FLAGS, first ? UndoPageLayout.FLAG_FIRST_PAGE : 0);
+        writePageHeaderU16(handle, UndoPageLayout.FREE_OFFSET, UndoPageLayout.RECORD_AREA_START,
+                "format undo page free offset");
+        writePageHeaderU16(handle, UndoPageLayout.RECORD_COUNT, 0, "format undo page record count");
+        writePageHeaderLong(handle, UndoPageLayout.PAGE_LAST_UNDO_NO, 0L, "format undo page last undo no");
+        writePageHeaderLong(handle, UndoPageLayout.SEGMENT_ID, handle.segmentId().value(), "format undo segment id");
+        writePageHeaderU32(handle, UndoPageLayout.INODE_SLOT, handle.inodeSlot(), "format undo inode slot");
+        writePageHeaderU8(handle, UndoPageLayout.PAGE_FLAGS, first ? UndoPageLayout.FLAG_FIRST_PAGE : 0,
+                "format undo page flags");
+    }
+
+    private void writePageHeaderU8(UndoSegmentHandle handle, int offset, int value, String reason) {
+        UndoRedoDeltas.writeU8(mtr, guard, guard.pageId(), UndoMetadataDeltaKind.UNDO_PAGE_HEADER_FIELD,
+                handle.segmentId().value(), handle.inodeSlot(), offset, value, reason);
+    }
+
+    private void writePageHeaderU16(UndoSegmentHandle handle, int offset, int value, String reason) {
+        UndoRedoDeltas.writeU16(mtr, guard, guard.pageId(), UndoMetadataDeltaKind.UNDO_PAGE_HEADER_FIELD,
+                handle.segmentId().value(), handle.inodeSlot(), offset, value, reason);
+    }
+
+    private void writePageHeaderU32(UndoSegmentHandle handle, int offset, long value, String reason) {
+        validateU32(value);
+        UndoRedoDeltas.writeInt(mtr, guard, guard.pageId(), UndoMetadataDeltaKind.UNDO_PAGE_HEADER_FIELD,
+                handle.segmentId().value(), handle.inodeSlot(), offset, (int) value, reason);
+    }
+
+    private void writePageHeaderLong(UndoSegmentHandle handle, int offset, long value, String reason) {
+        UndoRedoDeltas.writeLong(mtr, guard, guard.pageId(), UndoMetadataDeltaKind.UNDO_PAGE_HEADER_FIELD,
+                handle.segmentId().value(), handle.inodeSlot(), offset, value, reason);
+    }
+
+    private void writePageHeaderU16(int offset, int value, String reason) {
+        UndoRedoDeltas.writeU16(mtr, guard, guard.pageId(), UndoMetadataDeltaKind.UNDO_PAGE_HEADER_FIELD,
+                segmentId().value(), inodeSlot(), offset, value, reason);
+    }
+
+    private void writePageHeaderLong(int offset, long value, String reason) {
+        UndoRedoDeltas.writeLong(mtr, guard, guard.pageId(), UndoMetadataDeltaKind.UNDO_PAGE_HEADER_FIELD,
+                segmentId().value(), inodeSlot(), offset, value, reason);
+    }
+
+    private void writeLogHeaderU8(UndoSegmentHandle handle, int offset, int value, String reason) {
+        UndoRedoDeltas.writeU8(mtr, guard, guard.pageId(), UndoMetadataDeltaKind.UNDO_LOG_HEADER_FIELD,
+                handle.segmentId().value(), handle.inodeSlot(), offset, value, reason);
+    }
+
+    private void writeLogHeaderU32(UndoSegmentHandle handle, int offset, long value, String reason) {
+        validateU32(value);
+        UndoRedoDeltas.writeInt(mtr, guard, guard.pageId(), UndoMetadataDeltaKind.UNDO_LOG_HEADER_FIELD,
+                handle.segmentId().value(), handle.inodeSlot(), offset, (int) value, reason);
+    }
+
+    private void writeLogHeaderLong(UndoSegmentHandle handle, int offset, long value, String reason) {
+        UndoRedoDeltas.writeLong(mtr, guard, guard.pageId(), UndoMetadataDeltaKind.UNDO_LOG_HEADER_FIELD,
+                handle.segmentId().value(), handle.inodeSlot(), offset, value, reason);
+    }
+
+    private void writeLogHeaderU8(int offset, int value, String reason) {
+        UndoRedoDeltas.writeU8(mtr, guard, guard.pageId(), UndoMetadataDeltaKind.UNDO_LOG_HEADER_FIELD,
+                segmentId().value(), inodeSlot(), offset, value, reason);
+    }
+
+    private void writeLogHeaderU32(int offset, long value, String reason) {
+        validateU32(value);
+        UndoRedoDeltas.writeInt(mtr, guard, guard.pageId(), UndoMetadataDeltaKind.UNDO_LOG_HEADER_FIELD,
+                segmentId().value(), inodeSlot(), offset, (int) value, reason);
+    }
+
+    private void writeLogHeaderLong(int offset, long value, String reason) {
+        UndoRedoDeltas.writeLong(mtr, guard, guard.pageId(), UndoMetadataDeltaKind.UNDO_LOG_HEADER_FIELD,
+                segmentId().value(), inodeSlot(), offset, value, reason);
     }
 
     private void requireHandleSpace(UndoSegmentHandle handle) {
@@ -332,30 +409,18 @@ public final class UndoPage {
         return guard.readBytes(off, 1)[0] & 0xFF;
     }
 
-    private void setU8(int off, int v) {
-        guard.writeBytes(off, new byte[]{(byte) v});
-    }
-
     private int getU16(int off) {
         byte[] b = guard.readBytes(off, 2);
         return ((b[0] & 0xFF) << 8) | (b[1] & 0xFF);
-    }
-
-    private void setU16(int off, int v) {
-        if (v < 0 || v > 0xFFFF) {
-            throw new DatabaseValidationException("u16 out of range: " + v);
-        }
-        guard.writeBytes(off, new byte[]{(byte) (v >>> 8), (byte) v});
     }
 
     private long getU32(int off) {
         return guard.readInt(off) & 0xFFFFFFFFL;
     }
 
-    private void setU32(int off, long v) {
+    private void validateU32(long v) {
         if (v < 0 || v > FilePageHeader.FIL_NULL) {
             throw new DatabaseValidationException("u32 out of range: " + v);
         }
-        guard.writeInt(off, (int) v);
     }
 }

@@ -33,9 +33,12 @@ public final class RedoApplyDispatcher {
         this.handlers = List.copyOf(handlers);
     }
 
-    /** 创建生产恢复分发器。保留历史命名，当前默认包含 FSP allocation handler 与 page handler。 */
+    /** 创建生产恢复分发器。保留历史命名，当前默认包含 FSP allocation、page handler 与 non-page trx handler。 */
     public static RedoApplyDispatcher pageDispatcher() {
-        return withHandlers(List.of(new FspPageAllocationRedoHandler(), new PageRedoApplyHandler()));
+        return withHandlers(List.of(
+                new FspPageAllocationRedoHandler(),
+                new PageRedoApplyHandler(),
+                new TransactionStateRedoHandler()));
     }
 
     /**

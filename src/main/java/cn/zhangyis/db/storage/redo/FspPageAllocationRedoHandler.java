@@ -12,7 +12,8 @@ import java.util.List;
  * {@link PageRedoApplyHandler} 重放 {@link PageInitRecord}/{@link PageBytesRecord}。
  *
  * <p>0.19c 起 free intent 也由本 handler 接住，但 apply 为 no-op：它只给 FORCE_SKIP 和诊断提供 affected page，
- * 不重新执行 free-list 或 segment 状态机。FSP 元数据页仍由同一 batch 的 metadata delta/PAGE_BYTES 恢复。
+ * 不重新执行 free-list 或 segment 状态机。FSP 账本字段由同一 batch 的 metadata delta 恢复，未迁移的页信封
+ * 或生命周期字节仍可与 {@link PageBytesRecord} 混合回放。
  */
 public final class FspPageAllocationRedoHandler implements RedoApplyHandler {
 

@@ -75,9 +75,9 @@ class UndoPageTest {
     void appendAdvancesPageHeaderOnlyAndReadsBack() {
         onFirstPage((page, handle) -> {
             byte[] a = {1, 2, 3};
-            int offA = page.appendRecord(a, UndoNo.of(1));
+            int offA = page.appendRecord(a, TransactionId.of(7), UndoNo.of(1));
             byte[] b = {9, 9};
-            int offB = page.appendRecord(b, UndoNo.of(2));
+            int offB = page.appendRecord(b, TransactionId.of(7), UndoNo.of(2));
             assertEquals(105, offA);
             assertEquals(105 + 2 + 3, offB);
             assertEquals(2, page.recordCount());
@@ -93,20 +93,20 @@ class UndoPageTest {
     void appendRejectsNoneUndoNo() {
         onFirstPage((page, handle) ->
                 assertThrows(DatabaseValidationException.class,
-                        () -> page.appendRecord(new byte[]{1}, UndoNo.NONE)));
+                        () -> page.appendRecord(new byte[]{1}, TransactionId.of(7), UndoNo.NONE)));
     }
 
     @Test
     void appendOverflowThrows() {
         onFirstPage((page, handle) ->
                 assertThrows(UndoPageOverflowException.class,
-                        () -> page.appendRecord(new byte[PS.bytes()], UndoNo.of(1))));
+                        () -> page.appendRecord(new byte[PS.bytes()], TransactionId.of(7), UndoNo.of(1))));
     }
 
     @Test
     void recordAtRejectsOutOfArea() {
         onFirstPage((page, handle) -> {
-            page.appendRecord(new byte[]{1, 2}, UndoNo.of(1));
+            page.appendRecord(new byte[]{1, 2}, TransactionId.of(7), UndoNo.of(1));
             assertThrows(UndoLogFormatException.class, () -> page.recordAt(10_000));
         });
     }

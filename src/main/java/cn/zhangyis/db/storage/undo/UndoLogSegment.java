@@ -118,9 +118,9 @@ public final class UndoLogSegment {
         byte[] payload = codec.encode(rec, keyDef, schema);
         int off;
         try {
-            off = current.appendRecord(payload, rec.undoNo());
+            off = current.appendRecord(payload, rec.transactionId(), rec.undoNo());
         } catch (UndoPageOverflowException overflow) {
-            off = growAndAppend(payload, rec.undoNo(), overflow);
+            off = growAndAppend(payload, rec.transactionId(), rec.undoNo(), overflow);
         }
         firstPage.setLogRecordCount(firstPage.logRecordCount() + 1);
         firstPage.setLogLastUndoNo(rec.undoNo().value());
@@ -137,11 +137,13 @@ public final class UndoLogSegment {
      * 重试 append。
      *
      * @param payload  已编码 payload。
+     * @param txnId    record 所属事务写 id。
      * @param undoNo   record undoNo。
      * @param overflow current 页原始溢出异常；单条超页时保持该异常语义。
      * @return 新页上的 record 槽 offset。
      */
-    private int growAndAppend(byte[] payload, UndoNo undoNo, UndoPageOverflowException overflow) {
+    private int growAndAppend(byte[] payload, TransactionId txnId, UndoNo undoNo,
+                              UndoPageOverflowException overflow) {
         int need = 2 + payload.length;
         int freshCapacity = pageSize.bytes() - PageEnvelopeLayout.FIL_PAGE_TRAILER_BYTES
                 - UndoPageLayout.RECORD_AREA_START;
@@ -159,7 +161,7 @@ public final class UndoLogSegment {
             handle = handle.withLastPage(newId);
             heldPages.put(newId.pageNo().value(), newPage);
             current = newPage;
-            return current.appendRecord(payload, undoNo);
+            return current.appendRecord(payload, txnId, undoNo);
         }
     }
 

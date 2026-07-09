@@ -7,7 +7,7 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
  * 因 FORCE_SKIP_CORRUPT_TABLESPACE 被丢弃的物理记录数”写入最终恢复报告。
  *
  * @param scannedBatchCount recovery reader 交给 dispatcher 检查的 batch 数；即使 batch 内记录全被 skip 也计入。
- * @param appliedBatchCount 至少有一条记录被交给 page handler 重放的 batch 数。
+ * @param appliedBatchCount 至少有一条记录被交给任一 handler 重放的 batch 数。
  * @param skippedRecordCount 在访问 PageStore 前按 PageId 过滤掉的 redo record 数。
  */
 public record RedoApplySummary(int scannedBatchCount, int appliedBatchCount, int skippedRecordCount) {

@@ -19,11 +19,17 @@ import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
 import cn.zhangyis.db.storage.page.FilePageHeader;
 import cn.zhangyis.db.storage.page.PageEnvelope;
 import cn.zhangyis.db.storage.page.PageType;
+import cn.zhangyis.db.storage.redo.FspMetadataDeltaKind;
+import cn.zhangyis.db.storage.redo.FspMetadataDeltaRecord;
+import cn.zhangyis.db.storage.redo.FspPageFreeRecord;
+import cn.zhangyis.db.storage.redo.FspPageAllocationRecord;
 import cn.zhangyis.db.storage.redo.PageInitRecord;
+import cn.zhangyis.db.storage.redo.RedoRecord;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.api.Test;
 
 import java.nio.file.Path;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -170,6 +176,89 @@ class DiskSpaceManagerTest {
     }
 
     @Test
+    void allocatePageEmitsFspLogicalRedoBeforePageInit() {
+        PageStore store = new FileChannelPageStore();
+        try (PageStore s = store; BufferPool pool = new LruBufferPool(store, PS, 64)) {
+            DiskSpaceManager dsm = new DiskSpaceManager(pool, store, PS);
+            MiniTransactionManager mgr = new MiniTransactionManager();
+            MiniTransaction m = mgr.begin();
+            dsm.createTablespace(m, SPACE, dir.resolve("s.ibd"), PageNo.of(128));
+            SegmentRef ref = dsm.createSegment(m, SPACE, SegmentPurpose.INDEX_LEAF);
+
+            PageId p = dsm.allocatePage(m, ref);
+            mgr.commit(m);
+
+            List<RedoRecord> records = mgr.redoLogManager().bufferedRecords();
+            int fspIndex = indexOfFspAlloc(records, p);
+            int initIndex = indexOfPageInit(records, p);
+            assertTrue(fspIndex >= 0, "allocatePage must persist FSP allocation intent");
+            assertTrue(initIndex > fspIndex, "FSP allocation intent must precede PAGE_INIT for the allocated page");
+
+            FspPageAllocationRecord record = (FspPageAllocationRecord) records.get(fspIndex);
+            assertEquals(ref.inodeSlot(), record.inodeSlot());
+            assertEquals(ref.segmentId(), record.segmentId());
+            assertEquals(false, record.autoExtendRetry());
+        }
+    }
+
+    @Test
+    void autoextendAllocationMarksFspLogicalRedoRetry() {
+        PageStore store = new FileChannelPageStore();
+        try (PageStore s = store; BufferPool pool = new LruBufferPool(store, PS, 128)) {
+            DiskSpaceManager dsm = new DiskSpaceManager(pool, store, PS);
+            MiniTransactionManager mgr = new MiniTransactionManager();
+            MiniTransaction m = mgr.begin();
+            dsm.createTablespace(m, SPACE, dir.resolve("s.ibd"), PageNo.of(128));
+            SegmentRef ref = dsm.createSegment(m, SPACE, SegmentPurpose.INDEX_LEAF);
+
+            PageId p = null;
+            for (int i = 0; i < 33; i++) {
+                p = dsm.allocatePage(m, ref);
+            }
+            mgr.commit(m);
+
+            List<RedoRecord> records = mgr.redoLogManager().bufferedRecords();
+            FspPageAllocationRecord record = (FspPageAllocationRecord) records.get(indexOfFspAlloc(records, p));
+            assertEquals(PageId.of(SPACE, PageNo.of(128)), record.allocatedPageId());
+            assertEquals(true, record.autoExtendRetry());
+        }
+    }
+
+    @Test
+    void fspOperationsEmitMetadataDeltaRecordsAndPageFreeIntent() {
+        PageStore store = new FileChannelPageStore();
+        try (PageStore s = store; BufferPool pool = new LruBufferPool(store, PS, 64)) {
+            DiskSpaceManager dsm = new DiskSpaceManager(pool, store, PS);
+            MiniTransactionManager mgr = new MiniTransactionManager();
+            MiniTransaction m = mgr.begin();
+            dsm.createTablespace(m, SPACE, dir.resolve("s.ibd"), PageNo.of(128));
+            SegmentRef ref = dsm.createSegment(m, SPACE, SegmentPurpose.INDEX_LEAF);
+            PageId p = dsm.allocatePage(m, ref);
+            dsm.freePage(m, ref, p);
+            mgr.commit(m);
+
+            List<RedoRecord> records = mgr.redoLogManager().bufferedRecords();
+            assertTrue(containsDeltaKind(records, FspMetadataDeltaKind.SPACE_HEADER_FIELD),
+                    "space header currentSize/freeLimit/nextSegmentId changes must emit metadata delta");
+            assertTrue(containsDeltaKind(records, FspMetadataDeltaKind.XDES_FIELD),
+                    "XDES state/owner/list field changes must emit metadata delta");
+            assertTrue(containsDeltaKind(records, FspMetadataDeltaKind.XDES_BITMAP_BYTE),
+                    "XDES page allocation bitmap changes must emit metadata delta");
+            assertTrue(containsDeltaKind(records, FspMetadataDeltaKind.INODE_SLOT_IMAGE),
+                    "segment creation must emit a full inode-slot after image");
+            assertTrue(containsDeltaKind(records, FspMetadataDeltaKind.INODE_FIELD),
+                    "inode used/reserved counters must emit field delta");
+            assertTrue(containsDeltaKind(records, FspMetadataDeltaKind.INODE_FRAGMENT_SLOT),
+                    "fragment slot assignment/free must emit fragment slot delta");
+            assertTrue(records.stream().anyMatch(r -> r instanceof FspPageFreeRecord free
+                            && free.freedPageId().equals(p)
+                            && free.inodeSlot() == ref.inodeSlot()
+                            && free.segmentId().equals(ref.segmentId())),
+                    "freePage must persist a page free intent before metadata bytes remain the recovery authority");
+        }
+    }
+
+    @Test
     void reallocateResidentPageReinitializes() {
         PageStore store = new FileChannelPageStore();
         try (PageStore s = store; BufferPool pool = new LruBufferPool(store, PS, 64)) {
@@ -187,6 +276,31 @@ class DiskSpaceManagerTest {
                 assertEquals(PageType.ALLOCATED, PageEnvelope.readHeader(g).pageType());
             }
         }
+    }
+
+    private static int indexOfFspAlloc(List<RedoRecord> records, PageId pageId) {
+        for (int i = 0; i < records.size(); i++) {
+            if (records.get(i) instanceof FspPageAllocationRecord record
+                    && record.allocatedPageId().equals(pageId)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private static int indexOfPageInit(List<RedoRecord> records, PageId pageId) {
+        for (int i = 0; i < records.size(); i++) {
+            if (records.get(i) instanceof PageInitRecord record
+                    && record.pageId().equals(pageId)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private static boolean containsDeltaKind(List<RedoRecord> records, FspMetadataDeltaKind kind) {
+        return records.stream().anyMatch(record -> record instanceof FspMetadataDeltaRecord delta
+                && delta.kind() == kind);
     }
 
 }

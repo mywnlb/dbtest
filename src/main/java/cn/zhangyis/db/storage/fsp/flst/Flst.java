@@ -1,5 +1,7 @@
 package cn.zhangyis.db.storage.fsp.flst;
+import cn.zhangyis.db.storage.fsp.FspRedoDeltas;
 import cn.zhangyis.db.storage.fsp.exception.FspMetadataException;
+import cn.zhangyis.db.storage.redo.FspMetadataDeltaKind;
 
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
@@ -41,16 +43,21 @@ public final class Flst {
         PageGuard nodeG = g[1];
         FlstBase base = FlstBase.readFrom(baseG, baseAddr.offset());
         if (base.last().isNull()) {
-            new FlstNode(FileAddress.NULL, FileAddress.NULL).writeTo(nodeG, nodeAddr.offset());
-            new FlstBase(1L, nodeAddr, nodeAddr).writeTo(baseG, baseAddr.offset());
+            writeNode(mtr, spaceId, nodeG, nodeAddr, new FlstNode(FileAddress.NULL, FileAddress.NULL),
+                    "FLST addLast initialize node");
+            writeBase(mtr, spaceId, baseG, baseAddr, new FlstBase(1L, nodeAddr, nodeAddr),
+                    "FLST addLast initialize base");
             return;
         }
         FileAddress oldLast = base.last();
         PageGuard oldLastG = mtr.getPage(pool, pageId(spaceId, oldLast), PageLatchMode.EXCLUSIVE);
         FlstNode oln = FlstNode.readFrom(oldLastG, oldLast.offset());
-        new FlstNode(oldLast, FileAddress.NULL).writeTo(nodeG, nodeAddr.offset());
-        new FlstNode(oln.prev(), nodeAddr).writeTo(oldLastG, oldLast.offset());
-        new FlstBase(base.length() + 1L, base.first(), nodeAddr).writeTo(baseG, baseAddr.offset());
+        writeNode(mtr, spaceId, nodeG, nodeAddr, new FlstNode(oldLast, FileAddress.NULL),
+                "FLST addLast write new node");
+        writeNode(mtr, spaceId, oldLastG, oldLast, new FlstNode(oln.prev(), nodeAddr),
+                "FLST addLast relink old last");
+        writeBase(mtr, spaceId, baseG, baseAddr, new FlstBase(base.length() + 1L, base.first(), nodeAddr),
+                "FLST addLast update base");
     }
 
     /** 头插：node 接到 base.first 之前，更新 base.first 与 length。 */
@@ -61,16 +68,21 @@ public final class Flst {
         PageGuard nodeG = g[1];
         FlstBase base = FlstBase.readFrom(baseG, baseAddr.offset());
         if (base.first().isNull()) {
-            new FlstNode(FileAddress.NULL, FileAddress.NULL).writeTo(nodeG, nodeAddr.offset());
-            new FlstBase(1L, nodeAddr, nodeAddr).writeTo(baseG, baseAddr.offset());
+            writeNode(mtr, spaceId, nodeG, nodeAddr, new FlstNode(FileAddress.NULL, FileAddress.NULL),
+                    "FLST addFirst initialize node");
+            writeBase(mtr, spaceId, baseG, baseAddr, new FlstBase(1L, nodeAddr, nodeAddr),
+                    "FLST addFirst initialize base");
             return;
         }
         FileAddress oldFirst = base.first();
         PageGuard oldFirstG = mtr.getPage(pool, pageId(spaceId, oldFirst), PageLatchMode.EXCLUSIVE);
         FlstNode ofn = FlstNode.readFrom(oldFirstG, oldFirst.offset());
-        new FlstNode(FileAddress.NULL, oldFirst).writeTo(nodeG, nodeAddr.offset());
-        new FlstNode(nodeAddr, ofn.next()).writeTo(oldFirstG, oldFirst.offset());
-        new FlstBase(base.length() + 1L, nodeAddr, base.last()).writeTo(baseG, baseAddr.offset());
+        writeNode(mtr, spaceId, nodeG, nodeAddr, new FlstNode(FileAddress.NULL, oldFirst),
+                "FLST addFirst write new node");
+        writeNode(mtr, spaceId, oldFirstG, oldFirst, new FlstNode(nodeAddr, ofn.next()),
+                "FLST addFirst relink old first");
+        writeBase(mtr, spaceId, baseG, baseAddr, new FlstBase(base.length() + 1L, nodeAddr, base.last()),
+                "FLST addFirst update base");
     }
 
     /** 解链：从 base 所属链移除 node，修复 prev/next 与 base.first/last/length；移除后 node 指针置空。 */
@@ -91,21 +103,26 @@ public final class Flst {
         } else {
             PageGuard prevG = mtr.getPage(pool, pageId(spaceId, node.prev()), PageLatchMode.EXCLUSIVE);
             FlstNode prev = FlstNode.readFrom(prevG, node.prev().offset());
-            new FlstNode(prev.prev(), node.next()).writeTo(prevG, node.prev().offset());
+            writeNode(mtr, spaceId, prevG, node.prev(), new FlstNode(prev.prev(), node.next()),
+                    "FLST remove relink prev");
         }
         if (node.next().isNull()) {
             newLast = node.prev();
         } else {
             PageGuard nextG = mtr.getPage(pool, pageId(spaceId, node.next()), PageLatchMode.EXCLUSIVE);
             FlstNode next = FlstNode.readFrom(nextG, node.next().offset());
-            new FlstNode(node.prev(), next.next()).writeTo(nextG, node.next().offset());
+            writeNode(mtr, spaceId, nextG, node.next(), new FlstNode(node.prev(), next.next()),
+                    "FLST remove relink next");
         }
-        new FlstNode(FileAddress.NULL, FileAddress.NULL).writeTo(nodeG, nodeAddr.offset());
+        writeNode(mtr, spaceId, nodeG, nodeAddr, new FlstNode(FileAddress.NULL, FileAddress.NULL),
+                "FLST remove clear node");
         long newLen = base.length() - 1L;
         if (newLen == 0L) {
-            new FlstBase(0L, FileAddress.NULL, FileAddress.NULL).writeTo(baseG, baseAddr.offset());
+            writeBase(mtr, spaceId, baseG, baseAddr, new FlstBase(0L, FileAddress.NULL, FileAddress.NULL),
+                    "FLST remove empty base");
         } else {
-            new FlstBase(newLen, newFirst, newLast).writeTo(baseG, baseAddr.offset());
+            writeBase(mtr, spaceId, baseG, baseAddr, new FlstBase(newLen, newFirst, newLast),
+                    "FLST remove update base");
         }
     }
 
@@ -142,6 +159,22 @@ public final class Flst {
         requireRead(mtr, spaceId, nodeAddr);
         PageGuard nodeG = mtr.getPage(pool, pageId(spaceId, nodeAddr), PageLatchMode.SHARED);
         return FlstNode.readFrom(nodeG, nodeAddr.offset()).prev();
+    }
+
+    private static void writeBase(MiniTransaction mtr, SpaceId spaceId, PageGuard guard,
+                                  FileAddress baseAddr, FlstBase base, String reason) {
+        FspRedoDeltas.withFspCategory(mtr, reason, () -> base.writeTo(guard, baseAddr.offset()));
+        FspRedoDeltas.recordAfterImage(mtr, guard, pageId(spaceId, baseAddr),
+                FspMetadataDeltaKind.FLST_BASE_FIELD, baseAddr.pageNo().value(), baseAddr.offset(),
+                baseAddr.offset(), FlstBaseLayout.SIZE, reason);
+    }
+
+    private static void writeNode(MiniTransaction mtr, SpaceId spaceId, PageGuard guard,
+                                  FileAddress nodeAddr, FlstNode node, String reason) {
+        FspRedoDeltas.withFspCategory(mtr, reason, () -> node.writeTo(guard, nodeAddr.offset()));
+        FspRedoDeltas.recordAfterImage(mtr, guard, pageId(spaceId, nodeAddr),
+                FspMetadataDeltaKind.FLST_NODE_FIELD, nodeAddr.pageNo().value(), nodeAddr.offset(),
+                nodeAddr.offset(), FlstNodeLayout.SIZE, reason);
     }
 
     /**

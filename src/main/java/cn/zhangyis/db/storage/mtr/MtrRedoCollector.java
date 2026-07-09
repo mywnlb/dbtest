@@ -17,17 +17,17 @@ import java.util.Set;
 
 /**
  * 本 MTR 的 redo 收集器：实现 buf 的 {@link PageWriteListener}，把页写译成 {@link PageBytesRecord} 累积；
- * {@code newPage} 经 {@link #recordInit} 产 {@link PageInitRecord}。维护 {@code touchedPages}（收到任一记录即标记该页），
- * commit 据此决定给哪些页盖 pageLSN（不读 PageGuard.wrote 私有状态）。
+ * {@code newPage} 经 {@link #recordInit} 产 {@link PageInitRecord}，FSP 等模块可显式追加逻辑 intent record。
+ * {@code touchedPages} 只由物理页写和页初始化维护，commit 据此决定给哪些页盖 pageLSN（不读 PageGuard.wrote 私有状态）。
  *
- * <p>0.23b 起额外维护 {@link MtrRedoEntry} 诊断列表：record 仍是实际提交给 redo manager 的物理命令，
- * category 只表达本 MTR 内这次字节写来自 record、btree、fsp 还是 undo。它不改变 redo 编码和恢复行为。
+ * <p>0.23b 起额外维护 {@link MtrRedoEntry} 诊断列表：record 是实际提交给 redo manager 的持久命令，
+ * category 只表达本 MTR 内这次记录来自 record、btree、fsp 还是 undo。它不改变 redo 编码和恢复行为。
  *
  * <p>{@code enabled} 开关：commit 盖戳前关闭，使 pageLSN 写不入 redo。单线程拥有（随 MiniTransaction），无需加锁。
  */
 final class MtrRedoCollector implements PageWriteListener {
 
-    /** 实际提交给 redo manager 的物理 redo record，顺序即本 MTR 内页写入被捕获的顺序。 */
+    /** 实际提交给 redo manager 的 redo record，顺序即本 MTR 内收集顺序。 */
     private final List<RedoRecord> records = new ArrayList<>();
 
     /** 与 {@link #records} 一一对应的本地诊断条目；分类不进入持久 redo 文件，只用于审计语义来源。 */
@@ -65,6 +65,31 @@ final class MtrRedoCollector implements PageWriteListener {
         records.add(record);
         entries.add(new MtrRedoEntry(record, MtrRedoCategory.PAGE_INIT));
         touchedPages.add(pageId);
+    }
+
+    /**
+     * 追加一条显式逻辑 redo record。它不来自 PageGuard 字节写监听，因此不会自动增加 touched page；
+     * 调用方必须确保同一 MTR 内存在对应的物理页修改或恢复期安全副作用来承载该逻辑意图。
+     *
+     * @param record  将被持久化到 redo 文件的逻辑 record。
+     * @param category 本地诊断分类，说明 record 来源模块；不进入 redo 文件。
+     * @param reason  追加原因，必须说明数据库语义，便于 review 追踪。
+     */
+    void recordLogical(RedoRecord record, MtrRedoCategory category, String reason) {
+        if (!enabled) {
+            return;
+        }
+        if (record == null || category == null) {
+            throw new DatabaseValidationException("logical redo record/category must not be null");
+        }
+        if (category == MtrRedoCategory.PAGE_INIT) {
+            throw new DatabaseValidationException("PAGE_INIT category is reserved for MiniTransaction.newPage");
+        }
+        if (reason == null || reason.isBlank()) {
+            throw new DatabaseValidationException("logical redo reason must not be blank");
+        }
+        records.add(record);
+        entries.add(new MtrRedoEntry(record, category));
     }
 
     /**

@@ -46,7 +46,10 @@ import cn.zhangyis.db.storage.fsp.segment.SegmentSpaceService;
 import cn.zhangyis.db.storage.fsp.header.SpaceHeaderRepository;
 import cn.zhangyis.db.storage.fsp.header.SpaceHeaderSnapshot;
 import cn.zhangyis.db.storage.fsp.lifecycle.TablespaceLifecycleHeader;
+import cn.zhangyis.db.storage.mtr.MtrRedoCategory;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
+import cn.zhangyis.db.storage.redo.FspPageAllocationRecord;
+import cn.zhangyis.db.storage.redo.FspPageFreeRecord;
 
 import java.nio.file.Path;
 import java.util.List;
@@ -351,25 +354,29 @@ public final class DiskSpaceManager {
         }
         requireOrdinaryAccess(mtr, ref.spaceId());
         reservationService.consumePageIfReserved(mtr, ref.spaceId());
-        PageId allocated = doAllocatePage(mtr, ref, hint);
-        initAllocatedPage(mtr, allocated);
-        return allocated;
+        AllocationResult allocation = doAllocatePage(mtr, ref, hint);
+        mtr.appendLogicalRedo(new FspPageAllocationRecord(
+                        allocation.pageId(), ref.inodeSlot(), ref.segmentId(), allocation.autoExtendRetry()),
+                MtrRedoCategory.FSP_METADATA_BYTES,
+                "FSP page allocation intent before PAGE_INIT");
+        initAllocatedPage(mtr, allocation.pageId());
+        return allocation.pageId();
     }
 
     /** 现有分配逻辑（fragment→extent，autoextend 一次重试），只决定页号、不碰数据页帧。 */
-    private PageId doAllocatePage(MiniTransaction mtr, SegmentRef ref, PageAllocationHint hint) {
+    private AllocationResult doAllocatePage(MiniTransaction mtr, SegmentRef ref, PageAllocationHint hint) {
         ExtentAllocationDirection direction = toFspDirection(hint.direction());
         Optional<PageId> first = allocator.allocatePage(mtr, ref.spaceId(), ref.inodeSlot(),
                 direction, hint.hintPageNo(), hint.pagesNeeded());
         if (first.isPresent()) {
-            return first.get();
+            return new AllocationResult(first.get(), false);
         }
         PageNo newSize = pageStore.extend(ref.spaceId());
         headerRepo.setCurrentSizeInPages(mtr, ref.spaceId(), newSize);
         Optional<PageId> second = allocator.allocatePage(mtr, ref.spaceId(), ref.inodeSlot(),
                 direction, hint.hintPageNo(), hint.pagesNeeded());
         if (second.isPresent()) {
-            return second.get();
+            return new AllocationResult(second.get(), true);
         }
         throw new NoFreeSpaceException("no free space for segment " + ref.segmentId().value()
                 + " in tablespace " + ref.spaceId().value());
@@ -394,11 +401,24 @@ public final class DiskSpaceManager {
                 FilePageHeader.FIL_NULL, FilePageHeader.FIL_NULL, 0L, PageType.ALLOCATED));
     }
 
+    /**
+     * 单次页分配的内部结果。`autoExtendRetry` 只记录 facade 是否走过物理扩展后的第二次 allocator 尝试，
+     * 不暴露 FSP 内部 fragment/extent 决策，避免 B+Tree/Undo 调用方依赖空间管理实现细节。
+     */
+    private record AllocationResult(PageId pageId, boolean autoExtendRetry) {
+        private AllocationResult {
+            if (pageId == null) {
+                throw new DatabaseValidationException("allocated page id must not be null");
+            }
+        }
+    }
+
     /** 释放一个属于该 segment 的页。 */
     public void freePage(MiniTransaction mtr, SegmentRef ref, PageId pageId) {
         requireMtr(mtr);
         requireRef(ref);
         requireOrdinaryAccess(mtr, ref.spaceId());
+        appendPageFreeIntent(mtr, ref, pageId);
         segSpace.freePage(mtr, ref.spaceId(), ref.inodeSlot(), pageId);
     }
 
@@ -414,7 +434,9 @@ public final class DiskSpaceManager {
         for (int f = 0; f < 32; f++) {
             Optional<PageNo> fragment = inodeRepo.getFragmentPage(mtr, spaceId, slot, f);
             if (fragment.isPresent()) {
-                segSpace.freePage(mtr, spaceId, slot, PageId.of(spaceId, fragment.get()));
+                PageId pageId = PageId.of(spaceId, fragment.get());
+                appendPageFreeIntent(mtr, ref, pageId);
+                segSpace.freePage(mtr, spaceId, slot, pageId);
             }
         }
         releaseSegmentExtents(mtr, spaceId, inodeRepo.freeExtentListBaseAddr(spaceId, slot));
@@ -430,6 +452,12 @@ public final class DiskSpaceManager {
         requireOrdinaryAccess(mtr, spaceId);
         SpaceHeaderSnapshot h = headerRepo.read(mtr, spaceId);
         return new SpaceUsage(h.currentSizeInPages(), h.freeLimitPageNo(), h.nextSegmentId());
+    }
+
+    private static void appendPageFreeIntent(MiniTransaction mtr, SegmentRef ref, PageId pageId) {
+        mtr.appendLogicalRedo(new FspPageFreeRecord(pageId, ref.inodeSlot(), ref.segmentId()),
+                MtrRedoCategory.FSP_METADATA_BYTES,
+                "FSP page free intent before metadata PAGE_BYTES compatibility redo");
     }
 
     /** 把一条 segment extent 链上的所有 extent 逐个摘下并归还 FSP_FREE。 */

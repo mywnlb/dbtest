@@ -1,8 +1,10 @@
 package cn.zhangyis.db.storage.fsp.segment;
+import cn.zhangyis.db.storage.fsp.FspRedoDeltas;
 import cn.zhangyis.db.storage.fsp.exception.FspMetadataException;
 import cn.zhangyis.db.storage.fsp.flst.FileAddress;
 import cn.zhangyis.db.storage.fsp.flst.Flst;
 import cn.zhangyis.db.storage.fsp.flst.FlstBase;
+import cn.zhangyis.db.storage.redo.FspMetadataDeltaKind;
 
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
@@ -60,17 +62,23 @@ public final class SegmentInodeRepository {
         for (int slot = 0; slot < max; slot++) {
             int base = SegmentInodeLayout.slotOffset(slot);
             if (g.readInt(base + SegmentInodeLayout.USED) == 0) {
-                g.writeInt(base + SegmentInodeLayout.USED, 1);
-                g.writeLong(base + SegmentInodeLayout.SEGMENT_ID, segmentId.value());
-                g.writeInt(base + SegmentInodeLayout.PURPOSE, purpose.ordinal());
-                g.writeLong(base + SegmentInodeLayout.USED_PAGE_COUNT, 0L);
-                g.writeLong(base + SegmentInodeLayout.RESERVED_PAGE_COUNT, 0L);
-                FlstBase.EMPTY.writeTo(g, base + SegmentInodeLayout.FREE_EXTENT_LIST_BASE);
-                FlstBase.EMPTY.writeTo(g, base + SegmentInodeLayout.NOT_FULL_EXTENT_LIST_BASE);
-                FlstBase.EMPTY.writeTo(g, base + SegmentInodeLayout.FULL_EXTENT_LIST_BASE);
-                for (int f = 0; f < SegmentInodeLayout.FRAGMENT_SLOT_COUNT; f++) {
-                    g.writeLong(SegmentInodeLayout.fragmentSlotOffset(slot, f), 0L);
-                }
+                int slotIndex = slot;
+                int slotBase = base;
+                FspRedoDeltas.withFspCategory(mtr, "allocate segment inode slot", () -> {
+                    g.writeInt(slotBase + SegmentInodeLayout.USED, 1);
+                    g.writeLong(slotBase + SegmentInodeLayout.SEGMENT_ID, segmentId.value());
+                    g.writeInt(slotBase + SegmentInodeLayout.PURPOSE, purpose.ordinal());
+                    g.writeLong(slotBase + SegmentInodeLayout.USED_PAGE_COUNT, 0L);
+                    g.writeLong(slotBase + SegmentInodeLayout.RESERVED_PAGE_COUNT, 0L);
+                    FlstBase.EMPTY.writeTo(g, slotBase + SegmentInodeLayout.FREE_EXTENT_LIST_BASE);
+                    FlstBase.EMPTY.writeTo(g, slotBase + SegmentInodeLayout.NOT_FULL_EXTENT_LIST_BASE);
+                    FlstBase.EMPTY.writeTo(g, slotBase + SegmentInodeLayout.FULL_EXTENT_LIST_BASE);
+                    for (int f = 0; f < SegmentInodeLayout.FRAGMENT_SLOT_COUNT; f++) {
+                        g.writeLong(SegmentInodeLayout.fragmentSlotOffset(slotIndex, f), 0L);
+                    }
+                });
+                FspRedoDeltas.recordAfterImage(mtr, g, inodePage(spaceId), FspMetadataDeltaKind.INODE_SLOT_IMAGE,
+                        slotIndex, 0, slotBase, SegmentInodeLayout.ENTRY_SIZE, "allocate segment inode slot image");
                 return slot;
             }
         }
@@ -101,7 +109,8 @@ public final class SegmentInodeRepository {
         requireSpace(spaceId);
         int base = requireSlot(spaceId, inodeSlot);
         PageGuard g = mtr.getPage(pool, inodePage(spaceId), PageLatchMode.EXCLUSIVE);
-        g.writeBytes(base, new byte[SegmentInodeLayout.ENTRY_SIZE]);
+        FspRedoDeltas.writeBytes(mtr, g, inodePage(spaceId), FspMetadataDeltaKind.INODE_SLOT_IMAGE,
+                inodeSlot, 0, base, new byte[SegmentInodeLayout.ENTRY_SIZE], "free segment inode slot");
     }
 
     public void setUsedPageCount(MiniTransaction mtr, SpaceId spaceId, int inodeSlot, long value) {
@@ -157,7 +166,9 @@ public final class SegmentInodeRepository {
             throw new DatabaseValidationException("page 0 is reserved as empty fragment sentinel");
         }
         PageGuard g = mtr.getPage(pool, inodePage(spaceId), PageLatchMode.EXCLUSIVE);
-        g.writeLong(SegmentInodeLayout.fragmentSlotOffset(inodeSlot, fragIdx), raw);
+        FspRedoDeltas.writeLong(mtr, g, inodePage(spaceId), FspMetadataDeltaKind.INODE_FRAGMENT_SLOT,
+                inodeSlot, fragIdx, SegmentInodeLayout.fragmentSlotOffset(inodeSlot, fragIdx), raw,
+                "set inode fragment slot");
     }
 
     /** 返回首个空（值为 0）fragment 槽下标；满则抛 FspMetadataException。 */
@@ -214,7 +225,8 @@ public final class SegmentInodeRepository {
         requireSpace(spaceId);
         int base = requireSlot(spaceId, inodeSlot);
         PageGuard g = mtr.getPage(pool, inodePage(spaceId), PageLatchMode.EXCLUSIVE);
-        g.writeLong(base + fieldOffset, value);
+        FspRedoDeltas.writeLong(mtr, g, inodePage(spaceId), FspMetadataDeltaKind.INODE_FIELD,
+                inodeSlot, fieldOffset, base + fieldOffset, value, "write inode long field");
     }
 
     private static SegmentPurpose decodePurpose(int ordinal) {

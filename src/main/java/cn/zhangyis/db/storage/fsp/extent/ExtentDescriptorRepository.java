@@ -1,8 +1,10 @@
 package cn.zhangyis.db.storage.fsp.extent;
+import cn.zhangyis.db.storage.fsp.FspRedoDeltas;
 import cn.zhangyis.db.storage.fsp.exception.FspMetadataException;
 import cn.zhangyis.db.storage.fsp.flst.FileAddress;
 import cn.zhangyis.db.storage.fsp.flst.Flst;
 import cn.zhangyis.db.storage.fsp.header.SpaceHeaderLayout;
+import cn.zhangyis.db.storage.redo.FspMetadataDeltaKind;
 
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
@@ -141,11 +143,15 @@ public final class ExtentDescriptorRepository {
         }
         int base = entryOffset(extentId);
         PageGuard g = mtr.getPage(pool, page0(extentId), PageLatchMode.EXCLUSIVE);
-        g.writeInt(base + ExtentDescriptorLayout.STATE, ExtentState.FREE.ordinal());
-        g.writeLong(base + ExtentDescriptorLayout.OWNER_SEGMENT, 0L);
-        FileAddress.NULL.writeTo(g, base + ExtentDescriptorLayout.PREV);
-        FileAddress.NULL.writeTo(g, base + ExtentDescriptorLayout.NEXT);
-        g.writeBytes(base + ExtentDescriptorLayout.BITMAP, new byte[ExtentDescriptorLayout.BITMAP_BYTES]);
+        writeStateImage(mtr, g, extentId, base, ExtentState.FREE, "initialize FREE extent state");
+        writeOwnerImage(mtr, g, extentId, base, 0L, "initialize FREE extent owner");
+        writeAddressImage(mtr, g, extentId, base + ExtentDescriptorLayout.PREV,
+                FileAddress.NULL, ExtentDescriptorLayout.PREV, "initialize FREE extent prev");
+        writeAddressImage(mtr, g, extentId, base + ExtentDescriptorLayout.NEXT,
+                FileAddress.NULL, ExtentDescriptorLayout.NEXT, "initialize FREE extent next");
+        FspRedoDeltas.writeBytes(mtr, g, page0(extentId), FspMetadataDeltaKind.XDES_BITMAP_BYTE,
+                extentId.extentNo(), 0, base + ExtentDescriptorLayout.BITMAP,
+                new byte[ExtentDescriptorLayout.BITMAP_BYTES], "initialize FREE extent bitmap");
     }
 
     /** 初始化/修复 extent0 系统保留状态：page0..3 固定管理页标记已分配，避免普通 allocator 误用。 */
@@ -157,15 +163,21 @@ public final class ExtentDescriptorRepository {
         ExtentId extentId = ExtentId.of(spaceId, 0);
         int base = entryOffset(extentId);
         PageGuard g = mtr.getPage(pool, page0(extentId), PageLatchMode.EXCLUSIVE);
-        g.writeInt(base + ExtentDescriptorLayout.STATE, ExtentState.FSEG_FRAG.ordinal());
-        g.writeLong(base + ExtentDescriptorLayout.OWNER_SEGMENT, 0L);
-        FileAddress.NULL.writeTo(g, base + ExtentDescriptorLayout.PREV);
-        FileAddress.NULL.writeTo(g, base + ExtentDescriptorLayout.NEXT);
-        g.writeBytes(base + ExtentDescriptorLayout.BITMAP, new byte[ExtentDescriptorLayout.BITMAP_BYTES]);
+        writeStateImage(mtr, g, extentId, base, ExtentState.FSEG_FRAG, "reserve system extent state");
+        writeOwnerImage(mtr, g, extentId, base, 0L, "reserve system extent owner");
+        writeAddressImage(mtr, g, extentId, base + ExtentDescriptorLayout.PREV,
+                FileAddress.NULL, ExtentDescriptorLayout.PREV, "reserve system extent prev");
+        writeAddressImage(mtr, g, extentId, base + ExtentDescriptorLayout.NEXT,
+                FileAddress.NULL, ExtentDescriptorLayout.NEXT, "reserve system extent next");
+        FspRedoDeltas.writeBytes(mtr, g, page0(extentId), FspMetadataDeltaKind.XDES_BITMAP_BYTE,
+                extentId.extentNo(), 0, base + ExtentDescriptorLayout.BITMAP,
+                new byte[ExtentDescriptorLayout.BITMAP_BYTES], "reserve system extent bitmap");
         for (int page = 0; page < 4; page++) {
             int byteOffset = base + ExtentDescriptorLayout.BITMAP + page / 8;
             byte b = g.readBytes(byteOffset, 1)[0];
-            g.writeBytes(byteOffset, new byte[] {(byte) (b | (1 << (page % 8)))});
+            FspRedoDeltas.writeBytes(mtr, g, page0(extentId), FspMetadataDeltaKind.XDES_BITMAP_BYTE,
+                    extentId.extentNo(), page / 8, byteOffset,
+                    new byte[] {(byte) (b | (1 << (page % 8)))}, "reserve system extent allocated bit");
         }
     }
 
@@ -177,7 +189,7 @@ public final class ExtentDescriptorRepository {
         requireOrdinaryMutableExtent(extentId);
         int base = entryOffset(extentId);
         PageGuard g = mtr.getPage(pool, page0(extentId), PageLatchMode.EXCLUSIVE);
-        g.writeInt(base + ExtentDescriptorLayout.STATE, state.ordinal());
+        writeStateImage(mtr, g, extentId, base, state, "write XDES state");
     }
 
     public void writeOwner(MiniTransaction mtr, ExtentId extentId, Optional<SegmentId> owner) {
@@ -192,7 +204,7 @@ public final class ExtentDescriptorRepository {
         }
         int base = entryOffset(extentId);
         PageGuard g = mtr.getPage(pool, page0(extentId), PageLatchMode.EXCLUSIVE);
-        g.writeLong(base + ExtentDescriptorLayout.OWNER_SEGMENT, raw);
+        writeOwnerImage(mtr, g, extentId, base, raw, "write XDES owner");
     }
 
     public void writePrev(MiniTransaction mtr, ExtentId extentId, FileAddress prev) {
@@ -222,7 +234,9 @@ public final class ExtentDescriptorRepository {
         int mask = 1 << (pageIndexInExtent % 8);
         byte b = g.readBytes(byteOffset, 1)[0];
         byte nb = (byte) (allocated ? (b | mask) : (b & ~mask));
-        g.writeBytes(byteOffset, new byte[] {nb});
+        FspRedoDeltas.writeBytes(mtr, g, page0(extentId), FspMetadataDeltaKind.XDES_BITMAP_BYTE,
+                extentId.extentNo(), pageIndexInExtent / 8, byteOffset, new byte[] {nb},
+                "set XDES page allocation bit");
     }
 
     private void writeAddr(MiniTransaction mtr, ExtentId extentId, int fieldOffset, FileAddress addr) {
@@ -233,7 +247,27 @@ public final class ExtentDescriptorRepository {
         requireOrdinaryMutableExtent(extentId);
         int base = entryOffset(extentId);
         PageGuard g = mtr.getPage(pool, page0(extentId), PageLatchMode.EXCLUSIVE);
-        addr.writeTo(g, base + fieldOffset);
+        writeAddressImage(mtr, g, extentId, base + fieldOffset, addr, fieldOffset, "write XDES list address");
+    }
+
+    private void writeStateImage(MiniTransaction mtr, PageGuard guard, ExtentId extentId, int base,
+                                 ExtentState state, String reason) {
+        FspRedoDeltas.writeInt(mtr, guard, page0(extentId), FspMetadataDeltaKind.XDES_FIELD,
+                extentId.extentNo(), ExtentDescriptorLayout.STATE,
+                base + ExtentDescriptorLayout.STATE, state.ordinal(), reason);
+    }
+
+    private void writeOwnerImage(MiniTransaction mtr, PageGuard guard, ExtentId extentId, int base,
+                                 long owner, String reason) {
+        FspRedoDeltas.writeLong(mtr, guard, page0(extentId), FspMetadataDeltaKind.XDES_FIELD,
+                extentId.extentNo(), ExtentDescriptorLayout.OWNER_SEGMENT,
+                base + ExtentDescriptorLayout.OWNER_SEGMENT, owner, reason);
+    }
+
+    private void writeAddressImage(MiniTransaction mtr, PageGuard guard, ExtentId extentId, int offset,
+                                   FileAddress address, int fieldOffset, String reason) {
+        FspRedoDeltas.writeAddress(mtr, guard, page0(extentId), FspMetadataDeltaKind.XDES_FIELD,
+                extentId.extentNo(), fieldOffset, offset, address, reason);
     }
 
     private static ExtentState decodeState(int ordinal) {

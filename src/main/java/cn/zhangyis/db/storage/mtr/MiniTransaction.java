@@ -11,6 +11,7 @@ import cn.zhangyis.db.storage.fil.access.TablespaceAccessController;
 import cn.zhangyis.db.storage.page.PageEnvelope;
 import cn.zhangyis.db.storage.page.PageType;
 import cn.zhangyis.db.storage.redo.LogRange;
+import cn.zhangyis.db.storage.redo.RedoRecord;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
 
 import java.util.List;
@@ -19,7 +20,7 @@ import java.util.List;
  * mini-transaction：短物理临界区的一致性边界（设计 §9）。memo 收集 page latch + buffer fix，
  * commit/rollback 时 LIFO 释放；savepoint 提前释放局部资源。
  *
- * <p>单线程拥有，非线程安全。commit 会把 collector 中的物理 redo append 到 {@link RedoLogManager}、
+ * <p>单线程拥有，非线程安全。commit 会把 collector 中的 redo records append 到 {@link RedoLogManager}、
  * 取得 batch end LSN、给 touched 页盖 pageLSN，并在 dirty 发布后关闭 redo range；rollback 仍不撤销
  * 已写入 buffer 的页内容（MTR 无 content undo，依赖事务 undo/恢复路径兜底）。
  *
@@ -170,6 +171,20 @@ public final class MiniTransaction {
     public MtrRedoCategoryScope enterRedoCategory(MtrRedoCategory category, String reason) {
         ensureActive();
         return collector.enterCategory(category, reason);
+    }
+
+    /**
+     * 追加一条显式逻辑 redo record。该入口供 FSP/Undo 等模块在已经持有正确 MTR 资源边界时记录逻辑意图；
+     * 它不会触发 PageGuard 字节写，也不会直接把任何页加入 touched 集合。若该逻辑 record 需要 pageLSN 幂等边界，
+     * 调用方必须在同一 MTR 内保留对应物理页修改（例如 FSP page allocation 后紧跟 PAGE_INIT/metadata PAGE_BYTES）。
+     *
+     * @param record 将随本 MTR 一起持久化的 redo record。
+     * @param category 本地诊断分类，不进入 redo 文件。
+     * @param reason 追加原因，必须说明数据库语义。
+     */
+    public void appendLogicalRedo(RedoRecord record, MtrRedoCategory category, String reason) {
+        ensureActive();
+        collector.recordLogical(record, category, reason);
     }
 
     /**

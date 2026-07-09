@@ -5,7 +5,7 @@ import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.storage.fil.io.PageStore;
 
 /**
- * Redo 回放上下文。Recovery 把物理页 store 和实例页大小传给 page handler；handler 不依赖 BufferPool/MTR。
+ * Redo 回放上下文。Recovery 把物理页 store 和实例页大小传给各类 redo handler；handler 不依赖 BufferPool/MTR。
  *
  * @param pageStore 恢复期直接读写物理页的 PageStore。
  * @param pageSize  实例页大小。

@@ -9,7 +9,7 @@ import java.util.List;
  * recovery 必须先应用批内所有同页记录，再把该页 pageLSN 推到批次 endLsn。
  *
  * @param range   批次占用的 LSN 区间。
- * @param records 批内物理 redo 记录，按 MTR 收集顺序排列。
+ * @param records 批内 redo 记录，按 MTR 收集顺序排列；可同时包含物理页 record 与少量逻辑 intent record。
  */
 public record RedoLogBatch(LogRange range, List<RedoRecord> records) {
 

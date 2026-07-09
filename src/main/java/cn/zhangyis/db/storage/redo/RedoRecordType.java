@@ -7,7 +7,13 @@ public enum RedoRecordType {
     /** 页初始化 record，对应 {@link PageInitRecord}。 */
     PAGE_INIT((byte) 1),
     /** 页内连续字节覆盖 record，对应 {@link PageBytesRecord}。 */
-    PAGE_BYTES((byte) 2);
+    PAGE_BYTES((byte) 2),
+    /** FSP 页分配意图 record，对应 {@link FspPageAllocationRecord}。 */
+    FSP_PAGE_ALLOC((byte) 3),
+    /** FSP 元数据字段 after-image record，对应 {@link FspMetadataDeltaRecord}。 */
+    FSP_METADATA_DELTA((byte) 4),
+    /** FSP 页释放意图 record，对应 {@link FspPageFreeRecord}。 */
+    FSP_PAGE_FREE((byte) 5);
 
     private final byte tag;
 

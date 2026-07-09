@@ -4,6 +4,7 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.Lsn;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageNo;
+import cn.zhangyis.db.domain.SegmentId;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.page.PageType;
 
@@ -164,6 +165,27 @@ final class RedoBatchFrameCodec {
             byte[] bytes = pbr.bytes();
             out.writeInt(bytes.length);
             out.write(bytes);
+        } else if (r instanceof FspPageAllocationRecord far) {
+            out.writeByte(RedoRecordType.FSP_PAGE_ALLOC.tag());
+            writePageId(out, pageId);
+            out.writeInt(far.inodeSlot());
+            out.writeLong(far.segmentId().value());
+            out.writeBoolean(far.autoExtendRetry());
+        } else if (r instanceof FspMetadataDeltaRecord fmd) {
+            out.writeByte(RedoRecordType.FSP_METADATA_DELTA.tag());
+            writePageId(out, pageId);
+            out.writeByte(fmd.kind().code());
+            out.writeLong(fmd.subjectId());
+            out.writeInt(fmd.subIndex());
+            out.writeInt(fmd.offset());
+            byte[] payload = fmd.afterImage();
+            out.writeInt(payload.length);
+            out.write(payload);
+        } else if (r instanceof FspPageFreeRecord fpf) {
+            out.writeByte(RedoRecordType.FSP_PAGE_FREE.tag());
+            writePageId(out, pageId);
+            out.writeInt(fpf.inodeSlot());
+            out.writeLong(fpf.segmentId().value());
         } else {
             throw new RedoLogCorruptedException("unsupported redo record type: " + r.getClass().getName());
         }
@@ -186,6 +208,24 @@ final class RedoBatchFrameCodec {
                 }
                 yield new PageBytesRecord(pageId, offset, payload);
             }
+            case FSP_PAGE_ALLOC -> new FspPageAllocationRecord(
+                    pageId, in.readInt(), SegmentId.of(in.readLong()), in.readBoolean());
+            case FSP_METADATA_DELTA -> {
+                FspMetadataDeltaKind kind = FspMetadataDeltaKind.fromCode(in.readByte());
+                long subjectId = in.readLong();
+                int subIndex = in.readInt();
+                int offset = in.readInt();
+                int len = in.readInt();
+                if (len < 0 || len > MAX_PAYLOAD_BYTES) {
+                    throw new RedoLogCorruptedException("FSP metadata delta payload length invalid: " + len);
+                }
+                byte[] payload = in.readNBytes(len);
+                if (payload.length != len) {
+                    throw new RedoLogCorruptedException("FSP metadata delta payload truncated");
+                }
+                yield new FspMetadataDeltaRecord(pageId, kind, subjectId, subIndex, offset, payload);
+            }
+            case FSP_PAGE_FREE -> new FspPageFreeRecord(pageId, in.readInt(), SegmentId.of(in.readLong()));
         };
     }
 
@@ -204,6 +244,15 @@ final class RedoBatchFrameCodec {
         }
         if (r instanceof PageBytesRecord pbr) {
             return pbr.pageId();
+        }
+        if (r instanceof FspPageAllocationRecord far) {
+            return far.allocatedPageId();
+        }
+        if (r instanceof FspMetadataDeltaRecord fmd) {
+            return fmd.pageId();
+        }
+        if (r instanceof FspPageFreeRecord fpf) {
+            return fpf.freedPageId();
         }
         throw new RedoLogCorruptedException("unsupported redo record type: " + r.getClass().getName());
     }

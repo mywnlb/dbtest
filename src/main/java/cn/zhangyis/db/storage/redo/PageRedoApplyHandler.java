@@ -15,7 +15,8 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * PAGE_INIT/PAGE_BYTES 的物理页回放 handler。它按批次缓存同页修改，先应用批内所有记录，再把 pageLSN 盖到 batch endLsn。
+ * PAGE_INIT/PAGE_BYTES/FSP metadata delta 的物理页回放 handler。它按批次缓存同页修改，先应用批内所有记录，
+ * 再把 pageLSN 盖到 batch endLsn。
  *
  * <p>这个顺序很关键：D3/D4 的 MTR commit 语义是“批内所有修改共享 endLsn”。若 PAGE_INIT 后立即盖 pageLSN，
  * 同批后续 PAGE_BYTES 会被 pageLSN 幂等判断误跳过，导致恢复页半成品。
@@ -24,7 +25,9 @@ public final class PageRedoApplyHandler implements RedoApplyHandler {
 
     @Override
     public boolean supports(RedoRecord record) {
-        return record instanceof PageInitRecord || record instanceof PageBytesRecord;
+        return record instanceof PageInitRecord
+                || record instanceof PageBytesRecord
+                || record instanceof FspMetadataDeltaRecord;
     }
 
     @Override
@@ -118,6 +121,8 @@ public final class PageRedoApplyHandler implements RedoApplyHandler {
                 page.touched = true;
             } else if (record instanceof PageBytesRecord pbr) {
                 applyBytes(context, page, pbr);
+            } else if (record instanceof FspMetadataDeltaRecord fmd) {
+                applyMetadataDelta(context, page, fmd);
             } else {
                 throw new RedoLogCorruptedException("unsupported redo record type: " + record.getClass().getName());
             }
@@ -135,13 +140,24 @@ public final class PageRedoApplyHandler implements RedoApplyHandler {
     }
 
     private static void applyBytes(RedoApplyContext context, ReplayPage page, PageBytesRecord record) {
-        byte[] bytes = record.bytes();
-        long end = (long) record.offset() + bytes.length;
-        if (record.offset() < 0 || end > context.pageSize().bytes()) {
-            throw new RedoLogCorruptedException("redo PAGE_BYTES out of page bounds: offset="
-                    + record.offset() + " length=" + bytes.length + " pageSize=" + context.pageSize().bytes());
+        applyPatch(context, page, record.offset(), record.bytes(), "redo PAGE_BYTES");
+    }
+
+    /**
+     * FSP metadata delta 与 PAGE_BYTES 共用同一个 batch page cache。这样同一 MTR 内 metadata delta 和兼容期
+     * PAGE_BYTES 指向同一 page0/page2 时，恢复只会读一次、批末写一次，避免两个 handler 各自缓存并覆盖彼此修改。
+     */
+    private static void applyMetadataDelta(RedoApplyContext context, ReplayPage page, FspMetadataDeltaRecord record) {
+        applyPatch(context, page, record.offset(), record.afterImage(), "redo FSP metadata delta");
+    }
+
+    private static void applyPatch(RedoApplyContext context, ReplayPage page, int offset, byte[] patch, String what) {
+        long end = (long) offset + patch.length;
+        if (offset < 0 || end > context.pageSize().bytes()) {
+            throw new RedoLogCorruptedException(what + " out of page bounds: offset="
+                    + offset + " length=" + patch.length + " pageSize=" + context.pageSize().bytes());
         }
-        System.arraycopy(bytes, 0, page.bytes, record.offset(), bytes.length);
+        System.arraycopy(patch, 0, page.bytes, offset, patch.length);
         page.touched = true;
     }
 
@@ -191,6 +207,9 @@ public final class PageRedoApplyHandler implements RedoApplyHandler {
         }
         if (record instanceof PageBytesRecord pbr) {
             return pbr.pageId();
+        }
+        if (record instanceof FspMetadataDeltaRecord fmd) {
+            return fmd.pageId();
         }
         throw new RedoLogCorruptedException("unsupported redo record type: " + record.getClass().getName());
     }

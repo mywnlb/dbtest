@@ -9,8 +9,8 @@ import java.util.Map;
 import java.util.function.Predicate;
 
 /**
- * Redo apply 分发器。0.19a 起支持多 handler registry，但默认生产入口仍只注册 PAGE_INIT/PAGE_BYTES
- * 物理页 handler；新增持久逻辑 redo 类型时只需注册新的 {@link RedoApplyHandler}。
+ * Redo apply 分发器。0.19a 起支持多 handler registry；0.19b 起默认生产入口同时注册
+ * FSP allocation intent handler 与 PAGE_INIT/PAGE_BYTES 物理页 handler。
  *
  * <p>分发器必须保持 batch 内 record 的原始顺序：page handler 依赖批末统一 pageLSN，未来 FSP/BTree
  * handler 也可能依赖同一 MTR 内的先后关系。因此这里按 record 顺序解析 handler 并调用 batch session，
@@ -33,9 +33,9 @@ public final class RedoApplyDispatcher {
         this.handlers = List.copyOf(handlers);
     }
 
-    /** 创建只包含 page handler 的恢复分发器。 */
+    /** 创建生产恢复分发器。保留历史命名，当前默认包含 FSP allocation handler 与 page handler。 */
     public static RedoApplyDispatcher pageDispatcher() {
-        return withHandlers(List.of(new PageRedoApplyHandler()));
+        return withHandlers(List.of(new FspPageAllocationRedoHandler(), new PageRedoApplyHandler()));
     }
 
     /**

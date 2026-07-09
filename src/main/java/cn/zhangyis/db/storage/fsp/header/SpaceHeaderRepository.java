@@ -1,12 +1,14 @@
 package cn.zhangyis.db.storage.fsp.header;
 import cn.zhangyis.db.storage.fil.state.TablespaceState;
 
+import cn.zhangyis.db.storage.fsp.FspRedoDeltas;
 import cn.zhangyis.db.storage.fsp.exception.FspMetadataException;
 import cn.zhangyis.db.storage.fsp.flst.FileAddress;
 import cn.zhangyis.db.storage.fsp.flst.Flst;
 import cn.zhangyis.db.storage.fsp.flst.FlstBase;
 import cn.zhangyis.db.storage.fsp.lifecycle.TablespaceLifecycleFormat;
 import cn.zhangyis.db.storage.fsp.lifecycle.TablespaceLifecycleHeader;
+import cn.zhangyis.db.storage.redo.FspMetadataDeltaKind;
 
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
@@ -57,21 +59,46 @@ public final class SpaceHeaderRepository {
         // FilePageHeader 不变量——loader/recovery 打开时据此判定 page0 真为表空间头，拒绝绑定错误或损坏的物理页。
         // 信封头经 page guard 写入，作为 PAGE_BYTES 进入 MTR redo，replay 可重建；pageLSN 由 MTR commit 盖戳。
         // FSP 自描述字段（SPACE_ID@38 等）位于信封头之后，二者偏移不重叠。
-        PageEnvelope.writeHeader(g, new FilePageHeader(h.spaceId(), 0L,
-                FilePageHeader.FIL_NULL, FilePageHeader.FIL_NULL, 0L, PageType.FSP_HDR));
-        g.writeInt(SpaceHeaderLayout.SPACE_ID, h.spaceId().value());
-        g.writeInt(SpaceHeaderLayout.PAGE_SIZE_BYTES, h.pageSize().bytes());
-        g.writeInt(SpaceHeaderLayout.SPACE_FLAGS, h.spaceFlags());
-        g.writeLong(SpaceHeaderLayout.CURRENT_SIZE, h.currentSizeInPages().value());
-        g.writeLong(SpaceHeaderLayout.FREE_LIMIT, h.freeLimitPageNo().value());
-        g.writeLong(SpaceHeaderLayout.NEXT_SEGMENT_ID, h.nextSegmentId());
-        h.freeExtentList().writeTo(g, SpaceHeaderLayout.FREE_EXTENT_LIST_BASE);
-        h.freeFragExtentList().writeTo(g, SpaceHeaderLayout.FREE_FRAG_LIST_BASE);
-        h.fullFragExtentList().writeTo(g, SpaceHeaderLayout.FULL_FRAG_LIST_BASE);
-        g.writeLong(SpaceHeaderLayout.FIRST_INODE_PAGE, h.firstInodePageNo().value());
-        g.writeLong(SpaceHeaderLayout.SDI_ROOT, h.sdiRootPageNo());
-        g.writeInt(SpaceHeaderLayout.SERVER_VERSION, h.serverVersion());
-        g.writeLong(SpaceHeaderLayout.SPACE_VERSION, h.spaceVersion());
+        FspRedoDeltas.withFspCategory(mtr, "initialize page0 FSP_HDR envelope",
+                () -> PageEnvelope.writeHeader(g, new FilePageHeader(h.spaceId(), 0L,
+                        FilePageHeader.FIL_NULL, FilePageHeader.FIL_NULL, 0L, PageType.FSP_HDR)));
+        PageId pageId = page0(h.spaceId());
+        FspRedoDeltas.writeInt(mtr, g, pageId, FspMetadataDeltaKind.SPACE_HEADER_FIELD,
+                0L, SpaceHeaderLayout.SPACE_ID, SpaceHeaderLayout.SPACE_ID, h.spaceId().value(),
+                "initialize space id");
+        FspRedoDeltas.writeInt(mtr, g, pageId, FspMetadataDeltaKind.SPACE_HEADER_FIELD,
+                0L, SpaceHeaderLayout.PAGE_SIZE_BYTES, SpaceHeaderLayout.PAGE_SIZE_BYTES, h.pageSize().bytes(),
+                "initialize page size");
+        FspRedoDeltas.writeInt(mtr, g, pageId, FspMetadataDeltaKind.SPACE_HEADER_FIELD,
+                0L, SpaceHeaderLayout.SPACE_FLAGS, SpaceHeaderLayout.SPACE_FLAGS, h.spaceFlags(),
+                "initialize space flags");
+        FspRedoDeltas.writeLong(mtr, g, pageId, FspMetadataDeltaKind.SPACE_HEADER_FIELD,
+                0L, SpaceHeaderLayout.CURRENT_SIZE, SpaceHeaderLayout.CURRENT_SIZE, h.currentSizeInPages().value(),
+                "initialize current size");
+        FspRedoDeltas.writeLong(mtr, g, pageId, FspMetadataDeltaKind.SPACE_HEADER_FIELD,
+                0L, SpaceHeaderLayout.FREE_LIMIT, SpaceHeaderLayout.FREE_LIMIT, h.freeLimitPageNo().value(),
+                "initialize free limit");
+        FspRedoDeltas.writeLong(mtr, g, pageId, FspMetadataDeltaKind.SPACE_HEADER_FIELD,
+                0L, SpaceHeaderLayout.NEXT_SEGMENT_ID, SpaceHeaderLayout.NEXT_SEGMENT_ID, h.nextSegmentId(),
+                "initialize next segment id");
+        writeFlstBase(mtr, g, pageId, SpaceHeaderLayout.FREE_EXTENT_LIST_BASE, h.freeExtentList(),
+                "initialize FSP_FREE base");
+        writeFlstBase(mtr, g, pageId, SpaceHeaderLayout.FREE_FRAG_LIST_BASE, h.freeFragExtentList(),
+                "initialize FSP_FREE_FRAG base");
+        writeFlstBase(mtr, g, pageId, SpaceHeaderLayout.FULL_FRAG_LIST_BASE, h.fullFragExtentList(),
+                "initialize FSP_FULL_FRAG base");
+        FspRedoDeltas.writeLong(mtr, g, pageId, FspMetadataDeltaKind.SPACE_HEADER_FIELD,
+                0L, SpaceHeaderLayout.FIRST_INODE_PAGE, SpaceHeaderLayout.FIRST_INODE_PAGE,
+                h.firstInodePageNo().value(), "initialize first inode page");
+        FspRedoDeltas.writeLong(mtr, g, pageId, FspMetadataDeltaKind.SPACE_HEADER_FIELD,
+                0L, SpaceHeaderLayout.SDI_ROOT, SpaceHeaderLayout.SDI_ROOT, h.sdiRootPageNo(),
+                "initialize SDI root");
+        FspRedoDeltas.writeInt(mtr, g, pageId, FspMetadataDeltaKind.SPACE_HEADER_FIELD,
+                0L, SpaceHeaderLayout.SERVER_VERSION, SpaceHeaderLayout.SERVER_VERSION, h.serverVersion(),
+                "initialize server version");
+        FspRedoDeltas.writeLong(mtr, g, pageId, FspMetadataDeltaKind.SPACE_HEADER_FIELD,
+                0L, SpaceHeaderLayout.SPACE_VERSION, SpaceHeaderLayout.SPACE_VERSION, h.spaceVersion(),
+                "initialize space version");
     }
 
     /** 读出全部 header 字段（S）；三个 list base 经 FlstBase.readFrom 解码（含空链一致性校验）。 */
@@ -166,15 +193,18 @@ public final class SpaceHeaderRepository {
     }
 
     public void setCurrentSizeInPages(MiniTransaction mtr, SpaceId spaceId, PageNo value) {
-        writeLongField(mtr, spaceId, SpaceHeaderLayout.CURRENT_SIZE, requireValue(value).value());
+        writeLongField(mtr, spaceId, SpaceHeaderLayout.CURRENT_SIZE, requireValue(value).value(),
+                "set current size");
     }
 
     public void setFreeLimitPageNo(MiniTransaction mtr, SpaceId spaceId, PageNo value) {
-        writeLongField(mtr, spaceId, SpaceHeaderLayout.FREE_LIMIT, requireValue(value).value());
+        writeLongField(mtr, spaceId, SpaceHeaderLayout.FREE_LIMIT, requireValue(value).value(),
+                "set free limit");
     }
 
     public void setFirstInodePageNo(MiniTransaction mtr, SpaceId spaceId, PageNo value) {
-        writeLongField(mtr, spaceId, SpaceHeaderLayout.FIRST_INODE_PAGE, requireValue(value).value());
+        writeLongField(mtr, spaceId, SpaceHeaderLayout.FIRST_INODE_PAGE, requireValue(value).value(),
+                "set first inode page");
     }
 
     /** FSP_FREE 链 base 地址（page0 内固定偏移），供 Flst/2b 维护链。 */
@@ -204,15 +234,25 @@ public final class SpaceHeaderRepository {
         if (current <= 0) {
             throw new FspMetadataException("invalid next segment id on disk: " + current);
         }
-        g.writeLong(SpaceHeaderLayout.NEXT_SEGMENT_ID, current + 1);
+        FspRedoDeltas.writeLong(mtr, g, page0(spaceId), FspMetadataDeltaKind.SPACE_HEADER_FIELD,
+                0L, SpaceHeaderLayout.NEXT_SEGMENT_ID, SpaceHeaderLayout.NEXT_SEGMENT_ID, current + 1,
+                "allocate next segment id");
         return current;
     }
 
-    private void writeLongField(MiniTransaction mtr, SpaceId spaceId, int offset, long value) {
+    private void writeLongField(MiniTransaction mtr, SpaceId spaceId, int offset, long value, String reason) {
         requireMtr(mtr);
         requireSpace(spaceId);
         PageGuard g = mtr.getPage(pool, page0(spaceId), PageLatchMode.EXCLUSIVE);
-        g.writeLong(offset, value);
+        FspRedoDeltas.writeLong(mtr, g, page0(spaceId), FspMetadataDeltaKind.SPACE_HEADER_FIELD,
+                0L, offset, offset, value, reason);
+    }
+
+    private static void writeFlstBase(MiniTransaction mtr, PageGuard guard, PageId pageId,
+                                      int offset, FlstBase base, String reason) {
+        FspRedoDeltas.withFspCategory(mtr, reason, () -> base.writeTo(guard, offset));
+        FspRedoDeltas.recordAfterImage(mtr, guard, pageId, FspMetadataDeltaKind.FLST_BASE_FIELD,
+                0L, offset, offset, cn.zhangyis.db.storage.fsp.flst.FlstBaseLayout.SIZE, reason);
     }
 
     private static void requireMtr(MiniTransaction mtr) {

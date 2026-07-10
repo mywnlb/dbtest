@@ -8,7 +8,7 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
  *
  * @param restoredSlots 从 rollback segment header page3 恢复出的占用 slot 数量。
  * @param rolledBackActiveSlots 已执行 recovery rollback 并释放内存 slot 的 ACTIVE 段数量。
- * @param skippedActiveSlots 因当前教学简化（未配置单聚簇索引、无 DD）而保留未回滚的 ACTIVE 段数量。
+ * @param skippedActiveSlots 为 force-recovery 扩展保留的诊断字段；当前生产链不允许跳过 ACTIVE，固定为 0。
  * @param rebuiltHistoryEntries 从 COMMITTED undo header 重建并提交到内存 history list 的条目数量。
  */
 public record TransactionUndoRecoveryResult(int restoredSlots,

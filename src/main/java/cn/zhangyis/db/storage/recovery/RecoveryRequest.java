@@ -29,7 +29,8 @@ import java.util.Set;
  * @param recoveredRedoManager REDO_BOUNDARY_INSTALL 阶段使用的、本进程将继续 append 的 RedoLogManager；
  *                             为空表示跳过该阶段（仅用于不需要续写 redo 的纯回放测试）。真实重启必须提供，
  *                             否则新 MTR 会从 0 重新分配 LSN 覆盖已有日志。
- * @param transactionUndoRecovery 可选事务 undo 恢复参与者；负责正式 UNDO_ROLLBACK/RESUME_PURGE 阶段。
+ * @param transactionRecoveryContext 可选正式事务恢复上下文；在 redo replay 前装载 sidecar，期间接收 transaction delta。
+ * @param transactionUndoRecovery 可选事务 undo 恢复参与者；消费 immutable snapshot 并负责正式 UNDO_ROLLBACK/RESUME_PURGE。
  * @param skipPolicy force-skip 恢复策略；NORMAL/READ_ONLY_VALIDATE 必须为空，避免普通启动隐式跳过数据。
  */
 public record RecoveryRequest(RecoveryMode mode,
@@ -42,6 +43,7 @@ public record RecoveryRequest(RecoveryMode mode,
                               UndoTablespaceRecoveryParticipant undoTablespaceRecovery,
                               List<SpaceId> spacesToReconcile,
                               RedoLogManager recoveredRedoManager,
+                              TransactionRecoveryContext transactionRecoveryContext,
                               TransactionUndoRecoveryParticipant transactionUndoRecovery,
                               RecoverySkipPolicy skipPolicy) {
 
@@ -60,6 +62,24 @@ public record RecoveryRequest(RecoveryMode mode,
         if (mode == RecoveryMode.FORCE_SKIP_CORRUPT_TABLESPACE && skipPolicy.isEmpty()) {
             throw new DatabaseValidationException("FORCE_SKIP_CORRUPT_TABLESPACE requires skipped spaces");
         }
+        if (transactionUndoRecovery != null && transactionRecoveryContext == null) {
+            throw new DatabaseValidationException(
+                    "transaction undo recovery requires a formal transaction recovery context");
+        }
+        if (mode == RecoveryMode.READ_ONLY_VALIDATE && transactionUndoRecovery != null) {
+            throw new DatabaseValidationException(
+                    "READ_ONLY_VALIDATE cannot execute transaction undo recovery");
+        }
+        if (mode != RecoveryMode.READ_ONLY_VALIDATE
+                && transactionRecoveryContext != null && transactionUndoRecovery == null) {
+            throw new DatabaseValidationException(
+                    "writable transaction recovery context requires an undo recovery participant");
+        }
+        if (mode != RecoveryMode.READ_ONLY_VALIDATE && transactionRecoveryContext != null
+                && !dispatcher.isBoundToTransactionStateSink(transactionRecoveryContext.deltaSink())) {
+            throw new DatabaseValidationException(
+                    "formal transaction recovery context requires its bound transaction-state dispatcher");
+        }
         pagesToRepair = pagesToRepair == null ? List.of() : List.copyOf(pagesToRepair);
         if (doublewriteScanner == null && !pagesToRepair.isEmpty()) {
             throw new DatabaseValidationException("recovery pages require a doublewrite scanner");
@@ -75,7 +95,7 @@ public record RecoveryRequest(RecoveryMode mode,
                                          RedoApplyDispatcher dispatcher,
                                          RedoApplyContext applyContext) {
         return new RecoveryRequest(RecoveryMode.NORMAL, checkpointStore, redoRepository,
-                dispatcher, applyContext, null, List.of(), null, List.of(), null, null,
+                dispatcher, applyContext, null, List.of(), null, List.of(), null, null, null,
                 RecoverySkipPolicy.none());
     }
 
@@ -88,7 +108,7 @@ public record RecoveryRequest(RecoveryMode mode,
                                                    RedoApplyDispatcher dispatcher,
                                                    RedoApplyContext applyContext) {
         return new RecoveryRequest(RecoveryMode.READ_ONLY_VALIDATE, checkpointStore, redoRepository,
-                dispatcher, applyContext, null, List.of(), null, List.of(), null, null,
+                dispatcher, applyContext, null, List.of(), null, List.of(), null, null, null,
                 RecoverySkipPolicy.none());
     }
 
@@ -110,7 +130,7 @@ public record RecoveryRequest(RecoveryMode mode,
                                             Set<SpaceId> skippedSpaces) {
         return new RecoveryRequest(RecoveryMode.FORCE_SKIP_CORRUPT_TABLESPACE,
                 checkpointStore, redoRepository, dispatcher, applyContext,
-                null, List.of(), null, List.of(), null, null,
+                null, List.of(), null, List.of(), null, null, null,
                 RecoverySkipPolicy.of(skippedSpaces));
     }
 
@@ -123,7 +143,7 @@ public record RecoveryRequest(RecoveryMode mode,
         }
         return new RecoveryRequest(mode, checkpointStore, redoRepository, dispatcher, applyContext,
                 scanner, pages, undoTablespaceRecovery, spacesToReconcile,
-                recoveredRedoManager, transactionUndoRecovery, skipPolicy);
+                recoveredRedoManager, transactionRecoveryContext, transactionUndoRecovery, skipPolicy);
     }
 
     /**
@@ -135,7 +155,7 @@ public record RecoveryRequest(RecoveryMode mode,
         }
         return new RecoveryRequest(mode, checkpointStore, redoRepository, dispatcher, applyContext,
                 doublewriteScanner, pagesToRepair, participant, spacesToReconcile,
-                recoveredRedoManager, transactionUndoRecovery, skipPolicy);
+                recoveredRedoManager, transactionRecoveryContext, transactionUndoRecovery, skipPolicy);
     }
 
     /**
@@ -151,7 +171,7 @@ public record RecoveryRequest(RecoveryMode mode,
         }
         return new RecoveryRequest(mode, checkpointStore, redoRepository, dispatcher, applyContext,
                 doublewriteScanner, pagesToRepair, undoTablespaceRecovery, spaces,
-                recoveredRedoManager, transactionUndoRecovery, skipPolicy);
+                recoveredRedoManager, transactionRecoveryContext, transactionUndoRecovery, skipPolicy);
     }
 
     /**
@@ -167,22 +187,41 @@ public record RecoveryRequest(RecoveryMode mode,
         }
         return new RecoveryRequest(mode, checkpointStore, redoRepository, dispatcher, applyContext,
                 doublewriteScanner, pagesToRepair, undoTablespaceRecovery, spacesToReconcile,
-                redoManager, transactionUndoRecovery, skipPolicy);
+                redoManager, transactionRecoveryContext, transactionUndoRecovery, skipPolicy);
     }
 
     /**
-     * 接入正式事务 undo 恢复阶段：redo replay 和物理空间续作完成后，OPEN_TRAFFIC 前调用该参与者扫描 page3、
-     * rollback recovered ACTIVE 段并重建 committed history。request 保持不可变，避免启动恢复中替换参与者。
+     * 接入正式事务表恢复：context 同时提供 sidecar 基线和 dispatcher sink，participant 只接收 replay 后快照。
+     * 本方法重建标准 page dispatcher 并绑定该 context 的 sink，调用方先前传入的 no-op dispatcher 不会静默丢 delta。
      *
-     * @param participant 事务 undo 恢复参与者。
-     * @return 携带事务 undo 恢复参与者的新请求。
+     * @param context 事务恢复上下文。
+     * @param participant page3/undo 恢复参与者。
+     * @return 携带正式事务恢复链的新请求。
      */
-    public RecoveryRequest withTransactionUndoRecovery(TransactionUndoRecoveryParticipant participant) {
-        if (participant == null) {
-            throw new DatabaseValidationException("transaction undo recovery participant must not be null");
+    public RecoveryRequest withTransactionRecovery(
+            TransactionRecoveryContext context, TransactionUndoRecoveryParticipant participant) {
+        if (context == null || participant == null) {
+            throw new DatabaseValidationException("transaction recovery context/participant must not be null");
+        }
+        return new RecoveryRequest(mode, checkpointStore, redoRepository,
+                RedoApplyDispatcher.pageDispatcher(context.deltaSink()), applyContext,
+                doublewriteScanner, pagesToRepair, undoTablespaceRecovery, spacesToReconcile,
+                recoveredRedoManager, context, participant, skipPolicy);
+    }
+
+    /**
+     * READ_ONLY_VALIDATE 只接事务 sidecar 覆盖校验，不注入 redo sink 或 undo participant，保证诊断路径不写页/redo。
+     */
+    public RecoveryRequest withTransactionRecoveryValidation(TransactionRecoveryContext context) {
+        if (context == null) {
+            throw new DatabaseValidationException("transaction recovery validation context must not be null");
+        }
+        if (mode != RecoveryMode.READ_ONLY_VALIDATE) {
+            throw new DatabaseValidationException(
+                    "transaction recovery validation-only context requires READ_ONLY_VALIDATE mode");
         }
         return new RecoveryRequest(mode, checkpointStore, redoRepository, dispatcher, applyContext,
                 doublewriteScanner, pagesToRepair, undoTablespaceRecovery, spacesToReconcile,
-                recoveredRedoManager, participant, skipPolicy);
+                recoveredRedoManager, context, transactionUndoRecovery, skipPolicy);
     }
 }

@@ -65,4 +65,19 @@ class TransactionSystemTest {
         assertEquals(21L, sys.allocateTransactionNo().value(),
                 "restoreCounters must not move nextTransactionNo backward");
     }
+
+    /** checkpoint 快照读取的是两个 next-counter，不能消费号码或暴露活跃表可变状态。 */
+    @Test
+    void counterSnapshotCapturesNextValuesWithoutAllocatingThem() {
+        TransactionSystem sys = new TransactionSystem();
+        sys.allocateWriteId();
+        sys.allocateTransactionNo();
+
+        TransactionCounterSnapshot snapshot = sys.snapshotCounters();
+
+        assertEquals(TransactionId.of(2), snapshot.nextTransactionId());
+        assertEquals(TransactionNo.of(2), snapshot.nextTransactionNo());
+        assertEquals(TransactionId.of(2), sys.allocateWriteId());
+        assertEquals(TransactionNo.of(2), sys.allocateTransactionNo());
+    }
 }

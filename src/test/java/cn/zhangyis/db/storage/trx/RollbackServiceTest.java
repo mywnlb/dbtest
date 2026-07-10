@@ -115,6 +115,7 @@ class RollbackServiceTest {
             assertTrue(records.stream().anyMatch(record -> record instanceof TransactionStateDeltaRecord delta
                             && delta.transactionId().equals(wid)
                             && delta.toState() == TransactionStateDeltaState.ROLLED_BACK
+                            && delta.transactionNo().isNone()
                             && delta.reason() == TransactionStateDeltaReason.ROLLBACK),
                     "rollback completion must write diagnostic trx state redo before finishRollback");
             assertEquals(0, ctx.slots.activeSlotCount(), "slot released after rollback");
@@ -344,6 +345,14 @@ class RollbackServiceTest {
             assertFalse(ctx.slots.isOccupied(undoContext.slotId()),
                     "recovery rollback finalization releases the recovered slot");
             assertRowsPresent(ctx, fixture.index(), false, false, false);
+            assertTrue(ctx.mgr.redoLogManager().bufferedRecords().stream()
+                            .anyMatch(record -> record instanceof TransactionStateDeltaRecord delta
+                                    && delta.transactionId().equals(fixture.transaction().transactionId())
+                                    && delta.fromState() == TransactionStateDeltaState.ACTIVE
+                                    && delta.toState() == TransactionStateDeltaState.ROLLED_BACK
+                                    && delta.transactionNo().isNone()
+                                    && delta.reason() == TransactionStateDeltaReason.RECOVERY_ROLLBACK),
+                    "recovery finalization MTR must retain terminal transaction-id evidence after page3 clear");
         });
     }
 

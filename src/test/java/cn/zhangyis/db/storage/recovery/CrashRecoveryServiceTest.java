@@ -5,7 +5,10 @@ import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.SpaceId;
+import cn.zhangyis.db.domain.TransactionId;
+import cn.zhangyis.db.domain.TransactionNo;
 import cn.zhangyis.db.common.exception.DatabaseRuntimeException;
+import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.storage.buf.FlushPageSnapshot;
 import cn.zhangyis.db.storage.fil.io.FileChannelPageStore;
 import cn.zhangyis.db.storage.fil.io.PageStore;
@@ -25,6 +28,9 @@ import cn.zhangyis.db.storage.redo.RedoCheckpointLabel;
 import cn.zhangyis.db.storage.redo.RedoCheckpointStore;
 import cn.zhangyis.db.storage.redo.RedoLogFileRepository;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
+import cn.zhangyis.db.storage.redo.TransactionStateDeltaReason;
+import cn.zhangyis.db.storage.redo.TransactionStateDeltaRecord;
+import cn.zhangyis.db.storage.redo.TransactionStateDeltaState;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -398,20 +404,25 @@ class CrashRecoveryServiceTest {
             RecoveryTrafficGate gate = new RecoveryTrafficGate();
             AtomicReference<RecoveryState> gateStateDuringStage = new AtomicReference<>();
             AtomicReference<Lsn> recoveredBoundarySeen = new AtomicReference<>();
-            TransactionUndoRecoveryParticipant participant = recoveredToLsn -> {
+            AtomicReference<RecoveredTransactionSnapshot> transactionSnapshotSeen = new AtomicReference<>();
+            TransactionUndoRecoveryParticipant participant = (recoveredToLsn, transactionSnapshot) -> {
                 gateStateDuringStage.set(gate.state());
                 recoveredBoundarySeen.set(recoveredToLsn);
+                transactionSnapshotSeen.set(transactionSnapshot);
                 return new TransactionUndoRecoveryResult(3, 1, 0, 2);
             };
             RecoveryRequest request = RecoveryRequest.normal(checkpointStore, redoRepo,
                             RedoApplyDispatcher.pageDispatcher(), new RedoApplyContext(store, PS))
-                    .withTransactionUndoRecovery(participant);
+                    .withTransactionRecovery(
+                            TransactionRecoveryContext.using(TransactionRecoveryCheckpointSource.empty()),
+                            participant);
 
             RecoveryReport report = new CrashRecoveryService(gate).recover(request);
 
             assertEquals(RecoveryState.RECOVERING, gateStateDuringStage.get(),
                     "transaction undo recovery must run before user traffic opens");
             assertEquals(range.end(), recoveredBoundarySeen.get());
+            assertEquals(TransactionId.of(1), transactionSnapshotSeen.get().nextTransactionId());
             assertEquals(List.of(RecoveryStageName.TRAFFIC_CLOSED,
                             RecoveryStageName.DOUBLEWRITE_REPAIR,
                             RecoveryStageName.REDO_REPLAY,
@@ -438,12 +449,169 @@ class CrashRecoveryServiceTest {
             RecoveryTrafficGate gate = new RecoveryTrafficGate();
             RecoveryRequest request = RecoveryRequest.normal(checkpointStore, redoRepo,
                             RedoApplyDispatcher.pageDispatcher(), new RedoApplyContext(store, PS))
-                    .withTransactionUndoRecovery(recoveredToLsn -> {
-                        throw new DatabaseRuntimeException("synthetic transaction recovery failure");
-                    });
+                    .withTransactionRecovery(
+                            TransactionRecoveryContext.using(TransactionRecoveryCheckpointSource.empty()),
+                            (recoveredToLsn, transactionSnapshot) -> {
+                                throw new DatabaseRuntimeException("synthetic transaction recovery failure");
+                            });
 
             assertThrows(RecoveryStartupException.class, () -> new CrashRecoveryService(gate).recover(request));
             assertEquals(RecoveryState.FAILED, gate.state());
+        }
+    }
+
+    /** checkpoint 基线与 redo delta 必须由同一 context 汇合，再以不可变 snapshot 交给事务 undo 恢复。 */
+    @Test
+    void transactionRecoveryContextCollectsRedoBeforeUndoParticipant() {
+        Path redoPath = dir.resolve("formal-trx-redo.log");
+        TransactionStateDeltaRecord committed = new TransactionStateDeltaRecord(
+                TransactionId.of(7), TransactionStateDeltaState.ACTIVE,
+                TransactionStateDeltaState.COMMITTED, TransactionNo.of(3),
+                TransactionStateDeltaReason.COMMIT);
+        try (RedoLogFileRepository redoRepo = RedoLogFileRepository.open(redoPath)) {
+            RedoLogManager redo = RedoLogManager.durable(redoRepo);
+            redo.append(List.of(committed));
+            redo.flush();
+        }
+
+        try (PageStore store = new FileChannelPageStore();
+             RedoLogFileRepository redoRepo = RedoLogFileRepository.open(redoPath);
+             RedoCheckpointStore checkpointStore = RedoCheckpointStore.open(dir.resolve("formal-trx-redo-control"));
+             TransactionRecoveryCheckpointStore transactionStore =
+                     TransactionRecoveryCheckpointStore.open(dir.resolve("formal-trx-control"))) {
+            TransactionRecoveryContext context = TransactionRecoveryContext.using(transactionStore);
+            AtomicReference<RecoveredTransactionSnapshot> seen = new AtomicReference<>();
+            RecoveryRequest request = RecoveryRequest.normal(checkpointStore, redoRepo,
+                            RedoApplyDispatcher.pageDispatcher(),
+                            new RedoApplyContext(store, PS))
+                    .withTransactionRecovery(context, (recoveredToLsn, snapshot) -> {
+                        seen.set(snapshot);
+                        return new TransactionUndoRecoveryResult(0, 0, 0, 0);
+                    });
+
+            new CrashRecoveryService(new RecoveryTrafficGate()).recover(request);
+
+            RecoveredTransactionEntry entry = seen.get().entry(TransactionId.of(7)).orElseThrow();
+            assertEquals(RecoveredTransactionState.COMMITTED, entry.state());
+            assertEquals(TransactionNo.of(3), entry.transactionNo());
+            assertEquals(TransactionId.of(8), seen.get().nextTransactionId());
+            assertEquals(TransactionNo.of(4), seen.get().nextTransactionNo());
+        }
+    }
+
+    /** READ_ONLY_VALIDATE 不能跳过事务 sidecar 完整性诊断；非零 checkpoint 缺基线时同样 fail closed。 */
+    @Test
+    void readOnlyValidateRejectsMissingTransactionSidecarWithoutApplyingRedo() {
+        Path redoPath = dir.resolve("readonly-missing-trx-redo.log");
+        LogRange range;
+        try (RedoLogFileRepository redoRepo = RedoLogFileRepository.open(redoPath)) {
+            RedoLogManager redo = RedoLogManager.durable(redoRepo);
+            range = redo.append(List.of(new PageInitRecord(PAGE, PageType.INDEX)));
+            redo.flush();
+        }
+        try (PageStore store = new FileChannelPageStore();
+             RedoLogFileRepository redoRepo = RedoLogFileRepository.open(redoPath);
+             RedoCheckpointStore checkpointStore =
+                     RedoCheckpointStore.open(dir.resolve("readonly-missing-trx-redo-control"))) {
+            store.create(SPACE, dir.resolve("readonly-missing-trx.ibd"), PS, PageNo.of(4));
+            checkpointStore.write(RedoCheckpointLabel.of(range.end(), range.end(), 1_000L));
+            RecoveryTrafficGate gate = new RecoveryTrafficGate();
+            TransactionRecoveryContext context = TransactionRecoveryContext.using(
+                    TransactionRecoveryCheckpointSource.empty());
+            RecoveryRequest request = RecoveryRequest.readOnlyValidate(
+                            checkpointStore, redoRepo, RedoApplyDispatcher.pageDispatcher(),
+                            new RedoApplyContext(store, PS))
+                    .withTransactionRecoveryValidation(context);
+
+            assertThrows(RecoveryStartupException.class,
+                    () -> new CrashRecoveryService(gate).recover(request));
+            assertEquals(RecoveryState.FAILED, gate.state());
+        }
+    }
+
+    /** READ_ONLY_VALIDATE 必须扫描 trx delta 并报告 PREPARED，而不是因为不 apply page redo 就漏诊断。 */
+    @Test
+    void readOnlyValidateRejectsPreparedTransactionDelta() {
+        Path redoPath = dir.resolve("readonly-prepared-redo.log");
+        TransactionStateDeltaRecord prepared = new TransactionStateDeltaRecord(
+                TransactionId.of(7), TransactionStateDeltaState.ACTIVE,
+                TransactionStateDeltaState.PREPARED, TransactionNo.NONE,
+                TransactionStateDeltaReason.COMMIT);
+        try (RedoLogFileRepository redoRepo = RedoLogFileRepository.open(redoPath)) {
+            RedoLogManager redo = RedoLogManager.durable(redoRepo);
+            redo.append(List.of(prepared));
+            redo.flush();
+        }
+        try (PageStore store = new FileChannelPageStore();
+             RedoLogFileRepository redoRepo = RedoLogFileRepository.open(redoPath);
+             RedoCheckpointStore checkpointStore =
+                     RedoCheckpointStore.open(dir.resolve("readonly-prepared-redo-control"))) {
+            RecoveryTrafficGate gate = new RecoveryTrafficGate();
+            TransactionRecoveryContext context = TransactionRecoveryContext.using(
+                    TransactionRecoveryCheckpointSource.empty());
+            RecoveryRequest request = RecoveryRequest.readOnlyValidate(
+                            checkpointStore, redoRepo, RedoApplyDispatcher.pageDispatcher(),
+                            new RedoApplyContext(store, PS))
+                    .withTransactionRecoveryValidation(context);
+
+            assertThrows(RecoveryStartupException.class,
+                    () -> new CrashRecoveryService(gate).recover(request));
+            assertEquals(RecoveryState.FAILED, gate.state());
+        }
+    }
+
+    /** sidecar 领先 redo label 时，完整 redo 尾必须覆盖 sidecar LSN；中间日志丢失不能靠高估 counter 掩盖。 */
+    @Test
+    void recoveryRejectsRedoTailThatDoesNotCoverNewerTransactionSidecar() {
+        Path redoPath = dir.resolve("sidecar-ahead-redo.log");
+        LogRange durableRange;
+        try (RedoLogFileRepository redoRepo = RedoLogFileRepository.open(redoPath)) {
+            RedoLogManager redo = RedoLogManager.durable(redoRepo);
+            durableRange = redo.append(List.of(new PageInitRecord(PAGE, PageType.INDEX)));
+            redo.flush();
+        }
+        try (PageStore store = new FileChannelPageStore();
+             RedoLogFileRepository redoRepo = RedoLogFileRepository.open(redoPath);
+             RedoCheckpointStore checkpointStore =
+                     RedoCheckpointStore.open(dir.resolve("sidecar-ahead-redo-control"));
+             TransactionRecoveryCheckpointStore transactionStore =
+                     TransactionRecoveryCheckpointStore.open(dir.resolve("sidecar-ahead-trx-control"))) {
+            store.create(SPACE, dir.resolve("sidecar-ahead.ibd"), PS, PageNo.of(4));
+            transactionStore.write(new TransactionRecoveryCheckpoint(
+                    Lsn.of(durableRange.end().value() + 1), TransactionId.of(8), TransactionNo.of(4)));
+            TransactionRecoveryContext context = TransactionRecoveryContext.using(transactionStore);
+            RecoveryRequest request = RecoveryRequest.normal(
+                            checkpointStore, redoRepo,
+                            RedoApplyDispatcher.pageDispatcher(context.deltaSink()),
+                            new RedoApplyContext(store, PS))
+                    .withTransactionRecovery(context,
+                            (recoveredToLsn, snapshot) -> new TransactionUndoRecoveryResult(0, 0, 0, 0));
+            RecoveryTrafficGate gate = new RecoveryTrafficGate();
+
+            assertThrows(RecoveryStartupException.class,
+                    () -> new CrashRecoveryService(gate).recover(request));
+            assertEquals(RecoveryState.FAILED, gate.state());
+        }
+    }
+
+    /** public canonical request 也不能把 formal context 与 no-op dispatcher 组合，绕过安全 fluent API。 */
+    @Test
+    void formalTransactionContextRejectsUnboundDispatcher() {
+        Path redoPath = dir.resolve("unbound-context-redo.log");
+        try (PageStore store = new FileChannelPageStore();
+             RedoLogFileRepository redoRepo = RedoLogFileRepository.open(redoPath);
+             RedoCheckpointStore checkpointStore =
+                     RedoCheckpointStore.open(dir.resolve("unbound-context-redo-control"))) {
+            TransactionRecoveryContext context = TransactionRecoveryContext.using(
+                    TransactionRecoveryCheckpointSource.empty());
+            TransactionUndoRecoveryParticipant participant = (recoveredToLsn, snapshot) ->
+                    new TransactionUndoRecoveryResult(0, 0, 0, 0);
+
+            assertThrows(DatabaseValidationException.class, () -> new RecoveryRequest(
+                    RecoveryMode.NORMAL, checkpointStore, redoRepo,
+                    RedoApplyDispatcher.pageDispatcher(), new RedoApplyContext(store, PS),
+                    null, List.of(), null, List.of(), null, context, participant,
+                    RecoverySkipPolicy.none()));
         }
     }
 

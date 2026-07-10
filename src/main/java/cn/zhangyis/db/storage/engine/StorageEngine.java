@@ -53,6 +53,10 @@ import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
 import cn.zhangyis.db.storage.record.type.TypeCodecRegistry;
 import cn.zhangyis.db.storage.recovery.CrashRecoveryService;
 import cn.zhangyis.db.storage.recovery.RecoveryMode;
+import cn.zhangyis.db.storage.recovery.RecoveredTransactionSnapshot;
+import cn.zhangyis.db.storage.recovery.RecoveredTransactionReconciliation;
+import cn.zhangyis.db.storage.recovery.RecoveredTransactionReconciler;
+import cn.zhangyis.db.storage.recovery.RecoveredUndoSlotEvidence;
 import cn.zhangyis.db.storage.recovery.RecoveryDiagnosticsSnapshot;
 import cn.zhangyis.db.storage.recovery.RecoveryProgressJournal;
 import cn.zhangyis.db.storage.recovery.RecoveryReport;
@@ -60,6 +64,11 @@ import cn.zhangyis.db.storage.recovery.RecoveryRequest;
 import cn.zhangyis.db.storage.recovery.RecoveryState;
 import cn.zhangyis.db.storage.recovery.RecoveryTrafficGate;
 import cn.zhangyis.db.storage.recovery.TransactionUndoRecoveryResult;
+import cn.zhangyis.db.storage.recovery.TransactionRecoveryCheckpoint;
+import cn.zhangyis.db.storage.recovery.TransactionRecoveryCheckpointStore;
+import cn.zhangyis.db.storage.recovery.TransactionRecoveryCheckpointSource;
+import cn.zhangyis.db.storage.recovery.TransactionRecoveryContext;
+import cn.zhangyis.db.storage.recovery.TransactionRecoveryException;
 import cn.zhangyis.db.storage.redo.RedoApplyContext;
 import cn.zhangyis.db.storage.redo.RedoApplyDispatcher;
 import cn.zhangyis.db.storage.redo.RedoCapacityThrottle;
@@ -80,6 +89,7 @@ import cn.zhangyis.db.storage.trx.MvccReader;
 import cn.zhangyis.db.storage.trx.RollbackSegmentSlotManager;
 import cn.zhangyis.db.storage.trx.RollbackService;
 import cn.zhangyis.db.storage.trx.TransactionManager;
+import cn.zhangyis.db.storage.trx.TransactionCounterSnapshot;
 import cn.zhangyis.db.storage.trx.TransactionSystem;
 import cn.zhangyis.db.storage.trx.UndoLogManager;
 import cn.zhangyis.db.storage.trx.UndoSegmentFinalizer;
@@ -130,6 +140,10 @@ public final class StorageEngine {
     private PageStore store;
     private RedoLogFileRepository redoRepo;
     private RedoCheckpointStore checkpointStore;
+    /**
+     * fuzzy checkpoint 的事务 id/no 高水位 sidecar；NORMAL/FORCE/fresh 打开，READ_ONLY_VALIDATE 不创建或写入。
+     */
+    private TransactionRecoveryCheckpointStore transactionRecoveryCheckpointStore;
     /** doublewrite buffer 文件仓储；前向刷脏写整页副本，恢复期供 scanner 修复 torn data page。 */
     private DoublewriteFileRepository doublewriteRepo;
     private BufferPool pool;
@@ -168,7 +182,10 @@ public final class StorageEngine {
     private UndoLogSegmentAccess undoAccess;
     /** 四条 undo 终态共享的 FSP drop + page3 clear 原子协调器。 */
     private UndoSegmentFinalizer undoSegmentFinalizer;
-    /** 单显式配置聚簇索引（无 DD，open 前 set）：同时服务恢复期回滚（R 1.2）与后台 purge（0.4）；null 则都跳过。 */
+    /**
+     * 单显式配置聚簇索引（无 DD，open 前 set）：同时服务恢复期回滚（R 1.2）与后台 purge（0.4）。null 时
+     * 不启动 purge；若 existing-open 发现 ACTIVE undo，恢复必须 fail-closed，不能跳过 rollback 后开放流量。
+     */
     private BTreeIndex clusteredIndex;
     /** 事务系统（id/no 分配 + active 表 + purge low water）；purge boundary 来源。 */
     private TransactionSystem txnSystem;
@@ -233,6 +250,16 @@ public final class StorageEngine {
             throw new EngineStateException("open requires NEW state: " + state);
         }
         try {
+            openInternal();
+        } catch (RuntimeException failure) {
+            cleanupAfterFailedOpen(failure);
+            throw failure;
+        }
+    }
+
+    /** 执行实际 bootstrap/recovery；任何异常由 {@link #open()} 统一停止 worker 并关闭部分初始化句柄。 */
+    private void openInternal() {
+        try {
             Files.createDirectories(config.baseDir());
         } catch (IOException e) {
             throw new DatabaseRuntimeException("create engine baseDir failed: " + config.baseDir(), e);
@@ -258,6 +285,15 @@ public final class StorageEngine {
         }
         this.redo = RedoLogManager.durable(redoRepo);
         this.checkpointStore = RedoCheckpointStore.open(config.redoControlFile());
+        if (config.recoveryMode() == RecoveryMode.READ_ONLY_VALIDATE) {
+            if (Files.exists(config.transactionRecoveryCheckpointFile())) {
+                this.transactionRecoveryCheckpointStore = TransactionRecoveryCheckpointStore.openReadOnly(
+                        config.transactionRecoveryCheckpointFile());
+            }
+        } else {
+            this.transactionRecoveryCheckpointStore = TransactionRecoveryCheckpointStore.open(
+                    config.transactionRecoveryCheckpointFile());
+        }
         // doublewrite 文件早于 FlushCoordinator/recovery 打开、跨进程持久：恢复枚举到的是上一进程的整页副本。
         this.doublewriteRepo = DoublewriteFileRepository.open(config.doublewriteFile(), config.pageSize());
         this.accessController = new TablespaceAccessController();
@@ -269,11 +305,16 @@ public final class StorageEngine {
         this.registry = new CachingTablespaceRegistry(
                 new PageZeroTablespaceMetadataLoader(store, config.pageSize(), accessController));
         this.diskSpaceManager = new DiskSpaceManager(pool, store, config.pageSize(), registry);
+        // TransactionSystem 必须早于 CheckpointCoordinator：checkpoint participant 在 redo label 前短锁读取其 next-counter。
+        this.txnSystem = new TransactionSystem();
 
         FlushCoordinator flushCoordinator = new FlushCoordinator(pool, store, redo, config.pageSize(),
                 new RecoverableDoublewriteStrategy(doublewriteRepo), config.flushTimeout(), accessController);
         CheckpointCoordinator checkpointCoordinator =
-                new CheckpointCoordinator(pool, redo, checkpointStore, redoReclaim);
+                transactionRecoveryCheckpointStore == null
+                        ? new CheckpointCoordinator(pool, redo, checkpointStore, redoReclaim)
+                        : new CheckpointCoordinator(pool, redo, checkpointStore,
+                                this::persistTransactionRecoveryCheckpoint, redoReclaim);
         this.flushService = new FlushService(pool, flushCoordinator, checkpointCoordinator, redo,
                 RedoCapacityPolicy.fixed(config.redoCapacityBytes()),
                 AdaptiveFlushPolicy.adaptive(1, 1, config.bufferPoolCapacityFrames()));
@@ -295,7 +336,6 @@ public final class StorageEngine {
                 foregroundRedoReservationBytes());
 
         TypeCodecRegistry typeRegistry = new TypeCodecRegistry();
-        this.txnSystem = new TransactionSystem();
         this.transactionManager = new TransactionManager(txnSystem);
         this.rollbackSlots = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), config.slotCapacity());
         this.rsegHeaderRepo = new RollbackSegmentHeaderRepository(pool, config.pageSize());
@@ -428,27 +468,45 @@ public final class StorageEngine {
                 doublewritePages.add(pageId);
             }
         }
+        TransactionRecoveryCheckpointSource transactionRecoverySource =
+                transactionRecoveryCheckpointStore == null
+                        ? TransactionRecoveryCheckpointSource.empty()
+                        : transactionRecoveryCheckpointStore;
+        TransactionRecoveryContext transactionRecovery = TransactionRecoveryContext.using(transactionRecoverySource);
         RecoveryRequest request = switch (config.recoveryMode()) {
             case NORMAL -> RecoveryRequest.normal(checkpointStore, redoRepo,
-                            RedoApplyDispatcher.pageDispatcher(), new RedoApplyContext(store, config.pageSize()))
+                            RedoApplyDispatcher.pageDispatcher(),
+                            new RedoApplyContext(store, config.pageSize()))
                     .withDoublewriteRepair(doublewriteScanner, doublewritePages)
                     .withRedoBoundaryInstall(redo)
                     .withUndoTablespaceRecovery(buildUndoTablespaceRecovery())
                     .withSpaceFileReconcile(recoverySpaces)
-                    .withTransactionUndoRecovery(this::recoverTransactionUndoAfterRedo);
+                    .withTransactionRecovery(transactionRecovery, this::recoverTransactionUndoAfterRedo);
             case READ_ONLY_VALIDATE -> RecoveryRequest.readOnlyValidate(checkpointStore, redoRepo,
                             RedoApplyDispatcher.pageDispatcher(), new RedoApplyContext(store, config.pageSize()))
-                    .withDoublewriteRepair(doublewriteScanner, doublewritePages);
+                    .withDoublewriteRepair(doublewriteScanner, doublewritePages)
+                    .withTransactionRecoveryValidation(transactionRecovery);
             case FORCE_SKIP_CORRUPT_TABLESPACE -> RecoveryRequest.forceSkip(checkpointStore, redoRepo,
-                            RedoApplyDispatcher.pageDispatcher(), new RedoApplyContext(store, config.pageSize()),
+                            RedoApplyDispatcher.pageDispatcher(),
+                            new RedoApplyContext(store, config.pageSize()),
                             config.forceSkippedSpaces())
                     .withDoublewriteRepair(doublewriteScanner, doublewritePages)
                     .withRedoBoundaryInstall(redo)
                     .withUndoTablespaceRecovery(buildUndoTablespaceRecovery())
                     .withSpaceFileReconcile(recoverySpaces)
-                    .withTransactionUndoRecovery(this::recoverTransactionUndoAfterRedo);
+                    .withTransactionRecovery(transactionRecovery, this::recoverTransactionUndoAfterRedo);
         };
         lastRecoveryReport = crashRecoveryService.recover(request);
+    }
+
+    /**
+     * checkpoint 元数据参与者：在 redo label force 前捕获并 force 事务 next-counter。TransactionSystem 短锁只保护
+     * 内存快照，文件 IO 发生在快照返回后；失败直接阻止 checkpoint/reclaim 前进。
+     */
+    private void persistTransactionRecoveryCheckpoint(Lsn checkpointLsn) {
+        TransactionCounterSnapshot counters = txnSystem.snapshotCounters();
+        transactionRecoveryCheckpointStore.write(new TransactionRecoveryCheckpoint(
+                checkpointLsn, counters.nextTransactionId(), counters.nextTransactionNo()));
     }
 
     /**
@@ -458,23 +516,30 @@ public final class StorageEngine {
      * 并复位事务 id/no 高水位，供启动后的后台 purge driver 续作。
      *
      * <p>简化点：未引入独立 {@code UndoRecoveryService} 类；当前仍由 engine 组合根作为
-     * {@code TransactionUndoRecoveryParticipant} 实现阶段端口。未配置聚簇索引时 active rollback 跳过并保留 slot，
-     * 但 committed history 与计数器仍会从持久 undo header 重建。
+     * {@code TransactionUndoRecoveryParticipant} 实现阶段端口。无 DD 时只支持显式单聚簇索引；若发现 ACTIVE
+     * 但未配置该索引，恢复 fail-closed，绝不保留未回滚 slot 后开放流量。
      *
-     * @param recoveredToLsn redo replay 连续恢复边界；当前实现不需要读取该值，但保留在签名中作为阶段诊断和后续
-     *                       recovery journal 扩展点。
+     * @param recoveredToLsn redo replay 连续恢复边界；作为 page3 合成证据 LSN，并用于 sidecar/redo 覆盖诊断。
+     * @param transactionSnapshot checkpoint/redo 合并后的不可变事务证据；page3 扫描必须与它交叉校验。
      * @return 事务 undo 恢复摘要。
      */
-    private TransactionUndoRecoveryResult recoverTransactionUndoAfterRedo(Lsn recoveredToLsn) {
-        if (recoveredToLsn == null) {
-            throw new DatabaseValidationException("recoveredToLsn must not be null");
+    private TransactionUndoRecoveryResult recoverTransactionUndoAfterRedo(
+            Lsn recoveredToLsn, RecoveredTransactionSnapshot transactionSnapshot) {
+        if (recoveredToLsn == null || transactionSnapshot == null) {
+            throw new DatabaseValidationException("transaction undo recovery inputs must not be null");
         }
         MiniTransaction scan = miniTransactionManager.begin();
-        RollbackSegmentHeaderSnapshot snapshot = rsegHeaderRepo.read(scan, config.undoSpaceId(),
-                rollbackSlots.rollbackSegmentId(), config.slotCapacity());
-        miniTransactionManager.commit(scan);
-        snapshot.occupiedSlots().forEach(rollbackSlots::restore);
-        return recoverRollbackSegmentTransactions(snapshot.occupiedSlots());
+        RollbackSegmentHeaderSnapshot snapshot;
+        try {
+            snapshot = rsegHeaderRepo.read(scan, config.undoSpaceId(),
+                    rollbackSlots.rollbackSegmentId(), config.slotCapacity());
+            miniTransactionManager.commit(scan);
+        } catch (RuntimeException error) {
+            rollbackRecoveryScanMtr(scan, error);
+            throw error;
+        }
+        return recoverRollbackSegmentTransactions(
+                recoveredToLsn, transactionSnapshot, snapshot.occupiedSlots());
     }
 
     /**
@@ -485,53 +550,53 @@ public final class StorageEngine {
      *
      * @param occupiedSlots page3 扫描得到的 slot->undo first page 映射。
      */
-    private TransactionUndoRecoveryResult recoverRollbackSegmentTransactions(Map<UndoSlotId, PageId> occupiedSlots) {
-        List<HistoryEntry> committed = new ArrayList<>();
-        long nextTransactionId = 1;
-        long nextTransactionNo = 1;
-        int rolledBackActiveSlots = 0;
-        int skippedActiveSlots = 0;
-
+    private TransactionUndoRecoveryResult recoverRollbackSegmentTransactions(
+            Lsn recoveredToLsn,
+            RecoveredTransactionSnapshot transactionSnapshot,
+            Map<UndoSlotId, PageId> occupiedSlots) {
+        List<RecoveredUndoSlotEvidence> recoveredSlots = new ArrayList<>();
         for (Map.Entry<UndoSlotId, PageId> entry : occupiedSlots.entrySet()) {
-            RecoveredUndoSlot recovered = readRecoveredUndoSlot(entry.getKey(), entry.getValue());
-            if (!recovered.creatorTrxId().isNone()) {
-                nextTransactionId = Math.max(nextTransactionId, recovered.creatorTrxId().value() + 1);
-            }
+            recoveredSlots.add(readRecoveredUndoSlot(entry.getKey(), entry.getValue()));
+        }
+        // 所有 header 已在短只读 MTR 中复制并释放 latch；先全量校验，避免冲突中途已经 rollback/history 部分 slot。
+        RecoveredTransactionReconciliation reconciliation = new RecoveredTransactionReconciler()
+                .reconcile(transactionSnapshot, recoveredToLsn, recoveredSlots);
+        if (!reconciliation.activeSlots().isEmpty() && clusteredIndex == null) {
+            throw new TransactionRecoveryException(
+                    "recovered ACTIVE transactions require the configured clustered index; "
+                            + "cannot skip undo rollback before opening traffic: activeSlots="
+                            + reconciliation.activeSlots().size());
+        }
+        txnSystem.restoreCounters(
+                reconciliation.snapshot().nextTransactionId().value(),
+                reconciliation.snapshot().nextTransactionNo().value());
+        occupiedSlots.forEach(rollbackSlots::restore);
 
-            if (recovered.active()) {
-                if (clusteredIndex != null) {
-                    rollbackService.rollbackRecovered(recovered.slotId(), recovered.firstPageId(),
-                            recovered.creatorTrxId(), clusteredIndex);
-                    rolledBackActiveSlots++;
-                } else {
-                    skippedActiveSlots++;
-                }
-                continue;
-            }
+        List<HistoryEntry> committed = new ArrayList<>();
+        int rolledBackActiveSlots = 0;
 
-            if (recovered.creatorTrxId().isNone() || recovered.commitNo().isNone()) {
-                throw new UndoLogFormatException("committed undo slot " + recovered.slotId()
-                        + " has invalid creator/commit header: creator=" + recovered.creatorTrxId().value()
-                        + ", commitNo=" + recovered.commitNo().value());
-            }
-            nextTransactionNo = Math.max(nextTransactionNo, recovered.commitNo().value() + 1);
-            committed.add(new HistoryEntry(recovered.commitNo(), recovered.creatorTrxId(),
+        for (RecoveredUndoSlotEvidence recovered : reconciliation.activeSlots()) {
+            rollbackService.rollbackRecovered(recovered.slotId(), recovered.firstPageId(),
+                    recovered.creatorTransactionId(), clusteredIndex);
+            rolledBackActiveSlots++;
+        }
+        for (RecoveredUndoSlotEvidence recovered : reconciliation.committedSlots()) {
+            committed.add(new HistoryEntry(recovered.transactionNo(), recovered.creatorTransactionId(),
                     recovered.firstPageId().spaceId(), recovered.firstPageId(), recovered.slotId()));
         }
 
-        txnSystem.restoreCounters(nextTransactionId, nextTransactionNo);
         committed.stream()
                 .sorted(Comparator.comparingLong(entry -> entry.transactionNo().value()))
                 .forEach(history::submitCommitted);
         return new TransactionUndoRecoveryResult(occupiedSlots.size(), rolledBackActiveSlots,
-                skippedActiveSlots, committed.size());
+                0, committed.size());
     }
 
     /**
      * 只读读取一个 restored undo slot 的恢复 header。异常时回滚该只读 MTR，避免损坏 undo 页导致 guard/lease 泄漏。
      * 返回值只含内存快照，不持有 page latch；调用方可安全地在之后进入 B+Tree rollback 或 history 入队。
      */
-    private RecoveredUndoSlot readRecoveredUndoSlot(UndoSlotId slotId, PageId firstPageId) {
+    private RecoveredUndoSlotEvidence readRecoveredUndoSlot(UndoSlotId slotId, PageId firstPageId) {
         MiniTransaction stateMtr = miniTransactionManager.begin();
         try {
             UndoLogSegment segment = undoAccess.open(stateMtr, firstPageId, PageLatchMode.SHARED);
@@ -541,22 +606,27 @@ public final class StorageEngine {
                 throw new UndoLogFormatException("undo slot " + slotId + " first page " + firstPageId
                         + " has unknown state " + segment.state());
             }
-            RecoveredUndoSlot recovered = new RecoveredUndoSlot(slotId, firstPageId, active,
-                    segment.creatorTransactionId(), segment.committedTransactionNo());
+            RecoveredUndoSlotEvidence recovered = active
+                    ? RecoveredUndoSlotEvidence.active(
+                            slotId, firstPageId, segment.creatorTransactionId())
+                    : RecoveredUndoSlotEvidence.committed(
+                            slotId, firstPageId, segment.creatorTransactionId(),
+                            segment.committedTransactionNo());
             miniTransactionManager.commit(stateMtr);
             return recovered;
         } catch (RuntimeException e) {
-            miniTransactionManager.rollbackUncommitted(stateMtr);
+            rollbackRecoveryScanMtr(stateMtr, e);
             throw e;
         }
     }
 
-    /**
-     * 恢复期从 undo first 页读取出的 slot header 快照。它刻意不保存 {@link UndoLogSegment} 句柄，确保读取 header
-     * 的 MTR 已释放后，后续 rollback/purge history 重建才进入 B+Tree 或 history list。
-     */
-    private record RecoveredUndoSlot(UndoSlotId slotId, PageId firstPageId, boolean active,
-                                     TransactionId creatorTrxId, TransactionNo commitNo) {
+    /** 恢复只读扫描失败时释放 memo；清理异常只作 suppressed，不能覆盖原始损坏/IO 根因。 */
+    private void rollbackRecoveryScanMtr(MiniTransaction mtr, RuntimeException original) {
+        try {
+            miniTransactionManager.rollbackUncommitted(mtr);
+        } catch (RuntimeException cleanupFailure) {
+            original.addSuppressed(cleanupFailure);
+        }
     }
 
     /**
@@ -680,7 +750,8 @@ public final class StorageEngine {
 
     /**
      * 关闭引擎。先 {@link FlushService#flushThrough}（WAL 顺序持久 + 清空 dirty），再依次关闭 pool（此时 dirty 已空，
-     * legacy flushAll 为 no-op，不绕 WAL gate）、store、redoRepo、checkpointStore。幂等：CLOSED 再 close 为 no-op。
+     * legacy flushAll 为 no-op，不绕 WAL gate）、store、redoRepo、redo/transaction checkpoint stores。幂等：
+     * CLOSED 再 close 为 no-op。
      */
     public void close() {
         if (state == EngineState.CLOSED) {
@@ -713,6 +784,7 @@ public final class StorageEngine {
         closeQuietly(store, errors);
         closeQuietly(redoRepo, errors);
         closeQuietly(checkpointStore, errors);
+        closeQuietly(transactionRecoveryCheckpointStore, errors);
         closeQuietly(doublewriteRepo, errors);
         state = EngineState.CLOSED;
         if (!errors.isEmpty()) {
@@ -721,6 +793,30 @@ public final class StorageEngine {
                             errors.get(0));
             errors.subList(1, errors.size()).forEach(aggregate::addSuppressed);
             throw aggregate;
+        }
+    }
+
+    /**
+     * open 失败清理。停止顺序与普通 close 一致，但每个失败只作为原始启动异常的 suppressed，不能覆盖导致
+     * fail-closed 的 redo/sidecar/page3 根因；句柄聚合关闭结束后状态固定为 CLOSED，调用方可安全重复 close。
+     */
+    private void cleanupAfterFailedOpen(RuntimeException original) {
+        stopAfterFailedOpen(this::stopBackgroundReadAhead, original);
+        stopAfterFailedOpen(this::stopBackgroundPageCleaner, original);
+        stopAfterFailedOpen(this::stopBackgroundRedoFlusher, original);
+        stopAfterFailedOpen(this::stopBackgroundPurgeDriver, original);
+        try {
+            closeOpenedHandles();
+        } catch (RuntimeException closeFailure) {
+            original.addSuppressed(closeFailure);
+        }
+    }
+
+    private static void stopAfterFailedOpen(Runnable stopAction, RuntimeException original) {
+        try {
+            stopAction.run();
+        } catch (RuntimeException stopFailure) {
+            original.addSuppressed(stopFailure);
         }
     }
 
@@ -852,8 +948,8 @@ public final class StorageEngine {
 
     /**
      * 配置本 engine 的单聚簇索引（无 DD 前由测试/上层显式注入），**必须在 {@link #open()} 之前**调用。
-     * 同时服务恢复期回滚（R 1.2）与后台 purge driver（0.4）。未配置时跳过恢复回滚、不启动 purge driver
-     * （既有 engine 测试行为不变）。
+     * 同时服务恢复期回滚（R 1.2）与后台 purge driver（0.4）。未配置时不启动 purge；existing-open 仅在
+     * 未发现 ACTIVE undo 时可继续，发现 ACTIVE 则 fail-closed，绝不以缺少索引为由跳过恢复回滚。
      */
     public void configureClusteredIndex(BTreeIndex clusteredIndex) {
         if (state == EngineState.OPEN) {

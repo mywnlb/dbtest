@@ -15,7 +15,9 @@ public enum TransactionStateDeltaState {
     /** 事务正在回滚，undo 链仍可能被逐条应用。 */
     ROLLING_BACK((byte) 4),
     /** 事务回滚完成。 */
-    ROLLED_BACK((byte) 5);
+    ROLLED_BACK((byte) 5),
+    /** XA prepare 已持久化；只追加 code，v1 recovery 无协调器时 fail closed。 */
+    PREPARED((byte) 6);
 
     /** redo 文件中的稳定 1 字节状态码；只能追加，不能重排。 */
     private final byte code;

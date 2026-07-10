@@ -14,7 +14,8 @@ import java.util.Set;
 
 /**
  * {@link StorageEngine} 启动配置（E1/E2/E3a）。固定文件布局在 {@code baseDir} 下：redo 日志 {@code redo.log}、
- * redo control（checkpoint label）{@code redo-control}、系统 undo 表空间 {@code undo_<undoSpaceId>.ibu}；
+ * redo control（checkpoint label）{@code redo-control}、事务恢复高水位 sidecar
+ * {@code transaction-recovery-control}、系统 undo 表空间 {@code undo_<undoSpaceId>.ibu}；
  * 数据表空间文件路径由调用方建/开（本片无 data dictionary）。
  *
  * @param baseDir                  引擎数据目录（redo/control/undo 文件所在）。
@@ -279,6 +280,14 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
     /** redo control（checkpoint label）文件路径。 */
     public Path redoControlFile() {
         return baseDir.resolve("redo-control");
+    }
+
+    /**
+     * 事务恢复高水位 sidecar 路径。固定从 redo control 的同级目录派生，不增加配置 record 组件，
+     * 避免调用方把二者放到不同故障域后破坏 checkpoint 原子顺序。
+     */
+    public Path transactionRecoveryCheckpointFile() {
+        return redoControlFile().resolveSibling("transaction-recovery-control");
     }
 
     /** 系统 undo 表空间数据文件路径。 */

@@ -34,7 +34,7 @@ import cn.zhangyis.db.storage.undo.UndoRecord;
  *
  * <p><b>状态机两阶段</b>：{@code rollback} 在 ACTIVE 状态先预检整条逻辑链，再经
  * {@link TransactionManager#beginRollback} 进入 ROLLING_BACK；已处于 ROLLING_BACK 的失败重试直接恢复走链。
- * 走完链并经 finalizer 同批 drop segment、清 page3、写 rollback-complete 诊断 redo后，才调用
+ * 走完链并经 finalizer 同批 drop segment、清 page3、写 rollback-complete 正式恢复证据后，才调用
  * {@link TransactionManager#finishRollback}（removeActive + →ROLLED_BACK）。
  *
  * <p><b>每条 undo 短读 + 独立写 MTR</b>（§7.6 step 6）：先分别用短只读 MTR 物化当前 record 与真实前驱，
@@ -105,8 +105,8 @@ public final class RollbackService {
      *   <li>若有 {@link UndoContext}：从当前 logical head 反向走链；每条在两个短只读 MTR 中物化 current/前驱，
      *       再以独立 index MTR 执行 inverse，随后独立 marker MTR CAS 后退持久头。</li>
      *   <li>marker commit 后才发布内存 context；两次成功 commit 之间 crash 时，重启最多重复当前 inverse。</li>
-     *   <li>走到 {@code prev=NULL} 后由 finalizer 在同一 MTR drop segment、CAS 清 page3，并追加非权威
-     *       rollback-complete diagnostic redo；提交成功后才发布内存 slot 释放。</li>
+     *   <li>走到 {@code prev=NULL} 后由 finalizer 在同一 MTR drop segment、CAS 清 page3，并追加 recovery table
+     *       消费的 rollback-complete 终态/高水位证据；提交成功后才发布内存 slot 释放。</li>
      *   <li>{@code finishRollback}：removeActive + ROLLING_BACK→ROLLED_BACK；若此前失败，后续调用可从
      *       ROLLING_BACK 幂等重走链。</li>
      * </ol>
@@ -156,7 +156,7 @@ public final class RollbackService {
         if (ctx != null) {
             finalizer.finalizeLiveRollback(txn, ctx);
         } else {
-            // 无 undo segment 的事务没有可原子合并的物理 finalization，只写非权威 diagnostic redo。
+            // 无 undo segment 时没有 page3 可交叉校验；终态 delta 是 recovery table 的正式证据，写成功后才能发布内存终态。
             writeRollbackCompleteRedo(txn);
         }
         txnMgr.finishRollback(txn);
@@ -507,9 +507,10 @@ public final class RollbackService {
     }
 
     /**
-     * 写回滚完成 diagnostic redo。它在 slot release / {@code finishRollback} 之前执行，此时事务仍处于
+     * 写回滚完成正式恢复 redo。它在 slot release / {@code finishRollback} 之前执行，此时事务仍处于
      * ROLLING_BACK，redo record 能记录真实的 from-state；若写入失败，slot 仍由本事务占用，调用方可安全重试。
-     * 该 record 不是恢复权威，crash recovery 仍以 undo/rseg header 为准。
+     * recovery table 消费该 record 重建终态和 counter 高水位；若事务存在 undo slot，恢复仍必须与 page3/header
+     * 交叉校验，不能把 logical redo 当成绕过物理状态检查的许可。
      */
     private void writeRollbackCompleteRedo(Transaction txn) {
         MiniTransaction stateMtr = mtrMgr.begin();

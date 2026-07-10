@@ -91,6 +91,22 @@ public final class TransactionSystem {
         }
     }
 
+    /**
+     * 原子捕获两个 next-counter，供 fuzzy checkpoint sidecar 使用。快照不消费号码，也不复制活跃事务表；
+     * 锁内只读两个 long 后立即释放，不执行文件 IO。
+     *
+     * @return 下一事务 id/no 的不可变高水位快照。
+     */
+    public TransactionCounterSnapshot snapshotCounters() {
+        lock.lock();
+        try {
+            return new TransactionCounterSnapshot(
+                    TransactionId.of(nextTransactionId), TransactionNo.of(nextTransactionNo));
+        } finally {
+            lock.unlock();
+        }
+    }
+
     /** 活跃读写事务 id 的不可变快照（拷贝后立即释放锁）。 */
     public Set<Long> snapshotActiveReadWriteIds() {
         lock.lock();

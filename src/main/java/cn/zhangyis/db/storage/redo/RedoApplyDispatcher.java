@@ -20,8 +20,11 @@ public final class RedoApplyDispatcher {
 
     /** 已注册 handler，顺序用于诊断与批末 finish 的首次出现顺序；构造后不可变。 */
     private final List<RedoApplyHandler> handlers;
+    /** 标准 page dispatcher 绑定的 trx sink；自定义 registry 为 null，不能伪装成 formal recovery wiring。 */
+    private final TransactionStateDeltaSink transactionStateSink;
 
-    private RedoApplyDispatcher(List<RedoApplyHandler> handlers) {
+    private RedoApplyDispatcher(List<RedoApplyHandler> handlers,
+                                TransactionStateDeltaSink transactionStateSink) {
         if (handlers == null) {
             throw new DatabaseValidationException("redo apply handlers must not be null");
         }
@@ -31,14 +34,29 @@ public final class RedoApplyDispatcher {
             }
         }
         this.handlers = List.copyOf(handlers);
+        this.transactionStateSink = transactionStateSink;
     }
 
     /** 创建生产恢复分发器。保留历史命名，当前默认包含 FSP allocation、page handler 与 non-page trx handler。 */
     public static RedoApplyDispatcher pageDispatcher() {
-        return withHandlers(List.of(
+        return pageDispatcher(TransactionStateDeltaSink.NO_OP);
+    }
+
+    /**
+     * 创建带事务状态顺序消费端口的生产恢复分发器。页/FSP handler 集合不变，只有 non-page trx handler
+     * 把稳定 record 交给 sink。
+     *
+     * @param transactionStateSink 事务状态 redo 消费端口。
+     * @return dispatcher。
+     */
+    public static RedoApplyDispatcher pageDispatcher(TransactionStateDeltaSink transactionStateSink) {
+        if (transactionStateSink == null) {
+            throw new DatabaseValidationException("transaction state delta sink must not be null");
+        }
+        return new RedoApplyDispatcher(List.of(
                 new FspPageAllocationRedoHandler(),
                 new PageRedoApplyHandler(),
-                new TransactionStateRedoHandler()));
+                new TransactionStateRedoHandler(transactionStateSink)), transactionStateSink);
     }
 
     /**
@@ -48,7 +66,15 @@ public final class RedoApplyDispatcher {
      * @return dispatcher。
      */
     public static RedoApplyDispatcher withHandlers(List<RedoApplyHandler> handlers) {
-        return new RedoApplyDispatcher(handlers);
+        return new RedoApplyDispatcher(handlers, null);
+    }
+
+    /**
+     * 判断该标准 dispatcher 是否绑定到同一个 trx sink 实例。RecoveryRequest 用身份校验阻止 formal context
+     * 与 no-op/custom dispatcher 误组合；sink 本身不从此方法泄漏。
+     */
+    public boolean isBoundToTransactionStateSink(TransactionStateDeltaSink sink) {
+        return sink != null && transactionStateSink == sink;
     }
 
     /**

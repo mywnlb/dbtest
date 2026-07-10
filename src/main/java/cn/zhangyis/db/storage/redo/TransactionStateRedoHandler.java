@@ -6,10 +6,26 @@ import cn.zhangyis.db.domain.PageId;
 import java.util.List;
 
 /**
- * 事务状态 logical redo 的恢复 handler。当前切片只保证 non-page record 可以保序扫描并被诊断性消费；
- * 真正的事务活跃表/提交表恢复仍由后续切片结合 undo/rseg 状态实现。
+ * 事务状态 logical redo 的恢复 handler。non-page record 按 batch 顺序交给可注入的
+ * {@link TransactionStateDeltaSink}；默认 sink 为 no-op，正式 StorageEngine recovery 注入线程独占事务恢复表。
  */
 public final class TransactionStateRedoHandler implements RedoApplyHandler {
+
+    /** 顺序消费端口；默认 no-op 维持通用 page replay 的兼容行为。 */
+    private final TransactionStateDeltaSink sink;
+
+    /** 创建不收集事务恢复证据的兼容 handler。 */
+    public TransactionStateRedoHandler() {
+        this(TransactionStateDeltaSink.NO_OP);
+    }
+
+    /** 创建把已解码 record 顺序交给指定 sink 的 handler。 */
+    public TransactionStateRedoHandler(TransactionStateDeltaSink sink) {
+        if (sink == null) {
+            throw new DatabaseValidationException("transaction state delta sink must not be null");
+        }
+        this.sink = sink;
+    }
 
     @Override
     public boolean supports(RedoRecord record) {
@@ -33,18 +49,27 @@ public final class TransactionStateRedoHandler implements RedoApplyHandler {
         if (range == null || context == null) {
             throw new DatabaseValidationException("transaction state redo apply range/context must not be null");
         }
-        return new Batch();
+        return new Batch(range, sink);
     }
 
-    /** 当前无运行时副作用，只校验 record 类型，保留恢复顺序中的消费点。 */
+    /** 单个 redo batch 的交付会话；只持不可变 range/sink，不访问页或事务系统。 */
     private static final class Batch implements RedoApplyBatchHandler {
+
+        private final LogRange range;
+        private final TransactionStateDeltaSink sink;
+
+        private Batch(LogRange range, TransactionStateDeltaSink sink) {
+            this.range = range;
+            this.sink = sink;
+        }
 
         @Override
         public void apply(RedoRecord record) {
-            if (!(record instanceof TransactionStateDeltaRecord)) {
+            if (!(record instanceof TransactionStateDeltaRecord delta)) {
                 throw new DatabaseValidationException("transaction state handler received unsupported record: "
                         + record.getClass().getName());
             }
+            sink.accept(range, delta);
         }
 
         @Override

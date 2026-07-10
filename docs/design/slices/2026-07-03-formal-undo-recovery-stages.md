@@ -16,7 +16,8 @@
 
 - 新增 `TransactionUndoRecoveryParticipant` 作为 recovery 层端口，避免 `CrashRecoveryService` 直接依赖 trx/undo/btree 内部。
 - 新增 `TransactionUndoRecoveryResult` 记录 restored slot、rolled-back active、skipped active、rebuilt history 计数。
-- `StorageEngine` 用现有 page3 扫描逻辑实现 participant，并通过 `RecoveryRequest.withTransactionUndoRecovery(...)` 注入。
+- `StorageEngine` 用 page3 扫描逻辑实现 participant；正式 trx recovery v1 后改由
+  `RecoveryRequest.withTransactionRecovery(context, participant)` 成对注入 sidecar/sink/snapshot 与 undo 恢复。
 - `CrashRecoveryService` 在 `OPEN_TRAFFIC` 前调用 participant，并记录 `UNDO_ROLLBACK` / `RESUME_PURGE` stage。
 - recovery rollback 可能追加 redo；若 request 携带 `recoveredRedoManager`，开放流量前执行 `redo.flush()`，保证回滚 redo durable。
 

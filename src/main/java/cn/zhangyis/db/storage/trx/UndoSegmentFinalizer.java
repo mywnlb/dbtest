@@ -79,7 +79,7 @@ public final class UndoSegmentFinalizer {
     }
 
     /**
-     * 纯 INSERT commit：以 drop+clear batch 作为当前提交恢复权威，并在同批追加 commit diagnostic redo。
+     * 纯 INSERT commit：在同一 batch 完成 drop+clear，并追加 recovery table 消费的 commit 终态/高水位证据。
      *
      * @param transaction 仍为 ACTIVE、已预留提交号的写事务。
      * @param context     该事务的 insert-only undo identity。
@@ -163,6 +163,9 @@ public final class UndoSegmentFinalizer {
                     TransactionStateRedoDeltas.appendCommit(finalizationMtr, transaction);
                 } else if (kind == UndoFinalizationKind.LIVE_ROLLBACK) {
                     TransactionStateRedoDeltas.appendRollbackComplete(finalizationMtr, transaction);
+                } else if (kind == UndoFinalizationKind.RECOVERY_ROLLBACK) {
+                    TransactionStateRedoDeltas.appendRecoveredRollback(
+                            finalizationMtr, identity.creatorTransactionId());
                 }
                 mtrManager.commit(finalizationMtr);
             } catch (RuntimeException error) {

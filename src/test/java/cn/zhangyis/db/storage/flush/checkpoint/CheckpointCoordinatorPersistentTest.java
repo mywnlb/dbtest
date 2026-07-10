@@ -22,9 +22,12 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
  * R2 checkpoint 持久化测试：内存 safe checkpoint 前进后必须写 redo control label，且不能因后续 dirty oldest 回退而覆盖旧 label。
@@ -80,6 +83,64 @@ class CheckpointCoordinatorPersistentTest {
 
             assertEquals(first, second);
             assertEquals(first, label.checkpointLsn());
+        }
+    }
+
+    /** 事务基线必须先成功，再写 redo label，最后才能公开 reclaim boundary。 */
+    @Test
+    void metadataParticipantRunsBeforeRedoLabelAndReclaim() {
+        try (PageStore store = new FileChannelPageStore();
+             BufferPool pool = new LruBufferPool(store, PS, 4);
+             RedoLogFileRepository repo = RedoLogFileRepository.open(dir.resolve("ordered-redo.log"));
+             RedoCheckpointStore checkpointStore = RedoCheckpointStore.open(dir.resolve("ordered-redo-control"))) {
+            store.create(SPACE, dir.resolve("ordered.ibd"), PS, PageNo.of(4));
+            RedoLogManager redo = RedoLogManager.durable(repo);
+            LogRange range = redo.append(List.of(new PageBytesRecord(PAGE, 200, new byte[]{1})));
+            redo.flush();
+            redo.markClosed(range);
+            List<String> events = new ArrayList<>();
+            AtomicReference<Lsn> metadataLsn = new AtomicReference<>();
+            CheckpointCoordinator coordinator = new CheckpointCoordinator(pool, redo, checkpointStore,
+                    checkpoint -> {
+                        events.add("sidecar");
+                        metadataLsn.set(checkpoint);
+                    }, checkpoint -> {
+                        assertEquals(checkpoint, checkpointStore.readLatest().checkpointLsn(),
+                                "redo label must already be durable before reclaim is published");
+                        events.add("reclaim");
+                    });
+
+            Lsn published = coordinator.advanceCheckpoint();
+
+            assertEquals(published, metadataLsn.get());
+            assertEquals(List.of("sidecar", "reclaim"), events);
+        }
+    }
+
+    /** sidecar force 失败时，redo label、内存 checkpoint 与 reclaim 必须全部停在旧边界。 */
+    @Test
+    void metadataFailurePreventsRedoLabelAndReclaimAdvance() {
+        try (PageStore store = new FileChannelPageStore();
+             BufferPool pool = new LruBufferPool(store, PS, 4);
+             RedoLogFileRepository repo = RedoLogFileRepository.open(dir.resolve("failed-redo.log"));
+             RedoCheckpointStore checkpointStore = RedoCheckpointStore.open(dir.resolve("failed-redo-control"))) {
+            store.create(SPACE, dir.resolve("failed.ibd"), PS, PageNo.of(4));
+            RedoLogManager redo = RedoLogManager.durable(repo);
+            LogRange range = redo.append(List.of(new PageBytesRecord(PAGE, 200, new byte[]{1})));
+            redo.flush();
+            redo.markClosed(range);
+            AtomicReference<Lsn> reclaimed = new AtomicReference<>();
+            CheckpointCoordinator coordinator = new CheckpointCoordinator(pool, redo, checkpointStore,
+                    checkpoint -> {
+                        throw new cn.zhangyis.db.storage.recovery.TransactionRecoveryException(
+                                "synthetic sidecar force failure");
+                    }, reclaimed::set);
+
+            assertThrows(cn.zhangyis.db.storage.recovery.TransactionRecoveryException.class,
+                    coordinator::advanceCheckpoint);
+            assertEquals(Lsn.of(0), checkpointStore.readLatest().checkpointLsn());
+            assertEquals(Lsn.of(0), coordinator.lastCheckpointLsn());
+            assertEquals(null, reclaimed.get());
         }
     }
 

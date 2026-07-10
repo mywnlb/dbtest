@@ -26,7 +26,8 @@ import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * R2 crash recovery 启动门面。它只负责编排阶段顺序：关闭流量、doublewrite repair、checkpoint-aware redo replay、
- * 成功后开放流量；事务 rollback、DDL recovery、purge resume 是后续阶段，不在本类中伪实现。
+ * 事务表快照/undo rollback/purge resume，成功后开放流量；具体 page3、B+Tree、history 语义由参与者实现，
+ * DDL recovery 仍未接入。
  */
 public final class CrashRecoveryService {
 
@@ -88,9 +89,17 @@ public final class CrashRecoveryService {
                         doublewriteSummary.skippedPageCount(), request.skipPolicy()));
 
                 RedoCheckpointLabel checkpoint = request.checkpointStore().readLatest();
+                if (request.transactionRecoveryContext() != null) {
+                    // sidecar 必须在任何 TRX_STATE_DELTA 交付前校验并建立 counter 基线；dispatcher 中的 sink
+                    // 引用同一 context，故 applyAll 完成后 snapshot 包含完整 post-checkpoint 顺序证据。
+                    request.transactionRecoveryContext().initialize(checkpoint.checkpointLsn());
+                }
                 RedoRecoveryReader reader = new RedoRecoveryReader(request.redoRepository(), checkpoint.checkpointLsn());
                 tracker.begin(RecoveryStageName.REDO_REPLAY);
                 List<RedoLogBatch> batches = reader.readBatches();
+                if (request.transactionRecoveryContext() != null) {
+                    request.transactionRecoveryContext().verifyRedoCoverage(reader.recoveredToLsn());
+                }
                 RedoApplySummary redoSummary = request.dispatcher().applyAll(batches, request.applyContext(),
                         request.skipPolicy()::shouldSkip);
                 tracker.complete(state, reader.recoveredToLsn(), skipDetail("skippedRedoRecords",
@@ -121,8 +130,11 @@ public final class CrashRecoveryService {
 
                 if (request.transactionUndoRecovery() != null) {
                     tracker.begin(RecoveryStageName.UNDO_ROLLBACK);
+                    RecoveredTransactionSnapshot transactionSnapshot =
+                            request.transactionRecoveryContext().snapshot();
                     TransactionUndoRecoveryResult undoResult =
-                            request.transactionUndoRecovery().recoverAfterRedo(reader.recoveredToLsn());
+                            request.transactionUndoRecovery().recoverAfterRedo(
+                                    reader.recoveredToLsn(), transactionSnapshot);
                     if (undoResult == null) {
                         throw new DatabaseValidationException("transaction undo recovery result must not be null");
                     }
@@ -176,9 +188,18 @@ public final class CrashRecoveryService {
         tracker.complete(state, Lsn.of(0));
 
         RedoCheckpointLabel checkpoint = request.checkpointStore().readLatest();
+        if (request.transactionRecoveryContext() != null) {
+            // 只读诊断仍必须证明 sidecar 覆盖 redo checkpoint；initialize 只构造私有内存表，既不 apply delta，
+            // 也不发布 counter/rollback/history 或写文件。
+            request.transactionRecoveryContext().initialize(checkpoint.checkpointLsn());
+        }
         RedoRecoveryReader reader = new RedoRecoveryReader(request.redoRepository(), checkpoint.checkpointLsn());
         tracker.begin(RecoveryStageName.REDO_REPLAY);
-        reader.readBatches();
+        List<RedoLogBatch> batches = reader.readBatches();
+        if (request.transactionRecoveryContext() != null) {
+            request.transactionRecoveryContext().verifyRedoCoverage(reader.recoveredToLsn());
+            request.transactionRecoveryContext().validateTransactionDeltas(batches);
+        }
         tracker.complete(state, reader.recoveredToLsn());
 
         tracker.begin(RecoveryStageName.READ_ONLY_DIAGNOSTIC_OPEN);

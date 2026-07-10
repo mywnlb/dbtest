@@ -244,7 +244,7 @@ public final class UndoLogManager {
      * <ul>
      *   <li>未写事务（{@code undoContext()==null}）：no-op。</li>
      *   <li>纯 insert 事务（{@code !hasUpdateUndo()}）：insert undo 提交后不再服务一致性读，经
-     *       {@link UndoSegmentFinalizer} 同批 drop 段、CAS 清 page3、写 commit diagnostic，提交后释放内存 slot。</li>
+     *       {@link UndoSegmentFinalizer} 同批 drop 段、CAS 清 page3、写正式 commit 终态/高水位 redo，提交后释放内存 slot。</li>
      *   <li>含 update undo 事务（{@code hasUpdateUndo()}，T1.3e）：**保留** slot/段——committed update undo 仍可能被
      *       T1.4 MVCC 旧版本读 / purge 需要，不能在 commit 即回收；后续由 purge 走同一 finalizer 回收。</li>
      * </ul>
@@ -287,7 +287,7 @@ public final class UndoLogManager {
                     ctx.undoFirstPageId(), ctx.slotId()));
         } else {
             // INSERT roll pointer 的 insert bit 足以让旧 ReadView 判“不存在”；无需保留 undo record。finalizer 同一 MTR
-            // drop segment + clear page3 + append commit diagnostic，commit 后才释放内存 slot。
+            // drop segment + clear page3 + append recovery table 的正式 commit 证据，commit 后才释放内存 slot。
             finalizer.finalizeInsertCommit(txn, ctx);
         }
     }

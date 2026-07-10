@@ -10,7 +10,7 @@
 ## 1. 范围
 
 做：
-- 新增双槽 CRC `TransactionRecoveryCheckpointStore`，持久 `{checkpointLsn,nextTrxId,nextTrxNo}`。
+- 新增双槽 CRC `TransactionRecoveryCheckpointStore`，两槽物理分隔到独立 4 KiB 页，持久 `{checkpointLsn,nextTrxId,nextTrxNo}`。
 - checkpoint 先短锁快照事务计数并 force sidecar，再持久 redo label，最后才推进 redo reclaim boundary。
 - 新增 `CheckpointMetadataParticipant` 端口；默认 no-op，StorageEngine 注入事务基线参与者。
 - 新增恢复线程独占的 `RecoveredTransactionTable`，合并 checkpoint 基线、顺序 redo delta 与 page3 slot。
@@ -24,6 +24,7 @@
 - 不实现 XA commit/rollback 决议、DD/tablespace discovery、多索引 rollback 或 DDL recovery。
 - 不让 redo handler 执行事务状态机、undo rollback、MVCC 可见性或普通锁等待。
 - `READ_ONLY_VALIDATE` 只诊断文件，不发布 recovery table、counter 或用户写流量。
+- `READ_ONLY_VALIDATE` 仍须只读校验 sidecar 覆盖与 trx delta/PREPARED 冲突，不能漏报 NORMAL 必失败输入。
 
 ## 2. 关键决策
 
@@ -35,6 +36,8 @@
 6. ACTIVE page3 与 COMMITTED/ROLLED_BACK/PREPARED redo 证据冲突；不得进入 rollback 或开放流量。
 7. 非零 redo checkpoint 缺失/损坏 sidecar 无法证明纯 INSERT 高水位，旧教学实例明确拒绝并要求重建。
 8. recovery rollback terminal delta 使用独立 reason，下一次 crash 可在 page3 已清后保留 transaction-id 证据。
+9. sidecar 领先 redo label 时，实际完整 redo 尾仍必须覆盖 sidecar checkpoint；否则说明日志丢失并 fail-closed。
+10. 存在 RECOVERED_ACTIVE 但无显式聚簇索引解析入口时禁止跳过 rollback 后开放流量。
 
 ## 3. 验收测试
 

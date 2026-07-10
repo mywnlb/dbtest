@@ -12,7 +12,8 @@ import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * fuzzy checkpoint 协调器。F1 默认构造器只计算和单调发布内存安全 checkpoint LSN；R2 可注入
- * {@link RedoCheckpointStore} 持久化 redo control label。它仍不触发后台 page cleaner，也不回收 redo 文件。
+ * {@link RedoCheckpointStore} 持久化 redo control label，并可在 label 成功后驱动 redo 回收边界；它本身不触发
+ * 后台 page cleaner。
  *
  * <p>checkpoint 必须读取 {@link RedoLogManager#closedLsn()}，不能用 current LSN 代替。current 只说明 redo
  * 已分配到哪里，closed 才说明相关 dirty page 已发布到 Buffer Pool 的 flush 视图。
@@ -23,6 +24,8 @@ public final class CheckpointCoordinator {
     private final RedoLogManager redo;
     /** 可选 redo control store；为空时保持 F1 内存 checkpoint 语义。 */
     private final RedoCheckpointStore checkpointStore;
+    /** redo label 之前必须 force 的附加恢复元数据；默认 no-op。 */
+    private final CheckpointMetadataParticipant metadataParticipant;
     /**
      * 可选 redo 回收边界端口（0.18b）；为空时不驱动 redo 文件回收（单文件仓储场景）。checkpoint 持久并单调前进后，
      * 把已持久 checkpoint LSN 推送给它，让 redo 文件环复用旧文件。
@@ -51,12 +54,33 @@ public final class CheckpointCoordinator {
      */
     public CheckpointCoordinator(BufferPool bufferPool, RedoLogManager redo, RedoCheckpointStore checkpointStore,
                                  RedoReclaimBoundary redoReclaimBoundary) {
+        this(bufferPool, redo, checkpointStore, CheckpointMetadataParticipant.NO_OP, redoReclaimBoundary);
+    }
+
+    /**
+     * 创建带附加恢复元数据屏障的 checkpoint 协调器。严格顺序为 participant→redo label→内存发布→reclaim；
+     * participant 或 label 写失败都会在发布前抛出，使旧 redo 仍不可回收。
+     *
+     * @param metadataParticipant redo label 前持久化的恢复元数据参与者，不能为 null。
+     * @param redoReclaimBoundary redo 回收边界端口（可空）。
+     */
+    public CheckpointCoordinator(BufferPool bufferPool, RedoLogManager redo, RedoCheckpointStore checkpointStore,
+                                 CheckpointMetadataParticipant metadataParticipant,
+                                 RedoReclaimBoundary redoReclaimBoundary) {
         if (bufferPool == null || redo == null) {
             throw new DatabaseValidationException("checkpoint buffer pool/redo must not be null");
+        }
+        if (metadataParticipant == null) {
+            throw new DatabaseValidationException("checkpoint metadata participant must not be null");
+        }
+        if (redoReclaimBoundary != null && checkpointStore == null) {
+            throw new DatabaseValidationException(
+                    "redo reclaim boundary requires a persistent checkpoint store");
         }
         this.bufferPool = bufferPool;
         this.redo = redo;
         this.checkpointStore = checkpointStore;
+        this.metadataParticipant = metadataParticipant;
         this.redoReclaimBoundary = redoReclaimBoundary;
     }
 
@@ -87,6 +111,8 @@ public final class CheckpointCoordinator {
         lock.lock();
         try {
             if (safe.value() > lastCheckpointLsn.value()) {
+                // 事务高水位必须先于 redo checkpoint force；若顺序反转，redo 环回收后将无法证明纯 INSERT 事务 id/no。
+                metadataParticipant.persistBeforeCheckpoint(safe);
                 if (checkpointStore != null) {
                     checkpointStore.write(RedoCheckpointLabel.of(safe, redo.currentLsn(), System.currentTimeMillis()));
                 }

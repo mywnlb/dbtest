@@ -8,6 +8,7 @@ import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.RollPointer;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.domain.TransactionId;
+import cn.zhangyis.db.domain.TransactionNo;
 import cn.zhangyis.db.domain.UndoSlotId;
 import cn.zhangyis.db.server.lockobs.api.SnapshotRequest;
 import cn.zhangyis.db.server.lockobs.snapshot.LockDiagnosticSnapshot;
@@ -30,6 +31,7 @@ import cn.zhangyis.db.storage.recovery.RecoveryReport;
 import cn.zhangyis.db.storage.recovery.RecoveryMode;
 import cn.zhangyis.db.storage.recovery.RecoveryStageName;
 import cn.zhangyis.db.storage.recovery.RecoveryState;
+import cn.zhangyis.db.storage.recovery.RecoveryStartupException;
 import cn.zhangyis.db.storage.recovery.RecoveryTrafficGate;
 import cn.zhangyis.db.storage.redo.LogRange;
 import cn.zhangyis.db.storage.redo.PageBytesRecord;
@@ -470,6 +472,23 @@ class StorageEngineTest {
         assertEquals(EngineState.CLOSED, readOnly.state());
     }
 
+    /** 只读诊断必须报告 NORMAL 会遇到的事务 sidecar 缺失，同时不得为诊断偷偷重建空文件。 */
+    @Test
+    void readOnlyValidateMissingTransactionSidecarFailsWithoutCreatingIt() throws Exception {
+        EngineConfig cfg = config();
+        StorageEngine original = new StorageEngine(cfg);
+        original.open();
+        original.close();
+        Files.delete(cfg.transactionRecoveryCheckpointFile());
+
+        StorageEngine readOnly = new StorageEngine(cfg.withRecoveryMode(RecoveryMode.READ_ONLY_VALIDATE));
+        assertThrows(RecoveryStartupException.class, readOnly::open);
+        assertEquals(EngineState.CLOSED, readOnly.state());
+        assertFalse(Files.exists(cfg.transactionRecoveryCheckpointFile()),
+                "READ_ONLY_VALIDATE must not create a missing transaction sidecar");
+        readOnly.close();
+    }
+
     @Test
     void ordinaryAccessorsRejectWhenRecoveryGateLeavesOpenAfterStartup() {
         RecoveryTrafficGate gate = new RecoveryTrafficGate();
@@ -624,7 +643,7 @@ class StorageEngineTest {
      * page3 重建内存 slot 目录，active 事务的 undo segment 首页被找回。
      */
     @Test
-    void recoversActiveRsegSlotFromPage3OnRestart() {
+    void activeRsegWithoutRecoveryIndexFailsClosed() {
         EngineConfig cfg = config();
 
         StorageEngine e1 = new StorageEngine(cfg);
@@ -638,16 +657,14 @@ class StorageEngineTest {
         // 不 commit/onCommit：模拟 active 事务
         UndoSlotId activeSlot = UndoSlotId.of(0); // 首写 first-fit 占最低空槽
         assertEquals(1, e1.rollbackSegmentSlotManager().activeSlotCount());
-        PageId firstPage = e1.rollbackSegmentSlotManager().insertUndoFirstPageId(activeSlot);
         e1.checkpoint(); // page3 + undo 页 durable
         e1.close();
 
         StorageEngine e2 = new StorageEngine(cfg);
-        e2.open();
-        assertEquals(1, e2.rollbackSegmentSlotManager().activeSlotCount(),
-                "active txn's rseg slot restored from page3 after restart");
-        assertEquals(firstPage, e2.rollbackSegmentSlotManager().insertUndoFirstPageId(activeSlot),
-                "restored slot points to the undo segment first page");
+        assertThrows(RecoveryStartupException.class, e2::open,
+                "without DD/multi-index recovery metadata, ACTIVE undo cannot be skipped before OPEN");
+        assertEquals(EngineState.CLOSED, e2.state(),
+                "failed open must close every partially opened recovery handle");
         e2.close();
     }
 
@@ -667,6 +684,8 @@ class StorageEngineTest {
         e1.transactionManager().prepareCommit(txn);
         e1.undoLogManager().onCommit(txn); // 纯 insert → 释放并清空 page3 该 slot
         e1.transactionManager().commit(txn);
+        TransactionId committedId = txn.transactionId();
+        TransactionNo committedNo = txn.transactionNo();
         assertEquals(0, e1.rollbackSegmentSlotManager().activeSlotCount());
         e1.checkpoint();
         e1.close();
@@ -675,6 +694,14 @@ class StorageEngineTest {
         e2.open();
         assertEquals(0, e2.rollbackSegmentSlotManager().activeSlotCount(),
                 "committed insert txn slot cleared on page3, not restored");
+        Transaction next = e2.transactionManager().begin(TransactionOptions.defaults());
+        e2.transactionManager().assignWriteId(next);
+        e2.transactionManager().prepareCommit(next);
+        assertTrue(next.transactionId().value() > committedId.value(),
+                "checkpointed pure INSERT transaction id must not be reused after its page3 slot was cleared");
+        assertTrue(next.transactionNo().value() > committedNo.value(),
+                "checkpointed pure INSERT commit number must not be reused after redo recycling");
+        e2.transactionManager().rollback(next);
         e2.close();
     }
 

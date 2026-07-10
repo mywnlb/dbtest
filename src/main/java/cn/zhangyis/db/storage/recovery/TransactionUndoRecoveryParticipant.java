@@ -16,7 +16,9 @@ public interface TransactionUndoRecoveryParticipant {
      * 执行正式 UNDO_ROLLBACK / RESUME_PURGE 恢复阶段。
      *
      * @param recoveredToLsn redo replay 扫描到的连续恢复边界；实现可用于诊断或校验后续 redo 续写边界。
+     * @param transactionSnapshot checkpoint 基线与 post-checkpoint redo 合并后的不可变事务证据。
      * @return 本次恢复阶段摘要；不能返回 null。
      */
-    TransactionUndoRecoveryResult recoverAfterRedo(Lsn recoveredToLsn);
+    TransactionUndoRecoveryResult recoverAfterRedo(
+            Lsn recoveredToLsn, RecoveredTransactionSnapshot transactionSnapshot);
 }

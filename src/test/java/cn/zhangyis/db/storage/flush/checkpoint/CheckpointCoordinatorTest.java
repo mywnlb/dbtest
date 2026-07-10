@@ -17,6 +17,8 @@ import cn.zhangyis.db.storage.redo.PageBytesRecord;
 import cn.zhangyis.db.storage.redo.RedoLogFileRepository;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
 import cn.zhangyis.db.storage.redo.RedoReclaimBoundary;
+import cn.zhangyis.db.storage.redo.RedoCheckpointStore;
+import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -26,6 +28,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
  * F1 checkpoint 测试：safe checkpoint LSN 是 dirty oldest、redo current/closed、redo flushed 的安全交集。
@@ -117,7 +120,9 @@ class CheckpointCoordinatorTest {
     void advanceCheckpointPushesRedoReclaimBoundaryWhenAdvanced() {
         try (PageStore store = new FileChannelPageStore();
              BufferPool pool = new LruBufferPool(store, PS, 4);
-             RedoLogFileRepository repo = RedoLogFileRepository.open(dir.resolve("redo-reclaim.log"))) {
+             RedoLogFileRepository repo = RedoLogFileRepository.open(dir.resolve("redo-reclaim.log"));
+             RedoCheckpointStore checkpointStore =
+                     RedoCheckpointStore.open(dir.resolve("redo-reclaim-control"))) {
             store.create(SPACE, dir.resolve("s-reclaim.ibd"), PS, PageNo.of(4));
             RedoLogManager redo = RedoLogManager.durable(repo);
             LogRange range = redo.append(List.of(new PageBytesRecord(PAGE, 200, new byte[]{1})));
@@ -127,7 +132,8 @@ class CheckpointCoordinatorTest {
             redo.markClosed(range);
 
             AtomicReference<Lsn> reclaimed = new AtomicReference<>();
-            CheckpointCoordinator coordinator = new CheckpointCoordinator(pool, redo, null, reclaimed::set);
+            CheckpointCoordinator coordinator =
+                    new CheckpointCoordinator(pool, redo, checkpointStore, reclaimed::set);
 
             assertEquals(Lsn.of(durable), coordinator.advanceCheckpoint());
             assertEquals(Lsn.of(durable), reclaimed.get(),
@@ -139,7 +145,9 @@ class CheckpointCoordinatorTest {
     void doesNotTouchReclaimBoundaryWhenCheckpointDoesNotAdvance() {
         try (PageStore store = new FileChannelPageStore();
              BufferPool pool = new LruBufferPool(store, PS, 4);
-             RedoLogFileRepository repo = RedoLogFileRepository.open(dir.resolve("redo-noadvance.log"))) {
+             RedoLogFileRepository repo = RedoLogFileRepository.open(dir.resolve("redo-noadvance.log"));
+             RedoCheckpointStore checkpointStore =
+                     RedoCheckpointStore.open(dir.resolve("redo-noadvance-control"))) {
             store.create(SPACE, dir.resolve("s-noadvance.ibd"), PS, PageNo.of(4));
             RedoLogManager redo = RedoLogManager.durable(repo);
             // append 但不 markClosed → closedLsn 仍为 0 → 安全 checkpoint 不前进。
@@ -147,10 +155,24 @@ class CheckpointCoordinatorTest {
             redo.flush();
 
             AtomicReference<Lsn> reclaimed = new AtomicReference<>();
-            CheckpointCoordinator coordinator = new CheckpointCoordinator(pool, redo, null, reclaimed::set);
+            CheckpointCoordinator coordinator =
+                    new CheckpointCoordinator(pool, redo, checkpointStore, reclaimed::set);
 
             assertEquals(Lsn.of(0), coordinator.advanceCheckpoint());
             assertNull(reclaimed.get(), "checkpoint 未推进时不触碰回收边界，避免过早放开覆盖");
+        }
+    }
+
+    /** reclaim 没有持久 redo label 保护时会覆盖恢复仍需要的日志，构造阶段必须拒绝。 */
+    @Test
+    void reclaimBoundaryRequiresPersistentCheckpointStore() {
+        try (PageStore store = new FileChannelPageStore();
+             BufferPool pool = new LruBufferPool(store, PS, 4);
+             RedoLogFileRepository repo = RedoLogFileRepository.open(dir.resolve("unsafe-reclaim.log"))) {
+            RedoLogManager redo = RedoLogManager.durable(repo);
+
+            assertThrows(DatabaseValidationException.class,
+                    () -> new CheckpointCoordinator(pool, redo, null, checkpoint -> { }));
         }
     }
 

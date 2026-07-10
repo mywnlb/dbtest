@@ -14,6 +14,7 @@ import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -60,6 +61,26 @@ class TransactionStateRedoTest {
         assertEquals(1, summary.appliedBatchCount());
         assertEquals(0, summary.skippedRecordCount());
         assertFalse(skipCalled.get(), "non-page trx redo must not invoke page skip predicate");
+    }
+
+    /** 注入 sink 后，handler 只按 batch 顺序交付 record/range，不访问事务状态机或 PageStore。 */
+    @Test
+    void dispatcherDeliversTransactionStateDeltaToInjectedSink() {
+        TransactionStateDeltaRecord delta = new TransactionStateDeltaRecord(
+                TransactionId.of(7), TransactionStateDeltaState.ACTIVE,
+                TransactionStateDeltaState.COMMITTED, TransactionNo.of(3),
+                TransactionStateDeltaReason.COMMIT);
+        RedoLogBatch batch = batchOf(List.of(delta));
+        AtomicReference<LogRange> deliveredRange = new AtomicReference<>();
+        AtomicReference<TransactionStateDeltaRecord> deliveredRecord = new AtomicReference<>();
+
+        RedoApplyDispatcher.pageDispatcher((range, record) -> {
+            deliveredRange.set(range);
+            deliveredRecord.set(record);
+        }).apply(batch, new RedoApplyContext(new FailingPageStore(), PS));
+
+        assertEquals(batch.range(), deliveredRange.get());
+        assertEquals(delta, deliveredRecord.get());
     }
 
     private static RedoLogBatch batchOf(List<RedoRecord> records) {

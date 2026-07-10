@@ -6,6 +6,8 @@ import cn.zhangyis.db.storage.mtr.MtrRedoCategory;
 import cn.zhangyis.db.storage.redo.TransactionStateDeltaReason;
 import cn.zhangyis.db.storage.redo.TransactionStateDeltaRecord;
 import cn.zhangyis.db.storage.redo.TransactionStateDeltaState;
+import cn.zhangyis.db.domain.TransactionId;
+import cn.zhangyis.db.domain.TransactionNo;
 
 /**
  * 事务状态 logical redo 收集小工具。它位于 trx 包，负责把运行时 {@link TransactionState}
@@ -17,15 +19,15 @@ final class TransactionStateRedoDeltas {
     }
 
     /**
-     * 在 commit MTR 中追加提交状态 redo。该 record 不修改物理页；undo first page 的 COMMITTED marker
-     * 仍是当前恢复判定提交/未提交的权威状态，本 record 只补充 redo 顺序中的事务状态诊断边界。
+     * 在 commit MTR 中追加提交状态 redo。该 record 不修改物理页，但会被正式 recovery table 用作终态与
+     * transaction id/no 高水位证据；存在 undo slot 时仍必须与 page3/first-page 状态交叉校验，不能单独跳过恢复。
      *
      * @param mtr 当前 commit MTR。
      * @param txn 正在提交或已预留提交号的事务。
      */
     static void appendCommit(MiniTransaction mtr, Transaction txn) {
         append(mtr, txn, toRedoState(txn.state()), TransactionStateDeltaState.COMMITTED,
-                TransactionStateDeltaReason.COMMIT);
+                txn.transactionNo(), TransactionStateDeltaReason.COMMIT);
     }
 
     /**
@@ -38,16 +40,37 @@ final class TransactionStateRedoDeltas {
      */
     static void appendRollbackComplete(MiniTransaction mtr, Transaction txn) {
         append(mtr, txn, toRedoState(txn.state()), TransactionStateDeltaState.ROLLED_BACK,
-                TransactionStateDeltaReason.ROLLBACK);
+                TransactionNo.NONE, TransactionStateDeltaReason.ROLLBACK);
+    }
+
+    /**
+     * 在 recovery rollback 的原子终结 MTR 中追加终态证据。恢复期没有 live {@link Transaction}，因此显式使用
+     * 已由 page3/undo first-page 交叉校验的 creator id；提交号固定 NONE。该 record 与 drop segment + clear slot
+     * 同批，下一次 crash 即使 page3 已清也能从 redo 保留 id 高水位和 ROLLED_BACK 终态。
+     *
+     * @param mtr recovery finalization MTR。
+     * @param creatorTransactionId 已核对的崩溃事务 creator id。
+     */
+    static void appendRecoveredRollback(MiniTransaction mtr, TransactionId creatorTransactionId) {
+        if (mtr == null || creatorTransactionId == null || creatorTransactionId.isNone()) {
+            throw new DatabaseValidationException(
+                    "recovery rollback state redo requires mtr and non-NONE creator transaction id");
+        }
+        mtr.appendLogicalRedo(new TransactionStateDeltaRecord(
+                        creatorTransactionId, TransactionStateDeltaState.ACTIVE,
+                        TransactionStateDeltaState.ROLLED_BACK, TransactionNo.NONE,
+                        TransactionStateDeltaReason.RECOVERY_ROLLBACK),
+                MtrRedoCategory.TRX_STATE, "append recovery rollback terminal-state redo");
     }
 
     private static void append(MiniTransaction mtr, Transaction txn, TransactionStateDeltaState fromState,
-                               TransactionStateDeltaState toState, TransactionStateDeltaReason reason) {
+                               TransactionStateDeltaState toState, TransactionNo transactionNo,
+                               TransactionStateDeltaReason reason) {
         if (mtr == null || txn == null) {
             throw new DatabaseValidationException("transaction state redo mtr/txn must not be null");
         }
         mtr.appendLogicalRedo(new TransactionStateDeltaRecord(
-                        txn.transactionId(), fromState, toState, txn.transactionNo(), reason),
+                        txn.transactionId(), fromState, toState, transactionNo, reason),
                 MtrRedoCategory.TRX_STATE, "append transaction state logical redo");
     }
 

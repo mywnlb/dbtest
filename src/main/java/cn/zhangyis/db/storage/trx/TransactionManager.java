@@ -109,7 +109,7 @@ public final class TransactionManager {
      *
      * <p>T1.3c 之前无 undo，本方法只翻状态；T1.3d 起拆为 {@link #beginRollback}/{@link #finishRollback} 两阶段，
      * 本方法是「无 undo 链可走」（只读/未写事务）的便捷组合：{@code RollbackService} 对有 {@code UndoContext} 的
-     * 事务改为先 {@code beginRollback}、反向走 undo 链、释放 slot，再 {@code finishRollback}，使撤销发生在真正的
+     * 事务改为先 {@code beginRollback}、反向走 undo 链、原子终结段并释放 slot，再 {@code finishRollback}，使撤销发生在真正的
      * {@code ROLLING_BACK} 状态内（设计 §7.6）。本组合行为与旧实现完全一致。
      */
     public void rollback(Transaction txn) {
@@ -127,7 +127,7 @@ public final class TransactionManager {
     }
 
     /**
-     * 收尾回滚：ROLLING_BACK→ROLLED_BACK，读写事务移出活跃表。只有 undo 链**完整**走到 prev=NULL 并释放 slot 后
+     * 收尾回滚：ROLLING_BACK→ROLLED_BACK，读写事务移出活跃表。只有 undo 链**完整**走到 prev=NULL、持久终结并释放 slot 后
      * 才调用；单条 undo 失败不应到达此处（{@code RollbackService} 让异常传播、事务停在 {@code ROLLING_BACK} 可重试）。
      *
      * @throws TransactionStateException 当前不在 {@code ROLLING_BACK}（未先 {@link #beginRollback}）。

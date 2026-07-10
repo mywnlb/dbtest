@@ -207,6 +207,25 @@ public final class UndoContext {
     }
 
     /**
+     * 发布一条已经成功提交到 first-page header 的 full rollback 进度。调用方只能在 marker MTR commit 返回后调用；
+     * 本方法不再执行可能失败的磁盘/链校验，只把同一个不可变 pair 复制到事务内存态，避免 marker 已持久而 context
+     * 仍指向旧 record。完整回滚一旦开始便不会回到 ACTIVE，所有运行期保存点随第一条进度失效并清空。
+     *
+     * <p>{@link #lastUndoNo} 是物理 append 高水位，故意不随逻辑头回退；否则 rollback 后的诊断或未来格式扩展会误以为
+     * detached record 从未分配过 undoNo。
+     *
+     * @param persistedHead 已由 marker MTR 成功提交的新持久逻辑头。
+     */
+    void publishFullRollbackProgress(UndoLogicalHead persistedHead) {
+        if (persistedHead == null) {
+            throw new DatabaseValidationException("full rollback persisted head must not be null");
+        }
+        this.logicalLastUndoNo = persistedHead.undoNo();
+        this.lastRollPointer = persistedHead.rollPointer();
+        savepointStack.clear();
+    }
+
+    /**
      * 释放一个运行期保存点及其后创建的所有嵌套保存点。该操作只管理内存中的边界生命周期，不修改 undo 链，
      * 因而用于 statement guard 成功关闭或完成回滚后的收尾；目标保存点必须仍属于本 context。
      *

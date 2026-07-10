@@ -93,7 +93,7 @@ class PurgeDriverWorkerTest {
             if (failWith != null) {
                 throw failWith;
             }
-            return new PurgeSummary(0, 0, 0);
+            return new PurgeSummary(0, 0);
         }
     }
 }

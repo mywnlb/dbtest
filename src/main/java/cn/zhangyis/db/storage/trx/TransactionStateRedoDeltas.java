@@ -29,8 +29,9 @@ final class TransactionStateRedoDeltas {
     }
 
     /**
-     * 在 finishRollback 前追加回滚完成 redo。调用点必须已经完整走完 undo 链并释放 slot；
-     * 恢复期不能仅凭该 record 跳过 undo/rseg 状态检查。
+     * 在 finishRollback 前追加回滚完成 redo。调用点必须已经完整走完 undo 链；有 undo 段时该 record 与
+     * segment drop + page3 clear 位于同一 finalization MTR，内存 slot 在该 MTR 提交后才释放。恢复期不能仅凭
+     * 本 record 跳过 undo/rseg 状态检查。
      *
      * @param mtr 当前短 MTR。
      * @param txn 正处于 ROLLING_BACK 的事务。

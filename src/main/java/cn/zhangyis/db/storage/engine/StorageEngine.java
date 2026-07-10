@@ -82,6 +82,7 @@ import cn.zhangyis.db.storage.trx.RollbackService;
 import cn.zhangyis.db.storage.trx.TransactionManager;
 import cn.zhangyis.db.storage.trx.TransactionSystem;
 import cn.zhangyis.db.storage.trx.UndoLogManager;
+import cn.zhangyis.db.storage.trx.UndoSegmentFinalizer;
 import cn.zhangyis.db.storage.trx.lock.LockManager;
 import cn.zhangyis.db.storage.undo.RollbackSegmentHeaderRepository;
 import cn.zhangyis.db.storage.undo.RollbackSegmentHeaderSnapshot;
@@ -165,6 +166,8 @@ public final class StorageEngine {
     private RollbackSegmentHeaderRepository rsegHeaderRepo;
     /** undo 段物理设施；恢复期读 undo 段 state、回滚 ACTIVE 段用。 */
     private UndoLogSegmentAccess undoAccess;
+    /** 四条 undo 终态共享的 FSP drop + page3 clear 原子协调器。 */
+    private UndoSegmentFinalizer undoSegmentFinalizer;
     /** 单显式配置聚簇索引（无 DD，open 前 set）：同时服务恢复期回滚（R 1.2）与后台 purge（0.4）；null 则都跳过。 */
     private BTreeIndex clusteredIndex;
     /** 事务系统（id/no 分配 + active 表 + purge low water）；purge boundary 来源。 */
@@ -299,8 +302,10 @@ public final class StorageEngine {
         this.history = new HistoryList();
         this.undoAllocator = new DiskSpaceUndoAllocator(diskSpaceManager);
         this.undoAccess = new UndoLogSegmentAccess(pool, config.pageSize(), undoAllocator, typeRegistry, registry);
+        this.undoSegmentFinalizer = new UndoSegmentFinalizer(miniTransactionManager, undoAccess, undoAllocator,
+                rsegHeaderRepo, rollbackSlots);
         this.undoLogManager = new UndoLogManager(undoAccess, rollbackSlots, config.undoSpaceId(), history,
-                rsegHeaderRepo, miniTransactionManager);
+                rsegHeaderRepo, miniTransactionManager, undoSegmentFinalizer);
         this.indexPageAccess = new IndexPageAccess(pool, config.pageSize(), registry);
         this.btreeService = new SplitCapableBTreeIndexService(indexPageAccess, diskSpaceManager, typeRegistry);
         this.lockObservationService = new DefaultLockObservationService();
@@ -309,8 +314,8 @@ public final class StorageEngine {
                 new BTreeCurrentReadService(miniTransactionManager, btreeService, lockManager);
         this.mvccReader = new MvccReader(miniTransactionManager, btreeService, undoAccess,
                 config.undoSpaceId(), config.maxVersionHops());
-        this.rollbackService = new RollbackService(btreeService, undoAccess, rollbackSlots, transactionManager,
-                miniTransactionManager);
+        this.rollbackService = new RollbackService(btreeService, undoAccess, transactionManager,
+                miniTransactionManager, undoSegmentFinalizer);
         this.dmlService = new ClusteredDmlService(transactionManager, undoLogManager, miniTransactionManager,
                 btreeService, btreeCurrentReadService, rollbackService, lockManager, redo, recoveryGate);
 
@@ -495,8 +500,8 @@ public final class StorageEngine {
 
             if (recovered.active()) {
                 if (clusteredIndex != null) {
-                    rollbackService.rollbackRecovered(recovered.firstPageId(), clusteredIndex);
-                    rollbackSlots.release(recovered.slotId());
+                    rollbackService.rollbackRecovered(recovered.slotId(), recovered.firstPageId(),
+                            recovered.creatorTrxId(), clusteredIndex);
                     rolledBackActiveSlots++;
                 } else {
                     skippedActiveSlots++;
@@ -645,7 +650,7 @@ public final class StorageEngine {
             return;
         }
         PurgeCoordinator coordinator = new PurgeCoordinator(miniTransactionManager, txnSystem, history,
-                undoAccess, undoAllocator, rollbackSlots, btreeService, clusteredIndex);
+                undoAccess, undoSegmentFinalizer, btreeService, clusteredIndex);
         purgeDriverWorker = new PurgeDriverWorker(coordinator, config.slotCapacity(), config.backgroundFlushInterval());
         purgeDriverWorker.start();
     }

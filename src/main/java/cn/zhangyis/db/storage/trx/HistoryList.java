@@ -7,28 +7,21 @@ import java.util.Optional;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * 已提交 undo log 的 history list（设计 §5.6/§7.4，purge 内存版）。两条独立队列：
- * <ul>
- *   <li><b>committed</b>：含 update/delete undo 的已提交事务，按提交序 FIFO 入队（提交序 = TransactionNo 单调序）。
- *       purge 从队首按 TransactionNo boundary 处理，遇首个未达 boundary 即停。</li>
- *   <li><b>insertReclaim</b>：纯 insert undo 段（提交即可回收、无 boundary），purge 直接排空 dropUndoSegment。</li>
- * </ul>
+ * 已提交 update/delete undo log 的 history list（设计 §5.6/§7.4，purge 内存投影）。事务按提交序 FIFO 入队，
+ * purge 从队首按 TransactionNo boundary 处理；纯 insert undo 在 commit finalization 中直接 drop，不进入 history。
  *
  * <p><b>并发</b>：生产者是 commit（{@code UndoLogManager.onCommit}），消费者是 {@code PurgeCoordinator}；用一把
- * {@link ReentrantLock} 短锁保护两队列，锁内只增删队列、不做 IO、不等待。禁止 {@code synchronized}（项目约束）。
- * peek/poll 分离，使 purge 能"先 peek 处理、成功后才 poll"实现 per-entry 原子（失败保留队首、停批）。
+ * {@link ReentrantLock} 短锁保护队列，锁内只增删、不做 IO、不等待。禁止 {@code synchronized}。peek/complete
+ * 分离，使 purge 先处理物理任务，finalization 成功后再按 expected identity 精确摘队首。
  *
- * <p><b>本片简化</b>：内存版，无持久化 / 无 crash recovery 重建 / 单 rollback segment 单链（多 rseg、持久 rseg
- * header、恢复期 history 重建留后续片）。
+ * <p><b>恢复</b>：队列自身不持久化；page3 中仍占用且 first-page state=COMMITTED 的 slot 是恢复重建权威。
  */
 public final class HistoryList {
 
-    /** 保护两队列的短锁。 */
+    /** 保护 committed FIFO 的短锁。 */
     private final ReentrantLock lock = new ReentrantLock();
     /** 含 update/delete undo 的已提交 undo log，按提交序 FIFO。 */
     private final ArrayDeque<HistoryEntry> committed = new ArrayDeque<>();
-    /** 纯 insert undo 段回收队列（无序，提交即可回收）。 */
-    private final ArrayDeque<InsertReclaimEntry> insertReclaim = new ArrayDeque<>();
 
     /** 提交时把含 update/delete undo 的事务挂入 history 队尾（提交序）。 */
     public void submitCommitted(HistoryEntry entry) {
@@ -38,19 +31,6 @@ public final class HistoryList {
         lock.lock();
         try {
             committed.addLast(entry);
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    /** 提交时把纯 insert undo 段挂入回收队列。 */
-    public void submitInsertReclaim(InsertReclaimEntry entry) {
-        if (entry == null) {
-            throw new DatabaseValidationException("insert reclaim entry must not be null");
-        }
-        lock.lock();
-        try {
-            insertReclaim.addLast(entry);
         } finally {
             lock.unlock();
         }
@@ -66,34 +46,22 @@ public final class HistoryList {
         }
     }
 
-    /** 移除并返回 committed 队首（purge 成功处理完一条后调用，实现 per-entry 原子）。 */
-    public Optional<HistoryEntry> pollCommitted() {
-        lock.lock();
-        try {
-            return Optional.ofNullable(committed.pollFirst());
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    /** 移除并返回一条 insert-reclaim 条目（无序）；空则 empty，供 purge 排空。 */
-    public Optional<InsertReclaimEntry> pollInsertReclaim() {
-        lock.lock();
-        try {
-            return Optional.ofNullable(insertReclaim.pollFirst());
-        } finally {
-            lock.unlock();
-        }
-    }
-
     /**
-     * 查看 insert-reclaim 队首但不移除。purge 必须先成功 drop segment 再 poll；若先 poll 后 IO 失败，
-     * 纯 insert undo 段会永久丢失回收任务。
+     * finalization commit 后精确移除 expected committed 队首。错序或重复完成代表内存投影与 page3 生命周期漂移，
+     * 必须 fail-closed，不能静默摘除其它事务 history。
      */
-    public Optional<InsertReclaimEntry> peekInsertReclaim() {
+    public void completeCommitted(HistoryEntry expected) {
+        if (expected == null) {
+            throw new DatabaseValidationException("completed history entry must not be null");
+        }
         lock.lock();
         try {
-            return Optional.ofNullable(insertReclaim.peekFirst());
+            HistoryEntry current = committed.peekFirst();
+            if (!expected.equals(current)) {
+                throw new DatabaseValidationException(
+                        "committed history head mismatch: expected=" + expected + ", current=" + current);
+            }
+            committed.removeFirst();
         } finally {
             lock.unlock();
         }
@@ -109,13 +77,4 @@ public final class HistoryList {
         }
     }
 
-    /** 当前 insert-reclaim 队列长度。 */
-    public int insertReclaimSize() {
-        lock.lock();
-        try {
-            return insertReclaim.size();
-        } finally {
-            lock.unlock();
-        }
-    }
 }

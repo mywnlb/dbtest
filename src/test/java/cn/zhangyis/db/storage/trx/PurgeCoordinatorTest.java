@@ -12,6 +12,7 @@ import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.domain.TransactionId;
 import cn.zhangyis.db.domain.TransactionNo;
 import cn.zhangyis.db.domain.UndoNo;
+import cn.zhangyis.db.domain.UndoSlotId;
 import cn.zhangyis.db.storage.api.DiskSpaceManager;
 import cn.zhangyis.db.storage.api.DiskSpaceUndoAllocator;
 import cn.zhangyis.db.storage.api.index.IndexPageAccess;
@@ -45,6 +46,8 @@ import cn.zhangyis.db.storage.record.type.ColumnValue;
 import cn.zhangyis.db.storage.record.type.TypeCodecRegistry;
 import cn.zhangyis.db.storage.redo.RedoLogFileRepository;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
+import cn.zhangyis.db.storage.redo.FspMetadataDeltaKind;
+import cn.zhangyis.db.storage.redo.FspMetadataDeltaRecord;
 import cn.zhangyis.db.storage.undo.UndoLogSegment;
 import cn.zhangyis.db.storage.undo.UndoLogSegmentAccess;
 import cn.zhangyis.db.storage.undo.UndoRecord;
@@ -57,16 +60,19 @@ import org.junit.jupiter.api.io.TempDir;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * P6 PurgeCoordinator 端到端：单线程聚簇 purge + undo 段回收。整栈 test-wired
  * （assignWriteId → beforeX → Xclustered → commit+onCommit → runBatch）。覆盖：无 live ReadView 物理移除 delete-marked +
- * 回收；live ReadView 挡住、release 后放行；UPDATE-only 只回收段不碰记录（#9）；insert-only 立即回收；
- * per-entry 原子（drop 失败保留 history head，#8）。
+ * 回收；live ReadView 挡住、release 后放行；UPDATE-only 只回收段不碰记录（#9）；insert-only 在 commit
+ * 原子终结；per-entry 原子（drop 失败保留 history head，#8）。
  */
 class PurgeCoordinatorTest {
 
@@ -98,7 +104,6 @@ class PurgeCoordinatorTest {
 
             assertEquals(1, summary.purgedLogs());
             assertEquals(1, summary.removedRecords(), "delete-marked row physically removed");
-            assertEquals(1, summary.reclaimedInsertSegments(), "T1 insert undo segment reclaimed");
             assertEquals(0, ctx.history.committedSize(), "history drained");
             MiniTransaction r = ctx.mgr.begin();
             assertTrue(ctx.svc.lookupIncludingDeleted(r, index, search(1)).isEmpty(), "row gone after purge");
@@ -214,14 +219,16 @@ class PurgeCoordinatorTest {
             UndoSpaceAllocator allocator = new DiskSpaceUndoAllocator(disk);
             UndoLogSegmentAccess undoAccess = new UndoLogSegmentAccess(pool, PS, allocator, registry);
             RollbackSegmentSlotManager slots = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 64);
-            var slot = slots.claim(fixture.firstPageId());
+            slots.restore(fixture.slotId(), fixture.firstPageId());
+            UndoFinalizationTestSupport.Components finalization = UndoFinalizationTestSupport.create(
+                    mgr, pool, PS, undoAccess, allocator, slots);
             HistoryList history = new HistoryList();
             history.submitCommitted(new HistoryEntry(TransactionNo.of(1), TransactionId.of(7),
-                    UNDO_SPACE, fixture.firstPageId(), slot));
+                    UNDO_SPACE, fixture.firstPageId(), fixture.slotId()));
             TransactionSystem system = new TransactionSystem();
             system.restoreCounters(8, 2);
-            PurgeCoordinator purge = new PurgeCoordinator(mgr, system, history, undoAccess, allocator,
-                    slots, new SplitCapableBTreeIndexService(
+            PurgeCoordinator purge = new PurgeCoordinator(mgr, system, history, undoAccess,
+                    finalization.finalizer(), new SplitCapableBTreeIndexService(
                             new IndexPageAccess(pool, PS), disk, registry), fixture.index());
 
             PurgeSummary summary = purge.runBatch(1);
@@ -229,6 +236,10 @@ class PurgeCoordinatorTest {
             assertEquals(1, summary.purgedLogs());
             assertEquals(0, summary.removedRecords());
             assertEquals(0, history.committedSize());
+            assertTrue(mgr.redoLogManager().bufferedBatches().getLast().records().stream()
+                            .anyMatch(record -> record instanceof FspMetadataDeltaRecord delta
+                                    && delta.kind() == FspMetadataDeltaKind.XDES_FIELD),
+                    "finalization batch must release the segment-owned extent, not only fragment pages");
         }
     }
 
@@ -240,35 +251,33 @@ class PurgeCoordinatorTest {
             Transaction t1 = ctx.beginRw();
             ctx.insert(index, t1, 1);
             ctx.commit(t1);
-            assertEquals(1, ctx.history.insertReclaimSize(), "insert-only commit enqueues reclaim");
             assertEquals(0, ctx.history.committedSize());
+            assertEquals(0, ctx.slots.activeSlotCount(), "insert-only commit atomically releases its undo slot");
 
             PurgeSummary summary = ctx.purge.runBatch(10);
 
-            assertEquals(1, summary.reclaimedInsertSegments());
+            assertEquals(0, summary.purgedLogs(), "insert-only undo never enters purge history");
             assertEquals(0, summary.removedRecords());
-            assertEquals(0, ctx.history.insertReclaimSize());
             MiniTransaction r = ctx.mgr.begin();
             assertTrue(ctx.svc.lookup(r, index, search(1)).isPresent(), "committed inserted row stays (only undo reclaimed)");
             ctx.mgr.commit(r);
         });
     }
 
-    /** insert-reclaim 必须先成功 drop 再 poll；drop IO 失败时任务仍留在队首供下一批重试。 */
+    /** insert-only commit 的 drop 失败发生在提交发布前；事务与 slot 保持 ACTIVE/占用，不能伪装提交成功。 */
     @Test
-    void insertReclaimEntryIsRetainedWhenDropFails() {
+    void insertCommitFailsClosedWhenAtomicFinalizationDropFails() {
         onPool(true, ctx -> {
             ctx.boot();
             BTreeIndex index = ctx.clusteredIndex();
             Transaction txn = ctx.beginRw();
             ctx.insert(index, txn, 1);
-            ctx.commit(txn);
-            assertEquals(1, ctx.history.insertReclaimSize());
 
-            assertThrows(DatabaseRuntimeException.class, () -> ctx.purge.runBatch(10));
+            assertThrows(UndoFinalizationException.class, () -> ctx.commit(txn));
 
-            assertEquals(1, ctx.history.insertReclaimSize(),
-                    "failed drop must not lose the insert-reclaim entry");
+            assertEquals(TransactionState.ACTIVE, txn.state(), "commit must not publish after finalization failure");
+            assertEquals(1, ctx.slots.activeSlotCount(), "owner remains available for crash recovery");
+            assertEquals(0, ctx.history.committedSize(), "insert-only undo has no deferred reclaim queue");
         });
     }
 
@@ -287,6 +296,45 @@ class PurgeCoordinatorTest {
             // drop 抛错：异常传播、history head 不被 poll
             assertThrows(DatabaseRuntimeException.class, () -> ctx.purge.runBatch(10));
             assertEquals(1, ctx.history.committedSize(), "history head retained on hard failure (per-entry atomic)");
+            assertEquals(1, ((FailingDropAllocator) ctx.undoAllocator).dropAttempts());
+
+            assertThrows(DatabaseRuntimeException.class, () -> ctx.purge.runBatch(10));
+            assertEquals(1, ((FailingDropAllocator) ctx.undoAllocator).dropAttempts(),
+                    "physical failure keeps FINALIZING, so retry cannot invoke allocator again");
+        });
+    }
+
+    /** finalization commit 后、history 内存摘除前 crash：page3 已清，重启不会从残留 Java 队列重建该条目。 */
+    @Test
+    void purgeCrashAfterFinalizationCommitLeavesOnlyStaleMemoryProjection() {
+        AtomicBoolean injected = new AtomicBoolean();
+        onPool(false, (kind, slotId, firstPageId) -> {
+            if (kind == UndoFinalizationKind.PURGE && injected.compareAndSet(false, true)) {
+                throw new SimulatedPurgeCrashException("crash after purge finalization commit");
+            }
+        }, ctx -> {
+            ctx.boot();
+            BTreeIndex index = ctx.clusteredIndex();
+            Transaction creator = ctx.beginRw();
+            ctx.insert(index, creator, 1);
+            ctx.commit(creator);
+            Transaction updater = ctx.beginRw();
+            ctx.update(index, updater, 1, "v2");
+            ctx.commit(updater);
+            HistoryEntry head = ctx.history.peekCommitted().orElseThrow();
+
+            assertThrows(SimulatedPurgeCrashException.class, () -> ctx.purge.runBatch(1));
+
+            assertEquals(1, ctx.history.committedSize(),
+                    "old process has not published history completion at the crash point");
+            assertTrue(ctx.slots.isOccupied(head.slotId()),
+                    "old process also retains its stale memory slot projection");
+            MiniTransaction read = ctx.mgr.begin();
+            var snapshot = ctx.finalization.header().read(read, UNDO_SPACE,
+                    ctx.slots.rollbackSegmentId(), ctx.slots.slotCapacity());
+            ctx.mgr.commit(read);
+            assertFalse(snapshot.occupiedSlots().containsKey(head.slotId()),
+                    "page3 recovery authority was cleared by the committed finalization batch");
         });
     }
 
@@ -319,7 +367,7 @@ class PurgeCoordinatorTest {
                 new ColumnValue.StringValue("payload-" + id)), false, RecordType.CONVENTIONAL);
     }
 
-    /** 构建 20 条约 7KiB UPDATE undo（约十余页）并刷盘，供 4-frame reopen 验证 purge 资源边界。 */
+    /** 构建 70 条约 7KiB UPDATE undo（超过 32 个 fragment 页并进入 extent）供 4-frame reopen 验证终结资源边界。 */
     private MultiPagePurgeFixture buildMultiPagePurgeFixture(Path dataPath, Path undoPath) {
         Path redoPath = dir.resolve("purge-small-pool-redo.log");
         try (PageStore store = new FileChannelPageStore();
@@ -331,6 +379,9 @@ class PurgeCoordinatorTest {
             IndexPageAccess indexAccess = new IndexPageAccess(pool, PS);
             UndoSpaceAllocator allocator = new DiskSpaceUndoAllocator(disk);
             UndoLogSegmentAccess undoAccess = new UndoLogSegmentAccess(pool, PS, allocator, registry);
+            RollbackSegmentSlotManager slots = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 64);
+            UndoFinalizationTestSupport.Components finalization = UndoFinalizationTestSupport.create(
+                    mgr, pool, PS, undoAccess, allocator, slots);
 
             MiniTransaction boot = mgr.begin();
             disk.createTablespace(boot, DATA_SPACE, dataPath, PageNo.of(64));
@@ -339,6 +390,7 @@ class PurgeCoordinatorTest {
             PageId root = disk.allocatePage(boot, leaf);
             indexAccess.createIndexPage(boot, root, INDEX_ID, 0);
             disk.createTablespace(boot, UNDO_SPACE, undoPath, PageNo.of(64));
+            finalization.format(boot, UNDO_SPACE);
             mgr.commit(boot);
 
             TableSchema schema = largePurgeSchema();
@@ -346,9 +398,14 @@ class PurgeCoordinatorTest {
             MiniTransaction create = mgr.begin();
             UndoLogSegment segment = undoAccess.create(create, UNDO_SPACE, TransactionId.of(7));
             PageId firstPageId = segment.firstPageId();
+            UndoSlotId slotId = slots.claim(firstPageId);
+            try (var ignored = create.allowOutOfOrderPageLatch(
+                    "test fixture persists rseg slot after creating undo first page")) {
+                finalization.header().claimSlot(create, UNDO_SPACE, slotId, firstPageId);
+            }
             RollPointer previous = RollPointer.NULL;
             String largeValue = "x".repeat(7_000);
-            for (int i = 1; i <= 20; i++) {
+            for (int i = 1; i <= 70; i++) {
                 if (i > 1) {
                     mgr.commit(create);
                     create = mgr.begin();
@@ -368,7 +425,7 @@ class PurgeCoordinatorTest {
             redo.flush();
             new FlushCoordinator(pool, store, redo, PS, new NoDoublewriteStrategy(), Duration.ofMillis(100))
                     .flushList(Lsn.of(Long.MAX_VALUE), pool.capacity());
-            return new MultiPagePurgeFixture(index, firstPageId);
+            return new MultiPagePurgeFixture(index, firstPageId, slotId);
         }
     }
 
@@ -378,13 +435,17 @@ class PurgeCoordinatorTest {
                 new ColumnDef(new ColumnId(1), "payload", ColumnType.varchar(8_000, true), 1)), true);
     }
 
-    private record MultiPagePurgeFixture(BTreeIndex index, PageId firstPageId) {
+    private record MultiPagePurgeFixture(BTreeIndex index, PageId firstPageId, UndoSlotId slotId) {
     }
 
     private void onPool(boolean failDrop, Body body) {
+        onPool(failDrop, UndoFinalizationFaultInjector.none(), body);
+    }
+
+    private void onPool(boolean failDrop, UndoFinalizationFaultInjector faultInjector, Body body) {
         PageStore store = new FileChannelPageStore();
         try (PageStore ignored = store; BufferPool pool = new LruBufferPool(store, PS, 128)) {
-            body.run(new Ctx(store, pool, failDrop));
+            body.run(new Ctx(store, pool, failDrop, faultInjector));
         }
     }
 
@@ -395,6 +456,8 @@ class PurgeCoordinatorTest {
     /** 仅在 dropUndoSegment 抛错的分配器包装，用于 per-entry 原子测试；create/allocate 透传真实分配器。 */
     private static final class FailingDropAllocator implements UndoSpaceAllocator {
         private final UndoSpaceAllocator delegate;
+        /** 记录是否有重复终结越过运行期 lease 到达物理 allocator。 */
+        private final AtomicInteger dropAttempts = new AtomicInteger();
 
         private FailingDropAllocator(UndoSpaceAllocator delegate) {
             this.delegate = delegate;
@@ -417,7 +480,12 @@ class PurgeCoordinatorTest {
 
         @Override
         public void dropUndoSegment(MiniTransaction mtr, UndoSegmentHandle handle) {
+            dropAttempts.incrementAndGet();
             throw new DatabaseRuntimeException("injected dropUndoSegment failure");
+        }
+
+        private int dropAttempts() {
+            return dropAttempts.get();
         }
     }
 
@@ -428,6 +496,7 @@ class PurgeCoordinatorTest {
         final UndoSpaceAllocator undoAllocator;
         final UndoLogSegmentAccess undoAccess;
         final RollbackSegmentSlotManager slots;
+        final UndoFinalizationTestSupport.Components finalization;
         final HistoryList history = new HistoryList();
         final TransactionManager txnMgr = new TransactionManager(new TransactionSystem());
         final UndoLogManager undoMgr;
@@ -439,7 +508,8 @@ class PurgeCoordinatorTest {
         private SegmentRef nonLeafSegment;
         private PageId rootPageId;
 
-        private Ctx(PageStore store, BufferPool pool, boolean failDrop) {
+        private Ctx(PageStore store, BufferPool pool, boolean failDrop,
+                    UndoFinalizationFaultInjector faultInjector) {
             this.pool = pool;
             this.disk = new DiskSpaceManager(pool, store, PS);
             this.access = new IndexPageAccess(pool, PS);
@@ -447,9 +517,12 @@ class PurgeCoordinatorTest {
             this.undoAllocator = failDrop ? new FailingDropAllocator(real) : real;
             this.undoAccess = new UndoLogSegmentAccess(pool, PS, undoAllocator, registry);
             this.slots = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 64);
-            this.undoMgr = new UndoLogManager(undoAccess, slots, UNDO_SPACE, history);
+            this.finalization = UndoFinalizationTestSupport.create(
+                    mgr, pool, PS, undoAccess, undoAllocator, slots, faultInjector);
+            this.undoMgr = finalization.manager(undoAccess, UNDO_SPACE, history, mgr);
             this.svc = new SplitCapableBTreeIndexService(access, disk, registry);
-            this.rollbackService = new RollbackService(svc, undoAccess, slots, txnMgr, mgr);
+            this.rollbackService = new RollbackService(
+                    svc, undoAccess, txnMgr, mgr, finalization.finalizer());
         }
 
         private void boot() {
@@ -460,9 +533,10 @@ class PurgeCoordinatorTest {
             rootPageId = disk.allocatePage(b, leafSegment);
             access.createIndexPage(b, rootPageId, INDEX_ID, 0);
             disk.createTablespace(b, UNDO_SPACE, dir.resolve("undo.ibu"), PageNo.of(64));
+            finalization.format(b, UNDO_SPACE);
             mgr.commit(b);
-            this.purge = new PurgeCoordinator(mgr, txnMgr.system(), history, undoAccess, undoAllocator,
-                    slots, svc, clusteredIndex());
+            this.purge = new PurgeCoordinator(mgr, txnMgr.system(), history, undoAccess,
+                    finalization.finalizer(), svc, clusteredIndex());
         }
 
         private BTreeIndex clusteredIndex() {
@@ -521,10 +595,18 @@ class PurgeCoordinatorTest {
             mgr.commit(corrupt);
         }
 
-        /** commit 编排：先 txnMgr.commit 分配 TransactionNo，再 onCommit 入 history（评审 #3 顺序）。 */
+        /** commit 编排：先预留提交号，再完成 undo 终态，最后才向事务系统发布 COMMITTED。 */
         private void commit(Transaction txn) {
-            txnMgr.commit(txn);
+            txnMgr.prepareCommit(txn);
             undoMgr.onCommit(txn);
+            txnMgr.commit(txn);
+        }
+    }
+
+    /** 只模拟 finalization 已提交后进程消失；生产 purge 不安装该 hook。 */
+    private static final class SimulatedPurgeCrashException extends DatabaseRuntimeException {
+        private SimulatedPurgeCrashException(String message) {
+            super(message);
         }
     }
 }

@@ -30,7 +30,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * RollbackSegmentHeaderRepository：page3 slot 目录 format/writeSlot/read 往返 + 页头/容量/越界校验。
+ * RollbackSegmentHeaderRepository：page3 slot 目录 format/claim/clear/read 往返，以及 owner CAS、redo、越界校验。
  */
 class RollbackSegmentHeaderRepositoryTest {
 
@@ -58,12 +58,12 @@ class RollbackSegmentHeaderRepositoryTest {
     }
 
     @Test
-    void writeSlotThenReadRoundTrips() {
+    void claimSlotThenReadRoundTrips() {
         withRepo((repo, mgr) -> {
             PageId firstPage = PageId.of(UNDO, PageNo.of(7));
             MiniTransaction w = mgr.begin();
             repo.format(w, UNDO, RSEG, 8);
-            repo.writeSlot(w, UNDO, UndoSlotId.of(2), firstPage);
+            repo.claimSlot(w, UNDO, UndoSlotId.of(2), firstPage);
             mgr.commit(w);
 
             MiniTransaction r = mgr.begin();
@@ -74,13 +74,42 @@ class RollbackSegmentHeaderRepositoryTest {
         });
     }
 
+    /**
+     * 首写在分配 undo segment 前必须只读预检 page3；空槽通过，已有 owner 则抛精确领域冲突且不改页。
+     */
     @Test
-    void writeSlotAppendsUndoMetadataDeltaRedo() {
+    void requireSlotFreeRejectsPersistentOwnerWithoutMutation() {
+        withRepo((repo, mgr) -> {
+            PageId owner = PageId.of(UNDO, PageNo.of(7));
+            MiniTransaction format = mgr.begin();
+            repo.format(format, UNDO, RSEG, 8);
+            repo.claimSlot(format, UNDO, UndoSlotId.of(2), owner);
+            mgr.commit(format);
+
+            MiniTransaction freeCheck = mgr.begin();
+            repo.requireSlotFree(freeCheck, UNDO, UndoSlotId.of(1));
+            mgr.commit(freeCheck);
+
+            MiniTransaction occupiedCheck = mgr.begin();
+            UndoSlotOwnershipConflictException conflict = assertThrows(
+                    UndoSlotOwnershipConflictException.class,
+                    () -> repo.requireSlotFree(occupiedCheck, UNDO, UndoSlotId.of(2)));
+            assertTrue(conflict.getMessage().contains("current first page=7"));
+            mgr.rollbackUncommitted(occupiedCheck);
+
+            MiniTransaction read = mgr.begin();
+            assertEquals(Map.of(UndoSlotId.of(2), owner), repo.read(read, UNDO, RSEG, 8).occupiedSlots());
+            mgr.commit(read);
+        });
+    }
+
+    @Test
+    void claimSlotAppendsUndoMetadataDeltaRedo() {
         withRepo((repo, mgr) -> {
             PageId firstPage = PageId.of(UNDO, PageNo.of(7));
             MiniTransaction w = mgr.begin();
             repo.format(w, UNDO, RSEG, 8);
-            repo.writeSlot(w, UNDO, UndoSlotId.of(2), firstPage);
+            repo.claimSlot(w, UNDO, UndoSlotId.of(2), firstPage);
             mgr.commit(w);
 
             List<RedoRecord> records = mgr.redoLogManager().bufferedRecords();
@@ -97,17 +126,43 @@ class RollbackSegmentHeaderRepositoryTest {
     }
 
     @Test
-    void writeSlotNullClearsSlot() {
+    void clearSlotRequiresExpectedOwnerAndClearsSlot() {
         withRepo((repo, mgr) -> {
             MiniTransaction w = mgr.begin();
             repo.format(w, UNDO, RSEG, 8);
-            repo.writeSlot(w, UNDO, UndoSlotId.of(2), PageId.of(UNDO, PageNo.of(7)));
-            repo.writeSlot(w, UNDO, UndoSlotId.of(2), null);
+            PageId firstPage = PageId.of(UNDO, PageNo.of(7));
+            repo.claimSlot(w, UNDO, UndoSlotId.of(2), firstPage);
+            repo.clearSlot(w, UNDO, UndoSlotId.of(2), firstPage);
             mgr.commit(w);
 
             MiniTransaction r = mgr.begin();
             assertTrue(repo.read(r, UNDO, RSEG, 8).occupiedSlots().isEmpty());
             mgr.commit(r);
+        });
+    }
+
+    @Test
+    void claimOccupiedAndClearStaleOwnerFailClosed() {
+        withRepo((repo, mgr) -> {
+            PageId owner = PageId.of(UNDO, PageNo.of(7));
+            MiniTransaction format = mgr.begin();
+            repo.format(format, UNDO, RSEG, 8);
+            repo.claimSlot(format, UNDO, UndoSlotId.of(2), owner);
+            mgr.commit(format);
+
+            MiniTransaction duplicate = mgr.begin();
+            assertThrows(UndoLogFormatException.class,
+                    () -> repo.claimSlot(duplicate, UNDO, UndoSlotId.of(2), PageId.of(UNDO, PageNo.of(8))));
+            mgr.rollbackUncommitted(duplicate);
+
+            MiniTransaction staleClear = mgr.begin();
+            assertThrows(UndoLogFormatException.class,
+                    () -> repo.clearSlot(staleClear, UNDO, UndoSlotId.of(2), PageId.of(UNDO, PageNo.of(8))));
+            mgr.rollbackUncommitted(staleClear);
+
+            MiniTransaction read = mgr.begin();
+            assertEquals(Map.of(UndoSlotId.of(2), owner), repo.read(read, UNDO, RSEG, 8).occupiedSlots());
+            mgr.commit(read);
         });
     }
 
@@ -135,12 +190,12 @@ class RollbackSegmentHeaderRepositoryTest {
     }
 
     @Test
-    void writeSlotRejectsOutOfRangeSlot() {
+    void claimSlotRejectsOutOfRangeSlot() {
         withRepo((repo, mgr) -> {
             MiniTransaction w = mgr.begin();
             repo.format(w, UNDO, RSEG, 4);
             assertThrows(UndoLogFormatException.class,
-                    () -> repo.writeSlot(w, UNDO, UndoSlotId.of(10), PageId.of(UNDO, PageNo.of(7))));
+                    () -> repo.claimSlot(w, UNDO, UndoSlotId.of(10), PageId.of(UNDO, PageNo.of(7))));
             mgr.commit(w);
         });
     }

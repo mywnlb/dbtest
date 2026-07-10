@@ -7,7 +7,7 @@ package cn.zhangyis.db.storage.trx;
 public interface PurgeTarget {
 
     /**
-     * 同步处理一批已提交 undo（排空 insert-reclaim + 按 purge boundary 处理至多 {@code maxLogs} 条 committed log）。
+     * 同步处理一批已提交 update/delete undo（按 purge boundary 处理至多 {@code maxLogs} 条 committed log）。
      *
      * @param maxLogs 本批最多处理的 committed undo log 数（正）。
      * @return 本批统计。

@@ -88,30 +88,107 @@ public final class RollbackSegmentHeaderRepository {
     }
 
     /**
-     * 写一个 slot：{@code firstPage != null} 登记其页号；{@code null} 清空（{@code FIL_NULL}）。X latch 下写，
-     * 产 redo。先校验页头与 slot 越界，再写——避免把错误页号写进损坏的 rseg header。
+     * 以 compare-and-set 语义认领一个磁盘空 slot。只有当前值为 {@code FIL_NULL} 才写入 first page；重复 claim
+     * 或内存/磁盘 owner 漂移必须在覆盖旧 owner 前 fail-closed。
      *
-     * @param firstPage 该 slot 的 insert-undo segment 首页（须在同一 undo space）；{@code null} 表释放该 slot。
+     * @param mtr       持有 page3 X latch 并收集 redo 的短 MTR。
+     * @param spaceId   rseg page3 所属 undo 表空间。
+     * @param slot      要认领的稳定 slot 下标。
+     * @param firstPage 新 undo segment 首页，必须属于同一 undo tablespace。
      */
-    public void writeSlot(MiniTransaction mtr, SpaceId spaceId, UndoSlotId slot, PageId firstPage) {
+    public void claimSlot(MiniTransaction mtr, SpaceId spaceId, UndoSlotId slot, PageId firstPage) {
+        SlotWrite write = prepareSlotWrite(mtr, spaceId, slot, firstPage, "claim");
+        long current = write.guard().readLong(write.offset());
+        if (current != FilePageHeader.FIL_NULL) {
+            throw new UndoLogFormatException("claim of occupied rseg slot " + slot.value()
+                    + ": current first page=" + current);
+        }
+        writeSlotPageNo(mtr, write, firstPage.pageNo().value(), "claim rseg slot first page");
+    }
+
+    /**
+     * 在物理 undo segment 分配前以 page3 S latch 预检槽为空。方法只读取页格式、容量和目标 slot，且无论成功或
+     * 异常都在返回前释放 latch，使后续 FSP page0/page2 分配不形成 page3 -&gt; FSP 的逆序等待。持久 claim 仍须
+     * 在创建段后用 {@link #claimSlot} 再做一次 X-latch CAS；本方法只把正常单进程冲突前移到无物理副作用阶段。
+     *
+     * @param mtr     当前业务 MTR；调用方必须在触碰其他页前调用本方法。
+     * @param spaceId page3 所属 undo 表空间。
+     * @param slot    已由内存 claim lease 预留的稳定槽号。
+     * @throws UndoSlotOwnershipConflictException 磁盘槽已有 owner 时抛出。
+     */
+    public void requireSlotFree(MiniTransaction mtr, SpaceId spaceId, UndoSlotId slot) {
         requireMtr(mtr);
         requireSpace(spaceId);
         if (slot == null) {
-            throw new DatabaseValidationException("undo slot must not be null");
+            throw new DatabaseValidationException("rseg slot preflight slot must not be null");
         }
-        if (firstPage != null && !firstPage.spaceId().equals(spaceId)) {
+        PageId pageId = headerPage(spaceId);
+        PageGuard guard = mtr.getPage(pool, pageId, PageLatchMode.SHARED);
+        try {
+            int capacity = validateHeaderAndReadCapacity(guard);
+            int idx = slot.value();
+            if (idx < 0 || idx >= capacity) {
+                throw new UndoLogFormatException("rseg slot out of range: " + idx + " capacity=" + capacity);
+            }
+            long current = guard.readLong(RollbackSegmentHeaderLayout.slotOffset(idx));
+            if (current != FilePageHeader.FIL_NULL) {
+                throw new UndoSlotOwnershipConflictException("preflight of occupied rseg slot " + idx
+                        + ": current first page=" + current);
+            }
+        } finally {
+            mtr.releaseLatch(pageId, guard);
+        }
+    }
+
+    /**
+     * 以 compare-and-set 语义清空 slot。只有磁盘 owner 精确等于 {@code expectedFirstPage} 才写 {@code FIL_NULL}，
+     * 防止 stale rollback/purge 清掉已经被后续事务复用的 slot。
+     *
+     * @param mtr               finalization MTR；FSP drop 已在同一 MTR 中先执行。
+     * @param spaceId           rseg page3 所属 undo 表空间。
+     * @param slot              要清理的稳定 slot 下标。
+     * @param expectedFirstPage 调用方预期仍占有该 slot 的 undo segment 首页。
+     */
+    public void clearSlot(MiniTransaction mtr, SpaceId spaceId, UndoSlotId slot, PageId expectedFirstPage) {
+        SlotWrite write = prepareSlotWrite(mtr, spaceId, slot, expectedFirstPage, "clear");
+        long current = write.guard().readLong(write.offset());
+        long expected = expectedFirstPage.pageNo().value();
+        if (current != expected) {
+            throw new UndoLogFormatException("clear of stale rseg slot " + slot.value()
+                    + ": expected first page=" + expected + ", current=" + current);
+        }
+        writeSlotPageNo(mtr, write, FilePageHeader.FIL_NULL, "clear rseg slot first page");
+    }
+
+    /** 校验公共参数、页格式与 slot 边界，并返回仍持 X latch 的写定位。 */
+    private SlotWrite prepareSlotWrite(MiniTransaction mtr, SpaceId spaceId, UndoSlotId slot,
+                                       PageId firstPage, String operation) {
+        requireMtr(mtr);
+        requireSpace(spaceId);
+        if (slot == null || firstPage == null) {
+            throw new DatabaseValidationException("rseg slot " + operation + " slot/first page must not be null");
+        }
+        if (!firstPage.spaceId().equals(spaceId)) {
             throw new DatabaseValidationException("rseg slot first page must be in the undo space: " + firstPage);
         }
-        PageGuard g = mtr.getPage(pool, headerPage(spaceId), PageLatchMode.EXCLUSIVE);
-        int capacity = validateHeaderAndReadCapacity(g);
+        PageGuard guard = mtr.getPage(pool, headerPage(spaceId), PageLatchMode.EXCLUSIVE);
+        int capacity = validateHeaderAndReadCapacity(guard);
         int idx = slot.value();
         if (idx < 0 || idx >= capacity) {
             throw new UndoLogFormatException("rseg slot out of range: " + idx + " capacity=" + capacity);
         }
-        long pageNo = firstPage == null ? FilePageHeader.FIL_NULL : firstPage.pageNo().value();
-        long rsegId = g.readInt(RollbackSegmentHeaderLayout.RSEG_ID) & 0xFFFFFFFFL;
-        UndoRedoDeltas.writeLong(mtr, g, g.pageId(), UndoMetadataDeltaKind.RSEG_SLOT,
-                rsegId, idx, RollbackSegmentHeaderLayout.slotOffset(idx), pageNo, "write rseg slot first page");
+        long rsegId = guard.readInt(RollbackSegmentHeaderLayout.RSEG_ID) & 0xFFFFFFFFL;
+        return new SlotWrite(guard, idx, RollbackSegmentHeaderLayout.slotOffset(idx), rsegId);
+    }
+
+    /** 写 slot pageNo after-image；调用方已经完成 expected-owner CAS。 */
+    private void writeSlotPageNo(MiniTransaction mtr, SlotWrite write, long pageNo, String reason) {
+        UndoRedoDeltas.writeLong(mtr, write.guard(), write.guard().pageId(), UndoMetadataDeltaKind.RSEG_SLOT,
+                write.rsegId(), write.slotIndex(), write.offset(), pageNo, reason);
+    }
+
+    /** 一次已校验 slot 写的页定位；生命周期绑定到调用方 MTR memo。 */
+    private record SlotWrite(PageGuard guard, int slotIndex, int offset, long rsegId) {
     }
 
     /**

@@ -36,6 +36,9 @@
 
 本项目允许使用 Superpowers 或类似 agent 工作流工具，但这些工具只提供过程纪律，不能改变本仓库的文档分层和权威来源。
 
+- **禁止使用 GitNexus**：不要调用 GitNexus skill、MCP、CLI、索引或知识图谱，也不要依据 GitNexus 生成的调用链、影响分析或架构结论开展实现与评审。
+- 代码探索、调用链核对和 blast radius 分析必须直接基于本仓库的设计文档、`current-implementation-map.md`、生产源码、测试、`rg`/Git 等本地事实完成。
+
 - `docs/design/` 下的厚设计文档是长期教学资产，描述目标架构、模块边界和恢复语义。
 - `docs/design/current-implementation-map.md` 是当前源码真实链路地图，必须基于生产代码调用链核对后更新。
 - 切片 spec 可以持久化，但必须瘦身，默认放在 `docs/design/slices/`，控制在 40-60 行左右，只写本次切片的目标、关键决策、非目标、验收测试和 current map 更新要求。

@@ -410,6 +410,7 @@ class MvccReaderTest {
         final SplitCapableBTreeIndexService svc;
         final UndoLogSegmentAccess undoAccess;
         final RollbackSegmentSlotManager slots;
+        final UndoFinalizationTestSupport.Components finalization;
         final UndoLogManager undoMgr;
         final TransactionManager txnMgr = new TransactionManager(new TransactionSystem());
         final MvccReader mvcc;
@@ -421,9 +422,11 @@ class MvccReaderTest {
             this.disk = new DiskSpaceManager(pool, store, PS);
             this.access = new IndexPageAccess(pool, PS);
             this.svc = new SplitCapableBTreeIndexService(access, disk, registry);
-            this.undoAccess = new UndoLogSegmentAccess(pool, PS, new DiskSpaceUndoAllocator(disk), registry);
+            DiskSpaceUndoAllocator allocator = new DiskSpaceUndoAllocator(disk);
+            this.undoAccess = new UndoLogSegmentAccess(pool, PS, allocator, registry);
             this.slots = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 64);
-            this.undoMgr = new UndoLogManager(undoAccess, slots, UNDO_SPACE, new HistoryList());
+            this.finalization = UndoFinalizationTestSupport.create(mgr, pool, PS, undoAccess, allocator, slots);
+            this.undoMgr = finalization.manager(undoAccess, UNDO_SPACE, new HistoryList(), mgr);
             this.mvcc = new MvccReader(mgr, svc, undoAccess, UNDO_SPACE, 100);
         }
 
@@ -435,6 +438,7 @@ class MvccReaderTest {
             rootPageId = disk.allocatePage(b, leafSegment);
             access.createIndexPage(b, rootPageId, INDEX_ID, 0);
             disk.createTablespace(b, UNDO_SPACE, dir.resolve("undo.ibu"), PageNo.of(64));
+            finalization.format(b, UNDO_SPACE);
             mgr.commit(b);
         }
 
@@ -500,8 +504,9 @@ class MvccReaderTest {
         }
 
         private void commit(Transaction txn) {
-            txnMgr.commit(txn);
+            txnMgr.prepareCommit(txn);
             undoMgr.onCommit(txn);
+            txnMgr.commit(txn);
         }
     }
 }

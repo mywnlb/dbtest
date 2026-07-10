@@ -1,14 +1,18 @@
 package cn.zhangyis.db.storage.trx;
 
+import cn.zhangyis.db.common.exception.DatabaseRuntimeException;
+import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.Lsn;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.RollPointer;
 import cn.zhangyis.db.domain.RollbackSegmentId;
+import cn.zhangyis.db.domain.SegmentId;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.domain.TransactionId;
 import cn.zhangyis.db.domain.UndoNo;
+import cn.zhangyis.db.domain.UndoSlotId;
 import cn.zhangyis.db.storage.api.DiskSpaceManager;
 import cn.zhangyis.db.storage.api.DiskSpaceUndoAllocator;
 import cn.zhangyis.db.storage.buf.BufferPool;
@@ -33,25 +37,46 @@ import cn.zhangyis.db.storage.record.type.ColumnValue;
 import cn.zhangyis.db.storage.record.type.TypeCodecRegistry;
 import cn.zhangyis.db.storage.undo.UndoLogSegment;
 import cn.zhangyis.db.storage.undo.UndoLogSegmentAccess;
+import cn.zhangyis.db.storage.undo.UndoLogFormatException;
 import cn.zhangyis.db.storage.undo.UndoPageOverflowException;
 import cn.zhangyis.db.storage.undo.UndoRecord;
 import cn.zhangyis.db.storage.undo.UndoRecordType;
+import cn.zhangyis.db.storage.undo.UndoSlotOwnershipConflictException;
+import cn.zhangyis.db.storage.undo.UndoSegmentHandle;
+import cn.zhangyis.db.storage.undo.UndoSpaceAllocator;
+import cn.zhangyis.db.storage.undo.UndoSpaceReservation;
 import cn.zhangyis.db.storage.redo.RedoRecord;
 import cn.zhangyis.db.storage.redo.RedoLogFileRepository;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
+import cn.zhangyis.db.storage.redo.FspMetadataDeltaRecord;
+import cn.zhangyis.db.storage.redo.FspPageFreeRecord;
+import cn.zhangyis.db.storage.redo.RedoLogBatch;
 import cn.zhangyis.db.storage.redo.TransactionStateDeltaReason;
 import cn.zhangyis.db.storage.redo.TransactionStateDeltaRecord;
 import cn.zhangyis.db.storage.redo.TransactionStateDeltaState;
+import cn.zhangyis.db.storage.redo.UndoMetadataDeltaKind;
+import cn.zhangyis.db.storage.redo.UndoMetadataDeltaRecord;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -121,6 +146,196 @@ class UndoLogManagerTest {
         });
     }
 
+    /**
+     * page3 与空内存目录冲突时必须在 undo segment 创建前失败：取消 RESERVED，不绑定事务，也不推进 FSP segment id。
+     */
+    @Test
+    void persistentSlotConflictCancelsReservationBeforeSegmentCreation() {
+        onPool(h -> {
+            PageId persistentOwner = PageId.of(UNDO_SPACE, PageNo.of(63));
+            MiniTransaction occupy = h.mgr.begin();
+            h.finalization.header().claimSlot(occupy, UNDO_SPACE, UndoSlotId.of(0), persistentOwner);
+            h.mgr.commit(occupy);
+
+            MiniTransaction usageBeforeMtr = h.mgr.begin();
+            long nextSegmentIdBefore = h.disk.usage(usageBeforeMtr, UNDO_SPACE).nextSegmentId();
+            h.mgr.commit(usageBeforeMtr);
+
+            Transaction txn = h.txnMgr.begin(TransactionOptions.defaults());
+            h.txnMgr.assignWriteId(txn);
+            MiniTransaction write = h.mgr.begin();
+            assertThrows(UndoSlotOwnershipConflictException.class,
+                    () -> h.undoMgr.beforeInsert(txn, write, TABLE_ID, INDEX_ID,
+                            keyOf(100), keyDef(), schema()));
+            h.mgr.rollbackUncommitted(write);
+
+            assertEquals(0, h.slots.activeSlotCount(), "failed preflight cancels the in-memory reservation");
+            assertNull(txn.undoContext(), "failed preflight never binds an undo context");
+
+            MiniTransaction usageAfterMtr = h.mgr.begin();
+            long nextSegmentIdAfter = h.disk.usage(usageAfterMtr, UNDO_SPACE).nextSegmentId();
+            h.mgr.commit(usageAfterMtr);
+            assertEquals(nextSegmentIdBefore, nextSegmentIdAfter,
+                    "page3 conflict must be discovered before any physical segment allocation");
+        });
+    }
+
+    /**
+     * 预检通过后若另一个 owner 抢先持久化同槽，已经创建并 bind 的 segment 不能补偿释放；必须升级为 fatal。
+     */
+    @Test
+    void postBindClaimConflictFailsStopWithFatalPublicationError() {
+        BlockingCreateAllocator[] blocking = new BlockingCreateAllocator[1];
+        onPool(UndoFinalizationFaultInjector.none(), delegate -> {
+            blocking[0] = new BlockingCreateAllocator(delegate);
+            return blocking[0];
+        }, h -> {
+            Transaction txn = h.txnMgr.begin(TransactionOptions.defaults());
+            h.txnMgr.assignWriteId(txn);
+            ExecutorService executor = Executors.newSingleThreadExecutor();
+            try {
+                Future<?> writer = executor.submit(() -> {
+                    MiniTransaction write = h.mgr.begin();
+                    try {
+                        h.undoMgr.beforeInsert(txn, write, TABLE_ID, INDEX_ID,
+                                keyOf(100), keyDef(), schema());
+                        h.mgr.commit(write);
+                    } catch (RuntimeException error) {
+                        h.mgr.rollbackUncommitted(write);
+                        throw error;
+                    }
+                });
+                assertTrue(blocking[0].awaitCreate(), "writer passed page3 preflight and reached segment create");
+
+                PageId competingOwner = PageId.of(UNDO_SPACE, PageNo.of(63));
+                MiniTransaction drift = h.mgr.begin();
+                h.finalization.header().claimSlot(drift, UNDO_SPACE, UndoSlotId.of(0), competingOwner);
+                h.mgr.commit(drift);
+                blocking[0].releaseCreate();
+
+                ExecutionException failure = assertThrows(ExecutionException.class,
+                        () -> writer.get(5, TimeUnit.SECONDS));
+                assertTrue(failure.getCause() instanceof UndoClaimPublicationException,
+                        "post-bind publication conflict is fatal, not a retryable format error");
+                assertEquals(1, h.slots.activeSlotCount(), "bound ACTIVE slot remains fenced");
+                assertNull(txn.undoContext(), "context is not published after persistent claim failure");
+                assertEquals(1, blocking[0].createAttempts(), "same-process recovery does not recreate the segment");
+            } finally {
+                blocking[0].releaseCreate();
+                executor.shutdownNow();
+                assertDoesNotThrow(() -> executor.awaitTermination(5, TimeUnit.SECONDS));
+            }
+        });
+    }
+
+    /**
+     * 两个终态命令命中同一 owner 时，只有第一个能越过物理 drop 边界；第二个必须在 page/FSP 访问前失败。
+     */
+    @Test
+    void concurrentFinalizationAllowsOnlyOnePhysicalDropAttempt() {
+        BlockingDropAllocator[] blocking = new BlockingDropAllocator[1];
+        onPool(UndoFinalizationFaultInjector.none(), delegate -> {
+            blocking[0] = new BlockingDropAllocator(delegate);
+            return blocking[0];
+        }, h -> {
+            Transaction txn = h.txnMgr.begin(TransactionOptions.defaults());
+            h.txnMgr.assignWriteId(txn);
+            MiniTransaction write = h.mgr.begin();
+            h.undoMgr.beforeInsert(txn, write, TABLE_ID, INDEX_ID, keyOf(101), keyDef(), schema());
+            h.mgr.commit(write);
+            h.txnMgr.prepareCommit(txn);
+
+            UndoContext context = txn.undoContext();
+            ExecutorService executor = Executors.newFixedThreadPool(2);
+            try {
+                Future<?> first = executor.submit(
+                        () -> h.finalization.finalizer().finalizeInsertCommit(txn, context));
+                assertTrue(blocking[0].awaitFirstDrop(), "first terminal command reached the drop boundary");
+
+                Future<?> duplicate = executor.submit(
+                        () -> h.finalization.finalizer().finalizeInsertCommit(txn, context));
+                ExecutionException duplicateFailure = assertThrows(ExecutionException.class,
+                        () -> duplicate.get(5, TimeUnit.SECONDS));
+                assertTrue(duplicateFailure.getCause() instanceof DatabaseRuntimeException,
+                        "duplicate terminal command returns a domain failure");
+                assertEquals(1, blocking[0].dropAttempts(),
+                        "duplicate finalization must fail before invoking the physical allocator");
+
+                blocking[0].releaseFirstDrop();
+                assertDoesNotThrow(() -> first.get(5, TimeUnit.SECONDS));
+                assertEquals(0, h.slots.activeSlotCount(), "the winning finalization publishes FREE after commit");
+            } finally {
+                blocking[0].releaseFirstDrop();
+                executor.shutdownNow();
+                assertDoesNotThrow(() -> executor.awaitTermination(5, TimeUnit.SECONDS));
+            }
+        });
+    }
+
+    /** undo-header identity 预检失败尚未触碰 FSP，lease 必须恢复 ACTIVE，让正确终态命令仍可完成。 */
+    @Test
+    void finalizationPreflightFailureRestoresActiveOwnerForCorrectRetry() {
+        onPool(h -> {
+            Transaction txn = h.txnMgr.begin(TransactionOptions.defaults());
+            TransactionId creator = h.txnMgr.assignWriteId(txn);
+            MiniTransaction write = h.mgr.begin();
+            h.undoMgr.beforeInsert(txn, write, TABLE_ID, INDEX_ID, keyOf(102), keyDef(), schema());
+            h.mgr.commit(write);
+            UndoContext context = txn.undoContext();
+
+            assertThrows(UndoLogFormatException.class,
+                    () -> h.finalization.finalizer().finalizeRecoveredRollback(
+                            context.slotId(), context.undoFirstPageId(), TransactionId.of(creator.value() + 1)));
+            assertEquals(context.undoFirstPageId(), h.slots.insertUndoFirstPageId(context.slotId()),
+                    "pre-physical identity failure restores the original ACTIVE owner");
+
+            h.txnMgr.prepareCommit(txn);
+            h.undoMgr.onCommit(txn);
+            assertEquals(0, h.slots.activeSlotCount(), "correct terminal command succeeds after preflight failure");
+        });
+    }
+
+    /** 旧 identity 穿过真实 finalizer 命中新复用槽时，creator/owner 校验必须在 allocator drop 前拒绝。 */
+    @Test
+    void staleFinalizerCannotDropReusedPhysicalSegment() {
+        CountingDropAllocator[] counting = new CountingDropAllocator[1];
+        onPool(UndoFinalizationFaultInjector.none(), delegate -> {
+            counting[0] = new CountingDropAllocator(delegate);
+            return counting[0];
+        }, h -> {
+            Transaction oldTxn = h.txnMgr.begin(TransactionOptions.defaults());
+            TransactionId oldCreator = h.txnMgr.assignWriteId(oldTxn);
+            MiniTransaction oldWrite = h.mgr.begin();
+            h.undoMgr.beforeInsert(oldTxn, oldWrite, TABLE_ID, INDEX_ID, keyOf(103), keyDef(), schema());
+            h.mgr.commit(oldWrite);
+            UndoContext oldContext = oldTxn.undoContext();
+            h.txnMgr.prepareCommit(oldTxn);
+            h.undoMgr.onCommit(oldTxn);
+            h.txnMgr.commit(oldTxn);
+            assertEquals(1, counting[0].dropAttempts());
+
+            Transaction newTxn = h.txnMgr.begin(TransactionOptions.defaults());
+            h.txnMgr.assignWriteId(newTxn);
+            MiniTransaction newWrite = h.mgr.begin();
+            h.undoMgr.beforeInsert(newTxn, newWrite, TABLE_ID, INDEX_ID, keyOf(104), keyDef(), schema());
+            h.mgr.commit(newWrite);
+            UndoContext newContext = newTxn.undoContext();
+            assertEquals(oldContext.slotId(), newContext.slotId(), "completed slot is reused by first-fit");
+
+            assertThrows(DatabaseRuntimeException.class,
+                    () -> h.finalization.finalizer().finalizeRecoveredRollback(
+                            oldContext.slotId(), oldContext.undoFirstPageId(), oldCreator));
+            assertEquals(1, counting[0].dropAttempts(),
+                    "stale finalizer is rejected before touching the new segment inode/pages");
+            assertEquals(newContext.undoFirstPageId(), h.slots.insertUndoFirstPageId(newContext.slotId()));
+
+            h.txnMgr.prepareCommit(newTxn);
+            h.undoMgr.onCommit(newTxn);
+            h.txnMgr.commit(newTxn);
+            assertEquals(2, counting[0].dropAttempts(), "the new owner can still finalize normally");
+        });
+    }
+
     @Test
     void multipleInsertsIncrementUndoNoAndChainPrevRollPointer() {
         onPool(h -> {
@@ -178,11 +393,14 @@ class UndoLogManagerTest {
             DiskSpaceUndoAllocator allocator = new DiskSpaceUndoAllocator(disk);
             UndoLogSegmentAccess access = new UndoLogSegmentAccess(pool, PS, allocator, registry);
             RollbackSegmentSlotManager slots = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), SLOT_CAPACITY);
-            UndoLogManager undoMgr = new UndoLogManager(access, slots, UNDO_SPACE, new HistoryList());
+            UndoFinalizationTestSupport.Components finalization = UndoFinalizationTestSupport.create(
+                    mgr, pool, PS, access, allocator, slots);
+            UndoLogManager undoMgr = finalization.manager(access, UNDO_SPACE, new HistoryList(), mgr);
             TransactionManager txnMgr = new TransactionManager(new TransactionSystem());
 
             MiniTransaction boot = mgr.begin();
             disk.createTablespace(boot, UNDO_SPACE, path, PageNo.of(64));
+            finalization.format(boot, UNDO_SPACE);
             mgr.commit(boot);
 
             Transaction txn = txnMgr.begin(TransactionOptions.defaults());
@@ -273,9 +491,10 @@ class UndoLogManagerTest {
             h.mgr.commit(m);
             assertEquals(1, h.slots.activeSlotCount(), "slot claimed on first write");
 
-            // commit 编排：onCommit 释放 insert undo slot（commit 后不再服务一致性读）
-            h.txnMgr.commit(txn);
+            // commit 编排：先预留提交号，onCommit 原子回收 insert undo，最后发布事务 COMMITTED。
+            h.txnMgr.prepareCommit(txn);
             h.undoMgr.onCommit(txn);
+            h.txnMgr.commit(txn);
 
             assertEquals(0, h.slots.activeSlotCount(), "onCommit releases the insert undo slot");
 
@@ -286,8 +505,63 @@ class UndoLogManagerTest {
             h.undoMgr.beforeInsert(txn2, m2, TABLE_ID, INDEX_ID, keyOf(200), keyDef(), schema());
             h.mgr.commit(m2);
             assertEquals(1, h.slots.activeSlotCount(), "released slot reusable by next txn");
-            h.txnMgr.commit(txn2);
+            h.txnMgr.prepareCommit(txn2);
             h.undoMgr.onCommit(txn2);
+            h.txnMgr.commit(txn2);
+        });
+    }
+
+    /**
+     * 模拟 finalization MTR 已提交、内存 slot 尚未发布即进程崩溃：page3 与 FSP drop 必须已经处于同一 redo batch，
+     * 新进程只依据 page3 不会复活该段；旧进程残留的内存映射只是不可继续运行的瞬时投影。
+     */
+    @Test
+    void crashAfterAtomicInsertFinalizationCommitDoesNotLeavePersistentOwner() {
+        AtomicBoolean injected = new AtomicBoolean();
+        onPool((kind, slotId, firstPageId) -> {
+            if (kind == UndoFinalizationKind.INSERT_COMMIT && injected.compareAndSet(false, true)) {
+                throw new SimulatedFinalizationCrashException("crash after finalization MTR commit");
+            }
+        }, h -> {
+            Transaction txn = h.txnMgr.begin(TransactionOptions.defaults());
+            h.txnMgr.assignWriteId(txn);
+            MiniTransaction write = h.mgr.begin();
+            h.undoMgr.beforeInsert(txn, write, TABLE_ID, INDEX_ID, keyOf(100), keyDef(), schema());
+            h.mgr.commit(write);
+            UndoContext context = txn.undoContext();
+            int batchesBeforeFinalization = h.mgr.redoLogManager().bufferedBatches().size();
+
+            h.txnMgr.prepareCommit(txn);
+            assertThrows(SimulatedFinalizationCrashException.class, () -> h.undoMgr.onCommit(txn));
+
+            assertEquals(TransactionState.ACTIVE, txn.state(), "transaction terminal state was not published");
+            assertTrue(h.slots.isOccupied(context.slotId()),
+                    "simulated old process still has the pre-crash memory projection");
+            assertThrows(DatabaseValidationException.class, () -> h.undoMgr.onCommit(txn),
+                    "post-commit crash leaves FINALIZING and rejects same-process retry before page access");
+            MiniTransaction read = h.mgr.begin();
+            var snapshot = h.finalization.header().read(read, UNDO_SPACE,
+                    h.slots.rollbackSegmentId(), h.slots.slotCapacity());
+            h.mgr.commit(read);
+            assertFalse(snapshot.occupiedSlots().containsKey(context.slotId()),
+                    "page3 is recovery authority and was cleared before the simulated crash");
+
+            List<RedoLogBatch> batches = h.mgr.redoLogManager().bufferedBatches();
+            assertEquals(batchesBeforeFinalization + 1, batches.size(),
+                    "drop, slot clear and commit diagnostic share one finalization MTR");
+            List<RedoRecord> records = batches.getLast().records();
+            assertTrue(records.stream().anyMatch(FspMetadataDeltaRecord.class::isInstance),
+                    "finalization batch contains the physical segment-release ledger changes");
+            assertTrue(records.stream().anyMatch(FspPageFreeRecord.class::isInstance),
+                    "the same batch contains the undo page free intent");
+            assertTrue(records.stream().anyMatch(record -> record instanceof UndoMetadataDeltaRecord delta
+                            && delta.kind() == UndoMetadataDeltaKind.RSEG_SLOT
+                            && delta.subIndex() == context.slotId().value()),
+                    "the same batch clears the exact page3 owner slot");
+            assertTrue(records.stream().anyMatch(record -> record instanceof TransactionStateDeltaRecord delta
+                            && delta.reason() == TransactionStateDeltaReason.COMMIT
+                            && delta.toState() == TransactionStateDeltaState.COMMITTED),
+                    "the same batch records the insert commit diagnostic boundary");
         });
     }
 
@@ -364,8 +638,9 @@ class UndoLogManagerTest {
             assertEquals(oldHidden, rec.oldHiddenColumns());
 
             // commit 不回收含 delete undo 事务的 slot
-            h.txnMgr.commit(txn);
+            h.txnMgr.prepareCommit(txn);
             h.undoMgr.onCommit(txn);
+            h.txnMgr.commit(txn);
             assertEquals(1, h.slots.activeSlotCount(), "slot retained when txn wrote DELETE_MARK undo");
         });
     }
@@ -382,8 +657,9 @@ class UndoLogManagerTest {
             h.mgr.commit(m);
             assertEquals(1, h.slots.activeSlotCount());
 
-            h.txnMgr.commit(txn);
+            h.txnMgr.prepareCommit(txn);
             h.undoMgr.onCommit(txn);
+            h.txnMgr.commit(txn);
             assertEquals(1, h.slots.activeSlotCount(),
                     "slot retained when txn wrote UPDATE undo (T1.4 MVCC/purge needs it)");
         });
@@ -392,8 +668,7 @@ class UndoLogManagerTest {
     @Test
     void onCommitWritesTransactionStateRedoInCommitMtr() {
         onPool(h -> {
-            UndoLogManager durableUndo = new UndoLogManager(h.access, h.slots, UNDO_SPACE,
-                    new HistoryList(), null, h.mgr);
+            UndoLogManager durableUndo = h.undoMgr;
             Transaction txn = h.txnMgr.begin(TransactionOptions.defaults());
             h.txnMgr.assignWriteId(txn);
             MiniTransaction m = h.mgr.begin();
@@ -428,13 +703,17 @@ class UndoLogManagerTest {
             RedoLogManager redo = RedoLogManager.durable(repo);
             MiniTransactionManager mgr = new MiniTransactionManager(new TablespaceAccessController(), redo);
             DiskSpaceManager disk = new DiskSpaceManager(pool, store, PS);
-            UndoLogSegmentAccess access = new UndoLogSegmentAccess(pool, PS, new DiskSpaceUndoAllocator(disk), registry);
+            DiskSpaceUndoAllocator allocator = new DiskSpaceUndoAllocator(disk);
+            UndoLogSegmentAccess access = new UndoLogSegmentAccess(pool, PS, allocator, registry);
             RollbackSegmentSlotManager slots = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), SLOT_CAPACITY);
-            UndoLogManager undoMgr = new UndoLogManager(access, slots, UNDO_SPACE, new HistoryList());
+            UndoFinalizationTestSupport.Components finalization = UndoFinalizationTestSupport.create(
+                    mgr, pool, PS, access, allocator, slots);
+            UndoLogManager undoMgr = finalization.manager(access, UNDO_SPACE, new HistoryList(), mgr);
             TransactionManager txnMgr = new TransactionManager(new TransactionSystem());
 
             MiniTransaction boot = mgr.begin();
             disk.createTablespace(boot, UNDO_SPACE, path, PageNo.of(64));
+            finalization.format(boot, UNDO_SPACE);
             mgr.commit(boot);
 
             Transaction txn = txnMgr.begin(TransactionOptions.defaults());
@@ -498,21 +777,211 @@ class UndoLogManagerTest {
     }
 
     private void onPool(Body body) {
+        onPool(UndoFinalizationFaultInjector.none(), body);
+    }
+
+    private void onPool(UndoFinalizationFaultInjector faultInjector, Body body) {
+        onPool(faultInjector, Function.identity(), body);
+    }
+
+    /** 允许 focused concurrency 测试装饰真实 allocator，同时保留其完整分配与 FSP 副作用。 */
+    private void onPool(UndoFinalizationFaultInjector faultInjector,
+                        Function<UndoSpaceAllocator, UndoSpaceAllocator> allocatorDecorator,
+                        Body body) {
         PageStore store = new FileChannelPageStore();
         try (PageStore ignored = store; BufferPool pool = new LruBufferPool(store, PS, 128)) {
             MiniTransactionManager mgr = new MiniTransactionManager();
             DiskSpaceManager disk = new DiskSpaceManager(pool, store, PS);
-            DiskSpaceUndoAllocator allocator = new DiskSpaceUndoAllocator(disk);
+            UndoSpaceAllocator allocator = allocatorDecorator.apply(new DiskSpaceUndoAllocator(disk));
             UndoLogSegmentAccess access = new UndoLogSegmentAccess(pool, PS, allocator, registry);
             RollbackSegmentSlotManager slots = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), SLOT_CAPACITY);
-            UndoLogManager undoMgr = new UndoLogManager(access, slots, UNDO_SPACE, new HistoryList());
+            UndoFinalizationTestSupport.Components finalization = UndoFinalizationTestSupport.create(
+                    mgr, pool, PS, access, allocator, slots, faultInjector);
+            UndoLogManager undoMgr = finalization.manager(access, UNDO_SPACE, new HistoryList(), mgr);
             TransactionManager txnMgr = new TransactionManager(new TransactionSystem());
 
             MiniTransaction boot = mgr.begin();
             disk.createTablespace(boot, UNDO_SPACE, dir.resolve("undo.ibu"), PageNo.of(64));
+            finalization.format(boot, UNDO_SPACE);
             mgr.commit(boot);
 
-            body.run(new H(mgr, access, slots, undoMgr, txnMgr));
+            body.run(new H(mgr, disk, access, slots, undoMgr, txnMgr, finalization));
+        }
+    }
+
+    /**
+     * 保留真实 allocator 全部行为，只在第一次 drop 入口形成可控并发窗口；第二次尝试在触碰 FSP 前拒绝，避免
+     * 回归测试为了证明竞态而真的双重释放同一 inode/page。
+     */
+    private static final class BlockingDropAllocator implements UndoSpaceAllocator {
+        /** 完整真实行为的下游 allocator。 */
+        private final UndoSpaceAllocator delegate;
+        /** 第一次 drop 已进入的有界等待信号。 */
+        private final CountDownLatch firstDropEntered = new CountDownLatch(1);
+        /** 允许第一次 drop 继续的显式释放信号。 */
+        private final CountDownLatch releaseFirstDrop = new CountDownLatch(1);
+        /** 所有 drop 调用次数；第二次在 delegate 前被拒绝。 */
+        private final AtomicInteger dropAttempts = new AtomicInteger();
+
+        private BlockingDropAllocator(UndoSpaceAllocator delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public UndoSegmentHandle createUndoSegment(MiniTransaction mtr, SpaceId undoSpace) {
+            return delegate.createUndoSegment(mtr, undoSpace);
+        }
+
+        @Override
+        public UndoSpaceReservation reserveGrowPages(MiniTransaction mtr, SpaceId undoSpace, long pages) {
+            return delegate.reserveGrowPages(mtr, undoSpace, pages);
+        }
+
+        @Override
+        public PageId allocatePage(MiniTransaction mtr, SpaceId undoSpace, int inodeSlot, SegmentId segmentId) {
+            return delegate.allocatePage(mtr, undoSpace, inodeSlot, segmentId);
+        }
+
+        @Override
+        public void dropUndoSegment(MiniTransaction mtr, UndoSegmentHandle handle) {
+            int attempt = dropAttempts.incrementAndGet();
+            if (attempt > 1) {
+                throw new DatabaseRuntimeException("duplicate physical undo drop attempt");
+            }
+            firstDropEntered.countDown();
+            try {
+                if (!releaseFirstDrop.await(5, TimeUnit.SECONDS)) {
+                    throw new DatabaseRuntimeException("timed out waiting to release first undo drop");
+                }
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new DatabaseRuntimeException("interrupted while blocking first undo drop", interrupted);
+            }
+            delegate.dropUndoSegment(mtr, handle);
+        }
+
+        private boolean awaitFirstDrop() {
+            try {
+                return firstDropEntered.await(5, TimeUnit.SECONDS);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new DatabaseRuntimeException("interrupted while awaiting first undo drop", interrupted);
+            }
+        }
+
+        private void releaseFirstDrop() {
+            releaseFirstDrop.countDown();
+        }
+
+        private int dropAttempts() {
+            return dropAttempts.get();
+        }
+    }
+
+    /** 在真实 create 之前形成预检→持久 claim 的竞态窗口，其余 allocator 行为完整透传。 */
+    private static final class BlockingCreateAllocator implements UndoSpaceAllocator {
+        /** 完整真实行为的下游 allocator。 */
+        private final UndoSpaceAllocator delegate;
+        /** writer 已通过 page3 预检并进入 create 的信号。 */
+        private final CountDownLatch createEntered = new CountDownLatch(1);
+        /** 允许 writer 继续真实分配的信号。 */
+        private final CountDownLatch releaseCreate = new CountDownLatch(1);
+        /** create 调用计数，防止异常后隐式重建。 */
+        private final AtomicInteger createAttempts = new AtomicInteger();
+
+        private BlockingCreateAllocator(UndoSpaceAllocator delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public UndoSegmentHandle createUndoSegment(MiniTransaction mtr, SpaceId undoSpace) {
+            createAttempts.incrementAndGet();
+            createEntered.countDown();
+            try {
+                if (!releaseCreate.await(5, TimeUnit.SECONDS)) {
+                    throw new DatabaseRuntimeException("timed out waiting to release undo create");
+                }
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new DatabaseRuntimeException("interrupted while blocking undo create", interrupted);
+            }
+            return delegate.createUndoSegment(mtr, undoSpace);
+        }
+
+        @Override
+        public UndoSpaceReservation reserveGrowPages(MiniTransaction mtr, SpaceId undoSpace, long pages) {
+            return delegate.reserveGrowPages(mtr, undoSpace, pages);
+        }
+
+        @Override
+        public PageId allocatePage(MiniTransaction mtr, SpaceId undoSpace, int inodeSlot, SegmentId segmentId) {
+            return delegate.allocatePage(mtr, undoSpace, inodeSlot, segmentId);
+        }
+
+        @Override
+        public void dropUndoSegment(MiniTransaction mtr, UndoSegmentHandle handle) {
+            delegate.dropUndoSegment(mtr, handle);
+        }
+
+        private boolean awaitCreate() {
+            try {
+                return createEntered.await(5, TimeUnit.SECONDS);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new DatabaseRuntimeException("interrupted while awaiting undo create", interrupted);
+            }
+        }
+
+        private void releaseCreate() {
+            releaseCreate.countDown();
+        }
+
+        private int createAttempts() {
+            return createAttempts.get();
+        }
+    }
+
+    /** 完整透传真实 allocator，并只统计物理 drop 边界是否被 stale finalizer 触达。 */
+    private static final class CountingDropAllocator implements UndoSpaceAllocator {
+        /** 完整真实行为的下游 allocator。 */
+        private final UndoSpaceAllocator delegate;
+        /** 成功进入物理 drop 端口的次数。 */
+        private final AtomicInteger dropAttempts = new AtomicInteger();
+
+        private CountingDropAllocator(UndoSpaceAllocator delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public UndoSegmentHandle createUndoSegment(MiniTransaction mtr, SpaceId undoSpace) {
+            return delegate.createUndoSegment(mtr, undoSpace);
+        }
+
+        @Override
+        public UndoSpaceReservation reserveGrowPages(MiniTransaction mtr, SpaceId undoSpace, long pages) {
+            return delegate.reserveGrowPages(mtr, undoSpace, pages);
+        }
+
+        @Override
+        public PageId allocatePage(MiniTransaction mtr, SpaceId undoSpace, int inodeSlot, SegmentId segmentId) {
+            return delegate.allocatePage(mtr, undoSpace, inodeSlot, segmentId);
+        }
+
+        @Override
+        public void dropUndoSegment(MiniTransaction mtr, UndoSegmentHandle handle) {
+            dropAttempts.incrementAndGet();
+            delegate.dropUndoSegment(mtr, handle);
+        }
+
+        private int dropAttempts() {
+            return dropAttempts.get();
+        }
+    }
+
+    /** 只用于模拟 commit 后进程消失；生产 finalizer 不安装该 hook。 */
+    private static final class SimulatedFinalizationCrashException extends DatabaseRuntimeException {
+        private SimulatedFinalizationCrashException(String message) {
+            super(message);
         }
     }
 
@@ -528,18 +997,24 @@ class UndoLogManagerTest {
 
     private static final class H {
         final MiniTransactionManager mgr;
+        final DiskSpaceManager disk;
         final UndoLogSegmentAccess access;
         final RollbackSegmentSlotManager slots;
         final UndoLogManager undoMgr;
         final TransactionManager txnMgr;
+        final UndoFinalizationTestSupport.Components finalization;
 
-        H(MiniTransactionManager mgr, UndoLogSegmentAccess access, RollbackSegmentSlotManager slots,
-          UndoLogManager undoMgr, TransactionManager txnMgr) {
+        H(MiniTransactionManager mgr, DiskSpaceManager disk, UndoLogSegmentAccess access,
+          RollbackSegmentSlotManager slots,
+          UndoLogManager undoMgr, TransactionManager txnMgr,
+          UndoFinalizationTestSupport.Components finalization) {
             this.mgr = mgr;
+            this.disk = disk;
             this.access = access;
             this.slots = slots;
             this.undoMgr = undoMgr;
             this.txnMgr = txnMgr;
+            this.finalization = finalization;
         }
     }
 }

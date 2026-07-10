@@ -10,23 +10,28 @@ import java.util.concurrent.locks.ReentrantLock;
 /**
  * 内存 rollback segment slot 目录（设计 §5.4/§6.3/§9.3，T1.3c 简化版）。固定单一默认
  * {@link RollbackSegmentId}，用内存 slot array 记录 {@code UndoSlotId -> insertUndoFirstPageId}，供事务运行时
- * 定位 insert undo segment 首页和测试断言。
+ * 定位 insert undo segment 首页，并用显式状态保护认领与物理终结之间的并发窗口。
  *
- * <p><b>并发边界</b>：单把 {@link ReentrantLock} 串行「扫空槽→登记 firstPageId」短临界区。锁内不做页分配、
- * 不访问 BufferPool、不等待 IO——页分配（{@code UndoLogSegmentAccess.create}）由 {@code UndoLogManager} 在锁外
- * 完成，claim 只把已分配的首页 id 登记到空闲 slot。禁止 {@code synchronized}。
+ * <p><b>并发边界</b>：单把 {@link ReentrantLock} 只保护
+ * {@code FREE -> RESERVED -> ACTIVE -> FINALIZING -> FREE} 短状态转换。锁内不做页分配、不访问 BufferPool、
+ * 不等待 IO；调用方通过 {@link ClaimLease} 与 {@link FinalizationLease} 在锁外完成 page3/FSP/MTR 协作。
+ * {@code RESERVED} 和 {@code FINALIZING} 都计为占用，避免同一 slot 在持久 owner 建立前或物理回收期间被复用。
  *
- * <p><b>本片不做</b>（→ T1.3d+）：slot 回收（commit/rollback 后释放）、持久 rseg header 页格式、恢复期 active
- * slot 扫描、多 rseg 选择策略、多 undo 表空间。slot 耗尽抛 {@link UndoSlotExhaustedException}（可恢复，非致命）。
+ * <p><b>持久协作</b>：本类只维护运行期投影；page3 的 claim/clear 由上层 undo 生命周期编排。终结路径必须先在
+ * redo-protected MTR 中完成 segment drop + page3 owner CAS clear，再以终结租约 {@link FinalizationLease#complete()}
+ * 发布内存释放。多 rseg
+ * 选择策略和多 undo 表空间仍留后续切片。slot 耗尽抛 {@link UndoSlotExhaustedException}（可恢复，非致命）。
  */
 public final class RollbackSegmentSlotManager {
 
     /** 所属 rollback segment；本片固定单一默认值，多 rseg 选择留后续片。 */
     private final RollbackSegmentId rollbackSegmentId;
-    /** slot 容量；本片为固定上限，耗尽即抛异常（无回收/扩容）。 */
+    /** slot 容量；当前为固定上限，运行期终结后可复用但不动态扩容。 */
     private final int slotCapacity;
-    /** slot array，下标 = {@link UndoSlotId#value()}；null 表空闲，非 null 表该 slot 已登记的 insert undo 首页。 */
+    /** slot owner array；只有 ACTIVE/FINALIZING 有非 null owner，RESERVED 尚未创建物理段。 */
     private final PageId[] slots;
+    /** slot 生命周期数组；与 slots 同下标并由 lock 共同保护，是运行期是否可复用的权威状态。 */
+    private final SlotLifecycleState[] states;
     /** 串行 slot 认领/查询的短锁；保护 slots 与 activeCount，不包围页分配或 IO。 */
     private final ReentrantLock lock = new ReentrantLock();
     /** 已占用 slot 计数；activeSlotCount() 直接返回，避免调用方扫全数组。 */
@@ -48,6 +53,8 @@ public final class RollbackSegmentSlotManager {
         this.rollbackSegmentId = rollbackSegmentId;
         this.slotCapacity = slotCapacity;
         this.slots = new PageId[slotCapacity];
+        this.states = new SlotLifecycleState[slotCapacity];
+        java.util.Arrays.fill(this.states, SlotLifecycleState.FREE);
     }
 
     /** 所属 rollback segment。 */
@@ -63,17 +70,32 @@ public final class RollbackSegmentSlotManager {
      * @param insertUndoFirstPageId 已由 {@code UndoLogSegmentAccess.create} 分配的 undo segment 首页。
      * @return 认领到的 slot id。
      */
-    public UndoSlotId claim(PageId insertUndoFirstPageId) {
+    UndoSlotId claim(PageId insertUndoFirstPageId) {
         if (insertUndoFirstPageId == null) {
             throw new DatabaseValidationException("insert undo first page id must not be null");
         }
+        try (ClaimLease claim = reserveClaim()) {
+            claim.bind(insertUndoFirstPageId);
+            return claim.slotId();
+        }
+    }
+
+    /**
+     * 预留最低空闲槽并返回 RAII claim lease。预留只把 FREE 改为 RESERVED，不绑定物理 owner；因此调用方可先在
+     * 锁外用 page3 S latch 验证持久槽为空，再创建 undo segment。若 lease 在 {@link ClaimLease#bind(PageId)} 前
+     * 关闭，状态自动回到 FREE；绑定成功后 close 不做补偿，避免 MTR 无 content undo 时隐藏已创建物理段。
+     *
+     * @return 已占用一个 RESERVED 槽的 claim lease。
+     * @throws UndoSlotExhaustedException 没有 FREE 槽时抛出。
+     */
+    ClaimLease reserveClaim() {
         lock.lock();
         try {
             for (int i = 0; i < slotCapacity; i++) {
-                if (slots[i] == null) {
-                    slots[i] = insertUndoFirstPageId;
+                if (states[i] == SlotLifecycleState.FREE) {
+                    states[i] = SlotLifecycleState.RESERVED;
                     activeCount++;
-                    return UndoSlotId.of(i);
+                    return new ClaimLease(this, UndoSlotId.of(i));
                 }
             }
             throw new UndoSlotExhaustedException(rollbackSegmentId);
@@ -82,29 +104,63 @@ public final class RollbackSegmentSlotManager {
         }
     }
 
-    /**
-     * 释放一个已占用 slot（T1.3d）。数据流：加锁 → 校验 slot 已占用 → 置空 + activeCount-- → 解锁。
-     * 由 commit（{@code UndoLogManager.onCommit}）或 rollback（{@code RollbackService} 走完链）调用：insert undo
-     * 提交后不再服务一致性读、回滚后已应用完，两种情况下 slot 都可被后续事务重认领（first-fit 复用最低空槽）。
-     *
-     * <p>释放未占用/越界/null slot 是调用方 slot 生命周期 bug（重复释放、错配），必须抛
-     * {@link DatabaseValidationException} 不静默——否则 activeCount 会失衡、空槽会被误判为占用。锁内只改内存数组，
-     * 不回收 undo 页/段（undo 物理回收留 purge/truncation 片）。
-     *
-     * @param slot 要释放的 slot，必须当前已占用。
-     */
-    public void release(UndoSlotId slot) {
-        if (slot == null) {
-            throw new DatabaseValidationException("slot must not be null");
+    /** 将 RESERVED 槽绑定到已创建的 undo 首页并发布为 ACTIVE。 */
+    private void bindClaim(UndoSlotId slot, PageId firstPageId) {
+        if (firstPageId == null) {
+            throw new DatabaseValidationException("claim first page id must not be null");
         }
         lock.lock();
         try {
-            int idx = slot.value();
-            if (idx < 0 || idx >= slotCapacity || slots[idx] == null) {
-                throw new DatabaseValidationException("release of unoccupied or out-of-range undo slot: " + idx);
+            int idx = requireIndex(slot, "bind claim");
+            if (states[idx] != SlotLifecycleState.RESERVED || slots[idx] != null) {
+                throw new DatabaseValidationException("bind requires RESERVED undo slot: " + idx
+                        + " state=" + states[idx]);
             }
-            slots[idx] = null;
+            slots[idx] = firstPageId;
+            states[idx] = SlotLifecycleState.ACTIVE;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** 未绑定 claim lease 的失败补偿；只允许 RESERVED 回到 FREE。 */
+    private void cancelClaim(UndoSlotId slot) {
+        lock.lock();
+        try {
+            int idx = requireIndex(slot, "cancel claim");
+            if (states[idx] != SlotLifecycleState.RESERVED || slots[idx] != null) {
+                throw new DatabaseValidationException("cancel requires unbound RESERVED undo slot: " + idx
+                        + " state=" + states[idx]);
+            }
+            states[idx] = SlotLifecycleState.FREE;
             activeCount--;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 对 ACTIVE owner 建立非阻塞终结租约。状态在短锁内改为 FINALIZING，后续重复终态命令会在触碰 page/FSP 前
+     * 失败。关闭尚未进入物理修改的 lease 会恢复 ACTIVE；物理修改开始后则 fail-stop 保持 FINALIZING。
+     *
+     * @param slot              要终结的运行期槽。
+     * @param expectedFirstPage 预期物理 owner，用于拒绝 stale terminal command。
+     * @return 独占该 slot 终结资格的 RAII lease。
+     */
+    FinalizationLease beginFinalization(UndoSlotId slot, PageId expectedFirstPage) {
+        if (expectedFirstPage == null) {
+            throw new DatabaseValidationException("finalization expected first page must not be null");
+        }
+        lock.lock();
+        try {
+            int idx = requireIndex(slot, "begin finalization");
+            if (states[idx] != SlotLifecycleState.ACTIVE || !expectedFirstPage.equals(slots[idx])) {
+                throw new DatabaseValidationException("finalization requires matching ACTIVE undo slot " + idx
+                        + ": expected=" + expectedFirstPage + ", current=" + slots[idx]
+                        + ", state=" + states[idx]);
+            }
+            states[idx] = SlotLifecycleState.FINALIZING;
+            return new FinalizationLease(this, slot, expectedFirstPage);
         } finally {
             lock.unlock();
         }
@@ -125,7 +181,9 @@ public final class RollbackSegmentSlotManager {
         lock.lock();
         try {
             int idx = slot.value();
-            if (idx < 0 || idx >= slotCapacity || slots[idx] == null) {
+            if (idx < 0 || idx >= slotCapacity || slots[idx] == null
+                    || (states[idx] != SlotLifecycleState.ACTIVE
+                    && states[idx] != SlotLifecycleState.FINALIZING)) {
                 throw new DatabaseValidationException("undo slot not occupied or out of range: " + idx);
             }
             return slots[idx];
@@ -153,10 +211,11 @@ public final class RollbackSegmentSlotManager {
             if (idx < 0 || idx >= slotCapacity) {
                 throw new DatabaseValidationException("restore of out-of-range undo slot: " + idx);
             }
-            if (slots[idx] != null) {
+            if (states[idx] != SlotLifecycleState.FREE) {
                 throw new DatabaseValidationException("restore of already-occupied undo slot: " + idx);
             }
             slots[idx] = insertUndoFirstPageId;
+            states[idx] = SlotLifecycleState.ACTIVE;
             activeCount++;
         } finally {
             lock.unlock();
@@ -174,7 +233,7 @@ public final class RollbackSegmentSlotManager {
             if (idx < 0 || idx >= slotCapacity) {
                 return false;
             }
-            return slots[idx] != null;
+            return states[idx] != SlotLifecycleState.FREE;
         } finally {
             lock.unlock();
         }
@@ -193,5 +252,196 @@ public final class RollbackSegmentSlotManager {
     /** slot 容量上限。 */
     public int slotCapacity() {
         return slotCapacity;
+    }
+
+    /** 校验 slot 非 null 且位于当前目录容量内，并返回数组下标。调用方必须已持 lock。 */
+    private int requireIndex(UndoSlotId slot, String operation) {
+        if (slot == null) {
+            throw new DatabaseValidationException(operation + " slot must not be null");
+        }
+        int idx = slot.value();
+        if (idx < 0 || idx >= slotCapacity) {
+            throw new DatabaseValidationException(operation + " of out-of-range undo slot: " + idx);
+        }
+        return idx;
+    }
+
+    /**
+     * 认领租约。对象由创建线程顺序使用；目录共享状态仍全部由外层显式锁保护。close 幂等，未 bind 才取消预留。
+     */
+    static final class ClaimLease implements AutoCloseable {
+        /** 所属 slot 目录。 */
+        private final RollbackSegmentSlotManager owner;
+        /** 已预留的稳定槽号。 */
+        private final UndoSlotId slotId;
+        /** 是否已经把物理 undo 首页绑定并发布为 ACTIVE。 */
+        private boolean bound;
+        /** 防止重复 close 或 close 后继续 bind。 */
+        private boolean closed;
+
+        private ClaimLease(RollbackSegmentSlotManager owner, UndoSlotId slotId) {
+            this.owner = owner;
+            this.slotId = slotId;
+        }
+
+        /** 返回当前租约预留的稳定槽号，供 page3 预检和持久登记使用。 */
+        UndoSlotId slotId() {
+            return slotId;
+        }
+
+        /** 段创建成功后把首页 owner 绑定到 reservation；成功后 close 不再回退状态。 */
+        void bind(PageId firstPageId) {
+            requireOpen("bind");
+            if (bound) {
+                throw new DatabaseValidationException("claim lease already bound: " + slotId.value());
+            }
+            owner.bindClaim(slotId, firstPageId);
+            bound = true;
+        }
+
+        /** 未绑定时释放 reservation；已绑定时只结束 guard 生命周期。 */
+        @Override
+        public void close() {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            if (!bound) {
+                owner.cancelClaim(slotId);
+            }
+        }
+
+        private void requireOpen(String operation) {
+            if (closed) {
+                throw new DatabaseValidationException(operation + " on closed claim lease: " + slotId.value());
+            }
+        }
+    }
+
+    /**
+     * 终结租约。调用方必须先完成全部只读预检，再调用 {@link #physicalMutationStarted()}，成功提交 drop+clear MTR 后
+     * 调用 {@link #complete()}。一旦声明物理修改开始，异常退出会把槽保留为 FINALIZING，防止同进程误复用。
+     */
+    static final class FinalizationLease implements AutoCloseable {
+        /** 所属 slot 目录。 */
+        private final RollbackSegmentSlotManager owner;
+        /** 被终结的稳定槽号。 */
+        private final UndoSlotId slotId;
+        /** 获取 lease 时匹配的 undo segment 首页。 */
+        private final PageId expectedFirstPage;
+        /** 是否已经越过 MTR 无 content undo 的物理修改边界。 */
+        private boolean physicalMutationStarted;
+        /** 是否已经在持久 commit 后发布 FREE。 */
+        private boolean completed;
+        /** guard 是否已经关闭。 */
+        private boolean closed;
+
+        private FinalizationLease(RollbackSegmentSlotManager owner, UndoSlotId slotId,
+                                  PageId expectedFirstPage) {
+            this.owner = owner;
+            this.slotId = slotId;
+            this.expectedFirstPage = expectedFirstPage;
+        }
+
+        /** 在首个 FSP/undo/page3 写之前标记 fail-stop 边界。 */
+        void physicalMutationStarted() {
+            requireOpen("mark physical mutation");
+            if (physicalMutationStarted) {
+                throw new DatabaseValidationException("physical mutation already marked for undo slot: "
+                        + slotId.value());
+            }
+            owner.validateFinalizingOwner(slotId, expectedFirstPage);
+            physicalMutationStarted = true;
+        }
+
+        /** 持久 MTR 已成功提交后发布内存 FREE；未越过物理边界不得伪造完成。 */
+        void complete() {
+            requireOpen("complete finalization");
+            if (!physicalMutationStarted) {
+                throw new DatabaseValidationException("cannot complete undo finalization before physical mutation: "
+                        + slotId.value());
+            }
+            owner.completeFinalization(slotId, expectedFirstPage);
+            completed = true;
+        }
+
+        /** 物理修改前退出恢复 ACTIVE；物理修改后退出保留 FINALIZING；成功 complete 后无额外动作。 */
+        @Override
+        public void close() {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            if (!completed) {
+                owner.closeFinalization(slotId, expectedFirstPage, physicalMutationStarted);
+            }
+        }
+
+        private void requireOpen(String operation) {
+            if (closed) {
+                throw new DatabaseValidationException(operation + " on closed finalization lease: "
+                        + slotId.value());
+            }
+        }
+    }
+
+    /** 验证 lease 仍独占匹配的 FINALIZING owner。 */
+    private void validateFinalizingOwner(UndoSlotId slot, PageId expectedFirstPage) {
+        lock.lock();
+        try {
+            int idx = requireIndex(slot, "validate finalization");
+            requireFinalizingOwner(idx, expectedFirstPage);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** 成功持久提交后的唯一 FINALIZING -> FREE 转换。 */
+    private void completeFinalization(UndoSlotId slot, PageId expectedFirstPage) {
+        lock.lock();
+        try {
+            int idx = requireIndex(slot, "complete finalization");
+            requireFinalizingOwner(idx, expectedFirstPage);
+            slots[idx] = null;
+            states[idx] = SlotLifecycleState.FREE;
+            activeCount--;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** 异常关闭终结租约：物理边界前恢复 ACTIVE，之后只校验并保留 fail-stop 状态。 */
+    private void closeFinalization(UndoSlotId slot, PageId expectedFirstPage, boolean physicalMutationStarted) {
+        lock.lock();
+        try {
+            int idx = requireIndex(slot, "close finalization");
+            requireFinalizingOwner(idx, expectedFirstPage);
+            if (!physicalMutationStarted) {
+                states[idx] = SlotLifecycleState.ACTIVE;
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** 调用方持 lock 时校验 FINALIZING 状态与 owner 精确匹配。 */
+    private void requireFinalizingOwner(int idx, PageId expectedFirstPage) {
+        if (states[idx] != SlotLifecycleState.FINALIZING || !expectedFirstPage.equals(slots[idx])) {
+            throw new DatabaseValidationException("undo slot is not owned by the finalization lease: " + idx
+                    + " expected=" + expectedFirstPage + ", current=" + slots[idx]
+                    + ", state=" + states[idx]);
+        }
+    }
+
+    /** 内存槽运行期状态；RESERVED/FINALIZING 不落盘，恢复扫描只重建 ACTIVE。 */
+    private enum SlotLifecycleState {
+        /** 可被下一次 first-fit 认领。 */
+        FREE,
+        /** 已预留槽号但尚未创建/绑定 undo segment。 */
+        RESERVED,
+        /** 已绑定运行期与 page3 owner，可正常 append/rollback/purge。 */
+        ACTIVE,
+        /** 某个终态命令已独占，是否可回退由 finalization lease 的物理边界决定。 */
+        FINALIZING
     }
 }

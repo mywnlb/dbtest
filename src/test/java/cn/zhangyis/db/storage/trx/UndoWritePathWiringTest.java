@@ -178,6 +178,7 @@ class UndoWritePathWiringTest {
         final DiskSpaceUndoAllocator undoAllocator;
         final UndoLogSegmentAccess undoAccess;
         final RollbackSegmentSlotManager slots;
+        final UndoFinalizationTestSupport.Components finalization;
         final UndoLogManager undoMgr;
         final TransactionManager txnMgr = new TransactionManager(new TransactionSystem());
         private SegmentRef leafSegment;
@@ -190,7 +191,9 @@ class UndoWritePathWiringTest {
             this.undoAllocator = new DiskSpaceUndoAllocator(disk);
             this.undoAccess = new UndoLogSegmentAccess(pool, PS, undoAllocator, registry);
             this.slots = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 64);
-            this.undoMgr = new UndoLogManager(undoAccess, slots, UNDO_SPACE, new HistoryList());
+            this.finalization = UndoFinalizationTestSupport.create(
+                    mgr, pool, PS, undoAccess, undoAllocator, slots);
+            this.undoMgr = finalization.manager(undoAccess, UNDO_SPACE, new HistoryList(), mgr);
         }
 
         private SplitCapableBTreeIndexService service() {
@@ -206,6 +209,7 @@ class UndoWritePathWiringTest {
             rootPageId = disk.allocatePage(b, leafSegment);
             access.createIndexPage(b, rootPageId, INDEX_ID, 0);
             disk.createTablespace(b, UNDO_SPACE, dir.resolve("undo.ibu"), PageNo.of(64));
+            finalization.format(b, UNDO_SPACE);
             mgr.commit(b);
         }
 

@@ -664,8 +664,9 @@ class StorageEngineTest {
         e1.undoLogManager().beforeInsert(txn, m, TABLE_ID, INDEX_ID,
                 List.of(new ColumnValue.IntValue(1)), idKey(), clusteredSchema());
         e1.miniTransactionManager().commit(m);
-        e1.transactionManager().commit(txn);
+        e1.transactionManager().prepareCommit(txn);
         e1.undoLogManager().onCommit(txn); // 纯 insert → 释放并清空 page3 该 slot
+        e1.transactionManager().commit(txn);
         assertEquals(0, e1.rollbackSegmentSlotManager().activeSlotCount());
         e1.checkpoint();
         e1.close();
@@ -680,8 +681,9 @@ class StorageEngineTest {
     // ---- R 1.2：恢复期回滚未提交事务 ----
 
     /**
-     * money test：active 事务插一行（写 undo + insertClustered）→ 不 commit → checkpoint → close → 重开（注入
-     * recoveryRollbackIndex）→ 恢复回滚删除该行。
+     * money test：同一 active 事务插三行（写 undo + insertClustered）→ 不 commit → checkpoint → close → 重开（注入
+     * recoveryRollbackIndex）→ 恢复逐条回滚到 EMPTY 并原子 drop+清 page3；再次重启不得再发现 slot、重复 inverse
+     * 或复活数据。
      */
     @Test
     void recoveryRollsBackActiveInsertOnRestart() {
@@ -691,9 +693,12 @@ class StorageEngineTest {
         StorageEngine e1 = new StorageEngine(cfg);
         e1.open();
         BTreeIndex index = createClusteredIndex(e1, dataPath);
-        insertRowActive(e1, index, 1, "v1"); // active：写 undo + 插行，不 commit/onCommit
+        insertRowsActive(e1, index, 3); // active：同一事务写三条 undo + 插行，不 commit/onCommit
         MiniTransaction r1 = e1.miniTransactionManager().begin();
-        assertTrue(e1.btreeService().lookup(r1, index, search(1)).isPresent(), "row present before crash");
+        for (int id = 1; id <= 3; id++) {
+            assertTrue(e1.btreeService().lookup(r1, index, search(id)).isPresent(),
+                    "row " + id + " present before crash");
+        }
         e1.miniTransactionManager().commit(r1);
         e1.checkpoint();
         e1.close();
@@ -702,14 +707,31 @@ class StorageEngineTest {
         e2.configureClusteredIndex(index); // open 前注入恢复回滚索引（无 DD）
         e2.open();
         assertStageBeforeOpen(e2, RecoveryStageName.UNDO_ROLLBACK);
+        assertEquals(0, e2.rollbackSegmentSlotManager().activeSlotCount(),
+                "recovery finalization removes the ACTIVE page3 owner");
         MiniTransaction r2 = e2.miniTransactionManager().begin();
-        assertTrue(e2.btreeService().lookup(r2, index, search(1)).isEmpty(),
-                "active insert rolled back at recovery (row deleted)");
+        for (int id = 1; id <= 3; id++) {
+            assertTrue(e2.btreeService().lookup(r2, index, search(id)).isEmpty(),
+                    "active row " + id + " rolled back at recovery");
+        }
         e2.miniTransactionManager().commit(r2);
         e2.close();
+
+        StorageEngine e3 = new StorageEngine(cfg);
+        e3.configureClusteredIndex(index);
+        e3.open();
+        assertEquals(0, e3.rollbackSegmentSlotManager().activeSlotCount(),
+                "second startup must not rediscover a finalized rollback segment");
+        MiniTransaction r3 = e3.miniTransactionManager().begin();
+        for (int id = 1; id <= 3; id++) {
+            assertTrue(e3.btreeService().lookup(r3, index, search(id)).isEmpty(),
+                    "atomic rollback finalization keeps row " + id + " absent on the second restart");
+        }
+        e3.miniTransactionManager().commit(r3);
+        e3.close();
     }
 
-    /** 对照：committed insert（onCommit 标 COMMITTED + 清 page3 slot）重启后保留，不被恢复误删。 */
+    /** 对照：committed insert 的 onCommit 原子 drop undo + 清 page3，重启后数据保留且不会被恢复误删。 */
     @Test
     void recoveryPreservesCommittedInsertOnRestart() {
         Path dataPath = dir.resolve("data-keep.ibd");
@@ -732,19 +754,21 @@ class StorageEngineTest {
         e2.close();
     }
 
-    /** 像 {@link #insertRow} 但**不** commit/onCommit：事务停在 ACTIVE，undo 段 state 保持 ACTIVE。 */
-    private void insertRowActive(StorageEngine engine, BTreeIndex index, long id, String payload) {
+    /** 在同一事务中插入 count 行但不 commit/onCommit，使 undo 段保持 ACTIVE 供恢复逐条回滚。 */
+    private void insertRowsActive(StorageEngine engine, BTreeIndex index, int count) {
         TransactionManager txnMgr = engine.transactionManager();
         MiniTransactionManager mtrMgr = engine.miniTransactionManager();
         UndoLogManager undoMgr = engine.undoLogManager();
         SplitCapableBTreeIndexService svc = engine.btreeService();
         Transaction txn = txnMgr.begin(TransactionOptions.defaults());
         txnMgr.assignWriteId(txn);
-        MiniTransaction m = mtrMgr.begin();
-        RollPointer rp = undoMgr.beforeInsert(txn, m, TABLE_ID, INDEX_ID,
-                List.of(new ColumnValue.IntValue(id)), index.keyDef(), index.schema());
-        svc.insertClustered(m, index, row(id, payload), txn.transactionId(), rp);
-        mtrMgr.commit(m);
+        for (int id = 1; id <= count; id++) {
+            MiniTransaction m = mtrMgr.begin();
+            RollPointer rp = undoMgr.beforeInsert(txn, m, TABLE_ID, INDEX_ID,
+                    List.of(new ColumnValue.IntValue(id)), index.keyDef(), index.schema());
+            svc.insertClustered(m, index, row(id, "v" + id), txn.transactionId(), rp);
+            mtrMgr.commit(m);
+        }
         // 不 commit txn / onCommit：保持 ACTIVE
     }
 
@@ -849,8 +873,9 @@ class StorageEngineTest {
         svc.setClusteredDeleteMark(m, index, search(id), true,
                 new HiddenColumns(txn.transactionId(), delRp), oldHidden.dbTrxId(), oldHidden.dbRollPtr());
         mtrMgr.commit(m);
-        txnMgr.commit(txn);
+        txnMgr.prepareCommit(txn);
         undoMgr.onCommit(txn);
+        txnMgr.commit(txn);
     }
 
     // ---- helpers ----
@@ -904,8 +929,9 @@ class StorageEngineTest {
                 List.of(new ColumnValue.IntValue(id)), index.keyDef(), index.schema());
         svc.insertClustered(m, index, row(id, payload), txn.transactionId(), rp);
         mtrMgr.commit(m);
-        txnMgr.commit(txn);
+        txnMgr.prepareCommit(txn);
         undoMgr.onCommit(txn);
+        txnMgr.commit(txn);
     }
 
     private static String payloadOf(BTreeLookupResult r) {

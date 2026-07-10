@@ -129,6 +129,104 @@ class RollbackSegmentSlotManagerTest {
         assertThrows(DatabaseRuntimeException.class, () -> mgr.claim(null));
     }
 
+    /**
+     * 槽位预留必须立即阻止并发认领；若 page3 预检或段创建尚未发生就退出，RAII close 应恢复 FREE。
+     */
+    @Test
+    void unboundClaimLeaseReservesThenCancelsSlot() {
+        RollbackSegmentSlotManager mgr = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 1);
+
+        try (RollbackSegmentSlotManager.ClaimLease claim = mgr.reserveClaim()) {
+            assertTrue(mgr.isOccupied(claim.slotId()), "RESERVED slot participates in occupancy");
+            assertEquals(1, mgr.activeSlotCount(), "RESERVED slot prevents false empty diagnostics");
+            assertThrows(UndoSlotExhaustedException.class, mgr::reserveClaim,
+                    "a concurrent claim cannot reuse a RESERVED slot");
+            assertThrows(DatabaseRuntimeException.class, () -> mgr.insertUndoFirstPageId(claim.slotId()),
+                    "RESERVED has no segment owner before bind");
+        }
+
+        assertEquals(0, mgr.activeSlotCount(), "closing an unbound claim cancels the reservation");
+        assertFalse(mgr.isOccupied(UndoSlotId.of(0)));
+    }
+
+    /** 段创建完成后绑定 reservation，close 不得补偿释放已经进入 ACTIVE 的槽位。 */
+    @Test
+    void boundClaimLeasePublishesActiveOwner() {
+        RollbackSegmentSlotManager mgr = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 1);
+        UndoSlotId slot;
+
+        try (RollbackSegmentSlotManager.ClaimLease claim = mgr.reserveClaim()) {
+            slot = claim.slotId();
+            claim.bind(page(65));
+        }
+
+        assertTrue(mgr.isOccupied(slot));
+        assertEquals(page(65), mgr.insertUndoFirstPageId(slot));
+        assertEquals(1, mgr.activeSlotCount());
+    }
+
+    /** 预检失败发生在物理修改前时，终结租约 close 必须把 FINALIZING 恢复为 ACTIVE。 */
+    @Test
+    void finalizationLeaseRevertsToActiveBeforePhysicalMutation() {
+        RollbackSegmentSlotManager mgr = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 1);
+        UndoSlotId slot = mgr.claim(page(65));
+
+        try (RollbackSegmentSlotManager.FinalizationLease ignored =
+                     mgr.beginFinalization(slot, page(65))) {
+            assertThrows(DatabaseRuntimeException.class, () -> mgr.beginFinalization(slot, page(65)),
+                    "duplicate terminal command must fail before touching physical pages");
+        }
+
+        assertEquals(page(65), mgr.insertUndoFirstPageId(slot),
+                "pre-physical failure keeps the original ACTIVE owner retryable");
+    }
+
+    /** MTR 已开始物理修改后即使退出，槽位也必须 fail-stop 保持占用，不能被新事务复用。 */
+    @Test
+    void finalizationLeaseRetainsSlotAfterPhysicalMutationBegins() {
+        RollbackSegmentSlotManager mgr = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 1);
+        UndoSlotId slot = mgr.claim(page(65));
+
+        RollbackSegmentSlotManager.FinalizationLease lease = mgr.beginFinalization(slot, page(65));
+        lease.physicalMutationStarted();
+        lease.close();
+
+        assertTrue(mgr.isOccupied(slot));
+        assertEquals(1, mgr.activeSlotCount());
+        assertThrows(DatabaseRuntimeException.class, () -> mgr.beginFinalization(slot, page(65)));
+        assertThrows(UndoSlotExhaustedException.class, mgr::reserveClaim,
+                "a fail-stop FINALIZING slot cannot be reclaimed in the same process");
+    }
+
+    /** 只有持久 MTR 成功后显式 complete，终结租约才发布 FREE。 */
+    @Test
+    void completedFinalizationLeaseReleasesSlot() {
+        RollbackSegmentSlotManager mgr = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 1);
+        UndoSlotId slot = mgr.claim(page(65));
+
+        try (RollbackSegmentSlotManager.FinalizationLease lease =
+                     mgr.beginFinalization(slot, page(65))) {
+            lease.physicalMutationStarted();
+            lease.complete();
+        }
+
+        assertFalse(mgr.isOccupied(slot));
+        assertEquals(0, mgr.activeSlotCount());
+    }
+
+    /** 已完成终结的槽被新 owner 复用后，旧命令必须因 expected owner 不符而在物理访问前失败。 */
+    @Test
+    void staleFinalizationCannotTouchReusedSlotOwner() {
+        RollbackSegmentSlotManager mgr = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 1);
+        UndoSlotId oldSlot = mgr.claim(page(65));
+        completeFinalization(mgr, oldSlot, page(65));
+        UndoSlotId reused = mgr.claim(page(66));
+
+        assertEquals(oldSlot, reused, "first-fit reuses the completed slot");
+        assertThrows(DatabaseRuntimeException.class, () -> mgr.beginFinalization(oldSlot, page(65)));
+        assertEquals(page(66), mgr.insertUndoFirstPageId(reused), "stale command leaves the new owner untouched");
+    }
+
     @Test
     void insertUndoFirstPageIdRejectsUnoccupiedOrOutOfRange() {
         RollbackSegmentSlotManager mgr = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 4);
@@ -141,12 +239,12 @@ class RollbackSegmentSlotManagerTest {
     // ---- T1.3d：slot 回收（commit/rollback 后释放，供后续事务重认领） ----
 
     @Test
-    void releaseFreesSlotForReclaim() {
+    void completedFinalizationFreesSlotForReclaim() {
         RollbackSegmentSlotManager mgr = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 2);
         UndoSlotId s0 = mgr.claim(page(65));
         mgr.claim(page(66)); // 容量 2 占满
 
-        mgr.release(s0);
+        completeFinalization(mgr, s0, page(65));
 
         // 释放后该 slot 空闲、可被新事务重认领（first-fit 复用最低空槽 = s0）
         assertFalse(mgr.isOccupied(s0), "released slot must be free");
@@ -156,30 +254,33 @@ class RollbackSegmentSlotManagerTest {
     }
 
     @Test
-    void releaseDropsActiveCount() {
+    void completedFinalizationDropsActiveCount() {
         RollbackSegmentSlotManager mgr = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 8);
         UndoSlotId s0 = mgr.claim(page(65));
         UndoSlotId s1 = mgr.claim(page(66));
         assertEquals(2, mgr.activeSlotCount());
 
-        mgr.release(s0);
+        completeFinalization(mgr, s0, page(65));
         assertEquals(1, mgr.activeSlotCount(), "release decrements active count");
-        mgr.release(s1);
+        completeFinalization(mgr, s1, page(66));
         assertEquals(0, mgr.activeSlotCount(), "all released → empty");
     }
 
     @Test
-    void releaseOfUnoccupiedOrNullThrows() {
+    void finalizationOfUnoccupiedStaleOrNullOwnerThrows() {
         RollbackSegmentSlotManager mgr = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 4);
-        // 释放未占用 slot 是调用方 bug（slot 生命周期不一致），必须抛领域异常不静默
-        assertThrows(DatabaseRuntimeException.class, () -> mgr.release(UndoSlotId.of(0)));
+        // 终结未占用 slot 是调用方 bug（slot 生命周期不一致），必须抛领域异常不静默
+        assertThrows(DatabaseRuntimeException.class, () -> mgr.beginFinalization(UndoSlotId.of(0), page(65)));
         // 越界与 null 同样拒绝
-        assertThrows(DatabaseRuntimeException.class, () -> mgr.release(UndoSlotId.of(99)));
-        assertThrows(DatabaseRuntimeException.class, () -> mgr.release(null));
-        // 重复释放：claim 后 release 两次，第二次抛
+        assertThrows(DatabaseRuntimeException.class, () -> mgr.beginFinalization(UndoSlotId.of(99), page(65)));
+        assertThrows(DatabaseRuntimeException.class, () -> mgr.beginFinalization(null, page(65)));
+        assertThrows(DatabaseRuntimeException.class, () -> mgr.beginFinalization(UndoSlotId.of(0), null));
+        // stale owner 与重复终结都拒绝
         UndoSlotId s = mgr.claim(page(65));
-        mgr.release(s);
-        assertThrows(DatabaseRuntimeException.class, () -> mgr.release(s));
+        assertThrows(DatabaseRuntimeException.class, () -> mgr.beginFinalization(s, page(66)),
+                "finalization must compare the expected first-page owner");
+        completeFinalization(mgr, s, page(65));
+        assertThrows(DatabaseRuntimeException.class, () -> mgr.beginFinalization(s, page(65)));
     }
 
     // ---- 0.3：恢复期 restore（扫 page3 rseg header 后按下标精确重建内存目录） ----
@@ -204,5 +305,13 @@ class RollbackSegmentSlotManagerTest {
         assertThrows(DatabaseRuntimeException.class, () -> mgr.restore(UndoSlotId.of(1), page(71)));
         assertThrows(DatabaseRuntimeException.class, () -> mgr.restore(UndoSlotId.of(99), page(72)));
         assertThrows(DatabaseRuntimeException.class, () -> mgr.restore(UndoSlotId.of(2), null));
+    }
+
+    /** 测试侧按真实状态机发布一次已成功持久化的终结。 */
+    private static void completeFinalization(RollbackSegmentSlotManager mgr, UndoSlotId slot, PageId owner) {
+        try (RollbackSegmentSlotManager.FinalizationLease lease = mgr.beginFinalization(slot, owner)) {
+            lease.physicalMutationStarted();
+            lease.complete();
+        }
     }
 }

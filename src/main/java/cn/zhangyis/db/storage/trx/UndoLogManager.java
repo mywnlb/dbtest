@@ -54,43 +54,35 @@ public final class UndoLogManager {
     private final RollbackSegmentSlotManager slotManager;
     /** undo 表空间；{@code ensureUndoContext} 首写建段时传给 {@link UndoLogSegmentAccess#create}。 */
     private final SpaceId undoSpace;
-    /** 已提交 undo log 的 history list；{@code onCommit} 据事务类型挂入 committed / insert-reclaim 队列供 purge 回收。 */
+    /** 已提交 update/delete undo 的 history list；纯 insert undo 在 commit finalization 中直接物理回收。 */
     private final HistoryList history;
     /**
-     * 持久 rseg header 仓储（0.3，可选）。非 null 时把 slot claim/release 持久化到 undo 表空间 page3（redo 保护），
-     * 使崩溃后恢复扫描可重建内存 slot 目录。为 null 时纯内存（既有 test-only 行为，无持久/恢复）。
+     * 持久 rseg header 仓储。首写 claim 与 undo segment 创建同一 MTR；终态 clear 统一交给 finalizer。
      */
     private final RollbackSegmentHeaderRepository headerRepo;
-    /** 短 MTR 来源（0.3，可选）；onCommit 释放 slot 时持久化 page3 用，与 {@link #headerRepo} 同时提供才生效。 */
+    /** 短 MTR 来源；update/delete commit 写 COMMITTED header 与 transaction-state redo 使用。 */
     private final MiniTransactionManager mtrManager;
+    /** 四条 undo 终态共享的 atomic drop+page3-clear 协作者。 */
+    private final UndoSegmentFinalizer finalizer;
 
     /**
-     * 构造纯内存 undo 门面（既有 test-only：不持久 rseg header、不可恢复 slot 目录）。
-     */
-    public UndoLogManager(UndoLogSegmentAccess access, RollbackSegmentSlotManager slotManager, SpaceId undoSpace,
-                          HistoryList history) {
-        this(access, slotManager, undoSpace, history, null, null);
-    }
-
-    /**
-     * 构造可持久 rseg header 的 undo 门面（0.3）。{@code headerRepo != null} 时 slot claim 在调用方 MTR 内持久到
-     * page3、纯 insert 事务 {@code onCommit} 释放在短 MTR 内清空 page3 槽；崩溃后由启动恢复扫描 page3 重建。
+     * 构造生产 undo 门面。slot claim 必须持久到 page3；纯 insert commit 必须经 finalizer 在同一 redo batch
+     * drop segment + clear slot，故不再提供绕过持久生命周期的构造方式。
      *
      * @param access      undo 物理设施入口，不能为 null。
      * @param slotManager 内存 rseg slot 目录，不能为 null。
      * @param undoSpace   undo 表空间，不能为 null。
      * @param history     已提交 undo log 的 history list，不能为 null。
-     * @param headerRepo  持久 rseg header 仓储；为 null 则纯内存。
-     * @param mtrManager  短 MTR 来源；持久 release 用，{@code headerRepo} 非 null 时必须一并提供。
+     * @param headerRepo  持久 rseg header 仓储。
+     * @param mtrManager  短 MTR 来源。
+     * @param finalizer   atomic undo segment 终态协作者。
      */
     public UndoLogManager(UndoLogSegmentAccess access, RollbackSegmentSlotManager slotManager, SpaceId undoSpace,
-                          HistoryList history, RollbackSegmentHeaderRepository headerRepo,
-                          MiniTransactionManager mtrManager) {
-        if (access == null || slotManager == null || undoSpace == null || history == null) {
+                           HistoryList history, RollbackSegmentHeaderRepository headerRepo,
+                           MiniTransactionManager mtrManager, UndoSegmentFinalizer finalizer) {
+        if (access == null || slotManager == null || undoSpace == null || history == null
+                || headerRepo == null || mtrManager == null || finalizer == null) {
             throw new DatabaseValidationException("undo log manager args must not be null");
-        }
-        if (headerRepo != null && mtrManager == null) {
-            throw new DatabaseValidationException("persistent rseg header requires a mini transaction manager");
         }
         this.access = access;
         this.slotManager = slotManager;
@@ -98,6 +90,7 @@ public final class UndoLogManager {
         this.history = history;
         this.headerRepo = headerRepo;
         this.mtrManager = mtrManager;
+        this.finalizer = finalizer;
     }
 
     /**
@@ -247,19 +240,19 @@ public final class UndoLogManager {
     }
 
     /**
-     * 提交回收 undo slot（T1.3d，对齐 InnoDB {@code trx_undo_insert_cleanup}）。数据流：
+     * 提交 undo 生命周期（对齐 InnoDB {@code trx_undo_insert_cleanup} / history 挂接思想）。数据流：
      * <ul>
      *   <li>未写事务（{@code undoContext()==null}）：no-op。</li>
-     *   <li>纯 insert 事务（{@code !hasUpdateUndo()}）：insert undo 提交后不再服务一致性读，立即
-     *       {@link RollbackSegmentSlotManager#release} 释放 slot 供后续事务重认领。</li>
+     *   <li>纯 insert 事务（{@code !hasUpdateUndo()}）：insert undo 提交后不再服务一致性读，经
+     *       {@link UndoSegmentFinalizer} 同批 drop 段、CAS 清 page3、写 commit diagnostic，提交后释放内存 slot。</li>
      *   <li>含 update undo 事务（{@code hasUpdateUndo()}，T1.3e）：**保留** slot/段——committed update undo 仍可能被
-     *       T1.4 MVCC 旧版本读 / purge 需要，不能在 commit 即回收。其回收留 purge/undo truncation 片（已知缺口）。</li>
+     *       T1.4 MVCC 旧版本读 / purge 需要，不能在 commit 即回收；后续由 purge 走同一 finalizer 回收。</li>
      * </ul>
      *
      * <p><b>commit 编排</b>：{@code TransactionManager.commit()} 保持纯内存状态、**不**自动调用本方法；2.1 起
      * {@code ClusteredDmlService.commit} 先通过 {@code TransactionManager.prepareCommit(txn)} 预留提交号，
-     * 再调用本方法持久化 undo commit marker，最后才 {@code commit(txn)} 移出 active table。本方法只处理
-     * slot/history 状态，undo record/page/segment 的物理回收留 purge/truncation 片。
+     * 再调用本方法持久化 undo 终态，最后才 {@code commit(txn)} 移出 active table。纯 insert 在此物理回收；
+     * update/delete 只标 COMMITTED 并挂内存 history，保留给 MVCC/purge。
      *
      * @param txn 提交中的事务，不能为 null。
      */
@@ -271,48 +264,41 @@ public final class UndoLogManager {
         if (ctx == null) {
             return; // 未写事务：无 undo 段
         }
-        // R 1.2 + 0.3：短 MTR 内标 undo 段首页 STATE=COMMITTED（恢复期据此跳过已提交事务回滚）；纯 insert 同 MTR 持久
-        // 清 page3 槽（0.3 release）。mtrManager 为 null（纯内存 fixture）时不持久——既有 test-only 行为不变。
-        if (mtrManager != null) {
+        TransactionNo no = txn.transactionNo();
+        if (no.isNone()) {
+            throw new TransactionStateException(
+                    "onCommit requires an assigned TransactionNo; call TransactionManager.prepareCommit first");
+        }
+        if (ctx.hasUpdateUndo()) {
+            // update/delete undo 仍服务 MVCC：以 COMMITTED+COMMIT_NO 留在 page3，恢复可据此重建 history。
             MiniTransaction commitMtr = mtrManager.begin();
             try {
-                // R 1.3：标 COMMITTED 同时写提交序号（txn.transactionNo()，commit 前已预留），供恢复重建 committed history。
+                // R 1.3：STATE 与提交序号同 MTR，供恢复重建 committed history。
                 access.open(commitMtr, ctx.undoFirstPageId(), PageLatchMode.EXCLUSIVE)
-                        .markCommitted(txn.transactionNo());
-                if (!ctx.hasUpdateUndo() && headerRepo != null) {
-                    writeRsegSlotAfterUndoPage(commitMtr, ctx.slotId(), null);
-                }
+                        .markCommitted(no);
                 TransactionStateRedoDeltas.appendCommit(commitMtr, txn);
                 mtrManager.commit(commitMtr);
             } catch (RuntimeException e) {
-                rollbackCommitMtr(commitMtr, e);
+                rollbackActiveMtr(commitMtr, e);
                 throw e;
             }
-        }
-        if (ctx.hasUpdateUndo()) {
-            // 含 update/delete undo：挂入 history list 供 purge 按 TransactionNo boundary 回收（slot/段由 purge 释放，
-            // 不在此 release）。要求 commit 已分配 TransactionNo——编排序必须先 commit 再 onCommit（评审 #3）。
-            TransactionNo no = txn.transactionNo();
-            if (no.isNone()) {
-                throw new TransactionStateException(
-                        "onCommit requires an assigned TransactionNo for an update-undo transaction; "
-                                + "call TransactionManager.prepareCommit before onCommit");
-            }
+            // history 是内存投影；若 submit 前 crash，page3 COMMITTED header 会在恢复期重建。
             history.submitCommitted(new HistoryEntry(no, txn.transactionId(), undoSpace,
                     ctx.undoFirstPageId(), ctx.slotId()));
         } else {
-            // 纯 insert undo：提交即不再服务一致性读（§7.2）。持久清 page3 已在上面同 MTR 完成，提交成功后才释放内存 slot。
-            slotManager.release(ctx.slotId());
-            history.submitInsertReclaim(new InsertReclaimEntry(undoSpace, ctx.undoFirstPageId()));
+            // INSERT roll pointer 的 insert bit 足以让旧 ReadView 判“不存在”；无需保留 undo record。finalizer 同一 MTR
+            // drop segment + clear page3 + append commit diagnostic，commit 后才释放内存 slot。
+            finalizer.finalizeInsertCommit(txn, ctx);
         }
     }
 
-    private void rollbackCommitMtr(MiniTransaction commitMtr, RuntimeException original) {
-        if (commitMtr.state() != MiniTransactionState.ACTIVE) {
+    /** MTR 仍 ACTIVE 时释放 memo；提交阶段已开始则保留原始结果不确定状态。 */
+    private void rollbackActiveMtr(MiniTransaction mtr, RuntimeException original) {
+        if (mtr.state() != MiniTransactionState.ACTIVE) {
             return;
         }
         try {
-            mtrManager.rollbackUncommitted(commitMtr);
+            mtrManager.rollbackUncommitted(mtr);
         } catch (RuntimeException rollbackError) {
             original.addSuppressed(rollbackError);
         }
@@ -321,13 +307,14 @@ public final class UndoLogManager {
     /**
      * 惰性确保事务有 {@link UndoContext} 与可写 insert undo segment。数据流：
      * <ul>
-     *   <li>事务首写（{@code txn.undoContext() == null}）：{@link UndoLogSegmentAccess#create} 建 insert undo
-     *       segment（含首页格式化，X 持）→ {@link RollbackSegmentSlotManager#claim} 占内存 slot 登记首页 →
-     *       构造 {@link UndoContext}（rseg=slotManager 默认 rseg，slot，首页，NONE/NULL 初值）→
-     *       {@link Transaction#setUndoContext} 绑定。</li>
+     *   <li>事务首写（{@code txn.undoContext() == null}）：内存 slot 先进入 RESERVED → 当前业务 MTR 以 page3 S latch
+     *       预检持久槽为空并立即释放 → {@link UndoLogSegmentAccess#create} 建 insert undo segment（含首页格式化，X 持）→
+     *       reservation 绑定首页成为 ACTIVE → page3 X-latch CAS 持久登记 → 构造 {@link UndoContext}
+     *       （rseg=slotManager 默认 rseg，slot，首页，NONE/NULL 初值）→ {@link Transaction#setUndoContext} 绑定。</li>
      *   <li>后续写：{@link UndoLogSegmentAccess#open} 按 {@code ctx.undoFirstPageId} 重开 EXCLUSIVE 续 append。</li>
      * </ul>
-     * <p>slot 认领在页分配之后、锁内只登记 firstPageId，不分配页、不访问 BufferPool（§9.3 锁序）。
+     * <p>所有 slot 状态转换都在内存短锁内，page3/FSP/undo IO 均在锁外。page3 预检 S latch 在 FSP page0/page2
+     * 分配前释放，避免逆序持锁；创建后持久 claim 仍做 CAS，发现异常漂移时保留 ACTIVE owner 而不做不安全补偿。
      *
      * @return 当前 MTR 内可写（EXCLUSIVE）的 undo segment 句柄。
      */
@@ -336,18 +323,35 @@ public final class UndoLogManager {
         if (existing != null) {
             return access.open(mtr, existing.undoFirstPageId(), PageLatchMode.EXCLUSIVE);
         }
-        // 首写：建 insert undo segment（页分配在 slot 锁外完成）
-        UndoLogSegment seg = access.create(mtr, undoSpace, txnId);
-        PageId firstPageId = seg.firstPageId();
-        UndoSlotId slot = slotManager.claim(firstPageId);
-        // 0.3：在**同一 MTR** 内把 slot 登记持久化到 page3 rseg header——与 undo segment 创建同批 redo，crash-safe；
-        // 任一失败由 MTR rollback 一并不发布（避免 page3 引用不存在的段，或段不被任何 slot 引用）。
-        if (headerRepo != null) {
-            writeRsegSlotAfterUndoPage(mtr, slot, firstPageId);
+        try (RollbackSegmentSlotManager.ClaimLease claim = slotManager.reserveClaim()) {
+            // page3 冲突必须发生在段分配前；lease 尚未 bind，异常 close 会安全取消 RESERVED。
+            requirePersistentSlotFree(mtr, claim.slotId());
+
+            UndoLogSegment seg = access.create(mtr, undoSpace, txnId);
+            PageId firstPageId = seg.firstPageId();
+            claim.bind(firstPageId);
+
+            try {
+                // 与 undo segment 创建同批 redo；预检与 claim 间若发生异常 owner 漂移，ACTIVE 保持占用以 fail-closed。
+                claimRsegSlotAfterUndoPage(mtr, claim.slotId(), firstPageId);
+                UndoContext ctx = new UndoContext(slotManager.rollbackSegmentId(), claim.slotId(), firstPageId);
+                txn.setUndoContext(ctx);
+                return seg;
+            } catch (RuntimeException error) {
+                // bind 后 MTR 无 content undo，既不能释放 ACTIVE 槽，也不能允许同进程把该事务当成可重试错误继续。
+                throw new UndoClaimPublicationException(
+                        "undo segment was bound but owner publication failed: slot=" + claim.slotId().value()
+                                + ", firstPage=" + firstPageId + ", transactionId=" + txnId.value(), error);
+            }
         }
-        UndoContext ctx = new UndoContext(slotManager.rollbackSegmentId(), slot, firstPageId);
-        txn.setUndoContext(ctx);
-        return seg;
+    }
+
+    /**
+     * 用当前业务 MTR 检查 page3 slot 为空。生产 DML 在新建 MTR 后先调用 undo，再触碰 B+Tree 页；repository 又在
+     * 返回前提前释放 page3 S latch，因此随后的 FSP page0/page2 分配没有遗留高页号 latch，也不需要隐式嵌套 MTR。
+     */
+    private void requirePersistentSlotFree(MiniTransaction mtr, UndoSlotId slot) {
+        headerRepo.requireSlotFree(mtr, undoSpace, slot);
     }
 
     /**
@@ -358,10 +362,10 @@ public final class UndoLogManager {
      * segment 的普通写路径也不会在持 page3 latch 时反向请求 undo page latch。因此该例外只放在 UndoLogManager
      * 的事务 undo 编排层，不下沉到 repository 的所有调用。
      */
-    private void writeRsegSlotAfterUndoPage(MiniTransaction mtr, UndoSlotId slot, PageId firstPage) {
+    private void claimRsegSlotAfterUndoPage(MiniTransaction mtr, UndoSlotId slot, PageId firstPage) {
         try (var ignored = mtr.allowOutOfOrderPageLatch(
                 "undo rseg slot update: page3 metadata never waits for undo page latches")) {
-            headerRepo.writeSlot(mtr, undoSpace, slot, firstPage);
+            headerRepo.claimSlot(mtr, undoSpace, slot, firstPage);
         }
     }
 }

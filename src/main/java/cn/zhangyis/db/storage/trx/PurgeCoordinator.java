@@ -18,8 +18,6 @@ import cn.zhangyis.db.storage.undo.UndoLogFormatException;
 import cn.zhangyis.db.storage.undo.UndoLogicalHead;
 import cn.zhangyis.db.storage.undo.UndoRecord;
 import cn.zhangyis.db.storage.undo.UndoRecordType;
-import cn.zhangyis.db.storage.undo.UndoSegmentHandle;
-import cn.zhangyis.db.storage.undo.UndoSpaceAllocator;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -28,8 +26,6 @@ import java.util.Optional;
 /**
  * 单线程 purge 协调器（设计 §5.7/§7.7，purge 切片）。{@link #runBatch} 同步处理一批已提交 undo：
  * <ol>
- *   <li>排空 insert-reclaim 队列：纯 insert undo 段提交即可回收（一致性读从不需要 insert undo），无 boundary，直接
- *       {@code dropUndoSegment}。</li>
  *   <li>按 purge boundary（= {@link TransactionSystem#purgeLowWaterNo()}，最老 live ReadView 低水位）FIFO 处理 committed
  *       history：对每条 {@code DELETE_MARK} undo 严格物理移除对应 delete-marked 聚簇记录；该 log 全部记录处理完后回收
  *       undo 段并释放 slot。遇队首 {@code transactionNo >= boundary} 即停（更老读者可能仍需旧版本）。</li>
@@ -38,34 +34,51 @@ import java.util.Optional;
  * <p><b>Latch 纪律</b>（同 {@link MvccReader}）：先用短只读 MTR 取得 first-page 持久 logical head + 段 handle，
  * 再沿 {@code prevRollPointer} 每条用独立短读 MTR 物化 DELETE_MARK task；每次提交都立即释放 undo latch/fix。
  * 整条链校验完成后才逐条开启 index MTR 调用
- * {@link SplitCapableBTreeIndexService#purgeDeleteMarkedClustered}，最后独立 MTR {@code dropUndoSegment}。
+ * {@link SplitCapableBTreeIndexService#purgeDeleteMarkedClustered}，最后由 {@link UndoSegmentFinalizer} 在单一 MTR
+ * 原子执行 segment drop + page3 clear。
  * 任一时刻只持 undo 或 index 之一，也不会把超过 Buffer Pool 容量的整条 undo 页链同时 fixed。
  *
- * <p><b>per-entry 失败边界</b>：insert/committed 两队列都先 peek，只有 index 任务、segment drop 与 slot release
- * 全部成功后才 poll。可预测的 slot ownership 在任何 index/drop 副作用前预检；drop 前 IO/页损坏会保留队首并停批，
- * 已移除 index 记录重试时 stale-skip。当前 history/slot 仍是内存结构，进程在 drop 成功与 poll 之间崩溃的持久原子性
- * 依赖未来的持久 history/release 协议，本片不作超范围承诺。
+ * <p><b>per-entry 失败边界</b>：committed 队列先 peek，只有 index tasks 与 finalization 全部成功后才按 expected
+ * identity 摘队首。task 中途失败保留 page3 COMMITTED slot，重启可重建并 stale-skip 已完成任务；finalization 的
+ * drop+clear 同批提交后即使在内存 complete 前 crash，page3 也不会重新暴露已释放 segment。
  *
  * <p><b>当前范围</b>：协调器自身同步串行，生产由单 daemon driver 周期调用；单聚簇索引、内存 history，
- * recovery 会从 COMMITTED header 重建队列。二级索引 purge、多 worker、多 rseg 和持久 history/release 协议留后续片。
+ * recovery 会从仍占用 page3 的 COMMITTED header 重建队列。二级索引 purge、多 worker、多 rseg 留后续片。
  */
 public final class PurgeCoordinator implements PurgeTarget {
 
+    /** undo 短读与 index 写 MTR 来源；每次循环返回前释放全部 latch/fix。 */
     private final MiniTransactionManager mgr;
+    /** live ReadView purge low-water 的权威来源。 */
     private final TransactionSystem system;
+    /** page3 COMMITTED slots 的内存 FIFO 投影。 */
     private final HistoryList history;
+    /** 逐 pointer 读取 committed undo logical chain 的入口。 */
     private final UndoLogSegmentAccess undoAccess;
-    private final UndoSpaceAllocator undoAllocator;
-    private final RollbackSegmentSlotManager slotManager;
+    /** tasks 完成后原子 drop segment + clear page3 owner 的终态协作者。 */
+    private final UndoSegmentFinalizer finalizer;
+    /** 物理删除仍匹配 creator/roll-pointer 的 delete-marked 聚簇记录。 */
     private final SplitCapableBTreeIndexService btree;
+    /** 当前无 DD 时显式配置的唯一聚簇索引。 */
     private final BTreeIndex clusteredIndex;
 
+    /**
+     * 构造单线程 purge 协调器；所有依赖必须属于同一 engine/undo tablespace 生命周期。
+     *
+     * @param mgr            MTR 来源。
+     * @param system         purge boundary 来源。
+     * @param history        committed history 内存投影。
+     * @param undoAccess     undo logical chain 读取入口。
+     * @param finalizer      undo 段原子终结器。
+     * @param btree          聚簇物理删除服务。
+     * @param clusteredIndex 当前显式配置的聚簇索引。
+     */
     public PurgeCoordinator(MiniTransactionManager mgr, TransactionSystem system, HistoryList history,
-                            UndoLogSegmentAccess undoAccess, UndoSpaceAllocator undoAllocator,
-                            RollbackSegmentSlotManager slotManager, SplitCapableBTreeIndexService btree,
+                            UndoLogSegmentAccess undoAccess, UndoSegmentFinalizer finalizer,
+                            SplitCapableBTreeIndexService btree,
                             BTreeIndex clusteredIndex) {
-        if (mgr == null || system == null || history == null || undoAccess == null || undoAllocator == null
-                || slotManager == null || btree == null || clusteredIndex == null) {
+        if (mgr == null || system == null || history == null || undoAccess == null || finalizer == null
+                || btree == null || clusteredIndex == null) {
             throw new DatabaseValidationException("purge coordinator collaborators must not be null");
         }
         if (!clusteredIndex.clustered()) {
@@ -75,14 +88,13 @@ public final class PurgeCoordinator implements PurgeTarget {
         this.system = system;
         this.history = history;
         this.undoAccess = undoAccess;
-        this.undoAllocator = undoAllocator;
-        this.slotManager = slotManager;
+        this.finalizer = finalizer;
         this.btree = btree;
         this.clusteredIndex = clusteredIndex;
     }
 
     /**
-     * 执行一个可测试 purge 批次：先排空 insert-reclaim，再按 boundary FIFO 处理至多 {@code maxLogs} 条 committed undo log。
+     * 执行一个可测试 purge 批次：按 boundary FIFO 处理至多 {@code maxLogs} 条 committed update/delete undo log。
      *
      * @param maxLogs 本批最多处理的 committed undo log 数（正）。
      * @return 本批统计。
@@ -91,14 +103,6 @@ public final class PurgeCoordinator implements PurgeTarget {
         if (maxLogs <= 0) {
             throw new DatabaseValidationException("purge maxLogs must be positive: " + maxLogs);
         }
-        int reclaimedInsertSegments = 0;
-        Optional<InsertReclaimEntry> ins;
-        while ((ins = history.peekInsertReclaim()).isPresent()) {
-            reclaimInsertSegment(ins.get());
-            history.pollInsertReclaim();
-            reclaimedInsertSegments++;
-        }
-
         TransactionNo boundary = system.purgeLowWaterNo();
         int purgedLogs = 0;
         int removedRecords = 0;
@@ -112,10 +116,15 @@ public final class PurgeCoordinator implements PurgeTarget {
                 break; // 未达 boundary：FIFO 停批，更老读者仍可能需要旧版本
             }
             removedRecords += purgeCommittedLog(head);
-            history.pollCommitted(); // 全部成功后才移除（硬失败已在上一行抛出，队首保留）
+            try {
+                history.completeCommitted(head);
+            } catch (RuntimeException error) {
+                throw new UndoFinalizationException(
+                        "purge finalization committed but history publication failed: " + head, error);
+            }
             purgedLogs++;
         }
-        return new PurgeSummary(purgedLogs, removedRecords, reclaimedInsertSegments);
+        return new PurgeSummary(purgedLogs, removedRecords);
     }
 
     /**
@@ -123,12 +132,7 @@ public final class PurgeCoordinator implements PurgeTarget {
      * 返回本 log 物理移除的记录数（stale 不计）。
      */
     private int purgeCommittedLog(HistoryEntry entry) {
-        PageId occupiedFirstPage = slotManager.insertUndoFirstPageId(entry.slotId());
-        if (!occupiedFirstPage.equals(entry.undoFirstPageId())) {
-            throw new UndoLogFormatException("purge history slot points to " + occupiedFirstPage
-                    + " instead of " + entry.undoFirstPageId());
-        }
-        // 首个短 MTR 只取逻辑入口和段回收句柄；不能用物理 slot/FIL NEXT 遍历，否则会重新消费 rolled-back 分支。
+        // 首个短 MTR 只取逻辑入口；不能用物理 slot/FIL NEXT 遍历，否则会重新消费 rolled-back 分支。
         LogicalChainStart start;
         MiniTransaction read = mgr.begin();
         try {
@@ -138,7 +142,7 @@ public final class PurgeCoordinator implements PurgeTarget {
                         + entry.creatorTrxId().value() + " != undo segment creator "
                         + seg.creatorTransactionId().value());
             }
-            start = new LogicalChainStart(seg.logicalHead(), seg.handle());
+            start = new LogicalChainStart(seg.logicalHead());
             mgr.commit(read);
         } catch (RuntimeException e) {
             rollbackReadMtr(read, e);
@@ -165,17 +169,7 @@ public final class PurgeCoordinator implements PurgeTarget {
             }
         }
 
-        // MTR-drop：回收 undo 段（归还页给 FSP）
-        MiniTransaction drop = mgr.begin();
-        try {
-            undoAllocator.dropUndoSegment(drop, start.handle());
-        } catch (RuntimeException e) {
-            mgr.rollbackUncommitted(drop);
-            throw e;
-        }
-        mgr.commit(drop);
-
-        slotManager.release(entry.slotId());
+        finalizer.finalizePurgedHistory(entry);
         return removed;
     }
 
@@ -240,34 +234,11 @@ public final class PurgeCoordinator implements PurgeTarget {
         }
     }
 
-    /** 回收一条纯 insert undo 段：只读 MTR 取 handle → 独立 MTR dropUndoSegment（slot 已在 onCommit 释放）。 */
-    private void reclaimInsertSegment(InsertReclaimEntry entry) {
-        UndoSegmentHandle handle;
-        MiniTransaction read = mgr.begin();
-        try {
-            UndoLogSegment seg = undoAccess.open(read, entry.undoFirstPageId(), PageLatchMode.SHARED);
-            handle = seg.handle();
-            mgr.commit(read);
-        } catch (RuntimeException e) {
-            rollbackReadMtr(read, e);
-            throw e;
-        }
-
-        MiniTransaction drop = mgr.begin();
-        try {
-            undoAllocator.dropUndoSegment(drop, handle);
-            mgr.commit(drop);
-        } catch (RuntimeException e) {
-            rollbackReadMtr(drop, e);
-            throw e;
-        }
-    }
-
     /** 一条待移除的 delete-marked 聚簇记录：搜索 key + 该 DELETE_MARK undo 记录自身地址（= 记录应有的 DB_ROLL_PTR）。 */
     private record DeleteTask(SearchKey key, RollPointer rollPointer) {
     }
 
-    /** 一次短读取得的持久链入口与后续 drop 所需 segment 定位值对象。 */
-    private record LogicalChainStart(UndoLogicalHead head, UndoSegmentHandle handle) {
+    /** 一次短读取得的持久逻辑链入口。 */
+    private record LogicalChainStart(UndoLogicalHead head) {
     }
 }

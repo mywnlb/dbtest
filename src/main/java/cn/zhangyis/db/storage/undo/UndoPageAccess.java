@@ -89,8 +89,9 @@ public final class UndoPageAccess {
     }
 
     /**
-     * 打开已存在 UNDO 页。只校验 FIL 信封页类型，具体 first/chain 角色由 UndoPage 访问器或
-     * UndoLogSegmentAccess.open 再判断。
+     * 打开已存在 UNDO 页。先校验 FIL 信封页类型，再校验每页 page-header 格式版本；具体 first/chain 角色由
+     * UndoPage 访问器或 UndoLogSegmentAccess.open 再判断。版本守门必须位于本公共入口，因为 MVCC 可凭
+     * RollPointer 直接打开 chain 页，不能依赖 first-page open 间接检查。
      */
     public UndoPage openUndoPage(MiniTransaction mtr, PageId pageId, PageLatchMode mode) {
         if (mtr == null || pageId == null || mode == null) {
@@ -102,7 +103,9 @@ public final class UndoPageAccess {
         if (h.pageType() != PageType.UNDO) {
             throw new UndoLogFormatException("page " + pageId + " is not an UNDO page: " + h.pageType());
         }
-        return new UndoPage(mtr, g, pageSize);
+        UndoPage page = new UndoPage(mtr, g, pageSize);
+        page.requireCurrentFormat();
+        return page;
     }
 
     private PageGuard newUndoEnvelope(MiniTransaction mtr, PageId pageId) {

@@ -281,6 +281,39 @@ class ClusteredDmlServiceTest {
         }
     }
 
+    /** full rollback 尚未进入终态时失败必须保留事务锁，避免其它事务观察或覆盖半回滚数据。 */
+    @Test
+    @DisplayName("A failed full rollback keeps row locks until a successful retry")
+    void failedFullRollbackKeepsLocksUntilSuccessfulRetry() {
+        StorageEngine engine = new StorageEngine(config(dir));
+        engine.open();
+        try {
+            BTreeIndex index = createClusteredIndex(engine, dir.resolve("dml-rollback-lock-retain.ibd"));
+            Transaction txn = engine.transactionManager().begin(TransactionOptions.defaults());
+            engine.dmlService().insert(new ClusteredInsertCommand(
+                    txn, index, search(1), row(1, "v1"), TABLE_ID, Duration.ofSeconds(1)));
+            assertTrue(hasGrantedLock(engine, txn));
+
+            IndexKeyDef wrongKey = new IndexKeyDef(INDEX_ID + 1, index.keyDef().parts());
+            BTreeIndex wrongIndex = new BTreeIndex(INDEX_ID + 1, index.rootPageId(), index.rootLevel(),
+                    wrongKey, index.schema(), index.unique(), index.leafSegment(), index.nonLeafSegment());
+
+            assertThrows(DatabaseRuntimeException.class,
+                    () -> engine.dmlService().rollback(new DmlRollbackCommand(txn, wrongIndex)));
+            assertEquals(TransactionState.ACTIVE, txn.state(),
+                    "chain preflight fails before entering ROLLING_BACK");
+            assertTrue(hasGrantedLock(engine, txn),
+                    "failed rollback must retain row locks while transaction is not terminal");
+
+            DmlRollbackResult retried = engine.dmlService().rollback(new DmlRollbackCommand(txn, index));
+            assertEquals(TransactionState.ROLLED_BACK, txn.state());
+            assertEquals(1, retried.rollbackSummary().undoRecordsApplied());
+            assertFalse(hasGrantedLock(engine, txn));
+        } finally {
+            engine.close();
+        }
+    }
+
     @Test
     @DisplayName("Statement guard rolls back only DML writes after an existing undo boundary")
     void statementGuardRollsBackOnlyWritesAfterExistingUndoBoundary() {

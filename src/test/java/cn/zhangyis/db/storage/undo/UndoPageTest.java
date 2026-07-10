@@ -4,6 +4,7 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
+import cn.zhangyis.db.domain.RollPointer;
 import cn.zhangyis.db.domain.SegmentId;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.domain.TransactionId;
@@ -56,7 +57,9 @@ class UndoPageTest {
     @Test
     void formatFirstPageInitsBothHeaders() {
         onFirstPage((page, handle) -> {
-            assertEquals(105, page.freeOffset());
+            assertEquals(120, UndoPageLayout.RECORD_AREA_START,
+                    "persistent-head page format reserves a 15-byte logical head");
+            assertEquals(UndoPageLayout.RECORD_AREA_START, page.freeOffset());
             assertEquals(0, page.recordCount());
             assertEquals(0L, page.pageLastUndoNo().value());
             assertTrue(page.isFirstPage());
@@ -68,6 +71,8 @@ class UndoPageTest {
             assertEquals(page.pageId().pageNo().value(), page.lastPageNo());
             assertEquals(0L, page.logRecordCount());
             assertEquals(0L, page.logLastUndoNo().value());
+            assertEquals(UndoLogicalHead.EMPTY, page.logicalHead());
+            assertEquals(UndoPageLayout.CURRENT_FORMAT_VERSION, page.formatVersion());
         });
     }
 
@@ -78,8 +83,8 @@ class UndoPageTest {
             int offA = page.appendRecord(a, TransactionId.of(7), UndoNo.of(1));
             byte[] b = {9, 9};
             int offB = page.appendRecord(b, TransactionId.of(7), UndoNo.of(2));
-            assertEquals(105, offA);
-            assertEquals(105 + 2 + 3, offB);
+            assertEquals(UndoPageLayout.RECORD_AREA_START, offA);
+            assertEquals(UndoPageLayout.RECORD_AREA_START + 2 + 3, offB);
             assertEquals(2, page.recordCount());
             assertEquals(2L, page.pageLastUndoNo().value());
             assertArrayEquals(a, page.recordAt(offA));
@@ -87,6 +92,30 @@ class UndoPageTest {
             assertEquals(0L, page.logRecordCount());
             assertEquals(0L, page.logLastUndoNo().value());
         });
+    }
+
+    /** logical undo 头必须把 undoNo 与 RollPointer 作为一个不可拆分的持久边界读写。 */
+    @Test
+    void logicalHeadRoundTripsAsOnePair() {
+        onFirstPage((page, handle) -> {
+            RollPointer pointer = new RollPointer(false, page.pageId().pageNo(),
+                    UndoPageLayout.RECORD_AREA_START);
+            UndoLogicalHead head = new UndoLogicalHead(UndoNo.of(9), pointer);
+
+            page.setLogicalHead(head);
+
+            assertEquals(head, page.logicalHead());
+        });
+    }
+
+    /** 一空一非空会让 recovery 从错误边界开始，值对象必须在写页前拒绝该状态。 */
+    @Test
+    void logicalHeadRejectsInconsistentPair() {
+        assertThrows(DatabaseValidationException.class,
+                () -> new UndoLogicalHead(UndoNo.NONE,
+                        new RollPointer(false, PageNo.of(9), UndoPageLayout.RECORD_AREA_START)));
+        assertThrows(DatabaseValidationException.class,
+                () -> new UndoLogicalHead(UndoNo.of(1), RollPointer.NULL));
     }
 
     @Test
@@ -122,7 +151,8 @@ class UndoPageTest {
             undoAccess.createFirstPage(m, p1, UndoLogKind.INSERT, TransactionId.of(7), handle);
             UndoPage chain = undoAccess.createChainPage(m, p2, handle);
             assertFalse(chain.isFirstPage());
-            assertEquals(105, chain.freeOffset());
+            assertEquals(UndoPageLayout.RECORD_AREA_START, chain.freeOffset());
+            assertEquals(UndoPageLayout.CURRENT_FORMAT_VERSION, chain.formatVersion());
             assertEquals(handle.segmentId().value(), chain.segmentId().value());
             assertThrows(UndoLogFormatException.class, chain::transactionId);
             assertThrows(UndoLogFormatException.class, chain::undoKind);
@@ -181,6 +211,80 @@ class UndoPageTest {
             assertThrows(UndoLogFormatException.class,
                     () -> undoAccess.openUndoPage(r, pid, PageLatchMode.SHARED));
             mgr.rollbackUncommitted(r);
+        });
+    }
+
+    /** 扩展 record-area 后不能把旧 flags 的页按新偏移静默解析，必须在打开入口 fail-closed。 */
+    @Test
+    void openUndoPageRejectsLegacyFormatVersion() {
+        onPool((mgr, disk, undoAccess, pool) -> {
+            MiniTransaction create = mgr.begin();
+            SegmentRef seg = disk.createSegment(create, UNDO_SPACE, SegmentPurpose.UNDO);
+            PageId pid = disk.allocatePage(create, seg);
+            UndoSegmentHandle handle = new UndoSegmentHandle(
+                    UNDO_SPACE, seg.inodeSlot(), seg.segmentId(), pid, pid);
+            undoAccess.createFirstPage(create, pid, UndoLogKind.INSERT, TransactionId.of(7), handle);
+            mgr.commit(create);
+
+            MiniTransaction corrupt = mgr.begin();
+            corrupt.getPage(pool, pid, PageLatchMode.EXCLUSIVE).writeBytes(
+                    UndoPageLayout.PAGE_FLAGS, new byte[]{(byte) UndoPageLayout.FLAG_FIRST_PAGE});
+            mgr.commit(corrupt);
+
+            MiniTransaction read = mgr.begin();
+            assertThrows(UndoLogFormatException.class,
+                    () -> undoAccess.openUndoPage(read, pid, PageLatchMode.SHARED));
+            mgr.rollbackUncommitted(read);
+        });
+    }
+
+    /** 未知的未来版本也不能按当前布局猜测读取。 */
+    @Test
+    void openUndoPageRejectsUnknownFormatVersion() {
+        onPool((mgr, disk, undoAccess, pool) -> {
+            MiniTransaction create = mgr.begin();
+            SegmentRef seg = disk.createSegment(create, UNDO_SPACE, SegmentPurpose.UNDO);
+            PageId pid = disk.allocatePage(create, seg);
+            UndoSegmentHandle handle = new UndoSegmentHandle(
+                    UNDO_SPACE, seg.inodeSlot(), seg.segmentId(), pid, pid);
+            undoAccess.createFirstPage(create, pid, UndoLogKind.INSERT, TransactionId.of(7), handle);
+            mgr.commit(create);
+
+            MiniTransaction corrupt = mgr.begin();
+            int unknownFlags = (2 << UndoPageLayout.FORMAT_VERSION_SHIFT) | UndoPageLayout.FLAG_FIRST_PAGE;
+            corrupt.getPage(pool, pid, PageLatchMode.EXCLUSIVE).writeBytes(
+                    UndoPageLayout.PAGE_FLAGS, new byte[]{(byte) unknownFlags});
+            mgr.commit(corrupt);
+
+            MiniTransaction read = mgr.begin();
+            assertThrows(UndoLogFormatException.class,
+                    () -> undoAccess.openUndoPage(read, pid, PageLatchMode.SHARED));
+            mgr.rollbackUncommitted(read);
+        });
+    }
+
+    /** 落盘 pair 损坏属于 undo 格式错误，不能向恢复层泄漏普通参数校验异常。 */
+    @Test
+    void logicalHeadWrapsCorruptPairAsFormatException() {
+        onPool((mgr, disk, undoAccess, pool) -> {
+            MiniTransaction create = mgr.begin();
+            SegmentRef seg = disk.createSegment(create, UNDO_SPACE, SegmentPurpose.UNDO);
+            PageId pid = disk.allocatePage(create, seg);
+            UndoSegmentHandle handle = new UndoSegmentHandle(
+                    UNDO_SPACE, seg.inodeSlot(), seg.segmentId(), pid, pid);
+            undoAccess.createFirstPage(create, pid, UndoLogKind.INSERT, TransactionId.of(7), handle);
+            mgr.commit(create);
+
+            MiniTransaction corrupt = mgr.begin();
+            RollPointer nonNull = new RollPointer(false, pid.pageNo(), UndoPageLayout.RECORD_AREA_START);
+            corrupt.getPage(pool, pid, PageLatchMode.EXCLUSIVE).writeBytes(
+                    UndoPageLayout.LOGICAL_HEAD_ROLL_POINTER, nonNull.encode());
+            mgr.commit(corrupt);
+
+            MiniTransaction read = mgr.begin();
+            UndoPage page = undoAccess.openUndoPage(read, pid, PageLatchMode.SHARED);
+            assertThrows(UndoLogFormatException.class, page::logicalHead);
+            mgr.rollbackUncommitted(read);
         });
     }
 

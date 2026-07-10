@@ -86,6 +86,19 @@ public final class HistoryList {
         }
     }
 
+    /**
+     * 查看 insert-reclaim 队首但不移除。purge 必须先成功 drop segment 再 poll；若先 poll 后 IO 失败，
+     * 纯 insert undo 段会永久丢失回收任务。
+     */
+    public Optional<InsertReclaimEntry> peekInsertReclaim() {
+        lock.lock();
+        try {
+            return Optional.ofNullable(insertReclaim.peekFirst());
+        } finally {
+            lock.unlock();
+        }
+    }
+
     /** 当前 committed（update/delete）队列长度。 */
     public int committedSize() {
         lock.lock();

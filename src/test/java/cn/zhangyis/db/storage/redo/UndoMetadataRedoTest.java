@@ -28,6 +28,8 @@ class UndoMetadataRedoTest {
     private static final PageId RSEG_PAGE = PageId.of(SPACE, PageNo.of(3));
     /** rseg page3 slot array 起点：FIL header(38) + magic/format/rsegId/slotCapacity(16)。 */
     private static final int RSEG_SLOT_0 = PageEnvelopeLayout.FIL_PAGE_HEADER_BYTES + 16;
+    /** undo first-page v1 中 logical pair 起点；布局测试另在 storage.undo 包钉死 record-area=120。 */
+    private static final int LOGICAL_HEAD_OFFSET = 105;
 
     @Test
     void undoMetadataDeltaRoundTripsThroughRedoFrameCodec() {
@@ -62,6 +64,36 @@ class UndoMetadataRedoTest {
         assertEquals(batch.range().end().value(), ByteBuffer.wrap(page).getLong(PageEnvelopeLayout.PAGE_LSN));
         assertEquals(1, store.readCount);
         assertEquals(1, store.writeCount);
+    }
+
+    /** 15B logical head after-image 必须能作为一个 redo record 编码、重放，并以 batch end LSN 幂等跳过。 */
+    @Test
+    void persistentLogicalHeadPairReplaysAtomicallyAndIdempotently() {
+        RecordingPageStore store = new RecordingPageStore();
+        store.create(SPACE, Path.of("undo-head.ibu"), PS, PageNo.of(4));
+        byte[] pair = ByteBuffer.allocate(Long.BYTES + 7)
+                .putLong(9L)
+                .put(new byte[]{(byte) 0x80, 0, 0, 0, 7, 0, 120})
+                .array();
+        UndoMetadataDeltaRecord delta = new UndoMetadataDeltaRecord(RSEG_PAGE,
+                UndoMetadataDeltaKind.UNDO_LOG_HEADER_FIELD, 33L, 2,
+                LOGICAL_HEAD_OFFSET, pair);
+        RedoLogBatch batch = batchOf(List.of(delta));
+
+        RedoApplyDispatcher dispatcher = RedoApplyDispatcher.pageDispatcher();
+        RedoApplySummary first = dispatcher.apply(batch, new RedoApplyContext(store, PS));
+        RedoApplySummary repeated = dispatcher.apply(batch, new RedoApplyContext(store, PS));
+
+        byte[] page = store.page(RSEG_PAGE);
+        assertEquals(1, first.appliedBatchCount());
+        assertEquals(1, repeated.appliedBatchCount(),
+                "dispatcher counts a dispatched batch even when the page handler skips by pageLSN");
+        assertArrayEquals(pair, slice(page, LOGICAL_HEAD_OFFSET, pair.length));
+        assertEquals(batch.range().end().value(), ByteBuffer.wrap(page).getLong(PageEnvelopeLayout.PAGE_LSN));
+        assertEquals(1, store.writeCount, "pageLSN must suppress the repeated physical page write");
+
+        RedoLogBatch decoded = RedoBatchFrameCodec.decodeFrames(RedoBatchFrameCodec.encodeFrame(batch)).getFirst();
+        assertEquals(List.of(delta), decoded.records(), "15B pair must survive persistent redo frame round-trip");
     }
 
     private static RedoLogBatch batchOf(List<RedoRecord> records) {

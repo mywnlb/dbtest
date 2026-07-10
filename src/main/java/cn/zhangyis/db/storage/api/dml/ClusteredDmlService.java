@@ -273,8 +273,9 @@ public final class ClusteredDmlService {
     }
 
     /**
-     * 回滚数据库事务。调用 rollback service 沿 undo 链反向应用记录级撤销，然后释放事务 row locks；
-     * 若回滚过程中出现异常，facade 仍尝试释放本事务已持有的 row locks，并把释放失败作为 suppressed cause 保留。
+     * 回滚数据库事务。调用 rollback service 沿 undo 链反向应用记录级撤销，只有事务真正进入
+     * {@link TransactionState#ROLLED_BACK} 后才释放 row locks。若 preflight/apply 失败而事务仍为 ACTIVE 或
+     * ROLLING_BACK，必须保留锁隔离半回滚数据，供同连接重试或重启恢复；提前 releaseAll 会让其它事务改写尚待撤销的版本。
      */
     public DmlRollbackResult rollback(DmlRollbackCommand command) {
         if (command == null) {
@@ -288,7 +289,10 @@ public final class ClusteredDmlService {
             int released = releaseLocks(txnId);
             return new DmlRollbackResult(summary, released);
         } catch (RuntimeException e) {
-            releaseLocksOnFailure(txnId, e);
+            if (txn.state() == TransactionState.ROLLED_BACK) {
+                // rollback 已完成、仅锁清理自身失败时可重试 release；非终态必须继续持锁。
+                releaseLocksOnFailure(txnId, e);
+            }
             if (e instanceof DatabaseRuntimeException databaseError) {
                 throw databaseError;
             }

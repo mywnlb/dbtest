@@ -4,6 +4,7 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
+import cn.zhangyis.db.domain.RollPointer;
 import cn.zhangyis.db.domain.SegmentId;
 import cn.zhangyis.db.domain.TransactionId;
 import cn.zhangyis.db.domain.UndoNo;
@@ -13,6 +14,8 @@ import cn.zhangyis.db.storage.page.FilePageHeader;
 import cn.zhangyis.db.storage.page.PageEnvelope;
 import cn.zhangyis.db.storage.page.PageEnvelopeLayout;
 import cn.zhangyis.db.storage.redo.UndoMetadataDeltaKind;
+
+import java.nio.ByteBuffer;
 
 /**
  * undo 页视图（PageGuard 之上）。所有状态都在页字节中，写入经 MTR 持有的 X latch guard 产生
@@ -70,10 +73,11 @@ public final class UndoPage {
         writeLogHeaderLong(handle, UndoPageLayout.LOG_RECORD_COUNT, 0L, "format undo log record count");
         writeLogHeaderLong(handle, UndoPageLayout.LOG_LAST_UNDO_NO, 0L, "format undo log last undo no");
         writeLogHeaderLong(handle, UndoPageLayout.COMMIT_NO, 0L, "format undo commit no");
+        setLogicalHead(UndoLogicalHead.EMPTY);
     }
 
     /**
-     * 格式化 undo chain 页。chain 页仍预留 log header 宽度并清零 {@code [63,105)}，这样 record area 起点
+     * 格式化 undo chain 页。chain 页仍预留 log header 宽度并清零 {@code [63,120)}，这样 record area 起点
      * 与 first 页完全一致；first-only 访问器会通过 {@link #isFirstPage()} 拒绝解析这些清零字节。
      *
      * @param handle segment 定位；页必须与 handle 所属表空间一致。
@@ -228,6 +232,23 @@ public final class UndoPage {
         return getU8(UndoPageLayout.PAGE_FLAGS);
     }
 
+    /** 当前 undo 页物理格式版本；first 标志不参与版本值。 */
+    int formatVersion() {
+        return (pageFlags() & UndoPageLayout.FORMAT_VERSION_MASK) >>> UndoPageLayout.FORMAT_VERSION_SHIFT;
+    }
+
+    /**
+     * 打开既有页时统一执行版本守门。旧格式的 record area 从 105 开始，若按当前 120 偏移继续解析会把
+     * 旧 record 误当 header 或跳过，因此 legacy/未知版本都必须快速失败，不能猜测兼容。
+     */
+    void requireCurrentFormat() {
+        int version = formatVersion();
+        if (version != UndoPageLayout.CURRENT_FORMAT_VERSION) {
+            throw new UndoLogFormatException("unsupported undo page format version " + version
+                    + " on " + guard.pageId() + " (expected " + UndoPageLayout.CURRENT_FORMAT_VERSION + ")");
+        }
+    }
+
     /** 下一条页内追加位置。 */
     int freeOffset() {
         return getU16(UndoPageLayout.FREE_OFFSET);
@@ -309,13 +330,54 @@ public final class UndoPage {
     /** first 页 log header 中的整链 record 总数。 */
     long logRecordCount() {
         requireFirstPage();
-        return guard.readLong(UndoPageLayout.LOG_RECORD_COUNT);
+        long count = guard.readLong(UndoPageLayout.LOG_RECORD_COUNT);
+        if (count < 0) {
+            throw new UndoLogFormatException("negative undo log record count on " + guard.pageId() + ": " + count);
+        }
+        return count;
     }
 
     /** first 页 log header 中的整链最近 undoNo。 */
     UndoNo logLastUndoNo() {
         requireFirstPage();
-        return UndoNo.of(guard.readLong(UndoPageLayout.LOG_LAST_UNDO_NO));
+        long value = guard.readLong(UndoPageLayout.LOG_LAST_UNDO_NO);
+        if (value < 0) {
+            throw new UndoLogFormatException("negative undo log high-water on " + guard.pageId() + ": " + value);
+        }
+        return UndoNo.of(value);
+    }
+
+    /**
+     * 读取 first-page header 中连续编码的持久逻辑头。磁盘负值、RollPointer 保留位或半空 pair 都属于
+     * undo 格式损坏，统一包装成 {@link UndoLogFormatException}，避免 recovery 把它误判为普通调用参数错误。
+     */
+    UndoLogicalHead logicalHead() {
+        requireFirstPage();
+        try {
+            UndoNo undoNo = UndoNo.of(guard.readLong(UndoPageLayout.LOGICAL_LAST_UNDO_NO));
+            RollPointer pointer = RollPointer.decode(
+                    guard.readBytes(UndoPageLayout.LOGICAL_HEAD_ROLL_POINTER, RollPointer.BYTES), 0);
+            return new UndoLogicalHead(undoNo, pointer);
+        } catch (DatabaseValidationException e) {
+            throw new UndoLogFormatException("corrupt persistent logical undo head on " + guard.pageId(), e);
+        }
+    }
+
+    /**
+     * 把 logical undo 头作为单个 15 字节 after-image 写入 first-page header。一次 metadata delta 使 undoNo 与
+     * pointer 在同一 MTR redo batch 中不可拆分；调用方必须在写前完成目标 record/高水位校验。
+     */
+    void setLogicalHead(UndoLogicalHead head) {
+        requireFirstPage();
+        if (head == null) {
+            throw new DatabaseValidationException("undo logical head must not be null");
+        }
+        byte[] image = ByteBuffer.allocate(Long.BYTES + RollPointer.BYTES)
+                .putLong(head.undoNo().value())
+                .put(head.rollPointer().encode())
+                .array();
+        writeLogHeaderBytes(UndoPageLayout.LOGICAL_LAST_UNDO_NO, image,
+                "write persistent logical undo head");
     }
 
     private void writePageHeader(UndoSegmentHandle handle, boolean first) {
@@ -325,7 +387,8 @@ public final class UndoPage {
         writePageHeaderLong(handle, UndoPageLayout.PAGE_LAST_UNDO_NO, 0L, "format undo page last undo no");
         writePageHeaderLong(handle, UndoPageLayout.SEGMENT_ID, handle.segmentId().value(), "format undo segment id");
         writePageHeaderU32(handle, UndoPageLayout.INODE_SLOT, handle.inodeSlot(), "format undo inode slot");
-        writePageHeaderU8(handle, UndoPageLayout.PAGE_FLAGS, first ? UndoPageLayout.FLAG_FIRST_PAGE : 0,
+        int flags = UndoPageLayout.CURRENT_FORMAT_FLAGS | (first ? UndoPageLayout.FLAG_FIRST_PAGE : 0);
+        writePageHeaderU8(handle, UndoPageLayout.PAGE_FLAGS, flags,
                 "format undo page flags");
     }
 
@@ -389,6 +452,11 @@ public final class UndoPage {
 
     private void writeLogHeaderLong(int offset, long value, String reason) {
         UndoRedoDeltas.writeLong(mtr, guard, guard.pageId(), UndoMetadataDeltaKind.UNDO_LOG_HEADER_FIELD,
+                segmentId().value(), inodeSlot(), offset, value, reason);
+    }
+
+    private void writeLogHeaderBytes(int offset, byte[] value, String reason) {
+        UndoRedoDeltas.writeBytes(mtr, guard, guard.pageId(), UndoMetadataDeltaKind.UNDO_LOG_HEADER_FIELD,
                 segmentId().value(), inodeSlot(), offset, value, reason);
     }
 

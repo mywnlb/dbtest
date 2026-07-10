@@ -1,6 +1,7 @@
 package cn.zhangyis.db.storage.trx;
 
 import cn.zhangyis.db.common.exception.DatabaseRuntimeException;
+import cn.zhangyis.db.domain.Lsn;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
@@ -9,6 +10,8 @@ import cn.zhangyis.db.domain.RollbackSegmentId;
 import cn.zhangyis.db.domain.SegmentId;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.domain.TransactionId;
+import cn.zhangyis.db.domain.TransactionNo;
+import cn.zhangyis.db.domain.UndoNo;
 import cn.zhangyis.db.storage.api.DiskSpaceManager;
 import cn.zhangyis.db.storage.api.DiskSpaceUndoAllocator;
 import cn.zhangyis.db.storage.api.index.IndexPageAccess;
@@ -18,8 +21,12 @@ import cn.zhangyis.db.storage.btree.BTreeLookupResult;
 import cn.zhangyis.db.storage.btree.SplitCapableBTreeIndexService;
 import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.LruBufferPool;
+import cn.zhangyis.db.storage.buf.PageLatchMode;
 import cn.zhangyis.db.storage.fil.io.FileChannelPageStore;
 import cn.zhangyis.db.storage.fil.io.PageStore;
+import cn.zhangyis.db.storage.fil.access.TablespaceAccessController;
+import cn.zhangyis.db.storage.flush.FlushCoordinator;
+import cn.zhangyis.db.storage.flush.doublewrite.NoDoublewriteStrategy;
 import cn.zhangyis.db.storage.fsp.segment.SegmentPurpose;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
@@ -36,7 +43,11 @@ import cn.zhangyis.db.storage.record.schema.KeyPartDef;
 import cn.zhangyis.db.storage.record.schema.TableSchema;
 import cn.zhangyis.db.storage.record.type.ColumnValue;
 import cn.zhangyis.db.storage.record.type.TypeCodecRegistry;
+import cn.zhangyis.db.storage.redo.RedoLogFileRepository;
+import cn.zhangyis.db.storage.redo.RedoLogManager;
+import cn.zhangyis.db.storage.undo.UndoLogSegment;
 import cn.zhangyis.db.storage.undo.UndoLogSegmentAccess;
+import cn.zhangyis.db.storage.undo.UndoRecord;
 import cn.zhangyis.db.storage.undo.UndoSegmentHandle;
 import cn.zhangyis.db.storage.undo.UndoSpaceAllocator;
 import cn.zhangyis.db.storage.undo.UndoSpaceReservation;
@@ -44,6 +55,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -153,6 +165,73 @@ class PurgeCoordinatorTest {
         });
     }
 
+    /**
+     * 部分回滚后的物理分支不再属于 committed logical chain。即使该废弃槽随后损坏，purge 也应只沿持久头处理
+     * 当前链并成功回收 segment；按物理槽扫描会在解码废弃 DELETE_MARK 时错误失败。
+     */
+    @Test
+    void purgeSkipsCorruptPhysicalBranchDetachedByPartialRollback() {
+        onPool(false, ctx -> {
+            ctx.boot();
+            BTreeIndex index = ctx.clusteredIndex();
+            Transaction creator = ctx.beginRw();
+            ctx.insert(index, creator, 1);
+            ctx.commit(creator);
+
+            Transaction txn = ctx.beginRw();
+            ctx.update(index, txn, 1, "v2");
+            TransactionSavepoint savepoint = ctx.rollbackService.createSavepoint(txn);
+            RollPointer detached = ctx.deleteMark(index, txn, 1);
+            ctx.rollbackService.rollbackToSavepoint(txn, index, savepoint);
+            ctx.corruptDetachedUndoType(detached);
+            ctx.commit(txn);
+
+            PurgeSummary summary = ctx.purge.runBatch(10);
+
+            assertEquals(1, summary.purgedLogs());
+            assertEquals(0, summary.removedRecords(),
+                    "rolled-back DELETE_MARK branch must not become a purge task");
+            MiniTransaction read = ctx.mgr.begin();
+            BTreeLookupResult row = ctx.svc.lookup(read, index, search(1)).orElseThrow();
+            ctx.mgr.commit(read);
+            assertEquals("v2", payloadOf(row));
+        });
+    }
+
+    /** 物理链页数超过小池容量时，purge 仍应逐 pointer 短读；旧单 MTR FIL 扫描会累计 fix 后耗尽池。 */
+    @Test
+    void purgeLogicalTraversalSurvivesSmallBufferPoolReopen() {
+        Path dataPath = dir.resolve("purge-small-pool-data.ibd");
+        Path undoPath = dir.resolve("purge-small-pool-undo.ibu");
+        MultiPagePurgeFixture fixture = buildMultiPagePurgeFixture(dataPath, undoPath);
+
+        try (PageStore store = new FileChannelPageStore();
+             BufferPool pool = new LruBufferPool(store, PS, 4)) {
+            MiniTransactionManager mgr = new MiniTransactionManager();
+            DiskSpaceManager disk = new DiskSpaceManager(pool, store, PS);
+            disk.openTablespace(DATA_SPACE, dataPath);
+            disk.openTablespace(UNDO_SPACE, undoPath);
+            UndoSpaceAllocator allocator = new DiskSpaceUndoAllocator(disk);
+            UndoLogSegmentAccess undoAccess = new UndoLogSegmentAccess(pool, PS, allocator, registry);
+            RollbackSegmentSlotManager slots = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 64);
+            var slot = slots.claim(fixture.firstPageId());
+            HistoryList history = new HistoryList();
+            history.submitCommitted(new HistoryEntry(TransactionNo.of(1), TransactionId.of(7),
+                    UNDO_SPACE, fixture.firstPageId(), slot));
+            TransactionSystem system = new TransactionSystem();
+            system.restoreCounters(8, 2);
+            PurgeCoordinator purge = new PurgeCoordinator(mgr, system, history, undoAccess, allocator,
+                    slots, new SplitCapableBTreeIndexService(
+                            new IndexPageAccess(pool, PS), disk, registry), fixture.index());
+
+            PurgeSummary summary = purge.runBatch(1);
+
+            assertEquals(1, summary.purgedLogs());
+            assertEquals(0, summary.removedRecords());
+            assertEquals(0, history.committedSize());
+        }
+    }
+
     @Test
     void insertOnlyUndoReclaimedImmediately() {
         onPool(false, ctx -> {
@@ -172,6 +251,24 @@ class PurgeCoordinatorTest {
             MiniTransaction r = ctx.mgr.begin();
             assertTrue(ctx.svc.lookup(r, index, search(1)).isPresent(), "committed inserted row stays (only undo reclaimed)");
             ctx.mgr.commit(r);
+        });
+    }
+
+    /** insert-reclaim 必须先成功 drop 再 poll；drop IO 失败时任务仍留在队首供下一批重试。 */
+    @Test
+    void insertReclaimEntryIsRetainedWhenDropFails() {
+        onPool(true, ctx -> {
+            ctx.boot();
+            BTreeIndex index = ctx.clusteredIndex();
+            Transaction txn = ctx.beginRw();
+            ctx.insert(index, txn, 1);
+            ctx.commit(txn);
+            assertEquals(1, ctx.history.insertReclaimSize());
+
+            assertThrows(DatabaseRuntimeException.class, () -> ctx.purge.runBatch(10));
+
+            assertEquals(1, ctx.history.insertReclaimSize(),
+                    "failed drop must not lose the insert-reclaim entry");
         });
     }
 
@@ -220,6 +317,68 @@ class PurgeCoordinatorTest {
     private static LogicalRecord row(long id) {
         return new LogicalRecord(1, List.of(new ColumnValue.IntValue(id),
                 new ColumnValue.StringValue("payload-" + id)), false, RecordType.CONVENTIONAL);
+    }
+
+    /** 构建 20 条约 7KiB UPDATE undo（约十余页）并刷盘，供 4-frame reopen 验证 purge 资源边界。 */
+    private MultiPagePurgeFixture buildMultiPagePurgeFixture(Path dataPath, Path undoPath) {
+        Path redoPath = dir.resolve("purge-small-pool-redo.log");
+        try (PageStore store = new FileChannelPageStore();
+             BufferPool pool = new LruBufferPool(store, PS, 64);
+             RedoLogFileRepository repo = RedoLogFileRepository.open(redoPath)) {
+            RedoLogManager redo = RedoLogManager.durable(repo);
+            MiniTransactionManager mgr = new MiniTransactionManager(new TablespaceAccessController(), redo);
+            DiskSpaceManager disk = new DiskSpaceManager(pool, store, PS);
+            IndexPageAccess indexAccess = new IndexPageAccess(pool, PS);
+            UndoSpaceAllocator allocator = new DiskSpaceUndoAllocator(disk);
+            UndoLogSegmentAccess undoAccess = new UndoLogSegmentAccess(pool, PS, allocator, registry);
+
+            MiniTransaction boot = mgr.begin();
+            disk.createTablespace(boot, DATA_SPACE, dataPath, PageNo.of(64));
+            SegmentRef leaf = disk.createSegment(boot, DATA_SPACE, SegmentPurpose.INDEX_LEAF);
+            SegmentRef nonLeaf = disk.createSegment(boot, DATA_SPACE, SegmentPurpose.INDEX_NON_LEAF);
+            PageId root = disk.allocatePage(boot, leaf);
+            indexAccess.createIndexPage(boot, root, INDEX_ID, 0);
+            disk.createTablespace(boot, UNDO_SPACE, undoPath, PageNo.of(64));
+            mgr.commit(boot);
+
+            TableSchema schema = largePurgeSchema();
+            BTreeIndex index = new BTreeIndex(INDEX_ID, root, 0, idKey(), schema, true, leaf, nonLeaf);
+            MiniTransaction create = mgr.begin();
+            UndoLogSegment segment = undoAccess.create(create, UNDO_SPACE, TransactionId.of(7));
+            PageId firstPageId = segment.firstPageId();
+            RollPointer previous = RollPointer.NULL;
+            String largeValue = "x".repeat(7_000);
+            for (int i = 1; i <= 20; i++) {
+                if (i > 1) {
+                    mgr.commit(create);
+                    create = mgr.begin();
+                    segment = undoAccess.open(create, firstPageId, PageLatchMode.EXCLUSIVE);
+                }
+                UndoRecord record = UndoRecord.update(UndoNo.of(i), TransactionId.of(7), TABLE_ID, INDEX_ID,
+                        key(i), List.of(new ColumnValue.IntValue(i), new ColumnValue.StringValue(largeValue)),
+                        new HiddenColumns(TransactionId.of(3), RollPointer.NULL), previous);
+                previous = segment.append(record, index.keyDef(), index.schema());
+            }
+            mgr.commit(create);
+            MiniTransaction committed = mgr.begin();
+            undoAccess.open(committed, firstPageId, PageLatchMode.EXCLUSIVE)
+                    .markCommitted(TransactionNo.of(1));
+            mgr.commit(committed);
+
+            redo.flush();
+            new FlushCoordinator(pool, store, redo, PS, new NoDoublewriteStrategy(), Duration.ofMillis(100))
+                    .flushList(Lsn.of(Long.MAX_VALUE), pool.capacity());
+            return new MultiPagePurgeFixture(index, firstPageId);
+        }
+    }
+
+    private static TableSchema largePurgeSchema() {
+        return new TableSchema(1, List.of(
+                new ColumnDef(new ColumnId(0), "id", ColumnType.intType(false, false), 0),
+                new ColumnDef(new ColumnId(1), "payload", ColumnType.varchar(8_000, true), 1)), true);
+    }
+
+    private record MultiPagePurgeFixture(BTreeIndex index, PageId firstPageId) {
     }
 
     private void onPool(boolean failDrop, Body body) {
@@ -273,12 +432,15 @@ class PurgeCoordinatorTest {
         final TransactionManager txnMgr = new TransactionManager(new TransactionSystem());
         final UndoLogManager undoMgr;
         final SplitCapableBTreeIndexService svc;
+        final RollbackService rollbackService;
+        final BufferPool pool;
         PurgeCoordinator purge;
         private SegmentRef leafSegment;
         private SegmentRef nonLeafSegment;
         private PageId rootPageId;
 
         private Ctx(PageStore store, BufferPool pool, boolean failDrop) {
+            this.pool = pool;
             this.disk = new DiskSpaceManager(pool, store, PS);
             this.access = new IndexPageAccess(pool, PS);
             UndoSpaceAllocator real = new DiskSpaceUndoAllocator(disk);
@@ -287,6 +449,7 @@ class PurgeCoordinatorTest {
             this.slots = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 64);
             this.undoMgr = new UndoLogManager(undoAccess, slots, UNDO_SPACE, history);
             this.svc = new SplitCapableBTreeIndexService(access, disk, registry);
+            this.rollbackService = new RollbackService(svc, undoAccess, slots, txnMgr, mgr);
         }
 
         private void boot() {
@@ -320,7 +483,7 @@ class PurgeCoordinatorTest {
             mgr.commit(m);
         }
 
-        private void deleteMark(BTreeIndex index, Transaction txn, long id) {
+        private RollPointer deleteMark(BTreeIndex index, Transaction txn, long id) {
             MiniTransaction read = mgr.begin();
             BTreeLookupResult old = svc.lookup(read, index, search(id)).orElseThrow();
             mgr.commit(read);
@@ -331,9 +494,10 @@ class PurgeCoordinatorTest {
             svc.setClusteredDeleteMark(m, index, search(id), true,
                     new HiddenColumns(txn.transactionId(), delRp), oldHidden.dbTrxId(), oldHidden.dbRollPtr());
             mgr.commit(m);
+            return delRp;
         }
 
-        private void update(BTreeIndex index, Transaction txn, long id, String payload) {
+        private RollPointer update(BTreeIndex index, Transaction txn, long id, String payload) {
             MiniTransaction read = mgr.begin();
             BTreeLookupResult old = svc.lookup(read, index, search(id)).orElseThrow();
             mgr.commit(read);
@@ -346,6 +510,15 @@ class PurgeCoordinatorTest {
                             false, RecordType.CONVENTIONAL, new HiddenColumns(txn.transactionId(), newRp)),
                     oldHidden.dbTrxId(), oldHidden.dbRollPtr());
             mgr.commit(m);
+            return newRp;
+        }
+
+        /** 只破坏已被持久 logical head 摘除的槽，验证 purge 不再读取无效物理分支。 */
+        private void corruptDetachedUndoType(RollPointer detached) {
+            MiniTransaction corrupt = mgr.begin();
+            corrupt.getPage(pool, PageId.of(UNDO_SPACE, detached.pageNo()), PageLatchMode.EXCLUSIVE)
+                    .writeBytes(detached.offset() + Short.BYTES, new byte[]{(byte) 0x7F});
+            mgr.commit(corrupt);
         }
 
         /** commit 编排：先 txnMgr.commit 分配 TransactionNo，再 onCommit 入 history（评审 #3 顺序）。 */

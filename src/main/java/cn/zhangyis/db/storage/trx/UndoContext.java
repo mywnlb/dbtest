@@ -6,6 +6,7 @@ import cn.zhangyis.db.domain.RollPointer;
 import cn.zhangyis.db.domain.RollbackSegmentId;
 import cn.zhangyis.db.domain.UndoNo;
 import cn.zhangyis.db.domain.UndoSlotId;
+import cn.zhangyis.db.storage.undo.UndoLogicalHead;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -110,6 +111,14 @@ public final class UndoContext {
     /** 当前逻辑回滚链入口（最新有效 undo record 位置）；NULL 表当前逻辑链为空。 */
     public RollPointer lastRollPointer() {
         return lastRollPointer;
+    }
+
+    /**
+     * 返回当前运行期有效 undo 链头的成对快照。部分回滚用该值作为持久 header 的 expected CAS 边界；
+     * 任一字段若被错误地单独推进，{@link UndoLogicalHead} 会在落盘前暴露 pair 不一致。
+     */
+    UndoLogicalHead logicalHead() {
+        return new UndoLogicalHead(logicalLastUndoNo, lastRollPointer);
     }
 
     /** 本事务是否写过 UPDATE undo（决定 commit 是否回收 slot）。 */

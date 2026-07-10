@@ -19,8 +19,8 @@ import java.nio.ByteBuffer;
  * after-image 同步登记为 {@link UndoMetadataDeltaRecord}，并把对应物理字节写标为
  * {@link MtrRedoCategory#UNDO_PAGE_BYTES}。
  *
- * <p>0.19e 只追加逻辑 delta，不删除物理 {@code PAGE_BYTES}。这样旧恢复路径继续兼容，后续可在提交边界对 undo
- * metadata 字节做精确替代。
+ * <p>0.19f 起 MTR 提交视图会精确过滤被 metadata after-image 完整覆盖的物理 {@code PAGE_BYTES}；未覆盖的
+ * record payload 等字节仍保留物理 redo。1.4b 的 15B logical-head pair 也通过同一机制作为单条 delta 持久化。
  */
 final class UndoRedoDeltas {
 

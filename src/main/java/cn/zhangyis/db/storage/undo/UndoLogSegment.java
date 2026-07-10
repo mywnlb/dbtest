@@ -102,8 +102,11 @@ public final class UndoLogSegment {
 
     /**
      * 追加一条 undo record。数据流：要求 EXCLUSIVE 会话 → codec 编码 record payload →
-     * current 页追加 record 槽 → first 页 log header 的整链计数和最新 undoNo 在成功后推进 →
-     * 返回指向槽起点的 insert RollPointer。
+     * current 页追加 record 槽 → 构造该槽的 RollPointer → first 页 log header 的整链计数、物理最新 undoNo
+     * 和持久 logical head 在同一 MTR 成功后推进 → 返回 RollPointer。
+     *
+     * <p>事务 id、索引 id、连续 undoNo、record count 容量、predecessor=当前持久头以及非空头指针均在
+     * {@code appendRecord} 前预检；任何可预测失败都不能先写页，因为 MTR rollback 不撤销 buffer content。
      *
      * <p>如果 current 页放不下，会先确认一张全新 undo 页能容纳该 record，再分配并 FIL 链入新页。preflight
      * 必须早于任何页修改，否则 MTR rollbackUncommitted 不做 content undo，会留下半生长脏链。
@@ -112,9 +115,7 @@ public final class UndoLogSegment {
         if (mode != PageLatchMode.EXCLUSIVE) {
             throw new DatabaseValidationException("append requires an EXCLUSIVE (writable) undo log segment session");
         }
-        if (rec == null) {
-            throw new DatabaseValidationException("undo append record must not be null");
-        }
+        long nextRecordCount = preflightAppend(rec, keyDef, schema);
         byte[] payload = codec.encode(rec, keyDef, schema);
         int off;
         try {
@@ -122,12 +123,70 @@ public final class UndoLogSegment {
         } catch (UndoPageOverflowException overflow) {
             off = growAndAppend(payload, rec.transactionId(), rec.undoNo(), overflow);
         }
-        firstPage.setLogRecordCount(firstPage.logRecordCount() + 1);
-        firstPage.setLogLastUndoNo(rec.undoNo().value());
         // RollPointer.insert 标志按记录类型决定（T1.3e）：INSERT_ROW→true、UPDATE_ROW→false。混合段中段头
         // UndoLogKind 不权威，insert 标志与每条记录的 UndoRecordType 一致，供 MVCC/版本链区分 insert vs update undo。
         boolean insert = rec.type() == UndoRecordType.INSERT_ROW;
-        return new RollPointer(insert, current.pageId().pageNo(), off);
+        RollPointer pointer = new RollPointer(insert, current.pageId().pageNo(), off);
+        UndoLogicalHead newHead = new UndoLogicalHead(rec.undoNo(), pointer);
+        firstPage.setLogRecordCount(nextRecordCount);
+        firstPage.setLogLastUndoNo(rec.undoNo().value());
+        firstPage.setLogicalHead(newHead);
+        return pointer;
+    }
+
+    /**
+     * 在任何 record slot/FIL/header 写入前验证 append 不变量。页内物理高水位必须严格连续，record 事务/索引
+     * 必须属于本段，且 record predecessor 必须精确等于持久 logical head；否则一次错误 append 会覆盖链头并让
+     * recovery/purge 永久跳过旧记录。非空持久头也会实际解码并核对 undoNo，避免把损坏 pointer 继续传播到新分支。
+     *
+     * @return 校验后的新整链 record count；调用方写槽成功后直接落该值，不再执行可能溢出的加法。
+     */
+    private long preflightAppend(UndoRecord rec, IndexKeyDef keyDef, TableSchema schema) {
+        if (rec == null || keyDef == null || schema == null) {
+            throw new DatabaseValidationException("undo append record/keyDef/schema must not be null");
+        }
+        TransactionId creator = firstPage.transactionId();
+        if (!rec.transactionId().equals(creator)) {
+            throw new DatabaseValidationException("undo append transaction " + rec.transactionId().value()
+                    + " != segment creator " + creator.value());
+        }
+        if (rec.indexId() != keyDef.indexId()) {
+            throw new DatabaseValidationException("undo append indexId " + rec.indexId()
+                    + " != key definition " + keyDef.indexId());
+        }
+        UndoNo physicalHighWater = firstPage.logLastUndoNo();
+        if (physicalHighWater.value() == Long.MAX_VALUE) {
+            throw new DatabaseValidationException("undo append high-water exhausted at Long.MAX_VALUE");
+        }
+        long expectedUndoNo = physicalHighWater.value() + 1;
+        if (rec.undoNo().value() != expectedUndoNo) {
+            throw new DatabaseValidationException("undo append number " + rec.undoNo().value()
+                    + " must equal physical high-water successor " + expectedUndoNo);
+        }
+        long recordCount = firstPage.logRecordCount();
+        if (recordCount < 0) {
+            throw new UndoLogFormatException("negative undo log record count: " + recordCount);
+        }
+        if (recordCount == Long.MAX_VALUE) {
+            throw new DatabaseValidationException("undo log record count exhausted at Long.MAX_VALUE");
+        }
+        UndoLogicalHead head = firstPage.logicalHead();
+        if (head.undoNo().value() > physicalHighWater.value()) {
+            throw new UndoLogFormatException("logical undo head exceeds physical high-water: "
+                    + head.undoNo().value() + " > " + physicalHighWater.value());
+        }
+        if (!rec.prevRollPointer().equals(head.rollPointer())) {
+            throw new DatabaseValidationException("undo append predecessor " + rec.prevRollPointer()
+                    + " != persistent logical head " + head.rollPointer());
+        }
+        if (!head.isEmpty()) {
+            UndoRecord headRecord = readRecord(head.rollPointer(), keyDef, schema);
+            if (!headRecord.undoNo().equals(head.undoNo())) {
+                throw new UndoLogFormatException("persistent logical head pointer resolves to undoNo "
+                        + headRecord.undoNo().value() + " instead of " + head.undoNo().value());
+            }
+        }
+        return recordCount + 1;
     }
 
     /**
@@ -248,8 +307,8 @@ public final class UndoLogSegment {
      * 一致；段不符代表指针指向别的 undo segment 或页内容损坏，不能继续按当前 schema 解码。
      */
     public UndoRecord readRecord(RollPointer rp, IndexKeyDef keyDef, TableSchema schema) {
-        if (rp == null) {
-            throw new DatabaseValidationException("undo readRecord roll pointer must not be null");
+        if (rp == null || keyDef == null || schema == null) {
+            throw new DatabaseValidationException("undo readRecord roll pointer/keyDef/schema must not be null");
         }
         if (rp.isNull()) {
             throw new UndoLogFormatException("cannot read undo record from NULL roll pointer");
@@ -257,11 +316,73 @@ public final class UndoLogSegment {
         UndoPage page = resolvePage(rp.pageNo());
         requireSameSegment(page, "roll pointer page " + rp.pageNo());
         byte[] payload = page.recordAt(rp.offset());
-        return codec.decode(payload, 0, keyDef, schema);
+        UndoRecord record = codec.decode(payload, 0, keyDef, schema);
+        requirePointerMatchesRecord(rp, record, keyDef);
+        return record;
     }
 
     /**
-     * 正向遍历整条 undo log 页链。每页按 record area 中的 {@code [len u16][payload]} 槽顺序解码，
+     * 读取 first-page header 的持久逻辑链头。该值是 crash recovery 与 purge 的权威入口；物理
+     * {@link #logLastUndoNo()} 只表示 append 高水位，部分回滚后可能大于本值。
+     */
+    public UndoLogicalHead logicalHead() {
+        return firstPage.logicalHead();
+    }
+
+    /**
+     * 以 compare-and-set 语义持久化部分回滚边界。所有可预见校验均发生在 15B header 写入之前：会话必须可写、
+     * 页内当前头等于 expected、目标不能向前推进或越过物理高水位，且非空 target 必须解析到本 segment 中 undoNo
+     * 和 pointer 类型一致的真实 record。这样 stale context 或损坏 target 不会在 MTR 无 content undo 的前提下留下
+     * 半完成 header。
+     *
+     * <p><b>调用前置条件</b>：本方法为物理 CAS，不在一个长 MTR 内遍历 expected→target 的完整祖先链，避免
+     * 大事务把所有 undo 页同时 fixed。生产调用方 {@code RollbackService} 必须先用逐 pointer 短 MTR 精确证明
+     * target 可达；本方法再校验 target 自身 record 与高水位并完成最终 CAS。
+     *
+     * @param expected 调用方开始 partial rollback 时看到的旧逻辑头。
+     * @param target   已成功完成所有逆操作后要持久化的 savepoint/空边界。
+     * @param keyDef   解码目标 undo record 的聚簇索引 key 定义。
+     * @param schema   解码目标 undo record 的表 schema。
+     */
+    public void updateLogicalHead(UndoLogicalHead expected, UndoLogicalHead target,
+                                  IndexKeyDef keyDef, TableSchema schema) {
+        if (mode != PageLatchMode.EXCLUSIVE) {
+            throw new DatabaseValidationException(
+                    "updateLogicalHead requires an EXCLUSIVE undo log segment session");
+        }
+        if (expected == null || target == null || keyDef == null || schema == null) {
+            throw new DatabaseValidationException("logical head update args must not be null");
+        }
+        UndoLogicalHead currentHead = firstPage.logicalHead();
+        if (!currentHead.equals(expected)) {
+            throw new UndoLogicalHeadConflictException("persistent logical undo head changed: expected="
+                    + expected + ", actual=" + currentHead);
+        }
+        if (target.undoNo().value() > expected.undoNo().value()) {
+            throw new DatabaseValidationException("partial rollback target cannot advance logical undo head: "
+                    + target.undoNo().value() + " > " + expected.undoNo().value());
+        }
+        UndoNo physicalHighWater = firstPage.logLastUndoNo();
+        if (target.undoNo().value() > physicalHighWater.value()) {
+            throw new DatabaseValidationException("logical undo head exceeds physical high-water: "
+                    + target.undoNo().value() + " > " + physicalHighWater.value());
+        }
+        if (!target.isEmpty()) {
+            UndoRecord targetRecord = readRecord(target.rollPointer(), keyDef, schema);
+            if (!targetRecord.undoNo().equals(target.undoNo())) {
+                throw new UndoLogFormatException("logical head pointer resolves to undoNo "
+                        + targetRecord.undoNo().value() + " instead of " + target.undoNo().value());
+            }
+        }
+        if (!currentHead.equals(target)) {
+            firstPage.setLogicalHead(target);
+        }
+    }
+
+    /**
+     * 按物理 FIL 页链正向遍历全部槽。该 API 仅供格式诊断/测试，不表达部分回滚后的当前逻辑链；recovery/purge
+     * 必须从 {@link #logicalHead()} 沿 {@link UndoRecord#prevRollPointer()} 逐条短读。每页按 record area
+     * 中的 {@code [len u16][payload]} 槽顺序解码，
      * 然后沿 FIL NEXT 继续。链上任何页类型或 segment 归属异常都会通过 openUndoPage/requireSameSegment 抛出
      * {@link UndoLogFormatException}。
      */
@@ -273,9 +394,9 @@ public final class UndoLogSegment {
     }
 
     /**
-     * 正向遍历整条 undo log 页链，并向 consumer 同时给出**每条 record 自身的 {@link RollPointer} 地址**（pageNo+offset，
-     * insert 标志按记录类型）。purge 用它把已提交 undo log 的每条 DELETE_MARK/UPDATE record 与聚簇记录的
-     * {@code DB_ROLL_PTR} 严格比对（记录的 DB_ROLL_PTR 即写入时返回的该 undo record 地址，见 {@link #append}）。
+     * 按物理 FIL 页链正向遍历全部槽，并向 consumer 同时给出**每条 record 自身的 {@link RollPointer} 地址**
+     *（pageNo+offset，insert 标志按记录类型）。它只表达物理槽顺序，供格式诊断和测试核对 record 地址；
+     * partial rollback 后该顺序还包含 detached branch，生产 rollback/recovery/purge 不得据此判断当前逻辑链。
      *
      * <p>遍历语义与 {@link #forEachRecord} 一致：每页按 record area {@code [len u16][payload]} 槽顺序解码后沿 FIL NEXT
      * 继续；页类型/段归属异常经 openUndoPage/requireSameSegment 抛 {@link UndoLogFormatException}。
@@ -344,6 +465,22 @@ public final class UndoLogSegment {
     /** first 页 log header 中的整链最近 undoNo。 */
     public UndoNo logLastUndoNo() {
         return firstPage.logLastUndoNo();
+    }
+
+    private void requirePointerMatchesRecord(RollPointer pointer, UndoRecord record, IndexKeyDef keyDef) {
+        boolean expectedInsert = record.type() == UndoRecordType.INSERT_ROW;
+        if (pointer.insert() != expectedInsert) {
+            throw new UndoLogFormatException("roll pointer insert bit " + pointer.insert()
+                    + " inconsistent with undo record type " + record.type());
+        }
+        if (!record.transactionId().equals(firstPage.transactionId())) {
+            throw new UndoLogFormatException("undo record transaction " + record.transactionId().value()
+                    + " != segment creator " + firstPage.transactionId().value());
+        }
+        if (record.indexId() != keyDef.indexId()) {
+            throw new UndoLogFormatException("undo record indexId " + record.indexId()
+                    + " != expected " + keyDef.indexId());
+        }
     }
 
     private UndoPage resolvePage(PageNo pageNo) {

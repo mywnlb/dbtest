@@ -1,14 +1,19 @@
 package cn.zhangyis.db.storage.undo;
 
+import cn.zhangyis.db.domain.RollPointer;
 import cn.zhangyis.db.storage.page.PageEnvelopeLayout;
 
 /**
- * undo page 物理布局（T1.3b 头部拆分，R 1.3 扩展提交序号）。page header {@code [38,63)} 每页都有，保存页内追加游标、
- * segment 归属和 first 页标志；undo log header {@code [63,105)} 仅 first 页有语义，非 first 页仍预留并清零。
+ * undo page 物理布局（T1.3b 头部拆分，R 1.3 提交序号，1.4b 持久逻辑头）。page header {@code [38,63)}
+ * 每页都有，保存页内追加游标、segment 归属、first 标志和格式版本；undo log header {@code [63,120)}
+ * 仅 first 页有语义，非 first 页仍预留并清零。
  *
- * <p>所有 undo 页统一 {@link #RECORD_AREA_START}=105，换来 RollPointer.offset 与页内 record 槽解析不区分
- * first/chain 页。R 1.3 比 T1.3b 多 8 字节 {@link #COMMIT_NO}，这是恢复期重建 history 的提交序权威来源。
- * 页链前后指针复用 FIL header 的 prev/next，不在本布局中重复保存。
+ * <p>所有 v1 undo 页统一 {@link #RECORD_AREA_START}=120，换来 RollPointer.offset 与页内 record 槽解析不区分
+ * first/chain 页。{@link #LOGICAL_LAST_UNDO_NO} 与 {@link #LOGICAL_HEAD_ROLL_POINTER} 连续组成 15 字节持久逻辑头；
+ * 它不替代 {@link #LOG_LAST_UNDO_NO} 物理 append 高水位。页链前后指针复用 FIL header 的 prev/next。
+ *
+ * <p><b>格式兼容性</b>：本教学实现不在线迁移旧版 {@code RECORD_AREA_START=105} 的 undo 文件。每张页都在
+ * {@link #PAGE_FLAGS} 编码版本，打开旧版或未知版本必须 fail-closed；这是有意简化，与 MySQL/InnoDB 磁盘格式不兼容。
  */
 final class UndoPageLayout {
 
@@ -25,7 +30,7 @@ final class UndoPageLayout {
     static final int SEGMENT_ID = PAGE_LAST_UNDO_NO + 8;                     // 50
     /** FSP segment inode 槽（u32），与 segment id 一起定位续分配所需的 SegmentRef。 */
     static final int INODE_SLOT = SEGMENT_ID + 8;                            // 58
-    /** 页标志（u8）：bit0 表示 first page；其余位预留，当前格式写 0。 */
+    /** 页标志（u8）：bit0 表示 first page；bits1..7 编码 undo 页格式版本。 */
     static final int PAGE_FLAGS = INODE_SLOT + 4;                            // 62
     /** page header 末尾，也是 undo log header 起点。 */
     static final int PAGE_HEADER_END = PAGE_FLAGS + 1;                       // 63
@@ -46,8 +51,12 @@ final class UndoPageLayout {
     static final int LOG_LAST_UNDO_NO = LOG_RECORD_COUNT + 8;                // 89
     /** 提交序号 TransactionNo（u64，R 1.3）；ACTIVE 时为 0，commit 标 COMMITTED 时写入，恢复重建 history 用。 */
     static final int COMMIT_NO = LOG_LAST_UNDO_NO + 8;                       // 97
+    /** 当前有效逻辑链头 undoNo（u64）；0 必须与 NULL pointer 成对，部分回滚会退回该值。 */
+    static final int LOGICAL_LAST_UNDO_NO = COMMIT_NO + 8;                  // 105
+    /** 当前有效逻辑链头 RollPointer（7B）；与 {@link #LOGICAL_LAST_UNDO_NO} 组成单个 15B after-image。 */
+    static final int LOGICAL_HEAD_ROLL_POINTER = LOGICAL_LAST_UNDO_NO + 8;  // 113
     /** undo log header 末尾。 */
-    static final int LOG_HEADER_END = COMMIT_NO + 8;                        // 105
+    static final int LOG_HEADER_END = LOGICAL_HEAD_ROLL_POINTER + RollPointer.BYTES; // 120
 
     /** record area 起点；所有页一致，record 槽格式为 [len u16][payload]。 */
     static final int RECORD_AREA_START = LOG_HEADER_END;
@@ -58,4 +67,12 @@ final class UndoPageLayout {
     static final int STATE_COMMITTED = 1;
     /** {@link #PAGE_FLAGS} bit0：first page 标志。 */
     static final int FLAG_FIRST_PAGE = 0x01;
+    /** {@link #PAGE_FLAGS} 中格式版本的最低 bit。 */
+    static final int FORMAT_VERSION_SHIFT = 1;
+    /** {@link #PAGE_FLAGS} bits1..7：格式版本掩码。 */
+    static final int FORMAT_VERSION_MASK = 0xFE;
+    /** 当前持久 logical-head 页格式版本。 */
+    static final int CURRENT_FORMAT_VERSION = 1;
+    /** 当前版本写入每张 undo 页的 flags 基值；first 页另 OR {@link #FLAG_FIRST_PAGE}。 */
+    static final int CURRENT_FORMAT_FLAGS = CURRENT_FORMAT_VERSION << FORMAT_VERSION_SHIFT;
 }

@@ -50,6 +50,9 @@ import cn.zhangyis.db.storage.redo.RedoLogManager;
 import cn.zhangyis.db.storage.redo.TransactionStateDeltaReason;
 import cn.zhangyis.db.storage.redo.TransactionStateDeltaRecord;
 import cn.zhangyis.db.storage.redo.TransactionStateDeltaState;
+import cn.zhangyis.db.storage.undo.UndoLogicalHead;
+import cn.zhangyis.db.storage.undo.UndoLogicalHeadConflictException;
+import cn.zhangyis.db.storage.undo.UndoLogSegment;
 import cn.zhangyis.db.storage.undo.UndoLogSegmentAccess;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -78,6 +81,8 @@ class RollbackServiceTest {
     private static final SpaceId UNDO_SPACE = SpaceId.of(77);
     private static final long INDEX_ID = 9L;
     private static final long TABLE_ID = 1L;
+    /** UndoRecord payload 中 prevRollPointer 前有 type + undoNo/txnId/tableId/indexId。 */
+    private static final int UNDO_PREV_POINTER_IN_PAYLOAD = 1 + 4 * Long.BYTES;
 
     @TempDir
     Path dir;
@@ -114,6 +119,63 @@ class RollbackServiceTest {
             MiniTransaction r = ctx.mgr.begin();
             assertTrue(svc.lookup(r, index, search(1)).isEmpty(), "inserted row removed by rollback");
             ctx.mgr.commit(r);
+        });
+    }
+
+    /** 前一次 apply 失败会留下 ROLLING_BACK；重试必须从持久/内存链头幂等重走并完成终态。 */
+    @Test
+    void rollbackResumesTransactionAlreadyRollingBack() {
+        onPool(ctx -> {
+            ctx.boot();
+            SplitCapableBTreeIndexService svc = ctx.service();
+            BTreeIndex index = ctx.clusteredIndex();
+            Transaction txn = ctx.txnMgr.begin(TransactionOptions.defaults());
+            TransactionId wid = ctx.txnMgr.assignWriteId(txn);
+            MiniTransaction write = ctx.mgr.begin();
+            RollPointer pointer = ctx.undoMgr.beforeInsert(txn, write, TABLE_ID, INDEX_ID,
+                    key(1), index.keyDef(), index.schema());
+            svc.insertClustered(write, index, row(1), wid, pointer);
+            ctx.mgr.commit(write);
+            ctx.txnMgr.beginRollback(txn);
+
+            RollbackSummary summary = ctx.rollbackService.rollback(txn, index);
+
+            assertEquals(1, summary.undoRecordsApplied());
+            assertEquals(TransactionState.ROLLED_BACK, txn.state());
+            assertEquals(0, ctx.slots.activeSlotCount());
+        });
+    }
+
+    /** 损坏 predecessor 环必须在 ACTIVE→ROLLING_BACK 和任何 index inverse 前被严格下降检查拒绝。 */
+    @Test
+    void fullRollbackRejectsUndoCycleBeforeChangingStateOrRows() {
+        onPool(ctx -> {
+            ctx.boot();
+            SplitCapableBTreeIndexService svc = ctx.service();
+            BTreeIndex index = ctx.clusteredIndex();
+            Transaction txn = ctx.txnMgr.begin(TransactionOptions.defaults());
+            TransactionId wid = ctx.txnMgr.assignWriteId(txn);
+            MiniTransaction first = ctx.mgr.begin();
+            RollPointer rp1 = ctx.undoMgr.beforeInsert(txn, first, TABLE_ID, INDEX_ID,
+                    key(1), index.keyDef(), index.schema());
+            svc.insertClustered(first, index, row(1), wid, rp1);
+            ctx.mgr.commit(first);
+            MiniTransaction second = ctx.mgr.begin();
+            RollPointer rp2 = ctx.undoMgr.beforeInsert(txn, second, TABLE_ID, INDEX_ID,
+                    key(2), index.keyDef(), index.schema());
+            svc.insertClustered(second, index, row(2), wid, rp2);
+            ctx.mgr.commit(second);
+            ctx.rewriteUndoPredecessor(rp2, rp2);
+
+            assertThrows(DatabaseRuntimeException.class,
+                    () -> ctx.rollbackService.rollback(txn, index));
+
+            assertEquals(TransactionState.ACTIVE, txn.state());
+            assertEquals(1, ctx.slots.activeSlotCount());
+            MiniTransaction read = ctx.mgr.begin();
+            assertTrue(svc.lookup(read, index, search(1)).isPresent());
+            assertTrue(svc.lookup(read, index, search(2)).isPresent());
+            ctx.mgr.commit(read);
         });
     }
 
@@ -172,6 +234,13 @@ class RollbackServiceTest {
             RollbackSummary summary = ctx.rollbackService.rollbackToSavepoint(txn, index, savepoint);
 
             assertEquals(1, summary.undoRecordsApplied(), "only undo after the savepoint is applied");
+            MiniTransaction headRead = ctx.mgr.begin();
+            UndoLogicalHead persisted = ctx.undoAccess.open(
+                    headRead, txn.undoContext().undoFirstPageId(),
+                    cn.zhangyis.db.storage.buf.PageLatchMode.SHARED).logicalHead();
+            ctx.mgr.commit(headRead);
+            assertEquals(new UndoLogicalHead(UndoNo.of(1), rp1), persisted,
+                    "partial rollback must persist its boundary before moving the in-memory head");
             assertEquals(TransactionState.ACTIVE, txn.state(), "savepoint rollback must not finish the transaction");
             assertEquals(1, ctx.slots.activeSlotCount(), "partial rollback keeps the undo slot owned by the transaction");
             assertFalse(ctx.mgr.redoLogManager().bufferedRecords().stream()
@@ -181,6 +250,122 @@ class RollbackServiceTest {
             assertTrue(svc.lookup(r, index, search(1)).isPresent(), "row before savepoint remains visible");
             assertTrue(svc.lookup(r, index, search(2)).isEmpty(), "row after savepoint is removed");
             ctx.mgr.commit(r);
+        });
+    }
+
+    /** 恢复期必须从持久逻辑头开始，不能再次消费已由 statement rollback 撤销的物理分支。 */
+    @Test
+    void recoveredRollbackStartsAtPersistedLogicalHead() {
+        onPool(ctx -> {
+            ctx.boot();
+            SplitCapableBTreeIndexService svc = ctx.service();
+            BTreeIndex index = ctx.clusteredIndex();
+            Transaction txn = ctx.txnMgr.begin(TransactionOptions.defaults());
+            TransactionId wid = ctx.txnMgr.assignWriteId(txn);
+
+            MiniTransaction first = ctx.mgr.begin();
+            RollPointer rp1 = ctx.undoMgr.beforeInsert(txn, first, TABLE_ID, INDEX_ID,
+                    key(1), index.keyDef(), index.schema());
+            svc.insertClustered(first, index, row(1), wid, rp1);
+            ctx.mgr.commit(first);
+            TransactionSavepoint savepoint = ctx.rollbackService.createSavepoint(txn);
+
+            MiniTransaction second = ctx.mgr.begin();
+            RollPointer rp2 = ctx.undoMgr.beforeInsert(txn, second, TABLE_ID, INDEX_ID,
+                    key(2), index.keyDef(), index.schema());
+            svc.insertClustered(second, index, row(2), wid, rp2);
+            ctx.mgr.commit(second);
+            ctx.rollbackService.rollbackToSavepoint(txn, index, savepoint);
+
+            RollbackSummary recovered = ctx.rollbackService.rollbackRecovered(
+                    txn.undoContext().undoFirstPageId(), index);
+
+            assertEquals(1, recovered.undoRecordsApplied(),
+                    "recovery must follow rp1 only; detached physical rp2 was already rolled back");
+            RollbackSummary repeated = ctx.rollbackService.rollbackRecovered(
+                    txn.undoContext().undoFirstPageId(), index);
+            assertEquals(1, repeated.undoRecordsApplied(),
+                    "replaying the same persistent logical chain must remain idempotent");
+            MiniTransaction read = ctx.mgr.begin();
+            assertTrue(svc.lookupIncludingDeleted(read, index, search(1)).isEmpty());
+            assertTrue(svc.lookupIncludingDeleted(read, index, search(2)).isEmpty());
+            ctx.mgr.commit(read);
+        });
+    }
+
+    /**
+     * 模拟 statement inverse 已写盘、logical-head marker 尚未写盘即 crash：rp2 仍是持久头，recovery 会安全地
+     * 重做已经删除的 row2（no-op）后继续撤销 rp1，不能因 marker 落后产生错误结果。
+     */
+    @Test
+    void recoveredRollbackHandlesInversePersistedBeforeMarker() {
+        onPool(ctx -> {
+            ctx.boot();
+            SplitCapableBTreeIndexService svc = ctx.service();
+            BTreeIndex index = ctx.clusteredIndex();
+            Transaction txn = ctx.txnMgr.begin(TransactionOptions.defaults());
+            TransactionId wid = ctx.txnMgr.assignWriteId(txn);
+            MiniTransaction first = ctx.mgr.begin();
+            RollPointer rp1 = ctx.undoMgr.beforeInsert(txn, first, TABLE_ID, INDEX_ID,
+                    key(1), index.keyDef(), index.schema());
+            svc.insertClustered(first, index, row(1), wid, rp1);
+            ctx.mgr.commit(first);
+            MiniTransaction second = ctx.mgr.begin();
+            RollPointer rp2 = ctx.undoMgr.beforeInsert(txn, second, TABLE_ID, INDEX_ID,
+                    key(2), index.keyDef(), index.schema());
+            svc.insertClustered(second, index, row(2), wid, rp2);
+            ctx.mgr.commit(second);
+
+            // 只执行 rp2 的 inverse，不调用 rollbackToSavepoint，因此 first-page marker 仍停在 rp2。
+            MiniTransaction inverseOnly = ctx.mgr.begin();
+            svc.deleteClustered(inverseOnly, index, search(2), wid, rp2);
+            ctx.mgr.commit(inverseOnly);
+
+            RollbackSummary recovered = ctx.rollbackService.rollbackRecovered(
+                    txn.undoContext().undoFirstPageId(), index);
+
+            assertEquals(2, recovered.undoRecordsApplied(), "stale marker makes recovery revisit rp2 then rp1");
+            MiniTransaction read = ctx.mgr.begin();
+            assertTrue(svc.lookupIncludingDeleted(read, index, search(1)).isEmpty());
+            assertTrue(svc.lookupIncludingDeleted(read, index, search(2)).isEmpty());
+            ctx.mgr.commit(read);
+        });
+    }
+
+    /** marker CAS 发现页内头已变化时必须在写 header 前失败，且不能提前移动运行期 context。 */
+    @Test
+    void stalePersistentHeadRejectsMarkerWithoutMovingUndoContext() {
+        onPool(ctx -> {
+            ctx.boot();
+            SplitCapableBTreeIndexService svc = ctx.service();
+            BTreeIndex index = ctx.clusteredIndex();
+            Transaction txn = ctx.txnMgr.begin(TransactionOptions.defaults());
+            TransactionId wid = ctx.txnMgr.assignWriteId(txn);
+            MiniTransaction first = ctx.mgr.begin();
+            RollPointer rp1 = ctx.undoMgr.beforeInsert(txn, first, TABLE_ID, INDEX_ID,
+                    key(1), index.keyDef(), index.schema());
+            svc.insertClustered(first, index, row(1), wid, rp1);
+            ctx.mgr.commit(first);
+            TransactionSavepoint savepoint = ctx.rollbackService.createSavepoint(txn);
+            MiniTransaction second = ctx.mgr.begin();
+            RollPointer rp2 = ctx.undoMgr.beforeInsert(txn, second, TABLE_ID, INDEX_ID,
+                    key(2), index.keyDef(), index.schema());
+            svc.insertClustered(second, index, row(2), wid, rp2);
+            ctx.mgr.commit(second);
+
+            // 模拟另一个写者已把 persistent head 改到 rp1，但运行期 context 仍认为 rp2 是旧头。
+            MiniTransaction tamper = ctx.mgr.begin();
+            ctx.undoAccess.open(tamper, txn.undoContext().undoFirstPageId(),
+                            cn.zhangyis.db.storage.buf.PageLatchMode.EXCLUSIVE)
+                    .updateLogicalHead(new UndoLogicalHead(UndoNo.of(2), rp2),
+                            new UndoLogicalHead(UndoNo.of(1), rp1), index.keyDef(), index.schema());
+            ctx.mgr.commit(tamper);
+
+            assertThrows(UndoLogicalHeadConflictException.class,
+                    () -> ctx.rollbackService.rollbackToSavepoint(txn, index, savepoint));
+            assertEquals(UndoNo.of(2), txn.undoContext().logicalLastUndoNo());
+            assertEquals(rp2, txn.undoContext().lastRollPointer(),
+                    "marker failure must not publish the target into in-memory context");
         });
     }
 
@@ -270,13 +455,13 @@ class RollbackServiceTest {
             ctx.mgr.commit(second);
             TransactionSavepoint savepoint = ctx.rollbackService.createSavepoint(txn);
 
-            // 模拟分支损坏：下一条 undo 从 rp1 接出，当前链变成 rp3 -> rp1，保存点 rp2 不可达。
-            txn.undoContext().setLastRollPointer(rp1);
             MiniTransaction branch = ctx.mgr.begin();
             RollPointer rp3 = ctx.undoMgr.beforeInsert(txn, branch, TABLE_ID, INDEX_ID,
                     key(3), index.keyDef(), index.schema());
             svc.insertClustered(branch, index, row(3), wid, rp3);
             ctx.mgr.commit(branch);
+            // append 入口会拒绝错误 predecessor；这里显式破坏落盘 payload，构造 rp3 -> rp1、跳过保存点 rp2。
+            ctx.rewriteUndoPredecessor(rp3, rp1);
 
             assertThrows(DatabaseRuntimeException.class,
                     () -> ctx.rollbackService.rollbackToSavepoint(txn, index, savepoint));
@@ -330,6 +515,33 @@ class RollbackServiceTest {
         }
     }
 
+    /** recovery 也必须逐 pointer 短读；旧物理全链 MTR 在 4-frame pool 扫到第五张 undo 页前会耗尽。 */
+    @Test
+    void recoveredRollbackScansMoreUndoPagesThanBufferCapacityAfterReopen() {
+        Path dataPath = dir.resolve("recovery-small-pool-data.ibd");
+        Path undoPath = dir.resolve("recovery-small-pool-undo.ibu");
+        MultiPageRollbackFixture fixture = buildMultiPageRollbackFixture(dataPath, undoPath);
+
+        try (PageStore store = new FileChannelPageStore();
+             BufferPool pool = new LruBufferPool(store, PS, 4)) {
+            MiniTransactionManager mgr = new MiniTransactionManager();
+            DiskSpaceManager disk = new DiskSpaceManager(pool, store, PS);
+            disk.openTablespace(DATA_SPACE, dataPath);
+            disk.openTablespace(UNDO_SPACE, undoPath);
+            IndexPageAccess pageAccess = new IndexPageAccess(pool, PS);
+            UndoLogSegmentAccess undoAccess = new UndoLogSegmentAccess(
+                    pool, PS, new DiskSpaceUndoAllocator(disk), registry);
+            RollbackService rollback = new RollbackService(
+                    new SplitCapableBTreeIndexService(pageAccess, disk, registry), undoAccess,
+                    new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 64),
+                    new TransactionManager(new TransactionSystem()), mgr);
+
+            RollbackSummary summary = rollback.rollbackRecovered(fixture.undoFirstPageId(), fixture.index());
+
+            assertEquals(10, summary.undoRecordsApplied());
+        }
+    }
+
     @Test
     void emptyStatementBoundaryIsAnOwnedOneShotCapability() {
         onPool(ctx -> {
@@ -353,6 +565,13 @@ class RollbackServiceTest {
 
             assertEquals(1, summary.undoRecordsApplied());
             assertEquals(TransactionState.ACTIVE, txn.state());
+            MiniTransaction headRead = ctx.mgr.begin();
+            UndoLogicalHead persisted = ctx.undoAccess.open(
+                    headRead, txn.undoContext().undoFirstPageId(),
+                    cn.zhangyis.db.storage.buf.PageLatchMode.SHARED).logicalHead();
+            ctx.mgr.commit(headRead);
+            assertEquals(UndoLogicalHead.EMPTY, persisted,
+                    "empty statement rollback must persist an empty logical chain head");
             assertThrows(TransactionStateException.class,
                     () -> ctx.rollbackService.rollbackToEmptyStatementBoundary(txn, index, boundary),
                     "the same empty-boundary capability cannot be reused for later writes");
@@ -476,6 +695,16 @@ class RollbackServiceTest {
                     key(3), index.keyDef(), index.schema());
             svc.insertClustered(third, index, row(3), wid, rp3);
             ctx.mgr.commit(third);
+
+            MiniTransaction chainRead = ctx.mgr.begin();
+            UndoLogSegment persisted = ctx.undoAccess.open(
+                    chainRead, txn.undoContext().undoFirstPageId(),
+                    cn.zhangyis.db.storage.buf.PageLatchMode.SHARED);
+            assertEquals(new UndoLogicalHead(UndoNo.of(3), rp3), persisted.logicalHead());
+            assertEquals(rp1, persisted.readRecord(rp3, index.keyDef(), index.schema()).prevRollPointer(),
+                    "new append must reconnect to the persisted rollback boundary, not detached rp2");
+            assertEquals(UndoNo.of(3), persisted.logLastUndoNo(), "physical undoNo high-water never rewinds");
+            ctx.mgr.commit(chainRead);
 
             RollbackSummary summary = ctx.rollbackService.rollback(txn, index);
 
@@ -787,11 +1016,13 @@ class RollbackServiceTest {
         final UndoLogManager undoMgr;
         final TransactionManager txnMgr = new TransactionManager(new TransactionSystem());
         final RollbackService rollbackService;
+        final BufferPool pool;
         private SegmentRef leafSegment;
         private SegmentRef nonLeafSegment;
         private PageId rootPageId;
 
         private Ctx(PageStore store, BufferPool pool) {
+            this.pool = pool;
             this.disk = new DiskSpaceManager(pool, store, PS);
             this.access = new IndexPageAccess(pool, PS);
             this.undoAllocator = new DiskSpaceUndoAllocator(disk);
@@ -799,6 +1030,16 @@ class RollbackServiceTest {
             this.slots = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 64);
             this.undoMgr = new UndoLogManager(undoAccess, slots, UNDO_SPACE, new HistoryList());
             this.rollbackService = new RollbackService(service(), undoAccess, slots, txnMgr, mgr);
+        }
+
+        /** 仅供损坏链测试改写 record payload 内 predecessor；生产 append 永不允许构造该状态。 */
+        private void rewriteUndoPredecessor(RollPointer recordPointer, RollPointer predecessor) {
+            MiniTransaction corrupt = mgr.begin();
+            corrupt.getPage(pool, PageId.of(UNDO_SPACE, recordPointer.pageNo()),
+                            cn.zhangyis.db.storage.buf.PageLatchMode.EXCLUSIVE)
+                    .writeBytes(recordPointer.offset() + Short.BYTES + UNDO_PREV_POINTER_IN_PAYLOAD,
+                            predecessor.encode());
+            mgr.commit(corrupt);
         }
 
         private SplitCapableBTreeIndexService service() {

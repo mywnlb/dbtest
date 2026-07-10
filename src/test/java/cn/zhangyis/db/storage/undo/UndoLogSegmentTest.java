@@ -1,5 +1,6 @@
 package cn.zhangyis.db.storage.undo;
 
+import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageSize;
@@ -18,6 +19,7 @@ import cn.zhangyis.db.storage.fsp.exception.NoFreeSpaceException;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
 import cn.zhangyis.db.storage.redo.PageBytesRecord;
+import cn.zhangyis.db.storage.redo.RedoLogBatch;
 import cn.zhangyis.db.storage.redo.RedoRecord;
 import cn.zhangyis.db.storage.redo.UndoMetadataDeltaKind;
 import cn.zhangyis.db.storage.redo.UndoMetadataDeltaRecord;
@@ -75,6 +77,10 @@ class UndoLogSegmentTest {
                 1L, 9L, List.of(new ColumnValue.IntValue(id)), prev);
     }
 
+    private static boolean rangesOverlap(int leftOffset, int leftLength, int rightOffset, int rightLength) {
+        return leftOffset < rightOffset + rightLength && rightOffset < leftOffset + leftLength;
+    }
+
     @Test
     void createAppendReadBackSinglePage() {
         onSegment(seg -> {
@@ -86,15 +92,114 @@ class UndoLogSegmentTest {
             assertEquals(r, seg.readRecord(rp, keyDef(), schema()));
             assertEquals(1L, seg.logRecordCount());
             assertEquals(1L, seg.logLastUndoNo().value());
+            assertEquals(new UndoLogicalHead(UndoNo.of(1), rp), seg.logicalHead(),
+                    "append must publish the record as the persistent logical chain head");
+        });
+    }
+
+    /** 部分回滚只移动逻辑头，物理 record 计数和 append 高水位必须保留。 */
+    @Test
+    void updateLogicalHeadKeepsPhysicalAppendHighWater() {
+        onSegment(seg -> {
+            RollPointer rp1 = seg.append(rec(1, 100, RollPointer.NULL), keyDef(), schema());
+            RollPointer rp2 = seg.append(rec(2, 101, rp1), keyDef(), schema());
+            assertEquals(new UndoLogicalHead(UndoNo.of(2), rp2), seg.logicalHead());
+
+            seg.updateLogicalHead(
+                    new UndoLogicalHead(UndoNo.of(2), rp2),
+                    new UndoLogicalHead(UndoNo.of(1), rp1),
+                    keyDef(), schema());
+
+            assertEquals(new UndoLogicalHead(UndoNo.of(1), rp1), seg.logicalHead());
+            assertEquals(2L, seg.logRecordCount());
+            assertEquals(UndoNo.of(2), seg.logLastUndoNo());
+            assertEquals(rec(2, 101, rp1), seg.readRecord(rp2, keyDef(), schema()),
+                    "rolled-back branch remains physically readable until segment purge");
+        });
+    }
+
+    /** append 的事务、undoNo 和 predecessor 必须在任何槽写入前校验，失败不能留下无 redo 的 orphan bytes。 */
+    @Test
+    void appendRejectsBrokenLogicalChainBeforeMutation() {
+        onSegment(seg -> {
+            RollPointer rp1 = seg.append(rec(1, 100, RollPointer.NULL), keyDef(), schema());
+            UndoLogicalHead originalHead = new UndoLogicalHead(UndoNo.of(1), rp1);
+
+            assertThrows(DatabaseValidationException.class,
+                    () -> seg.append(rec(2, 101, RollPointer.NULL), keyDef(), schema()),
+                    "predecessor must equal the persistent logical head");
+            assertThrows(DatabaseValidationException.class,
+                    () -> seg.append(rec(3, 101, rp1), keyDef(), schema()),
+                    "undoNo must advance the physical high-water by exactly one");
+            UndoRecord foreignTxn = UndoRecord.insert(UndoNo.of(2), TransactionId.of(8),
+                    1L, 9L, List.of(new ColumnValue.IntValue(101)), rp1);
+            assertThrows(DatabaseValidationException.class,
+                    () -> seg.append(foreignTxn, keyDef(), schema()));
+
+            assertEquals(1L, seg.logRecordCount());
+            assertEquals(UndoNo.of(1), seg.logLastUndoNo());
+            assertEquals(originalHead, seg.logicalHead());
+            assertEquals(rec(1, 100, RollPointer.NULL), seg.readRecord(rp1, keyDef(), schema()));
+        });
+    }
+
+    /** logical pair 必须由一条 15B metadata delta 覆盖，避免 redo 中出现可拆分的半边界。 */
+    @Test
+    void appendWritesLogicalHeadAsSingleMetadataDelta() {
+        onAccess((mgr, access) -> {
+            MiniTransaction create = mgr.begin();
+            UndoLogSegment created = access.create(create, UNDO_SPACE, TransactionId.of(7));
+            PageId firstPageId = created.firstPageId();
+            mgr.commit(create);
+            int baseline = mgr.redoLogManager().bufferedRecords().size();
+            int baselineBatches = mgr.redoLogManager().bufferedBatches().size();
+
+            MiniTransaction append = mgr.begin();
+            UndoLogSegment writable = access.open(append, firstPageId,
+                    cn.zhangyis.db.storage.buf.PageLatchMode.EXCLUSIVE);
+            RollPointer pointer = writable.append(rec(1, 100, RollPointer.NULL), keyDef(), schema());
+            mgr.commit(append);
+
+            List<RedoRecord> allRecords = mgr.redoLogManager().bufferedRecords();
+            List<RedoRecord> appended = allRecords.subList(baseline, allRecords.size());
+            List<RedoLogBatch> batches = mgr.redoLogManager().bufferedBatches();
+            assertEquals(baselineBatches + 1, batches.size());
+            assertEquals(appended, batches.getLast().records(),
+                    "payload, physical high-water and logical head must share one MTR redo batch");
+            List<UndoMetadataDeltaRecord> headDeltas = appended.stream()
+                    .filter(UndoMetadataDeltaRecord.class::isInstance)
+                    .map(UndoMetadataDeltaRecord.class::cast)
+                    .filter(delta -> delta.pageId().equals(firstPageId)
+                            && delta.kind() == UndoMetadataDeltaKind.UNDO_LOG_HEADER_FIELD
+                            && delta.offset() == UndoPageLayout.LOGICAL_LAST_UNDO_NO)
+                    .toList();
+            byte[] expected = ByteBuffer.allocate(Long.BYTES + RollPointer.BYTES)
+                    .putLong(1L).put(pointer.encode()).array();
+            assertEquals(1, headDeltas.size());
+            assertTrue(Arrays.equals(expected, headDeltas.getFirst().afterImage()));
+            assertTrue(appended.stream().anyMatch(record -> record instanceof UndoRecordPayloadRecord payload
+                            && payload.pageId().equals(PageId.of(UNDO_SPACE, pointer.pageNo()))
+                            && payload.undoNo().equals(UndoNo.of(1))),
+                    "the same batch must contain the appended undo record payload");
+            assertTrue(appended.stream().anyMatch(record -> record instanceof UndoMetadataDeltaRecord delta
+                            && delta.pageId().equals(firstPageId)
+                            && delta.offset() == UndoPageLayout.LOG_LAST_UNDO_NO
+                            && ByteBuffer.wrap(delta.afterImage()).getLong() == 1L),
+                    "the same batch must contain the physical append high-water");
+            assertFalse(appended.stream().anyMatch(record -> record instanceof PageBytesRecord bytes
+                            && bytes.pageId().equals(firstPageId)
+                            && rangesOverlap(bytes.offset(), bytes.bytes().length,
+                                    UndoPageLayout.LOGICAL_LAST_UNDO_NO, expected.length)),
+                    "logical head metadata delta must replace its overlapping physical PAGE_BYTES");
         });
     }
 
     @Test
     void logHeaderCountsAdvancePerAppend() {
         onSegment(seg -> {
-            seg.append(rec(1, 100, RollPointer.NULL), keyDef(), schema());
-            seg.append(rec(2, 101, RollPointer.NULL), keyDef(), schema());
-            seg.append(rec(3, 102, RollPointer.NULL), keyDef(), schema());
+            RollPointer rp1 = seg.append(rec(1, 100, RollPointer.NULL), keyDef(), schema());
+            RollPointer rp2 = seg.append(rec(2, 101, rp1), keyDef(), schema());
+            seg.append(rec(3, 102, rp2), keyDef(), schema());
             assertEquals(3L, seg.logRecordCount());
             assertEquals(3L, seg.logLastUndoNo().value());
         });
@@ -103,11 +208,11 @@ class UndoLogSegmentTest {
     @Test
     void forEachRecordReturnsAllInOrderSinglePage() {
         onSegment(seg -> {
-            seg.append(rec(1, 100, RollPointer.NULL), keyDef(), schema());
-            seg.append(rec(2, 101, RollPointer.NULL), keyDef(), schema());
+            RollPointer rp1 = seg.append(rec(1, 100, RollPointer.NULL), keyDef(), schema());
+            seg.append(rec(2, 101, rp1), keyDef(), schema());
             List<UndoRecord> got = new ArrayList<>();
             seg.forEachRecord(got::add, keyDef(), schema());
-            assertEquals(List.of(rec(1, 100, RollPointer.NULL), rec(2, 101, RollPointer.NULL)), got);
+            assertEquals(List.of(rec(1, 100, RollPointer.NULL), rec(2, 101, rp1)), got);
         });
     }
 
@@ -203,16 +308,16 @@ class UndoLogSegmentTest {
     void growthAllocatesLinksNewPageAndReadsAcross() {
         onSegment(seg -> {
             RollPointer rp1 = seg.append(bigRec(1, bigKey(1), RollPointer.NULL), bigKeyDef(), bigSchema());
-            seg.append(bigRec(2, bigKey(2), RollPointer.NULL), bigKeyDef(), bigSchema());
-            RollPointer rp3 = seg.append(bigRec(3, bigKey(3), RollPointer.NULL), bigKeyDef(), bigSchema());
-            RollPointer rp4 = seg.append(bigRec(4, bigKey(4), RollPointer.NULL), bigKeyDef(), bigSchema());
+            RollPointer rp2 = seg.append(bigRec(2, bigKey(2), rp1), bigKeyDef(), bigSchema());
+            RollPointer rp3 = seg.append(bigRec(3, bigKey(3), rp2), bigKeyDef(), bigSchema());
+            RollPointer rp4 = seg.append(bigRec(4, bigKey(4), rp3), bigKeyDef(), bigSchema());
             assertEquals(seg.firstPageId().pageNo(), rp1.pageNo());
             assertEquals(seg.firstPageId().pageNo(), rp3.pageNo());
             assertNotEquals(seg.firstPageId().pageNo(), rp4.pageNo());
             assertEquals(seg.lastPageId().pageNo(), rp4.pageNo());
             assertEquals(4L, seg.logRecordCount());
             assertEquals(4L, seg.logLastUndoNo().value());
-            assertEquals(bigRec(4, bigKey(4), RollPointer.NULL), seg.readRecord(rp4, bigKeyDef(), bigSchema()));
+            assertEquals(bigRec(4, bigKey(4), rp3), seg.readRecord(rp4, bigKeyDef(), bigSchema()));
             assertEquals(bigRec(1, bigKey(1), RollPointer.NULL), seg.readRecord(rp1, bigKeyDef(), bigSchema()));
         });
     }
@@ -236,12 +341,12 @@ class UndoLogSegmentTest {
             MiniTransaction m = mgr.begin();
             UndoLogSegment seg = access.create(m, UNDO_SPACE, TransactionId.of(7));
             RollPointer rp1 = seg.append(bigRec(1, bigKey(1), RollPointer.NULL), bigKeyDef(), bigSchema());
-            seg.append(bigRec(2, bigKey(2), RollPointer.NULL), bigKeyDef(), bigSchema());
-            RollPointer rp3 = seg.append(bigRec(3, bigKey(3), RollPointer.NULL), bigKeyDef(), bigSchema());
+            RollPointer rp2 = seg.append(bigRec(2, bigKey(2), rp1), bigKeyDef(), bigSchema());
+            RollPointer rp3 = seg.append(bigRec(3, bigKey(3), rp2), bigKeyDef(), bigSchema());
             assertEquals(PageNo.of(128), store.currentSizeInPages(UNDO_SPACE),
                     "first undo segment page allocation autoextends once");
 
-            RollPointer rp4 = seg.append(bigRec(4, bigKey(4), RollPointer.NULL), bigKeyDef(), bigSchema());
+            RollPointer rp4 = seg.append(bigRec(4, bigKey(4), rp3), bigKeyDef(), bigSchema());
 
             assertEquals(PageNo.of(192), store.currentSizeInPages(UNDO_SPACE),
                     "0.14b UNDO reservation preextends before grow allocatePage");
@@ -279,15 +384,17 @@ class UndoLogSegmentTest {
             try {
                 UndoLogSegment seg = access.create(m, UNDO_SPACE, TransactionId.of(7));
                 List<UndoRecord> expected = new ArrayList<>();
+                RollPointer previous = RollPointer.NULL;
                 for (long i = 1; i <= 3; i++) {
-                    UndoRecord rec = bigRec(i, bigKey(i), RollPointer.NULL);
+                    UndoRecord rec = bigRec(i, bigKey(i), previous);
                     expected.add(rec);
-                    seg.append(rec, bigKeyDef(), bigSchema());
+                    previous = seg.append(rec, bigKeyDef(), bigSchema());
                 }
                 assertEquals(PageNo.of(128), store.currentSizeInPages(UNDO_SPACE));
 
+                RollPointer head = previous;
                 assertThrows(NoFreeSpaceException.class,
-                        () -> seg.append(bigRec(4, bigKey(4), RollPointer.NULL), bigKeyDef(), bigSchema()));
+                        () -> seg.append(bigRec(4, bigKey(4), head), bigKeyDef(), bigSchema()));
 
                 assertEquals(seg.firstPageId(), seg.lastPageId(),
                         "failed reservation must not allocate or link a chain page");
@@ -311,10 +418,11 @@ class UndoLogSegmentTest {
     void forEachTraversesAllPagesInOrder() {
         onSegment(seg -> {
             List<UndoRecord> expected = new ArrayList<>();
+            RollPointer previous = RollPointer.NULL;
             for (long i = 1; i <= 5; i++) {
-                UndoRecord r = bigRec(i, bigKey(i), RollPointer.NULL);
+                UndoRecord r = bigRec(i, bigKey(i), previous);
                 expected.add(r);
-                seg.append(r, bigKeyDef(), bigSchema());
+                previous = seg.append(r, bigKeyDef(), bigSchema());
             }
             assertNotEquals(seg.firstPageId().pageNo(), seg.lastPageId().pageNo());
             List<UndoRecord> got = new ArrayList<>();
@@ -326,14 +434,15 @@ class UndoLogSegmentTest {
     @Test
     void prevRollPointerChainsAcrossPages() {
         onSegment(seg -> {
-            seg.append(bigRec(1, bigKey(1), RollPointer.NULL), bigKeyDef(), bigSchema());
-            seg.append(bigRec(2, bigKey(2), RollPointer.NULL), bigKeyDef(), bigSchema());
-            RollPointer rp3 = seg.append(bigRec(3, bigKey(3), RollPointer.NULL), bigKeyDef(), bigSchema());
+            RollPointer rp1 = seg.append(
+                    bigRec(1, bigKey(1), RollPointer.NULL), bigKeyDef(), bigSchema());
+            RollPointer rp2 = seg.append(bigRec(2, bigKey(2), rp1), bigKeyDef(), bigSchema());
+            RollPointer rp3 = seg.append(bigRec(3, bigKey(3), rp2), bigKeyDef(), bigSchema());
             RollPointer rp4 = seg.append(bigRec(4, bigKey(4), rp3), bigKeyDef(), bigSchema());
             assertNotEquals(rp3.pageNo(), rp4.pageNo());
             UndoRecord back4 = seg.readRecord(rp4, bigKeyDef(), bigSchema());
             assertEquals(rp3, back4.prevRollPointer());
-            assertEquals(bigRec(3, bigKey(3), RollPointer.NULL),
+            assertEquals(bigRec(3, bigKey(3), rp2),
                     seg.readRecord(back4.prevRollPointer(), bigKeyDef(), bigSchema()));
         });
     }
@@ -359,7 +468,7 @@ class UndoLogSegmentTest {
     void readRecordRejectsPointerFromOtherSegment() {
         onAccess((mgr, access) -> {
             MiniTransaction m1 = mgr.begin();
-            UndoLogSegment segB = access.create(m1, UNDO_SPACE, TransactionId.of(8));
+            UndoLogSegment segB = access.create(m1, UNDO_SPACE, TransactionId.of(7));
             RollPointer rpB = segB.append(rec(1, 100, RollPointer.NULL), keyDef(), schema());
             mgr.commit(m1);
 
@@ -451,7 +560,7 @@ class UndoLogSegmentTest {
     void forEachRecordWithPointerYieldsAddressesThatRoundTrip() {
         onSegment(seg -> {
             RollPointer rp1 = seg.append(rec(1, 100, RollPointer.NULL), keyDef(), schema());
-            RollPointer rp2 = seg.append(rec(2, 101, RollPointer.NULL), keyDef(), schema());
+            RollPointer rp2 = seg.append(rec(2, 101, rp1), keyDef(), schema());
             List<UndoRecord> recs = new ArrayList<>();
             List<RollPointer> pointers = new ArrayList<>();
             seg.forEachRecordWithPointer((r, rp) -> {

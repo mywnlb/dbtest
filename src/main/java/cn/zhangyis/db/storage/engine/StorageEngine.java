@@ -264,28 +264,37 @@ public final class StorageEngine {
         } catch (IOException e) {
             throw new DatabaseRuntimeException("create engine baseDir failed: " + config.baseDir(), e);
         }
-        // redo 后端：默认单 append-only 文件；config 启用文件环时改用 RotatingRedoLogRepository（0.18b），
-        // 并把环作为回收边界端口交给 CheckpointCoordinator。fresh 判定按各自存在性：单文件看 redo.log，文件环看 redo 目录。
+        // redo 后端：默认文件环，也可显式回退单 append-only 文件。文件环 fresh 判定只看稳定命名的 ring 文件；
+        // 无关诊断文件不算 existing，而任意 partial ring 都必须进入完整性校验、不能被当作 fresh 覆盖。
+        // READ_ONLY_VALIDATE 使用只读 data/control channel，启动扫描不能创建、预分配、截断或修复 redo 输入。
         RedoReclaimBoundary redoReclaim;
         boolean fresh;
+        boolean readOnlyValidate = config.recoveryMode() == RecoveryMode.READ_ONLY_VALIDATE;
         if (config.redoRotationEnabled()) {
-            fresh = !Files.exists(config.redoDir());
+            fresh = !RotatingRedoLogRepository.hasAnyRingFiles(config.redoDir());
             rejectFreshRecoveryMode(fresh);
             validateRecoverySkipConfiguration();
-            RotatingRedoLogRepository ring = RedoLogFileRepository.openRing(
-                    config.redoDir(), config.redoRotation().fileCount(), config.redoRotation().fileBytes());
+            RotatingRedoLogRepository ring = readOnlyValidate
+                    ? RedoLogFileRepository.openRingReadOnly(
+                            config.redoDir(), config.redoRotation().fileCount(), config.redoRotation().fileBytes())
+                    : RedoLogFileRepository.openRing(
+                            config.redoDir(), config.redoRotation().fileCount(), config.redoRotation().fileBytes());
             this.redoRepo = ring;
             redoReclaim = ring;
         } else {
             fresh = !Files.exists(config.redoFile());
             rejectFreshRecoveryMode(fresh);
             validateRecoverySkipConfiguration();
-            this.redoRepo = RedoLogFileRepository.open(config.redoFile());
+            this.redoRepo = readOnlyValidate
+                    ? RedoLogFileRepository.openReadOnly(config.redoFile())
+                    : RedoLogFileRepository.open(config.redoFile());
             redoReclaim = null;
         }
         this.redo = RedoLogManager.durable(redoRepo);
-        this.checkpointStore = RedoCheckpointStore.open(config.redoControlFile());
-        if (config.recoveryMode() == RecoveryMode.READ_ONLY_VALIDATE) {
+        this.checkpointStore = readOnlyValidate
+                ? RedoCheckpointStore.openReadOnly(config.redoControlFile())
+                : RedoCheckpointStore.open(config.redoControlFile());
+        if (readOnlyValidate) {
             if (Files.exists(config.transactionRecoveryCheckpointFile())) {
                 this.transactionRecoveryCheckpointStore = TransactionRecoveryCheckpointStore.openReadOnly(
                         config.transactionRecoveryCheckpointFile());

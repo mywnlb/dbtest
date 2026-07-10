@@ -29,7 +29,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class RedoRuntimeHardeningTest {
 
-    private static final int MAGIC = 0x524C4731;
+    private static final int FRAME_MAGIC = 0x524C4731;
     private static final PageSize PS = PageSize.ofBytes(16 * 1024);
     private static final SpaceId SPACE = SpaceId.of(1);
     private static final PageId P = PageId.of(SPACE, PageNo.of(3));
@@ -65,20 +65,17 @@ class RedoRuntimeHardeningTest {
     }
 
     @Test
-    void readerWrapsCompleteInvalidPayloadAsRedoCorruption() throws Exception {
+    void repositoryRejectsChecksumValidBlockWithInvalidFramePayload() throws Exception {
         Path redoPath = dir.resolve("redo.log");
         byte[] payload = payloadWithUnknownPageType();
         ByteBuffer frame = ByteBuffer.allocate(12 + payload.length);
-        frame.putInt(MAGIC);
+        frame.putInt(FRAME_MAGIC);
         frame.putInt(payload.length);
         frame.putInt(crc32(payload));
         frame.put(payload);
-        Files.write(redoPath, frame.array());
+        Files.write(redoPath, singleBlock(frame.array()));
 
-        try (RedoLogFileRepository repo = RedoLogFileRepository.open(redoPath)) {
-            RedoRecoveryReader reader = new RedoRecoveryReader(repo);
-            assertThrows(RedoLogCorruptedException.class, reader::readBatches);
-        }
+        assertThrows(RedoLogCorruptedException.class, () -> RedoLogFileRepository.open(redoPath));
     }
 
     private PageStore createStore() {
@@ -105,5 +102,24 @@ class RedoRuntimeHardeningTest {
         CRC32 crc = new CRC32();
         crc.update(bytes);
         return (int) crc.getValue();
+    }
+
+    /** 把手工构造的完整 RLG1 frame 封入一个 CRC 正确的 LogBlock，确保失败来自内层语义而非 torn tail。 */
+    private static byte[] singleBlock(byte[] frame) {
+        byte[] bytes = new byte[RedoLogBlockCodec.BLOCK_BYTES];
+        ByteBuffer block = ByteBuffer.wrap(bytes);
+        block.putInt(RedoLogBlockCodec.MAGIC);
+        block.putInt(RedoLogBlockCodec.FORMAT_VERSION);
+        block.putLong(0L);
+        block.putLong(0L);
+        block.putShort((short) frame.length);
+        block.putShort((short) RedoLogBlockCodec.FIRST_RECORD_OFFSET);
+        block.putInt(RedoLogBlockCodec.FLAG_START | RedoLogBlockCodec.FLAG_END);
+        block.put(frame);
+        block.putInt(RedoLogBlockCodec.TRAILER_BLOCK_NO_OFFSET, 0);
+        CRC32 crc = new CRC32();
+        crc.update(bytes, 0, RedoLogBlockCodec.CHECKSUM_OFFSET);
+        block.putInt(RedoLogBlockCodec.CHECKSUM_OFFSET, (int) crc.getValue());
+        return bytes;
     }
 }

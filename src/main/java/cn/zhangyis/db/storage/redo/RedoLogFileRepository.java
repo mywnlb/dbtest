@@ -1,6 +1,7 @@
 package cn.zhangyis.db.storage.redo;
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
+import cn.zhangyis.db.domain.Lsn;
 
 import java.nio.file.Path;
 import java.util.List;
@@ -9,15 +10,22 @@ import java.util.List;
  * Redo 物理文件仓储角色：向 redo writer/flusher/recovery 暴露稳定的「追加批次 / fsync / 顺序扫描」能力，
  * 屏蔽底层是单文件还是文件环。
  *
- * <p>两种实现共用 {@link RedoBatchFrameCodec} 的帧格式，因此一种实现写出的 redo 可被另一种实现在 crash recovery 时读回：
+ * <p>两种实现共用 {@link RedoLogBlockCodec} / {@link RedoLogBlockScanner}，内部都嵌套
+ * {@link RedoBatchFrameCodec}；它们共享 block/batch 语义，但物理容器不同（ring 文件额外带 v2 header），
+ * 不把单个 ring 文件伪装成 standalone 单文件读取：
  * <ul>
- *   <li>{@link SingleFileRedoLogRepository}：R1 单 append-only 文件，简单但无界增长，保留给现有测试与最小场景；</li>
- *   <li>{@link RotatingRedoLogRepository}：0.18 文件环，轮转 + checkpoint 回收，长跑下占用有界。</li>
+ *   <li>{@link SingleFileRedoLogRepository}：无容器 header 的 append-only LogBlock 文件，保留给 opt-out/测试；</li>
+ *   <li>{@link RotatingRedoLogRepository}：v2 header 文件环，轮转 + checkpoint 回收，长跑下占用有界。</li>
  * </ul>
  *
  * <p>本接口只承载两种实现都具备的公共能力；文件环特有的回收边界推进等在其具体类上，避免接口被单一实现的细节污染。
  */
 public interface RedoLogFileRepository extends AutoCloseable {
+
+    /** 当前 repository 写入/扫描的 redo data 持久格式版本。 */
+    default int formatVersion() {
+        return RedoLogBlockCodec.FORMAT_VERSION;
+    }
 
     /**
      * 追加一个完整 redo 批次。调用方负责按 LSN 顺序调用；实现只保证单批 bytes 原样落到底层文件。
@@ -36,12 +44,25 @@ public interface RedoLogFileRepository extends AutoCloseable {
      */
     List<RedoLogBatch> readBatches();
 
+    /**
+     * 返回一次恢复扫描及其 retained 逻辑边界。默认实现适用于从 LSN 0 开始的单文件和测试仓储；
+     * 文件环覆盖此方法，以便在“仅剩 torn batch”时仍保留非零 header startLsn。
+     */
+    default RedoRecoveryScan readRecoveryScan() {
+        List<RedoLogBatch> batches = readBatches();
+        if (batches.isEmpty()) {
+            return new RedoRecoveryScan(List.of(), Lsn.of(0), Lsn.of(0));
+        }
+        return new RedoRecoveryScan(batches, batches.getFirst().range().start(),
+                batches.getLast().range().end());
+    }
+
     @Override
     void close();
 
     /**
-     * 打开或创建单 redo 文件仓储（R1 行为）。保留为静态工厂，使既有 {@code RedoLogFileRepository.open(path)} 调用点
-     * 在接口化后仍可编译，并默认得到单文件实现。
+     * 打开或创建 standalone LogBlock v1 单文件仓储。保留静态工厂，使既有
+     * {@code RedoLogFileRepository.open(path)} 调用点继续得到单文件实现。
      *
      * @param path redo 文件路径。
      * @return 单文件仓储。
@@ -53,15 +74,25 @@ public interface RedoLogFileRepository extends AutoCloseable {
         return SingleFileRedoLogRepository.open(path);
     }
 
+    /** 只读打开已存在单 redo 文件；不创建或修复恢复输入。 */
+    static RedoLogFileRepository openReadOnly(Path path) {
+        return SingleFileRedoLogRepository.openReadOnly(path);
+    }
+
     /**
-     * 打开或创建 redo 文件环仓储（0.18）。
+     * 打开或创建带 v2 header 的 redo 文件环仓储。
      *
      * @param dir                  redo 目录。
      * @param fileCount            文件数（≥1）。
-     * @param maxFrameBytesPerFile 单文件帧容量上限（不含文件头，&gt;0）。
+     * @param fileBytes 单文件 LogBlock 区容量（不含文件头，至少 512B 且按 512B 对齐）。
      * @return 文件环仓储。
      */
-    static RotatingRedoLogRepository openRing(Path dir, int fileCount, long maxFrameBytesPerFile) {
-        return RotatingRedoLogRepository.open(dir, fileCount, maxFrameBytesPerFile);
+    static RotatingRedoLogRepository openRing(Path dir, int fileCount, long fileBytes) {
+        return RotatingRedoLogRepository.open(dir, fileCount, fileBytes);
+    }
+
+    /** 只读打开完整 existing redo ring；不创建缺失目录/文件或修复 torn tail。 */
+    static RotatingRedoLogRepository openRingReadOnly(Path dir, int fileCount, long fileBytes) {
+        return RotatingRedoLogRepository.openReadOnly(dir, fileCount, fileBytes);
     }
 }

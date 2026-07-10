@@ -26,7 +26,10 @@ import cn.zhangyis.db.storage.redo.RedoApplyContext;
 import cn.zhangyis.db.storage.redo.RedoApplyDispatcher;
 import cn.zhangyis.db.storage.redo.RedoCheckpointLabel;
 import cn.zhangyis.db.storage.redo.RedoCheckpointStore;
+import cn.zhangyis.db.storage.redo.RedoLogBatch;
+import cn.zhangyis.db.storage.redo.RedoLogCorruptedException;
 import cn.zhangyis.db.storage.redo.RedoLogFileRepository;
+import cn.zhangyis.db.storage.redo.RedoLogFormatException;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
 import cn.zhangyis.db.storage.redo.TransactionStateDeltaReason;
 import cn.zhangyis.db.storage.redo.TransactionStateDeltaRecord;
@@ -58,6 +61,28 @@ class CrashRecoveryServiceTest {
 
     @TempDir
     Path dir;
+
+    /** redo-control 声明的 data format 必须与实际 repository 一致，恢复不得跨格式猜测。 */
+    @Test
+    void redoControlAndDataFormatMismatchFailsBeforeReplay() {
+        Path redoPath = dir.resolve("format-mismatch-redo.log");
+        try (PageStore store = new FileChannelPageStore();
+             RedoLogFileRepository delegate = RedoLogFileRepository.open(redoPath);
+             RedoCheckpointStore checkpointStore = RedoCheckpointStore.open(
+                     dir.resolve("format-mismatch-control"))) {
+            RedoLogFileRepository mismatched = new VersionedRepositoryView(delegate, 2);
+            RecoveryTrafficGate gate = new RecoveryTrafficGate();
+            CrashRecoveryService service = new CrashRecoveryService(gate);
+            RecoveryRequest request = RecoveryRequest.normal(checkpointStore, mismatched,
+                    RedoApplyDispatcher.pageDispatcher(), new RedoApplyContext(store, PS));
+
+            RecoveryStartupException failure = assertThrows(
+                    RecoveryStartupException.class, () -> service.recover(request));
+
+            assertTrue(failure.getCause() instanceof RedoLogFormatException);
+            assertEquals(RecoveryState.FAILED, gate.state());
+        }
+    }
 
     @Test
     void recoverRepairsDoublewriteBeforeCheckpointAwareRedoReplay() {
@@ -273,13 +298,10 @@ class CrashRecoveryServiceTest {
 
     @Test
     void recoverFailsClosedWhenRedoIsCorrupted() throws Exception {
-        Path redoPath = dir.resolve("bad-redo.log");
-        Files.write(redoPath, new byte[]{0x12, 0x34, 0x56, 0x78, 0, 0, 0, 1, 0, 0, 0, 0});
-
         try (PageStore store = new FileChannelPageStore();
-             RedoLogFileRepository redoRepo = RedoLogFileRepository.open(redoPath);
              RedoCheckpointStore checkpointStore = RedoCheckpointStore.open(dir.resolve("redo-control"))) {
             store.create(SPACE, dir.resolve("s.ibd"), PS, PageNo.of(4));
+            RedoLogFileRepository redoRepo = new CorruptingRepository();
             RecoveryTrafficGate gate = new RecoveryTrafficGate();
             Path progressPath = dir.resolve("bad-redo-progress.jsonl");
             RecoveryProgressJournal journal = RecoveryProgressJournal.persistent(progressPath);
@@ -677,5 +699,66 @@ class CrashRecoveryServiceTest {
                                        RecoveryState state) {
         return events.stream().anyMatch(event ->
                 event.kind() == kind && event.stageName() == stageName && event.state() == state);
+    }
+
+    /** 在不伪造物理文件的前提下，模拟 repository 报告不同 redo data format。 */
+    private static final class VersionedRepositoryView implements RedoLogFileRepository {
+
+        private final RedoLogFileRepository delegate;
+        private final int formatVersion;
+
+        private VersionedRepositoryView(RedoLogFileRepository delegate, int formatVersion) {
+            this.delegate = delegate;
+            this.formatVersion = formatVersion;
+        }
+
+        @Override
+        public int formatVersion() {
+            return formatVersion;
+        }
+
+        @Override
+        public void append(RedoLogBatch batch) {
+            delegate.append(batch);
+        }
+
+        @Override
+        public void force() {
+            delegate.force();
+        }
+
+        @Override
+        public List<RedoLogBatch> readBatches() {
+            return delegate.readBatches();
+        }
+
+        @Override
+        public void close() {
+            // delegate 由测试自己的 try-with-resources 释放，view 不拥有其生命周期。
+        }
+    }
+
+    /** 模拟 repository 已在物理扫描中识别出非 torn-tail 的致命损坏。 */
+    private static final class CorruptingRepository implements RedoLogFileRepository {
+
+        @Override
+        public void append(RedoLogBatch batch) {
+            throw new AssertionError("recovery must not append before redo scan succeeds");
+        }
+
+        @Override
+        public void force() {
+            throw new AssertionError("recovery must not force before redo scan succeeds");
+        }
+
+        @Override
+        public List<RedoLogBatch> readBatches() {
+            throw new RedoLogCorruptedException("synthetic semantic corruption");
+        }
+
+        @Override
+        public void close() {
+            // 内存 stub 无资源。
+        }
     }
 }

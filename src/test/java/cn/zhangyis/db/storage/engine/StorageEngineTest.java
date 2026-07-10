@@ -65,7 +65,9 @@ import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.function.BooleanSupplier;
 
@@ -439,7 +441,7 @@ class StorageEngineTest {
     }
 
     @Test
-    void existingOpenWithReadOnlyValidatePublishesReadOnlyEngineAndRejectsAccessors() {
+    void existingOpenWithReadOnlyValidatePublishesReadOnlyEngineAndRejectsAccessors() throws Exception {
         Path dataPath = dir.resolve("data-readonly-validate.ibd");
         EngineConfig cfg = configWithRecoveryTablespace(dataPath);
 
@@ -447,6 +449,7 @@ class StorageEngineTest {
         clean.open();
         createClusteredIndex(clean, dataPath);
         clean.close();
+        Map<String, byte[]> redoBefore = snapshotRedoInputs(cfg);
 
         StorageEngine readOnly = new StorageEngine(cfg.withRecoveryMode(RecoveryMode.READ_ONLY_VALIDATE));
         readOnly.open();
@@ -470,6 +473,7 @@ class StorageEngineTest {
 
         readOnly.close();
         assertEquals(EngineState.CLOSED, readOnly.state());
+        assertRedoInputsEqual(redoBefore, snapshotRedoInputs(cfg));
     }
 
     /** 只读诊断必须报告 NORMAL 会遇到的事务 sidecar 缺失，同时不得为诊断偷偷重建空文件。 */
@@ -532,6 +536,24 @@ class StorageEngineTest {
         assertFalse(Files.exists(cfg.redoDir()));
         assertFalse(Files.exists(cfg.undoFile()));
         assertFalse(Files.exists(cfg.doublewriteFile()));
+    }
+
+    /** redo 目录里的无关诊断文件不能把 fresh 实例伪装成 existing ring。 */
+    @Test
+    void readOnlyValidateTreatsRedoDirectoryWithoutRingFilesAsFresh() throws Exception {
+        EngineConfig cfg = config().withRecoveryMode(RecoveryMode.READ_ONLY_VALIDATE);
+        Files.createDirectories(cfg.redoDir());
+        Path unrelated = cfg.redoDir().resolve("operator-note.txt");
+        Files.writeString(unrelated, "keep");
+        StorageEngine engine = new StorageEngine(cfg);
+
+        assertThrows(DatabaseValidationException.class, engine::open);
+
+        try (var entries = Files.list(cfg.redoDir())) {
+            assertEquals(List.of(unrelated), entries.sorted().toList());
+        }
+        assertFalse(Files.exists(cfg.redoControlFile()));
+        assertFalse(Files.exists(cfg.undoFile()));
     }
 
     @Test
@@ -1021,6 +1043,28 @@ class StorageEngineTest {
             System.arraycopy(page, offset, slice, 0, length);
             return slice;
         }
+    }
+
+    /** 只快照本切片约束的 redo data/control 输入；progress/doublewrite 诊断文件不在此集合。 */
+    private static Map<String, byte[]> snapshotRedoInputs(EngineConfig cfg) throws Exception {
+        Map<String, byte[]> snapshot = new LinkedHashMap<>();
+        snapshot.put("redo-control", Files.readAllBytes(cfg.redoControlFile()));
+        if (cfg.redoRotationEnabled()) {
+            try (var files = Files.list(cfg.redoDir())) {
+                for (Path path : files.filter(Files::isRegularFile).sorted().toList()) {
+                    snapshot.put(path.getFileName().toString(), Files.readAllBytes(path));
+                }
+            }
+        } else {
+            snapshot.put("redo.log", Files.readAllBytes(cfg.redoFile()));
+        }
+        return snapshot;
+    }
+
+    private static void assertRedoInputsEqual(Map<String, byte[]> expected, Map<String, byte[]> actual) {
+        assertEquals(expected.keySet(), actual.keySet());
+        expected.forEach((name, bytes) -> assertArrayEquals(
+                bytes, actual.get(name), "READ_ONLY_VALIDATE changed redo input " + name));
     }
 
     private static boolean awaitUntil(BooleanSupplier condition, Duration timeout) {

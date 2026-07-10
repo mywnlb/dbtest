@@ -40,7 +40,7 @@ final class RedoBatchFrameCodec {
     /** 防止损坏 length 触发大内存分配；教学实现单批 32MiB 足够。 */
     static final int MAX_PAYLOAD_BYTES = 32 * 1024 * 1024;
     /** payload 内层头：startLsn(8) + endLsn(8) + recordCount(4)。 */
-    private static final int PAYLOAD_HEADER_BYTES = 20;
+    static final int PAYLOAD_HEADER_BYTES = 20;
     /** 最小 record：PAGE_INIT，tag(1) + pageId(space 4 + pageNo 8) + type(4)。 */
     private static final int MIN_RECORD_BYTES = 17;
 
@@ -56,6 +56,10 @@ final class RedoBatchFrameCodec {
             throw new DatabaseValidationException("redo log batch must not be null");
         }
         byte[] payload = encodePayload(batch);
+        if (payload.length > MAX_PAYLOAD_BYTES) {
+            throw new DatabaseValidationException("redo batch payload exceeds recoverable frame limit: "
+                    + payload.length + " > " + MAX_PAYLOAD_BYTES);
+        }
         ByteBuffer frame = ByteBuffer.allocate(FRAME_HEADER_BYTES + payload.length);
         frame.putInt(MAGIC);
         frame.putInt(payload.length);

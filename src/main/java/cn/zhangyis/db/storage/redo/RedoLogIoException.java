@@ -8,6 +8,12 @@ import cn.zhangyis.db.common.exception.DatabaseRuntimeException;
  */
 public class RedoLogIoException extends DatabaseRuntimeException {
 
+    /** 创建不包装底层异常、但带完整 redo IO 上下文的异常。 */
+    public RedoLogIoException(String message) {
+        super(message);
+    }
+
+    /** 创建并保留底层 IO cause 的异常。 */
     public RedoLogIoException(String message, Throwable cause) {
         super(message, cause);
     }

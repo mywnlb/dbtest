@@ -13,8 +13,10 @@ import cn.zhangyis.db.domain.Lsn;
  * @param checkpointLsn 已持久化发布的恢复起点 LSN。
  * @param currentLsnAtCheckpoint 写 label 时 redo manager 的当前 LSN。
  * @param createdAtMillis label 创建时间，使用调用方注入的 epoch millis，便于测试稳定断言。
+ * @param redoFormatVersion checkpoint 所属 redo data 格式；恢复必须与 repository 声明一致。
  */
-public record RedoCheckpointLabel(Lsn checkpointLsn, Lsn currentLsnAtCheckpoint, long createdAtMillis) {
+public record RedoCheckpointLabel(Lsn checkpointLsn, Lsn currentLsnAtCheckpoint,
+                                  long createdAtMillis, int redoFormatVersion) {
 
     public RedoCheckpointLabel {
         if (checkpointLsn == null || currentLsnAtCheckpoint == null) {
@@ -23,6 +25,10 @@ public record RedoCheckpointLabel(Lsn checkpointLsn, Lsn currentLsnAtCheckpoint,
         if (createdAtMillis < 0) {
             throw new DatabaseValidationException("checkpoint label createdAtMillis must not be negative: "
                     + createdAtMillis);
+        }
+        if (redoFormatVersion <= 0) {
+            throw new DatabaseValidationException(
+                    "redo checkpoint format version must be positive: " + redoFormatVersion);
         }
         if (currentLsnAtCheckpoint.value() < checkpointLsn.value()) {
             throw new DatabaseValidationException("checkpoint current LSN must cover checkpoint LSN: checkpoint="
@@ -34,13 +40,22 @@ public record RedoCheckpointLabel(Lsn checkpointLsn, Lsn currentLsnAtCheckpoint,
      * 创建普通 checkpoint label。使用静态工厂让测试和生产代码表达字段语义，避免三个 long/Lsn 参数混淆。
      */
     public static RedoCheckpointLabel of(Lsn checkpointLsn, Lsn currentLsnAtCheckpoint, long createdAtMillis) {
-        return new RedoCheckpointLabel(checkpointLsn, currentLsnAtCheckpoint, createdAtMillis);
+        return new RedoCheckpointLabel(checkpointLsn, currentLsnAtCheckpoint,
+                createdAtMillis, RedoLogBlockCodec.FORMAT_VERSION);
+    }
+
+    /** control v2 解码入口；版本与 data repository 的匹配由 recovery 编排层再次校验。 */
+    static RedoCheckpointLabel decoded(Lsn checkpointLsn, Lsn currentLsnAtCheckpoint,
+                                       long createdAtMillis, int redoFormatVersion) {
+        return new RedoCheckpointLabel(
+                checkpointLsn, currentLsnAtCheckpoint, createdAtMillis, redoFormatVersion);
     }
 
     /**
      * 空 control 文件或两个 slot 均无效时的安全初始 label。恢复从 redo 文件头开始扫描。
      */
     public static RedoCheckpointLabel initial() {
-        return new RedoCheckpointLabel(Lsn.of(0), Lsn.of(0), 0);
+        return new RedoCheckpointLabel(
+                Lsn.of(0), Lsn.of(0), 0, RedoLogBlockCodec.FORMAT_VERSION);
     }
 }

@@ -7,10 +7,13 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
  * 非空表示启用 {@link cn.zhangyis.db.storage.redo.RotatingRedoLogRepository} 文件环，让长跑下 redo 占用有界。
  *
  * @param fileCount 文件环文件数；要求 ≥2，否则环满时无另一个文件可回收复用。
- * @param fileBytes 单文件帧容量上限（不含文件头）；必须大于引擎可能产生的最大单批 redo，否则该批 append 报配置错误。
+ * @param fileBytes 单文件 LogBlock 区容量（不含文件头）；必须是正的 512B 倍数，且大于引擎可能产生的
+ *                  最大单批 redo block chain，否则该批 append 报配置错误。
  */
 public record RedoRotationConfig(int fileCount, long fileBytes) {
 
+    /** LogBlock v1 固定物理块大小；配置层复述持久格式约束，避免 engine 打开到一半才失败。 */
+    private static final int LOG_BLOCK_BYTES = 512;
     /** 默认文件数：教学实现取 8（InnoDB 量级偏小），与单文件容量配合给出有界但宽裕的 redo 上限。 */
     private static final int DEFAULT_FILE_COUNT = 8;
     /**
@@ -23,8 +26,10 @@ public record RedoRotationConfig(int fileCount, long fileBytes) {
         if (fileCount < 2) {
             throw new DatabaseValidationException("redo rotation fileCount must be >= 2: " + fileCount);
         }
-        if (fileBytes <= 0) {
-            throw new DatabaseValidationException("redo rotation fileBytes must be positive: " + fileBytes);
+        if (fileBytes < LOG_BLOCK_BYTES || fileBytes > Integer.MAX_VALUE
+                || fileBytes % LOG_BLOCK_BYTES != 0) {
+            throw new DatabaseValidationException(
+                    "redo rotation fileBytes must be a 512-byte-aligned int: " + fileBytes);
         }
     }
 

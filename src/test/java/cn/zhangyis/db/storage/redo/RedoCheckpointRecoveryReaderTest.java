@@ -91,4 +91,67 @@ class RedoCheckpointRecoveryReaderTest {
             assertThrows(RedoLogCorruptedException.class, reader::readBatches);
         }
     }
+
+    /**
+     * 文件环回收后，第一条保留批次可以从非零 LSN 开始，但 checkpoint 必须已经覆盖此前区间；
+     * 否则恢复所需 redo 已被回收，不能把缺口误当作“无需 replay”。
+     */
+    @Test
+    void checkpointBeforeFirstRetainedBatchIsReportedAsCorruption() {
+        RedoLogBatch retained = batchAt(100, new PageInitRecord(PAGE, PageType.INDEX));
+        RedoRecoveryReader reader = new RedoRecoveryReader(
+                new StubRedoRepository(List.of(retained)), Lsn.of(99));
+
+        assertThrows(RedoLogCorruptedException.class, reader::readBatches);
+    }
+
+    /**
+     * repository 返回的完整批次必须首尾相接；即使每个批次自身可解码，中间缺失一个 LSN 区间也表示
+     * ring 文件丢失、错误排序或控制信息不一致，recovery 必须 fail closed。
+     */
+    @Test
+    void gapBetweenRetainedBatchesIsReportedAsCorruption() {
+        RedoLogBatch first = batchAt(0, new PageInitRecord(PAGE, PageType.INDEX));
+        RedoLogBatch second = batchAt(first.range().end().value() + 1,
+                new PageBytesRecord(PAGE, PAYLOAD_OFFSET, new byte[]{7}));
+        RedoRecoveryReader reader = new RedoRecoveryReader(
+                new StubRedoRepository(List.of(first, second)), Lsn.of(0));
+
+        assertThrows(RedoLogCorruptedException.class, reader::readBatches);
+    }
+
+    private static RedoLogBatch batchAt(long startLsn, RedoRecord record) {
+        return new RedoLogBatch(new LogRange(
+                Lsn.of(startLsn), Lsn.of(startLsn + record.byteLength())), List.of(record));
+    }
+
+    /** 仅为恢复读取器边界测试提供确定批次，不接触磁盘和写路径。 */
+    private static final class StubRedoRepository implements RedoLogFileRepository {
+
+        private final List<RedoLogBatch> batches;
+
+        private StubRedoRepository(List<RedoLogBatch> batches) {
+            this.batches = List.copyOf(batches);
+        }
+
+        @Override
+        public void append(RedoLogBatch batch) {
+            throw new AssertionError("recovery reader must not append redo");
+        }
+
+        @Override
+        public void force() {
+            throw new AssertionError("recovery reader must not force redo");
+        }
+
+        @Override
+        public List<RedoLogBatch> readBatches() {
+            return batches;
+        }
+
+        @Override
+        public void close() {
+            // 内存 stub 无需释放资源。
+        }
+    }
 }

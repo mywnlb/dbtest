@@ -56,6 +56,16 @@ class EngineConfigTest {
         assertFalse(single.redoRotationEnabled(), "withSingleFileRedo 显式回退单文件");
     }
 
+    /** LogBlock ring 的容量单位是完整 512B block，配置不能留下永远不可用的碎片尾部。 */
+    @Test
+    void redoRotationCapacityMustBePositive512ByteMultiple() {
+        assertThrows(DatabaseValidationException.class, () -> new RedoRotationConfig(2, 511));
+        assertThrows(DatabaseValidationException.class, () -> new RedoRotationConfig(2, 513));
+        assertThrows(DatabaseValidationException.class,
+                () -> new RedoRotationConfig(2, (long) Integer.MAX_VALUE + 1));
+        assertEquals(512, new RedoRotationConfig(2, 512).fileBytes());
+    }
+
     @Test
     void bufferPoolInstanceCountDefaultsToOneAndIsConfigurable() {
         EngineConfig c = valid();

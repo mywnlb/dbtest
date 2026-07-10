@@ -39,9 +39,9 @@ class RotatingRedoLogRepositoryTest {
         return new RedoLogBatch(new LogRange(Lsn.of(start), Lsn.of(start + rec.byteLength())), List.of(rec));
     }
 
-    /** 单批帧在磁盘上的字节数（含外层 frame header），用于把文件容量设成"恰好一批"。 */
+    /** 单批 LogBlock chain 的物理字节数，用于把文件容量设成“恰好一批”。 */
     private static int oneFrameBytes() {
-        return RedoBatchFrameCodec.encodeFrame(batch(0)).remaining();
+        return RedoLogBlockCodec.encodeBatch(batch(0), 0).byteLength();
     }
 
     @Test

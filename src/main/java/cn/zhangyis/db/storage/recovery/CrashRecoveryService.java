@@ -1,6 +1,4 @@
 package cn.zhangyis.db.storage.recovery;
-import cn.zhangyis.db.storage.fil.exception.TablespaceCorruptedException;
-
 
 import cn.zhangyis.db.common.exception.DatabaseRuntimeException;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
@@ -9,6 +7,7 @@ import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.SpaceId;
+import cn.zhangyis.db.storage.fil.exception.TablespaceCorruptedException;
 import cn.zhangyis.db.storage.fil.io.PageStore;
 import cn.zhangyis.db.storage.flush.doublewrite.DoublewriteRecoveryResult;
 import cn.zhangyis.db.storage.fsp.header.SpaceHeaderPhysical;
@@ -16,6 +15,7 @@ import cn.zhangyis.db.storage.fsp.header.SpaceHeaderRawCodec;
 import cn.zhangyis.db.storage.redo.RedoApplySummary;
 import cn.zhangyis.db.storage.redo.RedoCheckpointLabel;
 import cn.zhangyis.db.storage.redo.RedoLogBatch;
+import cn.zhangyis.db.storage.redo.RedoLogFormatException;
 import cn.zhangyis.db.storage.redo.RedoRecoveryReader;
 
 import java.nio.ByteBuffer;
@@ -79,8 +79,11 @@ public final class CrashRecoveryService {
                 gate.closeForRecovery();
                 tracker.complete(state, Lsn.of(0));
 
+                RedoCheckpointLabel checkpoint = request.checkpointStore().readLatest();
+                validateRedoFormat(request, checkpoint);
+
                 if (request.mode() == RecoveryMode.READ_ONLY_VALIDATE) {
-                    return recoverReadOnlyValidate(request, tracker);
+                    return recoverReadOnlyValidate(request, tracker, checkpoint);
                 }
 
                 tracker.begin(RecoveryStageName.DOUBLEWRITE_REPAIR);
@@ -88,7 +91,6 @@ public final class CrashRecoveryService {
                 tracker.complete(state, Lsn.of(0), skipDetail("skippedDoublewritePages",
                         doublewriteSummary.skippedPageCount(), request.skipPolicy()));
 
-                RedoCheckpointLabel checkpoint = request.checkpointStore().readLatest();
                 if (request.transactionRecoveryContext() != null) {
                     // sidecar 必须在任何 TRX_STATE_DELTA 交付前校验并建立 counter 基线；dispatcher 中的 sink
                     // 引用同一 context，故 applyAll 完成后 snapshot 包含完整 post-checkpoint 顺序证据。
@@ -182,12 +184,12 @@ public final class CrashRecoveryService {
      * {@code RedoApplyDispatcher.applyAll}、redo 边界安装、undo 续作、空间 reconcile、事务 rollback 和
      * {@code PageStore.forceAll}，确保调用方可以用同一份文件做灾难诊断而不改变磁盘内容。
      */
-    private RecoveryReport recoverReadOnlyValidate(RecoveryRequest request, RecoveryStageTracker tracker) {
+    private RecoveryReport recoverReadOnlyValidate(RecoveryRequest request, RecoveryStageTracker tracker,
+                                                   RedoCheckpointLabel checkpoint) {
         tracker.begin(RecoveryStageName.DOUBLEWRITE_REPAIR);
         DoublewriteRepairSummary doublewriteSummary = validateDoublewritePages(request);
         tracker.complete(state, Lsn.of(0));
 
-        RedoCheckpointLabel checkpoint = request.checkpointStore().readLatest();
         if (request.transactionRecoveryContext() != null) {
             // 只读诊断仍必须证明 sidecar 覆盖 redo checkpoint；initialize 只构造私有内存表，既不 apply delta，
             // 也不发布 counter/rollback/history 或写文件。
@@ -212,6 +214,20 @@ public final class CrashRecoveryService {
         lastReport = report;
         lastError = null;
         return report;
+    }
+
+    /**
+     * 在 doublewrite/page apply 等任何恢复写发生前，校验 redo-control 与 redo data 的持久格式属于同一代。
+     * 本切片明确拒绝旧 RLG1/control v1 和双格式猜测；若 label 与 repository 声明不一致，恢复必须 fail closed，
+     * 不能把同一 LSN 按错误的物理编码解释。
+     */
+    private static void validateRedoFormat(RecoveryRequest request, RedoCheckpointLabel checkpoint) {
+        int controlFormat = checkpoint.redoFormatVersion();
+        int dataFormat = request.redoRepository().formatVersion();
+        if (controlFormat != dataFormat) {
+            throw new RedoLogFormatException("redo control/data format mismatch: control="
+                    + controlFormat + " data=" + dataFormat);
+        }
     }
 
     /** 当前 service 状态。 */

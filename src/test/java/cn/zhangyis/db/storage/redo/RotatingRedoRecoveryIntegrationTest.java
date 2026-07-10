@@ -7,10 +7,14 @@ import cn.zhangyis.db.domain.SpaceId;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * 0.18 文件环与既有 redo durable/recovery 链路的集成：证明 {@link RotatingRedoLogRepository} 可经
@@ -30,11 +34,11 @@ class RotatingRedoRecoveryIntegrationTest {
         return new PageBytesRecord(P, 38, new byte[PAYLOAD]);
     }
 
-    /** 单批帧在磁盘上的字节数，用于把每文件容量设成"恰好一批"或"恰好两批"。 */
+    /** 单批 LogBlock chain 的物理字节数，用于把每文件容量设成“恰好一批”或“恰好两批”。 */
     private static int oneFrameBytes() {
         PageBytesRecord r = record();
-        return RedoBatchFrameCodec.encodeFrame(
-                new RedoLogBatch(new LogRange(Lsn.of(0), Lsn.of(r.byteLength())), List.of(r))).remaining();
+        return RedoLogBlockCodec.encodeBatch(
+                new RedoLogBatch(new LogRange(Lsn.of(0), Lsn.of(r.byteLength())), List.of(r)), 0).byteLength();
     }
 
     @Test
@@ -85,6 +89,47 @@ class RotatingRedoRecoveryIntegrationTest {
             assertEquals(0L, batches.get(0).range().start().value());
             assertEquals(firstEnd, batches.get(1).range().start().value(), "续写批次与恢复边界 LSN 连续");
             assertEquals(secondEnd, batches.get(1).range().end().value());
+        }
+    }
+
+    /**
+     * 已回收历史后，唯一 retained 文件可能只含 checkpoint 之后的 torn 首批；空 batch 列表仍必须携带
+     * header 的非零起点，使 recovery 接受“没有 durable 新批次”并停在 checkpoint，而不是误报 redo 丢失。
+     */
+    @Test
+    void recoversCheckpointWhenOnlyRetainedBatchIsTorn() throws Exception {
+        long checkpoint;
+        try (RotatingRedoLogRepository ring = RedoLogFileRepository.openRing(dir, 1, oneFrameBytes())) {
+            RedoLogManager manager = RedoLogManager.durable(ring);
+            checkpoint = manager.append(List.of(record())).end().value();
+            manager.flush();
+            ring.advanceReclaimBoundary(Lsn.of(checkpoint));
+            manager.append(List.of(record()));
+            manager.flush();
+        }
+        Path active = dir.resolve("redo-000000.log");
+        try (FileChannel channel = FileChannel.open(active, StandardOpenOption.WRITE)) {
+            channel.write(ByteBuffer.wrap(new byte[]{99}),
+                    RotatingRedoLogRepository.FILE_HEADER_BYTES + 40L);
+            channel.force(true);
+        }
+
+        try (RotatingRedoLogRepository ring = RedoLogFileRepository.openRing(dir, 1, oneFrameBytes())) {
+            RedoRecoveryReader reader = new RedoRecoveryReader(ring, Lsn.of(checkpoint));
+
+            assertTrue(reader.readBatches().isEmpty());
+            assertEquals(Lsn.of(checkpoint), reader.recoveredToLsn());
+            RedoLogManager manager = RedoLogManager.durable(ring);
+            manager.restoreRecoveredBoundary(reader.recoveredToLsn());
+            manager.append(List.of(record()));
+            manager.flush();
+        }
+        try (FileChannel channel = FileChannel.open(active, StandardOpenOption.READ)) {
+            ByteBuffer blockNo = ByteBuffer.allocate(Long.BYTES);
+            channel.read(blockNo, RotatingRedoLogRepository.FILE_HEADER_BYTES + 8L);
+            blockNo.flip();
+            assertEquals(checkpoint, blockNo.getLong(),
+                    "缺少可信旧 blockNo 时以 retained start LSN 跳号续写，不能回退到 0");
         }
     }
 }

@@ -89,6 +89,42 @@ class UndoContextTest {
     }
 
     @Test
+    void emptyBoundaryRestoreClearsLogicalChainWithoutReusingAppendUndoNo() {
+        Transaction txn = new Transaction(TransactionOptions.defaults(), 1L);
+        UndoContext ctx = new UndoContext(RSEG, SLOT, FIRST_PAGE);
+        txn.setUndoContext(ctx);
+        ctx.setLastUndoNo(UndoNo.of(1));
+        ctx.setLastRollPointer(new RollPointer(true, PageNo.of(65), 97));
+        ctx.createSavepoint(txn);
+
+        ctx.completeRollbackToEmptyBoundary();
+
+        assertEquals(UndoNo.of(1), ctx.lastUndoNo(),
+                "empty-boundary rollback keeps the append high-water mark");
+        assertEquals(UndoNo.NONE, ctx.logicalLastUndoNo(),
+                "empty-boundary rollback detaches all current logical undo");
+        assertEquals(RollPointer.NULL, ctx.lastRollPointer());
+        assertEquals(0, ctx.savepointCount(),
+                "no savepoint remains reachable after the logical chain returns to empty");
+    }
+
+    @Test
+    void releasingSavepointRemovesItAndAllNestedSavepoints() {
+        Transaction txn = new Transaction(TransactionOptions.defaults(), 1L);
+        UndoContext ctx = new UndoContext(RSEG, SLOT, FIRST_PAGE);
+        txn.setUndoContext(ctx);
+        TransactionSavepoint statementBoundary = ctx.createSavepoint(txn);
+        TransactionSavepoint nested = ctx.createSavepoint(txn);
+
+        ctx.releaseSavepoint(statementBoundary);
+
+        assertEquals(0, ctx.savepointCount(),
+                "closing the statement boundary also invalidates savepoints nested inside that statement");
+        assertThrows(DatabaseValidationException.class, () -> ctx.requireOwnedSavepoint(statementBoundary));
+        assertThrows(DatabaseValidationException.class, () -> ctx.requireOwnedSavepoint(nested));
+    }
+
+    @Test
     void createSavepointRejectsTransactionBoundToAnotherUndoContext() {
         Transaction txn = new Transaction(TransactionOptions.defaults(), 1L);
         UndoContext owned = new UndoContext(RSEG, SLOT, FIRST_PAGE);

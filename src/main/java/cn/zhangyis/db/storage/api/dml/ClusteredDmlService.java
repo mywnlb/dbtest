@@ -9,6 +9,7 @@ import cn.zhangyis.db.storage.btree.BTreeCurrentReadMode;
 import cn.zhangyis.db.storage.btree.BTreeCurrentReadRequest;
 import cn.zhangyis.db.storage.btree.BTreeCurrentReadService;
 import cn.zhangyis.db.storage.btree.BTreeDeleteMarkResult;
+import cn.zhangyis.db.storage.btree.BTreeIndex;
 import cn.zhangyis.db.storage.btree.BTreeLookupResult;
 import cn.zhangyis.db.storage.btree.BTreeUpdateResult;
 import cn.zhangyis.db.storage.btree.BTreeUniqueCheckResult;
@@ -21,10 +22,14 @@ import cn.zhangyis.db.storage.recovery.RecoveryTrafficGate;
 import cn.zhangyis.db.storage.record.format.HiddenColumns;
 import cn.zhangyis.db.storage.record.format.LogicalRecord;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
+import cn.zhangyis.db.storage.trx.EmptyUndoBoundary;
 import cn.zhangyis.db.storage.trx.RollbackService;
 import cn.zhangyis.db.storage.trx.RollbackSummary;
 import cn.zhangyis.db.storage.trx.Transaction;
 import cn.zhangyis.db.storage.trx.TransactionManager;
+import cn.zhangyis.db.storage.trx.TransactionSavepoint;
+import cn.zhangyis.db.storage.trx.TransactionState;
+import cn.zhangyis.db.storage.trx.TransactionStateException;
 import cn.zhangyis.db.storage.trx.UndoLogManager;
 import cn.zhangyis.db.storage.trx.lock.LockManager;
 
@@ -81,6 +86,37 @@ public final class ClusteredDmlService {
         this.lockManager = lockManager;
         this.redo = redo;
         this.recoveryGate = recoveryGate;
+    }
+
+    /**
+     * 打开一个显式 DML statement 边界。该 API 只固定 storage 层 undo 边界，不自动包裹单行
+     * {@link #insert(ClusteredInsertCommand)}/{@link #update(ClusteredUpdateCommand)}/
+     * {@link #delete(ClusteredDeleteCommand)}；上层 executor 因而可以用一个 Guard 覆盖多行修改。
+     *
+     * <p>事务已有 undo context 时创建真实保存点；事务尚未首写时创建一次性空 undo 边界令牌，后续失败可撤销
+     * 语句内首写。
+     * 调用方在失败分支必须先调用 {@link DmlStatementGuard#rollback()}，成功分支才直接
+     * {@link DmlStatementGuard#close()}。partial rollback 不结束事务，也不释放事务级 row locks、ReadView 或
+     * undo slot；SQL/session 自动 statement 生命周期与命名 SAVEPOINT 不在本 v1 范围内。
+     *
+     * @param txn            当前 ACTIVE 事务，不能为 null。
+     * @param clusteredIndex 本语句写入的单一聚簇索引，不能为 null。
+     * @return 绑定到当前 undo 边界的一次性 statement guard。
+     */
+    public DmlStatementGuard beginStatement(Transaction txn, BTreeIndex clusteredIndex) {
+        if (txn == null || clusteredIndex == null) {
+            throw new DatabaseValidationException("DML statement txn/index must not be null");
+        }
+        requireOpenForDml();
+        if (txn.state() != TransactionState.ACTIVE) {
+            throw new TransactionStateException("DML statement requires ACTIVE transaction: " + txn.state());
+        }
+        if (txn.undoContext() == null) {
+            EmptyUndoBoundary boundary = rollbackService.createEmptyStatementBoundary(txn);
+            return DmlStatementGuard.emptyBoundary(rollbackService, txn, clusteredIndex, boundary);
+        }
+        TransactionSavepoint savepoint = rollbackService.createSavepoint(txn);
+        return DmlStatementGuard.savepointBoundary(rollbackService, txn, clusteredIndex, savepoint);
     }
 
     /**

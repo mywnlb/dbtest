@@ -4,6 +4,7 @@ import cn.zhangyis.db.common.exception.DatabaseRuntimeException;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.RollPointer;
+import cn.zhangyis.db.domain.UndoNo;
 import cn.zhangyis.db.storage.btree.BTreeIndex;
 import cn.zhangyis.db.storage.btree.SplitCapableBTreeIndexService;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
@@ -15,6 +16,7 @@ import cn.zhangyis.db.storage.record.format.RecordType;
 import cn.zhangyis.db.storage.record.page.SearchKey;
 import cn.zhangyis.db.storage.undo.UndoLogSegment;
 import cn.zhangyis.db.storage.undo.UndoLogSegmentAccess;
+import cn.zhangyis.db.storage.undo.UndoLogFormatException;
 import cn.zhangyis.db.storage.undo.UndoRecord;
 
 import java.util.ArrayList;
@@ -38,10 +40,11 @@ import java.util.List;
  * slot 不释放、活跃表不变，保持可重试（{@code release}+{@code finishRollback} 仅在走到 {@code prev=NULL} 后执行）。
  *
  * <p><b>幂等</b>：B+Tree 反向命令未命中/所有权不匹配即 no-op，故 MTR 无 content undo 留下的 orphan undo
- * （已写 undo 但无对应聚簇行）由本走链幂等清理；1.4 起 statement/savepoint 边界可在 storage 内部显式回退。
+ * （已写 undo 但无对应聚簇行）由本走链幂等清理；1.4 起 statement/savepoint 边界可由 storage DML Guard
+ * 显式回退。
  *
  * <p><b>单聚簇索引假设</b>：用传入 {@code clusteredIndex} 的 keyDef/schema 解码所有 undo（T1 无 data dictionary）；
- * 多索引解析、二级索引删除、SQL/session statement 入口与 savepoint lock scope 留后续。
+ * 多索引解析、二级索引删除、SQL/session 自动 statement 生命周期与 savepoint lock scope 留后续。
  */
 public final class RollbackService {
 
@@ -119,8 +122,41 @@ public final class RollbackService {
     }
 
     /**
+     * 在事务首写前铸造一次性空 undo statement 边界。该令牌绑定本 service 与事务实例，后续只有携带它的
+     * rollback/close 才能消费空边界；事务已经创建 {@link UndoContext} 时必须改用真实保存点。
+     *
+     * @param txn 当前 ACTIVE 且尚未首写的事务。
+     * @return 绑定本 service 与事务的一次性空 undo 边界能力。
+     */
+    public EmptyUndoBoundary createEmptyStatementBoundary(Transaction txn) {
+        if (txn == null) {
+            throw new DatabaseValidationException("empty statement boundary transaction must not be null");
+        }
+        if (txn.state() != TransactionState.ACTIVE) {
+            throw new TransactionStateException(
+                    "empty statement boundary requires ACTIVE transaction: " + txn.state());
+        }
+        if (txn.undoContext() != null) {
+            throw new TransactionStateException("empty statement boundary requires no existing undo context");
+        }
+        return new EmptyUndoBoundary(this, txn);
+    }
+
+    /**
+     * statement rollback 发生结果不确定错误时撤销事务提交资格。事务仍保持 ACTIVE 并保留 undo/锁/ReadView，
+     * 使调用方能够转入完整事务 rollback；后续写入和提交由 TransactionManager 统一拒绝。
+     *
+     * @param txn   发生 statement rollback 失败的事务。
+     * @param cause 原始失败，首个原因进入事务诊断状态。
+     */
+    public void markRollbackOnly(Transaction txn, RuntimeException cause) {
+        txnMgr.markRollbackOnly(txn, cause);
+    }
+
+    /**
      * 创建 storage 内部保存点。v1 保存点挂在已经存在的 {@link UndoContext} 上，因此调用方应在事务首写之后
-     * 使用本方法；首写前 statement guard 如何表达“空 undo 边界”留给后续 session/DML facade 接线。
+     * 使用本方法；{@code ClusteredDmlService.beginStatement} 对首写前场景改用专用 empty-boundary Guard，
+     * 不伪造一个不属于任何 undo context 的保存点。
      *
      * @param txn 当前 ACTIVE 且已经写过 undo 的事务。
      * @return 绑定到该事务 undo context 的保存点。
@@ -144,7 +180,8 @@ public final class RollbackService {
      * <ol>
      *   <li>校验事务仍为 ACTIVE，保存点由同一事务创建。</li>
      *   <li>从 {@link UndoContext#lastRollPointer()} 指向的当前逻辑链头向前扫描。</li>
-     *   <li>仅应用 {@code undoNo > savepoint.undoNo()} 的记录；每条仍用独立 MTR，失败只回滚当前 MTR 并传播。</li>
+     *   <li>同时精确命中保存点的 roll pointer 与 undoNo；仅应用该边界之后的记录。每条仍用独立 MTR，
+     *       失败只回滚当前 MTR 并传播。</li>
      *   <li>全部成功后把 {@link UndoContext} 逻辑链头退回保存点边界，并修剪保存点栈。</li>
      * </ol>
      * 本方法不释放 undo slot、不释放事务级 ReadView、不释放行锁、不写 {@code TRX_STATE_DELTA(ROLLED_BACK)}，
@@ -172,36 +209,185 @@ public final class RollbackService {
             return new RollbackSummary(0);
         }
         ctx.requireOwnedSavepoint(savepoint);
+        int applied = rollbackUndoRecordsAfter(txn, clusteredIndex, ctx,
+                savepoint.undoNo(), savepoint.rollPointer());
+        ctx.completeRollbackToSavepoint(savepoint);
+        return new RollbackSummary(applied);
+    }
 
+    /**
+     * 把当前事务回滚到首写前的空 undo 边界。该入口专供 statement guard 在“创建 guard 时事务还没有
+     * {@link UndoContext}，但语句执行过程中发生首写”的场景使用；它不会伪造保存点，也不会跳过保存点归属校验。
+     *
+     * <p>数据流为：校验事务仍为 ACTIVE → 若语句从未写入则返回 0 → 从当前逻辑链头反向应用全部 undo →
+     * 将 {@link UndoContext#logicalLastUndoNo()} 和 {@link UndoContext#lastRollPointer()} 退回空值并清空运行期保存点。
+     * {@link UndoContext#lastUndoNo()}、undo slot、ReadView、事务行锁和事务状态均保持不变，使事务可以继续写入。
+     *
+     * @param txn            当前 ACTIVE 事务。
+     * @param clusteredIndex 该事务写入的聚簇索引，用于解码和反向应用 undo。
+     * @param boundary       本 service 在该事务首写前创建的一次性空边界能力。
+     * @return 本次回滚实际应用的 undo record 条数；语句没有写入时为 0。
+     */
+    public RollbackSummary rollbackToEmptyStatementBoundary(Transaction txn, BTreeIndex clusteredIndex,
+                                                            EmptyUndoBoundary boundary) {
+        if (txn == null || clusteredIndex == null || boundary == null) {
+            throw new DatabaseValidationException("empty statement rollback txn/index/boundary must not be null");
+        }
+        if (txn.state() != TransactionState.ACTIVE) {
+            throw new TransactionStateException(
+                    "empty statement rollback requires ACTIVE transaction: " + txn.state());
+        }
+        boundary.requireOpen(this, txn);
+        UndoContext ctx = txn.undoContext();
+        if (ctx == null) {
+            boundary.markRolledBack();
+            return new RollbackSummary(0);
+        }
+
+        int applied = rollbackUndoRecordsAfter(txn, clusteredIndex, ctx, UndoNo.NONE, RollPointer.NULL);
+        ctx.completeRollbackToEmptyBoundary();
+        boundary.markRolledBack();
+        return new RollbackSummary(applied);
+    }
+
+    /**
+     * 按语句成功路径关闭空 undo 边界。它不读取或修改 undo context，只校验事务仍为 ACTIVE 并消费一次性能力；
+     * 因而即使语句执行期间已经发生首写，成功 close 也会完整保留当前 undo 链供 commit/full rollback 使用。
+     *
+     * @param txn      边界所属 ACTIVE 事务。
+     * @param boundary 要关闭的一次性空 undo 边界能力。
+     */
+    public void releaseEmptyStatementBoundary(Transaction txn, EmptyUndoBoundary boundary) {
+        if (txn == null || boundary == null) {
+            throw new DatabaseValidationException("release empty statement boundary txn/boundary must not be null");
+        }
+        if (txn.state() != TransactionState.ACTIVE) {
+            throw new TransactionStateException(
+                    "release empty statement boundary requires ACTIVE transaction: " + txn.state());
+        }
+        boundary.requireOpen(this, txn);
+        boundary.markClosed();
+    }
+
+    /**
+     * 释放一个运行期保存点及其嵌套边界，不修改 undo 链。statement guard 在成功路径或 partial rollback 完成后
+     * 调用本方法，避免已经离开语句作用域的边界继续留在 {@link UndoContext} 中。事务必须仍为 ACTIVE，且保存点
+     * 必须属于该事务当前的 undo context；非法或重复释放会以领域异常暴露调用方生命周期错误。
+     *
+     * @param txn       保存点所属 ACTIVE 事务。
+     * @param savepoint 要释放的运行期保存点。
+     */
+    public void releaseSavepoint(Transaction txn, TransactionSavepoint savepoint) {
+        if (txn == null || savepoint == null) {
+            throw new DatabaseValidationException("releaseSavepoint txn/savepoint must not be null");
+        }
+        if (txn.state() != TransactionState.ACTIVE) {
+            throw new TransactionStateException("releaseSavepoint requires ACTIVE transaction: " + txn.state());
+        }
+        if (savepoint.transaction() != txn) {
+            throw new DatabaseValidationException("savepoint belongs to a different transaction");
+        }
+        UndoContext ctx = txn.undoContext();
+        if (ctx == null) {
+            throw new DatabaseValidationException("savepoint transaction has no undo context");
+        }
+        ctx.releaseSavepoint(savepoint);
+    }
+
+    /**
+     * 反向应用当前逻辑链中严格晚于指定 undoNo 边界的记录。方法先逐 pointer 使用短只读 MTR 预扫描并精确命中
+     * {@code (RollPointer,UndoNo)}；只有边界验证成功后，才从原链头再走一遍，每次用短只读 MTR 物化一条 command、
+     * 释放 undo latch，再放进独立写 MTR。这样损坏或陈旧边界不会留下部分 statement rollback，大语句也不会把
+     * 整条 undo 页链同时 fixed 在 Buffer Pool。
+     *
+     * <p>预扫描完成后不再持有 undo page latch；每条反向命令只持聚簇索引所需的短页 latch。单条应用失败时
+     * 已成功提交的前序命令仍保持幂等可恢复，但事务会由上层 Guard 标为 rollback-only，禁止提交不确定结果。
+     * 本方法不移动 context 链头，只有调用方在整个边界成功到达后才能提交运行期边界状态。
+     *
+     * @param txn            仅用于明确该链属于哪个事务；事务状态已由公开入口校验。
+     * @param clusteredIndex undo 解码和聚簇反向命令所需的索引快照。
+     * @param ctx            当前事务的 undo context。
+     * @param boundaryUndoNo      边界 undoNo；{@link UndoNo#NONE} 表示走到物理链尾即到达空边界。
+     * @param boundaryRollPointer 边界记录的精确指针；空边界必须为 {@link RollPointer#NULL}。
+     * @return 实际反向应用的 undo record 数量。
+     */
+    private int rollbackUndoRecordsAfter(Transaction txn, BTreeIndex clusteredIndex, UndoContext ctx,
+                                         UndoNo boundaryUndoNo, RollPointer boundaryRollPointer) {
+        if (txn.undoContext() != ctx) {
+            throw new DatabaseValidationException("rollback undo context is not owned by transaction");
+        }
+        if (boundaryUndoNo == null || boundaryRollPointer == null
+                || boundaryUndoNo.isNone() != boundaryRollPointer.isNull()) {
+            throw new DatabaseValidationException("rollback boundary undoNo/rollPointer pair is inconsistent");
+        }
+        RollPointer startRollPointer = ctx.lastRollPointer();
+        preflightUndoBoundary(clusteredIndex, ctx, startRollPointer, boundaryUndoNo, boundaryRollPointer);
         int applied = 0;
-        boolean reachedBoundary = savepoint.undoNo().isNone();
-        RollPointer rp = ctx.lastRollPointer();
-        while (!rp.isNull()) {
+        RollPointer rp = startRollPointer;
+        while (!rp.isNull() && (boundaryUndoNo.isNone() || !rp.equals(boundaryRollPointer))) {
+            RecordAt at = readUndoRecord(clusteredIndex, ctx, rp);
             MiniTransaction m = mtrMgr.begin();
-            RollPointer prev;
             try {
-                UndoLogSegment seg = undoAccess.open(m, ctx.undoFirstPageId(), PageLatchMode.SHARED);
-                UndoRecord rec = seg.readRecord(rp, clusteredIndex.keyDef(), clusteredIndex.schema());
-                if (rec.undoNo().value() <= savepoint.undoNo().value()) {
-                    reachedBoundary = true;
-                    mtrMgr.commit(m);
-                    break;
-                }
-                prev = rec.prevRollPointer();
-                applyUndoRecord(m, rec, rp, clusteredIndex);
+                applyUndoRecord(m, at.record(), at.pointer(), clusteredIndex);
             } catch (RuntimeException e) {
                 mtrMgr.rollbackUncommitted(m);
                 throw e;
             }
             mtrMgr.commit(m);
             applied++;
-            rp = prev;
+            rp = at.record().prevRollPointer();
         }
-        if (!reachedBoundary) {
-            throw new DatabaseRuntimeException("savepoint boundary is not reachable from current undo chain");
+        return applied;
+    }
+
+    /**
+     * 在任何聚簇记录修改前验证目标边界。每个 pointer 都在独立只读 MTR 中读取，提交后立即释放该 undo 页的
+     * S latch/fix；因此扫描页数可以超过 Buffer Pool 容量。空边界要求当前链自然走到 NULL；真实保存点要求指针
+     * 和 undoNo 同时命中。若 undoNo 已越过目标但指针未命中，说明事务逻辑链损坏，必须拒绝而不能仅凭序号猜测。
+     */
+    private void preflightUndoBoundary(BTreeIndex clusteredIndex, UndoContext ctx, RollPointer startRollPointer,
+                                       UndoNo boundaryUndoNo, RollPointer boundaryRollPointer) {
+        boolean emptyBoundary = boundaryUndoNo.isNone();
+        RollPointer rp = startRollPointer;
+        while (!rp.isNull()) {
+            RecordAt at = readUndoRecord(clusteredIndex, ctx, rp);
+            UndoRecord rec = at.record();
+            if (!emptyBoundary && rp.equals(boundaryRollPointer)) {
+                if (!rec.undoNo().equals(boundaryUndoNo)) {
+                    throw new UndoLogFormatException(
+                            "savepoint roll pointer resolves to a different undo number");
+                }
+                return;
+            } else if (!emptyBoundary && rec.undoNo().value() <= boundaryUndoNo.value()) {
+                // 指针未命中目标却已越过其 undoNo，说明逻辑链断裂；不能把保存点指针重新装回 context。
+                throw new UndoLogFormatException(
+                        "savepoint roll pointer is not reachable from current undo chain");
+            }
+            rp = rec.prevRollPointer();
         }
-        ctx.completeRollbackToSavepoint(savepoint);
-        return new RollbackSummary(applied);
+        if (!emptyBoundary) {
+            throw new UndoLogFormatException("savepoint boundary is not reachable from current undo chain");
+        }
+    }
+
+    /** 用独立只读 MTR 物化一条 undo record，返回前已释放所有 undo page latch/fix。 */
+    private RecordAt readUndoRecord(BTreeIndex clusteredIndex, UndoContext ctx, RollPointer rp) {
+        MiniTransaction readMtr = mtrMgr.begin();
+        try {
+            UndoLogSegment seg = undoAccess.open(readMtr, ctx.undoFirstPageId(), PageLatchMode.SHARED);
+            UndoRecord record = seg.readRecord(rp, clusteredIndex.keyDef(), clusteredIndex.schema());
+            mtrMgr.commit(readMtr);
+            return new RecordAt(record, rp);
+        } catch (RuntimeException e) {
+            if (readMtr.state() == MiniTransactionState.ACTIVE) {
+                try {
+                    mtrMgr.rollbackUncommitted(readMtr);
+                } catch (RuntimeException releaseError) {
+                    e.addSuppressed(releaseError);
+                }
+            }
+            throw e;
+        }
     }
 
     /**

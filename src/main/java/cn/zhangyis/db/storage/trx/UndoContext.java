@@ -187,6 +187,30 @@ public final class UndoContext {
     }
 
     /**
+     * statement rollback 成功退回“事务首写前”的空 undo 边界。调用方必须已经反向应用当前逻辑链上的全部
+     * undo record；本方法只把运行期链头置空并清除所有保存点，不释放 undo slot，也不回退
+     * {@link #lastUndoNo} append 高水位。保留高水位可保证同一事务后续写入不会复用已经落入 undo 页的序号。
+     */
+    void completeRollbackToEmptyBoundary() {
+        this.logicalLastUndoNo = UndoNo.NONE;
+        this.lastRollPointer = RollPointer.NULL;
+        savepointStack.clear();
+    }
+
+    /**
+     * 释放一个运行期保存点及其后创建的所有嵌套保存点。该操作只管理内存中的边界生命周期，不修改 undo 链，
+     * 因而用于 statement guard 成功关闭或完成回滚后的收尾；目标保存点必须仍属于本 context。
+     *
+     * @param savepoint 要释放的保存点，同时作为嵌套范围的起点。
+     */
+    void releaseSavepoint(TransactionSavepoint savepoint) {
+        int index = requireOwnedSavepoint(savepoint);
+        for (int i = savepointStack.size() - 1; i >= index; i--) {
+            savepointStack.remove(i);
+        }
+    }
+
+    /**
      * 校验保存点确实由本 context 创建，并返回其栈位置。RollbackService 会在应用任何 undo 前先调用本方法，
      * 防止传入伪造或陈旧保存点时出现“数据已经被撤销，随后才发现边界非法”的半完成状态。
      *

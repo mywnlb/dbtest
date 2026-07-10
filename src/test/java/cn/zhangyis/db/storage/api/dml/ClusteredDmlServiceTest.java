@@ -7,6 +7,7 @@ import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.RollbackSegmentId;
 import cn.zhangyis.db.domain.SpaceId;
+import cn.zhangyis.db.domain.UndoNo;
 import cn.zhangyis.db.domain.UndoSlotId;
 import cn.zhangyis.db.storage.api.DiskSpaceManager;
 import cn.zhangyis.db.storage.api.SegmentRef;
@@ -36,7 +37,9 @@ import cn.zhangyis.db.storage.page.PageType;
 import cn.zhangyis.db.storage.trx.Transaction;
 import cn.zhangyis.db.storage.trx.TransactionManager;
 import cn.zhangyis.db.storage.trx.TransactionOptions;
+import cn.zhangyis.db.storage.trx.TransactionSavepoint;
 import cn.zhangyis.db.storage.trx.TransactionState;
+import cn.zhangyis.db.storage.trx.TransactionStateException;
 import cn.zhangyis.db.storage.trx.TransactionSystem;
 import cn.zhangyis.db.storage.trx.UndoContext;
 import cn.zhangyis.db.storage.trx.lock.LockWaitTimeoutException;
@@ -53,6 +56,7 @@ import java.util.Optional;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -272,6 +276,181 @@ class ClusteredDmlServiceTest {
             assertFalse(hasGrantedLock(engine, txn), "rollback cleanup removes granted locks");
             assertTrue(lookupIncludingDeleted(engine, index, 1).isEmpty(),
                     "insert->update->delete in one transaction rolls back to non-existence");
+        } finally {
+            engine.close();
+        }
+    }
+
+    @Test
+    @DisplayName("Statement guard rolls back only DML writes after an existing undo boundary")
+    void statementGuardRollsBackOnlyWritesAfterExistingUndoBoundary() {
+        StorageEngine engine = new StorageEngine(config(dir));
+        engine.open();
+        try {
+            BTreeIndex index = createClusteredIndex(engine, dir.resolve("dml-statement-existing.ibd"));
+            Transaction txn = engine.transactionManager().begin(TransactionOptions.defaults());
+            engine.dmlService().insert(new ClusteredInsertCommand(txn, index, search(1), row(1, "v1"),
+                    TABLE_ID, Duration.ofSeconds(1)));
+
+            DmlStatementGuard guard = engine.dmlService().beginStatement(txn, index);
+            engine.dmlService().update(new ClusteredUpdateCommand(txn, index, search(1), row(1, "v2"),
+                    TABLE_ID, Duration.ofSeconds(1)));
+            engine.dmlService().insert(new ClusteredInsertCommand(txn, index, search(2), row(2, "new"),
+                    TABLE_ID, Duration.ofSeconds(1)));
+
+            var summary = guard.rollback();
+
+            assertEquals(2, summary.undoRecordsApplied(), "guard rollback must undo only writes after the boundary");
+            assertEquals(TransactionState.ACTIVE, txn.state(), "statement rollback must keep transaction active");
+            assertEquals("v1", payloadOf(lookup(engine, index, 1).orElseThrow()));
+            assertTrue(lookupIncludingDeleted(engine, index, 2).isEmpty(),
+                    "insert created inside the failed statement must be physically removed");
+            assertEquals(UndoNo.of(1), txn.undoContext().logicalLastUndoNo(),
+                    "guard rollback moves the logical chain head back to the saved boundary");
+
+            DmlRollbackResult full = engine.dmlService().rollback(new DmlRollbackCommand(txn, index));
+            assertEquals(1, full.rollbackSummary().undoRecordsApplied(),
+                    "full rollback after statement rollback must consume only the pre-guard insert");
+            assertTrue(lookupIncludingDeleted(engine, index, 1).isEmpty());
+        } finally {
+            engine.close();
+        }
+    }
+
+    @Test
+    @DisplayName("Statement guard can roll back the first write to an empty undo boundary")
+    void statementGuardRollsBackFirstWriteToEmptyUndoBoundary() {
+        StorageEngine engine = new StorageEngine(config(dir));
+        engine.open();
+        try {
+            BTreeIndex index = createClusteredIndex(engine, dir.resolve("dml-statement-empty.ibd"));
+            Transaction txn = engine.transactionManager().begin(TransactionOptions.defaults());
+
+            DmlStatementGuard guard = engine.dmlService().beginStatement(txn, index);
+            engine.dmlService().insert(new ClusteredInsertCommand(txn, index, search(1), row(1, "rolled-back"),
+                    TABLE_ID, Duration.ofSeconds(1)));
+
+            var summary = guard.rollback();
+
+            assertEquals(1, summary.undoRecordsApplied(), "empty-boundary rollback must undo the first write");
+            assertEquals(TransactionState.ACTIVE, txn.state());
+            assertTrue(lookupIncludingDeleted(engine, index, 1).isEmpty());
+            assertNotNull(txn.undoContext(), "v1 keeps the allocated undo context and slot for later writes");
+            assertEquals(UndoNo.of(1), txn.undoContext().lastUndoNo(),
+                    "append high-water mark must not be reused after statement rollback");
+            assertEquals(UndoNo.NONE, txn.undoContext().logicalLastUndoNo(),
+                    "current logical undo chain is empty after rolling back to the empty boundary");
+            assertTrue(txn.undoContext().lastRollPointer().isNull());
+
+            engine.dmlService().insert(new ClusteredInsertCommand(txn, index, search(2), row(2, "after"),
+                    TABLE_ID, Duration.ofSeconds(1)));
+            assertEquals(UndoNo.of(2), txn.undoContext().lastUndoNo(),
+                    "new writes after empty-boundary rollback continue with a fresh undo number");
+
+            DmlRollbackResult full = engine.dmlService().rollback(new DmlRollbackCommand(txn, index));
+            assertEquals(1, full.rollbackSummary().undoRecordsApplied(),
+                    "full rollback must see only the post-rollback insert in the current logical chain");
+            assertTrue(lookupIncludingDeleted(engine, index, 2).isEmpty());
+        } finally {
+            engine.close();
+        }
+    }
+
+    @Test
+    @DisplayName("Closing a successful statement guard keeps writes for later transaction rollback")
+    void statementGuardCloseKeepsSuccessfulWritesForFullRollback() {
+        StorageEngine engine = new StorageEngine(config(dir));
+        engine.open();
+        try {
+            BTreeIndex index = createClusteredIndex(engine, dir.resolve("dml-statement-success.ibd"));
+            Transaction txn = engine.transactionManager().begin(TransactionOptions.defaults());
+            engine.dmlService().insert(new ClusteredInsertCommand(txn, index, search(1), row(1, "v1"),
+                    TABLE_ID, Duration.ofSeconds(1)));
+
+            try (DmlStatementGuard ignored = engine.dmlService().beginStatement(txn, index)) {
+                engine.dmlService().update(new ClusteredUpdateCommand(txn, index, search(1), row(1, "v2"),
+                        TABLE_ID, Duration.ofSeconds(1)));
+            }
+
+            assertEquals("v2", payloadOf(lookup(engine, index, 1).orElseThrow()),
+                    "normal close is a success path and must not perform statement rollback");
+            DmlRollbackResult full = engine.dmlService().rollback(new DmlRollbackCommand(txn, index));
+            assertEquals(2, full.rollbackSummary().undoRecordsApplied(),
+                    "transaction rollback still consumes the successful statement update plus the original insert");
+            assertTrue(lookupIncludingDeleted(engine, index, 1).isEmpty());
+        } finally {
+            engine.close();
+        }
+    }
+
+    @Test
+    @DisplayName("Closing an empty statement guard still requires an active transaction")
+    void emptyStatementGuardCloseRequiresActiveTransaction() {
+        StorageEngine engine = new StorageEngine(config(dir));
+        engine.open();
+        try {
+            BTreeIndex index = createClusteredIndex(engine, dir.resolve("dml-statement-close-state.ibd"));
+            Transaction txn = engine.transactionManager().begin(TransactionOptions.defaults());
+            DmlStatementGuard guard = engine.dmlService().beginStatement(txn, index);
+            engine.transactionManager().commit(txn);
+
+            assertThrows(TransactionStateException.class, guard::close,
+                    "both empty and savepoint-backed guards must reject close after the transaction ends");
+        } finally {
+            engine.close();
+        }
+    }
+
+    @Test
+    @DisplayName("A statement rollback failure is terminal for the guard")
+    void statementGuardRollbackFailureIsTerminal() {
+        StorageEngine engine = new StorageEngine(config(dir));
+        engine.open();
+        try {
+            BTreeIndex index = createClusteredIndex(engine, dir.resolve("dml-statement-failed-state.ibd"));
+            Transaction txn = engine.transactionManager().begin(TransactionOptions.defaults());
+            DmlStatementGuard guard = engine.dmlService().beginStatement(txn, index);
+            engine.transactionManager().commit(txn);
+
+            assertThrows(TransactionStateException.class, guard::rollback,
+                    "the first rollback exposes the concrete transaction-state failure");
+            assertThrows(DmlOperationException.class, guard::rollback,
+                    "an outcome-uncertain rollback must not be retried through the same guard");
+        } finally {
+            engine.close();
+        }
+    }
+
+    /**
+     * ACTIVE 事务的 statement rollback 若在边界校验阶段失败，Guard 必须把事务标成 rollback-only；否则调用方
+     * 仍可走 facade commit，把 outcome-uncertain 的部分语句结果持久化。
+     */
+    @Test
+    @DisplayName("An active statement rollback failure dooms the transaction until full rollback")
+    void activeStatementRollbackFailureMarksTransactionRollbackOnly() {
+        StorageEngine engine = new StorageEngine(config(dir));
+        engine.open();
+        try {
+            BTreeIndex index = createClusteredIndex(engine, dir.resolve("dml-statement-doomed.ibd"));
+            Transaction txn = engine.transactionManager().begin(TransactionOptions.defaults());
+            engine.dmlService().insert(new ClusteredInsertCommand(txn, index, search(1), row(1, "v1"),
+                    TABLE_ID, Duration.ofSeconds(1)));
+            TransactionSavepoint real = engine.rollbackService().createSavepoint(txn);
+            TransactionSavepoint detached = new TransactionSavepoint(
+                    txn, real.undoNo(), real.rollPointer(), real.sequence() + 1_000);
+            DmlStatementGuard guard = DmlStatementGuard.savepointBoundary(
+                    engine.rollbackService(), txn, index, detached);
+
+            assertThrows(DatabaseValidationException.class, guard::rollback);
+            assertTrue(txn.rollbackOnly(), "failed statement rollback must revoke commit eligibility");
+            assertThrows(TransactionStateException.class, () -> engine.dmlService().commit(
+                    new DmlCommitCommand(txn, DurabilityPolicy.FLUSH_ON_COMMIT, Duration.ofSeconds(1))));
+            assertEquals(TransactionState.ACTIVE, txn.state(), "doomed transaction remains active for full rollback");
+
+            DmlRollbackResult result = engine.dmlService().rollback(new DmlRollbackCommand(txn, index));
+            assertEquals(1, result.rollbackSummary().undoRecordsApplied());
+            assertEquals(TransactionState.ROLLED_BACK, txn.state());
+            assertTrue(lookupIncludingDeleted(engine, index, 1).isEmpty());
         } finally {
             engine.close();
         }

@@ -9,6 +9,8 @@ import cn.zhangyis.db.domain.TransactionId;
  *
  * <p><b>本片无 undo</b>：commit/rollback 只翻转内存事务状态、维护活跃表，**不刷数据页、不撤销任何已写记录**——
  * 被 rollback 的事务插入的行仍物理留在页上、仍带它的 DB_TRX_ID。真正的数据回滚在 T1.3。
+ * statement rollback 失败可把 ACTIVE 事务标记为 rollback-only：事务继续留在活跃表供 full rollback，但普通写入和
+ * commit 会在任何提交副作用前被拒绝。
  *
  * <p>本片不提供 {@code current()}：不引入 ThreadLocal 绑定/嵌套 begin/线程切换语义，调用方显式持有并传递
  * {@link Transaction}，避免隐藏全局可变状态。
@@ -55,7 +57,7 @@ public final class TransactionManager {
      * 调用方在 B+Tree 聚簇写入前调用，再把 {@code txn.transactionId()} 传入写入路径。
      */
     public TransactionId assignWriteId(Transaction txn) {
-        requireActive(txn);
+        requireUsableActive(txn);
         if (txn.readOnly()) {
             throw new TransactionStateException("read-only transaction cannot assign a write id");
         }
@@ -78,7 +80,7 @@ public final class TransactionManager {
      * @param txn 仍处于 ACTIVE 的事务。
      */
     public void prepareCommit(Transaction txn) {
-        requireActive(txn);
+        requireUsableActive(txn);
         if (!txn.transactionId().isNone() && txn.transactionNo().isNone()) {
             txn.setTransactionNo(system.allocateTransactionNo());
         }
@@ -89,7 +91,7 @@ public final class TransactionManager {
      * 不分配序号、无需移出。不刷数据页、不撤销记录。
      */
     public void commit(Transaction txn) {
-        requireActive(txn);
+        requireUsableActive(txn);
         txn.transitionTo(TransactionState.COMMITTING);
         if (!txn.transactionId().isNone()) {
             if (txn.transactionNo().isNone()) {
@@ -143,6 +145,33 @@ public final class TransactionManager {
         // 移出活跃表后、进入终态前释放事务级 ReadView（T1.4）
         readViewManager.release(txn);
         txn.transitionTo(TransactionState.ROLLED_BACK);
+    }
+
+    /**
+     * statement rollback 失败后撤销事务提交资格。事务保持 ACTIVE 和 active-table 成员身份，保证调用方仍能执行
+     * full rollback；后续写入、prepareCommit、commit 由 {@link #requireUsableActive} 统一拒绝。
+     *
+     * @param txn   发生不确定 statement rollback 的 ACTIVE 事务。
+     * @param cause 触发失败的原始领域异常，用于保留首个诊断原因。
+     */
+    void markRollbackOnly(Transaction txn, RuntimeException cause) {
+        requireActive(txn);
+        if (cause == null) {
+            throw new DatabaseValidationException("rollback-only cause must not be null");
+        }
+        String message = cause.getMessage();
+        String reason = cause.getClass().getSimpleName()
+                + (message == null || message.isBlank() ? "" : ": " + message);
+        txn.markRollbackOnly(reason);
+    }
+
+    /** 校验事务可继续普通工作；rollback-only 虽保持 ACTIVE，但只能进入完整 rollback。 */
+    private static void requireUsableActive(Transaction txn) {
+        requireActive(txn);
+        if (txn.rollbackOnly()) {
+            throw new TransactionStateException(
+                    "transaction is rollback-only and cannot continue or commit: " + txn.rollbackOnlyReason());
+        }
     }
 
     private static void requireActive(Transaction txn) {

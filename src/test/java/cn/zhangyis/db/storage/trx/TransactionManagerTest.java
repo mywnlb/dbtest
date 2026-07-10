@@ -1,5 +1,6 @@
 package cn.zhangyis.db.storage.trx;
 
+import cn.zhangyis.db.common.exception.DatabaseRuntimeException;
 import cn.zhangyis.db.domain.TransactionId;
 import org.junit.jupiter.api.Test;
 
@@ -87,6 +88,30 @@ class TransactionManagerTest {
         Transaction t = mgr.begin(TransactionOptions.defaults());
         mgr.commit(t);
         assertThrows(TransactionStateException.class, () -> mgr.rollback(t));
+    }
+
+    /**
+     * statement rollback 结果不确定后，事务保持 ACTIVE 以便执行完整 rollback，但不得继续写入或提交。
+     */
+    @Test
+    void rollbackOnlyTransactionRejectsFurtherWritesAndCommitButAllowsFullRollback() {
+        TransactionManager mgr = newManager();
+        Transaction t = mgr.begin(TransactionOptions.defaults());
+        TransactionId id = mgr.assignWriteId(t);
+
+        mgr.markRollbackOnly(t, new DatabaseRuntimeException("statement rollback outcome is uncertain"));
+
+        assertTrue(t.rollbackOnly());
+        assertTrue(t.rollbackOnlyReason().contains("statement rollback outcome is uncertain"));
+        assertThrows(TransactionStateException.class, () -> mgr.assignWriteId(t));
+        assertThrows(TransactionStateException.class, () -> mgr.prepareCommit(t));
+        assertThrows(TransactionStateException.class, () -> mgr.commit(t));
+        assertEquals(TransactionState.ACTIVE, t.state(), "rollback-only is an ACTIVE sub-state until full rollback");
+        assertTrue(mgr.system().snapshotActiveReadWriteIds().contains(id.value()));
+
+        mgr.rollback(t);
+        assertEquals(TransactionState.ROLLED_BACK, t.state());
+        assertFalse(mgr.system().snapshotActiveReadWriteIds().contains(id.value()));
     }
 
     // ---- T1.3d：两阶段 rollback（RollbackService 把 undo 走链夹在 ROLLING_BACK 状态内） ----

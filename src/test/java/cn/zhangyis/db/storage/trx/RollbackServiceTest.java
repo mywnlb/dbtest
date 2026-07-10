@@ -1,14 +1,17 @@
 package cn.zhangyis.db.storage.trx;
 
+import cn.zhangyis.db.common.exception.DatabaseRuntimeException;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.RollPointer;
 import cn.zhangyis.db.domain.RollbackSegmentId;
+import cn.zhangyis.db.domain.Lsn;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.domain.TransactionId;
 import cn.zhangyis.db.domain.UndoNo;
+import cn.zhangyis.db.domain.UndoSlotId;
 import cn.zhangyis.db.storage.api.DiskSpaceManager;
 import cn.zhangyis.db.storage.api.DiskSpaceUndoAllocator;
 import cn.zhangyis.db.storage.api.index.IndexPageAccess;
@@ -20,11 +23,14 @@ import cn.zhangyis.db.storage.btree.BTreeLookupResult;
 import cn.zhangyis.db.storage.btree.SplitCapableBTreeIndexService;
 import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.LruBufferPool;
+import cn.zhangyis.db.storage.fil.access.TablespaceAccessController;
 import cn.zhangyis.db.storage.fil.io.FileChannelPageStore;
 import cn.zhangyis.db.storage.fil.io.PageStore;
 import cn.zhangyis.db.storage.fsp.segment.SegmentPurpose;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
+import cn.zhangyis.db.storage.flush.FlushCoordinator;
+import cn.zhangyis.db.storage.flush.doublewrite.NoDoublewriteStrategy;
 import cn.zhangyis.db.storage.record.format.HiddenColumns;
 import cn.zhangyis.db.storage.record.format.LogicalRecord;
 import cn.zhangyis.db.storage.record.format.RecordType;
@@ -39,6 +45,8 @@ import cn.zhangyis.db.storage.record.schema.TableSchema;
 import cn.zhangyis.db.storage.record.type.ColumnValue;
 import cn.zhangyis.db.storage.record.type.TypeCodecRegistry;
 import cn.zhangyis.db.storage.redo.RedoRecord;
+import cn.zhangyis.db.storage.redo.RedoLogFileRepository;
+import cn.zhangyis.db.storage.redo.RedoLogManager;
 import cn.zhangyis.db.storage.redo.TransactionStateDeltaReason;
 import cn.zhangyis.db.storage.redo.TransactionStateDeltaRecord;
 import cn.zhangyis.db.storage.redo.TransactionStateDeltaState;
@@ -47,6 +55,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -59,8 +68,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * （assignWriteId → beforeInsert → insertClustered → rollback），无生产组合根。覆盖：单行/多行 full rollback、
  * orphan undo 幂等、只读/未写事务仅翻状态。
  *
- * <p><b>当前覆盖</b>：完整 rollback、INSERT/UPDATE/DELETE_MARK 反向命令、storage 内部 savepoint rollback。
- * <b>非目标</b>：SQL/session statement 入口、多索引 rollback、undo 页回收。
+ * <p><b>当前覆盖</b>：完整 rollback、INSERT/UPDATE/DELETE_MARK 反向命令、精确 savepoint 与一次性空边界 rollback。
+ * <b>非目标</b>：SQL/session 自动 statement 生命周期、多索引 rollback、undo 页回收。
  */
 class RollbackServiceTest {
 
@@ -198,6 +207,155 @@ class RollbackServiceTest {
             assertTrue(svc.lookup(r, index, search(1)).isPresent(),
                     "foreign savepoint must be rejected before any undo record is applied");
             ctx.mgr.commit(r);
+        });
+    }
+
+    @Test
+    void rollbackToSavepointRejectsDetachedBoundaryInsteadOfResurrectingItsPointer() {
+        onPool(ctx -> {
+            ctx.boot();
+            SplitCapableBTreeIndexService svc = ctx.service();
+            BTreeIndex index = ctx.clusteredIndex();
+            Transaction txn = ctx.txnMgr.begin(TransactionOptions.defaults());
+            TransactionId wid = ctx.txnMgr.assignWriteId(txn);
+            MiniTransaction first = ctx.mgr.begin();
+            RollPointer rp1 = ctx.undoMgr.beforeInsert(txn, first, TABLE_ID, INDEX_ID,
+                    key(1), index.keyDef(), index.schema());
+            svc.insertClustered(first, index, row(1), wid, rp1);
+            ctx.mgr.commit(first);
+            MiniTransaction second = ctx.mgr.begin();
+            RollPointer rp2 = ctx.undoMgr.beforeInsert(txn, second, TABLE_ID, INDEX_ID,
+                    key(2), index.keyDef(), index.schema());
+            svc.insertClustered(second, index, row(2), wid, rp2);
+            ctx.mgr.commit(second);
+            TransactionSavepoint savepoint = txn.undoContext().createSavepoint(txn);
+
+            // 模拟逻辑链损坏：当前入口直接跳到保存点之前，目标 rp2 已不再从链头可达。
+            txn.undoContext().setLastRollPointer(rp1);
+
+            assertThrows(DatabaseRuntimeException.class,
+                    () -> ctx.rollbackService.rollbackToSavepoint(txn, index, savepoint));
+            assertEquals(rp1, txn.undoContext().lastRollPointer(),
+                    "unreachable savepoint must not resurrect its detached roll pointer");
+            MiniTransaction read = ctx.mgr.begin();
+            assertTrue(svc.lookup(read, index, search(1)).isPresent());
+            assertTrue(svc.lookup(read, index, search(2)).isPresent());
+            ctx.mgr.commit(read);
+        });
+    }
+
+    /**
+     * 保存点指针若从当前逻辑链断开，RollbackService 必须在执行任何反向命令前完成整条边界预检。
+     * 本用例构造「新分支记录 -> 保存点之前记录」的损坏链；旧单遍实现会先删除分支行，再发现跳过保存点。
+     */
+    @Test
+    void rollbackToSavepointPreflightsDetachedBoundaryBeforeApplyingNewerUndo() {
+        onPool(ctx -> {
+            ctx.boot();
+            SplitCapableBTreeIndexService svc = ctx.service();
+            BTreeIndex index = ctx.clusteredIndex();
+            Transaction txn = ctx.txnMgr.begin(TransactionOptions.defaults());
+            TransactionId wid = ctx.txnMgr.assignWriteId(txn);
+
+            MiniTransaction first = ctx.mgr.begin();
+            RollPointer rp1 = ctx.undoMgr.beforeInsert(txn, first, TABLE_ID, INDEX_ID,
+                    key(1), index.keyDef(), index.schema());
+            svc.insertClustered(first, index, row(1), wid, rp1);
+            ctx.mgr.commit(first);
+
+            MiniTransaction second = ctx.mgr.begin();
+            RollPointer rp2 = ctx.undoMgr.beforeInsert(txn, second, TABLE_ID, INDEX_ID,
+                    key(2), index.keyDef(), index.schema());
+            svc.insertClustered(second, index, row(2), wid, rp2);
+            ctx.mgr.commit(second);
+            TransactionSavepoint savepoint = ctx.rollbackService.createSavepoint(txn);
+
+            // 模拟分支损坏：下一条 undo 从 rp1 接出，当前链变成 rp3 -> rp1，保存点 rp2 不可达。
+            txn.undoContext().setLastRollPointer(rp1);
+            MiniTransaction branch = ctx.mgr.begin();
+            RollPointer rp3 = ctx.undoMgr.beforeInsert(txn, branch, TABLE_ID, INDEX_ID,
+                    key(3), index.keyDef(), index.schema());
+            svc.insertClustered(branch, index, row(3), wid, rp3);
+            ctx.mgr.commit(branch);
+
+            assertThrows(DatabaseRuntimeException.class,
+                    () -> ctx.rollbackService.rollbackToSavepoint(txn, index, savepoint));
+
+            MiniTransaction read = ctx.mgr.begin();
+            assertTrue(svc.lookup(read, index, search(1)).isPresent());
+            assertTrue(svc.lookup(read, index, search(2)).isPresent());
+            assertTrue(svc.lookup(read, index, search(3)).isPresent(),
+                    "boundary validation must finish before any newer undo is applied");
+            ctx.mgr.commit(read);
+        });
+    }
+
+    /**
+     * 边界预扫描必须逐 pointer 使用短只读 MTR。构建阶段把 10 条大 UPDATE undo 刷到多张页，随后用 4-frame
+     * Buffer Pool 重开；若一个 MTR 固定整条页链，扫描到第 5 张 undo 页前就会耗尽 frame。
+     */
+    @Test
+    void emptyBoundaryRollbackScansMoreUndoPagesThanBufferCapacity() {
+        Path dataPath = dir.resolve("small-pool-data.ibd");
+        Path undoPath = dir.resolve("small-pool-undo.ibu");
+        MultiPageRollbackFixture fixture = buildMultiPageRollbackFixture(dataPath, undoPath);
+
+        try (PageStore store = new FileChannelPageStore();
+             BufferPool pool = new LruBufferPool(store, PS, 4)) {
+            MiniTransactionManager mgr = new MiniTransactionManager();
+            DiskSpaceManager disk = new DiskSpaceManager(pool, store, PS);
+            disk.openTablespace(DATA_SPACE, dataPath);
+            disk.openTablespace(UNDO_SPACE, undoPath);
+            IndexPageAccess pageAccess = new IndexPageAccess(pool, PS);
+            UndoLogSegmentAccess undoAccess = new UndoLogSegmentAccess(
+                    pool, PS, new DiskSpaceUndoAllocator(disk), registry);
+            RollbackSegmentSlotManager slots = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 64);
+            TransactionManager txnMgr = new TransactionManager(new TransactionSystem());
+            RollbackService rollback = new RollbackService(
+                    new SplitCapableBTreeIndexService(pageAccess, disk, registry),
+                    undoAccess, slots, txnMgr, mgr);
+            Transaction txn = txnMgr.begin(TransactionOptions.defaults());
+            EmptyUndoBoundary boundary = rollback.createEmptyStatementBoundary(txn);
+            UndoSlotId slot = slots.claim(fixture.undoFirstPageId());
+            UndoContext restored = new UndoContext(slots.rollbackSegmentId(), slot, fixture.undoFirstPageId());
+            restored.setLastUndoNo(fixture.lastUndoNo());
+            restored.setLastRollPointer(fixture.lastRollPointer());
+            restored.markHasUpdateUndo();
+            txn.setUndoContext(restored);
+
+            RollbackSummary summary = rollback.rollbackToEmptyStatementBoundary(txn, fixture.index(), boundary);
+
+            assertEquals(10, summary.undoRecordsApplied());
+            assertTrue(restored.lastRollPointer().isNull());
+        }
+    }
+
+    @Test
+    void emptyStatementBoundaryIsAnOwnedOneShotCapability() {
+        onPool(ctx -> {
+            ctx.boot();
+            SplitCapableBTreeIndexService svc = ctx.service();
+            BTreeIndex index = ctx.clusteredIndex();
+            Transaction txn = ctx.txnMgr.begin(TransactionOptions.defaults());
+            EmptyUndoBoundary boundary = ctx.rollbackService.createEmptyStatementBoundary(txn);
+            TransactionId wid = ctx.txnMgr.assignWriteId(txn);
+            MiniTransaction insert = ctx.mgr.begin();
+            RollPointer rp = ctx.undoMgr.beforeInsert(txn, insert, TABLE_ID, INDEX_ID,
+                    key(1), index.keyDef(), index.schema());
+            svc.insertClustered(insert, index, row(1), wid, rp);
+            ctx.mgr.commit(insert);
+
+            assertThrows(TransactionStateException.class,
+                    () -> ctx.rollbackService.createEmptyStatementBoundary(txn),
+                    "an empty boundary cannot be minted after the transaction has started writing undo");
+            RollbackSummary summary = ctx.rollbackService.rollbackToEmptyStatementBoundary(
+                    txn, index, boundary);
+
+            assertEquals(1, summary.undoRecordsApplied());
+            assertEquals(TransactionState.ACTIVE, txn.state());
+            assertThrows(TransactionStateException.class,
+                    () -> ctx.rollbackService.rollbackToEmptyStatementBoundary(txn, index, boundary),
+                    "the same empty-boundary capability cannot be reused for later writes");
         });
     }
 
@@ -545,6 +703,67 @@ class RollbackServiceTest {
     private static LogicalRecord row(long id) {
         return new LogicalRecord(1, List.of(new ColumnValue.IntValue(id),
                 new ColumnValue.StringValue("payload-" + id)), false, RecordType.CONVENTIONAL);
+    }
+
+    /** 构建并刷出跨越至少五张页的大 undo 链，供小池重开测试验证扫描 latch 边界。 */
+    private MultiPageRollbackFixture buildMultiPageRollbackFixture(Path dataPath, Path undoPath) {
+        Path redoPath = dir.resolve("small-pool-redo.log");
+        try (PageStore store = new FileChannelPageStore();
+             BufferPool pool = new LruBufferPool(store, PS, 64);
+             RedoLogFileRepository repo = RedoLogFileRepository.open(redoPath)) {
+            RedoLogManager redo = RedoLogManager.durable(repo);
+            MiniTransactionManager mgr = new MiniTransactionManager(
+                    new TablespaceAccessController(), redo);
+            DiskSpaceManager disk = new DiskSpaceManager(pool, store, PS);
+            IndexPageAccess pageAccess = new IndexPageAccess(pool, PS);
+            UndoLogSegmentAccess undoAccess = new UndoLogSegmentAccess(
+                    pool, PS, new DiskSpaceUndoAllocator(disk), registry);
+            RollbackSegmentSlotManager slots = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 64);
+            TransactionManager txnMgr = new TransactionManager(new TransactionSystem());
+            UndoLogManager undoMgr = new UndoLogManager(undoAccess, slots, UNDO_SPACE, new HistoryList());
+
+            MiniTransaction boot = mgr.begin();
+            disk.createTablespace(boot, DATA_SPACE, dataPath, PageNo.of(64));
+            SegmentRef leaf = disk.createSegment(boot, DATA_SPACE, SegmentPurpose.INDEX_LEAF);
+            SegmentRef nonLeaf = disk.createSegment(boot, DATA_SPACE, SegmentPurpose.INDEX_NON_LEAF);
+            PageId root = disk.allocatePage(boot, leaf);
+            pageAccess.createIndexPage(boot, root, INDEX_ID, 0);
+            disk.createTablespace(boot, UNDO_SPACE, undoPath, PageNo.of(64));
+            mgr.commit(boot);
+
+            TableSchema schema = largeRollbackSchema();
+            IndexKeyDef keyDef = idKey();
+            BTreeIndex index = new BTreeIndex(INDEX_ID, root, 0, keyDef, schema, true, leaf, nonLeaf);
+            Transaction txn = txnMgr.begin(TransactionOptions.defaults());
+            TransactionId wid = txnMgr.assignWriteId(txn);
+            String largeValue = "x".repeat(7_000);
+            for (int i = 1; i <= 10; i++) {
+                MiniTransaction write = mgr.begin();
+                undoMgr.beforeUpdate(txn, write, TABLE_ID, INDEX_ID, key(i),
+                        List.of(new ColumnValue.IntValue(i), new ColumnValue.StringValue(largeValue)),
+                        new HiddenColumns(wid, RollPointer.NULL), keyDef, schema);
+                mgr.commit(write);
+            }
+            UndoContext ctx = txn.undoContext();
+            redo.flush();
+            FlushCoordinator coordinator = new FlushCoordinator(pool, store, redo, PS,
+                    new NoDoublewriteStrategy(), Duration.ofMillis(100));
+            coordinator.flushList(Lsn.of(Long.MAX_VALUE), pool.capacity());
+            return new MultiPageRollbackFixture(
+                    index, ctx.undoFirstPageId(), ctx.lastUndoNo(), ctx.lastRollPointer());
+        }
+    }
+
+    /** 大 old image 让少量 undo record 稳定跨越多张 16KiB undo 页。 */
+    private static TableSchema largeRollbackSchema() {
+        return new TableSchema(1, List.of(
+                new ColumnDef(new ColumnId(0), "id", ColumnType.intType(false, false), 0),
+                new ColumnDef(new ColumnId(1), "payload", ColumnType.varchar(8_000, true), 1)), true);
+    }
+
+    /** 小池重开所需的持久定位快照；不携带任何 Buffer Pool 句柄。 */
+    private record MultiPageRollbackFixture(BTreeIndex index, PageId undoFirstPageId,
+                                            UndoNo lastUndoNo, RollPointer lastRollPointer) {
     }
 
     private void onPool(Body body) {

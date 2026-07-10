@@ -32,6 +32,13 @@ public final class Transaction {
     private TransactionNo transactionNo = TransactionNo.NONE;
     /** 事务状态：仅经 {@link #transitionTo} 推进。 */
     private TransactionState state = TransactionState.ACTIVE;
+    /**
+     * ACTIVE 事务的提交资格：statement rollback 出现结果不确定错误后置为 true。它不替代主状态机——事务仍留在
+     * active table，唯一合法收尾是完整 rollback；后续 DML、prepareCommit 和 commit 必须拒绝。
+     */
+    private boolean rollbackOnly;
+    /** 首次把事务置为 rollback-only 的领域原因，供拒绝提交和恢复诊断；正常事务为空字符串。 */
+    private String rollbackOnlyReason = "";
     /** 事务 undo 子状态：惰性绑定，首写前为 {@code null}（未建 insert undo segment）。仅 UndoLogManager 修改。 */
     private UndoContext undoContext;
     /**
@@ -73,6 +80,16 @@ public final class Transaction {
 
     public TransactionState state() {
         return state;
+    }
+
+    /** 当前 ACTIVE 事务是否已经失去提交资格，只能执行完整 rollback。 */
+    public boolean rollbackOnly() {
+        return rollbackOnly;
+    }
+
+    /** 首次触发 rollback-only 的诊断原因；未触发时为空字符串。 */
+    public String rollbackOnlyReason() {
+        return rollbackOnlyReason;
     }
 
     /** 事务 undo 子状态；首写前为 {@code null}（未建 insert undo segment）。 */
@@ -121,6 +138,20 @@ public final class Transaction {
     /** 清空事务级 ReadView（RR）。仅 {@code ReadViewManager.release} 调用；幂等（已空再清无副作用）。 */
     void clearReadView() {
         this.readView = null;
+    }
+
+    /**
+     * 把 ACTIVE 事务标记为只能完整回滚。重复调用保留首次原因，避免后续清理异常覆盖最初的数据一致性故障。
+     * 主状态仍保持 ACTIVE，使事务继续留在活跃表并能被普通/恢复 rollback 消费 undo。
+     */
+    void markRollbackOnly(String reason) {
+        if (reason == null || reason.isBlank()) {
+            throw new DatabaseValidationException("rollback-only reason must not be blank");
+        }
+        if (!rollbackOnly) {
+            rollbackOnly = true;
+            rollbackOnlyReason = reason;
+        }
     }
 
     /** 经状态机校验后推进状态；非法转换抛 {@link TransactionStateException}。 */

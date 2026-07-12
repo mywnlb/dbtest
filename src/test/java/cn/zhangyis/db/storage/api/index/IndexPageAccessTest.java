@@ -200,6 +200,34 @@ class IndexPageAccessTest {
         });
     }
 
+    /** 虚高 GARBAGE 会误导 B+Tree underflow/merge-fit，必须在统一 open 边界拒绝且校验本身不产生 redo。 */
+    @Test
+    void openRejectsCorruptedGarbageAccountingInSharedAndExclusiveModes() {
+        onPool((pool, access, mgr) -> {
+            MiniTransaction create = mgr.begin();
+            access.createIndexPage(create, P, 7L, 0);
+            mgr.commit(create);
+
+            MiniTransaction corrupt = mgr.begin();
+            RecordPage page = access.openIndexPage(corrupt, P, PageLatchMode.EXCLUSIVE);
+            page.writeHeader(page.header().withGarbage(1)); // 空页 physicalDeadUpper=0。
+            mgr.commit(corrupt);
+            int redoBeforeRejectedOpens = mgr.redoLogManager().bufferedRecords().size();
+
+            MiniTransaction shared = mgr.begin();
+            assertThrows(PageDirectoryCorruptedException.class,
+                    () -> access.openIndexPage(shared, P, PageLatchMode.SHARED));
+            mgr.rollbackUncommitted(shared);
+
+            MiniTransaction exclusive = mgr.begin();
+            assertThrows(PageDirectoryCorruptedException.class,
+                    () -> access.openIndexPage(exclusive, P, PageLatchMode.EXCLUSIVE));
+            mgr.rollbackUncommitted(exclusive);
+            assertEquals(redoBeforeRejectedOpens, mgr.redoLogManager().bufferedRecords().size(),
+                    "garbage validation is read-only even for an EXCLUSIVE open");
+        });
+    }
+
     @Test
     void createIndexPageValidatesArgsBeforeTouchingPage() {
         onPool((pool, access, mgr) -> {

@@ -17,8 +17,9 @@ import java.util.Set;
  * 已格式化 INDEX 页的完整物理结构校验器。调用方必须已持有该页 S/X latch；本类只读取 {@link RecordPage}
  * 暴露的页内原语，不拥有 latch/fix、不访问文件，也不解析 schema、key 或事务可见性。
  *
- * <p>校验按 header/system records → next-record/user headers → directory/nOwned 的顺序执行。任何损坏都统一为
- * {@link PageDirectoryCorruptedException}，使 B+Tree 在字段解析或写页前 fail-closed；低层格式/边界异常保留为 cause。
+ * <p>校验按 header/system records → next-record/user headers → GarbageList/accounting → directory/nOwned 的顺序
+ * 执行。任何损坏都统一为 {@link PageDirectoryCorruptedException}，使 B+Tree 在字段解析、空间决策或写页前
+ * fail-closed；低层格式/边界异常保留为 cause。
  */
 public final class RecordPageStructureValidator {
 
@@ -52,6 +53,7 @@ public final class RecordPageStructureValidator {
         validateHeaderGeometry(page, header);
         SystemRecords system = validateSystemRecords(page);
         UserChain chain = validateUserChain(page, header, system);
+        validateGarbageList(page, header, chain);
         validateDirectory(page, header, system, chain);
     }
 
@@ -116,6 +118,7 @@ public final class RecordPageStructureValidator {
         Map<Integer, Integer> positions = new HashMap<>();
         Set<Integer> heapNumbers = new HashSet<>();
         List<RecordRange> ranges = new ArrayList<>();
+        long liveRecordBytes = 0;
         int current = system.infimum().nextRecordOffset();
         int position = 1;
         while (current != page.supremumOffset()) {
@@ -149,6 +152,8 @@ public final class RecordPageStructureValidator {
             positions.put(current, position++);
             headers.put(current, header);
             ranges.add(new RecordRange(current, current + header.recordLength()));
+            liveRecordBytes = checkedAdd(liveRecordBytes, header.recordLength(),
+                    "live record byte count overflows");
             current = header.nextRecordOffset();
         }
         if (headers.size() != pageHeader.nRecs()) {
@@ -158,7 +163,8 @@ public final class RecordPageStructureValidator {
         validateNonOverlappingRanges(ranges);
         positions.put(page.infimumOffset(), 0);
         positions.put(page.supremumOffset(), headers.size() + 1);
-        return new UserChain(headers, positions);
+        return new UserChain(Map.copyOf(headers), Map.copyOf(positions), Set.copyOf(heapNumbers),
+                List.copyOf(ranges), liveRecordBytes);
     }
 
     /** key 顺序与物理 offset 无关，因此按 offset 排序后单独验证 live record 区间不得重叠。 */
@@ -171,6 +177,65 @@ public final class RecordPageStructureValidator {
                 throw corrupted("live user record ranges overlap: previous=" + previous
                         + ", current=" + current);
             }
+        }
+    }
+
+    /**
+     * 校验 FREE fragment 链与 GARBAGE 的安全上下界。GARBAGE 允许大于链上容量（原地缩短只计数不定位），
+     * 但不能小于全部可定位 fragment，也不能超过用户 heap 中非 live record 的物理字节上限。
+     */
+    private static void validateGarbageList(RecordPage page, IndexPageHeader pageHeader, UserChain liveChain) {
+        Set<Integer> fragmentOffsets = new HashSet<>();
+        Set<Integer> occupiedHeapNumbers = new HashSet<>(liveChain.heapNumbers());
+        List<RecordRange> occupiedRanges = new ArrayList<>(liveChain.ranges());
+        long linkedFreeBytes = 0;
+        int fragment = pageHeader.free();
+        while (fragment != 0) {
+            if (!fragmentOffsets.add(fragment)) {
+                throw corrupted("garbage FREE chain repeats/cycles at offset " + fragment);
+            }
+            if (fragment < IndexPageLayout.USER_RECORDS_START
+                    || (long) fragment + IndexPageLayout.REC_HEADER_BYTES > pageHeader.heapTop()) {
+                throw corrupted("garbage fragment header outside used heap: offset=" + fragment
+                        + ", heapTop=" + pageHeader.heapTop());
+            }
+            RecordHeader header = page.recordHeaderAt(fragment);
+            if (header.recordType() != RecordType.CONVENTIONAL
+                    && header.recordType() != RecordType.NODE_POINTER) {
+                throw corrupted("garbage fragment has system record type at offset " + fragment
+                        + ": " + header.recordType());
+            }
+            if (header.recordLength() < IndexPageLayout.REC_HEADER_BYTES
+                    || (long) fragment + header.recordLength() > pageHeader.heapTop()) {
+                throw corrupted("garbage fragment length exceeds used heap: offset=" + fragment
+                        + ", length=" + header.recordLength() + ", heapTop=" + pageHeader.heapTop());
+            }
+            if (header.heapNo() < 2 || header.heapNo() >= pageHeader.nHeap()
+                    || !occupiedHeapNumbers.add(header.heapNo())) {
+                throw corrupted("garbage heapNo is out of range or conflicts with live/free record: offset="
+                        + fragment + ", heapNo=" + header.heapNo() + ", nHeap=" + pageHeader.nHeap());
+            }
+            occupiedRanges.add(new RecordRange(fragment, fragment + header.recordLength()));
+            linkedFreeBytes = checkedAdd(linkedFreeBytes, header.recordLength(),
+                    "linked garbage byte count overflows");
+            fragment = header.nextRecordOffset();
+        }
+
+        // live/free 与 free/free 共用同一个物理 heap；合并排序可同时发现两类区间重叠。
+        validateNonOverlappingRanges(occupiedRanges);
+        long heapSpan = (long) pageHeader.heapTop() - IndexPageLayout.USER_RECORDS_START;
+        long physicalDeadUpper = heapSpan - liveChain.liveRecordBytes();
+        if (physicalDeadUpper < 0) {
+            throw corrupted("live record bytes exceed user heap span: live=" + liveChain.liveRecordBytes()
+                    + ", heapSpan=" + heapSpan);
+        }
+        if (linkedFreeBytes > pageHeader.garbage()) {
+            throw corrupted("GARBAGE is smaller than linked FREE fragments: garbage=" + pageHeader.garbage()
+                    + ", linkedFreeBytes=" + linkedFreeBytes);
+        }
+        if (pageHeader.garbage() > physicalDeadUpper) {
+            throw corrupted("GARBAGE exceeds physical dead-byte upper bound: garbage=" + pageHeader.garbage()
+                    + ", physicalDeadUpper=" + physicalDeadUpper);
         }
     }
 
@@ -246,12 +311,25 @@ public final class RecordPageStructureValidator {
         return new PageDirectoryCorruptedException(message);
     }
 
+    /** checked 累加页内字节账本；溢出表示持久计数无法形成可信上界。 */
+    private static long checkedAdd(long left, long right, String message) {
+        try {
+            return Math.addExact(left, right);
+        } catch (ArithmeticException error) {
+            throw new PageDirectoryCorruptedException(message, error);
+        }
+    }
+
     /** 已校验的固定系统记录头。 */
     private record SystemRecords(RecordHeader infimum, RecordHeader supremum) {
     }
 
-    /** 已校验用户记录头与包含两端哨兵的逻辑链位置。 */
-    private record UserChain(Map<Integer, RecordHeader> headers, Map<Integer, Integer> positions) {
+    /** 已校验用户记录头、逻辑位置、heap identity、物理区间与 live 字节账本。 */
+    private record UserChain(Map<Integer, RecordHeader> headers,
+                             Map<Integer, Integer> positions,
+                             Set<Integer> heapNumbers,
+                             List<RecordRange> ranges,
+                             long liveRecordBytes) {
     }
 
     /** 一条 live 用户记录在物理 heap 中的半开区间。 */

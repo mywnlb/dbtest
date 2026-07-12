@@ -17,6 +17,7 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
  * 0.19h：B+Tree 结构页 delta v1。恢复期只 patch 页内结构字段，不重新执行 split/merge 算法。
@@ -60,6 +61,49 @@ class BTreePageDeltaRedoTest {
         assertEquals(1, summary.appliedBatchCount());
         assertArrayEquals(links, slice(page, PageEnvelopeLayout.PREV_PAGE_NO, links.length));
         assertEquals(batch.range().end().value(), ByteBuffer.wrap(page).getLong(PageEnvelopeLayout.PAGE_LSN));
+    }
+
+    @Test
+    void nodeAndRootDeltaLayoutsRejectMalformedOffsetsOrLengths() {
+        assertThrows(cn.zhangyis.db.common.exception.DatabaseValidationException.class,
+                () -> new BTreePageDeltaRecord(LEAF, 7L, BTreePageDeltaKind.ROOT_LEVEL_OR_HEADER,
+                        2L, 55, new byte[10]));
+        assertThrows(cn.zhangyis.db.common.exception.DatabaseValidationException.class,
+                () -> new BTreePageDeltaRecord(LEAF, 7L, BTreePageDeltaKind.ROOT_LEVEL_OR_HEADER,
+                        2L, 56, new byte[9]));
+        assertThrows(cn.zhangyis.db.common.exception.DatabaseValidationException.class,
+                () -> new BTreePageDeltaRecord(LEAF, 7L, BTreePageDeltaKind.NODE_POINTER_AREA,
+                        2L, 65, new byte[4]));
+    }
+
+    @Test
+    void nodeAndRootDeltasReplayAsPageLocalAfterImages() {
+        RecordingPageStore store = new RecordingPageStore();
+        store.create(SPACE, Path.of("idx-node.ibd"), PS, PageNo.of(64));
+        byte[] rootIdentity = ByteBuffer.allocate(10).putShort((short) 2).putLong(7L).array();
+        byte[] pointerHeap = new byte[]{1, 2, 3, 4, 5, 6};
+        RedoLogBatch batch = batchOf(List.of(
+                new BTreePageDeltaRecord(LEAF, 7L, BTreePageDeltaKind.ROOT_LEVEL_OR_HEADER,
+                        2L, 56, rootIdentity),
+                new BTreePageDeltaRecord(LEAF, 7L, BTreePageDeltaKind.NODE_POINTER_AREA,
+                        2L, 66, pointerHeap)));
+
+        RedoApplyDispatcher.pageDispatcher().apply(batch, new RedoApplyContext(store, PS));
+
+        assertArrayEquals(rootIdentity, slice(store.page(LEAF), 56, rootIdentity.length));
+        assertArrayEquals(pointerHeap, slice(store.page(LEAF), 66, pointerHeap.length));
+    }
+
+    @Test
+    void nodePointerDeltaCannotPatchFileTrailer() {
+        RecordingPageStore store = new RecordingPageStore();
+        store.create(SPACE, Path.of("idx-bad-node.ibd"), PS, PageNo.of(64));
+        RedoLogBatch batch = batchOf(List.of(new BTreePageDeltaRecord(
+                LEAF, 7L, BTreePageDeltaKind.NODE_POINTER_AREA, 1L,
+                PS.bytes() - 4, new byte[]{1, 2, 3, 4})));
+
+        assertThrows(RedoLogCorruptedException.class,
+                () -> RedoApplyDispatcher.pageDispatcher().apply(batch, new RedoApplyContext(store, PS)));
     }
 
     private static RedoLogBatch batchOf(List<RedoRecord> records) {

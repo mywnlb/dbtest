@@ -34,6 +34,8 @@ import cn.zhangyis.db.storage.record.schema.KeyPartDef;
 import cn.zhangyis.db.storage.record.schema.TableSchema;
 import cn.zhangyis.db.storage.record.type.ColumnValue;
 import cn.zhangyis.db.storage.record.type.TypeCodecRegistry;
+import cn.zhangyis.db.storage.redo.BTreePageDeltaKind;
+import cn.zhangyis.db.storage.redo.BTreePageDeltaRecord;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -316,6 +318,7 @@ class BTreeDeleteClusteredTest {
             }
             long inserted = id - 1;
             assertTrue(current.rootLevel() >= 2, "multi-level tree before deletes");
+            long rootDeltaBefore = countDeltas(ctx, BTreePageDeltaKind.ROOT_LEVEL_OR_HEADER);
 
             int totalFreed = 0;
             for (long k = 1; k <= inserted; k++) {
@@ -331,6 +334,8 @@ class BTreeDeleteClusteredTest {
             assertEquals(0, current.rootLevel(), "deleting every row collapses the tree to a level-0 root leaf");
             assertEquals(ctx.rootPageId, current.rootPageId(), "root page id stays stable across shrink");
             assertTrue(totalFreed > 0, "merge/shrink freed interior + leaf pages");
+            assertTrue(countDeltas(ctx, BTreePageDeltaKind.ROOT_LEVEL_OR_HEADER) > rootDeltaBefore,
+                    "root shrink to leaf must append a final level/index identity delta");
 
             MiniTransaction r = ctx.mgr.begin();
             for (long k = 1; k <= inserted; k++) {
@@ -620,6 +625,7 @@ class BTreeDeleteClusteredTest {
             List<Integer> before = new ArrayList<>();
             collectFills(ctx, current, before, new ArrayList<>());
             assertEquals(List.of(2, 3), before, "root has a 2-ptr left and a full 3-ptr right level-1 child");
+            long nodeDeltaBefore = countDeltas(ctx, BTreePageDeltaKind.NODE_POINTER_AREA);
 
             // 删最小 key → 左 A 一个 leaf 欠载并 merge → A 降到 1 ptr 欠载 → 与满兄弟 B(3 ptr) 合计 4>3 fit 不下
             // → 触发 internal redistribute 平分为 2+2（而非 0.12 留 1-ptr 退化内部页或 shrink）。
@@ -635,6 +641,8 @@ class BTreeDeleteClusteredTest {
             assertEquals(2, current.rootLevel(), "internal redistribute keeps the tree at level 2 (no shrink)");
             assertEquals(List.of(2, 2), after,
                     "internal redistribute rebalances the two level-1 children to 2+2 (no 1-ptr degenerate page)");
+            assertTrue(countDeltas(ctx, BTreePageDeltaKind.NODE_POINTER_AREA) > nodeDeltaBefore,
+                    "internal redistribute must append final node heap/directory images");
 
             MiniTransaction r = ctx.mgr.begin();
             List<Long> ids = svc.scan(r, current, new BTreeScanRange(kKey(1), true, kKey(10), true, 50))
@@ -642,6 +650,15 @@ class BTreeDeleteClusteredTest {
             ctx.mgr.commit(r);
             assertEquals(List.of(2L, 3L, 4L, 5L, 6L, 7L, 8L, 9L, 10L), ids, "remaining keys intact and ordered");
         });
+    }
+
+    /** 统计指定 B+Tree 结构 delta，供 split/redistribute/shrink 测试钉住新增 redo 生产接线。 */
+    private long countDeltas(Ctx ctx, BTreePageDeltaKind kind) {
+        return ctx.mgr.redoLogManager().bufferedRecords().stream()
+                .filter(BTreePageDeltaRecord.class::isInstance)
+                .map(BTreePageDeltaRecord.class::cast)
+                .filter(delta -> delta.kind() == kind)
+                .count();
     }
 
     /** 遍历整树，收集非根内部页的 pointer 数与 leaf 的记录数（白盒结构检查）。 */

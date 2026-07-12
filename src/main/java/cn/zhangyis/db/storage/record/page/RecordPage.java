@@ -190,6 +190,28 @@ public final class RecordPage {
         return dirStart() - PageU16.get(guard, IndexPageHeaderLayout.HEAP_TOP);
     }
 
+    /**
+     * 捕获当前 INDEX 页最终结构 after-image。数据流：读取权威 header 得到 level/record count/heapTop，
+     * 再复制固定 header、已使用 heap 和目录三段；不复制 free-space，不修改页面，也不触发 redo listener。
+     * 调用方必须仍持有当前页的 S/X latch；B+Tree 结构 redo 在写路径中使用 X latch 下的稳定快照。
+     */
+    public RecordPageStructureSnapshot structureSnapshot() {
+        IndexPageHeader current = header();
+        int directoryStart = dirStart();
+        int trailerStart = pageSize.bytes() - IndexPageLayout.FIL_PAGE_TRAILER_BYTES;
+        return new RecordPageStructureSnapshot(
+                current.level(),
+                current.nRecs(),
+                IndexPageLayout.PAGE_HEADER_START,
+                guard.readBytes(IndexPageLayout.PAGE_HEADER_START,
+                        IndexPageLayout.PAGE_HEADER_END - IndexPageLayout.PAGE_HEADER_START),
+                IndexPageLayout.INFIMUM_OFFSET,
+                guard.readBytes(IndexPageLayout.INFIMUM_OFFSET,
+                        current.heapTop() - IndexPageLayout.INFIMUM_OFFSET),
+                directoryStart,
+                guard.readBytes(directoryStart, trailerStart - directoryStart));
+    }
+
     // ---------------------------------------------------------------------
     // heap 分配 + next_record 链
     // ---------------------------------------------------------------------

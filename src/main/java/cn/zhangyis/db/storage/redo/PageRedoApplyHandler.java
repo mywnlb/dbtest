@@ -185,6 +185,15 @@ public final class PageRedoApplyHandler implements RedoApplyHandler {
      */
     private static void applyBTreePageDelta(RedoApplyContext context, ReplayPage page,
                                             BTreePageDeltaRecord record) {
+        if (record.kind() == BTreePageDeltaKind.NODE_POINTER_AREA) {
+            long end = (long) record.offset() + record.afterImage().length;
+            long trailerStart = context.pageSize().bytes() - PageEnvelopeLayout.FIL_PAGE_TRAILER_BYTES;
+            if (end > trailerStart) {
+                throw new RedoLogCorruptedException("redo B+Tree node pointer delta crosses file trailer: offset="
+                        + record.offset() + " length=" + record.afterImage().length
+                        + " trailerStart=" + trailerStart);
+            }
+        }
         applyPatch(context, page, record.offset(), record.afterImage(), "redo B+Tree page delta");
     }
 

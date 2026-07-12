@@ -8,11 +8,11 @@ public enum BTreePageDeltaKind {
 
     /** FIL prev/next sibling 链字段，当前 v1 已接生产 split/merge/root shrink 写点。 */
     SIBLING_LINKS((byte) 1),
-    /** 页格式/header 结构字段预留，后续 root level、page direction 等可迁移到该分类。 */
+    /** 普通 internal 页的完整 INDEX header after-image。 */
     PAGE_FORMAT_IMAGE((byte) 2),
-    /** internal node pointer 区域预留，用于后续替代节点指针物理字节。 */
+    /** internal node pointer 的已使用 heap 或 Page Directory after-image。 */
     NODE_POINTER_AREA((byte) 3),
-    /** root header / level 变化预留，用于后续把 root split/shrink 的结构元数据细化。 */
+    /** root 完整 INDEX header，或 shrink 到 leaf 后的 level/index identity。 */
     ROOT_LEVEL_OR_HEADER((byte) 4);
 
     /** redo 文件中的稳定 1 字节分类码；只能追加，不能重排。 */

@@ -919,6 +919,8 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         BTreeIndex after = index.withRootLevel(1);
         insertPointer(root, index.rootPageId(), after, new BTreeNodePointer(lowKey(split.left(), index), leftId));
         insertPointer(root, index.rootPageId(), after, new BTreeNodePointer(lowKey(split.right(), index), rightId));
+        BTreeRedoDeltas.captureNodePointerPage(mtr, root, index.rootPageId(), index.indexId(), true,
+                "btree root leaf split final node pointers");
         return new BTreeInsertResult(index, insertedRef, after, true, List.of(leftId, rightId));
     }
 
@@ -1081,6 +1083,9 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         RecordPage parent = parentHandle.recordPage();
         if (pointerFits(parent, index, separator)) {
             insertPointer(parent, parentHandle.pageId(), index, separator);
+            BTreeRedoDeltas.captureNodePointerPage(mtr, parent, parentHandle.pageId(), index.indexId(),
+                    parentHandle.pageId().equals(index.rootPageId()),
+                    "btree separator insertion final parent image");
             return index;
         }
         requireNonLeafSegment(index);
@@ -1108,6 +1113,10 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         RecordPage rightPage = createSmoIndexPage(mtr, rightId, index.indexId(), oldLevel);
         writePointers(leftPage, leftId, split.left(), index);
         writePointers(rightPage, rightId, split.right(), index);
+        BTreeRedoDeltas.captureNodePointerPage(mtr, leftPage, leftId, index.indexId(), false,
+                "btree internal root split final left child image");
+        BTreeRedoDeltas.captureNodePointerPage(mtr, rightPage, rightId, index.indexId(), false,
+                "btree internal root split final right child image");
 
         RecordPage root = rootHandle.recordPage();
         root.format(index.indexId(), oldLevel + 1);
@@ -1116,6 +1125,8 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         BTreeIndex after = index.withRootLevel(oldLevel + 1);
         insertPointer(root, index.rootPageId(), index, new BTreeNodePointer(split.left().get(0).lowKey(), leftId));
         insertPointer(root, index.rootPageId(), index, new BTreeNodePointer(split.right().get(0).lowKey(), rightId));
+        BTreeRedoDeltas.captureNodePointerPage(mtr, root, index.rootPageId(), index.indexId(), true,
+                "btree internal root split final root image");
         return after;
     }
 
@@ -1130,6 +1141,10 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         node.format(index.indexId(), level);
         writePointers(node, nodeHandle.pageId(), split.left(), index);
         writePointers(newSibling, newSiblingId, split.right(), index);
+        BTreeRedoDeltas.captureNodePointerPage(mtr, node, nodeHandle.pageId(), index.indexId(), false,
+                "btree non-root internal split final left image");
+        BTreeRedoDeltas.captureNodePointerPage(mtr, newSibling, newSiblingId, index.indexId(), false,
+                "btree non-root internal split final right image");
         return newSiblingId;
     }
 
@@ -1143,7 +1158,8 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
     //
     // 锁：悲观 X 下降（0.13d safe-node：保留链 = 「最近 delete-safe 内部节点 … leaf」，safe 节点以上祖先已早释放）+
     // 额外取 sibling/远兄弟/child 的 X，均入 MTR memo，commit 统一释放。merge 传播只在保留链内自底向上，safe 链顶必吸收。
-    // redo：复用物理 PAGE_BYTES/PAGE_INIT（move 条目 = inserter 写、摘 pointer = purger 写、root.format = PAGE_INIT），无 btree 专用逻辑 redo。
+    // redo：leaf row 仍用 PAGE_BYTES/PAGE_INIT；internal/root 完整结构动作结束后追加 page-local node/root after-image，
+    // recovery 只 patch 页面，不重新运行 merge/redistribute/shrink 决策。
     // =====================================================================
 
     /** 一条记录被物理摘除后，survivor 容纳 victim 所需的每条目额外余量（目录槽 + 对齐安全），与 {@link #pointerFits} 的 +8 一致。 */
@@ -1198,15 +1214,17 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         boolean leaf = node.header().level() == 0;
         if (!mergeFits(pair, leaf, index)) {
             // merge 放不下（相邻对合计 > 一页）→ redistribute 对半再平衡（0.12b）：双方脱离欠载、不删页/不传播/不改树高。
-            redistribute(index, pair, leaf, parent, parentHandle.pageId());
+            redistribute(mtr, index, pair, leaf, parent, parentHandle.pageId(), parentIsRoot);
             return index;
         }
         if (leaf) {
             mergeLeaf(mtr, index, pair);
         } else {
-            mergeInternal(index, pair);
+            mergeInternal(mtr, index, pair);
         }
         removePointerFromParent(parent, parentHandle.pageId(), index, pair.victimId());
+        BTreeRedoDeltas.captureNodePointerPage(mtr, parent, parentHandle.pageId(), index.indexId(), parentIsRoot,
+                "btree merge final parent image after victim removal");
         freed.add(pair.victimId());
         freeSmoPage(mtr, leaf ? index.leafSegment() : index.nonLeafSegment(), pair.victimId());
 
@@ -1323,11 +1341,13 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
     }
 
     /** 内部页 merge：先 reorganize survivor 压实 garbage，再把 victim 全部 node pointer 并入 survivor（victim key 段整体 &gt; survivor，按序追加）；内部页不参与 FIL 链。 */
-    private void mergeInternal(BTreeIndex index, MergePair pair) {
+    private void mergeInternal(MiniTransaction mtr, BTreeIndex index, MergePair pair) {
         RecordPage survivor = pair.survivor().recordPage();
         RecordPage victim = pair.victim().recordPage();
         reorganizer.reorganize(survivor);
         writePointers(survivor, pair.survivorId(), materializePointers(victim, index), index);
+        BTreeRedoDeltas.captureNodePointerPage(mtr, survivor, pair.survivorId(), index.indexId(), false,
+                "btree internal merge final survivor image");
     }
 
     /**
@@ -1343,7 +1363,8 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
      * <p>进入前提（{@code mergeFits=false} 且选到相邻兄弟）保证两页合计 &gt; 一页 ⟹ 条目数 ≥ 2 且对半后每页 &lt; 一页、
      * &gt; 半页（脱离欠载）；防御：万一合计 &lt; 2 直接返回（留原状，不抛）。
      */
-    private void redistribute(BTreeIndex index, MergePair pair, boolean leaf, RecordPage parent, PageId parentId) {
+    private void redistribute(MiniTransaction mtr, BTreeIndex index, MergePair pair, boolean leaf,
+                              RecordPage parent, PageId parentId, boolean parentIsRoot) {
         RecordPage left = pair.survivor().recordPage();
         RecordPage right = pair.victim().recordPage();
         PageId leftId = pair.survivorId();
@@ -1377,10 +1398,16 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
             writePointers(left, leftId, s.left(), index);
             right.format(index.indexId(), level);
             writePointers(right, rightId, s.right(), index);
+            BTreeRedoDeltas.captureNodePointerPage(mtr, left, leftId, index.indexId(), false,
+                    "btree internal redistribute final left image");
+            BTreeRedoDeltas.captureNodePointerPage(mtr, right, rightId, index.indexId(), false,
+                    "btree internal redistribute final right image");
             newRightLowKey = s.right().get(0).lowKey();
         }
         removePointerFromParent(parent, parentId, index, rightId);
         insertPointer(parent, parentId, index, new BTreeNodePointer(newRightLowKey, rightId));
+        BTreeRedoDeltas.captureNodePointerPage(mtr, parent, parentId, index.indexId(), parentIsRoot,
+                "btree redistribute final parent pointer replacement");
     }
 
     /** 从 parent 摘除指向 {@code victimId} 的 node pointer（deleteMark + purge；node pointer 非系统记录可标记后摘）。 */
@@ -1424,6 +1451,8 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
             for (LogicalRecord row : rows) {
                 inserter.insert(root, index.rootPageId(), row, index.keyDef(), index.schema());
             }
+            BTreeRedoDeltas.captureLeafRootIdentity(mtr, root, index.rootPageId(), index.indexId(),
+                    "btree root shrink final leaf level/index identity");
             freed.add(childId);
             freeSmoPage(mtr, index.leafSegment(), childId);
             return index.withRootLevel(0);
@@ -1433,6 +1462,8 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         BTreeRedoDeltas.writeSiblingLinks(mtr, rootHandle, index.indexId(),
                 FilePageHeader.FIL_NULL, FilePageHeader.FIL_NULL, "btree root shrink internal sibling reset");
         writePointers(root, index.rootPageId(), pointers, index);
+        BTreeRedoDeltas.captureNodePointerPage(mtr, root, index.rootPageId(), index.indexId(), true,
+                "btree root shrink final internal image");
         freed.add(childId);
         freeSmoPage(mtr, index.nonLeafSegment(), childId);
         BTreeIndex after = index.withRootLevel(childLevel);

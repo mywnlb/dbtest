@@ -9,8 +9,8 @@ import java.util.Arrays;
  * B+Tree 结构页 after-image redo。它把 split/merge/root shrink 等结构维护中稳定的页字段变化编码为
  * page-local patch，恢复期不重新执行 B+Tree 算法，也不依赖当前内存索引对象图。
  *
- * <p>0.19h v1 先接入 sibling link 字段；record row bytes、node pointer 数组和 root format 仍允许继续由
- * {@link PageBytesRecord} 保护，后续可逐步迁移为更细的结构 delta。
+ * <p>0.19h v1 接入 sibling link；后续切片复用预留 kind 接入 internal header、node-pointer used heap/directory
+ * 与 root level/index identity。leaf row bytes 继续由 {@link PageBytesRecord} 保护；同值物理写由 MTR 提交视图精确过滤。
  *
  * @param pageId     被 patch 的索引页。
  * @param indexId    索引 id，用于诊断和后续恢复阶段定位。
@@ -29,6 +29,16 @@ public record BTreePageDeltaRecord(
 
     /** tag(1)+pageId(12)+indexId(8)+kind(1)+subjectId(8)+offset(4)+payloadLen(4)。 */
     private static final int HEADER_BYTES = 38;
+    /** INDEX page header 固定布局 `[38,66)`。 */
+    public static final int INDEX_HEADER_OFFSET = 38;
+    /** INDEX page header 固定字节数。 */
+    public static final int INDEX_HEADER_BYTES = 28;
+    /** PAGE_LEVEL(u16)+INDEX_ID(u64) 固定布局 `[56,66)`。 */
+    public static final int ROOT_IDENTITY_OFFSET = 56;
+    /** root level/index identity 固定字节数。 */
+    public static final int ROOT_IDENTITY_BYTES = 10;
+    /** node pointer heap 最早从 infimum 起始偏移 66 开始。 */
+    public static final int NODE_AREA_MIN_OFFSET = 66;
 
     public BTreePageDeltaRecord {
         if (pageId == null || kind == null) {
@@ -47,6 +57,7 @@ public record BTreePageDeltaRecord(
         if (afterImage == null || afterImage.length == 0) {
             throw new DatabaseValidationException("B+Tree page delta after image must not be null or empty");
         }
+        validateKindLayout(kind, offset, afterImage.length);
         afterImage = afterImage.clone();
     }
 
@@ -87,5 +98,35 @@ public record BTreePageDeltaRecord(
         result = 31 * result + Integer.hashCode(offset);
         result = 31 * result + Arrays.hashCode(afterImage);
         return result;
+    }
+
+    /** kind 是稳定磁盘语义，固定结构字段必须在读写两侧 fail-closed，不能退化成任意 offset patch。 */
+    private static void validateKindLayout(BTreePageDeltaKind kind, int offset, int length) {
+        switch (kind) {
+            case SIBLING_LINKS -> {
+                if (offset != 12 || length != 8) {
+                    throw new DatabaseValidationException("B+Tree sibling delta layout must be [12,20)");
+                }
+            }
+            case PAGE_FORMAT_IMAGE -> {
+                if (offset != INDEX_HEADER_OFFSET || length != INDEX_HEADER_BYTES) {
+                    throw new DatabaseValidationException("B+Tree page format delta layout must be [38,66)");
+                }
+            }
+            case NODE_POINTER_AREA -> {
+                if (offset < NODE_AREA_MIN_OFFSET) {
+                    throw new DatabaseValidationException("B+Tree node pointer delta starts before record body: "
+                            + offset);
+                }
+            }
+            case ROOT_LEVEL_OR_HEADER -> {
+                boolean fullHeader = offset == INDEX_HEADER_OFFSET && length == INDEX_HEADER_BYTES;
+                boolean identityOnly = offset == ROOT_IDENTITY_OFFSET && length == ROOT_IDENTITY_BYTES;
+                if (!fullHeader && !identityOnly) {
+                    throw new DatabaseValidationException(
+                            "B+Tree root delta must cover [38,66) or [56,66)");
+                }
+            }
+        }
     }
 }

@@ -74,6 +74,16 @@ class RecordPageFormatTest {
                 assertEquals(16274, rp.freeSpace());
                 assertTrue(rp.recordOffsetsInOrder().isEmpty());
                 assertEquals(List.of(), rp.recordOffsetsInOrder());
+
+                RecordPageStructureSnapshot snapshot = rp.structureSnapshot();
+                assertEquals(0, snapshot.level());
+                assertEquals(0, snapshot.userRecordCount());
+                assertEquals(38, snapshot.headerOffset());
+                assertEquals(28, snapshot.headerImage().length);
+                assertEquals(66, snapshot.heapOffset());
+                assertEquals(32, snapshot.heapImage().length);
+                assertEquals(16372, snapshot.directoryOffset());
+                assertEquals(4, snapshot.directoryImage().length);
             }
         }
     }

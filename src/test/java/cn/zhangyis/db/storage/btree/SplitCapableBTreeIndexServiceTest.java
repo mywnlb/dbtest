@@ -254,12 +254,28 @@ class SplitCapableBTreeIndexServiceTest {
                     .toList();
 
             assertFalse(siblingDeltas.isEmpty(), "root split must log B+Tree sibling-link logical deltas");
+            List<BTreePageDeltaRecord> nodeDeltas = records.stream()
+                    .filter(BTreePageDeltaRecord.class::isInstance)
+                    .map(BTreePageDeltaRecord.class::cast)
+                    .filter(delta -> delta.indexId() == INDEX_ID)
+                    .filter(delta -> delta.kind() == BTreePageDeltaKind.NODE_POINTER_AREA)
+                    .toList();
+            List<BTreePageDeltaRecord> rootDeltas = records.stream()
+                    .filter(BTreePageDeltaRecord.class::isInstance)
+                    .map(BTreePageDeltaRecord.class::cast)
+                    .filter(delta -> delta.indexId() == INDEX_ID)
+                    .filter(delta -> delta.kind() == BTreePageDeltaKind.ROOT_LEVEL_OR_HEADER)
+                    .toList();
+            assertFalse(nodeDeltas.isEmpty(), "root split must log final node-pointer heap/directory images");
+            assertFalse(rootDeltas.isEmpty(), "root split must log final root level/index header image");
             for (RedoLogBatch batch : ctx.mgr.redoLogManager().bufferedBatches()) {
                 for (BTreePageDeltaRecord delta : batch.records().stream()
                         .filter(BTreePageDeltaRecord.class::isInstance)
                         .map(BTreePageDeltaRecord.class::cast)
                         .filter(delta -> delta.indexId() == INDEX_ID)
-                        .filter(delta -> delta.kind() == BTreePageDeltaKind.SIBLING_LINKS)
+                        .filter(delta -> delta.kind() == BTreePageDeltaKind.SIBLING_LINKS
+                                || delta.kind() == BTreePageDeltaKind.NODE_POINTER_AREA
+                                || delta.kind() == BTreePageDeltaKind.ROOT_LEVEL_OR_HEADER)
                         .toList()) {
                     assertFalse(batch.records().stream().anyMatch(record -> record instanceof PageBytesRecord bytes
                                     && isCoveredBy(delta, bytes)),
@@ -330,6 +346,11 @@ class SplitCapableBTreeIndexServiceTest {
             }
 
             assertTrue(current.rootLevel() >= 2, "wide node pointers grow the tree past level 1 via parent split");
+            assertTrue(ctx.mgr.redoLogManager().bufferedRecords().stream()
+                            .filter(BTreePageDeltaRecord.class::isInstance)
+                            .map(BTreePageDeltaRecord.class::cast)
+                            .anyMatch(delta -> delta.kind() == BTreePageDeltaKind.PAGE_FORMAT_IMAGE),
+                    "non-root internal split must log final page-header structure images");
             MiniTransaction read = ctx.mgr.begin();
             List<Long> ids = service.scan(read, current,
                             new BTreeScanRange(kPayload(1), true, kPayload(99), true, 100))

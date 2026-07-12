@@ -16,6 +16,7 @@ import cn.zhangyis.db.storage.api.DiskSpaceManager;
 import cn.zhangyis.db.storage.api.SegmentRef;
 import cn.zhangyis.db.storage.btree.BTreeIndex;
 import cn.zhangyis.db.storage.btree.BTreeLookupResult;
+import cn.zhangyis.db.storage.btree.BTreeRedoBudgetEstimator;
 import cn.zhangyis.db.storage.btree.SplitCapableBTreeIndexService;
 import cn.zhangyis.db.storage.fsp.segment.SegmentPurpose;
 import cn.zhangyis.db.storage.flush.cleaner.PageCleanerState;
@@ -39,6 +40,7 @@ import cn.zhangyis.db.storage.redo.RedoCheckpointLabel;
 import cn.zhangyis.db.storage.redo.RedoCheckpointStore;
 import cn.zhangyis.db.storage.redo.RedoLogFileRepository;
 import cn.zhangyis.db.storage.redo.RedoBudgetPurpose;
+import cn.zhangyis.db.storage.trx.UndoRedoBudgetEstimator;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
 import cn.zhangyis.db.storage.redo.RedoRecoveryReader;
 import cn.zhangyis.db.storage.trx.Transaction;
@@ -674,7 +676,8 @@ class StorageEngineTest {
         Transaction txn = e1.transactionManager().begin(TransactionOptions.defaults());
         e1.transactionManager().assignWriteId(txn);
         MiniTransaction m = e1.miniTransactionManager().begin(
-                e1.miniTransactionManager().budgetFor(RedoBudgetPurpose.CLUSTERED_INSERT));
+                e1.miniTransactionManager().budgetFor(RedoBudgetPurpose.CLUSTERED_INSERT,
+                        UndoRedoBudgetEstimator.append(true)));
         e1.undoLogManager().beforeInsert(txn, m, TABLE_ID, INDEX_ID,
                 List.of(new ColumnValue.IntValue(1)), idKey(), clusteredSchema());
         e1.miniTransactionManager().commit(m);
@@ -702,7 +705,8 @@ class StorageEngineTest {
         Transaction txn = e1.transactionManager().begin(TransactionOptions.defaults());
         e1.transactionManager().assignWriteId(txn);
         MiniTransaction m = e1.miniTransactionManager().begin(
-                e1.miniTransactionManager().budgetFor(RedoBudgetPurpose.CLUSTERED_INSERT));
+                e1.miniTransactionManager().budgetFor(RedoBudgetPurpose.CLUSTERED_INSERT,
+                        UndoRedoBudgetEstimator.append(true)));
         e1.undoLogManager().beforeInsert(txn, m, TABLE_ID, INDEX_ID,
                 List.of(new ColumnValue.IntValue(1)), idKey(), clusteredSchema());
         e1.miniTransactionManager().commit(m);
@@ -815,7 +819,9 @@ class StorageEngineTest {
         Transaction txn = txnMgr.begin(TransactionOptions.defaults());
         txnMgr.assignWriteId(txn);
         for (int id = 1; id <= count; id++) {
-            MiniTransaction m = mtrMgr.begin(mtrMgr.budgetFor(RedoBudgetPurpose.CLUSTERED_INSERT));
+            MiniTransaction m = mtrMgr.begin(mtrMgr.budgetFor(RedoBudgetPurpose.CLUSTERED_INSERT,
+                    BTreeRedoBudgetEstimator.insert(index.rootLevel())
+                            .plus(UndoRedoBudgetEstimator.append(id == 1))));
             RollPointer rp = undoMgr.beforeInsert(txn, m, TABLE_ID, INDEX_ID,
                     List.of(new ColumnValue.IntValue(id)), index.keyDef(), index.schema());
             svc.insertClustered(m, index, row(id, "v" + id), txn.transactionId(), rp);
@@ -918,7 +924,8 @@ class StorageEngineTest {
         BTreeLookupResult old = svc.lookup(read, index, search(id)).orElseThrow();
         mtrMgr.commit(read);
         HiddenColumns oldHidden = old.record().hiddenColumns();
-        MiniTransaction m = mtrMgr.begin(mtrMgr.budgetFor(RedoBudgetPurpose.CLUSTERED_DELETE));
+        MiniTransaction m = mtrMgr.begin(mtrMgr.budgetFor(RedoBudgetPurpose.CLUSTERED_DELETE,
+                BTreeRedoBudgetEstimator.pointRewrite().plus(UndoRedoBudgetEstimator.append(true))));
         RollPointer delRp = undoMgr.beforeDelete(txn, m, TABLE_ID, INDEX_ID,
                 List.of(new ColumnValue.IntValue(id)), old.record().columnValues(), oldHidden,
                 index.keyDef(), index.schema());
@@ -976,7 +983,9 @@ class StorageEngineTest {
         SplitCapableBTreeIndexService svc = engine.btreeService();
         Transaction txn = txnMgr.begin(TransactionOptions.defaults());
         txnMgr.assignWriteId(txn);
-        MiniTransaction m = mtrMgr.begin(mtrMgr.budgetFor(RedoBudgetPurpose.CLUSTERED_INSERT));
+        MiniTransaction m = mtrMgr.begin(mtrMgr.budgetFor(RedoBudgetPurpose.CLUSTERED_INSERT,
+                BTreeRedoBudgetEstimator.insert(index.rootLevel())
+                        .plus(UndoRedoBudgetEstimator.append(true))));
         RollPointer rp = undoMgr.beforeInsert(txn, m, TABLE_ID, INDEX_ID,
                 List.of(new ColumnValue.IntValue(id)), index.keyDef(), index.schema());
         svc.insertClustered(m, index, row(id, payload), txn.transactionId(), rp);

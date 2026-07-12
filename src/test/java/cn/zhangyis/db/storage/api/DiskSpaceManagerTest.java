@@ -10,6 +10,7 @@ import cn.zhangyis.db.storage.buf.LruBufferPool;
 import cn.zhangyis.db.storage.fil.io.FileChannelPageStore;
 import cn.zhangyis.db.storage.fil.io.PageStore;
 import cn.zhangyis.db.storage.fsp.exception.NoFreeSpaceException;
+import cn.zhangyis.db.storage.fsp.exception.FspMetadataException;
 import cn.zhangyis.db.storage.fsp.segment.SegmentPurpose;
 import cn.zhangyis.db.domain.Lsn;
 import cn.zhangyis.db.storage.buf.PageGuard;
@@ -25,6 +26,9 @@ import cn.zhangyis.db.storage.redo.FspPageFreeRecord;
 import cn.zhangyis.db.storage.redo.FspPageAllocationRecord;
 import cn.zhangyis.db.storage.redo.PageInitRecord;
 import cn.zhangyis.db.storage.redo.RedoRecord;
+import cn.zhangyis.db.storage.redo.RedoBudgetPurpose;
+import cn.zhangyis.db.storage.trx.UndoRedoBudgetEstimator;
+import cn.zhangyis.db.storage.undo.UndoSegmentDropPlan;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.api.Test;
 
@@ -144,6 +148,50 @@ class DiskSpaceManagerTest {
             PageId again = dsm.allocatePage(m, ref2);
             assertEquals(PageId.of(SPACE, PageNo.of(64)), again);
             mgr.commit(m);
+        });
+    }
+
+    /** drop plan 必须只读 inode 权威账本，并同时覆盖 fragment 与 extent 两种持有形态。 */
+    @Test
+    void inspectDropPlanReadsFragmentAndExtentCountsBeforeWriteBatch() {
+        withDsm((dsm, mgr) -> {
+            MiniTransaction write = mgr.begin();
+            dsm.createTablespace(write, SPACE, dir.resolve("s.ibd"), PageNo.of(192));
+            SegmentRef ref = dsm.createSegment(write, SPACE, SegmentPurpose.INDEX_LEAF);
+            for (int i = 0; i < 33; i++) {
+                dsm.allocatePage(write, ref);
+            }
+            mgr.commit(write);
+
+            MiniTransaction read = mgr.beginReadOnly();
+            SegmentDropPlan plan = dsm.inspectDropSegmentPlan(read, ref);
+            mgr.commit(read);
+
+            assertEquals(32, plan.fragmentPageCount());
+            assertEquals(1, plan.extentCount());
+            assertEquals(33, plan.usedPageCount());
+
+            MiniTransaction drop = mgr.begin(mgr.budgetFor(RedoBudgetPurpose.UNDO_FINALIZATION,
+                    UndoRedoBudgetEstimator.finalization(new UndoSegmentDropPlan(
+                            plan.fragmentPageCount(), plan.extentCount(), plan.usedPageCount()), false)));
+            dsm.dropSegment(drop, ref);
+            mgr.commit(drop);
+        });
+    }
+
+    /** 陈旧 handle 不得借 inode 槽复用读取另一 segment 的规模并进入物理 drop。 */
+    @Test
+    void inspectDropPlanRejectsSegmentIdentityMismatch() {
+        withDsm((dsm, mgr) -> {
+            MiniTransaction write = mgr.begin();
+            dsm.createTablespace(write, SPACE, dir.resolve("s.ibd"), PageNo.of(128));
+            SegmentRef ref = dsm.createSegment(write, SPACE, SegmentPurpose.INDEX_LEAF);
+            mgr.commit(write);
+
+            MiniTransaction read = mgr.beginReadOnly();
+            SegmentRef stale = new SegmentRef(ref.spaceId(), ref.inodeSlot(), SegmentId.of(99));
+            assertThrows(FspMetadataException.class, () -> dsm.inspectDropSegmentPlan(read, stale));
+            mgr.rollbackUncommitted(read);
         });
     }
 

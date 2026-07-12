@@ -14,6 +14,8 @@ import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
 import cn.zhangyis.db.storage.mtr.MiniTransactionState;
 import cn.zhangyis.db.storage.redo.RedoBudgetPurpose;
+import cn.zhangyis.db.storage.btree.BTreeRedoBudgetEstimator;
+import cn.zhangyis.db.storage.redo.RedoBudgetWorkload;
 import cn.zhangyis.db.storage.record.format.LogicalRecord;
 import cn.zhangyis.db.storage.record.format.RecordType;
 import cn.zhangyis.db.storage.record.page.SearchKey;
@@ -477,8 +479,9 @@ public final class RollbackService {
 
     /** 单条 inverse 的独立 index MTR；异常时只释放当前物理资源，已提交的前序 record 保持可恢复。 */
     private void applyUndoRecordInOwnMtr(RecordAt at, BTreeIndex clusteredIndex) {
-        MiniTransaction inverseMtr = mtrMgr.begin(
-                mtrMgr.budgetFor(RedoBudgetPurpose.ROLLBACK_INVERSE));
+        MiniTransaction inverseMtr = mtrMgr.begin(mtrMgr.budgetFor(
+                RedoBudgetPurpose.ROLLBACK_INVERSE,
+                rollbackInverseWorkload(at.record(), clusteredIndex)));
         try {
             applyUndoRecord(inverseMtr, at.record(), at.pointer(), clusteredIndex);
             mtrMgr.commit(inverseMtr);
@@ -630,5 +633,16 @@ public final class RollbackService {
             case DELETE_MARK -> btree.setClusteredDeleteMark(mtr, index, new SearchKey(rec.clusterKey()),
                     false, rec.oldHiddenColumns(), rec.transactionId(), rp);
         }
+    }
+
+    /** INSERT inverse 可能沿整棵树 merge/shrink；UPDATE/DELETE_MARK inverse 仅做单叶页等长改写。 */
+    private static RedoBudgetWorkload rollbackInverseWorkload(UndoRecord record, BTreeIndex index) {
+        if (record == null || index == null) {
+            throw new DatabaseValidationException("rollback redo budget record/index must not be null");
+        }
+        return switch (record.type()) {
+            case INSERT_ROW -> BTreeRedoBudgetEstimator.structuralDelete(index.rootLevel());
+            case UPDATE_ROW, DELETE_MARK -> BTreeRedoBudgetEstimator.pointRewrite();
+        };
     }
 }

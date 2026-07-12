@@ -9,6 +9,7 @@ import cn.zhangyis.db.storage.fsp.reservation.SpaceReservation;
 import cn.zhangyis.db.storage.fsp.reservation.SpaceReservationKind;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.undo.UndoSegmentHandle;
+import cn.zhangyis.db.storage.undo.UndoSegmentDropPlan;
 import cn.zhangyis.db.storage.undo.UndoSpaceAllocator;
 import cn.zhangyis.db.storage.undo.UndoSpaceReservation;
 
@@ -62,6 +63,18 @@ public final class DiskSpaceUndoAllocator implements UndoSpaceAllocator {
     public PageId allocatePage(MiniTransaction mtr, SpaceId undoSpace, int inodeSlot, SegmentId segmentId) {
         SegmentRef ref = new SegmentRef(undoSpace, inodeSlot, segmentId);
         return diskSpaceManager.allocatePage(mtr, ref);
+    }
+
+    /** 把 undo handle 转为 SegmentRef，并把通用 FSP drop plan 映射回 undo 自有值对象。 */
+    @Override
+    public UndoSegmentDropPlan inspectDropPlan(MiniTransaction mtr, UndoSegmentHandle handle) {
+        if (handle == null) {
+            throw new DatabaseValidationException("undo segment drop plan handle must not be null");
+        }
+        SegmentDropPlan plan = diskSpaceManager.inspectDropSegmentPlan(mtr,
+                new SegmentRef(handle.spaceId(), handle.inodeSlot(), handle.segmentId()));
+        return new UndoSegmentDropPlan(
+                plan.fragmentPageCount(), plan.extentCount(), plan.usedPageCount());
     }
 
     /**

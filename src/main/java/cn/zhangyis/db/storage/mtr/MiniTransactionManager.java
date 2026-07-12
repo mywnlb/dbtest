@@ -5,6 +5,7 @@ import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.storage.redo.RedoCapacityThrottle;
 import cn.zhangyis.db.storage.redo.RedoAppendBudget;
 import cn.zhangyis.db.storage.redo.RedoBudgetPurpose;
+import cn.zhangyis.db.storage.redo.RedoBudgetWorkload;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
 import cn.zhangyis.db.storage.fil.access.TablespaceAccessController;
 
@@ -104,6 +105,11 @@ public final class MiniTransactionManager {
      */
     public RedoAppendBudget budgetFor(RedoBudgetPurpose purpose) {
         return operationBudgetEstimator.estimate(purpose);
+    }
+
+    /** 把 begin 前由 BTree/Undo/DML 物化的领域 workload 转为实例级 redo admission 上界。 */
+    public RedoAppendBudget budgetFor(RedoBudgetPurpose purpose, RedoBudgetWorkload workload) {
+        return operationBudgetEstimator.estimate(purpose, workload);
     }
 
     private MiniTransaction beginInternal(RedoAppendBudget budget) {

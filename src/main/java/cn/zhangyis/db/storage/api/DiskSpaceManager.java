@@ -35,11 +35,13 @@ import cn.zhangyis.db.storage.fsp.flst.FileAddress;
 import cn.zhangyis.db.storage.fsp.flst.Flst;
 import cn.zhangyis.db.storage.fsp.flst.FlstBase;
 import cn.zhangyis.db.storage.fsp.extent.FreeExtentService;
+import cn.zhangyis.db.storage.fsp.exception.FspMetadataException;
 import cn.zhangyis.db.storage.fsp.exception.NoFreeSpaceException;
 import cn.zhangyis.db.storage.fsp.reservation.SpaceReservation;
 import cn.zhangyis.db.storage.fsp.reservation.SpaceReservationKind;
 import cn.zhangyis.db.storage.fsp.reservation.SpaceReservationService;
 import cn.zhangyis.db.storage.fsp.segment.SegmentInodeRepository;
+import cn.zhangyis.db.storage.fsp.segment.SegmentInode;
 import cn.zhangyis.db.storage.fsp.segment.SegmentPageAllocator;
 import cn.zhangyis.db.storage.fsp.segment.SegmentPurpose;
 import cn.zhangyis.db.storage.fsp.segment.SegmentSpaceService;
@@ -452,6 +454,36 @@ public final class DiskSpaceManager {
         requireOrdinaryAccess(mtr, spaceId);
         SpaceHeaderSnapshot h = headerRepo.read(mtr, spaceId);
         return new SpaceUsage(h.currentSizeInPages(), h.freeLimitPageNo(), h.nextSegmentId());
+    }
+
+    /**
+     * 在 drop 写 MTR 前只读物化 fragment/extent 规模。数据只来自 inode page2：校验 segment identity，扫描 32 个
+     * fragment 槽，并汇总三条 extent list 的持久 length；不遍历 XDES、不修改 FSP、不持有跨返回的 latch。
+     */
+    public SegmentDropPlan inspectDropSegmentPlan(MiniTransaction mtr, SegmentRef ref) {
+        requireMtr(mtr);
+        requireRef(ref);
+        requireOrdinaryAccess(mtr, ref.spaceId());
+        SegmentInode inode = inodeRepo.read(mtr, ref.spaceId(), ref.inodeSlot());
+        if (!inode.segmentId().equals(ref.segmentId())) {
+            throw new FspMetadataException(
+                    "segment drop plan identity mismatch: expected=" + ref.segmentId().value()
+                            + ", current=" + inode.segmentId().value());
+        }
+        long fragments = 0;
+        for (int slot = 0; slot < 32; slot++) {
+            if (inodeRepo.getFragmentPage(mtr, ref.spaceId(), ref.inodeSlot(), slot).isPresent()) {
+                fragments++;
+            }
+        }
+        try {
+            long extents = Math.addExact(inode.freeExtentList().length(), inode.notFullExtentList().length());
+            extents = Math.addExact(extents, inode.fullExtentList().length());
+            return new SegmentDropPlan(fragments, extents, inode.usedPageCount());
+        } catch (ArithmeticException error) {
+            throw new FspMetadataException(
+                    "segment extent count overflows for " + ref.segmentId().value(), error);
+        }
     }
 
     private static void appendPageFreeIntent(MiniTransaction mtr, SegmentRef ref, PageId pageId) {

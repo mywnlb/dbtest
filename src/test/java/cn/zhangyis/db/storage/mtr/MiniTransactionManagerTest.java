@@ -1,11 +1,15 @@
 package cn.zhangyis.db.storage.mtr;
 
+import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.Lsn;
+import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.storage.fil.access.TablespaceAccessController;
 import cn.zhangyis.db.storage.redo.RedoCapacityPolicy;
 import cn.zhangyis.db.storage.redo.RedoCapacityThrottle;
 import cn.zhangyis.db.storage.redo.RedoAppendBudget;
 import cn.zhangyis.db.storage.redo.RedoBudgetPurpose;
+import cn.zhangyis.db.storage.redo.RedoBudgetBuilder;
+import cn.zhangyis.db.storage.redo.RedoBudgetWorkload;
 import cn.zhangyis.db.storage.redo.PageInitRecord;
 import cn.zhangyis.db.storage.redo.RedoBudgetExceededException;
 import cn.zhangyis.db.domain.PageId;
@@ -28,6 +32,19 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
  * MiniTransactionManager 测试固定线程绑定、禁静默嵌套、commit/rollback 解绑、跨线程拒绝。
  */
 class MiniTransactionManagerTest {
+
+    @Test
+    void dynamicPurposeShouldRequireDomainWorkloadBeforeBegin() {
+        MiniTransactionManager mgr = new MiniTransactionManager();
+
+        assertThrows(DatabaseValidationException.class,
+                () -> mgr.budgetFor(RedoBudgetPurpose.CLUSTERED_INSERT));
+        RedoAppendBudget budget = mgr.budgetFor(
+                RedoBudgetPurpose.CLUSTERED_INSERT, RedoBudgetWorkload.pageImages(2));
+
+        assertEquals(2L * (PageSize.ofBytes(16 * 1024).bytes() + RedoBudgetBuilder.PAGE_BYTES_HEADER),
+                budget.logicalUpperBound());
+    }
 
     @Test
     void beginShouldActivateAndBind() {

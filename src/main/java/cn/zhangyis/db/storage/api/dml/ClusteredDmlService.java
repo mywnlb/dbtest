@@ -138,8 +138,10 @@ public final class ClusteredDmlService {
             throw new DmlDuplicateKeyException("duplicate clustered key for index " + command.index().indexId());
         }
 
-        MiniTransaction mtr = mtrManager.begin(
-                mtrManager.budgetFor(RedoBudgetPurpose.CLUSTERED_INSERT));
+        boolean firstUndoWrite = txn.undoContext() == null;
+        MiniTransaction mtr = mtrManager.begin(mtrManager.budgetFor(
+                RedoBudgetPurpose.CLUSTERED_INSERT,
+                DmlRedoBudgetEstimator.insert(command.index(), firstUndoWrite)));
         try {
             RollPointer rollPointer = undoLogManager.beforeInsert(txn, mtr, command.tableId(),
                     command.index().indexId(), command.key().values(), command.index().keyDef(),
@@ -177,8 +179,10 @@ public final class ClusteredDmlService {
         BTreeLookupResult old = locked.orElseThrow();
         HiddenColumns oldHidden = requireHiddenColumns(old.record(), "update");
 
-        MiniTransaction mtr = mtrManager.begin(
-                mtrManager.budgetFor(RedoBudgetPurpose.CLUSTERED_UPDATE));
+        boolean firstUndoWrite = txn.undoContext() == null;
+        MiniTransaction mtr = mtrManager.begin(mtrManager.budgetFor(
+                RedoBudgetPurpose.CLUSTERED_UPDATE,
+                DmlRedoBudgetEstimator.pointRewrite(command.index(), firstUndoWrite)));
         try {
             RollPointer rollPointer = undoLogManager.beforeUpdate(txn, mtr, command.tableId(),
                     command.index().indexId(), command.key().values(), old.record().columnValues(), oldHidden,
@@ -219,8 +223,10 @@ public final class ClusteredDmlService {
         BTreeLookupResult old = locked.orElseThrow();
         HiddenColumns oldHidden = requireHiddenColumns(old.record(), "delete");
 
-        MiniTransaction mtr = mtrManager.begin(
-                mtrManager.budgetFor(RedoBudgetPurpose.CLUSTERED_DELETE));
+        boolean firstUndoWrite = txn.undoContext() == null;
+        MiniTransaction mtr = mtrManager.begin(mtrManager.budgetFor(
+                RedoBudgetPurpose.CLUSTERED_DELETE,
+                DmlRedoBudgetEstimator.pointRewrite(command.index(), firstUndoWrite)));
         try {
             RollPointer rollPointer = undoLogManager.beforeDelete(txn, mtr, command.tableId(),
                     command.index().indexId(), command.key().values(), old.record().columnValues(), oldHidden,

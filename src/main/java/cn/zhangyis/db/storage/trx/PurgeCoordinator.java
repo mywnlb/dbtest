@@ -11,6 +11,7 @@ import cn.zhangyis.db.storage.buf.PageLatchMode;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
 import cn.zhangyis.db.storage.redo.RedoBudgetPurpose;
+import cn.zhangyis.db.storage.btree.BTreeRedoBudgetEstimator;
 import cn.zhangyis.db.storage.mtr.MiniTransactionState;
 import cn.zhangyis.db.storage.record.page.SearchKey;
 import cn.zhangyis.db.storage.undo.UndoLogSegment;
@@ -154,7 +155,8 @@ public final class PurgeCoordinator implements PurgeTarget {
 
         int removed = 0;
         for (DeleteTask task : tasks) {
-            MiniTransaction ix = mgr.begin(mgr.budgetFor(RedoBudgetPurpose.PURGE_INDEX));
+            MiniTransaction ix = mgr.begin(mgr.budgetFor(RedoBudgetPurpose.PURGE_INDEX,
+                    BTreeRedoBudgetEstimator.structuralDelete(clusteredIndex.rootLevel())));
             BTreeDeleteResult res;
             try {
                 // expected = (删除事务 id, 该 DELETE_MARK undo 记录地址)；严格：仅移除仍 delete-marked 且隐藏列匹配的行

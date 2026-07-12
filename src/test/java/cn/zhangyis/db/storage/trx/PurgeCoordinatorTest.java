@@ -479,6 +479,12 @@ class PurgeCoordinatorTest {
         }
 
         @Override
+        public cn.zhangyis.db.storage.undo.UndoSegmentDropPlan inspectDropPlan(
+                MiniTransaction mtr, UndoSegmentHandle handle) {
+            return delegate.inspectDropPlan(mtr, handle);
+        }
+
+        @Override
         public void dropUndoSegment(MiniTransaction mtr, UndoSegmentHandle handle) {
             dropAttempts.incrementAndGet();
             throw new DatabaseRuntimeException("injected dropUndoSegment failure");

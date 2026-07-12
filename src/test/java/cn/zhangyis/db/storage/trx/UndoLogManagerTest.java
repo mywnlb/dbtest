@@ -843,6 +843,12 @@ class UndoLogManagerTest {
         }
 
         @Override
+        public cn.zhangyis.db.storage.undo.UndoSegmentDropPlan inspectDropPlan(
+                MiniTransaction mtr, UndoSegmentHandle handle) {
+            return delegate.inspectDropPlan(mtr, handle);
+        }
+
+        @Override
         public void dropUndoSegment(MiniTransaction mtr, UndoSegmentHandle handle) {
             int attempt = dropAttempts.incrementAndGet();
             if (attempt > 1) {
@@ -919,6 +925,12 @@ class UndoLogManagerTest {
         }
 
         @Override
+        public cn.zhangyis.db.storage.undo.UndoSegmentDropPlan inspectDropPlan(
+                MiniTransaction mtr, UndoSegmentHandle handle) {
+            return delegate.inspectDropPlan(mtr, handle);
+        }
+
+        @Override
         public void dropUndoSegment(MiniTransaction mtr, UndoSegmentHandle handle) {
             delegate.dropUndoSegment(mtr, handle);
         }
@@ -965,6 +977,12 @@ class UndoLogManagerTest {
         @Override
         public PageId allocatePage(MiniTransaction mtr, SpaceId undoSpace, int inodeSlot, SegmentId segmentId) {
             return delegate.allocatePage(mtr, undoSpace, inodeSlot, segmentId);
+        }
+
+        @Override
+        public cn.zhangyis.db.storage.undo.UndoSegmentDropPlan inspectDropPlan(
+                MiniTransaction mtr, UndoSegmentHandle handle) {
+            return delegate.inspectDropPlan(mtr, handle);
         }
 
         @Override

@@ -16,15 +16,17 @@ import cn.zhangyis.db.storage.undo.UndoLogFormatException;
 import cn.zhangyis.db.storage.undo.UndoLogSegment;
 import cn.zhangyis.db.storage.undo.UndoLogSegmentAccess;
 import cn.zhangyis.db.storage.undo.UndoSegmentHandle;
+import cn.zhangyis.db.storage.undo.UndoSegmentDropPlan;
 import cn.zhangyis.db.storage.undo.UndoSpaceAllocator;
 
 /**
  * undo segment 终态协调器。它把 FSP segment drop 与 page3 slot clear 放入同一 MTR/redo batch，并在 commit
  * 后才发布内存 slot 释放，闭合 INSERT commit、live/recovery rollback 与 committed purge 的 crash 边界。
  *
- * <p><b>锁序</b>：预检 MTR 先读 page3、再读普通 undo first page；返回前释放二者。finalization MTR 先由
+ * <p><b>锁序</b>：预检 MTR 先读 page3、再读普通 undo first page；返回前释放二者。随后独立只读 MTR 读取
+ * inode page2 并物化 drop 规模，提交后才进入 finalization 写 MTR。写 MTR 先由
  * {@link UndoSpaceAllocator#dropUndoSegment} 修改 FSP page0/page2，再获取 page3 X latch 做 owner CAS。当前 XDES
- * 内嵌 page0，故不需要逆序例外；任何时刻都不在内存 slot/history 锁内等待 page latch 或 IO。
+ * 内嵌 page0，故不需要逆序例外；任何时刻都不跨 MTR 保留 page latch/fix，也不在内存 slot/history 锁内等待 IO。
  *
  * <p><b>失败语义</b>：可预测的 owner/state/head 冲突全部在物理写前抛出。进入 finalization MTR 后的异常属于
  * fail-stop：MTR 无 content undo，不能承诺同进程 buffer 可重试，故统一抛 {@link UndoFinalizationException}。
@@ -152,8 +154,10 @@ public final class UndoSegmentFinalizer {
         try (RollbackSegmentSlotManager.FinalizationLease lease =
                      slotManager.beginFinalization(identity.slotId(), identity.firstPageId())) {
             PreparedFinalization prepared = prepare(kind, identity);
+            UndoSegmentDropPlan dropPlan = inspectDropPlan(prepared.handle());
             MiniTransaction finalizationMtr = mtrManager.begin(
-                    mtrManager.budgetFor(RedoBudgetPurpose.UNDO_FINALIZATION));
+                    mtrManager.budgetFor(RedoBudgetPurpose.UNDO_FINALIZATION,
+                            UndoRedoBudgetEstimator.finalization(dropPlan, kind != UndoFinalizationKind.PURGE)));
             try {
                 // 从首个 FSP 写开始 MTR 无 content undo；此后任何异常都让 lease 保持 FINALIZING，禁止同进程复用。
                 lease.physicalMutationStarted();
@@ -217,6 +221,22 @@ public final class UndoSegmentFinalizer {
             return new PreparedFinalization(handle);
         } catch (RuntimeException error) {
             rollbackActiveMtr(readMtr, error);
+            throw error;
+        }
+    }
+
+    /**
+     * 在最终写批次前读取 inode 权威规模，用于把 redo admission 与实际 fragment/extent 数量绑定。
+     * 该 MTR 与 page3/undo 预检严格分离，提交返回后只保留不可变值对象，避免 page2 latch 跨入 drop 写路径。
+     */
+    private UndoSegmentDropPlan inspectDropPlan(UndoSegmentHandle handle) {
+        MiniTransaction planMtr = mtrManager.beginReadOnly();
+        try {
+            UndoSegmentDropPlan plan = undoAllocator.inspectDropPlan(planMtr, handle);
+            mtrManager.commit(planMtr);
+            return plan;
+        } catch (RuntimeException error) {
+            rollbackActiveMtr(planMtr, error);
             throw error;
         }
     }

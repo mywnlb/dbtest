@@ -90,7 +90,14 @@ public record ColumnType(TypeId typeId, boolean nullable, int length, int scale,
     }
 
     public static ColumnType charType(int nBytes, boolean nullable) {
-        return fixed(TypeId.CHAR, nBytes, 0, false, nullable);
+        return charType(nBytes, nullable, CharsetId.UTF8, CollationId.BINARY);
+    }
+
+    /**
+     * 创建显式字符集与排序规则的 CHAR；pair 的生产支持性由只读类型 registry 在 codec 选择时复核。
+     */
+    public static ColumnType charType(int nBytes, boolean nullable, CharsetId charset, CollationId collation) {
+        return new ColumnType(TypeId.CHAR, nullable, nBytes, 0, false, charset, collation, StorageKind.FIXED);
     }
 
     public static ColumnType binary(int nBytes, boolean nullable) {
@@ -106,8 +113,14 @@ public record ColumnType(TypeId typeId, boolean nullable, int length, int scale,
     }
 
     public static ColumnType varchar(int nBytes, boolean nullable) {
-        return new ColumnType(TypeId.VARCHAR, nullable, nBytes, 0, false, CharsetId.UTF8, CollationId.BINARY,
-                StorageKind.VARIABLE);
+        return varchar(nBytes, nullable, CharsetId.UTF8, CollationId.BINARY);
+    }
+
+    /**
+     * 创建显式字符集与排序规则的 VARCHAR；长度继续按编码后最大字节数解释，不按字符数解释。
+     */
+    public static ColumnType varchar(int nBytes, boolean nullable, CharsetId charset, CollationId collation) {
+        return new ColumnType(TypeId.VARCHAR, nullable, nBytes, 0, false, charset, collation, StorageKind.VARIABLE);
     }
 
     public static ColumnType varbinary(int nBytes, boolean nullable) {

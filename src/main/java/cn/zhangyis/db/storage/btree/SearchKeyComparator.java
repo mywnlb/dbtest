@@ -4,13 +4,12 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.storage.record.page.SearchKey;
 import cn.zhangyis.db.storage.record.schema.ColumnType;
 import cn.zhangyis.db.storage.record.schema.IndexKeyDef;
-import cn.zhangyis.db.storage.record.schema.KeyOrder;
 import cn.zhangyis.db.storage.record.schema.KeyPartDef;
 import cn.zhangyis.db.storage.record.schema.TableSchema;
 import cn.zhangyis.db.storage.record.type.ColumnValue;
+import cn.zhangyis.db.storage.record.type.EncodedKeyPartComparator;
 import cn.zhangyis.db.storage.record.type.FieldSlice;
 import cn.zhangyis.db.storage.record.type.FieldWriter;
-import cn.zhangyis.db.storage.record.type.KeyPrefix;
 import cn.zhangyis.db.storage.record.type.TypeCodec;
 import cn.zhangyis.db.storage.record.type.TypeCodecRegistry;
 
@@ -23,11 +22,15 @@ public final class SearchKeyComparator {
     /** 类型 codec 注册表；比较时复用 record 层保序编码规则，减少与 RecordComparator 的排序漂移。 */
     private final TypeCodecRegistry registry;
 
+    /** 与 leaf record 比较共享的 NULL/prefix/collation/方向规则。 */
+    private final EncodedKeyPartComparator keyPartComparator;
+
     public SearchKeyComparator(TypeCodecRegistry registry) {
         if (registry == null) {
             throw new DatabaseValidationException("type codec registry must not be null");
         }
         this.registry = registry;
+        this.keyPartComparator = new EncodedKeyPartComparator(registry);
     }
 
     /**
@@ -41,23 +44,14 @@ public final class SearchKeyComparator {
         for (int i = 0; i < m; i++) {
             KeyPartDef part = keyDef.parts().get(i);
             ColumnType ct = schema.column(part.columnId().value()).type();
-            boolean desc = part.order() == KeyOrder.DESC;
             boolean leftNull = left.value(i) instanceof ColumnValue.NullValue;
             boolean rightNull = right.value(i) instanceof ColumnValue.NullValue;
-            if (leftNull && rightNull) {
-                continue;
-            }
-            if (leftNull || rightNull) {
-                int c = leftNull ? -1 : 1;
-                return desc ? -c : c;
-            }
-            TypeCodec codec = registry.codecFor(ct);
-            // 前缀索引（prefixBytes>0）只比列的前 N 字节：两侧编码切片同截再比，与 RecordComparator 保持同序。
-            FieldSlice leftSlice = KeyPrefix.apply(encodeKey(left.value(i), ct, codec), ct, part.prefixBytes());
-            FieldSlice rightSlice = KeyPrefix.apply(encodeKey(right.value(i), ct, codec), ct, part.prefixBytes());
-            int c = codec.compare(leftSlice, rightSlice, ct);
+            TypeCodec codec = leftNull && rightNull ? null : registry.codecFor(ct);
+            FieldSlice leftSlice = leftNull ? null : encodeKey(left.value(i), ct, codec);
+            FieldSlice rightSlice = rightNull ? null : encodeKey(right.value(i), ct, codec);
+            int c = keyPartComparator.compare(leftNull, leftSlice, rightNull, rightSlice, ct, part);
             if (c != 0) {
-                return desc ? -c : c;
+                return c;
             }
         }
         return 0;

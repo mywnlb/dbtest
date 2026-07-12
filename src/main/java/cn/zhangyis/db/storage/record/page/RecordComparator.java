@@ -3,13 +3,12 @@ package cn.zhangyis.db.storage.record.page;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.storage.record.schema.ColumnType;
 import cn.zhangyis.db.storage.record.schema.IndexKeyDef;
-import cn.zhangyis.db.storage.record.schema.KeyOrder;
 import cn.zhangyis.db.storage.record.schema.KeyPartDef;
 import cn.zhangyis.db.storage.record.schema.TableSchema;
 import cn.zhangyis.db.storage.record.type.ColumnValue;
+import cn.zhangyis.db.storage.record.type.EncodedKeyPartComparator;
 import cn.zhangyis.db.storage.record.type.FieldSlice;
 import cn.zhangyis.db.storage.record.type.FieldWriter;
-import cn.zhangyis.db.storage.record.type.KeyPrefix;
 import cn.zhangyis.db.storage.record.type.TypeCodec;
 import cn.zhangyis.db.storage.record.type.TypeCodecRegistry;
 import cn.zhangyis.db.storage.record.format.RecordType;
@@ -21,17 +20,22 @@ import cn.zhangyis.db.storage.record.format.RecordType;
  * <p>规则：复合 key 按 part 顺序逐列比；ASC 中 NULL &lt; 非 NULL，DESC 反转；infimum/supremum 系统记录作哨兵
  * （恒小于/大于任何 key），不读其字段。key 短于 key part 数时按前缀比，前缀全相等返回 0。无状态、线程安全。
  *
- * <p>前缀索引（{@code KeyPartDef.prefixBytes>0}）经 {@link KeyPrefix} 只比列的前 N 字节（字节类型专用，见其文档）。
+ * <p>每个 part 的 NULL/prefix/collation/方向统一委托 {@link EncodedKeyPartComparator}，与 B+Tree node pointer
+ * 比较保持同序。
  */
 public final class RecordComparator {
 
     private final TypeCodecRegistry registry;
+
+    /** leaf record 与 node pointer 共享的单 part 排序规则。 */
+    private final EncodedKeyPartComparator keyPartComparator;
 
     public RecordComparator(TypeCodecRegistry registry) {
         if (registry == null) {
             throw new DatabaseValidationException("type codec registry must not be null");
         }
         this.registry = registry;
+        this.keyPartComparator = new EncodedKeyPartComparator(registry);
     }
 
     /**
@@ -52,24 +56,13 @@ public final class RecordComparator {
         for (int i = 0; i < m; i++) {
             KeyPartDef part = keyDef.parts().get(i);
             ColumnType ct = schema.column(part.columnId().value()).type();
-            boolean desc = part.order() == KeyOrder.DESC;
             boolean recordNull = record.isNull(part.columnId());
             boolean keyNull = key.value(i) instanceof ColumnValue.NullValue;
-            if (recordNull && keyNull) {
-                continue;
-            }
-            if (recordNull || keyNull) {
-                // ASC：NULL 较小。record NULL → record<key → 负；key NULL → 正。DESC 取反。
-                int c = recordNull ? -1 : 1;
-                return desc ? -c : c;
-            }
-            TypeCodec codec = registry.codecFor(ct);
-            // 前缀索引（prefixBytes>0）只比列的前 N 字节：对 record 侧列切片与 key 侧编码切片同截再比。
-            FieldSlice recordSlice = KeyPrefix.apply(record.columnSlice(part.columnId()), ct, part.prefixBytes());
-            FieldSlice keySlice = KeyPrefix.apply(encodeKey(key.value(i), ct, codec), ct, part.prefixBytes());
-            int c = codec.compare(recordSlice, keySlice, ct);
+            FieldSlice recordSlice = recordNull ? null : record.columnSlice(part.columnId());
+            FieldSlice keySlice = keyNull ? null : encodeKey(key.value(i), ct, registry.codecFor(ct));
+            int c = keyPartComparator.compare(recordNull, recordSlice, keyNull, keySlice, ct, part);
             if (c != 0) {
-                return desc ? -c : c;
+                return c;
             }
         }
         return 0;

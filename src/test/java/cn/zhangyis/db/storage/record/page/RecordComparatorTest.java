@@ -9,6 +9,7 @@ import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.LruBufferPool;
 import cn.zhangyis.db.storage.buf.PageGuard;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
+import cn.zhangyis.db.storage.btree.SearchKeyComparator;
 import cn.zhangyis.db.storage.fil.io.FileChannelPageStore;
 import cn.zhangyis.db.storage.fil.io.PageStore;
 import cn.zhangyis.db.storage.record.format.LogicalRecord;
@@ -17,6 +18,8 @@ import cn.zhangyis.db.storage.record.format.RecordType;
 import cn.zhangyis.db.storage.record.schema.ColumnDef;
 import cn.zhangyis.db.storage.record.schema.ColumnId;
 import cn.zhangyis.db.storage.record.schema.ColumnType;
+import cn.zhangyis.db.storage.record.schema.CharsetId;
+import cn.zhangyis.db.storage.record.schema.CollationId;
 import cn.zhangyis.db.storage.record.schema.IndexKeyDef;
 import cn.zhangyis.db.storage.record.schema.KeyOrder;
 import cn.zhangyis.db.storage.record.schema.KeyPartDef;
@@ -50,9 +53,14 @@ class RecordComparatorTest {
 
     /** id INT(not null) + name VARCHAR(20)(nullable) 两列表，覆盖定长/变长 + NULL。 */
     private static TableSchema schema() {
+        return schema(ColumnType.varchar(20, true));
+    }
+
+    /** 允许测试以相同物理表布局替换 name 的 charset/collation。 */
+    private static TableSchema schema(ColumnType nameType) {
         return new TableSchema(1, List.of(
                 new ColumnDef(new ColumnId(0), "id", ColumnType.intType(false, false), 0),
-                new ColumnDef(new ColumnId(1), "name", ColumnType.varchar(20, true), 1)));
+                new ColumnDef(new ColumnId(1), "name", nameType, 1)));
     }
 
     private static IndexKeyDef keyDef(KeyOrder idOrder, int... cols) {
@@ -72,6 +80,10 @@ class RecordComparatorTest {
     /** name(VARCHAR) 列上的前缀索引 key def（prefixBytes>0 只比前 N 字节）。 */
     private static IndexKeyDef namePrefixKeyDef(int prefixBytes) {
         return new IndexKeyDef(7L, List.of(new KeyPartDef(new ColumnId(1), KeyOrder.ASC, prefixBytes)));
+    }
+
+    private static IndexKeyDef nameKeyDef(KeyOrder order, int prefixBytes) {
+        return new IndexKeyDef(7L, List.of(new KeyPartDef(new ColumnId(1), order, prefixBytes)));
     }
 
     /** id(INT) 列上的前缀 key def——数值列指定 prefixBytes 属 schema 误用，用于验证拒绝。 */
@@ -97,7 +109,11 @@ class RecordComparatorTest {
 
     /** 建一页空 INDEX 页并交给回调操作（统一管理 store/pool/guard 生命周期）。 */
     private void onPage(PageBody body) {
-        TableSchema schema = schema();
+        onPage(schema(), body);
+    }
+
+    /** 使用指定 schema 建立 INDEX 页，验证字符排序规则不会旁路真实 record 编码/游标链。 */
+    private void onPage(TableSchema schema, PageBody body) {
         PageStore store = new FileChannelPageStore();
         store.create(SPACE, dir.resolve("s.ibd"), PS, PageNo.of(4));
         try (PageStore s = store; BufferPool pool = new LruBufferPool(store, PS, 4)) {
@@ -228,6 +244,31 @@ class RecordComparatorTest {
             IndexKeyDef kd = compositeKeyDef(KeyOrder.ASC, KeyOrder.ASC);
             assertTrue(comparator.compare(rec, key(new ColumnValue.IntValue(1), new ColumnValue.StringValue("banana")), kd, schema) < 0);
             assertTrue(comparator.compare(rec, key(new ColumnValue.IntValue(1), new ColumnValue.StringValue("aardvark")), kd, schema) > 0);
+        });
+    }
+
+    @Test
+    void asciiCaseInsensitiveCollationHonorsDirectionAndBytePrefix() {
+        TableSchema ciSchema = schema(ColumnType.varchar(
+                20, true, CharsetId.UTF8, CollationId.UTF8_ASCII_CI));
+        onPage(ciSchema, (rp, schema) -> {
+            SearchKeyComparator searchKeyComparator = new SearchKeyComparator(registry);
+            RecordCursor apple = place(rp, schema, 1, new ColumnValue.StringValue("Apple"));
+            assertEquals(0, comparator.compare(apple, key(new ColumnValue.StringValue("apple")),
+                    nameKeyDef(KeyOrder.ASC, 0), schema));
+            SearchKey appleKey = key(new ColumnValue.StringValue("Apple"));
+            SearchKey bananaKey = key(new ColumnValue.StringValue("banana"));
+            for (KeyOrder order : KeyOrder.values()) {
+                IndexKeyDef full = nameKeyDef(order, 0);
+                assertEquals(Integer.signum(searchKeyComparator.compare(appleKey, bananaKey, full, schema)),
+                        comparator.compare(apple, bananaKey, full, schema),
+                        "leaf record and node key must keep the same full-column sign for " + order);
+                IndexKeyDef prefix = nameKeyDef(order, 1);
+                SearchKey apricot = key(new ColumnValue.StringValue("apricot"));
+                assertEquals(Integer.signum(searchKeyComparator.compare(appleKey, apricot, prefix, schema)),
+                        comparator.compare(apple, apricot, prefix, schema),
+                        "leaf record and node key must keep the same prefix sign for " + order);
+            }
         });
     }
 

@@ -29,6 +29,18 @@ class ColumnTypeTest {
     }
 
     @Test
+    void characterFactoriesKeepBinaryDefaultAndAcceptExplicitPair() {
+        ColumnType defaultType = ColumnType.varchar(20, false);
+        assertEquals(CharsetId.UTF8, defaultType.charset());
+        assertEquals(CollationId.BINARY, defaultType.collation());
+
+        ColumnType latin1 = ColumnType.charType(
+                10, true, CharsetId.LATIN1, CollationId.LATIN1_ASCII_CI);
+        assertEquals(CharsetId.LATIN1, latin1.charset());
+        assertEquals(CollationId.LATIN1_ASCII_CI, latin1.collation());
+    }
+
+    @Test
     void decimalValidatesPrecisionScale() {
         ColumnType d = ColumnType.decimal(10, 2, false);
         assertEquals(10, d.length());

@@ -7,13 +7,13 @@ import cn.zhangyis.db.storage.record.schema.TypeId;
 /**
  * 前缀索引（{@code KeyPartDef.prefixBytes>0}）的比较辅助（innodb-record-design §11 prefix key）。
  *
- * <p>前缀只对**字节类型**（CHAR/VARCHAR/BINARY/VARBINARY，binary collation 按无符号字节序）有意义：这些类型
- * 的保序编码就是原始字节，把已编码切片截到前 {@code prefixBytes} 字节再比即得「只比列前 N 字节」的前缀序。
+ * <p>前缀只对**字节类型**（CHAR/VARCHAR/BINARY/VARBINARY）有意义：先把原始编码切片截到前
+ * {@code prefixBytes} 字节，再交给列声明的 binary 或 byte-local ASCII-CI collation 比较。
  * 数值/时间/浮点/DECIMAL 的编码字节没有「列前缀」语义（截断会破坏保序性），对其指定 {@code prefixBytes} 属
  * schema 误用，直接拒绝——与 MySQL「前缀长度只允许 string/blob 列」一致。
  *
- * <p><b>简化点</b>：{@code prefixBytes} 以**字节**计而非字符；binary collation 下按字节截断可能落在多字节 UTF-8
- * 字符中间，但字节序比较仍自洽。这与本仓库其余处的 binary collation 简化一致。
+ * <p><b>简化点</b>：{@code prefixBytes} 以**字节**计而非字符，可能落在多字节 UTF-8 字符中间。当前两种
+ * collation 都是逐字节函数，因此仍有确定顺序；未来引入 Unicode weight 时必须先重新定义字符级 prefix。
  */
 public final class KeyPrefix {
 

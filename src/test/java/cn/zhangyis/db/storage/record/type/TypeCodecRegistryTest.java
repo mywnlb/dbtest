@@ -1,12 +1,16 @@
 package cn.zhangyis.db.storage.record.type;
 
 import cn.zhangyis.db.storage.record.schema.ColumnType;
+import cn.zhangyis.db.storage.record.schema.CharsetId;
+import cn.zhangyis.db.storage.record.schema.CollationId;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigDecimal;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /** TypeCodecRegistry 按列类型返回正确 codec（类型与编码宽度）。 */
 class TypeCodecRegistryTest {
@@ -43,5 +47,14 @@ class TypeCodecRegistryTest {
         assertInstanceOf(FixedBytesCodec.class, registry.codecFor(ColumnType.binary(4, false)));
         assertInstanceOf(VarBytesCodec.class, registry.codecFor(ColumnType.varchar(10, false)));
         assertInstanceOf(VarBytesCodec.class, registry.codecFor(ColumnType.varbinary(10, false)));
+    }
+
+    @Test
+    void validatesAndResolvesExactCharsetCollationPair() {
+        assertSame(AsciiCaseInsensitiveCollation.INSTANCE,
+                registry.collationFor(CharsetId.UTF8, CollationId.UTF8_ASCII_CI));
+        ColumnType mismatched = ColumnType.varchar(
+                10, false, CharsetId.UTF8, CollationId.LATIN1_ASCII_CI);
+        assertThrows(UnsupportedCollationException.class, () -> registry.codecFor(mismatched));
     }
 }

@@ -4,7 +4,7 @@ import cn.zhangyis.db.storage.record.schema.ColumnType;
 
 /**
  * 类型编码策略（innodb-record-design §8.3，Strategy）。NULL 不由 codec 处理（由 record.format 的 NullBitmap）。
- * 保序编码：编码后的字节按无符号字典序比较 = 该类型的自然序（见 spec §4.4）。
+ * 数值/时间/binary 使用保序编码直接比较；字符类型由 {@link CollationStrategy} 解释编码切片。
  */
 public interface TypeCodec {
 
@@ -20,7 +20,7 @@ public interface TypeCodec {
     /** 从切片解码为列值。 */
     ColumnValue decode(FieldSlice slice, ColumnType type);
 
-    /** 比较两个已编码切片，返回 <0/0/>0（保序）。 */
+    /** 比较两个已编码切片，返回 &lt;0/0/&gt;0；字符类型服从 ColumnType 声明的 collation。 */
     int compare(FieldSlice left, FieldSlice right, ColumnType type);
 
     /** 校验值与类型相容、长度/范围合法；不合法抛领域异常。 */

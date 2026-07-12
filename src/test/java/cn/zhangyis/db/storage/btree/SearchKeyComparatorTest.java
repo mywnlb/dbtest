@@ -5,6 +5,8 @@ import cn.zhangyis.db.storage.record.page.SearchKey;
 import cn.zhangyis.db.storage.record.schema.ColumnDef;
 import cn.zhangyis.db.storage.record.schema.ColumnId;
 import cn.zhangyis.db.storage.record.schema.ColumnType;
+import cn.zhangyis.db.storage.record.schema.CharsetId;
+import cn.zhangyis.db.storage.record.schema.CollationId;
 import cn.zhangyis.db.storage.record.schema.IndexKeyDef;
 import cn.zhangyis.db.storage.record.schema.KeyOrder;
 import cn.zhangyis.db.storage.record.schema.KeyPartDef;
@@ -38,6 +40,10 @@ class SearchKeyComparatorTest {
         return new IndexKeyDef(7L, List.of(new KeyPartDef(new ColumnId(0), KeyOrder.ASC, prefixBytes)));
     }
 
+    private static IndexKeyDef nameKeyDef(KeyOrder order, int prefixBytes) {
+        return new IndexKeyDef(7L, List.of(new KeyPartDef(new ColumnId(0), order, prefixBytes)));
+    }
+
     private static SearchKey nameKey(String s) {
         return new SearchKey(List.of(new ColumnValue.StringValue(s)));
     }
@@ -69,5 +75,25 @@ class SearchKeyComparatorTest {
         SearchKey b = new SearchKey(List.of(new ColumnValue.IntValue(2)));
         assertThrows(DatabaseValidationException.class, () -> comparator.compare(a, b, kd, idSchema),
                 "prefix length on a numeric column must be rejected");
+    }
+
+    @Test
+    void charsetCollationOrderingMatrixKeepsDirectionNullAndPrefixSemantics() {
+        ColumnType binary = ColumnType.varchar(20, true, CharsetId.UTF8, CollationId.BINARY);
+        ColumnType caseInsensitive = ColumnType.varchar(
+                20, true, CharsetId.UTF8, CollationId.UTF8_ASCII_CI);
+        TableSchema binarySchema = new TableSchema(1, List.of(new ColumnDef(new ColumnId(0), "name", binary, 0)));
+        TableSchema ciSchema = new TableSchema(1, List.of(new ColumnDef(new ColumnId(0), "name", caseInsensitive, 0)));
+        SearchKey upper = nameKey("Apple");
+        SearchKey lower = nameKey("apple");
+        SearchKey nullKey = new SearchKey(List.of(ColumnValue.NullValue.INSTANCE));
+
+        assertTrue(comparator.compare(upper, lower, nameKeyDef(KeyOrder.ASC, 0), binarySchema) < 0);
+        assertTrue(comparator.compare(upper, lower, nameKeyDef(KeyOrder.DESC, 0), binarySchema) > 0);
+        assertEquals(0, comparator.compare(upper, lower, nameKeyDef(KeyOrder.ASC, 0), ciSchema));
+        assertEquals(0, comparator.compare(nameKey("Apple"), nameKey("apricot"),
+                nameKeyDef(KeyOrder.ASC, 1), ciSchema), "ASCII-CI prefix(1) folds A/a before comparison");
+        assertTrue(comparator.compare(nullKey, lower, nameKeyDef(KeyOrder.ASC, 0), ciSchema) < 0);
+        assertTrue(comparator.compare(nullKey, lower, nameKeyDef(KeyOrder.DESC, 0), ciSchema) > 0);
     }
 }

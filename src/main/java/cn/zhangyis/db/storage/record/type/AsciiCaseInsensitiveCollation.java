@@ -1,0 +1,34 @@
+package cn.zhangyis.db.storage.record.type;
+
+/**
+ * 确定性的教学型 case-insensitive collation：逐字节把 ASCII A-Z 折叠为 a-z，其余编码字节保持不变。
+ *
+ * <p>该策略刻意不使用 JDK {@code Collator}、locale 或 Unicode 数据表，避免 JDK/区域配置升级改变已建索引顺序。
+ * 它不是 MySQL Unicode weight collation；优点是 byte-prefix 即使截在 UTF-8 多字节字符中间仍可确定比较。
+ */
+public final class AsciiCaseInsensitiveCollation implements CollationStrategy {
+
+    /** 无状态共享单例。 */
+    public static final AsciiCaseInsensitiveCollation INSTANCE = new AsciiCaseInsensitiveCollation();
+
+    private AsciiCaseInsensitiveCollation() {
+    }
+
+    /** 按 ASCII fold 后的无符号字节字典序比较两个编码切片。 */
+    @Override
+    public int compare(byte[] a, int aOffset, int aLength, byte[] b, int bOffset, int bLength) {
+        int n = Math.min(aLength, bLength);
+        for (int i = 0; i < n; i++) {
+            int d = fold(a[aOffset + i] & 0xFF) - fold(b[bOffset + i] & 0xFF);
+            if (d != 0) {
+                return d;
+            }
+        }
+        return Integer.compare(aLength, bLength);
+    }
+
+    /** 只折叠 ASCII 大写范围；高位字节与标点不变。 */
+    private static int fold(int value) {
+        return value >= 'A' && value <= 'Z' ? value + ('a' - 'A') : value;
+    }
+}

@@ -1,6 +1,8 @@
 package cn.zhangyis.db.storage.record.type;
 
 import cn.zhangyis.db.storage.record.schema.ColumnType;
+import cn.zhangyis.db.storage.record.schema.CharsetId;
+import cn.zhangyis.db.storage.record.schema.CollationId;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -74,5 +76,35 @@ class BytesCodecTest {
         byte[] ab = enc(c, VC10, new ColumnValue.StringValue("ab"));
         assertTrue(c.compare(new FieldSlice(abc, 0, abc.length), new FieldSlice(abd, 0, abd.length), VC10) < 0);
         assertTrue(c.compare(new FieldSlice(ab, 0, ab.length), new FieldSlice(abc, 0, abc.length), VC10) < 0);
+    }
+
+    @Test
+    void varcharUsesDeclaredCharsetAndCollation() {
+        TypeCodecRegistry registry = new TypeCodecRegistry();
+        ColumnType latin1Ci = ColumnType.varchar(
+                10, false, CharsetId.LATIN1, CollationId.LATIN1_ASCII_CI);
+        TypeCodec codec = registry.codecFor(latin1Ci);
+        byte[] upper = enc(codec, latin1Ci, new ColumnValue.StringValue("ÉA"));
+        byte[] lower = enc(codec, latin1Ci, new ColumnValue.StringValue("Éa"));
+
+        assertArrayEquals(new byte[] {(byte) 0xC9, 'A'}, upper);
+        assertEquals("ÉA", ((ColumnValue.StringValue) dec(codec, latin1Ci, upper)).value());
+        assertEquals(0, codec.compare(
+                new FieldSlice(upper, 0, upper.length), new FieldSlice(lower, 0, lower.length), latin1Ci));
+    }
+
+    @Test
+    void characterCodecRejectsUnmappableAndMalformedValues() {
+        TypeCodecRegistry registry = new TypeCodecRegistry();
+        ColumnType latin1 = ColumnType.varchar(10, false, CharsetId.LATIN1, CollationId.BINARY);
+        TypeCodec latin1Codec = registry.codecFor(latin1);
+        assertThrows(InvalidCharacterEncodingException.class,
+                () -> latin1Codec.validate(new ColumnValue.StringValue("汉"), latin1));
+
+        ColumnType utf8 = ColumnType.varchar(10, false);
+        TypeCodec utf8Codec = registry.codecFor(utf8);
+        byte[] malformed = {(byte) 0xC3};
+        assertThrows(InvalidCharacterEncodingException.class,
+                () -> utf8Codec.decode(new FieldSlice(malformed, 0, 1), utf8));
     }
 }

@@ -12,6 +12,7 @@ import cn.zhangyis.db.storage.buf.PageLatchMode;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
 import cn.zhangyis.db.storage.mtr.MiniTransactionState;
+import cn.zhangyis.db.storage.redo.RedoBudgetPurpose;
 import cn.zhangyis.db.storage.record.format.HiddenColumns;
 import cn.zhangyis.db.storage.record.schema.IndexKeyDef;
 import cn.zhangyis.db.storage.record.schema.TableSchema;
@@ -271,7 +272,8 @@ public final class UndoLogManager {
         }
         if (ctx.hasUpdateUndo()) {
             // update/delete undo 仍服务 MVCC：以 COMMITTED+COMMIT_NO 留在 page3，恢复可据此重建 history。
-            MiniTransaction commitMtr = mtrManager.begin();
+            MiniTransaction commitMtr = mtrManager.begin(
+                    mtrManager.budgetFor(RedoBudgetPurpose.UNDO_COMMIT));
             try {
                 // R 1.3：STATE 与提交序号同 MTR，供恢复重建 committed history。
                 access.open(commitMtr, ctx.undoFirstPageId(), PageLatchMode.EXCLUSIVE)

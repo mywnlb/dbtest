@@ -38,6 +38,7 @@ import cn.zhangyis.db.storage.redo.PageBytesRecord;
 import cn.zhangyis.db.storage.redo.RedoCheckpointLabel;
 import cn.zhangyis.db.storage.redo.RedoCheckpointStore;
 import cn.zhangyis.db.storage.redo.RedoLogFileRepository;
+import cn.zhangyis.db.storage.redo.RedoBudgetPurpose;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
 import cn.zhangyis.db.storage.redo.RedoRecoveryReader;
 import cn.zhangyis.db.storage.trx.Transaction;
@@ -189,7 +190,7 @@ class StorageEngineTest {
         insertRow(engine, index, 1, "v1");
         insertRow(engine, index, 2, "v2");
 
-        MiniTransaction r = engine.miniTransactionManager().begin();
+        MiniTransaction r = engine.miniTransactionManager().beginReadOnly();
         BTreeLookupResult f1 = engine.btreeService().lookup(r, index, search(1)).orElseThrow();
         BTreeLookupResult f2 = engine.btreeService().lookup(r, index, search(2)).orElseThrow();
         engine.miniTransactionManager().commit(r);
@@ -212,7 +213,7 @@ class StorageEngineTest {
         StorageEngine e2 = new StorageEngine(cfg);
         e2.open();
         e2.diskSpaceManager().openTablespace(DATA_SPACE, dataPath);
-        MiniTransaction r = e2.miniTransactionManager().begin();
+        MiniTransaction r = e2.miniTransactionManager().beginReadOnly();
         BTreeLookupResult found = e2.btreeService().lookup(r, index, search(1)).orElseThrow();
         e2.miniTransactionManager().commit(r);
         assertEquals("v1", payloadOf(found), "row persists across clean restart (read from flushed data file)");
@@ -242,7 +243,7 @@ class StorageEngineTest {
         StorageEngine e3 = new StorageEngine(cfg);
         e3.open();
         e3.diskSpaceManager().openTablespace(DATA_SPACE, dataPath);
-        MiniTransaction r = e3.miniTransactionManager().begin();
+        MiniTransaction r = e3.miniTransactionManager().beginReadOnly();
         assertEquals("v1", payloadOf(e3.btreeService().lookup(r, index, search(1)).orElseThrow()));
         assertEquals("v2", payloadOf(e3.btreeService().lookup(r, index, search(2)).orElseThrow()));
         e3.miniTransactionManager().commit(r);
@@ -275,7 +276,7 @@ class StorageEngineTest {
         StorageEngine e3 = new StorageEngine(cfg);
         e3.open();
         e3.diskSpaceManager().openTablespace(DATA_SPACE, dataPath);
-        MiniTransaction r = e3.miniTransactionManager().begin();
+        MiniTransaction r = e3.miniTransactionManager().beginReadOnly();
         assertEquals("v1", payloadOf(e3.btreeService().lookup(r, index, search(1)).orElseThrow()));
         assertEquals("v2", payloadOf(e3.btreeService().lookup(r, index, search(2)).orElseThrow()),
                 "文件环模式下数据跨两次重启持久");
@@ -299,7 +300,7 @@ class StorageEngineTest {
         StorageEngine e2 = new StorageEngine(cfg);
         e2.open(); // open 期 warmup load 预取上次热页（不阻断、不破坏恢复）
         e2.diskSpaceManager().openTablespace(DATA_SPACE, dataPath);
-        MiniTransaction r = e2.miniTransactionManager().begin();
+        MiniTransaction r = e2.miniTransactionManager().beginReadOnly();
         assertEquals("v1", payloadOf(e2.btreeService().lookup(r, index, search(1)).orElseThrow()),
                 "warmup 接线后数据跨重启仍可读");
         e2.miniTransactionManager().commit(r);
@@ -322,20 +323,19 @@ class StorageEngineTest {
     @Test
     void foregroundRedoCapacityThrottleAdvancesCheckpointBeforeNextAppend() {
         EngineConfig cfg = new EngineConfig(dir, PS, 256, SpaceId.of(5), PageNo.of(64), 64, 100,
-                Duration.ofSeconds(2), 100L, List.of(), false, 4, Duration.ofSeconds(1), 256,
+                Duration.ofSeconds(2), 1_000_000L, List.of(), false, 4, Duration.ofSeconds(1), 256,
                 Duration.ofSeconds(2));
         StorageEngine engine = new StorageEngine(cfg);
         engine.open();
         try {
             RedoLogManager redo = engine.miniTransactionManager().redoLogManager();
-            for (int i = 0; i < 8; i++) {
-                LogRange range = redo.append(List.of(new PageBytesRecord(PageId.of(cfg.undoSpaceId(), PageNo.of(7)),
-                        RECOVERY_OFFSET + i, new byte[]{(byte) i})));
-                redo.markClosed(range);
-            }
+            LogRange range = redo.append(List.of(new PageBytesRecord(
+                    PageId.of(cfg.undoSpaceId(), PageNo.of(7)), RECOVERY_OFFSET, new byte[800_000])));
+            redo.markClosed(range);
             Lsn checkpointBefore = readCheckpoint(cfg);
 
-            MiniTransaction empty = engine.miniTransactionManager().begin();
+            MiniTransaction empty = engine.miniTransactionManager().begin(
+                    engine.miniTransactionManager().budgetFor(RedoBudgetPurpose.TRANSACTION_STATE));
             engine.miniTransactionManager().commit(empty);
 
             Lsn checkpointAfter = readCheckpoint(cfg);
@@ -361,7 +361,8 @@ class StorageEngineTest {
             redo.markClosed(pressure);
             Lsn checkpointBefore = readCheckpoint(cfg);
 
-            MiniTransaction empty = engine.miniTransactionManager().begin();
+            MiniTransaction empty = engine.miniTransactionManager().begin(
+                    engine.miniTransactionManager().budgetFor(RedoBudgetPurpose.TRANSACTION_STATE));
             engine.miniTransactionManager().commit(empty);
 
             assertTrue(readCheckpoint(cfg).value() > checkpointBefore.value(),
@@ -651,7 +652,7 @@ class StorageEngineTest {
         assertTrue(pageChecksumValid(dataPath, root), "repaired page checksum valid again");
 
         // DATA_SPACE 已由恢复期 openTablespaceForRecovery 打开，无需再 openTablespace。
-        MiniTransaction r = e2.miniTransactionManager().begin();
+        MiniTransaction r = e2.miniTransactionManager().beginReadOnly();
         assertEquals("v1", payloadOf(e2.btreeService().lookup(r, index, search(1)).orElseThrow()),
                 "row readable after torn-page repair");
         e2.miniTransactionManager().commit(r);
@@ -672,7 +673,8 @@ class StorageEngineTest {
         e1.open();
         Transaction txn = e1.transactionManager().begin(TransactionOptions.defaults());
         e1.transactionManager().assignWriteId(txn);
-        MiniTransaction m = e1.miniTransactionManager().begin();
+        MiniTransaction m = e1.miniTransactionManager().begin(
+                e1.miniTransactionManager().budgetFor(RedoBudgetPurpose.CLUSTERED_INSERT));
         e1.undoLogManager().beforeInsert(txn, m, TABLE_ID, INDEX_ID,
                 List.of(new ColumnValue.IntValue(1)), idKey(), clusteredSchema());
         e1.miniTransactionManager().commit(m);
@@ -699,7 +701,8 @@ class StorageEngineTest {
         e1.open();
         Transaction txn = e1.transactionManager().begin(TransactionOptions.defaults());
         e1.transactionManager().assignWriteId(txn);
-        MiniTransaction m = e1.miniTransactionManager().begin();
+        MiniTransaction m = e1.miniTransactionManager().begin(
+                e1.miniTransactionManager().budgetFor(RedoBudgetPurpose.CLUSTERED_INSERT));
         e1.undoLogManager().beforeInsert(txn, m, TABLE_ID, INDEX_ID,
                 List.of(new ColumnValue.IntValue(1)), idKey(), clusteredSchema());
         e1.miniTransactionManager().commit(m);
@@ -743,7 +746,7 @@ class StorageEngineTest {
         e1.open();
         BTreeIndex index = createClusteredIndex(e1, dataPath);
         insertRowsActive(e1, index, 3); // active：同一事务写三条 undo + 插行，不 commit/onCommit
-        MiniTransaction r1 = e1.miniTransactionManager().begin();
+        MiniTransaction r1 = e1.miniTransactionManager().beginReadOnly();
         for (int id = 1; id <= 3; id++) {
             assertTrue(e1.btreeService().lookup(r1, index, search(id)).isPresent(),
                     "row " + id + " present before crash");
@@ -758,7 +761,7 @@ class StorageEngineTest {
         assertStageBeforeOpen(e2, RecoveryStageName.UNDO_ROLLBACK);
         assertEquals(0, e2.rollbackSegmentSlotManager().activeSlotCount(),
                 "recovery finalization removes the ACTIVE page3 owner");
-        MiniTransaction r2 = e2.miniTransactionManager().begin();
+        MiniTransaction r2 = e2.miniTransactionManager().beginReadOnly();
         for (int id = 1; id <= 3; id++) {
             assertTrue(e2.btreeService().lookup(r2, index, search(id)).isEmpty(),
                     "active row " + id + " rolled back at recovery");
@@ -771,7 +774,7 @@ class StorageEngineTest {
         e3.open();
         assertEquals(0, e3.rollbackSegmentSlotManager().activeSlotCount(),
                 "second startup must not rediscover a finalized rollback segment");
-        MiniTransaction r3 = e3.miniTransactionManager().begin();
+        MiniTransaction r3 = e3.miniTransactionManager().beginReadOnly();
         for (int id = 1; id <= 3; id++) {
             assertTrue(e3.btreeService().lookup(r3, index, search(id)).isEmpty(),
                     "atomic rollback finalization keeps row " + id + " absent on the second restart");
@@ -796,7 +799,7 @@ class StorageEngineTest {
         StorageEngine e2 = new StorageEngine(cfg);
         e2.configureClusteredIndex(index);
         e2.open();
-        MiniTransaction r = e2.miniTransactionManager().begin();
+        MiniTransaction r = e2.miniTransactionManager().beginReadOnly();
         assertEquals("v1", payloadOf(e2.btreeService().lookup(r, index, search(1)).orElseThrow()),
                 "committed insert preserved (recovery skips committed/cleared slot)");
         e2.miniTransactionManager().commit(r);
@@ -812,7 +815,7 @@ class StorageEngineTest {
         Transaction txn = txnMgr.begin(TransactionOptions.defaults());
         txnMgr.assignWriteId(txn);
         for (int id = 1; id <= count; id++) {
-            MiniTransaction m = mtrMgr.begin();
+            MiniTransaction m = mtrMgr.begin(mtrMgr.budgetFor(RedoBudgetPurpose.CLUSTERED_INSERT));
             RollPointer rp = undoMgr.beforeInsert(txn, m, TABLE_ID, INDEX_ID,
                     List.of(new ColumnValue.IntValue(id)), index.keyDef(), index.schema());
             svc.insertClustered(m, index, row(id, "v" + id), txn.transactionId(), rp);
@@ -886,7 +889,7 @@ class StorageEngineTest {
     }
 
     private boolean lookupIncludingDeletedEmpty(StorageEngine engine, BTreeIndex index, long id) {
-        MiniTransaction r = engine.miniTransactionManager().begin();
+        MiniTransaction r = engine.miniTransactionManager().beginReadOnly();
         boolean empty = engine.btreeService().lookupIncludingDeleted(r, index, search(id)).isEmpty();
         engine.miniTransactionManager().commit(r);
         return empty;
@@ -911,11 +914,11 @@ class StorageEngineTest {
         SplitCapableBTreeIndexService svc = engine.btreeService();
         Transaction txn = txnMgr.begin(TransactionOptions.defaults());
         txnMgr.assignWriteId(txn);
-        MiniTransaction read = mtrMgr.begin();
+        MiniTransaction read = mtrMgr.beginReadOnly();
         BTreeLookupResult old = svc.lookup(read, index, search(id)).orElseThrow();
         mtrMgr.commit(read);
         HiddenColumns oldHidden = old.record().hiddenColumns();
-        MiniTransaction m = mtrMgr.begin();
+        MiniTransaction m = mtrMgr.begin(mtrMgr.budgetFor(RedoBudgetPurpose.CLUSTERED_DELETE));
         RollPointer delRp = undoMgr.beforeDelete(txn, m, TABLE_ID, INDEX_ID,
                 List.of(new ColumnValue.IntValue(id)), old.record().columnValues(), oldHidden,
                 index.keyDef(), index.schema());
@@ -956,7 +959,7 @@ class StorageEngineTest {
     private BTreeIndex createClusteredIndex(StorageEngine engine, Path dataPath) {
         DiskSpaceManager disk = engine.diskSpaceManager();
         MiniTransactionManager mtrMgr = engine.miniTransactionManager();
-        MiniTransaction boot = mtrMgr.begin();
+        MiniTransaction boot = mtrMgr.begin(mtrMgr.budgetFor(RedoBudgetPurpose.ENGINE_BOOT));
         disk.createTablespace(boot, DATA_SPACE, dataPath, PageNo.of(64));
         SegmentRef leaf = disk.createSegment(boot, DATA_SPACE, SegmentPurpose.INDEX_LEAF);
         SegmentRef nonLeaf = disk.createSegment(boot, DATA_SPACE, SegmentPurpose.INDEX_NON_LEAF);
@@ -973,7 +976,7 @@ class StorageEngineTest {
         SplitCapableBTreeIndexService svc = engine.btreeService();
         Transaction txn = txnMgr.begin(TransactionOptions.defaults());
         txnMgr.assignWriteId(txn);
-        MiniTransaction m = mtrMgr.begin();
+        MiniTransaction m = mtrMgr.begin(mtrMgr.budgetFor(RedoBudgetPurpose.CLUSTERED_INSERT));
         RollPointer rp = undoMgr.beforeInsert(txn, m, TABLE_ID, INDEX_ID,
                 List.of(new ColumnValue.IntValue(id)), index.keyDef(), index.schema());
         svc.insertClustered(m, index, row(id, payload), txn.transactionId(), rp);

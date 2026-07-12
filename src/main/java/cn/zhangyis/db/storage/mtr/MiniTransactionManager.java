@@ -1,7 +1,10 @@
 package cn.zhangyis.db.storage.mtr;
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
+import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.storage.redo.RedoCapacityThrottle;
+import cn.zhangyis.db.storage.redo.RedoAppendBudget;
+import cn.zhangyis.db.storage.redo.RedoBudgetPurpose;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
 import cn.zhangyis.db.storage.fil.access.TablespaceAccessController;
 
@@ -27,12 +30,8 @@ public final class MiniTransactionManager {
 
     /** redo 预算申请前的容量反压；默认 no-op，生产引擎可注入真实 throttle。 */
     private final RedoCapacityThrottle redoCapacityThrottle;
-    /**
-     * 每个前台 MTR 在 begin 时申请的 redo 预算。该预算只参与 capacity log-free-check，不分配真实 LSN；
-     * 真实 LSN 仍在 commit append 时按实际 record 长度分配。生产引擎按 redo capacity 配置保守估算，测试默认 0。
-     */
-    private final long foregroundRedoReservationBytes;
-
+    /** 实例页大小感知的生产操作 profile；只估算，不读取或修改 MTR/redo 状态。 */
+    private final MtrOperationRedoBudgetEstimator operationBudgetEstimator;
     public MiniTransactionManager() {
         this(new TablespaceAccessController(), new RedoLogManager());
     }
@@ -56,28 +55,21 @@ public final class MiniTransactionManager {
     public MiniTransactionManager(TablespaceAccessController accessController,
                                   RedoLogManager redoLogManager,
                                   RedoCapacityThrottle redoCapacityThrottle) {
-        this(accessController, redoLogManager, redoCapacityThrottle, 0);
+        this(accessController, redoLogManager, redoCapacityThrottle, PageSize.ofBytes(16 * 1024));
     }
 
-    /**
-     * 创建带前台 redo 预算的 MTR 管理器。预算在 {@link #begin()} 时申请并挂入 MTR memo，保证容量等待发生在
-     * page latch、buffer fix 和 tablespace lease 之前；commit 只做真实 append 与 pageLSN 盖戳，不再等待 checkpoint。
-     */
+    /** 创建使用实例真实页大小计算操作级 redo 上界的生产 MTR 管理器。 */
     public MiniTransactionManager(TablespaceAccessController accessController,
                                   RedoLogManager redoLogManager,
                                   RedoCapacityThrottle redoCapacityThrottle,
-                                  long foregroundRedoReservationBytes) {
+                                  PageSize pageSize) {
         if (accessController == null || redoLogManager == null || redoCapacityThrottle == null) {
             throw new DatabaseValidationException("MTR access controller/redo manager/throttle must not be null");
-        }
-        if (foregroundRedoReservationBytes < 0) {
-            throw new DatabaseValidationException("foreground redo reservation bytes must not be negative: "
-                    + foregroundRedoReservationBytes);
         }
         this.accessController = accessController;
         this.redoLogManager = redoLogManager;
         this.redoCapacityThrottle = redoCapacityThrottle;
-        this.foregroundRedoReservationBytes = foregroundRedoReservationBytes;
+        this.operationBudgetEstimator = new MtrOperationRedoBudgetEstimator(pageSize);
     }
 
     /**
@@ -86,16 +78,45 @@ public final class MiniTransactionManager {
      * @return 已 ACTIVE 的 MTR。
      */
     public MiniTransaction begin() {
+        if (redoCapacityThrottle.requiresExplicitBudget()) {
+            throw new MtrStateException("capacity-aware mini transaction requires an explicit redo budget");
+        }
+        return beginInternal(RedoAppendBudget.testingUnbounded());
+    }
+
+    /** 开启显式零预算的只读 MTR；即使 redo 接近水位也不触发 flush/checkpoint。 */
+    public MiniTransaction beginReadOnly() {
+        return beginInternal(RedoAppendBudget.readOnly());
+    }
+
+    /**
+     * 按操作级上界开启写 MTR。预算准入先于 MTR 暴露给调用方，因而调用方尚不可能持有本 MTR 的页/FSP 资源。
+     */
+    public MiniTransaction begin(RedoAppendBudget budget) {
+        if (budget == null) {
+            throw new DatabaseValidationException("mini transaction redo budget must not be null");
+        }
+        return beginInternal(budget);
+    }
+
+    /**
+     * 返回实例页大小感知的写操作上界。调用方必须在取得 page/FSP 资源前计算并立即传给 {@link #begin(RedoAppendBudget)}。
+     */
+    public RedoAppendBudget budgetFor(RedoBudgetPurpose purpose) {
+        return operationBudgetEstimator.estimate(purpose);
+    }
+
+    private MiniTransaction beginInternal(RedoAppendBudget budget) {
         if (current.get() != null) {
             throw new MtrStateException("nested mini transaction not allowed on this thread; create an explicit child");
         }
         // redo capacity reservation 必须发生在 MTR 取得任何 page latch、buffer fix 或 tablespace lease 之前。
         // 若在 commit 阶段等待，调用方通常已持有页锁与 FIL/FSP lease，会把 redo/checkpoint 压力放大成页锁等待链。
         RedoCapacityThrottle.Reservation reservation =
-                redoCapacityThrottle.reserveAppendBytes(foregroundRedoReservationBytes);
+                redoCapacityThrottle.reserveAppendBudget(budget);
         try {
             MiniTransaction mtr = new MiniTransaction(idSequence.incrementAndGet(), redoLogManager,
-                    accessController);
+                    accessController, budget, reservation);
             mtr.activate();
             mtr.enlistResource(reservation);
             current.set(mtr);

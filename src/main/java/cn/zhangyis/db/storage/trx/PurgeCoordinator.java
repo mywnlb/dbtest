@@ -10,6 +10,7 @@ import cn.zhangyis.db.storage.btree.SplitCapableBTreeIndexService;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
+import cn.zhangyis.db.storage.redo.RedoBudgetPurpose;
 import cn.zhangyis.db.storage.mtr.MiniTransactionState;
 import cn.zhangyis.db.storage.record.page.SearchKey;
 import cn.zhangyis.db.storage.undo.UndoLogSegment;
@@ -134,7 +135,7 @@ public final class PurgeCoordinator implements PurgeTarget {
     private int purgeCommittedLog(HistoryEntry entry) {
         // 首个短 MTR 只取逻辑入口；不能用物理 slot/FIL NEXT 遍历，否则会重新消费 rolled-back 分支。
         LogicalChainStart start;
-        MiniTransaction read = mgr.begin();
+        MiniTransaction read = mgr.beginReadOnly();
         try {
             UndoLogSegment seg = undoAccess.open(read, entry.undoFirstPageId(), PageLatchMode.SHARED);
             if (!seg.creatorTransactionId().equals(entry.creatorTrxId())) {
@@ -153,7 +154,7 @@ public final class PurgeCoordinator implements PurgeTarget {
 
         int removed = 0;
         for (DeleteTask task : tasks) {
-            MiniTransaction ix = mgr.begin();
+            MiniTransaction ix = mgr.begin(mgr.budgetFor(RedoBudgetPurpose.PURGE_INDEX));
             BTreeDeleteResult res;
             try {
                 // expected = (删除事务 id, 该 DELETE_MARK undo 记录地址)；严格：仅移除仍 delete-marked 且隐藏列匹配的行
@@ -210,7 +211,7 @@ public final class PurgeCoordinator implements PurgeTarget {
 
     /** 读取逻辑链单条 record；返回前已提交只读 MTR并释放 first/record 页 latch 与 buffer fix。 */
     private UndoRecord readLogicalRecord(PageId firstPageId, RollPointer pointer) {
-        MiniTransaction read = mgr.begin();
+        MiniTransaction read = mgr.beginReadOnly();
         try {
             UndoRecord record = undoAccess.open(read, firstPageId, PageLatchMode.SHARED)
                     .readRecord(pointer, clusteredIndex.keyDef(), clusteredIndex.schema());

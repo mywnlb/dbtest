@@ -9,6 +9,7 @@ import cn.zhangyis.db.storage.buf.PageLatchMode;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
 import cn.zhangyis.db.storage.mtr.MiniTransactionState;
+import cn.zhangyis.db.storage.redo.RedoBudgetPurpose;
 import cn.zhangyis.db.storage.undo.RollbackSegmentHeaderRepository;
 import cn.zhangyis.db.storage.undo.RollbackSegmentHeaderSnapshot;
 import cn.zhangyis.db.storage.undo.UndoLogFormatException;
@@ -151,7 +152,8 @@ public final class UndoSegmentFinalizer {
         try (RollbackSegmentSlotManager.FinalizationLease lease =
                      slotManager.beginFinalization(identity.slotId(), identity.firstPageId())) {
             PreparedFinalization prepared = prepare(kind, identity);
-            MiniTransaction finalizationMtr = mtrManager.begin();
+            MiniTransaction finalizationMtr = mtrManager.begin(
+                    mtrManager.budgetFor(RedoBudgetPurpose.UNDO_FINALIZATION));
             try {
                 // 从首个 FSP 写开始 MTR 无 content undo；此后任何异常都让 lease 保持 FINALIZING，禁止同进程复用。
                 lease.physicalMutationStarted();
@@ -199,7 +201,7 @@ public final class UndoSegmentFinalizer {
                     + ", current=" + memoryOwner);
         }
 
-        MiniTransaction readMtr = mtrManager.begin();
+        MiniTransaction readMtr = mtrManager.beginReadOnly();
         try {
             RollbackSegmentHeaderSnapshot snapshot = headerRepository.read(readMtr,
                     identity.firstPageId().spaceId(), slotManager.rollbackSegmentId(), slotManager.slotCapacity());

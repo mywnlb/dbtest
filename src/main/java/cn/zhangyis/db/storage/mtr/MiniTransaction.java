@@ -11,6 +11,8 @@ import cn.zhangyis.db.storage.fil.access.TablespaceAccessController;
 import cn.zhangyis.db.storage.page.PageEnvelope;
 import cn.zhangyis.db.storage.page.PageType;
 import cn.zhangyis.db.storage.redo.LogRange;
+import cn.zhangyis.db.storage.redo.RedoAppendBudget;
+import cn.zhangyis.db.storage.redo.RedoCapacityThrottle;
 import cn.zhangyis.db.storage.redo.RedoRecord;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
 
@@ -48,21 +50,30 @@ public final class MiniTransaction {
     /** 与截断服务共享的表空间 operation lease 控制器。 */
     private final TablespaceAccessController accessController;
 
+    /** begin admission 已授权的不可变 redo 上界；commit 只读取，不在持页资源时追加预算。 */
+    private final RedoAppendBudget redoBudget;
+    /** admission 原子账本句柄；append 成功后转移给真实 current LSN，异常/rollback 由 memo 兜底释放。 */
+    private final RedoCapacityThrottle.Reservation redoReservation;
+
     /**
      * page latch 全序例外嵌套深度。默认 MTR 获取不同页必须按 PageId 升序；B+Tree 已证明的 sibling/右邻局部路径
      * 可短暂进入例外作用域，作用域关闭后立即恢复默认守卫。
      */
     private int outOfOrderPageLatchScopeDepth;
 
-    MiniTransaction(long id, RedoLogManager redoLogManager, TablespaceAccessController accessController) {
+    MiniTransaction(long id, RedoLogManager redoLogManager, TablespaceAccessController accessController,
+                    RedoAppendBudget redoBudget, RedoCapacityThrottle.Reservation redoReservation) {
         this.id = id;
         this.redoLogManager = redoLogManager;
         this.accessController = accessController;
+        this.redoBudget = redoBudget;
+        this.redoReservation = redoReservation;
     }
 
     /** 包内兼容构造，仅供不参与生命周期协作的 MTR 状态单测使用。 */
     MiniTransaction(long id, RedoLogManager redoLogManager) {
-        this(id, redoLogManager, new TablespaceAccessController());
+        this(id, redoLogManager, new TablespaceAccessController(), RedoAppendBudget.testingUnbounded(),
+                RedoCapacityThrottle.NO_OP.reserveAppendBudget(RedoAppendBudget.testingUnbounded()));
     }
 
     /** NEW→ACTIVE。由 Manager.begin 调用。 */
@@ -308,7 +319,12 @@ public final class MiniTransaction {
      */
     Lsn commit() {
         transitTo(MiniTransactionState.COMMITTING);
-        LogRange range = redoLogManager.append(collector.records());
+        // persisted records 只冻结一次：预算结算、LSN 分配和 repository 编码必须观察完全相同的列表。
+        List<RedoRecord> persistedRecords = collector.records();
+        redoBudget.requireCovers(persistedRecords);
+        LogRange range = redoLogManager.append(persistedRecords);
+        // append 已把 actual bytes 纳入 current LSN；立即解除 admission 账本，避免直到 page 发布后仍双计数。
+        redoReservation.transferToAppend();
         Lsn endLsn = range.end();
         collector.disable();
         for (PageId pid : collector.touchedPages()) {

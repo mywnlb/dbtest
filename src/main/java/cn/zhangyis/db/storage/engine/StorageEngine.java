@@ -72,6 +72,7 @@ import cn.zhangyis.db.storage.recovery.TransactionRecoveryException;
 import cn.zhangyis.db.storage.redo.RedoApplyContext;
 import cn.zhangyis.db.storage.redo.RedoApplyDispatcher;
 import cn.zhangyis.db.storage.redo.RedoCapacityThrottle;
+import cn.zhangyis.db.storage.redo.RedoBudgetPurpose;
 import cn.zhangyis.db.storage.redo.RedoCapacityPolicy;
 import cn.zhangyis.db.storage.redo.RedoCheckpointStore;
 import cn.zhangyis.db.storage.redo.RedoFlushWorker;
@@ -340,9 +341,10 @@ public final class StorageEngine {
                     redo.flush();
                     flushService.flushForCapacity(foregroundCapacityFlushMaxPages());
                 },
-                config.flushTimeout());
-        this.miniTransactionManager = new MiniTransactionManager(accessController, redo, redoCapacityThrottle,
-                foregroundRedoReservationBytes());
+                config.flushTimeout(),
+                config.redoRotationEnabled() ? config.redoRotation().fileBytes() : Long.MAX_VALUE);
+        this.miniTransactionManager = new MiniTransactionManager(
+                accessController, redo, redoCapacityThrottle, config.pageSize());
 
         TypeCodecRegistry typeRegistry = new TypeCodecRegistry();
         this.transactionManager = new TransactionManager(txnSystem);
@@ -375,7 +377,8 @@ public final class StorageEngine {
 
         if (fresh) {
             // 建系统 undo 表空间（page0/inode 经 MTR 写入，redo 累积，close 时随 flushThrough durable）
-            MiniTransaction boot = miniTransactionManager.begin();
+            MiniTransaction boot = miniTransactionManager.begin(
+                    miniTransactionManager.budgetFor(RedoBudgetPurpose.ENGINE_BOOT));
             diskSpaceManager.createTablespace(boot, config.undoSpaceId(), config.undoFile(),
                     config.undoSpaceInitialPages(), TablespaceType.UNDO);
             // 0.3：同 boot MTR 格式化 page3 rseg header（空 slot 目录，redo 保护），供 claim/release 持久与恢复扫描。
@@ -537,7 +540,7 @@ public final class StorageEngine {
         if (recoveredToLsn == null || transactionSnapshot == null) {
             throw new DatabaseValidationException("transaction undo recovery inputs must not be null");
         }
-        MiniTransaction scan = miniTransactionManager.begin();
+        MiniTransaction scan = miniTransactionManager.beginReadOnly();
         RollbackSegmentHeaderSnapshot snapshot;
         try {
             snapshot = rsegHeaderRepo.read(scan, config.undoSpaceId(),
@@ -606,7 +609,7 @@ public final class StorageEngine {
      * 返回值只含内存快照，不持有 page latch；调用方可安全地在之后进入 B+Tree rollback 或 history 入队。
      */
     private RecoveredUndoSlotEvidence readRecoveredUndoSlot(UndoSlotId slotId, PageId firstPageId) {
-        MiniTransaction stateMtr = miniTransactionManager.begin();
+        MiniTransaction stateMtr = miniTransactionManager.beginReadOnly();
         try {
             UndoLogSegment segment = undoAccess.open(stateMtr, firstPageId, PageLatchMode.SHARED);
             boolean active = segment.isActive();
@@ -695,21 +698,6 @@ public final class StorageEngine {
      */
     private int foregroundCapacityFlushMaxPages() {
         return Math.max(1, config.bufferPoolCapacityFrames());
-    }
-
-    /**
-     * 前台 MTR begin 时的 redo 预算。它只用于 log-free-check 的保守压力计算，不分配真实 LSN。
-     *
-     * <p>当前教学实现没有 per-operation 精确 redo 预估，因此采用「redo capacity 的 1/8，且不超过单个 redo ring
-     * 文件容量」作为默认预算：足以让并发前台在接近 SYNC/HARD 水位前被反压，又不会像整段 capacity reservation
-     * 那样把所有写入完全串行化。单文件模式没有 ring 文件上限，直接取 capacity 的 1/8。
-     */
-    private long foregroundRedoReservationBytes() {
-        long byCapacity = Math.max(1L, config.redoCapacityBytes() / 8L);
-        if (!config.redoRotationEnabled()) {
-            return byCapacity;
-        }
-        return Math.max(1L, Math.min(byCapacity, config.redoRotation().fileBytes()));
     }
 
     private void startBackgroundRedoFlusher() {

@@ -25,6 +25,7 @@ import cn.zhangyis.db.storage.record.schema.KeyPartDef;
 import cn.zhangyis.db.storage.record.schema.TableSchema;
 import cn.zhangyis.db.storage.record.type.ColumnValue;
 import cn.zhangyis.db.storage.redo.DurabilityPolicy;
+import cn.zhangyis.db.storage.redo.RedoBudgetPurpose;
 import cn.zhangyis.db.storage.trx.TransactionOptions;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -99,7 +100,8 @@ class ClusteredDmlEngineIntegrationTest {
 
     private static BTreeIndex createClusteredIndex(StorageEngine engine, Path dataPath) {
         DiskSpaceManager disk = engine.diskSpaceManager();
-        MiniTransaction boot = engine.miniTransactionManager().begin();
+        MiniTransaction boot = engine.miniTransactionManager().begin(
+                engine.miniTransactionManager().budgetFor(RedoBudgetPurpose.ENGINE_BOOT));
         disk.createTablespace(boot, DATA_SPACE, dataPath, PageNo.of(64));
         SegmentRef leaf = disk.createSegment(boot, DATA_SPACE, SegmentPurpose.INDEX_LEAF);
         SegmentRef nonLeaf = disk.createSegment(boot, DATA_SPACE, SegmentPurpose.INDEX_NON_LEAF);
@@ -126,7 +128,7 @@ class ClusteredDmlEngineIntegrationTest {
     }
 
     private static Optional<BTreeLookupResult> lookup(StorageEngine engine, BTreeIndex index, long id) {
-        MiniTransaction read = engine.miniTransactionManager().begin();
+        MiniTransaction read = engine.miniTransactionManager().beginReadOnly();
         try {
             Optional<BTreeLookupResult> found = engine.btreeService().lookup(read, index, search(id));
             engine.miniTransactionManager().commit(read);

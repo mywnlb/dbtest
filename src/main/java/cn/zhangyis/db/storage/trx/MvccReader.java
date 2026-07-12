@@ -141,7 +141,7 @@ public final class MvccReader {
      * {@code rollbackUncommitted} 释放 MTR，避免线程残留绑定 MTR 致后续 {@code begin()} 失败。
      */
     private LogicalRecord lookupCurrentIncludingDeleted(BTreeIndex index, SearchKey key) {
-        MiniTransaction m = mgr.begin();
+        MiniTransaction m = mgr.beginReadOnly();
         Optional<BTreeLookupResult> found;
         try {
             found = btree.lookupIncludingDeleted(m, index, key);
@@ -158,7 +158,7 @@ public final class MvccReader {
      * 释放 MTR（同上，防泄漏）。任一时刻只持一个 page latch（index 或单个 undo），不反转写路径 undo→index 锁序。
      */
     private UndoRecord readUndoByRollPointer(BTreeIndex index, RollPointer rollPtr) {
-        MiniTransaction u = mgr.begin();
+        MiniTransaction u = mgr.beginReadOnly();
         UndoRecord undo;
         try {
             undo = undoAccess.readRecordByRollPointer(u, undoSpace, rollPtr, index.keyDef(), index.schema());

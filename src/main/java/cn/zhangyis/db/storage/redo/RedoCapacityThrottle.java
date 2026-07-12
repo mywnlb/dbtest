@@ -36,6 +36,8 @@ public final class RedoCapacityThrottle {
     private final Duration timeout;
     /** no-op 标记，避免默认构造参与任何 LSN 读取或等待。 */
     private final boolean noOp;
+    /** repository 允许一个 sealed batch 占用的最大物理字节；ring 模式为单文件大小。 */
+    private final long maxPhysicalBatchBytes;
     /**
      * 已授权但尚未释放的前台 redo 预算。它不是 LSN 权威，只是 log-free-check 的保守账本：
      * MTR 在拿页 latch 前申请预算，commit/rollback 释放预算，避免多个前台都在低水位 begin 后集中 append。
@@ -50,6 +52,7 @@ public final class RedoCapacityThrottle {
         this.blockingFlushOnce = null;
         this.timeout = Duration.ZERO;
         this.noOp = true;
+        this.maxPhysicalBatchBytes = Long.MAX_VALUE;
     }
 
     /**
@@ -68,12 +71,32 @@ public final class RedoCapacityThrottle {
                                 Runnable asyncFlushRequest,
                                 Runnable blockingFlushOnce,
                                 Duration timeout) {
+        this(capacityPolicy, currentLsnSupplier, checkpointLsnSupplier, asyncFlushRequest,
+                blockingFlushOnce, timeout, Long.MAX_VALUE);
+    }
+
+    /**
+     * 创建同时校验单批物理 file-fit 的生产 throttle。
+     *
+     * @param maxPhysicalBatchBytes repository 可原子写入一个 sealed batch 的最大物理字节。
+     */
+    public RedoCapacityThrottle(RedoCapacityPolicy capacityPolicy,
+                                Supplier<Lsn> currentLsnSupplier,
+                                Supplier<Lsn> checkpointLsnSupplier,
+                                Runnable asyncFlushRequest,
+                                Runnable blockingFlushOnce,
+                                Duration timeout,
+                                long maxPhysicalBatchBytes) {
         if (capacityPolicy == null || currentLsnSupplier == null || checkpointLsnSupplier == null
                 || asyncFlushRequest == null || blockingFlushOnce == null || timeout == null) {
             throw new DatabaseValidationException("redo capacity throttle dependencies must not be null");
         }
         if (timeout.isNegative()) {
             throw new DatabaseValidationException("redo capacity throttle timeout must not be negative: " + timeout);
+        }
+        if (maxPhysicalBatchBytes <= 0) {
+            throw new DatabaseValidationException("redo maximum physical batch bytes must be positive: "
+                    + maxPhysicalBatchBytes);
         }
         this.capacityPolicy = capacityPolicy;
         this.currentLsnSupplier = currentLsnSupplier;
@@ -82,6 +105,12 @@ public final class RedoCapacityThrottle {
         this.blockingFlushOnce = blockingFlushOnce;
         this.timeout = timeout;
         this.noOp = false;
+        this.maxPhysicalBatchBytes = maxPhysicalBatchBytes;
+    }
+
+    /** 生产 capacity-aware throttle 是否要求每个 MTR 显式声明预算。 */
+    public boolean requiresExplicitBudget() {
+        return !noOp;
     }
 
     /**
@@ -121,10 +150,30 @@ public final class RedoCapacityThrottle {
      * @return 必须随 MTR 生命周期关闭的预算句柄。
      */
     public Reservation reserveAppendBytes(long appendBytes) {
+        return reserveAppendBudget(RedoAppendBudget.upperBound(RedoBudgetPurpose.TEST_UNBOUNDED, appendBytes));
+    }
+
+    /**
+     * 在任何 page/FSP 资源获取前按操作预算执行 logical capacity 与 physical batch-fit 双重准入。
+     * physical 超限无需 flush 即失败，因为 checkpoint 推进不能让单个 sealed batch 变小。
+     */
+    public Reservation reserveAppendBudget(RedoAppendBudget budget) {
         if (noOp) {
             return Reservation.noOp();
         }
-        validateAppendBytes(appendBytes);
+        if (budget == null) {
+            throw new DatabaseValidationException("redo append budget must not be null");
+        }
+        if (budget.physicalBlockUpperBound() > maxPhysicalBatchBytes) {
+            throw new RedoBudgetTooLargeException("redo budget cannot fit one repository batch: purpose="
+                    + budget.purpose() + ", physical=" + budget.physicalBlockUpperBound()
+                    + ", maxPhysical=" + maxPhysicalBatchBytes);
+        }
+        long appendBytes = budget.logicalUpperBound();
+        // 只读 MTR 不消费 redo capacity；即使当前写流量已处于压力区，也不能让读路径代替写者触发 flush。
+        if (appendBytes == 0) {
+            return Reservation.noOp();
+        }
         while (true) {
             long existing = reservedAppendBytes.get();
             long prospectiveBytes = addExact(existing, appendBytes);
@@ -241,8 +290,8 @@ public final class RedoCapacityThrottle {
         private final RedoCapacityThrottle owner;
         /** 本句柄授权的 redo 预算字节数。 */
         private final long bytes;
-        /** 防止重复 close 把全局预算扣成负数。 */
-        private final AtomicBoolean closed = new AtomicBoolean();
+        /** close 与 append ownership transfer 共用的一次性释放门，防止全局预算扣成负数。 */
+        private final AtomicBoolean released = new AtomicBoolean();
 
         private Reservation(RedoCapacityThrottle owner, long bytes) {
             this.owner = owner;
@@ -253,9 +302,20 @@ public final class RedoCapacityThrottle {
             return NO_OP;
         }
 
+        /**
+         * append 成功分配真实 LSN 后立即把容量账本所有权转给 current LSN。此后 memo close 仍可调用但不会重复扣减。
+         */
+        public void transferToAppend() {
+            releaseOnce();
+        }
+
         @Override
         public void close() {
-            if (owner != null && closed.compareAndSet(false, true)) {
+            releaseOnce();
+        }
+
+        private void releaseOnce() {
+            if (owner != null && released.compareAndSet(false, true)) {
                 owner.releaseReservation(bytes);
             }
         }

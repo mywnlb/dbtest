@@ -31,6 +31,7 @@ import cn.zhangyis.db.storage.record.schema.KeyPartDef;
 import cn.zhangyis.db.storage.record.schema.TableSchema;
 import cn.zhangyis.db.storage.record.type.ColumnValue;
 import cn.zhangyis.db.storage.redo.DurabilityPolicy;
+import cn.zhangyis.db.storage.redo.RedoBudgetPurpose;
 import cn.zhangyis.db.storage.redo.PageInitRecord;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
 import cn.zhangyis.db.storage.page.PageType;
@@ -243,7 +244,7 @@ class ClusteredDmlServiceTest {
                     "undo commit marker 未持久化时，事务不能进入 COMMITTED 或移出 active 语义");
             assertTrue(hasGrantedLock(engine, txn),
                     "未提交事务的 row locks 不能因 onCommit 失败被释放，否则其它事务会看到未提交版本");
-            MiniTransaction probe = engine.miniTransactionManager().begin();
+            MiniTransaction probe = engine.miniTransactionManager().beginReadOnly();
             engine.miniTransactionManager().rollbackUncommitted(probe);
             engine.lockManager().releaseAll(txn.transactionId());
         } finally {
@@ -592,7 +593,8 @@ class ClusteredDmlServiceTest {
 
     private static BTreeIndex createClusteredIndex(StorageEngine engine, Path dataPath) {
         DiskSpaceManager disk = engine.diskSpaceManager();
-        MiniTransaction boot = engine.miniTransactionManager().begin();
+        MiniTransaction boot = engine.miniTransactionManager().begin(
+                engine.miniTransactionManager().budgetFor(RedoBudgetPurpose.ENGINE_BOOT));
         disk.createTablespace(boot, SPACE, dataPath, PageNo.of(64));
         SegmentRef leaf = disk.createSegment(boot, SPACE, SegmentPurpose.INDEX_LEAF);
         SegmentRef nonLeaf = disk.createSegment(boot, SPACE, SegmentPurpose.INDEX_NON_LEAF);
@@ -603,7 +605,7 @@ class ClusteredDmlServiceTest {
     }
 
     private static Optional<BTreeLookupResult> lookup(StorageEngine engine, BTreeIndex index, long id) {
-        MiniTransaction read = engine.miniTransactionManager().begin();
+        MiniTransaction read = engine.miniTransactionManager().beginReadOnly();
         try {
             Optional<BTreeLookupResult> found = engine.btreeService().lookup(read, index, search(id));
             engine.miniTransactionManager().commit(read);
@@ -616,7 +618,7 @@ class ClusteredDmlServiceTest {
 
     private static Optional<BTreeLookupResult> lookupIncludingDeleted(StorageEngine engine, BTreeIndex index,
                                                                       long id) {
-        MiniTransaction read = engine.miniTransactionManager().begin();
+        MiniTransaction read = engine.miniTransactionManager().beginReadOnly();
         try {
             Optional<BTreeLookupResult> found = engine.btreeService()
                     .lookupIncludingDeleted(read, index, search(id));

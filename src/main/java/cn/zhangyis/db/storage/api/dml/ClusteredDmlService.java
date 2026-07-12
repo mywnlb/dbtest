@@ -22,6 +22,7 @@ import cn.zhangyis.db.storage.recovery.RecoveryTrafficGate;
 import cn.zhangyis.db.storage.record.format.HiddenColumns;
 import cn.zhangyis.db.storage.record.format.LogicalRecord;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
+import cn.zhangyis.db.storage.redo.RedoBudgetPurpose;
 import cn.zhangyis.db.storage.trx.EmptyUndoBoundary;
 import cn.zhangyis.db.storage.trx.RollbackService;
 import cn.zhangyis.db.storage.trx.RollbackSummary;
@@ -137,7 +138,8 @@ public final class ClusteredDmlService {
             throw new DmlDuplicateKeyException("duplicate clustered key for index " + command.index().indexId());
         }
 
-        MiniTransaction mtr = mtrManager.begin();
+        MiniTransaction mtr = mtrManager.begin(
+                mtrManager.budgetFor(RedoBudgetPurpose.CLUSTERED_INSERT));
         try {
             RollPointer rollPointer = undoLogManager.beforeInsert(txn, mtr, command.tableId(),
                     command.index().indexId(), command.key().values(), command.index().keyDef(),
@@ -175,7 +177,8 @@ public final class ClusteredDmlService {
         BTreeLookupResult old = locked.orElseThrow();
         HiddenColumns oldHidden = requireHiddenColumns(old.record(), "update");
 
-        MiniTransaction mtr = mtrManager.begin();
+        MiniTransaction mtr = mtrManager.begin(
+                mtrManager.budgetFor(RedoBudgetPurpose.CLUSTERED_UPDATE));
         try {
             RollPointer rollPointer = undoLogManager.beforeUpdate(txn, mtr, command.tableId(),
                     command.index().indexId(), command.key().values(), old.record().columnValues(), oldHidden,
@@ -216,7 +219,8 @@ public final class ClusteredDmlService {
         BTreeLookupResult old = locked.orElseThrow();
         HiddenColumns oldHidden = requireHiddenColumns(old.record(), "delete");
 
-        MiniTransaction mtr = mtrManager.begin();
+        MiniTransaction mtr = mtrManager.begin(
+                mtrManager.budgetFor(RedoBudgetPurpose.CLUSTERED_DELETE));
         try {
             RollPointer rollPointer = undoLogManager.beforeDelete(txn, mtr, command.tableId(),
                     command.index().indexId(), command.key().values(), old.record().columnValues(), oldHidden,

@@ -65,6 +65,39 @@ class RedoCapacityThrottleTest {
     }
 
     @Test
+    void physicalBudgetLargerThanOneRepositoryBatchFailsBeforeFlush() {
+        FakeCapacityEnvironment env = new FakeCapacityEnvironment(0, 0);
+        RedoCapacityThrottle throttle = new RedoCapacityThrottle(
+                RedoCapacityPolicy.fixed(100_000), env::currentLsn, env::checkpointLsn,
+                env::requestAsyncFlush, env::flushOnce, Duration.ofMillis(1), 512);
+        RedoAppendBudget twoBlocks = RedoAppendBudget.upperBound(
+                RedoBudgetPurpose.CLUSTERED_INSERT, 441);
+
+        assertThrows(RedoBudgetTooLargeException.class,
+                () -> throttle.reserveAppendBudget(twoBlocks));
+        assertEquals(0, env.flushRequests());
+        assertEquals(0, env.asyncRequests());
+    }
+
+    @Test
+    void ownershipTransferAndCloseReleaseReservationExactlyOnce() {
+        FakeCapacityEnvironment env = new FakeCapacityEnvironment(50, 0);
+        RedoCapacityThrottle throttle = new RedoCapacityThrottle(
+                RedoCapacityPolicy.fixed(100), env::currentLsn, env::checkpointLsn,
+                env::requestAsyncFlush, env::flushOnce, Duration.ZERO);
+        RedoCapacityThrottle.Reservation first = throttle.reserveAppendBudget(
+                RedoAppendBudget.upperBound(RedoBudgetPurpose.CLUSTERED_INSERT, 10));
+        first.transferToAppend();
+        first.close();
+
+        try (RedoCapacityThrottle.Reservation ignored = throttle.reserveAppendBudget(
+                RedoAppendBudget.upperBound(RedoBudgetPurpose.CLUSTERED_UPDATE, 9))) {
+            assertEquals(0, env.flushRequests(),
+                    "transferred budget must stop double-counting once real current LSN owns the append");
+        }
+    }
+
+    @Test
     void hardPressureReleasesAfterFlushProgress() {
         FakeCapacityEnvironment env = new FakeCapacityEnvironment(95, 0);
         env.onFlushCheckpointSequence(Lsn.of(0), Lsn.of(30));

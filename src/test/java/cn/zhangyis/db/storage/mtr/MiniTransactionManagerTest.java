@@ -4,6 +4,14 @@ import cn.zhangyis.db.domain.Lsn;
 import cn.zhangyis.db.storage.fil.access.TablespaceAccessController;
 import cn.zhangyis.db.storage.redo.RedoCapacityPolicy;
 import cn.zhangyis.db.storage.redo.RedoCapacityThrottle;
+import cn.zhangyis.db.storage.redo.RedoAppendBudget;
+import cn.zhangyis.db.storage.redo.RedoBudgetPurpose;
+import cn.zhangyis.db.storage.redo.PageInitRecord;
+import cn.zhangyis.db.storage.redo.RedoBudgetExceededException;
+import cn.zhangyis.db.domain.PageId;
+import cn.zhangyis.db.domain.PageNo;
+import cn.zhangyis.db.domain.SpaceId;
+import cn.zhangyis.db.storage.page.PageType;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
 import org.junit.jupiter.api.Test;
 
@@ -103,12 +111,45 @@ class MiniTransactionManagerTest {
                 },
                 Duration.ofMillis(1));
         MiniTransactionManager mgr = new MiniTransactionManager(new TablespaceAccessController(),
-                new RedoLogManager(), throttle, 10);
+                new RedoLogManager(), throttle);
 
-        MiniTransaction mtr = mgr.begin();
+        assertThrows(MtrStateException.class, mgr::begin,
+                "capacity-aware manager must reject an anonymous production budget");
+        MiniTransaction mtr = mgr.begin(RedoAppendBudget.upperBound(RedoBudgetPurpose.CLUSTERED_INSERT, 10));
         assertEquals(1, flushRequests.get(),
                 "begin must check current LSN plus reserved foreground bytes before any page latch is acquired");
 
         mgr.commit(mtr);
+    }
+
+    @Test
+    void readOnlyBeginUsesZeroBudgetUnderSmallCapacity() {
+        AtomicInteger flushRequests = new AtomicInteger();
+        RedoCapacityThrottle throttle = new RedoCapacityThrottle(
+                RedoCapacityPolicy.fixed(100), () -> Lsn.of(70), () -> Lsn.of(0),
+                flushRequests::incrementAndGet, flushRequests::incrementAndGet, Duration.ZERO);
+        MiniTransactionManager mgr = new MiniTransactionManager(new TablespaceAccessController(),
+                new RedoLogManager(), throttle);
+
+        MiniTransaction read = mgr.beginReadOnly();
+        mgr.commit(read);
+
+        assertEquals(0, flushRequests.get());
+    }
+
+    @Test
+    void underestimatedBudgetFailsCommitWithoutPublishingRollbackPath() {
+        MiniTransactionManager mgr = new MiniTransactionManager();
+        MiniTransaction mtr = mgr.begin(
+                RedoAppendBudget.upperBound(RedoBudgetPurpose.TRANSACTION_STATE, 1));
+        mtr.appendLogicalRedo(new PageInitRecord(
+                        PageId.of(SpaceId.of(1), PageNo.of(9)), PageType.INDEX),
+                MtrRedoCategory.PAGE_BYTES_GENERIC,
+                "test commit must reject an underestimated operation budget before append");
+
+        assertThrows(RedoBudgetExceededException.class, () -> mgr.commit(mtr));
+        assertEquals(MiniTransactionState.COMMITTING, mtr.state(),
+                "low estimate after page mutation is fail-stop; rollback must not publish unlogged dirty state");
+        assertEquals(Lsn.of(0), mgr.redoLogManager().currentLsn());
     }
 }

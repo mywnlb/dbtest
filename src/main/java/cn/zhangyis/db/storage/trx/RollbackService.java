@@ -13,6 +13,7 @@ import cn.zhangyis.db.storage.buf.PageLatchMode;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
 import cn.zhangyis.db.storage.mtr.MiniTransactionState;
+import cn.zhangyis.db.storage.redo.RedoBudgetPurpose;
 import cn.zhangyis.db.storage.record.format.LogicalRecord;
 import cn.zhangyis.db.storage.record.format.RecordType;
 import cn.zhangyis.db.storage.record.page.SearchKey;
@@ -431,7 +432,7 @@ public final class RollbackService {
      * 该入口，避免不同回滚路径对 pointer/segment/transaction/index 校验产生漂移。
      */
     private RecordAt readUndoRecord(PageId firstPageId, BTreeIndex clusteredIndex, RollPointer rp) {
-        MiniTransaction readMtr = mtrMgr.begin();
+        MiniTransaction readMtr = mtrMgr.beginReadOnly();
         try {
             UndoLogSegment seg = undoAccess.open(readMtr, firstPageId, PageLatchMode.SHARED);
             UndoRecord record = seg.readRecord(rp, clusteredIndex.keyDef(), clusteredIndex.schema());
@@ -476,7 +477,8 @@ public final class RollbackService {
 
     /** 单条 inverse 的独立 index MTR；异常时只释放当前物理资源，已提交的前序 record 保持可恢复。 */
     private void applyUndoRecordInOwnMtr(RecordAt at, BTreeIndex clusteredIndex) {
-        MiniTransaction inverseMtr = mtrMgr.begin();
+        MiniTransaction inverseMtr = mtrMgr.begin(
+                mtrMgr.budgetFor(RedoBudgetPurpose.ROLLBACK_INVERSE));
         try {
             applyUndoRecord(inverseMtr, at.record(), at.pointer(), clusteredIndex);
             mtrMgr.commit(inverseMtr);
@@ -493,7 +495,8 @@ public final class RollbackService {
      */
     private void persistLogicalHead(PageId firstPageId, UndoLogicalHead expectedHead,
                                      UndoLogicalHead targetHead, BTreeIndex clusteredIndex) {
-        MiniTransaction markerMtr = mtrMgr.begin();
+        MiniTransaction markerMtr = mtrMgr.begin(
+                mtrMgr.budgetFor(RedoBudgetPurpose.ROLLBACK_MARKER));
         try {
             UndoLogSegment writable = undoAccess.open(
                     markerMtr, firstPageId, PageLatchMode.EXCLUSIVE);
@@ -513,7 +516,8 @@ public final class RollbackService {
      * 交叉校验，不能把 logical redo 当成绕过物理状态检查的许可。
      */
     private void writeRollbackCompleteRedo(Transaction txn) {
-        MiniTransaction stateMtr = mtrMgr.begin();
+        MiniTransaction stateMtr = mtrMgr.begin(
+                mtrMgr.budgetFor(RedoBudgetPurpose.TRANSACTION_STATE));
         try {
             TransactionStateRedoDeltas.appendRollbackComplete(stateMtr, txn);
             mtrMgr.commit(stateMtr);
@@ -581,7 +585,7 @@ public final class RollbackService {
 
     /** 用独立只读 MTR 读取 recovery 权威 logical head，返回前释放 first-page latch/fix。 */
     private UndoLogicalHead readRecoveredLogicalHead(PageId firstPageId) {
-        MiniTransaction readMtr = mtrMgr.begin();
+        MiniTransaction readMtr = mtrMgr.beginReadOnly();
         try {
             UndoLogicalHead head = undoAccess.open(readMtr, firstPageId, PageLatchMode.SHARED).logicalHead();
             mtrMgr.commit(readMtr);

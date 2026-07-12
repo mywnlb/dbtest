@@ -146,7 +146,7 @@ public final class BTreeCurrentReadService {
     }
 
     private BTreeCurrentReadPosition locate(BTreeIndex index, SearchKey key, boolean includeDeleted) {
-        MiniTransaction mtr = mtrManager.begin();
+        MiniTransaction mtr = mtrManager.beginReadOnly();
         try {
             BTreeCurrentReadPosition position = btree.locatePointForCurrentRead(mtr, index, key, includeDeleted);
             mtrManager.commit(mtr);
@@ -158,7 +158,7 @@ public final class BTreeCurrentReadService {
     }
 
     private BTreeCurrentReadRangePosition locateRange(BTreeIndex index, BTreeScanRange range) {
-        MiniTransaction mtr = mtrManager.begin();
+        MiniTransaction mtr = mtrManager.beginReadOnly();
         try {
             BTreeCurrentReadRangePosition position = btree.locateRangeForCurrentRead(mtr, index, range);
             mtrManager.commit(mtr);

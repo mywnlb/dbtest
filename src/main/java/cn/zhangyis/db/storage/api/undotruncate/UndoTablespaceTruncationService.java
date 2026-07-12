@@ -28,6 +28,7 @@ import cn.zhangyis.db.storage.fsp.undo.UndoTablespaceFspRebuilder;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
 import cn.zhangyis.db.storage.mtr.MiniTransactionState;
+import cn.zhangyis.db.storage.redo.RedoBudgetPurpose;
 import cn.zhangyis.db.storage.page.PageEnvelope;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
 
@@ -201,7 +202,7 @@ public final class UndoTablespaceTruncationService {
     }
 
     private ReadState readState(SpaceId spaceId) {
-        MiniTransaction mtr = mtrManager.begin();
+        MiniTransaction mtr = mtrManager.beginReadOnly();
         try {
             SpaceHeaderSnapshot header = headerRepository.read(mtr, spaceId);
             Optional<TablespaceLifecycleHeader> lifecycle = headerRepository.readLifecycle(mtr, spaceId);
@@ -216,7 +217,7 @@ public final class UndoTablespaceTruncationService {
     }
 
     private void ensureNoAllocatedInodes(SpaceId spaceId) {
-        MiniTransaction mtr = mtrManager.begin();
+        MiniTransaction mtr = mtrManager.beginReadOnly();
         try {
             boolean allocated = inodeRepository.hasAllocatedSlots(mtr, spaceId);
             mtrManager.commit(mtr);
@@ -231,7 +232,8 @@ public final class UndoTablespaceTruncationService {
     }
 
     private Lsn writeLifecycle(SpaceId spaceId, TablespaceLifecycleHeader lifecycle) {
-        MiniTransaction mtr = mtrManager.begin();
+        MiniTransaction mtr = mtrManager.begin(
+                mtrManager.budgetFor(RedoBudgetPurpose.UNDO_TRUNCATE_LIFECYCLE));
         try {
             headerRepository.writeLifecycle(mtr, spaceId, lifecycle);
             return mtrManager.commit(mtr);
@@ -242,7 +244,8 @@ public final class UndoTablespaceTruncationService {
     }
 
     private Lsn rebuild(SpaceHeaderSnapshot previous, TablespaceLifecycleHeader marker) {
-        MiniTransaction mtr = mtrManager.begin();
+        MiniTransaction mtr = mtrManager.begin(
+                mtrManager.budgetFor(RedoBudgetPurpose.UNDO_TRUNCATE_REBUILD));
         try {
             rebuilder.rebuild(mtr, previous, marker);
             return mtrManager.commit(mtr);

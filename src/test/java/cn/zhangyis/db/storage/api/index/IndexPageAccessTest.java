@@ -30,6 +30,7 @@ import cn.zhangyis.db.storage.record.format.RecordType;
 import cn.zhangyis.db.storage.record.page.RecordPage;
 import cn.zhangyis.db.storage.record.page.RecordPageInserter;
 import cn.zhangyis.db.storage.record.page.RecordPageSearch;
+import cn.zhangyis.db.storage.record.page.PageDirectoryCorruptedException;
 import cn.zhangyis.db.storage.record.page.SearchKey;
 import cn.zhangyis.db.storage.record.schema.ColumnDef;
 import cn.zhangyis.db.storage.record.schema.ColumnId;
@@ -168,6 +169,34 @@ class IndexPageAccessTest {
             PageGuard g = m3.getPage(pool, P, PageLatchMode.SHARED);
             assertEquals(pageLsnBefore, PageEnvelope.readPageLsn(g), "S-only does not restamp pageLSN");
             mgr.commit(m3);
+        });
+    }
+
+    /** 已格式化页的结构损坏必须在统一 open 边界被 S/X 两种访问拒绝，不能继续进入 B+Tree 解析或修改。 */
+    @Test
+    void openRejectsCorruptedRecordStructureInSharedAndExclusiveModes() {
+        onPool((pool, access, mgr) -> {
+            MiniTransaction create = mgr.begin();
+            access.createIndexPage(create, P, 7L, 0);
+            mgr.commit(create);
+
+            MiniTransaction corrupt = mgr.begin();
+            RecordPage page = access.openIndexPage(corrupt, P, PageLatchMode.EXCLUSIVE);
+            page.writeHeader(page.header().withNRecs(1));
+            mgr.commit(corrupt);
+            int redoBeforeRejectedOpens = mgr.redoLogManager().bufferedRecords().size();
+
+            MiniTransaction shared = mgr.begin();
+            assertThrows(PageDirectoryCorruptedException.class,
+                    () -> access.openIndexPage(shared, P, PageLatchMode.SHARED));
+            mgr.rollbackUncommitted(shared);
+
+            MiniTransaction exclusive = mgr.begin();
+            assertThrows(PageDirectoryCorruptedException.class,
+                    () -> access.openIndexPage(exclusive, P, PageLatchMode.EXCLUSIVE));
+            mgr.rollbackUncommitted(exclusive);
+            assertEquals(redoBeforeRejectedOpens, mgr.redoLogManager().bufferedRecords().size(),
+                    "structure validation is read-only even for an EXCLUSIVE open");
         });
     }
 

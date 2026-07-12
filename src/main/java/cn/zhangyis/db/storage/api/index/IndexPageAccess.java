@@ -13,6 +13,7 @@ import cn.zhangyis.db.storage.page.FilePageHeader;
 import cn.zhangyis.db.storage.page.PageEnvelope;
 import cn.zhangyis.db.storage.page.PageType;
 import cn.zhangyis.db.storage.record.page.RecordPage;
+import cn.zhangyis.db.storage.record.page.RecordPageStructureValidator;
 
 /**
  * INDEX 页的 MTR 生产入口（设计 §14，Facade）：把「建 RecordPage 的页」绑定到 MTR-owned guard，
@@ -104,6 +105,10 @@ public final class IndexPageAccess {
     /**
      * 打开已存在 INDEX 页并返回包含 FilePageHeader 与 RecordPage 视图的短生命周期句柄。
      * 句柄不拥有释放权，guard 仍由 MTR memo 持有；B+Tree split 使用它窄写 leaf sibling 链。
+     *
+     * <p>数据流：完成 lifecycle lease/registry 复核后 fix 目标页，再在当前 S/X latch 内执行一次完整 record-page
+     * 结构校验；只有 header、系统记录、用户链与 PageDirectory 账本一致才返回 handle。校验失败发生在任何本次
+     * B+Tree 内容修改与 redo 收集前，调用方回滚 MTR 即可统一释放刚取得的 guard/lease。
      */
     public IndexPageHandle openIndexPageHandle(MiniTransaction mtr, PageId pageId, PageLatchMode mode) {
         if (mtr == null || pageId == null || mode == null) {
@@ -111,6 +116,8 @@ public final class IndexPageAccess {
         }
         requireOrdinaryAccess(mtr, pageId.spaceId());
         PageGuard g = mtr.getPage(pool, pageId, mode);
+        // 已存在页在统一 fix 边界只校验一次；任何损坏都早于 B+Tree 字段解析、写页和 redo 收集失败。
+        RecordPageStructureValidator.validate(new RecordPage(g, pageSize));
         return new IndexPageHandle(pageId, g, pageSize);
     }
 

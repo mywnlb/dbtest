@@ -15,6 +15,19 @@ public final class UndoRedoBudgetEstimator {
         return RedoBudgetWorkload.pageImages(firstWrite ? 12 : 4);
     }
 
+    /** external payload 每页覆盖 FSP allocation、PAGE_INIT 与完整 PAGE_BYTES，按 LOB 同级每页追加 8 份余量。 */
+    public static RedoBudgetWorkload append(boolean firstWrite, int externalPages) {
+        if (externalPages < 0) {
+            throw new DatabaseValidationException("external undo page count must not be negative: " + externalPages);
+        }
+        try {
+            return RedoBudgetWorkload.pageImages(Math.addExact(firstWrite ? 12L : 4L,
+                    Math.multiplyExact(8L, externalPages)));
+        } catch (ArithmeticException error) {
+            throw new DatabaseValidationException("external undo redo workload overflows", error);
+        }
+    }
+
     /**
      * drop 固定覆盖 page0/page2/page3、inode/slot 与发布边界；每 fragment 计两份、每 extent 计四份元数据余量。
      */

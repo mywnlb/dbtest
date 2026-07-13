@@ -448,19 +448,19 @@ class UndoLogSegmentTest {
     }
 
     @Test
-    void oversizedRecordThrowsWithoutGrowing() {
+    void oversizedRecordUsesExternalPayloadWithoutGrowingMainUndoChain() {
         onSegment(seg -> {
             String huge = "y".repeat(16300);
             UndoRecord big = UndoRecord.insert(UndoNo.of(1), TransactionId.of(7),
                     1L, 9L, List.of(new ColumnValue.StringValue(huge)), RollPointer.NULL);
-            assertThrows(UndoPageOverflowException.class,
-                    () -> seg.append(big, bigKeyDef(), bigSchema()));
+            RollPointer pointer = seg.append(big, bigKeyDef(), bigSchema());
             assertEquals(seg.firstPageId(), seg.lastPageId());
-            assertEquals(0L, seg.logRecordCount());
-            assertEquals(0L, seg.logLastUndoNo().value());
+            assertEquals(1L, seg.logRecordCount());
+            assertEquals(1L, seg.logLastUndoNo().value());
+            assertEquals(big, seg.readRecord(pointer, bigKeyDef(), bigSchema()));
             List<UndoRecord> got = new ArrayList<>();
             seg.forEachRecord(got::add, bigKeyDef(), bigSchema());
-            assertTrue(got.isEmpty());
+            assertEquals(List.of(big), got);
         });
     }
 

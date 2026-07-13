@@ -28,6 +28,8 @@ import cn.zhangyis.db.storage.trx.RollbackService;
 import cn.zhangyis.db.storage.trx.RollbackSummary;
 import cn.zhangyis.db.storage.trx.Transaction;
 import cn.zhangyis.db.storage.trx.TransactionManager;
+import cn.zhangyis.db.storage.trx.UndoWriteFatalException;
+import cn.zhangyis.db.storage.trx.UndoWritePlan;
 import cn.zhangyis.db.storage.trx.TransactionSavepoint;
 import cn.zhangyis.db.storage.trx.TransactionState;
 import cn.zhangyis.db.storage.trx.TransactionStateException;
@@ -138,19 +140,23 @@ public final class ClusteredDmlService {
             throw new DmlDuplicateKeyException("duplicate clustered key for index " + command.index().indexId());
         }
 
-        boolean firstUndoWrite = txn.undoContext() == null;
+        UndoWritePlan undoPlan = undoLogManager.planInsert(txn, command.tableId(), command.index().indexId(),
+                command.key().values(), command.index().keyDef(), command.index().schema());
         MiniTransaction mtr = mtrManager.begin(mtrManager.budgetFor(
                 RedoBudgetPurpose.CLUSTERED_INSERT,
-                DmlRedoBudgetEstimator.insert(command.index(), firstUndoWrite)));
+                DmlRedoBudgetEstimator.insert(command.index(), undoPlan)));
+        boolean undoWritten = false;
         try {
-            RollPointer rollPointer = undoLogManager.beforeInsert(txn, mtr, command.tableId(),
-                    command.index().indexId(), command.key().values(), command.index().keyDef(),
-                    command.index().schema());
+            RollPointer rollPointer = undoLogManager.appendPlanned(txn, mtr, undoPlan);
+            undoWritten = true;
             btree.insertClustered(mtr, command.index(), command.record(), txnId, rollPointer);
             Lsn endLsn = mtrManager.commit(mtr);
             return new DmlWriteResult(true, 1, endLsn, txnId);
         } catch (RuntimeException e) {
             rollbackActiveMtr(mtr, e);
+            if (undoWritten && !(e instanceof UndoWriteFatalException)) {
+                throw new UndoWriteFatalException("clustered insert failed after undo physical write", e);
+            }
             if (e instanceof DatabaseRuntimeException databaseError) {
                 throw databaseError;
             }
@@ -179,14 +185,16 @@ public final class ClusteredDmlService {
         BTreeLookupResult old = locked.orElseThrow();
         HiddenColumns oldHidden = requireHiddenColumns(old.record(), "update");
 
-        boolean firstUndoWrite = txn.undoContext() == null;
+        UndoWritePlan undoPlan = undoLogManager.planUpdate(txn, command.tableId(), command.index().indexId(),
+                command.key().values(), old.record().columnValues(), oldHidden,
+                command.index().keyDef(), command.index().schema());
         MiniTransaction mtr = mtrManager.begin(mtrManager.budgetFor(
                 RedoBudgetPurpose.CLUSTERED_UPDATE,
-                DmlRedoBudgetEstimator.pointRewrite(command.index(), firstUndoWrite)));
+                DmlRedoBudgetEstimator.pointRewrite(command.index(), undoPlan)));
+        boolean undoWritten = false;
         try {
-            RollPointer rollPointer = undoLogManager.beforeUpdate(txn, mtr, command.tableId(),
-                    command.index().indexId(), command.key().values(), old.record().columnValues(), oldHidden,
-                    command.index().keyDef(), command.index().schema());
+            RollPointer rollPointer = undoLogManager.appendPlanned(txn, mtr, undoPlan);
+            undoWritten = true;
             LogicalRecord stamped = stampedRecord(command.newRecord(), false,
                     new HiddenColumns(txnId, rollPointer));
             BTreeUpdateResult replaced = btree.replaceClustered(mtr, command.index(), command.key(),
@@ -195,6 +203,9 @@ public final class ClusteredDmlService {
             return new DmlWriteResult(replaced.replaced(), replaced.replaced() ? 1 : 0, endLsn, txnId);
         } catch (RuntimeException e) {
             rollbackActiveMtr(mtr, e);
+            if (undoWritten && !(e instanceof UndoWriteFatalException)) {
+                throw new UndoWriteFatalException("clustered update failed after undo physical write", e);
+            }
             if (e instanceof DatabaseRuntimeException databaseError) {
                 throw databaseError;
             }
@@ -223,20 +234,25 @@ public final class ClusteredDmlService {
         BTreeLookupResult old = locked.orElseThrow();
         HiddenColumns oldHidden = requireHiddenColumns(old.record(), "delete");
 
-        boolean firstUndoWrite = txn.undoContext() == null;
+        UndoWritePlan undoPlan = undoLogManager.planDelete(txn, command.tableId(), command.index().indexId(),
+                command.key().values(), old.record().columnValues(), oldHidden,
+                command.index().keyDef(), command.index().schema());
         MiniTransaction mtr = mtrManager.begin(mtrManager.budgetFor(
                 RedoBudgetPurpose.CLUSTERED_DELETE,
-                DmlRedoBudgetEstimator.pointRewrite(command.index(), firstUndoWrite)));
+                DmlRedoBudgetEstimator.pointRewrite(command.index(), undoPlan)));
+        boolean undoWritten = false;
         try {
-            RollPointer rollPointer = undoLogManager.beforeDelete(txn, mtr, command.tableId(),
-                    command.index().indexId(), command.key().values(), old.record().columnValues(), oldHidden,
-                    command.index().keyDef(), command.index().schema());
+            RollPointer rollPointer = undoLogManager.appendPlanned(txn, mtr, undoPlan);
+            undoWritten = true;
             BTreeDeleteMarkResult marked = btree.setClusteredDeleteMark(mtr, command.index(), command.key(),
                     true, new HiddenColumns(txnId, rollPointer), oldHidden.dbTrxId(), oldHidden.dbRollPtr());
             Lsn endLsn = mtrManager.commit(mtr);
             return new DmlWriteResult(marked.changed(), marked.changed() ? 1 : 0, endLsn, txnId);
         } catch (RuntimeException e) {
             rollbackActiveMtr(mtr, e);
+            if (undoWritten && !(e instanceof UndoWriteFatalException)) {
+                throw new UndoWriteFatalException("clustered delete failed after undo physical write", e);
+            }
             if (e instanceof DatabaseRuntimeException databaseError) {
                 throw databaseError;
             }

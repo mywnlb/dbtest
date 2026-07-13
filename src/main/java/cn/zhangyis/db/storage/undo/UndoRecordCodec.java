@@ -132,6 +132,7 @@ public final class UndoRecordCodec {
             key.add(readFramedColumn(buf, c, schema.column(parts.get(i).columnId().value()).type(), "key col " + i));
         }
         if (typeCode == UndoRecordType.INSERT_ROW.code()) {
+            requireFullyConsumed(buf, c[0]);
             return UndoRecord.insert(UndoNo.of(undoNo), TransactionId.of(txn), tableId, indexId, key, prev);
         }
         // UPDATE_ROW / DELETE_MARK 尾部：旧隐藏列 + 全量旧 image（按 schema 全列序）。
@@ -151,12 +152,21 @@ public final class UndoRecordCodec {
         for (int i = 0; i < rowColCount; i++) {
             oldRow.add(readFramedColumn(buf, c, schema.column(i).type(), "old row col " + i));
         }
+        requireFullyConsumed(buf, c[0]);
         if (typeCode == UndoRecordType.UPDATE_ROW.code()) {
             return UndoRecord.update(UndoNo.of(undoNo), TransactionId.of(txn), tableId, indexId, key,
                     oldRow, oldHidden, prev);
         }
         return UndoRecord.deleteMark(UndoNo.of(undoNo), TransactionId.of(txn), tableId, indexId, key,
                 oldRow, oldHidden, prev);
+    }
+
+    /** record 槽长度是物理 framing 的权威边界；尾随字节不能被静默忽略，否则损坏 descriptor 可藏在合法前缀后。 */
+    private static void requireFullyConsumed(byte[] buf, int cursor) {
+        if (cursor != buf.length) {
+            throw new UndoLogFormatException("undo record has trailing bytes: consumed=" + cursor
+                    + " length=" + buf.length);
+        }
     }
 
     /** 读一列自带 framing：nullFlag==1→NULL；否则 [len u16][bytes] 按类型解码。截断抛 {@link UndoLogFormatException}。 */

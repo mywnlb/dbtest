@@ -48,6 +48,7 @@ import cn.zhangyis.db.storage.undo.UndoSpaceReservation;
 import cn.zhangyis.db.storage.redo.RedoRecord;
 import cn.zhangyis.db.storage.redo.RedoLogFileRepository;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
+import cn.zhangyis.db.storage.redo.RedoBudgetPurpose;
 import cn.zhangyis.db.storage.redo.FspMetadataDeltaRecord;
 import cn.zhangyis.db.storage.redo.FspPageFreeRecord;
 import cn.zhangyis.db.storage.redo.RedoLogBatch;
@@ -690,8 +691,15 @@ class UndoLogManagerTest {
     }
 
     @Test
-    void mixedInsertUpdateSegmentReopenReadsBothByRollPointer() {
+    void mixedInsertAndExternalUpdateSegmentReopenReadsBothByRollPointer() {
         Path path = dir.resolve("undo.ibu");
+        TableSchema wideSchema = new TableSchema(1, List.of(
+                new ColumnDef(new ColumnId(0), "id", ColumnType.intType(false, false), 0),
+                new ColumnDef(new ColumnId(1), "payload", ColumnType.varchar(20_000, true), 1)), true);
+        IndexKeyDef wideKey = new IndexKeyDef(INDEX_ID,
+                List.of(new KeyPartDef(new ColumnId(0), KeyOrder.ASC, 0)));
+        List<ColumnValue> hugeOldRow = List.of(new ColumnValue.IntValue(700),
+                new ColumnValue.StringValue("reopen".repeat(2_800)));
         RollPointer[] ins = new RollPointer[1];
         RollPointer[] upd = new RollPointer[1];
         PageId[] firstPage = new PageId[1];
@@ -719,9 +727,9 @@ class UndoLogManagerTest {
             Transaction txn = txnMgr.begin(TransactionOptions.defaults());
             widHolder[0] = txnMgr.assignWriteId(txn);
             MiniTransaction m = mgr.begin();
-            ins[0] = undoMgr.beforeInsert(txn, m, TABLE_ID, INDEX_ID, keyOf(700), keyDef(), schema());
+            ins[0] = undoMgr.beforeInsert(txn, m, TABLE_ID, INDEX_ID, keyOf(700), wideKey, wideSchema);
             upd[0] = undoMgr.beforeUpdate(txn, m, TABLE_ID, INDEX_ID, keyOf(700),
-                    List.of(new ColumnValue.IntValue(700)), new HiddenColumns(widHolder[0], ins[0]), keyDef(), schema());
+                    hugeOldRow, new HiddenColumns(widHolder[0], ins[0]), wideKey, wideSchema);
             firstPage[0] = txn.undoContext().undoFirstPageId();
             mgr.commit(m);
             txnMgr.commit(txn);
@@ -737,20 +745,22 @@ class UndoLogManagerTest {
 
             MiniTransaction read = mgr.begin();
             UndoLogSegment seg = access.open(read, firstPage[0], PageLatchMode.SHARED);
-            UndoRecord insRec = seg.readRecord(ins[0], keyDef(), schema());
-            UndoRecord updRec = seg.readRecord(upd[0], keyDef(), schema());
+            UndoRecord insRec = seg.readRecord(ins[0], wideKey, wideSchema);
+            UndoRecord updRec = seg.readRecord(upd[0], wideKey, wideSchema);
             mgr.rollbackUncommitted(read);
 
             assertEquals(UndoRecordType.INSERT_ROW, insRec.type(), "reopen reads insert undo by its roll pointer");
             assertEquals(UndoRecordType.UPDATE_ROW, updRec.type(), "reopen reads update undo by its roll pointer");
             assertEquals(new HiddenColumns(widHolder[0], ins[0]), updRec.oldHiddenColumns());
+            assertEquals(hugeOldRow, updRec.oldColumnValues(),
+                    "reopen must follow the root descriptor into the flushed external payload chain");
             assertTrue(ins[0].insert());
             assertFalse(upd[0].insert());
         }
     }
 
     @Test
-    void beforeUpdateOversizedOldImageThrowsOverflow() {
+    void beforeUpdateOversizedOldImageUsesExternalUndoPayload() {
         onPool(h -> {
             TableSchema wide = new TableSchema(1, List.of(
                     new ColumnDef(new ColumnId(0), "id", ColumnType.intType(false, false), 0),
@@ -760,13 +770,85 @@ class UndoLogManagerTest {
             Transaction txn = h.txnMgr.begin(TransactionOptions.defaults());
             h.txnMgr.assignWriteId(txn);
             MiniTransaction m = h.mgr.begin();
-            // 全量旧 image 超单页（无 extern undo payload，T1.3e 非目标）→ 抛溢出，不静默损坏
+            // 全量旧 image 超单页时，普通 UNDO 页只保存 descriptor，完整编码进入同 segment payload 页链。
             List<ColumnValue> hugeRow = List.of(new ColumnValue.IntValue(1),
                     new ColumnValue.StringValue("y".repeat(16300)));
-            assertThrows(UndoPageOverflowException.class, () -> h.undoMgr.beforeUpdate(txn, m, TABLE_ID, INDEX_ID,
+            RollPointer pointer = h.undoMgr.beforeUpdate(txn, m, TABLE_ID, INDEX_ID,
                     List.of(new ColumnValue.IntValue(1)), hugeRow,
-                    new HiddenColumns(txn.transactionId(), RollPointer.NULL), wideKey, wide));
-            h.mgr.rollbackUncommitted(m);
+                    new HiddenColumns(txn.transactionId(), RollPointer.NULL), wideKey, wide);
+            h.mgr.commit(m);
+
+            MiniTransaction read = h.mgr.beginReadOnly();
+            UndoRecord record = h.access.readRecordByRollPointer(read, UNDO_SPACE, pointer, wideKey, wide);
+            h.mgr.commit(read);
+            assertEquals(UndoRecordType.UPDATE_ROW, record.type());
+            assertEquals(hugeRow, record.oldColumnValues());
+        });
+    }
+
+    /** DML admission 前的不可变计划必须包含首段页、payload 页以及相应 redo 工作量。 */
+    @Test
+    void plannedExternalUpdateReservesExactPagesAndReadsBack() {
+        onPool(h -> {
+            TableSchema wide = new TableSchema(1, List.of(
+                    new ColumnDef(new ColumnId(0), "id", ColumnType.intType(false, false), 0),
+                    new ColumnDef(new ColumnId(1), "payload", ColumnType.varchar(20_000, true), 1)), true);
+            IndexKeyDef wideKey = new IndexKeyDef(INDEX_ID,
+                    List.of(new KeyPartDef(new ColumnId(0), KeyOrder.ASC, 0)));
+            Transaction txn = h.txnMgr.begin(TransactionOptions.defaults());
+            h.txnMgr.assignWriteId(txn);
+            List<ColumnValue> oldRow = List.of(new ColumnValue.IntValue(1),
+                    new ColumnValue.StringValue("p".repeat(16_300)));
+
+            UndoWritePlan plan = h.undoMgr.planUpdate(txn, TABLE_ID, INDEX_ID,
+                    List.of(new ColumnValue.IntValue(1)), oldRow,
+                    new HiddenColumns(txn.transactionId(), RollPointer.NULL), wideKey, wide);
+            assertTrue(plan.firstWrite());
+            assertTrue(plan.external());
+            assertTrue(plan.externalPageCount() >= 2);
+            assertEquals(1 + plan.externalPageCount(), plan.pagesToReserve(),
+                    "首写精确预留一个 UNDO root 页和全部 payload 页");
+            assertEquals(12L + 8L * plan.externalPageCount(),
+                    plan.redoWorkload().pageImageEquivalents());
+
+            MiniTransaction write = h.mgr.begin(h.mgr.budgetFor(
+                    RedoBudgetPurpose.CLUSTERED_UPDATE, plan.redoWorkload()));
+            RollPointer pointer = h.undoMgr.appendPlanned(txn, write, plan);
+            h.mgr.commit(write);
+
+            MiniTransaction read = h.mgr.beginReadOnly();
+            UndoRecord restored = h.access.readRecordByRollPointer(read, UNDO_SPACE, pointer, wideKey, wide);
+            h.mgr.commit(read);
+            assertEquals(oldRow, restored.oldColumnValues());
+        });
+    }
+
+    /** 两个同起点计划中只能有一个发布；后执行者必须在 reservation/页写前以 stale 失败。 */
+    @Test
+    void staleFirstWritePlanIsRejectedWithoutChangingPublishedUndoHead() {
+        onPool(h -> {
+            Transaction txn = h.txnMgr.begin(TransactionOptions.defaults());
+            h.txnMgr.assignWriteId(txn);
+            UndoWritePlan winner = h.undoMgr.planInsert(
+                    txn, TABLE_ID, INDEX_ID, keyOf(10), keyDef(), schema());
+            UndoWritePlan stale = h.undoMgr.planInsert(
+                    txn, TABLE_ID, INDEX_ID, keyOf(11), keyDef(), schema());
+
+            MiniTransaction first = h.mgr.begin(h.mgr.budgetFor(
+                    RedoBudgetPurpose.CLUSTERED_INSERT, winner.redoWorkload()));
+            RollPointer published = h.undoMgr.appendPlanned(txn, first, winner);
+            h.mgr.commit(first);
+
+            MiniTransaction second = h.mgr.begin(h.mgr.budgetFor(
+                    RedoBudgetPurpose.CLUSTERED_INSERT, stale.redoWorkload()));
+            assertThrows(UndoWriteStalePlanException.class,
+                    () -> h.undoMgr.appendPlanned(txn, second, stale));
+            h.mgr.rollbackUncommitted(second);
+
+            assertEquals(UndoNo.of(1), txn.undoContext().lastUndoNo());
+            assertEquals(published, txn.undoContext().lastRollPointer());
+            assertEquals(1, h.slots.activeSlotCount(),
+                    "stale plan must not reserve a second slot or overwrite the first owner");
         });
     }
 

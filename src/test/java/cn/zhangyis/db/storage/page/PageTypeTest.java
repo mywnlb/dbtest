@@ -20,6 +20,7 @@ class PageTypeTest {
         assertEquals(6, PageType.UNDO.code());
         assertEquals(7, PageType.RSEG_HEADER.code());
         assertEquals(8, PageType.BLOB.code());
+        assertEquals(9, PageType.UNDO_PAYLOAD.code());
     }
 
     @Test

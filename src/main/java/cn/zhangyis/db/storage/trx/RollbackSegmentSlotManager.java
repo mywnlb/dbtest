@@ -276,6 +276,8 @@ public final class RollbackSegmentSlotManager {
         private final UndoSlotId slotId;
         /** 是否已经把物理 undo 首页绑定并发布为 ACTIVE。 */
         private boolean bound;
+        /** 是否已进入可能创建 segment/修改 page0 的不可逆阶段；此后异常关闭必须保留 RESERVED 防止误复用。 */
+        private boolean physicalMutationStarted;
         /** 防止重复 close 或 close 后继续 bind。 */
         private boolean closed;
 
@@ -299,6 +301,15 @@ public final class RollbackSegmentSlotManager {
             bound = true;
         }
 
+        /** 在空间预留或 segment 创建之前标记 fail-stop 边界；标记后未 bind 的 close 也不得取消 slot。 */
+        void physicalMutationStarted() {
+            requireOpen("mark physical mutation");
+            if (physicalMutationStarted) {
+                throw new DatabaseValidationException("claim physical mutation already marked: " + slotId.value());
+            }
+            physicalMutationStarted = true;
+        }
+
         /** 未绑定时释放 reservation；已绑定时只结束 guard 生命周期。 */
         @Override
         public void close() {
@@ -306,7 +317,7 @@ public final class RollbackSegmentSlotManager {
                 return;
             }
             closed = true;
-            if (!bound) {
+            if (!bound && !physicalMutationStarted) {
                 owner.cancelClaim(slotId);
             }
         }

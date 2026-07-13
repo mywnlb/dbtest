@@ -42,6 +42,8 @@ class EngineConfigTest {
         assertEquals(Duration.ofSeconds(1), c.backgroundFlushInterval());
         assertEquals(c.bufferPoolCapacityFrames(), c.backgroundFlushMaxPages());
         assertEquals(c.flushTimeout(), c.backgroundFlushStopTimeout());
+        assertEquals(16, c.maxExternalUndoPayloadPages(),
+                "外置 undo 默认上限兼顾宽行教学场景与损坏链的读取边界");
     }
 
     @Test
@@ -80,6 +82,24 @@ class EngineConfigTest {
         // valid() 容量 256 帧；分片数不能超过帧数（否则有分片分到 0 帧）。
         assertThrows(DatabaseValidationException.class, () -> c.withBufferPoolInstanceCount(257),
                 "分片数须 <= bufferPoolCapacityFrames");
+    }
+
+    /** 外置 undo 链上限必须能被任一 buffer pool 分片容纳，避免单次 MTR 固定页超过分片容量。 */
+    @Test
+    void externalUndoPayloadPageLimitIsConfigurableAndBoundedBySmallestPoolInstance() {
+        EngineConfig c = valid();
+        EngineConfig configured = c.withMaxExternalUndoPayloadPages(32);
+        assertEquals(32, configured.maxExternalUndoPayloadPages());
+        assertEquals(16, c.maxExternalUndoPayloadPages(), "wither 保持原配置不可变");
+
+        EngineConfig sharded = c.withBufferPoolInstanceCount(4);
+        assertEquals(16, sharded.maxExternalUndoPayloadPages(),
+                "既有上限在最小分片容量内时应原样保留");
+        assertThrows(DatabaseValidationException.class,
+                () -> sharded.withMaxExternalUndoPayloadPages(65),
+                "256 帧分成 4 片后，单条外置链不能超过任一 64 帧分片");
+        assertThrows(DatabaseValidationException.class,
+                () -> c.withMaxExternalUndoPayloadPages(0));
     }
 
     @Test

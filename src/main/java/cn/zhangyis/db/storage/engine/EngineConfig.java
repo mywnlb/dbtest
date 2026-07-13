@@ -40,6 +40,7 @@ import java.util.Set;
  *                                 不发布普通 OPEN，也不启动会写文件的后台路径。recovery progress 文件路径由
  *                                 {@link #recoveryProgressFile()} 从 {@code baseDir} 派生。
  * @param forceSkippedSpaces       FORCE_SKIP_CORRUPT_TABLESPACE 模式下管理员显式隔离的表空间集合；普通模式必须为空。
+ * @param maxExternalUndoPayloadPages 单条 external undo payload 可占用的最大页数；同时作为读取期内存安全上限。
  */
 public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapacityFrames,
                            SpaceId undoSpaceId, PageNo undoSpaceInitialPages, int slotCapacity,
@@ -49,7 +50,7 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                            Duration backgroundFlushInterval, int backgroundFlushMaxPages,
                            Duration backgroundFlushStopTimeout, RedoRotationConfig redoRotation,
                            int bufferPoolInstanceCount, RecoveryMode recoveryMode,
-                           Set<SpaceId> forceSkippedSpaces) {
+                           Set<SpaceId> forceSkippedSpaces, int maxExternalUndoPayloadPages) {
 
     /** 默认启动后台 page cleaner，使 engine open 后具备持续 checkpoint tick 能力。 */
     private static final boolean DEFAULT_BACKGROUND_FLUSH_ENABLED = true;
@@ -59,6 +60,8 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
     private static final Duration DEFAULT_BACKGROUND_FLUSH_INTERVAL = Duration.ofSeconds(1);
     /** 默认 buffer pool 分片数；生产保守 1（对齐 MySQL 单实例默认 + 本片"机制完整、生产 N=1"基调）。 */
     private static final int DEFAULT_BUFFER_POOL_INSTANCE_COUNT = 1;
+    /** 教学实现默认把单条 external undo 限在 16 页，避免一个 MTR pin 住过多 frame。 */
+    private static final int DEFAULT_MAX_EXTERNAL_UNDO_PAYLOAD_PAGES = 16;
 
     public EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapacityFrames,
                         SpaceId undoSpaceId, PageNo undoSpaceInitialPages, int slotCapacity,
@@ -92,7 +95,8 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 slotCapacity, maxVersionHops, flushTimeout, redoCapacityBytes, recoveryTablespaces,
                 backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, RedoRotationConfig.defaults(),
-                DEFAULT_BUFFER_POOL_INSTANCE_COUNT, RecoveryMode.NORMAL, Set.of());
+                DEFAULT_BUFFER_POOL_INSTANCE_COUNT, RecoveryMode.NORMAL, Set.of(),
+                defaultMaxExternalUndoPages(bufferPoolCapacityFrames, DEFAULT_BUFFER_POOL_INSTANCE_COUNT));
     }
 
     /**
@@ -110,7 +114,26 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 slotCapacity, maxVersionHops, flushTimeout, redoCapacityBytes, recoveryTablespaces,
                 backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation,
-                bufferPoolInstanceCount, recoveryMode, Set.of());
+                bufferPoolInstanceCount, recoveryMode, Set.of(),
+                defaultMaxExternalUndoPages(bufferPoolCapacityFrames, bufferPoolInstanceCount));
+    }
+
+    /** 兼容新增 external undo 配置前的完整 canonical 签名。 */
+    public EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapacityFrames,
+                        SpaceId undoSpaceId, PageNo undoSpaceInitialPages, int slotCapacity,
+                        int maxVersionHops, Duration flushTimeout, long redoCapacityBytes,
+                        List<EngineTablespaceConfig> recoveryTablespaces,
+                        boolean backgroundFlushEnabled, int pageCleanerQueueCapacity,
+                        Duration backgroundFlushInterval, int backgroundFlushMaxPages,
+                        Duration backgroundFlushStopTimeout, RedoRotationConfig redoRotation,
+                        int bufferPoolInstanceCount, RecoveryMode recoveryMode,
+                        Set<SpaceId> forceSkippedSpaces) {
+        this(baseDir, pageSize, bufferPoolCapacityFrames, undoSpaceId, undoSpaceInitialPages,
+                slotCapacity, maxVersionHops, flushTimeout, redoCapacityBytes, recoveryTablespaces,
+                backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
+                backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation,
+                bufferPoolInstanceCount, recoveryMode, forceSkippedSpaces,
+                defaultMaxExternalUndoPages(bufferPoolCapacityFrames, bufferPoolInstanceCount));
     }
 
     public EngineConfig {
@@ -162,6 +185,11 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
             throw new DatabaseValidationException("bufferPoolInstanceCount must be <= bufferPoolCapacityFrames: count="
                     + bufferPoolInstanceCount + " frames=" + bufferPoolCapacityFrames);
         }
+        int minInstanceFrames = bufferPoolCapacityFrames / bufferPoolInstanceCount;
+        if (maxExternalUndoPayloadPages <= 0 || maxExternalUndoPayloadPages > minInstanceFrames) {
+            throw new DatabaseValidationException("maxExternalUndoPayloadPages must be in [1,min instance frames]: max="
+                    + maxExternalUndoPayloadPages + " minInstanceFrames=" + minInstanceFrames);
+        }
         validateRecoveryTablespaces(undoSpaceId, recoveryTablespaces);
         recoveryTablespaces = List.copyOf(recoveryTablespaces);
         validateForceSkippedSpaces(forceSkippedSpaces);
@@ -209,7 +237,7 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 slotCapacity, maxVersionHops, flushTimeout, redoCapacityBytes, recoveryTablespaces,
                 backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, rotation, bufferPoolInstanceCount, recoveryMode,
-                forceSkippedSpaces);
+                forceSkippedSpaces, maxExternalUndoPayloadPages);
     }
 
     /**
@@ -224,7 +252,7 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 slotCapacity, maxVersionHops, flushTimeout, redoCapacityBytes, recoveryTablespaces,
                 backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, instanceCount, recoveryMode,
-                forceSkippedSpaces);
+                forceSkippedSpaces, maxExternalUndoPayloadPages);
     }
 
     /**
@@ -239,7 +267,7 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 slotCapacity, maxVersionHops, flushTimeout, redoCapacityBytes, recoveryTablespaces,
                 backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, bufferPoolInstanceCount, mode,
-                forceSkippedSpaces);
+                forceSkippedSpaces, maxExternalUndoPayloadPages);
     }
 
     /**
@@ -255,7 +283,7 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 slotCapacity, maxVersionHops, flushTimeout, redoCapacityBytes, recoveryTablespaces,
                 backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, bufferPoolInstanceCount,
-                recoveryMode, skippedSpaces);
+                recoveryMode, skippedSpaces, maxExternalUndoPayloadPages);
     }
 
     /**
@@ -274,7 +302,23 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 slotCapacity, maxVersionHops, flushTimeout, redoCapacityBytes, recoveryTablespaces,
                 backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, bufferPoolInstanceCount,
-                RecoveryMode.FORCE_SKIP_CORRUPT_TABLESPACE, skippedSpaces);
+                RecoveryMode.FORCE_SKIP_CORRUPT_TABLESPACE, skippedSpaces, maxExternalUndoPayloadPages);
+    }
+
+    /** 派生单条 external undo payload 页数上限；降低该值前必须确认 active/history undo 不含更长页链。 */
+    public EngineConfig withMaxExternalUndoPayloadPages(int maxPages) {
+        return new EngineConfig(baseDir, pageSize, bufferPoolCapacityFrames, undoSpaceId, undoSpaceInitialPages,
+                slotCapacity, maxVersionHops, flushTimeout, redoCapacityBytes, recoveryTablespaces,
+                backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
+                backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, bufferPoolInstanceCount,
+                recoveryMode, forceSkippedSpaces, maxPages);
+    }
+
+    private static int defaultMaxExternalUndoPages(int capacityFrames, int instanceCount) {
+        if (capacityFrames <= 0 || instanceCount <= 0) {
+            return 1;
+        }
+        return Math.max(1, Math.min(DEFAULT_MAX_EXTERNAL_UNDO_PAYLOAD_PAGES, capacityFrames / instanceCount));
     }
 
     /** redo control（checkpoint label）文件路径。 */

@@ -53,6 +53,12 @@ public final class UndoLogSegment {
      * undo 页访问器。resolvePage 对未持有页只通过它打开 UNDO 页，页类型守门集中在该入口。
      */
     private final UndoPageAccess pageAccess;
+    /** external payload 页链物理存储。 */
+    private final UndoPayloadStorage payloadStorage;
+    /** inline/external 槽统一解码器。 */
+    private final UndoStoredRecordResolver storedRecordResolver;
+    /** 低层 append 现场规划使用的 external 页数上限。 */
+    private final int maxExternalPages;
 
     /**
      * 当前会话 latch 模式。EXCLUSIVE 才允许 append；SHARED 只允许 read/forEach。
@@ -81,9 +87,11 @@ public final class UndoLogSegment {
     private UndoPage current;
 
     UndoLogSegment(MiniTransaction mtr, PageSize pageSize, UndoSpaceAllocator allocator, UndoRecordCodec codec,
-                   UndoPageAccess pageAccess, UndoSegmentHandle handle, UndoPage firstPage, UndoPage current,
-                   PageLatchMode mode) {
+                   UndoPageAccess pageAccess, UndoPayloadStorage payloadStorage,
+                   UndoStoredRecordResolver storedRecordResolver, int maxExternalPages,
+                   UndoSegmentHandle handle, UndoPage firstPage, UndoPage current, PageLatchMode mode) {
         if (mtr == null || pageSize == null || allocator == null || codec == null || pageAccess == null
+                || payloadStorage == null || storedRecordResolver == null || maxExternalPages <= 0
                 || handle == null || firstPage == null || current == null || mode == null) {
             throw new DatabaseValidationException("undo log segment fields must not be null");
         }
@@ -92,6 +100,9 @@ public final class UndoLogSegment {
         this.allocator = allocator;
         this.codec = codec;
         this.pageAccess = pageAccess;
+        this.payloadStorage = payloadStorage;
+        this.storedRecordResolver = storedRecordResolver;
+        this.maxExternalPages = maxExternalPages;
         this.handle = handle;
         this.firstPage = firstPage;
         this.current = current;
@@ -112,16 +123,41 @@ public final class UndoLogSegment {
      * 必须早于任何页修改，否则 MTR rollbackUncommitted 不做 content undo，会留下半生长脏链。
      */
     public RollPointer append(UndoRecord rec, IndexKeyDef keyDef, TableSchema schema) {
+        UndoRecordWritePlan plan = UndoRecordWritePlan.create(codec, pageSize, rec, keyDef, schema,
+                maxExternalPages);
+        int pages = requiredNewPages(plan);
+        if (pages == 0) {
+            return appendPlanned(plan);
+        }
+        try (UndoSpaceReservation ignored = reserveGrowPages(pages)) {
+            return appendPlanned(plan);
+        }
+    }
+
+    /**
+     * 执行 admission 前形成的物理计划。调用方必须已为 {@link #requiredNewPages(UndoRecordWritePlan)} 返回值预留容量；
+     * 本方法不会嵌套申请 reservation，确保 external 页链与可能的 descriptor root grow 共用同一额度。
+     */
+    public RollPointer appendPlanned(UndoRecordWritePlan plan) {
         if (mode != PageLatchMode.EXCLUSIVE) {
             throw new DatabaseValidationException("append requires an EXCLUSIVE (writable) undo log segment session");
         }
-        long nextRecordCount = preflightAppend(rec, keyDef, schema);
-        byte[] payload = codec.encode(rec, keyDef, schema);
+        if (plan == null) {
+            throw new DatabaseValidationException("planned undo append plan must not be null");
+        }
+        UndoRecord rec = plan.record();
+        long nextRecordCount = preflightAppend(rec, plan.keyDef(), plan.schema());
+        byte[] payload;
+        if (plan.external()) {
+            payload = payloadStorage.write(mtr, allocator, handle, plan).encode();
+        } else {
+            payload = plan.encodedPayloadUnsafe();
+        }
         int off;
         try {
             off = current.appendRecord(payload, rec.transactionId(), rec.undoNo());
         } catch (UndoPageOverflowException overflow) {
-            off = growAndAppend(payload, rec.transactionId(), rec.undoNo(), overflow);
+            off = growAndAppendReserved(payload, rec.transactionId(), rec.undoNo(), overflow);
         }
         // RollPointer.insert 标志按记录类型决定（T1.3e）：INSERT_ROW→true、UPDATE_ROW→false。混合段中段头
         // UndoLogKind 不权威，insert 标志与每条记录的 UndoRecordType 一致，供 MVCC/版本链区分 insert vs update undo。
@@ -132,6 +168,16 @@ public final class UndoLogSegment {
         firstPage.setLogLastUndoNo(rec.undoNo().value());
         firstPage.setLogicalHead(newHead);
         return pointer;
+    }
+
+    /** external 页数加 descriptor/inline root 是否需要一张普通 UNDO grow 页。 */
+    public int requiredNewPages(UndoRecordWritePlan plan) {
+        if (plan == null) {
+            throw new DatabaseValidationException("undo page requirement plan must not be null");
+        }
+        int limit = pageSize.bytes() - PageEnvelopeLayout.FIL_PAGE_TRAILER_BYTES;
+        int rootGrow = current.freeOffset() + Short.BYTES + plan.rootPayloadLength() > limit ? 1 : 0;
+        return Math.addExact(plan.externalPageCount(), rootGrow);
     }
 
     /**
@@ -201,27 +247,23 @@ public final class UndoLogSegment {
      * @param overflow current 页原始溢出异常；单条超页时保持该异常语义。
      * @return 新页上的 record 槽 offset。
      */
-    private int growAndAppend(byte[] payload, TransactionId txnId, UndoNo undoNo,
-                              UndoPageOverflowException overflow) {
+    private int growAndAppendReserved(byte[] payload, TransactionId txnId, UndoNo undoNo,
+                                      UndoPageOverflowException overflow) {
         int need = 2 + payload.length;
         int freshCapacity = pageSize.bytes() - PageEnvelopeLayout.FIL_PAGE_TRAILER_BYTES
                 - UndoPageLayout.RECORD_AREA_START;
         if (need > freshCapacity) {
             throw overflow;
         }
-        // 0.14b：grow 是真实多页消费者。预留必须晚于单条容量 preflight、早于任何分配/格式化/FIL 链接/first header 修改；
-        // 否则 ENOSPC 发生在中途时，MTR 无 content undo，无法撤回半生长的 undo 页链。
-        try (UndoSpaceReservation ignored = reserveGrowPagesForChainAppend()) {
-            PageId newId = allocateChainPageForAppend();
-            UndoPage newPage = createChainPageForAppend(newId);
-            current.linkNextTo(newId.pageNo());
-            newPage.linkPrevTo(current.pageId().pageNo());
-            firstPage.setLastPageNo(newId.pageNo());
-            handle = handle.withLastPage(newId);
-            heldPages.put(newId.pageNo().value(), newPage);
-            current = newPage;
-            return current.appendRecord(payload, txnId, undoNo);
-        }
+        PageId newId = allocateChainPageForAppend();
+        UndoPage newPage = createChainPageForAppend(newId);
+        current.linkNextTo(newId.pageNo());
+        newPage.linkPrevTo(current.pageId().pageNo());
+        firstPage.setLastPageNo(newId.pageNo());
+        handle = handle.withLastPage(newId);
+        heldPages.put(newId.pageNo().value(), newPage);
+        current = newPage;
+        return current.appendRecord(payload, txnId, undoNo);
     }
 
     /**
@@ -232,16 +274,16 @@ public final class UndoLogSegment {
      * undo 页链；FSP 预留只获取表空间元页 latch，从不反向等待 undo 页 latch，因此不会形成
      * “Undo 页 ↔ FSP 元页”等待环。
      */
-    private UndoSpaceReservation reserveGrowPagesForChainAppend() {
+    private UndoSpaceReservation reserveGrowPages(long pages) {
         try (var ignored = mtr.allowOutOfOrderPageLatch(
                 "undo grow reservation: single-writer undo chain, FSP never waits for undo page latches")) {
-            return allocator.reserveGrowPages(mtr, handle.spaceId(), 1L);
+            return allocator.reserveGrowPages(mtr, handle.spaceId(), pages);
         }
     }
 
     /**
      * 在既有 undo segment 内续分配一张 chain 页。分配过程会访问 page0/page2/XDES 等较低 FSP 元页，
-     * 但不会读取或等待 undo 页内容；局部越序证明与 {@link #reserveGrowPagesForChainAppend()} 相同。
+     * 但不会读取或等待 undo 页内容；局部越序证明与 {@link #reserveGrowPages(long)} 相同。
      */
     private PageId allocateChainPageForAppend() {
         try (var ignored = mtr.allowOutOfOrderPageLatch(
@@ -316,7 +358,8 @@ public final class UndoLogSegment {
         UndoPage page = resolvePage(rp.pageNo());
         requireSameSegment(page, "roll pointer page " + rp.pageNo());
         byte[] payload = page.recordAt(rp.offset());
-        UndoRecord record = codec.decode(payload, 0, keyDef, schema);
+        UndoRecord record = storedRecordResolver.resolve(mtr, handle.spaceId(), segmentIdentity(page),
+                payload, keyDef, schema);
         requirePointerMatchesRecord(rp, record, keyDef);
         return record;
     }
@@ -414,7 +457,8 @@ public final class UndoLogSegment {
             int off = UndoPageLayout.RECORD_AREA_START;
             while (off < free) {
                 byte[] payload = page.recordAt(off);
-                UndoRecord rec = codec.decode(payload, 0, keyDef, schema);
+                UndoRecord rec = storedRecordResolver.resolve(mtr, handle.spaceId(), segmentIdentity(page),
+                        payload, keyDef, schema);
                 // 该 record 的地址 = 写入时返回的 RollPointer：insert 标志按类型（INSERT_ROW→true，其余 false），
                 // 与 append/聚簇记录 DB_ROLL_PTR 编码一致，供 purge 严格比对。
                 boolean insert = rec.type() == UndoRecordType.INSERT_ROW;
@@ -467,6 +511,13 @@ public final class UndoLogSegment {
         return firstPage.logLastUndoNo();
     }
 
+    /** 返回当前已持 X/S latch 会话观察到的 append 权威快照，供事务层在首次写前比较规划结果。 */
+    public UndoAppendSnapshot appendSnapshot() {
+        return new UndoAppendSnapshot(handle.firstPageId(), handle.lastPageId(), handle.segmentId(),
+                handle.inodeSlot(), firstPage.transactionId(), firstPage.logLastUndoNo(), firstPage.logicalHead(),
+                firstPage.logRecordCount(), current.freeOffset());
+    }
+
     private void requirePointerMatchesRecord(RollPointer pointer, UndoRecord record, IndexKeyDef keyDef) {
         boolean expectedInsert = record.type() == UndoRecordType.INSERT_ROW;
         if (pointer.insert() != expectedInsert) {
@@ -512,5 +563,9 @@ public final class UndoLogSegment {
             throw new UndoLogFormatException(what + " not in undo segment " + handle.segmentId().value()
                     + "/slot " + handle.inodeSlot());
         }
+    }
+
+    private static UndoPayloadStorage.SegmentIdentity segmentIdentity(UndoPage page) {
+        return new UndoPayloadStorage.SegmentIdentity(page.segmentId(), page.inodeSlot());
     }
 }

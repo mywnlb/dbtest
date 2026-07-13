@@ -278,6 +278,18 @@ public final class MiniTransaction {
         memo.release(guard);
     }
 
+    /**
+     * 返回本 MTR 已持有的 X guard，未持有则返回 null。该入口供同一 MTR 写后校验读取复用 touched 页；调用方不得
+     * close/release 返回 guard，生命周期仍归 memo，避免为了短读重复 fix 后被 savepoint 误判为释放写页。
+     */
+    public PageGuard retainedExclusivePage(PageId pageId) {
+        ensureActive();
+        if (pageId == null) {
+            throw new DatabaseValidationException("retained page id must not be null");
+        }
+        return memo.holds(pageId, PageLatchMode.EXCLUSIVE) ? memo.guardFor(pageId) : null;
+    }
+
     /** 记录当前 memo 深度为保存点。 */
     public MtrSavepoint savepoint() {
         ensureActive();

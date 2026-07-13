@@ -356,7 +356,8 @@ public final class StorageEngine {
         this.rsegHeaderRepo = new RollbackSegmentHeaderRepository(pool, config.pageSize());
         this.history = new HistoryList();
         this.undoAllocator = new DiskSpaceUndoAllocator(diskSpaceManager);
-        this.undoAccess = new UndoLogSegmentAccess(pool, config.pageSize(), undoAllocator, typeRegistry, registry);
+        this.undoAccess = new UndoLogSegmentAccess(pool, config.pageSize(), undoAllocator, typeRegistry, registry,
+                config.maxExternalUndoPayloadPages());
         this.undoSegmentFinalizer = new UndoSegmentFinalizer(miniTransactionManager, undoAccess, undoAllocator,
                 rsegHeaderRepo, rollbackSlots);
         this.undoLogManager = new UndoLogManager(undoAccess, rollbackSlots, config.undoSpaceId(), history,

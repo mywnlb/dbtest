@@ -115,6 +115,17 @@ class UndoRecordCodecTest {
         assertThrows(UndoLogFormatException.class, () -> codec.decode(cut, 0, twoColKey(), twoColSchema()));
     }
 
+    /** external 链重组后必须恰好得到一条 record，尾随垃圾不能被静默忽略。 */
+    @Test void decodeRejectsTrailingBytes() {
+        UndoRecordCodec codec = new UndoRecordCodec(registry);
+        byte[] encoded = codec.encode(rec(List.of(new ColumnValue.IntValue(1),
+                new ColumnValue.StringValue("x")), RollPointer.NULL), twoColKey(), twoColSchema());
+        byte[] withTrailingGarbage = Arrays.copyOf(encoded, encoded.length + 1);
+
+        assertThrows(UndoLogFormatException.class,
+                () -> codec.decode(withTrailingGarbage, 0, twoColKey(), twoColSchema()));
+    }
+
     @Test void decodeRejectsKeyColCountMismatch() {
         UndoRecordCodec codec = new UndoRecordCodec(registry);
         byte[] buf = codec.encode(rec(List.of(new ColumnValue.IntValue(1),

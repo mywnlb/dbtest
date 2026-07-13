@@ -377,6 +377,12 @@ undo page 逻辑格式：
 约束：
 
 - 单条 undo record 不能跨 page；过大的 old column image 使用 external undo payload 页。
+- external payload 不复用业务 LOB ownership：普通 UNDO record 槽只保存版本化根描述符，payload 页使用独立页类型，
+  与 root 同属一个 undo segment 但不加入主 UNDO 页链；segment drop 统一回收两类页。
+- 根描述符和每个 payload 页都携带事务/undoNo/segment identity、总长、页数与 CRC 证据；读取必须先完整校验链，
+  再交给 `UndoRecordCodec` 解码，不能把部分字节暴露给 MVCC、rollback 或 purge。
+- 写入前必须冻结 inline/external 决策和精确页数并完成空间/redo admission；超过配置上限在任何页修改前失败，
+  进入物理发布阶段后的异常按不可安全补偿处理。
 - page 内 record 按 `undoNo` 递增追加。
 - undo record 内存的上一版本 roll pointer（即该记录更新前的旧 `DB_ROLL_PTR`）串起**记录版本链**；聚簇记录的 `DB_ROLL_PTR` 是版本链入口，§7.5/§14.1 沿此遍历旧版本。事务回滚则按 undo log 内 `undoNo` 顺序反向应用各 undo record，不依赖单独的"事务链"指针——回滚顺序与版本链是两件事，勿混用同一字段表达。
 - undo page 修改必须写 redo；redo 类型由 Redo 模块保存字节级变更，不理解 MVCC。

@@ -11,6 +11,7 @@ import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
 import cn.zhangyis.db.storage.fil.meta.TablespaceRegistry;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
+import cn.zhangyis.db.storage.page.PageEnvelopeLayout;
 import cn.zhangyis.db.storage.record.schema.IndexKeyDef;
 import cn.zhangyis.db.storage.record.schema.TableSchema;
 import cn.zhangyis.db.storage.record.type.TypeCodecRegistry;
@@ -41,10 +42,16 @@ public final class UndoLogSegmentAccess {
      * undo page 访问器，负责 first/chain 页格式化和页类型守门。
      */
     private final UndoPageAccess pageAccess;
+    /** external payload 页链读写设施。 */
+    private final UndoPayloadStorage payloadStorage;
+    /** 所有 record 槽统一解码入口。 */
+    private final UndoStoredRecordResolver storedRecordResolver;
+    /** 单条 external undo payload 的实例安全上限。 */
+    private final int maxExternalPages;
 
     public UndoLogSegmentAccess(BufferPool pool, PageSize pageSize, UndoSpaceAllocator allocator,
                                 TypeCodecRegistry registry) {
-        this(pool, pageSize, allocator, registry, null);
+        this(pool, pageSize, allocator, registry, null, 16);
     }
 
     /**
@@ -54,13 +61,26 @@ public final class UndoLogSegmentAccess {
      */
     public UndoLogSegmentAccess(BufferPool pool, PageSize pageSize, UndoSpaceAllocator allocator,
                                 TypeCodecRegistry registry, TablespaceRegistry tablespaceRegistry) {
+        this(pool, pageSize, allocator, registry, tablespaceRegistry, 16);
+    }
+
+    /** 创建带 external undo payload 页数上限的生产 access。 */
+    public UndoLogSegmentAccess(BufferPool pool, PageSize pageSize, UndoSpaceAllocator allocator,
+                                TypeCodecRegistry registry, TablespaceRegistry tablespaceRegistry,
+                                int maxExternalPages) {
         if (pool == null || pageSize == null || allocator == null || registry == null) {
             throw new DatabaseValidationException("undo log segment access args must not be null");
+        }
+        if (maxExternalPages <= 0) {
+            throw new DatabaseValidationException("max external undo pages must be positive: " + maxExternalPages);
         }
         this.pageSize = pageSize;
         this.allocator = allocator;
         this.codec = new UndoRecordCodec(registry);
         this.pageAccess = new UndoPageAccess(pool, pageSize, tablespaceRegistry);
+        this.payloadStorage = new UndoPayloadStorage(pool, pageSize, tablespaceRegistry);
+        this.storedRecordResolver = new UndoStoredRecordResolver(codec, payloadStorage, maxExternalPages);
+        this.maxExternalPages = maxExternalPages;
     }
 
     /**
@@ -76,8 +96,8 @@ public final class UndoLogSegmentAccess {
         }
         UndoSegmentHandle handle = allocator.createUndoSegment(mtr, undoSpace);
         UndoPage firstPage = pageAccess.createFirstPage(mtr, handle.firstPageId(), UndoLogKind.INSERT, txnId, handle);
-        return new UndoLogSegment(mtr, pageSize, allocator, codec, pageAccess, handle, firstPage, firstPage,
-                PageLatchMode.EXCLUSIVE);
+        return new UndoLogSegment(mtr, pageSize, allocator, codec, pageAccess, payloadStorage,
+                storedRecordResolver, maxExternalPages, handle, firstPage, firstPage, PageLatchMode.EXCLUSIVE);
     }
 
     /**
@@ -112,7 +132,8 @@ public final class UndoLogSegmentAccess {
             }
             current = last;
         }
-        return new UndoLogSegment(mtr, pageSize, allocator, codec, pageAccess, handle, firstPage, current, mode);
+        return new UndoLogSegment(mtr, pageSize, allocator, codec, pageAccess, payloadStorage,
+                storedRecordResolver, maxExternalPages, handle, firstPage, current, mode);
     }
 
     /**
@@ -147,7 +168,9 @@ public final class UndoLogSegmentAccess {
         if (off + 2 + payload.length > free) {
             throw new UndoLogFormatException("undo record slot at " + off + " overruns used area (free=" + free + ")");
         }
-        UndoRecord rec = codec.decode(payload, 0, keyDef, schema);
+        UndoRecord rec = storedRecordResolver.resolve(mtr, undoSpace,
+                new UndoPayloadStorage.SegmentIdentity(page.segmentId(), page.inodeSlot()),
+                payload, keyDef, schema);
         boolean expectInsert = rec.type() == UndoRecordType.INSERT_ROW;
         if (rollPtr.insert() != expectInsert) {
             throw new UndoLogFormatException("roll pointer insert bit " + rollPtr.insert()
@@ -158,5 +181,61 @@ public final class UndoLogSegmentAccess {
                     + " != expected " + keyDef.indexId());
         }
         return rec;
+    }
+
+    /** 在写 MTR admission 前冻结一条 record 的编码与 external 页数。 */
+    public UndoRecordWritePlan planRecord(UndoRecord record, IndexKeyDef keyDef, TableSchema schema) {
+        return UndoRecordWritePlan.create(codec, pageSize, record, keyDef, schema, maxExternalPages);
+    }
+
+    /** 根据规划快照精确计算本次会消费的 segment 首页、普通 root grow 和 external payload 页总数。 */
+    public int plannedNewPages(boolean firstWrite, UndoAppendSnapshot snapshot, UndoRecordWritePlan recordPlan) {
+        if (recordPlan == null || (!firstWrite && snapshot == null)) {
+            throw new DatabaseValidationException("undo planned page calculation args invalid");
+        }
+        int rootPages;
+        if (firstWrite) {
+            rootPages = 1;
+        } else {
+            int limit = pageSize.bytes() - PageEnvelopeLayout.FIL_PAGE_TRAILER_BYTES;
+            rootPages = snapshot.tailFreeOffset() + Short.BYTES + recordPlan.rootPayloadLength() > limit ? 1 : 0;
+        }
+        return Math.addExact(rootPages, recordPlan.externalPageCount());
+    }
+
+    /** 为计划中全部新页一次性预留 undo 空间；0 页计划由调用方跳过。 */
+    public UndoSpaceReservation reservePages(MiniTransaction mtr, SpaceId spaceId, long pages) {
+        if (pages <= 0) {
+            throw new DatabaseValidationException("planned undo reservation pages must be positive: " + pages);
+        }
+        return allocator.reserveGrowPages(mtr, spaceId, pages);
+    }
+
+    /**
+     * 用短只读 MTR物化 append 所需的 first/tail 权威快照。尾页与首页不同时单独 S-open，并验证 segment owner；
+     * 调用方提交只读 MTR 后只保留该不可变值对象。
+     */
+    public UndoAppendSnapshot inspectAppendSnapshot(MiniTransaction mtr, PageId firstPageId) {
+        if (mtr == null || firstPageId == null) {
+            throw new DatabaseValidationException("undo append snapshot mtr/first page must not be null");
+        }
+        UndoPage first = pageAccess.openUndoPage(mtr, firstPageId, PageLatchMode.SHARED);
+        if (!first.isFirstPage()) {
+            throw new UndoLogFormatException("append snapshot page is not undo first page: " + firstPageId);
+        }
+        PageId tailId = PageId.of(firstPageId.spaceId(), PageNo.of(first.lastPageNo()));
+        UndoPage tail = first;
+        if (!tailId.equals(firstPageId)) {
+            try (var ignored = mtr.allowOutOfOrderPageLatch(
+                    "undo append planning opens persisted tail after first-page snapshot")) {
+                tail = pageAccess.openUndoPage(mtr, tailId, PageLatchMode.SHARED);
+            }
+            if (!tail.segmentId().equals(first.segmentId()) || tail.inodeSlot() != first.inodeSlot()) {
+                throw new UndoLogFormatException("undo append snapshot tail owner mismatch: " + tailId);
+            }
+        }
+        return new UndoAppendSnapshot(firstPageId, tailId, first.segmentId(), first.inodeSlot(),
+                first.transactionId(), first.logLastUndoNo(), first.logicalHead(), first.logRecordCount(),
+                tail.freeOffset());
     }
 }

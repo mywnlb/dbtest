@@ -39,11 +39,17 @@ class MiniTransactionManagerTest {
 
         assertThrows(DatabaseValidationException.class,
                 () -> mgr.budgetFor(RedoBudgetPurpose.CLUSTERED_INSERT));
+        assertThrows(DatabaseValidationException.class,
+                () -> mgr.budgetFor(RedoBudgetPurpose.LOB_WRITE));
         RedoAppendBudget budget = mgr.budgetFor(
                 RedoBudgetPurpose.CLUSTERED_INSERT, RedoBudgetWorkload.pageImages(2));
+        RedoAppendBudget lobBudget = mgr.budgetFor(
+                RedoBudgetPurpose.LOB_WRITE, RedoBudgetWorkload.pageImages(3));
 
         assertEquals(2L * (PageSize.ofBytes(16 * 1024).bytes() + RedoBudgetBuilder.PAGE_BYTES_HEADER),
                 budget.logicalUpperBound());
+        assertEquals(3L * (PageSize.ofBytes(16 * 1024).bytes() + RedoBudgetBuilder.PAGE_BYTES_HEADER),
+                lobBudget.logicalUpperBound());
     }
 
     @Test

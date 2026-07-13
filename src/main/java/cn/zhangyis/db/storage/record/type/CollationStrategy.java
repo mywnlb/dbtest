@@ -2,7 +2,7 @@ package cn.zhangyis.db.storage.record.type;
 
 /**
  * 排序规则策略（innodb-record-design §8.3）。字符/二进制比较必须经此，不直接用 String.compareTo。
- * 当前包含 {@link BinaryCollation} 与确定性的 {@link AsciiCaseInsensitiveCollation}；Unicode weight 留后续。
+ * 当前包含 binary、ASCII-CI 与版本化 {@link UnicodeWeightCollationV1}；实现必须确定且不可依赖默认 locale。
  */
 public interface CollationStrategy {
 

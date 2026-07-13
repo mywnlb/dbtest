@@ -1,9 +1,14 @@
 package cn.zhangyis.db.storage.record.format;
 
+import cn.zhangyis.db.domain.LobReference;
+import cn.zhangyis.db.domain.PageNo;
+import cn.zhangyis.db.domain.SegmentId;
+import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.record.schema.ColumnDef;
 import cn.zhangyis.db.storage.record.schema.ColumnId;
 import cn.zhangyis.db.storage.record.schema.ColumnType;
 import cn.zhangyis.db.storage.record.schema.TableSchema;
+import cn.zhangyis.db.storage.record.schema.TypeId;
 import cn.zhangyis.db.storage.record.type.ColumnValue;
 import cn.zhangyis.db.storage.record.type.TemporalKind;
 import cn.zhangyis.db.storage.record.type.TypeCodecRegistry;
@@ -39,7 +44,7 @@ class RecordCodecTest {
         return new TableSchema(version, List.of(cols));
     }
 
-    /** 全定长列（含有符号/无符号整数、DOUBLE、DATE、DATETIME）往返一致，无变长目录。 */
+    /** 全定长列（含数值与五种时间类型）往返一致，无变长目录。 */
     @Test
     void fixedOnlyRoundTrip() {
         TableSchema s = schema(1,
@@ -47,13 +52,19 @@ class RecordCodecTest {
                 col(1, "b", ColumnType.bigint(true, false)),
                 col(2, "c", ColumnType.doubleType(false)),
                 col(3, "d", ColumnType.date(false)),
-                col(4, "e", ColumnType.datetime(false)));
+                col(4, "e", ColumnType.time(false)),
+                col(5, "f", ColumnType.datetime(false)),
+                col(6, "g", ColumnType.timestamp(false)),
+                col(7, "h", ColumnType.year(false)));
         List<ColumnValue> vals = List.of(
                 new ColumnValue.IntValue(-12345),
                 new ColumnValue.IntValue(-1L),                 // unsigned 64 位以原始 bits 承载
                 new ColumnValue.DoubleValue(3.141592653589793),
                 new ColumnValue.TemporalValue(TemporalKind.DATE, -100),
-                new ColumnValue.TemporalValue(TemporalKind.DATETIME, -86_400_000L));
+                new ColumnValue.TemporalValue(TemporalKind.TIME, -86_400_000L),
+                new ColumnValue.TemporalValue(TemporalKind.DATETIME, -86_400_000L),
+                new ColumnValue.TemporalValue(TemporalKind.TIMESTAMP, 1_700_000_000_000L),
+                new ColumnValue.TemporalValue(TemporalKind.YEAR, 2026));
         assertRoundTrip(s, new LogicalRecord(1, vals, false, RecordType.CONVENTIONAL));
     }
 
@@ -107,6 +118,52 @@ class RecordCodecTest {
                 new ColumnValue.DoubleValue(-2.25),
                 new ColumnValue.DoubleValue(0.0));
         assertRoundTrip(s, new LogicalRecord(5, vals, false, RecordType.CONVENTIONAL));
+    }
+
+    /** BIT(n) 通过真实 fixed-area 布局往返，非 byte-aligned canonical 尾位保持不变。 */
+    @Test
+    void bitRoundTrip() {
+        TableSchema s = schema(6,
+                col(0, "flags", ColumnType.bit(9, false)),
+                col(1, "mask", ColumnType.bit(64, false)));
+        List<ColumnValue> vals = List.of(
+                new ColumnValue.BitValue(new byte[] {(byte) 0xA5, (byte) 0x80}),
+                new ColumnValue.BitValue(new byte[] {1, 2, 3, 4, 5, 6, 7, 8}));
+        assertRoundTrip(s, new LogicalRecord(6, vals, false, RecordType.CONVENTIONAL));
+    }
+
+    /** ENUM ordinal 与 SET bitmap 进入 fixed area，并按 schema 字典宽度往返。 */
+    @Test
+    void enumAndSetRoundTrip() {
+        TableSchema s = schema(8,
+                col(0, "state", ColumnType.enumType(List.of("NEW", "DONE"), false)),
+                col(1, "permissions", ColumnType.setType(List.of("READ", "WRITE", "ADMIN"), false)));
+        assertRoundTrip(s, new LogicalRecord(8, List.of(
+                new ColumnValue.EnumValue(2),
+                new ColumnValue.SetValue(0b101)), false, RecordType.CONVENTIONAL));
+    }
+
+    /** overflow-capable 列和普通 VARCHAR 共用变长目录；external envelope 不把完整 payload 塞回记录。 */
+    @Test
+    void inlineAndExternalLobRoundTripThroughVariableDirectory() {
+        TableSchema s = schema(9,
+                col(0, "summary", ColumnType.text(false)),
+                col(1, "payload", ColumnType.longBlob(false)));
+        LobReference reference = new LobReference(SpaceId.of(8), PageNo.of(64), 90_000, 6,
+                SegmentId.of(3), 1, 1234);
+        byte[] prefix = new byte[]{1, 2, 3};
+        LogicalRecord record = new LogicalRecord(9, List.of(
+                new ColumnValue.StringValue("inline text"),
+                new ColumnValue.ExternalValue(TypeId.LONGBLOB, reference, prefix)),
+                false, RecordType.CONVENTIONAL);
+
+        LogicalRecord decoded = decoder.decode(encoder.encode(record, s), s);
+        assertEquals(new ColumnValue.StringValue("inline text"), decoded.columnValues().get(0));
+        ColumnValue.ExternalValue external = assertInstanceOf(
+                ColumnValue.ExternalValue.class, decoded.columnValues().get(1));
+        assertEquals(TypeId.LONGBLOB, external.typeId());
+        assertEquals(reference, external.reference());
+        assertArrayEquals(prefix, external.inlinePrefix());
     }
 
     /** delete-mark 与 recordType 在往返中保留。 */
@@ -173,6 +230,9 @@ class RecordCodecTest {
         if (expected instanceof ColumnValue.BinaryValue eb) {
             assertInstanceOf(ColumnValue.BinaryValue.class, actual, "col " + ordinal);
             assertArrayEquals(eb.value(), ((ColumnValue.BinaryValue) actual).value(), "col " + ordinal);
+        } else if (expected instanceof ColumnValue.BitValue eb) {
+            assertInstanceOf(ColumnValue.BitValue.class, actual, "col " + ordinal);
+            assertArrayEquals(eb.value(), ((ColumnValue.BitValue) actual).value(), "col " + ordinal);
         } else if (expected instanceof ColumnValue.DecimalValue ed) {
             assertInstanceOf(ColumnValue.DecimalValue.class, actual, "col " + ordinal);
             assertEquals(0, ed.value().compareTo(((ColumnValue.DecimalValue) actual).value()), "col " + ordinal);

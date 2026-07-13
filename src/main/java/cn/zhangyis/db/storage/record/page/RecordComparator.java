@@ -68,6 +68,46 @@ public final class RecordComparator {
         return 0;
     }
 
+    /**
+     * 返回两条页内记录的索引序：&lt;0 left 在前、0 key 等价、&gt;0 left 在后。
+     *
+     * <p>数据流：先处理 infimum/supremum 哨兵，避免按用户 schema 解析系统标签；普通记录随后遍历完整 keyDef，
+     * 从两侧 cursor 读取 NULL 标志与编码切片，并复用 {@link EncodedKeyPartComparator} 的 prefix/collation/方向语义。
+     * 本入口不物化 {@link ColumnValue}，供 schema-aware 页内顺序校验以 O(n) 相邻扫描复用。
+     *
+     * @param left 左侧记录游标。
+     * @param right 右侧记录游标。
+     * @param keyDef 索引 key 定义。
+     * @param schema 两条记录共享的物理 schema。
+     * @return 规范化为 -1、0、1 的索引序比较结果。
+     */
+    public int compare(RecordCursor left, RecordCursor right, IndexKeyDef keyDef, TableSchema schema) {
+        if (left == null || right == null || keyDef == null || schema == null) {
+            throw new DatabaseValidationException("record comparison inputs must not be null");
+        }
+        RecordType leftType = left.recordType();
+        RecordType rightType = right.recordType();
+        if (leftType == RecordType.INFIMUM || rightType == RecordType.SUPREMUM) {
+            return leftType == rightType ? 0 : -1;
+        }
+        if (leftType == RecordType.SUPREMUM || rightType == RecordType.INFIMUM) {
+            return leftType == rightType ? 0 : 1;
+        }
+        for (KeyPartDef part : keyDef.parts()) {
+            ColumnType columnType = schema.column(part.columnId().value()).type();
+            boolean leftNull = left.isNull(part.columnId());
+            boolean rightNull = right.isNull(part.columnId());
+            FieldSlice leftSlice = leftNull ? null : left.columnSlice(part.columnId());
+            FieldSlice rightSlice = rightNull ? null : right.columnSlice(part.columnId());
+            int comparison = keyPartComparator.compare(
+                    leftNull, leftSlice, rightNull, rightSlice, columnType, part);
+            if (comparison != 0) {
+                return comparison;
+            }
+        }
+        return 0;
+    }
+
     /** 把 key 值编码进临时 buffer，得到与记录侧同编码的切片用于保序比较。 */
     private FieldSlice encodeKey(ColumnValue value, ColumnType ct, TypeCodec codec) {
         codec.validate(value, ct);

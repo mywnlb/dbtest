@@ -76,7 +76,7 @@ public final class RecordEncoder {
             if (!isNull) {
                 registry.validate(v, ct);
                 TypeCodec codec = registry.codecFor(ct);
-                if (ct.storageKind() == StorageKind.VARIABLE) {
+                if (ct.storageKind() != StorageKind.FIXED) {
                     int len = codec.encodedLength(v, ct);
                     varLengths.add(len);
                     varAreaLen += len;
@@ -120,7 +120,7 @@ public final class RecordEncoder {
                 continue;
             }
             TypeCodec codec = registry.codecFor(ct);
-            if (ct.storageKind() == StorageKind.VARIABLE) {
+            if (ct.storageKind() != StorageKind.FIXED) {
                 int len = codec.encodedLength(v, ct);
                 codec.encode(v, ct, new FieldWriter(buf, varOff));
                 varOff += len;

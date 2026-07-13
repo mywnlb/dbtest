@@ -349,10 +349,26 @@ public final class DiskSpaceManager {
      * @return 已初始化为 ALLOCATED 的新页。
      */
     public PageId allocatePage(MiniTransaction mtr, SegmentRef ref, PageAllocationHint hint) {
+        return allocatePage(mtr, ref, hint, PageType.ALLOCATED);
+    }
+
+    /** 为专用数据结构分配并直接初始化目标页类型；LOB 页借此产生 PAGE_INIT(BLOB)。 */
+    public PageId allocatePage(MiniTransaction mtr, SegmentRef ref, PageType pageType) {
+        return allocatePage(mtr, ref, PageAllocationHint.none(), pageType);
+    }
+
+    /**
+     * 带方向 hint 与物理页类型的统一分配入口。既有调用默认 ALLOCATED；专用页调用方必须随后在同一 MTR
+     * 写完整格式，避免已发布 type 但 body 尚未初始化。
+     */
+    public PageId allocatePage(MiniTransaction mtr, SegmentRef ref, PageAllocationHint hint, PageType pageType) {
         requireMtr(mtr);
         requireRef(ref);
-        if (hint == null) {
-            throw new DatabaseValidationException("page allocation hint must not be null");
+        if (hint == null || pageType == null) {
+            throw new DatabaseValidationException("page allocation hint/type must not be null");
+        }
+        if (pageType != PageType.ALLOCATED && pageType != PageType.BLOB) {
+            throw new DatabaseValidationException("generic segment allocation cannot initialize page type: " + pageType);
         }
         requireOrdinaryAccess(mtr, ref.spaceId());
         reservationService.consumePageIfReserved(mtr, ref.spaceId());
@@ -361,7 +377,7 @@ public final class DiskSpaceManager {
                         allocation.pageId(), ref.inodeSlot(), ref.segmentId(), allocation.autoExtendRetry()),
                 MtrRedoCategory.FSP_METADATA_BYTES,
                 "FSP page allocation intent before PAGE_INIT");
-        initAllocatedPage(mtr, allocation.pageId());
+        initAllocatedPage(mtr, allocation.pageId(), pageType);
         return allocation.pageId();
     }
 
@@ -393,14 +409,35 @@ public final class DiskSpaceManager {
     }
 
     /**
-     * 页创建：{@code newPage(X)} 取零帧（驻留则重初始化）+ 写信封（type=ALLOCATED；pageLsn=0 由 commit 盖真值）。
+     * 页创建：{@code newPage(X)} 取零帧（驻留则重初始化）+ 写目标类型信封（pageLsn=0 由 commit 盖真值）。
      * 不自行 close guard（mtr memo 持有，commit 释放并盖 pageLSN）。
      */
-    private void initAllocatedPage(MiniTransaction mtr, PageId p) {
-        PageGuard g = mtr.newPage(pool, p, PageLatchMode.EXCLUSIVE, PageType.ALLOCATED);
+    private void initAllocatedPage(MiniTransaction mtr, PageId p, PageType pageType) {
+        PageGuard g = mtr.newPage(pool, p, PageLatchMode.EXCLUSIVE, pageType);
         PageEnvelope.writeHeader(g, new FilePageHeader(
                 p.spaceId(), p.pageNo().value(),
-                FilePageHeader.FIL_NULL, FilePageHeader.FIL_NULL, 0L, PageType.ALLOCATED));
+                FilePageHeader.FIL_NULL, FilePageHeader.FIL_NULL, 0L, pageType));
+    }
+
+    /**
+     * 在 LOB 写/释放前以 page2 X latch 复核 segment identity 与用途。X 模式是刻意选择：后续 FSP 更新同样需要
+     * page2 X，提前拿 S 会违反 MiniTransaction 禁止 latch upgrade 的约束。
+     */
+    public void requireSegmentPurposeForWrite(MiniTransaction mtr, SegmentRef ref, SegmentPurpose expectedPurpose) {
+        requireMtr(mtr);
+        requireRef(ref);
+        if (expectedPurpose == null) {
+            throw new DatabaseValidationException("expected segment purpose must not be null");
+        }
+        requireOrdinaryAccess(mtr, ref.spaceId());
+        // FSP 后续可能同时修改 page0 与 page2；先按全序取得较小 page0，避免仅持 page2 X 后反向等待 page0。
+        mtr.getPage(pool, PageId.of(ref.spaceId(), PageNo.of(0)), PageLatchMode.EXCLUSIVE);
+        SegmentInode inode = inodeRepo.readExclusive(mtr, ref.spaceId(), ref.inodeSlot());
+        if (!inode.segmentId().equals(ref.segmentId()) || inode.purpose() != expectedPurpose) {
+            throw new FspMetadataException("segment identity/purpose mismatch: expected="
+                    + ref.segmentId().value() + "/" + expectedPurpose + ", actual="
+                    + inode.segmentId().value() + "/" + inode.purpose());
+        }
     }
 
     /**

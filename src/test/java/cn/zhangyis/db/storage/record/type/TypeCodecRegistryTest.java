@@ -38,6 +38,12 @@ class TypeCodecRegistryTest {
                 .encodedLength(new ColumnValue.TemporalValue(TemporalKind.DATE, 0), ColumnType.date(false)));
         assertEquals(8, registry.codecFor(ColumnType.datetime(false))
                 .encodedLength(new ColumnValue.TemporalValue(TemporalKind.DATETIME, 0), ColumnType.datetime(false)));
+        assertEquals(8, registry.codecFor(ColumnType.time(false))
+                .encodedLength(new ColumnValue.TemporalValue(TemporalKind.TIME, 0), ColumnType.time(false)));
+        assertEquals(8, registry.codecFor(ColumnType.timestamp(false))
+                .encodedLength(new ColumnValue.TemporalValue(TemporalKind.TIMESTAMP, 0), ColumnType.timestamp(false)));
+        assertEquals(2, registry.codecFor(ColumnType.year(false))
+                .encodedLength(new ColumnValue.TemporalValue(TemporalKind.YEAR, 2026), ColumnType.year(false)));
     }
 
     @Test
@@ -47,6 +53,16 @@ class TypeCodecRegistryTest {
         assertInstanceOf(FixedBytesCodec.class, registry.codecFor(ColumnType.binary(4, false)));
         assertInstanceOf(VarBytesCodec.class, registry.codecFor(ColumnType.varchar(10, false)));
         assertInstanceOf(VarBytesCodec.class, registry.codecFor(ColumnType.varbinary(10, false)));
+        ColumnType bit = ColumnType.bit(9, false);
+        assertInstanceOf(BitCodec.class, registry.codecFor(bit));
+        assertEquals(2, registry.codecFor(bit).fixedWidth(bit));
+        ColumnType enumType = ColumnType.enumType(java.util.List.of("A", "B"), false);
+        ColumnType setType = ColumnType.setType(java.util.List.of("A", "B"), false);
+        assertInstanceOf(EnumCodec.class, registry.codecFor(enumType));
+        assertInstanceOf(SetCodec.class, registry.codecFor(setType));
+        assertInstanceOf(LobCodec.class, registry.codecFor(ColumnType.text(false)));
+        assertInstanceOf(LobCodec.class, registry.codecFor(ColumnType.blob(false)));
+        assertInstanceOf(LobCodec.class, registry.codecFor(ColumnType.json(false)));
     }
 
     @Test

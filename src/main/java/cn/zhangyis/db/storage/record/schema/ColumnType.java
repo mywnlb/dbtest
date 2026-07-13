@@ -2,9 +2,14 @@ package cn.zhangyis.db.storage.record.schema;
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
 /**
  * 列类型描述符（innodb-record-design §8.1，不可变）。只描述类型属性，不读写页。
- * length 语义：CHAR/VARCHAR/BINARY/VARBINARY = 最大字节长度；DECIMAL = 精度 p；其余 = 0。
+ * length 语义：CHAR/VARCHAR/BINARY/VARBINARY = 最大字节长度；DECIMAL = 精度 p；BIT = bit width；
+ * ENUM/SET = symbols 数量；TEXT/BLOB/JSON = 最大 payload 字节数；其余 = 0。
  * scale 仅 DECIMAL 用；unsigned 仅整数用；charset/collation 仅字符类型有效（其余携带默认值，被忽略）。
  *
  * @param typeId      类型。
@@ -15,17 +20,29 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
  * @param charset     字符集。
  * @param collation   排序规则。
  * @param storageKind 定长/变长。
+ * @param symbols     ENUM/SET 的不可变声明顺序；其它类型必须为空。
  */
 public record ColumnType(TypeId typeId, boolean nullable, int length, int scale, boolean unsigned,
-                         CharsetId charset, CollationId collation, StorageKind storageKind) {
+                         CharsetId charset, CollationId collation, StorageKind storageKind,
+                         List<String> symbols) {
 
     /** DECIMAL 精度上限（教学简化）。 */
     public static final int MAX_DECIMAL_PRECISION = 38;
 
     public ColumnType {
-        if (typeId == null || charset == null || collation == null || storageKind == null) {
+        if (typeId == null || charset == null || collation == null || storageKind == null || symbols == null) {
             throw new DatabaseValidationException("column type enum fields must not be null");
         }
+        Set<String> uniqueSymbols = new HashSet<>();
+        for (String symbol : symbols) {
+            if (symbol == null || symbol.isBlank()) {
+                throw new DatabaseValidationException("ENUM/SET symbols must not be null or blank");
+            }
+            if (!uniqueSymbols.add(symbol)) {
+                throw new DatabaseValidationException("duplicate ENUM/SET symbol: " + symbol);
+            }
+        }
+        symbols = List.copyOf(symbols);
         switch (typeId) {
             case DECIMAL -> {
                 if (length < 1 || length > MAX_DECIMAL_PRECISION) {
@@ -35,7 +52,9 @@ public record ColumnType(TypeId typeId, boolean nullable, int length, int scale,
                     throw new DatabaseValidationException("decimal scale out of range: " + scale);
                 }
             }
-            case CHAR, VARCHAR, BINARY, VARBINARY -> {
+            case CHAR, VARCHAR, BINARY, VARBINARY,
+                    TINYTEXT, TEXT, MEDIUMTEXT, LONGTEXT,
+                    TINYBLOB, BLOB, MEDIUMBLOB, LONGBLOB, JSON -> {
                 if (length < 1) {
                     throw new DatabaseValidationException("char/binary length must be positive: " + length);
                 }
@@ -43,14 +62,38 @@ public record ColumnType(TypeId typeId, boolean nullable, int length, int scale,
                     throw new DatabaseValidationException("scale only valid for DECIMAL");
                 }
             }
+            case BIT -> {
+                if (length < 1 || length > 64) {
+                    throw new DatabaseValidationException("BIT width out of range 1..64: " + length);
+                }
+                if (scale != 0) {
+                    throw new DatabaseValidationException("scale only valid for DECIMAL");
+                }
+            }
+            case ENUM -> validateSymbols(typeId, length, scale, symbols, 65_535);
+            case SET -> validateSymbols(typeId, length, scale, symbols, 64);
             default -> {
+                if (length != 0) {
+                    throw new DatabaseValidationException("length only valid for DECIMAL/char/binary types");
+                }
                 if (scale != 0) {
                     throw new DatabaseValidationException("scale only valid for DECIMAL");
                 }
             }
         }
-        StorageKind expected = (typeId == TypeId.VARCHAR || typeId == TypeId.VARBINARY)
-                ? StorageKind.VARIABLE : StorageKind.FIXED;
+        if (typeId != TypeId.ENUM && typeId != TypeId.SET && !symbols.isEmpty()) {
+            throw new DatabaseValidationException("symbols only valid for ENUM/SET: " + typeId);
+        }
+        if (unsigned && typeId != TypeId.TINYINT && typeId != TypeId.SMALLINT
+                && typeId != TypeId.INT && typeId != TypeId.BIGINT) {
+            throw new DatabaseValidationException("unsigned flag only valid for integer types: " + typeId);
+        }
+        StorageKind expected = switch (typeId) {
+            case VARCHAR, VARBINARY -> StorageKind.VARIABLE;
+            case TINYTEXT, TEXT, MEDIUMTEXT, LONGTEXT,
+                    TINYBLOB, BLOB, MEDIUMBLOB, LONGBLOB, JSON -> StorageKind.OVERFLOW_CAPABLE;
+            default -> StorageKind.FIXED;
+        };
         if (storageKind != expected) {
             throw new DatabaseValidationException("storageKind mismatch for " + typeId + ": " + storageKind);
         }
@@ -58,7 +101,18 @@ public record ColumnType(TypeId typeId, boolean nullable, int length, int scale,
 
     private static ColumnType fixed(TypeId id, int length, int scale, boolean unsigned, boolean nullable) {
         return new ColumnType(id, nullable, length, scale, unsigned, CharsetId.UTF8, CollationId.BINARY,
-                StorageKind.FIXED);
+                StorageKind.FIXED, List.of());
+    }
+
+    /** 校验 schema-owned 字典规模与 length 一致；声明顺序是 ordinal/bitmap 的权威。 */
+    private static void validateSymbols(TypeId typeId, int length, int scale, List<String> symbols, int max) {
+        if (symbols.isEmpty() || symbols.size() > max || length != symbols.size()) {
+            throw new DatabaseValidationException(
+                    typeId + " symbol count must be 1.." + max + " and equal length: " + symbols.size());
+        }
+        if (scale != 0) {
+            throw new DatabaseValidationException("scale only valid for DECIMAL");
+        }
     }
 
     public static ColumnType tinyint(boolean unsigned, boolean nullable) {
@@ -97,7 +151,8 @@ public record ColumnType(TypeId typeId, boolean nullable, int length, int scale,
      * 创建显式字符集与排序规则的 CHAR；pair 的生产支持性由只读类型 registry 在 codec 选择时复核。
      */
     public static ColumnType charType(int nBytes, boolean nullable, CharsetId charset, CollationId collation) {
-        return new ColumnType(TypeId.CHAR, nullable, nBytes, 0, false, charset, collation, StorageKind.FIXED);
+        return new ColumnType(TypeId.CHAR, nullable, nBytes, 0, false, charset, collation,
+                StorageKind.FIXED, List.of());
     }
 
     public static ColumnType binary(int nBytes, boolean nullable) {
@@ -108,8 +163,42 @@ public record ColumnType(TypeId typeId, boolean nullable, int length, int scale,
         return fixed(TypeId.DATE, 0, 0, false, nullable);
     }
 
+    /** 创建 8B 带符号毫秒 duration 类型；MySQL TIME 业务范围留给 SQL 层校验。 */
+    public static ColumnType time(boolean nullable) {
+        return fixed(TypeId.TIME, 0, 0, false, nullable);
+    }
+
     public static ColumnType datetime(boolean nullable) {
         return fixed(TypeId.DATETIME, 0, 0, false, nullable);
+    }
+
+    /** 创建 8B UTC epoch millis 类型；session 时区转换不能进入 Record 层。 */
+    public static ColumnType timestamp(boolean nullable) {
+        return fixed(TypeId.TIMESTAMP, 0, 0, false, nullable);
+    }
+
+    /** 创建 2B unsigned 教学年份类型；物理可表达范围由 TemporalCodec 校验。 */
+    public static ColumnType year(boolean nullable) {
+        return fixed(TypeId.YEAR, 0, 0, false, nullable);
+    }
+
+    /** 创建 1..64 位定长 bit string；length 表示 bit 数而非编码 byte 数。 */
+    public static ColumnType bit(int bitWidth, boolean nullable) {
+        return fixed(TypeId.BIT, bitWidth, 0, false, nullable);
+    }
+
+    /** 创建声明顺序固定的 ENUM；逻辑值使用 1-based ordinal。 */
+    public static ColumnType enumType(List<String> symbols, boolean nullable) {
+        int count = symbols == null ? 0 : symbols.size();
+        return new ColumnType(TypeId.ENUM, nullable, count, 0, false,
+                CharsetId.UTF8, CollationId.BINARY, StorageKind.FIXED, symbols);
+    }
+
+    /** 创建最多 64 个 member 的 SET；逻辑值使用 ordinal 对应 bit 的 bitmap。 */
+    public static ColumnType setType(List<String> symbols, boolean nullable) {
+        int count = symbols == null ? 0 : symbols.size();
+        return new ColumnType(TypeId.SET, nullable, count, 0, false,
+                CharsetId.UTF8, CollationId.BINARY, StorageKind.FIXED, symbols);
     }
 
     public static ColumnType varchar(int nBytes, boolean nullable) {
@@ -120,11 +209,73 @@ public record ColumnType(TypeId typeId, boolean nullable, int length, int scale,
      * 创建显式字符集与排序规则的 VARCHAR；长度继续按编码后最大字节数解释，不按字符数解释。
      */
     public static ColumnType varchar(int nBytes, boolean nullable, CharsetId charset, CollationId collation) {
-        return new ColumnType(TypeId.VARCHAR, nullable, nBytes, 0, false, charset, collation, StorageKind.VARIABLE);
+        return new ColumnType(TypeId.VARCHAR, nullable, nBytes, 0, false, charset, collation,
+                StorageKind.VARIABLE, List.of());
     }
 
     public static ColumnType varbinary(int nBytes, boolean nullable) {
         return new ColumnType(TypeId.VARBINARY, nullable, nBytes, 0, false, CharsetId.UTF8, CollationId.BINARY,
-                StorageKind.VARIABLE);
+                StorageKind.VARIABLE, List.of());
+    }
+
+    /** 创建 UTF-8/BINARY TINYTEXT（最大 255B）。 */
+    public static ColumnType tinyText(boolean nullable) {
+        return textType(TypeId.TINYTEXT, 255, nullable, CharsetId.UTF8, CollationId.BINARY);
+    }
+
+    /** 创建 UTF-8/BINARY TEXT（最大 65535B）。 */
+    public static ColumnType text(boolean nullable) {
+        return textType(TypeId.TEXT, 65_535, nullable, CharsetId.UTF8, CollationId.BINARY);
+    }
+
+    /** 创建显式字符语义的 TEXT。 */
+    public static ColumnType text(boolean nullable, CharsetId charset, CollationId collation) {
+        return textType(TypeId.TEXT, 65_535, nullable, charset, collation);
+    }
+
+    /** 创建 UTF-8/BINARY MEDIUMTEXT（最大 16777215B）。 */
+    public static ColumnType mediumText(boolean nullable) {
+        return textType(TypeId.MEDIUMTEXT, 16_777_215, nullable, CharsetId.UTF8, CollationId.BINARY);
+    }
+
+    /** 创建 UTF-8/BINARY LONGTEXT；Java 数组边界使 v1 封顶 Integer.MAX_VALUE。 */
+    public static ColumnType longText(boolean nullable) {
+        return textType(TypeId.LONGTEXT, Integer.MAX_VALUE, nullable, CharsetId.UTF8, CollationId.BINARY);
+    }
+
+    /** 创建 TINYBLOB（最大 255B）。 */
+    public static ColumnType tinyBlob(boolean nullable) {
+        return binaryLob(TypeId.TINYBLOB, 255, nullable);
+    }
+
+    /** 创建 BLOB（最大 65535B）。 */
+    public static ColumnType blob(boolean nullable) {
+        return binaryLob(TypeId.BLOB, 65_535, nullable);
+    }
+
+    /** 创建 MEDIUMBLOB（最大 16777215B）。 */
+    public static ColumnType mediumBlob(boolean nullable) {
+        return binaryLob(TypeId.MEDIUMBLOB, 16_777_215, nullable);
+    }
+
+    /** 创建 LONGBLOB；Java 数组边界使 v1 封顶 Integer.MAX_VALUE。 */
+    public static ColumnType longBlob(boolean nullable) {
+        return binaryLob(TypeId.LONGBLOB, Integer.MAX_VALUE, nullable);
+    }
+
+    /** 创建 v1 JSON：严格 UTF-8 文本、不可进入核心索引比较。 */
+    public static ColumnType json(boolean nullable) {
+        return textType(TypeId.JSON, Integer.MAX_VALUE, nullable, CharsetId.UTF8, CollationId.BINARY);
+    }
+
+    private static ColumnType textType(TypeId typeId, int maxBytes, boolean nullable,
+                                       CharsetId charset, CollationId collation) {
+        return new ColumnType(typeId, nullable, maxBytes, 0, false, charset, collation,
+                StorageKind.OVERFLOW_CAPABLE, List.of());
+    }
+
+    private static ColumnType binaryLob(TypeId typeId, int maxBytes, boolean nullable) {
+        return new ColumnType(typeId, nullable, maxBytes, 0, false, CharsetId.UTF8, CollationId.BINARY,
+                StorageKind.OVERFLOW_CAPABLE, List.of());
     }
 }

@@ -5,11 +5,13 @@ import cn.zhangyis.db.storage.api.index.IndexPageAccess;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.record.format.LogicalRecord;
+import cn.zhangyis.db.storage.record.format.RecordType;
 import cn.zhangyis.db.storage.record.page.IndexPageHeader;
 import cn.zhangyis.db.storage.record.page.RecordComparator;
 import cn.zhangyis.db.storage.record.page.RecordCursor;
 import cn.zhangyis.db.storage.record.page.RecordPage;
 import cn.zhangyis.db.storage.record.page.RecordPageInserter;
+import cn.zhangyis.db.storage.record.page.RecordPageKeyOrderValidator;
 import cn.zhangyis.db.storage.record.page.RecordPageOverflowException;
 import cn.zhangyis.db.storage.record.page.RecordPageSearch;
 import cn.zhangyis.db.storage.record.page.SearchKey;
@@ -39,6 +41,8 @@ public final class LeafOnlyBTreeIndexService implements BTreeIndexService {
     private final RecordComparator comparator;
     /** 页内 key 有序插入器；B+Tree 第一片只负责调用与异常边界。 */
     private final RecordPageInserter inserter;
+    /** 既有 leaf 页的 schema-aware 用户链校验器；物理结构校验后、业务查找或写入前执行。 */
+    private final RecordPageKeyOrderValidator keyOrderValidator;
 
     public LeafOnlyBTreeIndexService(IndexPageAccess pageAccess, TypeCodecRegistry registry) {
         if (pageAccess == null || registry == null) {
@@ -49,6 +53,7 @@ public final class LeafOnlyBTreeIndexService implements BTreeIndexService {
         this.search = new RecordPageSearch(registry);
         this.comparator = new RecordComparator(registry);
         this.inserter = new RecordPageInserter(registry);
+        this.keyOrderValidator = new RecordPageKeyOrderValidator(registry);
     }
 
     /**
@@ -147,6 +152,8 @@ public final class LeafOnlyBTreeIndexService implements BTreeIndexService {
             throw new BTreeUnsupportedStructureException("leaf-only btree cannot read page level "
                     + header.level());
         }
+        keyOrderValidator.validate(index.rootPageId(), page, index.schema(), index.keyDef(),
+                RecordType.CONVENTIONAL);
         return page;
     }
 

@@ -86,10 +86,22 @@ public final class SegmentInodeRepository {
     }
 
     public SegmentInode read(MiniTransaction mtr, SpaceId spaceId, int inodeSlot) {
+        return read(mtr, spaceId, inodeSlot, PageLatchMode.SHARED);
+    }
+
+    /**
+     * 为马上会修改 segment 账本的调用方读取 inode，并从一开始持有 X latch，避免同一 MTR 随后分配/释放时
+     * 在 page2 上做不允许的 S→X 升级。
+     */
+    public SegmentInode readExclusive(MiniTransaction mtr, SpaceId spaceId, int inodeSlot) {
+        return read(mtr, spaceId, inodeSlot, PageLatchMode.EXCLUSIVE);
+    }
+
+    private SegmentInode read(MiniTransaction mtr, SpaceId spaceId, int inodeSlot, PageLatchMode mode) {
         requireMtr(mtr);
         requireSpace(spaceId);
         int base = requireSlot(spaceId, inodeSlot);
-        PageGuard g = mtr.getPage(pool, inodePage(spaceId), PageLatchMode.SHARED);
+        PageGuard g = mtr.getPage(pool, inodePage(spaceId), mode);
         if (g.readInt(base + SegmentInodeLayout.USED) == 0) {
             throw new FspMetadataException("inode slot is free: " + inodeSlot);
         }

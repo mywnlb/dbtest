@@ -67,7 +67,7 @@ public final class RecordFieldResolver {
             if (isNull[i]) {
                 continue;
             }
-            if (ct.storageKind() == StorageKind.VARIABLE) {
+            if (ct.storageKind() != StorageKind.FIXED) {
                 activeVarCount++;
             } else {
                 fixedAreaLen += registry.codecFor(ct).fixedWidth(ct);
@@ -86,7 +86,7 @@ public final class RecordFieldResolver {
             if (isNull[i]) {
                 continue;
             }
-            if (ct.storageKind() == StorageKind.VARIABLE) {
+            if (ct.storageKind() != StorageKind.FIXED) {
                 int len = dir.length(dirIdx++);
                 slices[i] = new FieldSlice(recordBytes, varOff, len);
                 varOff += len;

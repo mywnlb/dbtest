@@ -16,6 +16,7 @@ import cn.zhangyis.db.server.lockobs.snapshot.LockDiagnosticSnapshot;
 import cn.zhangyis.db.storage.api.DiskSpaceManager;
 import cn.zhangyis.db.storage.api.DiskSpaceUndoAllocator;
 import cn.zhangyis.db.storage.api.index.IndexPageAccess;
+import cn.zhangyis.db.storage.api.lob.LobStorage;
 import cn.zhangyis.db.storage.api.dml.ClusteredDmlService;
 import cn.zhangyis.db.storage.api.tablespace.PageZeroTablespaceMetadataLoader;
 import cn.zhangyis.db.storage.api.undotruncate.UndoTablespaceTruncationRecovery;
@@ -161,6 +162,8 @@ public final class StorageEngine {
     private RedoLogManager redo;
     private MiniTransactionManager miniTransactionManager;
     private DiskSpaceManager diskSpaceManager;
+    /** 0.21h off-page TEXT/BLOB/JSON 门面；与 B+Tree/Undo 共享同一 type registry、pool 与 FSP facade。 */
+    private LobStorage lobStorage;
     private TransactionManager transactionManager;
     private UndoLogManager undoLogManager;
     private SplitCapableBTreeIndexService btreeService;
@@ -347,6 +350,7 @@ public final class StorageEngine {
                 accessController, redo, redoCapacityThrottle, config.pageSize());
 
         TypeCodecRegistry typeRegistry = new TypeCodecRegistry();
+        this.lobStorage = new LobStorage(diskSpaceManager, pool, config.pageSize(), typeRegistry);
         this.transactionManager = new TransactionManager(txnSystem);
         this.rollbackSlots = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), config.slotCapacity());
         this.rsegHeaderRepo = new RollbackSegmentHeaderRepository(pool, config.pageSize());
@@ -884,6 +888,12 @@ public final class StorageEngine {
     public DiskSpaceManager diskSpaceManager() {
         requireOpen();
         return diskSpaceManager;
+    }
+
+    /** Off-page TEXT/BLOB/JSON 页链门面；调用方必须用本 engine 的 MiniTransactionManager 开启 MTR。 */
+    public LobStorage lobStorage() {
+        requireOpen();
+        return lobStorage;
     }
 
     public SplitCapableBTreeIndexService btreeService() {

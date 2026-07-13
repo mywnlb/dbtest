@@ -102,6 +102,31 @@ class RedoRuntimeRecoveryTest {
         }
     }
 
+    /** LOB 不新增专用 redo record；稳定 PageType code 经既有 PAGE_INIT/PAGE_BYTES dispatcher 原样恢复。 */
+    @Test
+    void genericRecoveryReplaysBlobPageTypeAndBody() {
+        byte[] payload = new byte[]{0x4c, 0x4f, 0x42, 0x31};
+        Path redoPath = dir.resolve("lob-redo.log");
+        LogRange range;
+        try (RedoLogFileRepository repo = RedoLogFileRepository.open(redoPath)) {
+            RedoLogManager manager = RedoLogManager.durable(repo);
+            range = manager.append(List.of(
+                    new PageInitRecord(P, PageType.BLOB),
+                    new PageBytesRecord(P, PAYLOAD_OFFSET, payload)));
+            manager.flush();
+        }
+        try (PageStore store = createStore("lob.ibd");
+             RedoLogFileRepository repo = RedoLogFileRepository.open(redoPath)) {
+            RedoApplyDispatcher.pageDispatcher().applyAll(
+                    new RedoRecoveryReader(repo).readBatches(), new RedoApplyContext(store, PS));
+            byte[] page = readPage(store, P);
+            ByteBuffer view = ByteBuffer.wrap(page);
+            assertEquals(PageType.BLOB.code(), view.getInt(PageEnvelopeLayout.PAGE_TYPE));
+            assertEquals(range.end().value(), view.getLong(PageEnvelopeLayout.PAGE_LSN));
+            assertArrayEquals(payload, slice(page, PAYLOAD_OFFSET, payload.length));
+        }
+    }
+
     @Test
     void recoverySkipsPageWhosePageLsnAlreadyCoversBatch() {
         byte[] oldPayload = new byte[]{4, 4, 4};

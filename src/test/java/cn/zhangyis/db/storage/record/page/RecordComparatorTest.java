@@ -285,4 +285,42 @@ class RecordComparatorTest {
             assertTrue(comparator.compare(sup, anyKey, kd, schema) > 0, "supremum > any key");
         });
     }
+
+    /** record-to-record 必须与既有 record-to-search-key 共用完整复合 key 的排序语义。 */
+    @Test
+    void recordToRecordKeepsCompositeNullDescPrefixAndCollationOrder() {
+        TableSchema ciSchema = schema(ColumnType.varchar(
+                20, true, CharsetId.UTF8, CollationId.UTF8_ASCII_CI));
+        onPage(ciSchema, (rp, schema) -> {
+            RecordCursor left = place(rp, schema, 5, new ColumnValue.StringValue("Apple-x"));
+            RecordCursor equalPrefix = place(rp, schema, 5, new ColumnValue.StringValue("apple-y"));
+            RecordCursor later = place(rp, schema, 5, new ColumnValue.StringValue("banana"));
+            RecordCursor nullName = place(rp, schema, 5, ColumnValue.NullValue.INSTANCE);
+            IndexKeyDef prefixAsc = nameKeyDef(KeyOrder.ASC, 5);
+            IndexKeyDef desc = nameKeyDef(KeyOrder.DESC, 0);
+
+            assertEquals(0, comparator.compare(left, equalPrefix, prefixAsc, schema),
+                    "ASCII_CI + byte-prefix equivalent records must compare equal");
+            assertTrue(comparator.compare(left, later, desc, schema) > 0,
+                    "DESC reverses the natural Apple < banana order");
+            assertTrue(comparator.compare(nullName, left, desc, schema) > 0,
+                    "DESC reverses the ASC NULL-first rule");
+        });
+    }
+
+    /** record-to-record 仍需正确处理页内系统哨兵，不能尝试按用户 schema 解析其标签。 */
+    @Test
+    void recordToRecordKeepsSystemSentinelOrder() {
+        onPage((rp, schema) -> {
+            RecordCursor inf = new RecordCursor(rp, rp.infimumOffset(), schema, registry);
+            RecordCursor sup = new RecordCursor(rp, rp.supremumOffset(), schema, registry);
+            RecordCursor user = place(rp, schema, 5, new ColumnValue.StringValue("x"));
+            IndexKeyDef kd = keyDef(KeyOrder.ASC);
+
+            assertTrue(comparator.compare(inf, user, kd, schema) < 0);
+            assertTrue(comparator.compare(user, sup, kd, schema) < 0);
+            assertEquals(0, comparator.compare(inf, inf, kd, schema));
+            assertEquals(0, comparator.compare(sup, sup, kd, schema));
+        });
+    }
 }

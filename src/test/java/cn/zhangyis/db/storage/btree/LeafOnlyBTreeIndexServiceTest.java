@@ -4,6 +4,7 @@ import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.SpaceId;
+import cn.zhangyis.db.domain.Lsn;
 import cn.zhangyis.db.storage.api.index.IndexPageAccess;
 import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.LruBufferPool;
@@ -13,7 +14,10 @@ import cn.zhangyis.db.storage.fil.io.PageStore;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
 import cn.zhangyis.db.storage.record.format.LogicalRecord;
+import cn.zhangyis.db.storage.record.format.RecordEncoder;
 import cn.zhangyis.db.storage.record.format.RecordType;
+import cn.zhangyis.db.storage.record.page.RecordCursor;
+import cn.zhangyis.db.storage.record.page.RecordKeyOrderCorruptedException;
 import cn.zhangyis.db.storage.record.page.RecordPage;
 import cn.zhangyis.db.storage.record.page.RecordPageInserter;
 import cn.zhangyis.db.storage.record.page.SearchKey;
@@ -186,6 +190,39 @@ class LeafOnlyBTreeIndexServiceTest {
         });
     }
 
+    /** 物理结构合法但 key 逆序的 root leaf 必须在 lookup/insert 内容访问前 fail-closed。 */
+    @Test
+    void existingRootRejectsSemanticKeyCorruptionWithoutNewRedoOrDirtyState() {
+        onPool((pool, access, mgr) -> {
+            createRoot(access, mgr);
+            seedRows(access, mgr, 1, 2);
+            MiniTransaction corrupt = mgr.begin();
+            RecordPage page = access.openIndexPage(corrupt, ROOT, PageLatchMode.EXCLUSIVE);
+            int first = page.recordOffsetsInOrder().get(0);
+            replaceIdField(page, first, 3, schema());
+            mgr.commit(corrupt);
+
+            int redoBefore = mgr.redoLogManager().bufferedRecords().size();
+            var dirtyBefore = pool.dirtyPageCandidates(Lsn.of(Long.MAX_VALUE), pool.capacity());
+            BTreeIndexService service = new LeafOnlyBTreeIndexService(access, registry);
+
+            MiniTransaction read = mgr.begin();
+            assertThrows(RecordKeyOrderCorruptedException.class,
+                    () -> service.lookup(read, index(), kId(2)));
+            mgr.rollbackUncommitted(read);
+
+            MiniTransaction write = mgr.begin();
+            assertThrows(RecordKeyOrderCorruptedException.class,
+                    () -> service.insert(write, index(), row(4, "v4")));
+            mgr.rollbackUncommitted(write);
+
+            assertEquals(redoBefore, mgr.redoLogManager().bufferedRecords().size(),
+                    "rejected semantic validation must not append redo");
+            assertEquals(dirtyBefore, pool.dirtyPageCandidates(Lsn.of(Long.MAX_VALUE), pool.capacity()),
+                    "rejected semantic validation must not change dirty-page state");
+        });
+    }
+
     @Test
     void nonLeafRootIsRejected() {
         onPool((pool, access, mgr) -> {
@@ -228,5 +265,16 @@ class LeafOnlyBTreeIndexServiceTest {
                 .map(values -> (ColumnValue.IntValue) values.get(0))
                 .map(ColumnValue.IntValue::value)
                 .toList();
+    }
+
+    /** 保留物理记录头和长度，仅把 INT key 改为同宽值，制造 validator 专属的语义损坏。 */
+    private void replaceIdField(RecordPage page, int offset, long replacementId, TableSchema schema) {
+        RecordCursor cursor = new RecordCursor(page, offset, schema, registry);
+        int fieldOffset = cursor.columnSlice(new ColumnId(0)).offset();
+        int fieldLength = cursor.columnSlice(new ColumnId(0)).length();
+        byte[] original = page.readRecordBytes(offset);
+        byte[] replacement = new RecordEncoder(registry).encode(row(replacementId, "v" + replacementId), schema);
+        System.arraycopy(replacement, fieldOffset, original, fieldOffset, fieldLength);
+        page.writeRecordBytes(offset, original);
     }
 }

@@ -31,6 +31,10 @@ public enum RedoBudgetPurpose {
     UNDO_TRUNCATE_LIFECYCLE,
     /** undo tablespace FSP 固定布局重建。 */
     UNDO_TRUNCATE_REBUILD,
+    /** 写入并格式化一条 off-page LOB 页链。 */
+    LOB_WRITE,
+    /** 校验并释放一条 off-page LOB 页链。 */
+    LOB_FREE,
     /** 仅供 no-op manager 的页原语测试；生产 capacity-aware manager 禁止隐式使用。 */
     TEST_UNBOUNDED
 }

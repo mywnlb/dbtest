@@ -144,6 +144,10 @@ class PageCleanerSupervisorTest {
             supervisor.start();
             supervisor.requestFlush(1);
             assertTrue(second.started.await(1, TimeUnit.SECONDS), "supervisor did not restart first failed worker");
+            // worker.start 的测试 latch 早于 supervisor 在锁内发布 replacement；必须等 supervisor IDLE，
+            // 否则全量并发负载下下一请求可能仍观察到已停止的旧 worker，形成测试自身的竞态。
+            assertTrue(supervisor.awaitState(PageCleanerState.IDLE, Duration.ofSeconds(1)),
+                    "supervisor did not publish restarted worker");
             supervisor.requestFlush(1);
 
             assertTrue(supervisor.awaitState(PageCleanerState.FAILED, Duration.ofSeconds(1)));

@@ -40,7 +40,7 @@ final class MtrOperationRedoBudgetEstimator {
             case UNDO_TRUNCATE_LIFECYCLE -> 4;
             case UNDO_TRUNCATE_REBUILD -> 24;
             case CLUSTERED_INSERT, CLUSTERED_UPDATE, CLUSTERED_DELETE, PURGE_INDEX,
-                    ROLLBACK_INVERSE, UNDO_FINALIZATION -> throw new DatabaseValidationException(
+                    ROLLBACK_INVERSE, UNDO_FINALIZATION, LOB_WRITE, LOB_FREE -> throw new DatabaseValidationException(
                     "dynamic redo budget purpose requires a domain workload: " + purpose);
             case READ_ONLY, TEST_UNBOUNDED -> throw new DatabaseValidationException(
                     "non-write redo purpose has no production profile: " + purpose);
@@ -58,7 +58,7 @@ final class MtrOperationRedoBudgetEstimator {
         }
         switch (purpose) {
             case CLUSTERED_INSERT, CLUSTERED_UPDATE, CLUSTERED_DELETE, PURGE_INDEX,
-                    ROLLBACK_INVERSE, UNDO_FINALIZATION -> {
+                    ROLLBACK_INVERSE, UNDO_FINALIZATION, LOB_WRITE, LOB_FREE -> {
                 // 这些操作的上界依赖领域事实；固定布局 purpose 必须继续走权威固定 profile。
             }
             default -> throw new DatabaseValidationException(

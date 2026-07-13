@@ -37,7 +37,11 @@ class CharacterTypeRegistryTest {
         assertSame(BinaryCollation.INSTANCE, registry.collationFor(CharsetId.LATIN1, CollationId.BINARY));
         assertSame(AsciiCaseInsensitiveCollation.INSTANCE,
                 registry.collationFor(CharsetId.UTF8, CollationId.UTF8_ASCII_CI));
+        assertSame(UnicodeWeightCollationV1.INSTANCE,
+                registry.collationFor(CharsetId.UTF8, CollationId.UTF8_UNICODE_CI_V1));
         assertThrows(UnsupportedCollationException.class,
                 () -> registry.collationFor(CharsetId.UTF8, CollationId.LATIN1_ASCII_CI));
+        assertThrows(UnsupportedCollationException.class,
+                () -> registry.collationFor(CharsetId.LATIN1, CollationId.UTF8_UNICODE_CI_V1));
     }
 }

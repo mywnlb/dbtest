@@ -23,7 +23,9 @@ public enum PageType {
     /** Undo 日志页：承载 undo page header + undo record（T1.3a 起）。 */
     UNDO(6),
     /** Rollback segment header 页：undo 表空间 page3，承载 slot 目录（slot -> insert-undo 首页），0.3 起。 */
-    RSEG_HEADER(7);
+    RSEG_HEADER(7),
+    /** Off-page TEXT/BLOB/JSON payload chain 页（0.21h）。 */
+    BLOB(8);
 
     private final int code;
 

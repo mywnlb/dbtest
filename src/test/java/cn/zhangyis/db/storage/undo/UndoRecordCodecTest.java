@@ -2,6 +2,9 @@ package cn.zhangyis.db.storage.undo;
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageNo;
+import cn.zhangyis.db.domain.LobReference;
+import cn.zhangyis.db.domain.SegmentId;
+import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.domain.RollPointer;
 import cn.zhangyis.db.domain.TransactionId;
 import cn.zhangyis.db.domain.UndoNo;
@@ -12,7 +15,9 @@ import cn.zhangyis.db.storage.record.schema.IndexKeyDef;
 import cn.zhangyis.db.storage.record.schema.KeyOrder;
 import cn.zhangyis.db.storage.record.schema.KeyPartDef;
 import cn.zhangyis.db.storage.record.schema.TableSchema;
+import cn.zhangyis.db.storage.record.schema.TypeId;
 import cn.zhangyis.db.storage.record.type.ColumnValue;
+import cn.zhangyis.db.storage.record.type.TemporalKind;
 import cn.zhangyis.db.storage.record.type.TypeCodecRegistry;
 import org.junit.jupiter.api.Test;
 
@@ -80,6 +85,26 @@ class UndoRecordCodecTest {
         assertEquals(r, back);
         assertTrue(back.prevRollPointer().insert());
         assertEquals(ColumnValue.NullValue.INSTANCE, back.clusterKey().get(1));
+    }
+
+    /** 新时间标量必须经 UndoRecordCodec 的真实 self-framing key payload 往返，不能只在 RecordCodec 生效。 */
+    @Test void roundTripsInlineTemporalClusterKey() {
+        TableSchema schema = new TableSchema(1, List.of(
+                new ColumnDef(new ColumnId(0), "duration", ColumnType.time(false), 0),
+                new ColumnDef(new ColumnId(1), "created_at", ColumnType.timestamp(false), 1),
+                new ColumnDef(new ColumnId(2), "year_value", ColumnType.year(false), 2)), true);
+        IndexKeyDef keyDef = new IndexKeyDef(9L, List.of(
+                new KeyPartDef(new ColumnId(0), KeyOrder.ASC, 0),
+                new KeyPartDef(new ColumnId(1), KeyOrder.ASC, 0),
+                new KeyPartDef(new ColumnId(2), KeyOrder.ASC, 0)));
+        List<ColumnValue> key = List.of(
+                new ColumnValue.TemporalValue(TemporalKind.TIME, -86_400_000L),
+                new ColumnValue.TemporalValue(TemporalKind.TIMESTAMP, 1_700_000_000_000L),
+                new ColumnValue.TemporalValue(TemporalKind.YEAR, 2026));
+        UndoRecord expected = rec(key, RollPointer.NULL);
+        UndoRecordCodec codec = new UndoRecordCodec(registry);
+
+        assertEquals(expected, codec.decode(codec.encode(expected, keyDef, schema), 0, keyDef, schema));
     }
 
     @Test void decodeRejectsTruncated() {
@@ -150,6 +175,25 @@ class UndoRecordCodecTest {
         UndoRecordCodec codec = new UndoRecordCodec(registry);
         UndoRecord back = codec.decode(codec.encode(r, twoColKey(), twoColSchema()), 0, twoColKey(), twoColSchema());
         assertEquals(ColumnValue.NullValue.INSTANCE, back.oldColumnValues().get(1));
+    }
+
+    /** UPDATE undo 保存 external reference 本身，不复制大 payload；rollback 可据此恢复旧聚簇记录引用。 */
+    @Test void updateRoundTripsExternalLobReferenceInOldImage() {
+        TableSchema schema = new TableSchema(1, List.of(
+                new ColumnDef(new ColumnId(0), "id", ColumnType.intType(false, false), 0),
+                new ColumnDef(new ColumnId(1), "payload", ColumnType.longBlob(true), 1)), true);
+        IndexKeyDef keyDef = new IndexKeyDef(9L, List.of(
+                new KeyPartDef(new ColumnId(0), KeyOrder.ASC, 0)));
+        LobReference reference = new LobReference(SpaceId.of(7), PageNo.of(64), 80_000, 5,
+                SegmentId.of(4), 2, 0x1234_5678L);
+        ColumnValue.ExternalValue external = new ColumnValue.ExternalValue(
+                TypeId.LONGBLOB, reference, new byte[]{1, 2, 3});
+        UndoRecord record = updateRec(List.of(new ColumnValue.IntValue(1)),
+                List.of(new ColumnValue.IntValue(1), external), RollPointer.NULL);
+        UndoRecordCodec codec = new UndoRecordCodec(registry);
+
+        UndoRecord decoded = codec.decode(codec.encode(record, keyDef, schema), 0, keyDef, schema);
+        assertEquals(external, decoded.oldColumnValues().get(1));
     }
 
     @Test void decodeRejectsUpdateTruncated() {

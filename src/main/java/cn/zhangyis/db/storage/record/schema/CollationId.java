@@ -12,7 +12,10 @@ public enum CollationId {
     UTF8_ASCII_CI(2),
 
     /** LATIN1 教学型大小写不敏感排序：仅折叠 ASCII A-Z。 */
-    LATIN1_ASCII_CI(3);
+    LATIN1_ASCII_CI(3),
+
+    /** UTF8 稳定教学权重 V1：固定 case/accent/combining-mark 主权重规则。 */
+    UTF8_UNICODE_CI_V1(4);
 
     /** 与枚举声明顺序无关的稳定编号。 */
     private final int stableId;

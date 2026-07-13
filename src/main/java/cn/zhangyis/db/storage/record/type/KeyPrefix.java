@@ -2,6 +2,8 @@ package cn.zhangyis.db.storage.record.type;
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.storage.record.schema.ColumnType;
+import cn.zhangyis.db.storage.record.schema.CollationId;
+import cn.zhangyis.db.storage.record.schema.CharsetId;
 import cn.zhangyis.db.storage.record.schema.TypeId;
 
 /**
@@ -41,10 +43,34 @@ public final class KeyPrefix {
                     "prefix index length only applies to CHAR/VARCHAR/BINARY/VARBINARY, not " + type.typeId());
         }
         int len = Math.min(encoded.length(), prefixBytes);
+        if ((type.typeId() == TypeId.CHAR || type.typeId() == TypeId.VARCHAR)
+                && type.charset() == CharsetId.UTF8
+                && type.collation() == CollationId.UTF8_UNICODE_CI_V1) {
+            len = completeUtf8PrefixLength(encoded, len);
+        }
         if (len == encoded.length()) {
             return encoded;
         }
         return new FieldSlice(encoded.backing(), encoded.offset(), len);
+    }
+
+    /**
+     * 先严格验证完整字段，再把 byte budget 退到最后一个完整 UTF-8 code point；最多回退 3B，不改变其它 collation
+     * 的历史 byte-prefix 语义。完整验证防止损坏字段通过“截掉坏尾部”伪装成合法 prefix。
+     */
+    private static int completeUtf8PrefixLength(FieldSlice encoded, int candidateLength) {
+        CharacterTypeRegistry characters = CharacterTypeRegistry.defaults();
+        characters.decode(encoded, CharsetId.UTF8);
+        int length = candidateLength;
+        while (length > 0) {
+            try {
+                characters.decode(new FieldSlice(encoded.backing(), encoded.offset(), length), CharsetId.UTF8);
+                return length;
+            } catch (InvalidCharacterEncodingException ignoredIncompleteTail) {
+                length--;
+            }
+        }
+        return 0;
     }
 
     private static boolean isBytePrefixable(TypeId typeId) {

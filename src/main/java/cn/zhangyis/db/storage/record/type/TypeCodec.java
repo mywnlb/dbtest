@@ -23,6 +23,14 @@ public interface TypeCodec {
     /** 比较两个已编码切片，返回 &lt;0/0/&gt;0；字符类型服从 ColumnType 声明的 collation。 */
     int compare(FieldSlice left, FieldSlice right, ColumnType type);
 
+    /**
+     * 比较索引 key part。普通类型复用既有 byte-prefix 后的 compare；LOB codec 可解释 inline/external envelope，
+     * JSON 等不可索引类型也在这一稳定扩展点 fail-closed。
+     */
+    default int compareKeyPart(FieldSlice left, FieldSlice right, ColumnType type, int prefixBytes) {
+        return compare(KeyPrefix.apply(left, type, prefixBytes), KeyPrefix.apply(right, type, prefixBytes), type);
+    }
+
     /** 校验值与类型相容、长度/范围合法；不合法抛领域异常。 */
     void validate(ColumnValue value, ColumnType type);
 }

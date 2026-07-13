@@ -51,9 +51,7 @@ public final class EncodedKeyPartComparator {
         } else if (leftNull || rightNull) {
             naturalOrder = leftNull ? -1 : 1;
         } else {
-            FieldSlice leftPrefix = KeyPrefix.apply(left, type, part.prefixBytes());
-            FieldSlice rightPrefix = KeyPrefix.apply(right, type, part.prefixBytes());
-            naturalOrder = Integer.signum(codec.compare(leftPrefix, rightPrefix, type));
+            naturalOrder = Integer.signum(codec.compareKeyPart(left, right, type, part.prefixBytes()));
         }
         return part.order() == KeyOrder.DESC ? -naturalOrder : naturalOrder;
     }

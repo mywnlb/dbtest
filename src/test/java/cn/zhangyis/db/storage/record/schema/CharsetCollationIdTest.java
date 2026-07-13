@@ -24,6 +24,7 @@ class CharsetCollationIdTest {
 
     @Test
     void collationStableIdsAreUniqueAndReversible() {
+        assertEquals(4, CollationId.UTF8_UNICODE_CI_V1.stableId());
         HashSet<Integer> ids = new HashSet<>();
         for (CollationId collation : CollationId.values()) {
             ids.add(collation.stableId());

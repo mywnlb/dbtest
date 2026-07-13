@@ -25,6 +25,8 @@ public final class CharacterTypeRegistry {
                     new CharsetCollationKey(CharsetId.UTF8, CollationId.BINARY), BinaryCollation.INSTANCE,
                     new CharsetCollationKey(CharsetId.UTF8, CollationId.UTF8_ASCII_CI),
                     AsciiCaseInsensitiveCollation.INSTANCE,
+                    new CharsetCollationKey(CharsetId.UTF8, CollationId.UTF8_UNICODE_CI_V1),
+                    UnicodeWeightCollationV1.INSTANCE,
                     new CharsetCollationKey(CharsetId.LATIN1, CollationId.BINARY), BinaryCollation.INSTANCE,
                     new CharsetCollationKey(CharsetId.LATIN1, CollationId.LATIN1_ASCII_CI),
                     AsciiCaseInsensitiveCollation.INSTANCE));

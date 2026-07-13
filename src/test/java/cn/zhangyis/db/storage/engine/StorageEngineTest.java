@@ -123,6 +123,7 @@ class StorageEngineTest {
         assertNotNull(engine.transactionManager());
         assertNotNull(engine.miniTransactionManager());
         assertNotNull(engine.diskSpaceManager());
+        assertNotNull(engine.lobStorage());
         assertNotNull(engine.btreeService());
         assertNotNull(engine.undoLogManager());
         assertNotNull(engine.mvccReader());
@@ -132,6 +133,39 @@ class StorageEngineTest {
         assertEquals(EngineState.CLOSED, engine.state());
         engine.close(); // 幂等
         assertEquals(EngineState.CLOSED, engine.state());
+    }
+
+    /** 生产组合根的 capacity-aware MTR 可用 LOB_WRITE profile 完成真实多页写读，不依赖测试 no-op manager。 */
+    @Test
+    void engineLobFacadeUsesSharedDiskPoolCodecAndRedoBudget() {
+        StorageEngine engine = new StorageEngine(config());
+        engine.open();
+        try {
+            MiniTransactionManager manager = engine.miniTransactionManager();
+            MiniTransaction create = manager.begin(manager.budgetFor(RedoBudgetPurpose.ENGINE_BOOT));
+            engine.diskSpaceManager().createTablespace(
+                    create, DATA_SPACE, dir.resolve("lob-data.ibd"), PageNo.of(128));
+            SegmentRef segment = engine.diskSpaceManager().createSegment(
+                    create, DATA_SPACE, SegmentPurpose.LOB);
+            manager.commit(create);
+
+            byte[] payload = new byte[20_000];
+            payload[0] = 1;
+            payload[payload.length - 1] = 2;
+            MiniTransaction write = manager.begin(manager.budgetFor(
+                    RedoBudgetPurpose.LOB_WRITE, engine.lobStorage().writeWorkload(payload.length)));
+            ColumnValue.ExternalValue external = engine.lobStorage().write(write, segment,
+                    ColumnType.longBlob(false), new ColumnValue.BinaryValue(payload));
+            manager.commit(write);
+
+            MiniTransaction read = manager.beginReadOnly();
+            ColumnValue.BinaryValue decoded = (ColumnValue.BinaryValue) engine.lobStorage().read(
+                    read, ColumnType.longBlob(false), external);
+            manager.commit(read);
+            assertArrayEquals(payload, decoded.value());
+        } finally {
+            engine.close();
+        }
     }
 
     @Test

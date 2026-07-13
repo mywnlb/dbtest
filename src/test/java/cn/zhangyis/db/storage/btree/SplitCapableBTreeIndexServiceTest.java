@@ -25,8 +25,10 @@ import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
 import cn.zhangyis.db.storage.page.FilePageHeader;
 import cn.zhangyis.db.storage.page.PageType;
 import cn.zhangyis.db.storage.record.format.LogicalRecord;
+import cn.zhangyis.db.storage.record.format.RecordEncoder;
 import cn.zhangyis.db.storage.record.format.RecordType;
 import cn.zhangyis.db.storage.record.page.RecordCursor;
+import cn.zhangyis.db.storage.record.page.RecordKeyOrderCorruptedException;
 import cn.zhangyis.db.storage.record.page.RecordPage;
 import cn.zhangyis.db.storage.record.page.RecordRef;
 import cn.zhangyis.db.storage.record.page.SearchKey;
@@ -151,6 +153,48 @@ class SplitCapableBTreeIndexServiceTest {
             assertEquals(ctx.rootPageId, current.rootPageId());
             assertFound(ctx, current, 1);
             assertFound(ctx, current, 4);
+        });
+    }
+
+    /** SplitCapable 必须在选择 child 前拒绝物理合法但 low-key 逆序的 internal root。 */
+    @Test
+    void lookupRejectsSemanticallyCorruptedInternalPageBeforeNavigation() {
+        onBTreePool((ctx) -> {
+            BTreeIndex current = ctx.insertWideRows(1, 4);
+            BTreeNodePointerSchema pointerSchema = BTreeNodePointerSchema.from(current);
+            MiniTransaction corrupt = ctx.mgr.begin();
+            RecordPage root = ctx.access.openIndexPage(corrupt, current.rootPageId(), PageLatchMode.EXCLUSIVE);
+            int first = root.recordOffsetsInOrder().get(0);
+            BTreeNodePointer original = new BTreeNodePointerCodec().fromRecord(
+                    new RecordCursor(root, first, pointerSchema.schema(), registry).materialize(), pointerSchema);
+            LogicalRecord replacement = new BTreeNodePointerCodec().toRecord(
+                    new BTreeNodePointer(kId(999), original.childPageId()), pointerSchema);
+            replaceKeyField(root, first, replacement, pointerSchema.schema(), new ColumnId(0));
+            ctx.mgr.commit(corrupt);
+
+            MiniTransaction read = ctx.mgr.begin();
+            assertThrows(RecordKeyOrderCorruptedException.class,
+                    () -> ctx.service().lookup(read, current, kId(2)));
+            ctx.mgr.rollbackUncommitted(read);
+        });
+    }
+
+    /** SplitCapable 下降到 leaf 后必须先验证页内顺序，再执行 record search。 */
+    @Test
+    void lookupRejectsSemanticallyCorruptedLeafAfterDescent() {
+        onBTreePool((ctx) -> {
+            BTreeIndex current = ctx.insertWideRows(1, 4);
+            PageId firstLeaf = rootPointers(ctx, current).get(0).childPageId();
+            MiniTransaction corrupt = ctx.mgr.begin();
+            RecordPage leaf = ctx.access.openIndexPage(corrupt, firstLeaf, PageLatchMode.EXCLUSIVE);
+            int first = leaf.recordOffsetsInOrder().get(0);
+            replaceKeyField(leaf, first, wideRow(999), current.schema(), new ColumnId(0));
+            ctx.mgr.commit(corrupt);
+
+            MiniTransaction read = ctx.mgr.begin();
+            assertThrows(RecordKeyOrderCorruptedException.class,
+                    () -> ctx.service().lookup(read, current, kId(1)));
+            ctx.mgr.rollbackUncommitted(read);
         });
     }
 
@@ -904,6 +948,18 @@ class SplitCapableBTreeIndexServiceTest {
 
     private static long idOf(BTreeLookupResult row) {
         return ((ColumnValue.IntValue) row.record().columnValues().get(0)).value();
+    }
+
+    /** 保留记录头与其余列，只替换同宽 key slice，确保物理页 validator 仍能通过。 */
+    private void replaceKeyField(RecordPage page, int offset, LogicalRecord replacement,
+                                 TableSchema schema, ColumnId keyColumn) {
+        RecordCursor cursor = new RecordCursor(page, offset, schema, registry);
+        int fieldOffset = cursor.columnSlice(keyColumn).offset();
+        int fieldLength = cursor.columnSlice(keyColumn).length();
+        byte[] original = page.readRecordBytes(offset);
+        byte[] encoded = new RecordEncoder(registry).encode(replacement, schema);
+        System.arraycopy(encoded, fieldOffset, original, fieldOffset, fieldLength);
+        page.writeRecordBytes(offset, original);
     }
 
     private static void persistRedoBatches(Path redoPath, List<RedoLogBatch> batches) {

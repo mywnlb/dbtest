@@ -43,7 +43,18 @@ public final class TypeCodecRegistry {
             }
             case VARBINARY -> new VarBytesCodec(type.length(), false);
             case DATE -> new TemporalCodec(TemporalKind.DATE);
+            case TIME -> new TemporalCodec(TemporalKind.TIME);
             case DATETIME -> new TemporalCodec(TemporalKind.DATETIME);
+            case TIMESTAMP -> new TemporalCodec(TemporalKind.TIMESTAMP);
+            case YEAR -> new TemporalCodec(TemporalKind.YEAR);
+            case BIT -> new BitCodec(type.length());
+            case ENUM -> new EnumCodec(type.symbols().size());
+            case SET -> new SetCodec(type.symbols().size());
+            case TINYTEXT, TEXT, MEDIUMTEXT, LONGTEXT -> new LobCodec(
+                    type.typeId(), true, false, characters);
+            case TINYBLOB, BLOB, MEDIUMBLOB, LONGBLOB -> new LobCodec(
+                    type.typeId(), false, false, characters);
+            case JSON -> new LobCodec(type.typeId(), true, true, characters);
         };
     }
 

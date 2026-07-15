@@ -5,6 +5,7 @@ import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.TransactionId;
 import cn.zhangyis.db.domain.TransactionNo;
 import cn.zhangyis.db.domain.UndoSlotId;
+import cn.zhangyis.db.storage.undo.UndoLogKind;
 
 /**
  * page3 slot 与 undo first-page header 的无 latch 恢复快照。
@@ -20,18 +21,22 @@ import cn.zhangyis.db.domain.UndoSlotId;
  */
 public record RecoveredUndoSlotEvidence(UndoSlotId slotId,
                                        PageId firstPageId,
+                                       UndoLogKind kind,
                                        RecoveredUndoState state,
                                        TransactionId creatorTransactionId,
                                        TransactionNo transactionNo) {
 
     public RecoveredUndoSlotEvidence {
-        if (slotId == null || firstPageId == null || state == null
+        if (slotId == null || firstPageId == null || kind == null || state == null
                 || creatorTransactionId == null || transactionNo == null) {
             throw new DatabaseValidationException("recovered undo slot evidence fields must not be null");
         }
         if (creatorTransactionId.isNone()) {
             throw new TransactionRecoveryException(
                     "recovered undo slot has NONE creator transaction id: slot=" + slotId.value());
+        }
+        if (kind == UndoLogKind.TEMPORARY) {
+            throw new TransactionRecoveryException("ordinary page3 slot cannot contain TEMPORARY undo");
         }
         if (state == RecoveredUndoState.ACTIVE && !transactionNo.isNone()) {
             throw new TransactionRecoveryException(
@@ -41,20 +46,24 @@ public record RecoveredUndoSlotEvidence(UndoSlotId slotId,
             throw new TransactionRecoveryException(
                     "COMMITTED recovered undo slot has no commit number: slot=" + slotId.value());
         }
+        if (state == RecoveredUndoState.COMMITTED && kind != UndoLogKind.UPDATE) {
+            throw new TransactionRecoveryException("COMMITTED page3 slot must be UPDATE undo: slot="
+                    + slotId.value() + ", kind=" + kind);
+        }
     }
 
     /** 构造未提交的 ACTIVE slot 证据。 */
     public static RecoveredUndoSlotEvidence active(
-            UndoSlotId slotId, PageId firstPageId, TransactionId creatorTransactionId) {
-        return new RecoveredUndoSlotEvidence(slotId, firstPageId, RecoveredUndoState.ACTIVE,
+            UndoSlotId slotId, PageId firstPageId, UndoLogKind kind, TransactionId creatorTransactionId) {
+        return new RecoveredUndoSlotEvidence(slotId, firstPageId, kind, RecoveredUndoState.ACTIVE,
                 creatorTransactionId, TransactionNo.NONE);
     }
 
     /** 构造已提交、待 history rebuild 的 slot 证据。 */
     public static RecoveredUndoSlotEvidence committed(
-            UndoSlotId slotId, PageId firstPageId, TransactionId creatorTransactionId,
+            UndoSlotId slotId, PageId firstPageId, UndoLogKind kind, TransactionId creatorTransactionId,
             TransactionNo transactionNo) {
-        return new RecoveredUndoSlotEvidence(slotId, firstPageId, RecoveredUndoState.COMMITTED,
+        return new RecoveredUndoSlotEvidence(slotId, firstPageId, kind, RecoveredUndoState.COMMITTED,
                 creatorTransactionId, transactionNo);
     }
 }

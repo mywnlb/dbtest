@@ -6,11 +6,15 @@ import cn.zhangyis.db.domain.RollbackSegmentId;
 import cn.zhangyis.db.domain.UndoSlotId;
 
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.List;
 
 /**
  * 内存 rollback segment slot 目录（设计 §5.4/§6.3/§9.3，T1.3c 简化版）。固定单一默认
- * {@link RollbackSegmentId}，用内存 slot array 记录 {@code UndoSlotId -> insertUndoFirstPageId}，供事务运行时
- * 定位 insert undo segment 首页，并用显式状态保护认领与物理终结之间的并发窗口。
+ * {@link RollbackSegmentId}，用内存 slot array 记录 {@code UndoSlotId -> undoFirstPageId}，供事务运行时
+ * 定位独立 INSERT/UPDATE undo segment 首页，并用显式状态保护认领与物理终结之间的并发窗口。
  *
  * <p><b>并发边界</b>：单把 {@link ReentrantLock} 只保护
  * {@code FREE -> RESERVED -> ACTIVE -> FINALIZING -> FREE} 短状态转换。锁内不做页分配、不访问 BufferPool、
@@ -63,19 +67,19 @@ public final class RollbackSegmentSlotManager {
     }
 
     /**
-     * 认领一个空闲 slot 并登记 insert undo segment 首页。数据流：加锁 → 顺序扫描首个 null slot → 写入
+     * 认领一个空闲 slot 并登记某一 kind 的 undo segment 首页。数据流：加锁 → 顺序扫描首个 null slot → 写入
      * {@code firstPageId}、activeCount++ → 返回 {@link UndoSlotId}；无空槽抛 {@link UndoSlotExhaustedException}。
      * 锁内不分配页、不访问 BufferPool。
      *
-     * @param insertUndoFirstPageId 已由 {@code UndoLogSegmentAccess.create} 分配的 undo segment 首页。
+     * @param undoFirstPageId 已由 {@code UndoLogSegmentAccess.create} 分配的 undo segment 首页。
      * @return 认领到的 slot id。
      */
-    UndoSlotId claim(PageId insertUndoFirstPageId) {
-        if (insertUndoFirstPageId == null) {
+    UndoSlotId claim(PageId undoFirstPageId) {
+        if (undoFirstPageId == null) {
             throw new DatabaseValidationException("insert undo first page id must not be null");
         }
         try (ClaimLease claim = reserveClaim()) {
-            claim.bind(insertUndoFirstPageId);
+            claim.bind(undoFirstPageId);
             return claim.slotId();
         }
     }
@@ -167,14 +171,51 @@ public final class RollbackSegmentSlotManager {
     }
 
     /**
-     * 查询 slot 登记的 insert undo segment 首页。未认领或越界 slot 抛
+     * 以全有或全无方式独占同一事务的多个 ACTIVE slot。全部 owner 在一段短锁临界区内校验后才一起进入
+     * FINALIZING；任一冲突都不会改变任何 slot。调用方随后在锁外完成双 segment MTR。
+     */
+    BatchFinalizationLease beginBatchFinalization(Collection<UndoLogBinding> bindings) {
+        if (bindings == null || bindings.isEmpty() || bindings.stream().anyMatch(java.util.Objects::isNull)) {
+            throw new DatabaseValidationException("batch finalization bindings must not be empty");
+        }
+        List<FinalizationTarget> targets = bindings.stream()
+                .map(binding -> new FinalizationTarget(binding.slotId(), binding.firstPageId()))
+                .sorted(Comparator.comparingInt(target -> target.slotId().value()))
+                .toList();
+        lock.lock();
+        try {
+            int previous = -1;
+            for (FinalizationTarget target : targets) {
+                int idx = requireIndex(target.slotId(), "begin batch finalization");
+                if (idx == previous) {
+                    throw new DatabaseValidationException("duplicate undo slot in batch finalization: " + idx);
+                }
+                previous = idx;
+                if (states[idx] != SlotLifecycleState.ACTIVE
+                        || !target.firstPageId().equals(slots[idx])) {
+                    throw new DatabaseValidationException("batch finalization requires matching ACTIVE undo slot "
+                            + idx + ": expected=" + target.firstPageId() + ", current=" + slots[idx]
+                            + ", state=" + states[idx]);
+                }
+            }
+            for (FinalizationTarget target : targets) {
+                states[target.slotId().value()] = SlotLifecycleState.FINALIZING;
+            }
+            return new BatchFinalizationLease(this, targets);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 查询 slot 登记的 undo segment 首页。未认领或越界 slot 抛
      * {@link DatabaseValidationException}，不静默返回 null——否则会让 {@code UndoLogManager} 拿到 stale 定位
      * 去 reopen 错误的 undo segment。
      *
      * @param slot 要查询的 slot。
-     * @return 该 slot 登记的 insert undo 首页。
+     * @return 该 slot 登记的 undo 首页。
      */
-    public PageId insertUndoFirstPageId(UndoSlotId slot) {
+    public PageId undoFirstPageId(UndoSlotId slot) {
         if (slot == null) {
             throw new DatabaseValidationException("slot must not be null");
         }
@@ -199,10 +240,10 @@ public final class RollbackSegmentSlotManager {
      * 是恢复编排 bug，必须抛 {@link DatabaseValidationException} 不静默，否则 activeCount 失衡。
      *
      * @param slot                 磁盘记录的 slot 下标。
-     * @param insertUndoFirstPageId 该 slot 登记的 insert undo segment 首页。
+     * @param undoFirstPageId 该 slot 登记的 undo segment 首页。
      */
-    public void restore(UndoSlotId slot, PageId insertUndoFirstPageId) {
-        if (slot == null || insertUndoFirstPageId == null) {
+    public void restore(UndoSlotId slot, PageId undoFirstPageId) {
+        if (slot == null || undoFirstPageId == null) {
             throw new DatabaseValidationException("restore slot/first page id must not be null");
         }
         lock.lock();
@@ -214,7 +255,7 @@ public final class RollbackSegmentSlotManager {
             if (states[idx] != SlotLifecycleState.FREE) {
                 throw new DatabaseValidationException("restore of already-occupied undo slot: " + idx);
             }
-            slots[idx] = insertUndoFirstPageId;
+            slots[idx] = undoFirstPageId;
             states[idx] = SlotLifecycleState.ACTIVE;
             activeCount++;
         } finally {
@@ -330,7 +371,7 @@ public final class RollbackSegmentSlotManager {
     }
 
     /**
-     * 终结租约。调用方必须先完成全部只读预检，再调用 {@link #physicalMutationStarted()}，成功提交 drop+clear MTR 后
+     * 终结租约。调用方必须先完成全部只读预检，再调用 {@link #physicalMutationStarted()}，成功提交 cache/drop owner MTR 后
      * 调用 {@link #complete()}。一旦声明物理修改开始，异常退出会把槽保留为 FINALIZING，防止同进程误复用。
      */
     static final class FinalizationLease implements AutoCloseable {
@@ -392,6 +433,105 @@ public final class RollbackSegmentSlotManager {
             if (closed) {
                 throw new DatabaseValidationException(operation + " on closed finalization lease: "
                         + slotId.value());
+            }
+        }
+    }
+
+    /** 多 slot 终结租约；物理边界与完成发布都对整批 slot 同步执行。 */
+    static final class BatchFinalizationLease implements AutoCloseable {
+        private final RollbackSegmentSlotManager owner;
+        private final List<FinalizationTarget> targets;
+        private boolean physicalMutationStarted;
+        private boolean completed;
+        private boolean closed;
+
+        private BatchFinalizationLease(RollbackSegmentSlotManager owner, List<FinalizationTarget> targets) {
+            this.owner = owner;
+            this.targets = List.copyOf(targets);
+        }
+
+        void physicalMutationStarted() {
+            requireOpen("mark batch physical mutation");
+            if (physicalMutationStarted) {
+                throw new DatabaseValidationException("batch physical mutation already marked");
+            }
+            owner.validateBatchFinalizing(targets);
+            physicalMutationStarted = true;
+        }
+
+        void complete() {
+            requireOpen("complete batch finalization");
+            if (completed) {
+                throw new DatabaseValidationException("batch finalization already completed");
+            }
+            if (!physicalMutationStarted) {
+                throw new DatabaseValidationException("cannot complete batch finalization before physical mutation");
+            }
+            owner.completeBatchFinalization(targets);
+            completed = true;
+        }
+
+        @Override
+        public void close() {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            if (!completed) {
+                owner.closeBatchFinalization(targets, physicalMutationStarted);
+            }
+        }
+
+        private void requireOpen(String operation) {
+            if (closed) {
+                throw new DatabaseValidationException(operation + " on closed batch finalization lease");
+            }
+        }
+    }
+
+    private void validateBatchFinalizing(List<FinalizationTarget> targets) {
+        lock.lock();
+        try {
+            targets.forEach(target -> requireFinalizingOwner(
+                    target.slotId().value(), target.firstPageId()));
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private void completeBatchFinalization(List<FinalizationTarget> targets) {
+        lock.lock();
+        try {
+            targets.forEach(target -> requireFinalizingOwner(
+                    target.slotId().value(), target.firstPageId()));
+            for (FinalizationTarget target : targets) {
+                int idx = target.slotId().value();
+                slots[idx] = null;
+                states[idx] = SlotLifecycleState.FREE;
+                activeCount--;
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private void closeBatchFinalization(List<FinalizationTarget> targets, boolean physicalMutationStarted) {
+        lock.lock();
+        try {
+            targets.forEach(target -> requireFinalizingOwner(
+                    target.slotId().value(), target.firstPageId()));
+            if (!physicalMutationStarted) {
+                targets.forEach(target -> states[target.slotId().value()] = SlotLifecycleState.ACTIVE);
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private record FinalizationTarget(UndoSlotId slotId, PageId firstPageId) {
+        private FinalizationTarget {
+            if (slotId == null || firstPageId == null) {
+                throw new DatabaseValidationException("batch finalization target fields must not be null");
             }
         }
     }

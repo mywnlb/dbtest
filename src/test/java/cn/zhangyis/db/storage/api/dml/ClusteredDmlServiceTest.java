@@ -43,6 +43,9 @@ import cn.zhangyis.db.storage.trx.TransactionState;
 import cn.zhangyis.db.storage.trx.TransactionStateException;
 import cn.zhangyis.db.storage.trx.TransactionSystem;
 import cn.zhangyis.db.storage.trx.UndoContext;
+import cn.zhangyis.db.storage.trx.UndoTestContexts;
+import cn.zhangyis.db.storage.undo.UndoLogKind;
+import cn.zhangyis.db.storage.undo.UndoLogicalHead;
 import cn.zhangyis.db.storage.trx.lock.LockWaitTimeoutException;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -110,7 +113,7 @@ class ClusteredDmlServiceTest {
             assertEquals(1, result.affectedRows());
             assertEquals(txn.transactionId(), result.transactionId());
             assertEquals(txn.transactionId(), hidden.dbTrxId(), "DB_TRX_ID 来自 facade 分配的写事务 id");
-            assertFalse(hidden.dbRollPtr().isNull(), "DB_ROLL_PTR 必须指向 beforeInsert 产生的真实 undo record");
+            assertFalse(hidden.dbRollPtr().isNull(), "DB_ROLL_PTR 必须指向 planInsert/appendPlanned 产生的真实 undo record");
             assertEquals("v1", payloadOf(found));
         } finally {
             engine.close();
@@ -234,8 +237,9 @@ class ClusteredDmlServiceTest {
                     TABLE_ID, Duration.ofSeconds(1)));
             assertTrue(hasGrantedLock(engine, txn), "写事务在 commit 前持有 INSERT/current-read 锁");
 
-            replaceUndoContext(txn, new UndoContext(RollbackSegmentId.of(0), UndoSlotId.of(0),
-                    PageId.of(SPACE, PageNo.of(9999))));
+            replaceUndoContext(txn, UndoTestContexts.restored(RollbackSegmentId.of(0), UndoLogKind.INSERT,
+                    UndoSlotId.of(0), PageId.of(SPACE, PageNo.of(9999)), UndoNo.NONE,
+                    UndoLogicalHead.EMPTY));
 
             assertThrows(DatabaseRuntimeException.class, () -> engine.dmlService().commit(new DmlCommitCommand(txn,
                     DurabilityPolicy.FLUSH_ON_COMMIT, Duration.ofSeconds(1))));
@@ -339,7 +343,7 @@ class ClusteredDmlServiceTest {
             assertEquals("v1", payloadOf(lookup(engine, index, 1).orElseThrow()));
             assertTrue(lookupIncludingDeleted(engine, index, 2).isEmpty(),
                     "insert created inside the failed statement must be physically removed");
-            assertEquals(UndoNo.of(1), txn.undoContext().logicalLastUndoNo(),
+            assertEquals(UndoNo.of(1), txn.undoContext().head(UndoLogKind.INSERT).undoNo(),
                     "guard rollback moves the logical chain head back to the saved boundary");
 
             DmlRollbackResult full = engine.dmlService().rollback(new DmlRollbackCommand(txn, index));
@@ -372,9 +376,9 @@ class ClusteredDmlServiceTest {
             assertNotNull(txn.undoContext(), "v1 keeps the allocated undo context and slot for later writes");
             assertEquals(UndoNo.of(1), txn.undoContext().lastUndoNo(),
                     "append high-water mark must not be reused after statement rollback");
-            assertEquals(UndoNo.NONE, txn.undoContext().logicalLastUndoNo(),
+            assertEquals(UndoNo.NONE, txn.undoContext().head(UndoLogKind.INSERT).undoNo(),
                     "current logical undo chain is empty after rolling back to the empty boundary");
-            assertTrue(txn.undoContext().lastRollPointer().isNull());
+            assertTrue(txn.undoContext().head(UndoLogKind.INSERT).rollPointer().isNull());
 
             engine.dmlService().insert(new ClusteredInsertCommand(txn, index, search(2), row(2, "after"),
                     TABLE_ID, Duration.ofSeconds(1)));
@@ -471,7 +475,7 @@ class ClusteredDmlServiceTest {
                     TABLE_ID, Duration.ofSeconds(1)));
             TransactionSavepoint real = engine.rollbackService().createSavepoint(txn);
             TransactionSavepoint detached = new TransactionSavepoint(
-                    txn, real.undoNo(), real.rollPointer(), real.sequence() + 1_000);
+                    txn, real.insertHead(), real.updateHead(), real.sequence() + 1_000);
             DmlStatementGuard guard = DmlStatementGuard.savepointBoundary(
                     engine.rollbackService(), txn, index, detached);
 

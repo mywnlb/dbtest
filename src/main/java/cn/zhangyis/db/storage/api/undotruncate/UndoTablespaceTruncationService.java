@@ -40,7 +40,8 @@ import java.util.Optional;
  * UNDO 单文件表空间 crash-safe 截断编排器。
  *
  * <p>不可逆边界是 page-0 TRUNCATING marker 的 redo durable：在此之前任何失败不碰物理文件；在此之后失败
- * 保持 marker，恢复或下一次调用按同 epoch/target 续作。完整顺序为：X operation lease → 类型/空 inode 校验 →
+ * 保持 marker，恢复或下一次调用按同 epoch/target 续作。完整顺序为：X operation lease → 拒绝 active slot 并排空
+ * cached segment → 空 inode 校验 →
  * marker MTR + redo fsync → 全局 flush/checkpoint barrier → Buffer Pool drain/invalidate → 物理 truncate+force →
  * page0/page2 空基线重建并持久化 → 最终状态持久化 → Registry 缩小快照发布。
  *
@@ -62,6 +63,8 @@ public final class UndoTablespaceTruncationService {
     private final SpaceHeaderRepository headerRepository;
     private final SegmentInodeRepository inodeRepository;
     private final UndoTablespaceFspRebuilder rebuilder;
+    /** 负责 marker 前验证空 history/排空 cache owner，以及物理重建时恢复 page3 v3 空目录。 */
+    private final UndoCachedSegmentTruncationCoordinator cachedSegmentCoordinator;
 
     public UndoTablespaceTruncationService(
             BufferPool bufferPool,
@@ -72,10 +75,11 @@ public final class UndoTablespaceTruncationService {
             MiniTransactionManager mtrManager,
             FlushService flushService,
             Duration waitTimeout,
-            UndoTruncationFaultInjector faultInjector) {
+            UndoTruncationFaultInjector faultInjector,
+            UndoCachedSegmentTruncationCoordinator cachedSegmentCoordinator) {
         if (bufferPool == null || pageStore == null || pageSize == null || registry == null
                 || accessController == null || mtrManager == null || flushService == null
-                || waitTimeout == null || faultInjector == null) {
+                || waitTimeout == null || faultInjector == null || cachedSegmentCoordinator == null) {
             throw new DatabaseValidationException("undo truncation dependencies must not be null");
         }
         if (waitTimeout.isZero() || waitTimeout.isNegative()) {
@@ -94,6 +98,7 @@ public final class UndoTablespaceTruncationService {
         this.headerRepository = new SpaceHeaderRepository(bufferPool);
         this.inodeRepository = new SegmentInodeRepository(bufferPool, pageSize);
         this.rebuilder = new UndoTablespaceFspRebuilder(bufferPool, pageSize);
+        this.cachedSegmentCoordinator = cachedSegmentCoordinator;
     }
 
     /**
@@ -149,8 +154,13 @@ public final class UndoTablespaceTruncationService {
                     runtime = publish(runtime, TablespaceState.TRUNCATING,
                             pageStore.currentSizeInPages(spaceId), read.header().freeLimitPageNo());
                 }
+                // marker 必须晚于 history/active/cache owner 清空；恢复期内存投影尚未重建，只依据 page3 持久证据守门。
+                cachedSegmentCoordinator.requirePersistentEmpty(spaceId);
+                ensureNoAllocatedInodes(spaceId);
             } else {
                 ensureStableSourceState(lifecycle.state());
+                // 持 X 时只尝试非阻塞 cache gate；忙则抛出并释放 X，由调用方重试，绝不与 finalizer 形成等待环。
+                cachedSegmentCoordinator.drainStableSpace(spaceId);
                 ensureNoAllocatedInodes(spaceId);
                 marker = new TablespaceLifecycleHeader(TablespaceState.TRUNCATING,
                         lifecycle.initialSizeInPages(), lifecycle.truncateEpoch() + 1,
@@ -248,6 +258,7 @@ public final class UndoTablespaceTruncationService {
                 mtrManager.budgetFor(RedoBudgetPurpose.UNDO_TRUNCATE_REBUILD));
         try {
             rebuilder.rebuild(mtr, previous, marker);
+            cachedSegmentCoordinator.rebuildHeader(mtr, previous.spaceId());
             return mtrManager.commit(mtr);
         } catch (RuntimeException failure) {
             rollbackIfActive(mtr);

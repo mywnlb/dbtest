@@ -16,7 +16,15 @@ public enum UndoMetadataDeltaKind {
     /** undo first 页 log header 字段，例如 transactionId、state、lastPageNo、commitNo。 */
     UNDO_LOG_HEADER_FIELD((byte) 4),
     /** undo 页 FIL sibling link 字段，当前用于链页 prev/next 关系的后续逻辑化预留。 */
-    UNDO_FIL_LINK_FIELD((byte) 5);
+    UNDO_FIL_LINK_FIELD((byte) 5),
+    /** rollback segment page3 v2 起的 INSERT/UPDATE cached segment pageNo 栈项。 */
+    RSEG_CACHE_ENTRY((byte) 6),
+    /** rollback segment page3 v2 起的 cached stack count。 */
+    RSEG_CACHE_COUNT((byte) 7),
+    /** rollback segment page3 v3 的持久 history base 字段。 */
+    RSEG_HISTORY_BASE((byte) 8),
+    /** undo first page v3 的 history prev/next 链接字段。 */
+    UNDO_HISTORY_LINK_FIELD((byte) 9);
 
     /** redo 文件中的稳定 1 字节分类码；只能追加，不能重排。 */
     private final byte code;

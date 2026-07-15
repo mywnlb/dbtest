@@ -23,13 +23,20 @@ import cn.zhangyis.db.storage.undo.UndoLogSegment;
 import cn.zhangyis.db.storage.undo.UndoLogSegmentAccess;
 import cn.zhangyis.db.storage.undo.UndoLogFormatException;
 import cn.zhangyis.db.storage.undo.UndoLogicalHead;
+import cn.zhangyis.db.storage.undo.UndoLogKind;
 import cn.zhangyis.db.storage.undo.UndoRecord;
 
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.EnumMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Collection;
+
 /**
- * 事务 rollback 执行器（设计 §7.6/§11.2/§14.4，T1.3d 首次消费 undo）。从 {@link UndoContext#lastRollPointer}
- * 反向走当前逻辑 undo 链，对 {@code INSERT_ROW}/{@code UPDATE_ROW}/{@code DELETE_MARK} 分别执行删除、旧 image
- * 恢复和取消删除标记；完整 rollback 最后原子回收 undo segment/page3 slot，savepoint rollback 则在逆操作完成后持久退回
- * first-page logical head，再同步运行期逻辑边界。
+ * 事务 rollback 执行器（设计 §7.6/§11.2/§14.4）。从 INSERT/UPDATE 两个局部 logical head 中反复选择较大
+ * undoNo，恢复全局 DML 逆序；三类 record 分别执行删除、旧 image 恢复和取消删除标记。完整 rollback 最后原子
+ * 回收全部 segments/page3 slots，savepoint rollback 则在逆操作完成后同批持久退回受影响的 heads。
  *
  * <p><b>依赖方向</b>：{@code storage.trx → storage.btree + storage.undo}（设计 §94）。本类直 import
  * {@link SplitCapableBTreeIndexService}（删除聚簇行）与 {@link UndoLogSegmentAccess}/{@link UndoRecord}（读 undo 链）；
@@ -37,7 +44,7 @@ import cn.zhangyis.db.storage.undo.UndoRecord;
  *
  * <p><b>状态机两阶段</b>：{@code rollback} 在 ACTIVE 状态先预检整条逻辑链，再经
  * {@link TransactionManager#beginRollback} 进入 ROLLING_BACK；已处于 ROLLING_BACK 的失败重试直接恢复走链。
- * 走完链并经 finalizer 同批 drop segment、清 page3、写 rollback-complete 正式恢复证据后，才调用
+ * 走完链并经 finalizer 同批 cache/drop segment、转移 page3 owner、写 rollback-complete 正式恢复证据后，才调用
  * {@link TransactionManager#finishRollback}（removeActive + →ROLLED_BACK）。
  *
  * <p><b>每条 undo 短读 + 独立写 MTR</b>（§7.6 step 6）：先分别用短只读 MTR 物化当前 record 与真实前驱，
@@ -62,7 +69,7 @@ public final class RollbackService {
     private final TransactionManager txnMgr;
     /** 物理短事务工厂；每条 undo 至少一个短读 MTR，反向修改另用独立 index MTR。 */
     private final MiniTransactionManager mtrMgr;
-    /** 完整/恢复回滚到 EMPTY 后执行 atomic drop+page3-clear 的终态协作者。 */
+    /** 完整/恢复回滚到 EMPTY 后执行 atomic cache/drop + page3 owner 转移的终态协作者。 */
     private final UndoSegmentFinalizer finalizer;
     /** 包内 crash-point 测试接缝；生产公开构造器固定注入 no-op，不改变正常控制流。 */
     private final RollbackProgressFaultInjector progressFaultInjector;
@@ -108,7 +115,7 @@ public final class RollbackService {
      *   <li>若有 {@link UndoContext}：从当前 logical head 反向走链；每条在两个短只读 MTR 中物化 current/前驱，
      *       再以独立 index MTR 执行 inverse，随后独立 marker MTR CAS 后退持久头。</li>
      *   <li>marker commit 后才发布内存 context；两次成功 commit 之间 crash 时，重启最多重复当前 inverse。</li>
-     *   <li>走到 {@code prev=NULL} 后由 finalizer 在同一 MTR drop segment、CAS 清 page3，并追加 recovery table
+     *   <li>走到 {@code prev=NULL} 后由 finalizer 在同一 MTR cache/drop segment、CAS 转移 page3 owner，并追加 recovery table
      *       消费的 rollback-complete 终态/高水位证据；提交成功后才发布内存 slot 释放。</li>
      *   <li>{@code finishRollback}：removeActive + ROLLING_BACK→ROLLED_BACK；若此前失败，后续调用可从
      *       ROLLING_BACK 幂等重走链。</li>
@@ -130,9 +137,7 @@ public final class RollbackService {
         }
         UndoContext ctx = txn.undoContext();
         if (ctx != null) {
-            UndoLogicalHead head = ctx.logicalHead();
-            // ACTIVE 在状态迁移前预检整链；ROLLING_BACK 重试则预检当前剩余链，二者都在本次 inverse 前发现损坏。
-            preflightUndoBoundary(clusteredIndex, ctx, head.rollPointer(), UndoNo.NONE, RollPointer.NULL);
+            preflightAllBindings(clusteredIndex, ctx, emptyTargets());
         }
         if (initialState == TransactionState.ACTIVE) {
             txnMgr.beginRollback(txn);
@@ -140,20 +145,23 @@ public final class RollbackService {
 
         int applied = 0;
         if (ctx != null) {
-            UndoLogicalHead expectedHead = ctx.logicalHead();
-            while (!expectedHead.isEmpty()) {
+            while (true) {
+                UndoLogBinding binding = newestBinding(ctx, emptyTargets());
+                if (binding == null) {
+                    break;
+                }
+                UndoLogicalHead expectedHead = binding.logicalHead();
                 RecordAt current = readUndoRecord(
-                        ctx.undoFirstPageId(), clusteredIndex, expectedHead.rollPointer());
+                        binding.firstPageId(), clusteredIndex, expectedHead.rollPointer());
                 UndoLogicalHead targetHead = derivePredecessorHead(
-                        ctx.undoFirstPageId(), clusteredIndex, expectedHead, current);
+                        binding.firstPageId(), clusteredIndex, expectedHead, current);
                 applyUndoRecordInOwnMtr(current, clusteredIndex);
                 applied++;
                 progressFaultInjector.after(RollbackProgressPhase.AFTER_INVERSE_COMMIT, expectedHead);
-                persistLogicalHead(ctx.undoFirstPageId(), expectedHead, targetHead, clusteredIndex);
+                persistLogicalHead(binding.firstPageId(), expectedHead, targetHead, clusteredIndex);
                 // marker 已提交后只发布无 IO 的内存 pair；测试 hook 放在发布之后，异常也不会制造持久/内存撕裂。
-                ctx.publishFullRollbackProgress(targetHead);
+                ctx.publishRollbackProgress(binding.kind(), targetHead);
                 progressFaultInjector.after(RollbackProgressPhase.AFTER_PROGRESS_COMMIT, targetHead);
-                expectedHead = targetHead;
             }
         }
         if (ctx != null) {
@@ -224,7 +232,7 @@ public final class RollbackService {
      * 回滚到事务保存点。数据流与完整 rollback 共用单条 undo 反向命令，但不进入事务终态：
      * <ol>
      *   <li>校验事务仍为 ACTIVE，保存点由同一事务创建。</li>
-     *   <li>从 {@link UndoContext#lastRollPointer()} 指向的当前逻辑链头向前扫描。</li>
+     *   <li>从 INSERT/UPDATE 两个当前局部头按 undoNo 归并向前扫描。</li>
      *   <li>同时精确命中保存点的 roll pointer 与 undoNo；仅应用该边界之后的记录。每条仍用独立 MTR，
      *       失败只回滚当前 MTR 并传播。</li>
      *   <li>全部逆操作成功后，以独立写 MTR compare-and-set 持久 logical head；marker 提交成功后才把
@@ -255,11 +263,10 @@ public final class RollbackService {
             return new RollbackSummary(0);
         }
         ctx.requireOwnedSavepoint(savepoint);
-        UndoLogicalHead expectedHead = ctx.logicalHead();
-        UndoLogicalHead targetHead = new UndoLogicalHead(savepoint.undoNo(), savepoint.rollPointer());
-        int applied = rollbackUndoRecordsAfter(txn, clusteredIndex, ctx,
-                savepoint.undoNo(), savepoint.rollPointer());
-        persistLogicalHead(ctx.undoFirstPageId(), expectedHead, targetHead, clusteredIndex);
+        Map<UndoLogKind, UndoLogicalHead> targets = new EnumMap<>(UndoLogKind.class);
+        targets.put(UndoLogKind.INSERT, savepoint.insertHead());
+        targets.put(UndoLogKind.UPDATE, savepoint.updateHead());
+        int applied = rollbackMergedAfter(txn, clusteredIndex, ctx, targets);
         ctx.completeRollbackToSavepoint(savepoint);
         return new RollbackSummary(applied);
     }
@@ -269,8 +276,7 @@ public final class RollbackService {
      * {@link UndoContext}，但语句执行过程中发生首写”的场景使用；它不会伪造保存点，也不会跳过保存点归属校验。
      *
      * <p>数据流为：校验事务仍为 ACTIVE → 若语句从未写入则返回 0 → 从当前逻辑链头反向应用全部 undo →
-     * 独立写 MTR 持久空 logical head → 将 {@link UndoContext#logicalLastUndoNo()} 和
-     * {@link UndoContext#lastRollPointer()} 退回空值并清空运行期保存点。
+     * 独立写 MTR 把已存在的一个或两个 logical heads 同批持久为空，再清空运行期保存点。
      * {@link UndoContext#lastUndoNo()}、undo slot、ReadView、事务行锁和事务状态均保持不变，使事务可以继续写入。
      *
      * @param txn            当前 ACTIVE 事务。
@@ -294,9 +300,7 @@ public final class RollbackService {
             return new RollbackSummary(0);
         }
 
-        UndoLogicalHead expectedHead = ctx.logicalHead();
-        int applied = rollbackUndoRecordsAfter(txn, clusteredIndex, ctx, UndoNo.NONE, RollPointer.NULL);
-        persistLogicalHead(ctx.undoFirstPageId(), expectedHead, UndoLogicalHead.EMPTY, clusteredIndex);
+        int applied = rollbackMergedAfter(txn, clusteredIndex, ctx, emptyTargets());
         ctx.completeRollbackToEmptyBoundary();
         boundary.markRolledBack();
         return new RollbackSummary(applied);
@@ -363,25 +367,40 @@ public final class RollbackService {
      * @param boundaryRollPointer 边界记录的精确指针；空边界必须为 {@link RollPointer#NULL}。
      * @return 实际反向应用的 undo record 数量。
      */
-    private int rollbackUndoRecordsAfter(Transaction txn, BTreeIndex clusteredIndex, UndoContext ctx,
-                                         UndoNo boundaryUndoNo, RollPointer boundaryRollPointer) {
+    private int rollbackMergedAfter(Transaction txn, BTreeIndex clusteredIndex, UndoContext ctx,
+                                    Map<UndoLogKind, UndoLogicalHead> targets) {
         if (txn.undoContext() != ctx) {
             throw new DatabaseValidationException("rollback undo context is not owned by transaction");
         }
-        if (boundaryUndoNo == null || boundaryRollPointer == null
-                || boundaryUndoNo.isNone() != boundaryRollPointer.isNull()) {
-            throw new DatabaseValidationException("rollback boundary undoNo/rollPointer pair is inconsistent");
+        preflightAllBindings(clusteredIndex, ctx, targets);
+        EnumMap<UndoLogKind, UndoLogicalHead> working = new EnumMap<>(UndoLogKind.class);
+        EnumMap<UndoLogKind, UndoLogicalHead> original = new EnumMap<>(UndoLogKind.class);
+        for (UndoLogBinding binding : ctx.bindings()) {
+            working.put(binding.kind(), binding.logicalHead());
+            original.put(binding.kind(), binding.logicalHead());
         }
-        RollPointer startRollPointer = ctx.lastRollPointer();
-        preflightUndoBoundary(clusteredIndex, ctx, startRollPointer, boundaryUndoNo, boundaryRollPointer);
         int applied = 0;
-        RollPointer rp = startRollPointer;
-        while (!rp.isNull() && (boundaryUndoNo.isNone() || !rp.equals(boundaryRollPointer))) {
-            RecordAt at = readUndoRecord(ctx.undoFirstPageId(), clusteredIndex, rp);
+        while (true) {
+            UndoLogBinding binding = newestBinding(ctx, targets, working);
+            if (binding == null) {
+                break;
+            }
+            UndoLogicalHead currentHead = working.get(binding.kind());
+            RecordAt at = readUndoRecord(binding.firstPageId(), clusteredIndex,
+                    currentHead.rollPointer());
             applyUndoRecordInOwnMtr(at, clusteredIndex);
             applied++;
-            rp = at.record().prevRollPointer();
+            working.put(binding.kind(), derivePredecessorHead(
+                    binding.firstPageId(), clusteredIndex, currentHead, at));
         }
+        List<HeadUpdate> updates = new ArrayList<>();
+        for (UndoLogBinding binding : ctx.bindings()) {
+            UndoLogicalHead target = targetFor(targets, binding.kind());
+            if (!original.get(binding.kind()).equals(target)) {
+                updates.add(new HeadUpdate(binding.firstPageId(), original.get(binding.kind()), target));
+            }
+        }
+        persistLogicalHeads(updates, clusteredIndex);
         return applied;
     }
 
@@ -390,32 +409,43 @@ public final class RollbackService {
      * S latch/fix；因此扫描页数可以超过 Buffer Pool 容量。空边界要求当前链自然走到 NULL；真实保存点要求指针
      * 和 undoNo 同时命中。若 undoNo 已越过目标但指针未命中，说明事务逻辑链损坏，必须拒绝而不能仅凭序号猜测。
      */
-    private void preflightUndoBoundary(BTreeIndex clusteredIndex, UndoContext ctx, RollPointer startRollPointer,
-                                       UndoNo boundaryUndoNo, RollPointer boundaryRollPointer) {
-        boolean emptyBoundary = boundaryUndoNo.isNone();
-        RollPointer rp = startRollPointer;
+    private void preflightAllBindings(BTreeIndex clusteredIndex, UndoContext ctx,
+                                      Map<UndoLogKind, UndoLogicalHead> targets) {
+        for (UndoLogBinding binding : ctx.bindings()) {
+            preflightBinding(clusteredIndex, binding, targetFor(targets, binding.kind()));
+        }
+    }
+
+    private void preflightBinding(BTreeIndex clusteredIndex, UndoLogBinding binding,
+                                  UndoLogicalHead target) {
+        UndoLogicalHead persistentHead = readPersistentLogicalHead(binding.firstPageId());
+        if (!persistentHead.equals(binding.logicalHead())) {
+            throw new UndoLogFormatException("in-memory " + binding.kind() + " logical head "
+                    + binding.logicalHead() + " differs from persistent head " + persistentHead);
+        }
+        RollPointer rp = binding.logicalHead().rollPointer();
         long previousUndoNo = 0L;
         boolean first = true;
         while (!rp.isNull()) {
-            RecordAt at = readUndoRecord(ctx.undoFirstPageId(), clusteredIndex, rp);
+            RecordAt at = readUndoRecord(binding.firstPageId(), clusteredIndex, rp);
             UndoRecord rec = at.record();
             long undoNo = rec.undoNo().value();
             if (first) {
-                if (undoNo != ctx.logicalLastUndoNo().value()) {
+                if (undoNo != binding.logicalHead().undoNo().value()) {
                     throw new UndoLogFormatException("in-memory logical head undoNo "
-                            + ctx.logicalLastUndoNo().value() + " resolves to " + undoNo);
+                            + binding.logicalHead().undoNo().value() + " resolves to " + undoNo);
                 }
             } else if (undoNo >= previousUndoNo) {
                 throw new UndoLogFormatException("undo logical chain is not strictly descending: "
                         + undoNo + " after " + previousUndoNo);
             }
-            if (!emptyBoundary && rp.equals(boundaryRollPointer)) {
-                if (!rec.undoNo().equals(boundaryUndoNo)) {
+            if (!target.isEmpty() && rp.equals(target.rollPointer())) {
+                if (!rec.undoNo().equals(target.undoNo())) {
                     throw new UndoLogFormatException(
                             "savepoint roll pointer resolves to a different undo number");
                 }
                 return;
-            } else if (!emptyBoundary && rec.undoNo().value() <= boundaryUndoNo.value()) {
+            } else if (!target.isEmpty() && rec.undoNo().value() <= target.undoNo().value()) {
                 // 指针未命中目标却已越过其 undoNo，说明逻辑链断裂；不能把保存点指针重新装回 context。
                 throw new UndoLogFormatException(
                         "savepoint roll pointer is not reachable from current undo chain");
@@ -424,9 +454,52 @@ public final class RollbackService {
             previousUndoNo = undoNo;
             rp = rec.prevRollPointer();
         }
-        if (!emptyBoundary) {
+        if (!target.isEmpty()) {
             throw new UndoLogFormatException("savepoint boundary is not reachable from current undo chain");
         }
+    }
+
+    private static Map<UndoLogKind, UndoLogicalHead> emptyTargets() {
+        EnumMap<UndoLogKind, UndoLogicalHead> targets = new EnumMap<>(UndoLogKind.class);
+        targets.put(UndoLogKind.INSERT, UndoLogicalHead.EMPTY);
+        targets.put(UndoLogKind.UPDATE, UndoLogicalHead.EMPTY);
+        return targets;
+    }
+
+    private static UndoLogicalHead targetFor(Map<UndoLogKind, UndoLogicalHead> targets, UndoLogKind kind) {
+        if (targets == null || targets.get(kind) == null) {
+            throw new DatabaseValidationException("rollback target missing for undo kind " + kind);
+        }
+        return targets.get(kind);
+    }
+
+    private static UndoLogBinding newestBinding(UndoContext ctx,
+                                                Map<UndoLogKind, UndoLogicalHead> targets) {
+        EnumMap<UndoLogKind, UndoLogicalHead> current = new EnumMap<>(UndoLogKind.class);
+        ctx.bindings().forEach(binding -> current.put(binding.kind(), binding.logicalHead()));
+        return newestBinding(ctx, targets, current);
+    }
+
+    private static UndoLogBinding newestBinding(UndoContext ctx,
+                                                Map<UndoLogKind, UndoLogicalHead> targets,
+                                                Map<UndoLogKind, UndoLogicalHead> current) {
+        UndoLogBinding newest = null;
+        long newestUndoNo = 0L;
+        for (UndoLogBinding binding : ctx.bindings()) {
+            UndoLogicalHead head = current.get(binding.kind());
+            if (head.equals(targetFor(targets, binding.kind()))) {
+                continue;
+            }
+            if (head.isEmpty() || head.undoNo().value() <= newestUndoNo) {
+                if (!head.isEmpty() && head.undoNo().value() == newestUndoNo) {
+                    throw new UndoLogFormatException("independent undo heads share duplicate undoNo " + newestUndoNo);
+                }
+                continue;
+            }
+            newest = binding;
+            newestUndoNo = head.undoNo().value();
+        }
+        return newest;
     }
 
     /**
@@ -513,6 +586,35 @@ public final class RollbackService {
     }
 
     /**
+     * partial rollback 的所有 inverse 完成后，在一个 marker MTR 中按 PageId 排序更新一个或两个 first-page heads。
+     * marker 永不领先数据修改；任一 CAS 失败都不发布内存保存点边界，事务由上层转为 rollback-only。
+     */
+    private void persistLogicalHeads(List<HeadUpdate> updates, BTreeIndex clusteredIndex) {
+        if (updates.isEmpty()) {
+            return;
+        }
+        List<HeadUpdate> ordered = updates.stream()
+                .sorted(Comparator.comparingInt((HeadUpdate item) -> item.firstPageId().spaceId().value())
+                        .thenComparingLong(item -> item.firstPageId().pageNo().value()))
+                .toList();
+        MiniTransaction marker = mtrMgr.begin(mtrMgr.budgetFor(RedoBudgetPurpose.ROLLBACK_MARKER));
+        try {
+            try (var ignored = marker.allowOutOfOrderPageLatch(
+                    "dual undo marker: target records may live on non-monotonic chain pages after sorted first pages")) {
+                for (HeadUpdate update : ordered) {
+                    undoAccess.open(marker, update.firstPageId(), PageLatchMode.EXCLUSIVE)
+                            .updateLogicalHead(update.expected(), update.target(),
+                                    clusteredIndex.keyDef(), clusteredIndex.schema());
+                }
+            }
+            mtrMgr.commit(marker);
+        } catch (RuntimeException error) {
+            rollbackActiveStateMtr(marker, error);
+            throw error;
+        }
+    }
+
+    /**
      * 写回滚完成正式恢复 redo。它在 slot release / {@code finishRollback} 之前执行，此时事务仍处于
      * ROLLING_BACK，redo record 能记录真实的 from-state；若写入失败，slot 仍由本事务占用，调用方可安全重试。
      * recovery table 消费该 record 重建终态和 counter 高水位；若事务存在 undo slot，恢复仍必须与 page3/header
@@ -550,7 +652,7 @@ public final class RollbackService {
      *   <li>每条 inverse 提交后，以独立 marker MTR 后退持久 logical head，再处理下一条。</li>
      * </ol>
      * 由正式 UNDO_ROLLBACK 阶段从 page3 重建出的、且 undo 段 state=ACTIVE 的 slot 调用；不走 Transaction 状态机
-     * （前台 {@link #rollback} 才走）。逻辑头到 EMPTY 后，本方法经 finalizer 原子 drop segment + CAS 清 page3，
+     * （前台 {@link #rollback} 才走）。逻辑头到 EMPTY 后，本方法经 finalizer 原子 cache/drop segment + CAS 转移 page3 owner，
      * 提交成功后才释放恢复期内存 slot，因此重启不会重新发现已终结段。
      *
      * <p><b>单显式聚簇索引假设</b>（无 DD）：用 {@code clusteredIndex} 的 keyDef/schema 解码所有 undo；
@@ -569,25 +671,95 @@ public final class RollbackService {
             throw new DatabaseValidationException(
                     "rollbackRecovered slot/firstPage/creator/clusteredIndex must not be null");
         }
-        UndoLogicalHead expectedHead = readRecoveredLogicalHead(firstPageId);
+        UndoLogKind kind = readRecoveredKind(firstPageId);
+        return rollbackRecovered(List.of(new RecoveredUndoLogIdentity(kind, slotId, firstPageId)),
+                creatorTrxId, clusteredIndex);
+    }
+
+    /** 同一 recovered ACTIVE 事务的一个或两个局部链按全局 undoNo 归并回滚，并一次性终结全部 slots。 */
+    public RollbackSummary rollbackRecovered(Collection<RecoveredUndoLogIdentity> logs,
+                                              TransactionId creatorTrxId,
+                                              BTreeIndex clusteredIndex) {
+        if (logs == null || logs.isEmpty() || creatorTrxId == null || clusteredIndex == null) {
+            throw new DatabaseValidationException("recovered rollback group fields must not be empty/null");
+        }
+        List<UndoLogBinding> bindings = new ArrayList<>();
+        EnumMap<UndoLogKind, Boolean> kinds = new EnumMap<>(UndoLogKind.class);
+        for (RecoveredUndoLogIdentity log : logs) {
+            if (log == null || kinds.putIfAbsent(log.kind(), Boolean.TRUE) != null) {
+                throw new DatabaseValidationException("recovered rollback group contains null/duplicate kind");
+            }
+            bindings.add(new UndoLogBinding(log.kind(), log.slotId(), log.firstPageId(),
+                    readPersistentLogicalHead(log.firstPageId())));
+        }
+        for (UndoLogBinding binding : bindings) {
+            preflightRecoveredBinding(clusteredIndex, binding);
+        }
         int applied = 0;
-        while (!expectedHead.isEmpty()) {
-            RecordAt current = readUndoRecord(firstPageId, clusteredIndex, expectedHead.rollPointer());
+        while (true) {
+            UndoLogBinding binding = newestRecoveredBinding(bindings);
+            if (binding == null) {
+                break;
+            }
+            UndoLogicalHead expectedHead = binding.logicalHead();
+            RecordAt current = readUndoRecord(binding.firstPageId(), clusteredIndex, expectedHead.rollPointer());
             UndoLogicalHead targetHead = derivePredecessorHead(
-                    firstPageId, clusteredIndex, expectedHead, current);
+                    binding.firstPageId(), clusteredIndex, expectedHead, current);
             applyUndoRecordInOwnMtr(current, clusteredIndex);
             applied++;
             progressFaultInjector.after(RollbackProgressPhase.AFTER_INVERSE_COMMIT, expectedHead);
-            persistLogicalHead(firstPageId, expectedHead, targetHead, clusteredIndex);
+            persistLogicalHead(binding.firstPageId(), expectedHead, targetHead, clusteredIndex);
+            binding.publishHead(targetHead);
             progressFaultInjector.after(RollbackProgressPhase.AFTER_PROGRESS_COMMIT, targetHead);
-            expectedHead = targetHead;
         }
-        finalizer.finalizeRecoveredRollback(slotId, firstPageId, creatorTrxId);
+        finalizer.finalizeRecoveredRollback(bindings, creatorTrxId);
         return new RollbackSummary(applied);
     }
 
-    /** 用独立只读 MTR 读取 recovery 权威 logical head，返回前释放 first-page latch/fix。 */
-    private UndoLogicalHead readRecoveredLogicalHead(PageId firstPageId) {
+    private void preflightRecoveredBinding(BTreeIndex index, UndoLogBinding binding) {
+        RollPointer pointer = binding.logicalHead().rollPointer();
+        long previous = Long.MAX_VALUE;
+        while (!pointer.isNull()) {
+            RecordAt at = readUndoRecord(binding.firstPageId(), index, pointer);
+            if (at.record().undoNo().value() >= previous) {
+                throw new UndoLogFormatException("recovered local undo chain is not strictly descending");
+            }
+            previous = at.record().undoNo().value();
+            pointer = at.record().prevRollPointer();
+        }
+    }
+
+    private static UndoLogBinding newestRecoveredBinding(List<UndoLogBinding> bindings) {
+        UndoLogBinding newest = null;
+        for (UndoLogBinding binding : bindings) {
+            if (binding.logicalHead().isEmpty()) {
+                continue;
+            }
+            if (newest != null && binding.logicalHead().undoNo().equals(newest.logicalHead().undoNo())) {
+                throw new UndoLogFormatException("recovered undo logs share duplicate head undoNo");
+            }
+            if (newest == null || binding.logicalHead().undoNo().value()
+                    > newest.logicalHead().undoNo().value()) {
+                newest = binding;
+            }
+        }
+        return newest;
+    }
+
+    private UndoLogKind readRecoveredKind(PageId firstPageId) {
+        MiniTransaction read = mtrMgr.beginReadOnly();
+        try {
+            UndoLogKind kind = undoAccess.open(read, firstPageId, PageLatchMode.SHARED).undoKind();
+            mtrMgr.commit(read);
+            return kind;
+        } catch (RuntimeException error) {
+            rollbackActiveStateMtr(read, error);
+            throw error;
+        }
+    }
+
+    /** 用独立只读 MTR 读取持久权威 logical head，供 live preflight 与 recovery 建链，返回前释放 page 资源。 */
+    private UndoLogicalHead readPersistentLogicalHead(PageId firstPageId) {
         MiniTransaction readMtr = mtrMgr.beginReadOnly();
         try {
             UndoLogicalHead head = undoAccess.open(readMtr, firstPageId, PageLatchMode.SHARED).logicalHead();
@@ -601,6 +773,9 @@ public final class RollbackService {
 
     /** 短只读 MTR 已物化并释放 undo 页资源的 (undo record, 其自身 roll pointer) 对。 */
     private record RecordAt(UndoRecord record, RollPointer pointer) {
+    }
+
+    private record HeadUpdate(PageId firstPageId, UndoLogicalHead expected, UndoLogicalHead target) {
     }
 
     /**

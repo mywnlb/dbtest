@@ -11,6 +11,7 @@ import cn.zhangyis.db.storage.redo.LogRange;
 import cn.zhangyis.db.storage.redo.TransactionStateDeltaReason;
 import cn.zhangyis.db.storage.redo.TransactionStateDeltaRecord;
 import cn.zhangyis.db.storage.redo.TransactionStateDeltaState;
+import cn.zhangyis.db.storage.undo.UndoLogKind;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -92,6 +93,37 @@ class RecoveredTransactionReconcilerTest {
                         table.snapshot(), Lsn.of(120), List.of(committedSlot(0, 7, 4))));
     }
 
+    @Test
+    void activeTransactionMayOwnOneInsertAndOneUpdateSlot() {
+        RecoveredUndoSlotEvidence insert = active(0, 7);
+        RecoveredUndoSlotEvidence update = RecoveredUndoSlotEvidence.active(
+                UndoSlotId.of(1), PageId.of(UNDO_SPACE, PageNo.of(11)),
+                UndoLogKind.UPDATE, TransactionId.of(7));
+        RecoveredTransactionReconciliation result = new RecoveredTransactionReconciler()
+                .reconcile(baseline(0, 3, 2), Lsn.of(100), List.of(insert, update));
+        assertEquals(List.of(insert, update), result.activeSlots());
+    }
+
+    @Test
+    void duplicateRecoveredKindForOneCreatorIsFatal() {
+        assertThrows(TransactionRecoveryException.class, () -> new RecoveredTransactionReconciler()
+                .reconcile(baseline(0, 3, 2), Lsn.of(100), List.of(active(0, 7), active(1, 7))));
+    }
+
+    @Test
+    void activeAndCommittedUndoForOneCreatorIsFatal() {
+        RecoveredTransactionTable table = table(0, 8, 4);
+        assertThrows(TransactionRecoveryException.class, () -> new RecoveredTransactionReconciler()
+                .reconcile(table.snapshot(), Lsn.of(100), List.of(active(0, 7), committedSlot(1, 7, 3))));
+    }
+
+    @Test
+    void committedInsertUndoEvidenceIsFatal() {
+        assertThrows(TransactionRecoveryException.class, () -> RecoveredUndoSlotEvidence.committed(
+                UndoSlotId.of(0), PageId.of(UNDO_SPACE, PageNo.of(10)), UndoLogKind.INSERT,
+                TransactionId.of(7), TransactionNo.of(3)));
+    }
+
     private static RecoveredTransactionSnapshot baseline(long lsn, long nextId, long nextNo) {
         return table(lsn, nextId, nextNo).snapshot();
     }
@@ -104,12 +136,14 @@ class RecoveredTransactionReconcilerTest {
 
     private static RecoveredUndoSlotEvidence active(int slot, long transactionId) {
         return RecoveredUndoSlotEvidence.active(UndoSlotId.of(slot),
-                PageId.of(UNDO_SPACE, PageNo.of(10 + slot)), TransactionId.of(transactionId));
+                PageId.of(UNDO_SPACE, PageNo.of(10 + slot)), UndoLogKind.INSERT,
+                TransactionId.of(transactionId));
     }
 
     private static RecoveredUndoSlotEvidence committedSlot(int slot, long transactionId, long transactionNo) {
         return RecoveredUndoSlotEvidence.committed(UndoSlotId.of(slot),
-                PageId.of(UNDO_SPACE, PageNo.of(10 + slot)), TransactionId.of(transactionId),
+                PageId.of(UNDO_SPACE, PageNo.of(10 + slot)), UndoLogKind.UPDATE,
+                TransactionId.of(transactionId),
                 TransactionNo.of(transactionNo));
     }
 

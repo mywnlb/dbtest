@@ -15,7 +15,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
  * T1.3c Transaction 与 UndoContext 的绑定。事务首写前 {@code undoContext()} 为 null（惰性，未建 undo segment）；
- * {@code setUndoContext} 由 {@code UndoLogManager.ensureUndoContext} 在首写时调用一次，null 引用必须拒绝。
+ * {@code setUndoContext} 由 {@code UndoLogManager.planned append} 在首写时调用一次，null 引用必须拒绝。
  */
 class TransactionUndoContextTest {
 
@@ -28,8 +28,7 @@ class TransactionUndoContextTest {
     @Test
     void setUndoContextBindsContext() {
         Transaction t = new Transaction(TransactionOptions.defaults(), 1L);
-        UndoContext ctx = new UndoContext(RollbackSegmentId.of(0), UndoSlotId.of(1),
-                PageId.of(SpaceId.of(77), PageNo.of(65)));
+        UndoContext ctx = new UndoContext(RollbackSegmentId.of(0));
 
         t.setUndoContext(ctx);
 
@@ -46,10 +45,8 @@ class TransactionUndoContextTest {
     void setUndoContextAllowsOverwriteByManager() {
         // UndoLogManager 控制单次调用；mutator 本身不强制单次，避免把生命周期约束塞进 setter
         Transaction t = new Transaction(TransactionOptions.defaults(), 1L);
-        UndoContext first = new UndoContext(RollbackSegmentId.of(0), UndoSlotId.of(0),
-                PageId.of(SpaceId.of(77), PageNo.of(65)));
-        UndoContext second = new UndoContext(RollbackSegmentId.of(0), UndoSlotId.of(1),
-                PageId.of(SpaceId.of(77), PageNo.of(66)));
+        UndoContext first = new UndoContext(RollbackSegmentId.of(0));
+        UndoContext second = new UndoContext(RollbackSegmentId.of(0));
 
         t.setUndoContext(first);
         assertDoesNotThrow(() -> t.setUndoContext(second));

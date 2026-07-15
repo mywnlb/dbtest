@@ -54,7 +54,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * T1.4 MvccReader 一致性读全栈：assignWriteId→beforeInsert/insertClustered、beforeUpdate/replaceClustered 构造
+ * T1.4 MvccReader 一致性读全栈：assignWriteId→planInsert/appendPlanned/insertClustered、planUpdate/appendPlanned/replaceClustered 构造
  * 版本链，MvccReader 沿 DB_ROLL_PTR→oldHidden.dbRollPtr 反向选可见版本。覆盖：未提交 insert 不可见、
  * committed 旧版本在新版本提交后仍按 RR 快照读回、自身写可见、RC 看到新提交、多版本链回到 v1。
  */
@@ -450,7 +450,7 @@ class MvccReaderTest {
         private void insertRow(Transaction txn, BTreeIndex index, long id, String payload) {
             TransactionId wid = txnMgr.assignWriteId(txn);
             MiniTransaction m = mgr.begin();
-            RollPointer rp = undoMgr.beforeInsert(txn, m, TABLE_ID, INDEX_ID,
+            RollPointer rp = UndoTestWrites.insert(undoMgr, txn, m, TABLE_ID, INDEX_ID,
                     List.of(new ColumnValue.IntValue(id)), index.keyDef(), index.schema());
             svc.insertClustered(m, index, new LogicalRecord(1,
                     List.of(new ColumnValue.IntValue(id), new ColumnValue.StringValue(payload)),
@@ -465,7 +465,7 @@ class MvccReaderTest {
             mgr.commit(read);
             HiddenColumns oldHidden = old.record().hiddenColumns();
             MiniTransaction m = mgr.begin();
-            RollPointer newRp = undoMgr.beforeUpdate(txn, m, TABLE_ID, INDEX_ID,
+            RollPointer newRp = UndoTestWrites.update(undoMgr, txn, m, TABLE_ID, INDEX_ID,
                     List.of(new ColumnValue.IntValue(id)), old.record().columnValues(), oldHidden,
                     index.keyDef(), index.schema());
             svc.replaceClustered(m, index, search(id), new LogicalRecord(1,
@@ -482,7 +482,7 @@ class MvccReaderTest {
             mgr.commit(read);
             HiddenColumns oldHidden = old.record().hiddenColumns();
             MiniTransaction m = mgr.begin();
-            RollPointer delRp = undoMgr.beforeDelete(txn, m, TABLE_ID, INDEX_ID,
+            RollPointer delRp = UndoTestWrites.delete(undoMgr, txn, m, TABLE_ID, INDEX_ID,
                     List.of(new ColumnValue.IntValue(id)), old.record().columnValues(), oldHidden,
                     index.keyDef(), index.schema());
             svc.setClusteredDeleteMark(m, index, search(id), true,

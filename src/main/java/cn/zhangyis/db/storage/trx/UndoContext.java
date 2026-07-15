@@ -1,236 +1,157 @@
 package cn.zhangyis.db.storage.trx;
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
-import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.RollPointer;
 import cn.zhangyis.db.domain.RollbackSegmentId;
 import cn.zhangyis.db.domain.UndoNo;
-import cn.zhangyis.db.domain.UndoSlotId;
+import cn.zhangyis.db.storage.undo.UndoLogKind;
 import cn.zhangyis.db.storage.undo.UndoLogicalHead;
+import cn.zhangyis.db.storage.undo.UndoAppendSnapshot;
 
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.EnumMap;
 import java.util.List;
 
 /**
- * 事务聚合内部的 undo 子状态（设计 §5.3，T1.3c 首次接入事务语义）。挂在一颗 {@link Transaction} 上，由
- * {@code UndoLogManager.ensureUndoContext} 在事务首写时惰性创建，记录该事务的 undo segment 定位、
- * rollback segment/slot 归属，以及事务内 undo record 序号和回滚链入口。
- *
- * <p><b>本片字段范围</b>：{@code rollbackSegmentId}/{@code slotId}/{@code undoFirstPageId}/
- * {@code lastUndoNo}/{@code logicalLastUndoNo}/{@code lastRollPointer}/{@code hasUpdateUndo}/
- * {@code savepointStack}。设计 §5.3 列出的 {@code modifiedTables}/{@code hasExternColumnUndo} 留后续片。
- *
- * <p><b>可变性边界</b>：{@code rollbackSegmentId}/{@code slotId}/{@code undoFirstPageId} 在创建时确定，
- * 本片不变；{@code lastUndoNo} 是 append 高水位，partial rollback 不倒回，防止后续写入复用 undoNo；
- * {@code logicalLastUndoNo}/{@code lastRollPointer} 是当前有效回滚链头，rollback-to-savepoint 会把它们退回到
- * 保存点边界。{@code lastRollPointer} ≠记录版本链入口；记录版本链由聚簇记录 {@code DB_ROLL_PTR} →
- * update undo → {@code oldHiddenColumns.dbRollPtr()} 重建，见设计 §5.3/§7.5。
- *
- * <p><b>惰性初值</b>：刚建段尚未 append 时 {@code lastUndoNo=NONE}、{@code lastRollPointer=NULL}、
- * {@code hasUpdateUndo=false}，{@code undoFirstPageId} 为刚分配的 undo segment 首页。
+ * 事务聚合内部的 undo 子状态。INSERT/UPDATE 各有独立 slot、segment 和局部逻辑链；事务只共享全局单调
+ * {@code lastUndoNo}，rollback 用两个局部头的 undoNo 归并真实 DML 逆序。对象归单事务 writer 所有。
  */
 public final class UndoContext {
 
-    /** 所属 rollback segment；本片固定单一默认 rseg，多 rseg 选择留后续片。 */
+    /** 所属 rollback segment；当前组合根固定一个 rseg，多 rseg 调度留后续切片。 */
     private final RollbackSegmentId rollbackSegmentId;
-    /** rseg 内认领的 slot；同一时间只归属本事务，回收留 T1.3d。 */
-    private final UndoSlotId slotId;
-    /**
-     * 本事务 undo segment 链首页 id；后续 {@code beforeInsert}/{@code beforeUpdate} 经它 reopen 续 append。
-     * T1.3e 起该段为 insert+update **混合** undo 段（单段简化）：段头 {@code UndoLogKind} 仅反映创建类型、非权威，
-     * 每条记录的 {@code UndoRecordType} 首字节才是权威类型；独立 insert/update undo log 留 purge 片。
-     */
-    private final PageId undoFirstPageId;
-    /** 事务内 undo record 序号；随每次 append 单调 +1，NONE 表「尚未 append」。 */
-    private UndoNo lastUndoNo;
-    /**
-     * 当前逻辑回滚链头 undoNo。正常 append 时等于 {@link #lastUndoNo}；rollback-to-savepoint 成功后退回保存点
-     * 边界，而 {@code lastUndoNo} 仍保留 append 高水位，保证后续 undoNo 不复用。
-     */
-    private UndoNo logicalLastUndoNo;
-    /** 当前逻辑回滚链入口（最新有效 undo record 位置）；NULL 表「当前无有效 undo」。 */
-    private RollPointer lastRollPointer;
-    /**
-     * 本事务是否写过 UPDATE undo（T1.3e）。决定 commit 时是否回收 slot：纯 insert 事务可回收（insert undo 提交即
-     * 可复用）；含 update 的事务必须保留 undo 段供 T1.4 MVCC/purge 读，故 {@code onCommit} 不回收其 slot。
-     */
-    private boolean hasUpdateUndo;
-    /**
-     * 运行期保存点栈。保存点只记录 undo 边界，不持有物理资源；partial rollback 成功后会删除目标之后的保存点，
-     * 目标本身保留以支持重复 rollback-to 同一边界。
-     */
+    /** 每种普通 undo 最多一条绑定；TEMPORARY 不进入本普通 undo context。 */
+    private final EnumMap<UndoLogKind, UndoLogBinding> bindings = new EnumMap<>(UndoLogKind.class);
+    /** 事务物理 append 全局高水位；partial rollback 永不回退，防止 detached undoNo 被复用。 */
+    private UndoNo lastUndoNo = UndoNo.NONE;
+    /** 运行期保存点栈；每项同时捕获 INSERT/UPDATE 两个精确局部头。 */
     private final List<TransactionSavepoint> savepointStack = new ArrayList<>();
-    /** 当前 {@link #savepointStack} 的创建序号来源；仅由所属事务线程推进。 */
+    /** 同一 context 内保存点创建序号，只用于诊断与稳定归属。 */
     private long nextSavepointSequence;
 
-    /**
-     * 构造一个「刚建段、尚未 append」的 undo context。{@code lastUndoNo} 初始化为 {@link UndoNo#NONE}，
-     * {@code lastRollPointer} 初始化为 {@link RollPointer#NULL}。
-     *
-     * @param rollbackSegmentId 所属 rollback segment，不能为 null。
-     * @param slotId            认领的 slot，不能为 null。
-     * @param undoFirstPageId   本事务 undo segment 首页，不能为 null。
-     */
-    public UndoContext(RollbackSegmentId rollbackSegmentId, UndoSlotId slotId, PageId undoFirstPageId) {
-        if (rollbackSegmentId == null || slotId == null || undoFirstPageId == null) {
-            throw new DatabaseValidationException("undo context fields must not be null");
+    /** 构造尚未创建任何物理 log 的事务 undo 上下文。 */
+    public UndoContext(RollbackSegmentId rollbackSegmentId) {
+        if (rollbackSegmentId == null) {
+            throw new DatabaseValidationException("undo context rollback segment must not be null");
         }
         this.rollbackSegmentId = rollbackSegmentId;
-        this.slotId = slotId;
-        this.undoFirstPageId = undoFirstPageId;
-        this.lastUndoNo = UndoNo.NONE;
-        this.logicalLastUndoNo = UndoNo.NONE;
-        this.lastRollPointer = RollPointer.NULL;
     }
 
-    /** 所属 rollback segment。 */
-    public RollbackSegmentId rollbackSegmentId() {
-        return rollbackSegmentId;
-    }
+    public RollbackSegmentId rollbackSegmentId() { return rollbackSegmentId; }
+    public UndoNo lastUndoNo() { return lastUndoNo; }
 
-    /** 认领的 slot。 */
-    public UndoSlotId slotId() {
-        return slotId;
-    }
-
-    /** 本事务 undo segment 链首页 id（insert+update 混合段）。 */
-    public PageId undoFirstPageId() {
-        return undoFirstPageId;
-    }
-
-    /** 事务内最新 undo record 序号；NONE 表尚未 append。 */
-    public UndoNo lastUndoNo() {
-        return lastUndoNo;
-    }
-
-    /** 当前逻辑回滚链头 undoNo；partial rollback 后可能小于 {@link #lastUndoNo()}. */
-    public UndoNo logicalLastUndoNo() {
-        return logicalLastUndoNo;
-    }
-
-    /** 当前逻辑回滚链入口（最新有效 undo record 位置）；NULL 表当前逻辑链为空。 */
-    public RollPointer lastRollPointer() {
-        return lastRollPointer;
-    }
-
-    /**
-     * 返回当前运行期有效 undo 链头的成对快照。部分回滚用该值作为持久 header 的 expected CAS 边界；
-     * 任一字段若被错误地单独推进，{@link UndoLogicalHead} 会在落盘前暴露 pair 不一致。
-     */
-    UndoLogicalHead logicalHead() {
-        return new UndoLogicalHead(logicalLastUndoNo, lastRollPointer);
-    }
-
-    /** 本事务是否写过 UPDATE undo（决定 commit 是否回收 slot）。 */
-    public boolean hasUpdateUndo() {
-        return hasUpdateUndo;
-    }
-
-    /** 当前运行期保存点数量，供诊断和测试确认栈修剪语义。 */
-    int savepointCount() {
-        return savepointStack.size();
-    }
-
-    /**
-     * 推进事务内最新 undo record 序号。仅 {@code UndoLogManager} 在 append 成功后调用。
-     *
-     * @param undoNo 新 undoNo，不能为 null。
-     */
-    void setLastUndoNo(UndoNo undoNo) {
-        if (undoNo == null) {
-            throw new DatabaseValidationException("undo context lastUndoNo must not be null");
+    /** 在 segment + page3 claim 已完成后附加一条 binding；同 kind 只允许一次。 */
+    void attach(UndoLogBinding binding) {
+        if (binding == null) {
+            throw new DatabaseValidationException("undo binding must not be null");
         }
-        this.lastUndoNo = undoNo;
-        this.logicalLastUndoNo = undoNo;
-    }
-
-    /**
-     * 推进事务回滚链入口。仅 {@code UndoLogManager} 在 append 成功后调用；{@code RollPointer#NULL} 是合法值
-     * （表「无前驱」），但 Java null 引用必须拒绝，避免隐藏 NPE 破坏回滚链不变量。
-     *
-     * @param rollPointer 新 roll pointer，不能为 Java null（可为 {@link RollPointer#NULL}）。
-     */
-    void setLastRollPointer(RollPointer rollPointer) {
-        if (rollPointer == null) {
-            throw new DatabaseValidationException("undo context lastRollPointer must not be null");
+        if (bindings.putIfAbsent(binding.kind(), binding) != null) {
+            throw new DatabaseValidationException("transaction already owns " + binding.kind() + " undo log");
         }
-        this.lastRollPointer = rollPointer;
     }
 
-    /**
-     * 创建运行期保存点。保存点捕获当前逻辑链头，而不是 append 高水位；这样 rollback-to 之后再写入时，
-     * 新 undo record 仍会用 {@code lastUndoNo + 1}，不会复用已经写入过的 undoNo。
-     *
-     * @param txn 所属事务，必须仍为 ACTIVE。
-     * @return 已压入本 context 保存点栈的保存点值对象。
-     */
+    /** recovery 根据已核对的持久 header 恢复 binding 与事务全局高水位。 */
+    void restoreBinding(UndoLogBinding binding, UndoNo globalHighWater) {
+        if (binding == null || globalHighWater == null
+                || globalHighWater.value() < binding.logicalHead().undoNo().value()) {
+            throw new DatabaseValidationException("invalid recovered undo binding/high-water");
+        }
+        attach(binding);
+        if (globalHighWater.value() > lastUndoNo.value()) {
+            lastUndoNo = globalHighWater;
+        }
+    }
+
+    public UndoLogBinding binding(UndoLogKind kind) {
+        requireOrdinaryKind(kind);
+        return bindings.get(kind);
+    }
+
+    public boolean hasBinding(UndoLogKind kind) {
+        if (kind == UndoLogKind.TEMPORARY) {
+            return false;
+        }
+        return binding(kind) != null;
+    }
+
+    /** 返回不可变 binding 列表；物理调用方仍须按 PageId/slot 明确排序。 */
+    public Collection<UndoLogBinding> bindings() { return List.copyOf(bindings.values()); }
+
+    /** 尚未创建指定 log 时返回 EMPTY，便于保存点把“当时不存在”表达为精确边界。 */
+    public UndoLogicalHead head(UndoLogKind kind) {
+        UndoLogBinding binding = binding(kind);
+        return binding == null ? UndoLogicalHead.EMPTY : binding.logicalHead();
+    }
+
+    /** append MTR 成功后原子发布全局高水位和目标局部头。 */
+    void publishAppend(UndoLogKind kind, UndoNo undoNo, RollPointer pointer) {
+        publishAppend(kind, undoNo, pointer, null);
+    }
+
+    /** 生产 append 同时发布供下一次无 IO 规划使用的权威物理快照。 */
+    void publishAppend(UndoLogKind kind, UndoNo undoNo, RollPointer pointer,
+                       UndoAppendSnapshot appendSnapshot) {
+        if (undoNo == null || pointer == null) {
+            throw new DatabaseValidationException("undo append publication fields must not be null");
+        }
+        UndoLogBinding binding = binding(kind);
+        if (binding == null) {
+            throw new DatabaseValidationException("transaction has no " + kind + " undo binding");
+        }
+        if (undoNo.value() <= lastUndoNo.value()) {
+            throw new DatabaseValidationException("global undo number must advance: current="
+                    + lastUndoNo.value() + ", next=" + undoNo.value());
+        }
+        UndoLogicalHead head = new UndoLogicalHead(undoNo, pointer);
+        if (appendSnapshot == null) {
+            binding.publishHead(head);
+        } else {
+            binding.publishAppend(head, appendSnapshot);
+        }
+        lastUndoNo = undoNo;
+    }
+
+    /** full/recovery marker 已提交后，只发布所属 kind 的新局部头；全局物理高水位保持不变。 */
+    void publishRollbackProgress(UndoLogKind kind, UndoLogicalHead persistedHead) {
+        if (persistedHead == null || binding(kind) == null) {
+            throw new DatabaseValidationException("rollback progress requires an existing binding and head");
+        }
+        binding(kind).publishHead(persistedHead);
+        savepointStack.clear();
+    }
+
     TransactionSavepoint createSavepoint(Transaction txn) {
-        if (txn == null) {
-            throw new DatabaseValidationException("savepoint transaction must not be null");
-        }
-        if (txn.state() != TransactionState.ACTIVE) {
-            throw new TransactionStateException("savepoint requires an ACTIVE transaction: " + txn.state());
+        if (txn == null || txn.state() != TransactionState.ACTIVE) {
+            throw new TransactionStateException("savepoint requires an ACTIVE transaction");
         }
         if (txn.undoContext() != null && txn.undoContext() != this) {
             throw new DatabaseValidationException("transaction is bound to a different undo context");
         }
-        TransactionSavepoint savepoint = new TransactionSavepoint(
-                txn, logicalLastUndoNo, lastRollPointer, nextSavepointSequence++);
+        TransactionSavepoint savepoint = new TransactionSavepoint(txn,
+                head(UndoLogKind.INSERT), head(UndoLogKind.UPDATE), nextSavepointSequence++);
         savepointStack.add(savepoint);
         return savepoint;
     }
 
-    /**
-     * rollback-to-savepoint 成功后的边界收尾。调用方必须已经把保存点之后的 undo record 全部反向应用成功；
-     * 本方法只修改运行期逻辑链头和保存点栈，不访问 undo 页、不释放 slot、不改变事务状态。
-     *
-     * @param savepoint 本 {@link UndoContext} 创建的保存点。
-     */
+    /** partial rollback 的双 header marker 已同批提交后发布两个精确边界并修剪嵌套保存点。 */
     void completeRollbackToSavepoint(TransactionSavepoint savepoint) {
         int index = requireOwnedSavepoint(savepoint);
-        this.logicalLastUndoNo = savepoint.undoNo();
-        this.lastRollPointer = savepoint.rollPointer();
+        publishExistingHead(UndoLogKind.INSERT, savepoint.insertHead());
+        publishExistingHead(UndoLogKind.UPDATE, savepoint.updateHead());
         for (int i = savepointStack.size() - 1; i > index; i--) {
             savepointStack.remove(i);
         }
     }
 
-    /**
-     * statement rollback 成功退回“事务首写前”的空 undo 边界。调用方必须已经反向应用当前逻辑链上的全部
-     * undo record；本方法只把运行期链头置空并清除所有保存点，不释放 undo slot，也不回退
-     * {@link #lastUndoNo} append 高水位。保留高水位可保证同一事务后续写入不会复用已经落入 undo 页的序号。
-     */
+    /** statement rollback 回到两条 log 都为空的边界，不回退全局 append 高水位。 */
     void completeRollbackToEmptyBoundary() {
-        this.logicalLastUndoNo = UndoNo.NONE;
-        this.lastRollPointer = RollPointer.NULL;
-        savepointStack.clear();
-    }
-
-    /**
-     * 发布一条已经成功提交到 first-page header 的 full rollback 进度。调用方只能在 marker MTR commit 返回后调用；
-     * 本方法不再执行可能失败的磁盘/链校验，只把同一个不可变 pair 复制到事务内存态，避免 marker 已持久而 context
-     * 仍指向旧 record。完整回滚一旦开始便不会回到 ACTIVE，所有运行期保存点随第一条进度失效并清空。
-     *
-     * <p>{@link #lastUndoNo} 是物理 append 高水位，故意不随逻辑头回退；否则 rollback 后的诊断或未来格式扩展会误以为
-     * detached record 从未分配过 undoNo。
-     *
-     * @param persistedHead 已由 marker MTR 成功提交的新持久逻辑头。
-     */
-    void publishFullRollbackProgress(UndoLogicalHead persistedHead) {
-        if (persistedHead == null) {
-            throw new DatabaseValidationException("full rollback persisted head must not be null");
+        for (UndoLogBinding binding : bindings.values()) {
+            binding.publishHead(UndoLogicalHead.EMPTY);
         }
-        this.logicalLastUndoNo = persistedHead.undoNo();
-        this.lastRollPointer = persistedHead.rollPointer();
         savepointStack.clear();
     }
 
-    /**
-     * 释放一个运行期保存点及其后创建的所有嵌套保存点。该操作只管理内存中的边界生命周期，不修改 undo 链，
-     * 因而用于 statement guard 成功关闭或完成回滚后的收尾；目标保存点必须仍属于本 context。
-     *
-     * @param savepoint 要释放的保存点，同时作为嵌套范围的起点。
-     */
     void releaseSavepoint(TransactionSavepoint savepoint) {
         int index = requireOwnedSavepoint(savepoint);
         for (int i = savepointStack.size() - 1; i >= index; i--) {
@@ -238,13 +159,6 @@ public final class UndoContext {
         }
     }
 
-    /**
-     * 校验保存点确实由本 context 创建，并返回其栈位置。RollbackService 会在应用任何 undo 前先调用本方法，
-     * 防止传入伪造或陈旧保存点时出现“数据已经被撤销，随后才发现边界非法”的半完成状态。
-     *
-     * @param savepoint 待校验保存点。
-     * @return 保存点在 {@link #savepointStack} 中的位置。
-     */
     int requireOwnedSavepoint(TransactionSavepoint savepoint) {
         if (savepoint == null) {
             throw new DatabaseValidationException("transaction savepoint must not be null");
@@ -256,11 +170,22 @@ public final class UndoContext {
         return index;
     }
 
-    /**
-     * 标记本事务已写 UPDATE undo。仅 {@code UndoLogManager.beforeUpdate} 在 append 成功后调用；单调置位，不复位
-     * （一旦含 update undo，commit 即不可回收该段 slot）。
-     */
-    void markHasUpdateUndo() {
-        this.hasUpdateUndo = true;
+    int savepointCount() { return savepointStack.size(); }
+
+    private void publishExistingHead(UndoLogKind kind, UndoLogicalHead head) {
+        UndoLogBinding binding = bindings.get(kind);
+        if (binding == null) {
+            if (!head.isEmpty()) {
+                throw new DatabaseValidationException("savepoint references missing " + kind + " undo log");
+            }
+            return;
+        }
+        binding.publishHead(head);
+    }
+
+    private static void requireOrdinaryKind(UndoLogKind kind) {
+        if (kind == null || kind == UndoLogKind.TEMPORARY) {
+            throw new DatabaseValidationException("ordinary undo context kind must be INSERT or UPDATE");
+        }
     }
 }

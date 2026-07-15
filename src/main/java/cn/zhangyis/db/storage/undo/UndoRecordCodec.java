@@ -26,7 +26,8 @@ import java.util.List;
  *       后跟每个 key 列：[nullFlag u8]（非 null 再 [len u16][bytes]）
  * UPDATE_ROW 追加尾部：[oldDbTrxId u64][oldDbRollPtr 7B][rowColCount u8] 后跟每个 row 列（同 framing，按 schema 全列序）
  * </pre>
- * INSERT_ROW 无尾部。{@code type} 首字节是每条记录的权威类型（混合 undo 段中段头 UndoLogKind 不权威，T1.3e）。
+ * INSERT_ROW 无尾部。{@code type} 首字节与 v2 普通 UNDO 页复制的 {@link UndoLogKind} 共同守门：INSERT log 仅容纳
+ * INSERT_ROW，UPDATE log 仅容纳 UPDATE_ROW/DELETE_MARK。
  *
  * <p><b>为什么自带 framing</b>：undo record 无 record 页的 NullBitmap/变长目录，而 {@link TypeCodec} 约定 NULL 不由
  * codec 处理、变长 codec 不自带长度。故本 codec 为每列写 nullFlag + 显式长度。<b>为什么需要 TableSchema</b>：

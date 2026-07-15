@@ -17,6 +17,7 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
  * 0.19e：undo/rseg metadata delta 逻辑 redo 的持久格式与无 PAGE_BYTES 合成重放。
@@ -26,9 +27,9 @@ class UndoMetadataRedoTest {
     private static final PageSize PS = PageSize.ofBytes(16 * 1024);
     private static final SpaceId SPACE = SpaceId.of(9);
     private static final PageId RSEG_PAGE = PageId.of(SPACE, PageNo.of(3));
-    /** rseg page3 slot array 起点：FIL header(38) + magic/format/rsegId/slotCapacity(16)。 */
-    private static final int RSEG_SLOT_0 = PageEnvelopeLayout.FIL_PAGE_HEADER_BYTES + 16;
-    /** undo first-page v1 中 logical pair 起点；布局测试另在 storage.undo 包钉死 record-area=120。 */
+    /** rseg page3 v3 slot array 起点：固定头 + cache count + history base/high-water。 */
+    private static final int RSEG_SLOT_0 = 98;
+    /** undo first-page v3 中 logical pair 起点；history links 紧随其后。 */
     private static final int LOGICAL_HEAD_OFFSET = 105;
 
     @Test
@@ -45,6 +46,18 @@ class UndoMetadataRedoTest {
         assertEquals(batch.range(), decoded.get(0).range());
         assertEquals(List.of(delta), decoded.get(0).records());
         assertEquals(1 + 12 + 1 + 8 + 4 + 4 + 4 + Long.BYTES, delta.byteLength());
+    }
+
+    @Test
+    void persistentHistoryRedoKindCodesAreAppendOnlyAndRoundTrip() {
+        assertEquals(8, UndoMetadataDeltaKind.RSEG_HISTORY_BASE.code());
+        assertEquals(9, UndoMetadataDeltaKind.UNDO_HISTORY_LINK_FIELD.code());
+        assertEquals(UndoMetadataDeltaKind.RSEG_HISTORY_BASE,
+                UndoMetadataDeltaKind.fromCode((byte) 8));
+        assertEquals(UndoMetadataDeltaKind.UNDO_HISTORY_LINK_FIELD,
+                UndoMetadataDeltaKind.fromCode((byte) 9));
+        assertThrows(RedoLogCorruptedException.class,
+                () -> UndoMetadataDeltaKind.fromCode((byte) 10));
     }
 
     @Test
@@ -66,6 +79,22 @@ class UndoMetadataRedoTest {
         assertEquals(1, store.writeCount);
     }
 
+    @Test
+    void historyBaseDeltaReplayIsIdempotentByPageLsn() {
+        RecordingPageStore store = new RecordingPageStore();
+        store.create(SPACE, Path.of("undo-history.ibu"), PS, PageNo.of(4));
+        byte[] after = longBytes(64L);
+        RedoLogBatch batch = batchOf(List.of(new UndoMetadataDeltaRecord(RSEG_PAGE,
+                UndoMetadataDeltaKind.RSEG_HISTORY_BASE, 0L, 0, 66, after)));
+
+        RedoApplyDispatcher dispatcher = RedoApplyDispatcher.pageDispatcher();
+        dispatcher.apply(batch, new RedoApplyContext(store, PS));
+        dispatcher.apply(batch, new RedoApplyContext(store, PS));
+
+        assertArrayEquals(after, slice(store.page(RSEG_PAGE), 66, Long.BYTES));
+        assertEquals(1, store.writeCount, "repeated recovery must skip the already stamped history base delta");
+    }
+
     /** 15B logical head after-image 必须能作为一个 redo record 编码、重放，并以 batch end LSN 幂等跳过。 */
     @Test
     void persistentLogicalHeadPairReplaysAtomicallyAndIdempotently() {
@@ -73,7 +102,7 @@ class UndoMetadataRedoTest {
         store.create(SPACE, Path.of("undo-head.ibu"), PS, PageNo.of(4));
         byte[] pair = ByteBuffer.allocate(Long.BYTES + 7)
                 .putLong(9L)
-                .put(new byte[]{(byte) 0x80, 0, 0, 0, 7, 0, 120})
+                .put(new byte[]{(byte) 0x80, 0, 0, 0, 7, 0, (byte) 136})
                 .array();
         UndoMetadataDeltaRecord delta = new UndoMetadataDeltaRecord(RSEG_PAGE,
                 UndoMetadataDeltaKind.UNDO_LOG_HEADER_FIELD, 33L, 2,

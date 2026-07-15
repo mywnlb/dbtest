@@ -182,4 +182,49 @@ class TransactionManagerTest {
         assertNull(t.readView());
         assertEquals(TransactionState.COMMITTED, t.state());
     }
+
+    /**
+     * ReadView 可在 TransactionNo 已分配但持久 commit 尚未发布的窗口创建；仅看 lowLimitNo 会误 purge，
+     * creator 可见性复核必须继续挡住该 history，直到快照关闭。
+     */
+    @Test
+    void purgeEligibilityChecksCreatorVisibilityAcrossPreparedCommitWindow() {
+        TransactionSystem system = new TransactionSystem();
+        TransactionManager manager = new TransactionManager(system);
+        Transaction writer = manager.begin(TransactionOptions.defaults());
+        TransactionId creator = manager.assignWriteId(writer);
+        manager.prepareCommit(writer);
+
+        Transaction reader = manager.begin(TransactionOptions.defaults());
+        manager.readViewManager().openReadView(reader);
+        assertTrue(writer.transactionNo().value() < system.purgeLowWaterNo().value(),
+                "allocated commit number alone appears older than the coarse boundary");
+        assertFalse(system.isPurgeEligible(writer.transactionNo(), creator),
+                "snapshot captured creator as active before persistent commit");
+
+        manager.commit(writer);
+        assertFalse(system.isPurgeEligible(writer.transactionNo(), creator),
+                "immutable old snapshot still needs the pre-commit version after writer terminal publication");
+        manager.rollback(reader);
+        assertTrue(system.isPurgeEligible(writer.transactionNo(), creator));
+    }
+
+    /**
+     * 即使当前没有 ReadView，已分配提交号但仍留在 active table 的 creator 也不能 purge；否则检查后新建的快照
+     * 会把 creator 捕获为活跃事务，却已失去构造旧版本所需的 undo。
+     */
+    @Test
+    void purgeEligibilityRejectsPreparedCommitCreatorWhenNoReadViewExists() {
+        TransactionSystem system = new TransactionSystem();
+        TransactionManager manager = new TransactionManager(system);
+        Transaction writer = manager.begin(TransactionOptions.defaults());
+        TransactionId creator = manager.assignWriteId(writer);
+        manager.prepareCommit(writer);
+
+        assertFalse(system.isPurgeEligible(writer.transactionNo(), creator),
+                "prepared creator remains active even when the live ReadView set is empty");
+
+        manager.commit(writer);
+        assertTrue(system.isPurgeEligible(writer.transactionNo(), creator));
+    }
 }

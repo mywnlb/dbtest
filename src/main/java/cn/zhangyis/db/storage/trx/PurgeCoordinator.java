@@ -3,7 +3,6 @@ package cn.zhangyis.db.storage.trx;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.RollPointer;
-import cn.zhangyis.db.domain.TransactionNo;
 import cn.zhangyis.db.storage.btree.BTreeDeleteResult;
 import cn.zhangyis.db.storage.btree.BTreeIndex;
 import cn.zhangyis.db.storage.btree.SplitCapableBTreeIndexService;
@@ -15,6 +14,7 @@ import cn.zhangyis.db.storage.btree.BTreeRedoBudgetEstimator;
 import cn.zhangyis.db.storage.mtr.MiniTransactionState;
 import cn.zhangyis.db.storage.record.page.SearchKey;
 import cn.zhangyis.db.storage.undo.UndoLogSegment;
+import cn.zhangyis.db.storage.undo.UndoLogKind;
 import cn.zhangyis.db.storage.undo.UndoLogSegmentAccess;
 import cn.zhangyis.db.storage.undo.UndoLogFormatException;
 import cn.zhangyis.db.storage.undo.UndoLogicalHead;
@@ -42,7 +42,7 @@ import java.util.Optional;
  *
  * <p><b>per-entry 失败边界</b>：committed 队列先 peek，只有 index tasks 与 finalization 全部成功后才按 expected
  * identity 摘队首。task 中途失败保留 page3 COMMITTED slot，重启可重建并 stale-skip 已完成任务；finalization 的
- * drop+clear 同批提交后即使在内存 complete 前 crash，page3 也不会重新暴露已释放 segment。
+ * cache/drop + page3 owner 转移同批提交后，即使在内存 complete 前 crash，恢复也只依据持久 owner 重建。
  *
  * <p><b>当前范围</b>：协调器自身同步串行，生产由单 daemon driver 周期调用；单聚簇索引、内存 history，
  * recovery 会从仍占用 page3 的 COMMITTED header 重建队列。二级索引 purge、多 worker、多 rseg 留后续片。
@@ -57,7 +57,7 @@ public final class PurgeCoordinator implements PurgeTarget {
     private final HistoryList history;
     /** 逐 pointer 读取 committed undo logical chain 的入口。 */
     private final UndoLogSegmentAccess undoAccess;
-    /** tasks 完成后原子 drop segment + clear page3 owner 的终态协作者。 */
+    /** tasks 完成后原子 cache/drop segment + 转移 page3 owner 的终态协作者。 */
     private final UndoSegmentFinalizer finalizer;
     /** 物理删除仍匹配 creator/roll-pointer 的 delete-marked 聚簇记录。 */
     private final SplitCapableBTreeIndexService btree;
@@ -96,7 +96,7 @@ public final class PurgeCoordinator implements PurgeTarget {
     }
 
     /**
-     * 执行一个可测试 purge 批次：按 boundary FIFO 处理至多 {@code maxLogs} 条 committed update/delete undo log。
+     * 执行一个可测试 purge 批次：按持久物理链 head 顺序处理至多 {@code maxLogs} 条 committed update/delete undo log。
      *
      * @param maxLogs 本批最多处理的 committed undo log 数（正）。
      * @return 本批统计。
@@ -105,7 +105,6 @@ public final class PurgeCoordinator implements PurgeTarget {
         if (maxLogs <= 0) {
             throw new DatabaseValidationException("purge maxLogs must be positive: " + maxLogs);
         }
-        TransactionNo boundary = system.purgeLowWaterNo();
         int purgedLogs = 0;
         int removedRecords = 0;
         while (purgedLogs < maxLogs) {
@@ -114,16 +113,10 @@ public final class PurgeCoordinator implements PurgeTarget {
                 break;
             }
             HistoryEntry head = headOpt.get();
-            if (head.transactionNo().value() >= boundary.value()) {
-                break; // 未达 boundary：FIFO 停批，更老读者仍可能需要旧版本
+            if (!system.isPurgeEligible(head.transactionNo(), head.creatorTrxId())) {
+                break; // 不越过物理 head；creator 非 active、提交号边界与 live ReadView 可见性必须同时成立
             }
             removedRecords += purgeCommittedLog(head);
-            try {
-                history.completeCommitted(head);
-            } catch (RuntimeException error) {
-                throw new UndoFinalizationException(
-                        "purge finalization committed but history publication failed: " + head, error);
-            }
             purgedLogs++;
         }
         return new PurgeSummary(purgedLogs, removedRecords);
@@ -143,6 +136,9 @@ public final class PurgeCoordinator implements PurgeTarget {
                 throw new UndoLogFormatException("purge history creator transaction "
                         + entry.creatorTrxId().value() + " != undo segment creator "
                         + seg.creatorTransactionId().value());
+            }
+            if (seg.undoKind() != UndoLogKind.UPDATE || !seg.isCommitted()) {
+                throw new UndoLogFormatException("purge history must reference a COMMITTED UPDATE undo log");
             }
             start = new LogicalChainStart(seg.logicalHead());
             mgr.commit(read);
@@ -172,7 +168,10 @@ public final class PurgeCoordinator implements PurgeTarget {
             }
         }
 
-        finalizer.finalizePurgedHistory(entry);
+        // B+Tree 任务全部完成后才占用跨 IO history transition，避免慢索引清理阻塞其它 commit append。
+        try (HistoryList.HeadRemovalLease lease = history.beginHeadRemoval(entry)) {
+            finalizer.finalizePurgedHistory(entry, lease);
+        }
         return removed;
     }
 

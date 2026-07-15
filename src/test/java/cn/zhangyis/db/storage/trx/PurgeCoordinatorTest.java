@@ -49,6 +49,7 @@ import cn.zhangyis.db.storage.redo.RedoLogManager;
 import cn.zhangyis.db.storage.redo.FspMetadataDeltaKind;
 import cn.zhangyis.db.storage.redo.FspMetadataDeltaRecord;
 import cn.zhangyis.db.storage.undo.UndoLogSegment;
+import cn.zhangyis.db.storage.undo.UndoLogKind;
 import cn.zhangyis.db.storage.undo.UndoLogSegmentAccess;
 import cn.zhangyis.db.storage.undo.UndoRecord;
 import cn.zhangyis.db.storage.undo.UndoSegmentHandle;
@@ -223,8 +224,8 @@ class PurgeCoordinatorTest {
             UndoFinalizationTestSupport.Components finalization = UndoFinalizationTestSupport.create(
                     mgr, pool, PS, undoAccess, allocator, slots);
             HistoryList history = new HistoryList();
-            history.submitCommitted(new HistoryEntry(TransactionNo.of(1), TransactionId.of(7),
-                    UNDO_SPACE, fixture.firstPageId(), fixture.slotId()));
+            history.restore(List.of(new HistoryEntry(TransactionNo.of(1), TransactionId.of(7),
+                    UNDO_SPACE, fixture.firstPageId(), fixture.slotId())));
             TransactionSystem system = new TransactionSystem();
             system.restoreCounters(8, 2);
             PurgeCoordinator purge = new PurgeCoordinator(mgr, system, history, undoAccess,
@@ -283,7 +284,7 @@ class PurgeCoordinatorTest {
 
     @Test
     void perEntryAtomicityKeepsHistoryHeadOnDropFailure() {
-        onPool(true, ctx -> { // failing dropUndoSegment
+        onPool(2, ctx -> { // mixed commit 的第 1 次 drop 成功，purge 的第 2 次 drop 注入失败
             ctx.boot();
             BTreeIndex index = ctx.clusteredIndex();
             // 单事务 insert+delete-mark → 提交为含 delete undo 的 committed log（无独立 insert-reclaim）
@@ -296,10 +297,11 @@ class PurgeCoordinatorTest {
             // drop 抛错：异常传播、history head 不被 poll
             assertThrows(DatabaseRuntimeException.class, () -> ctx.purge.runBatch(10));
             assertEquals(1, ctx.history.committedSize(), "history head retained on hard failure (per-entry atomic)");
-            assertEquals(1, ((FailingDropAllocator) ctx.undoAllocator).dropAttempts());
+            assertEquals(2, ((FailingDropAllocator) ctx.undoAllocator).dropAttempts(),
+                    "mixed commit drops INSERT first; purge fails on UPDATE drop");
 
             assertThrows(DatabaseRuntimeException.class, () -> ctx.purge.runBatch(10));
-            assertEquals(1, ((FailingDropAllocator) ctx.undoAllocator).dropAttempts(),
+            assertEquals(2, ((FailingDropAllocator) ctx.undoAllocator).dropAttempts(),
                     "physical failure keeps FINALIZING, so retry cannot invoke allocator again");
         });
     }
@@ -331,10 +333,11 @@ class PurgeCoordinatorTest {
                     "old process also retains its stale memory slot projection");
             MiniTransaction read = ctx.mgr.begin();
             var snapshot = ctx.finalization.header().read(read, UNDO_SPACE,
-                    ctx.slots.rollbackSegmentId(), ctx.slots.slotCapacity());
+                    ctx.slots.rollbackSegmentId(), ctx.slots.slotCapacity(),
+                    ctx.finalization.cache().capacityPerKind());
             ctx.mgr.commit(read);
             assertFalse(snapshot.occupiedSlots().containsKey(head.slotId()),
-                    "page3 recovery authority was cleared by the committed finalization batch");
+                    "page3 recovery authority was cleared by the committed finalization batch: " + snapshot);
         });
     }
 
@@ -396,7 +399,7 @@ class PurgeCoordinatorTest {
             TableSchema schema = largePurgeSchema();
             BTreeIndex index = new BTreeIndex(INDEX_ID, root, 0, idKey(), schema, true, leaf, nonLeaf);
             MiniTransaction create = mgr.begin();
-            UndoLogSegment segment = undoAccess.create(create, UNDO_SPACE, TransactionId.of(7));
+            UndoLogSegment segment = undoAccess.create(create, UNDO_SPACE, TransactionId.of(7), UndoLogKind.UPDATE);
             PageId firstPageId = segment.firstPageId();
             UndoSlotId slotId = slots.claim(firstPageId);
             try (var ignored = create.allowOutOfOrderPageLatch(
@@ -418,8 +421,11 @@ class PurgeCoordinatorTest {
             }
             mgr.commit(create);
             MiniTransaction committed = mgr.begin();
-            undoAccess.open(committed, firstPageId, PageLatchMode.EXCLUSIVE)
-                    .markCommitted(TransactionNo.of(1));
+            finalization.header().appendHistory(committed, UNDO_SPACE,
+                    cn.zhangyis.db.storage.undo.RollbackSegmentHistoryBase.empty(),
+                    slotId, firstPageId, TransactionNo.of(1));
+            undoAccess.appendHistoryNode(committed, java.util.Optional.empty(), firstPageId,
+                    TransactionId.of(7), TransactionNo.of(1));
             mgr.commit(committed);
 
             redo.flush();
@@ -439,13 +445,21 @@ class PurgeCoordinatorTest {
     }
 
     private void onPool(boolean failDrop, Body body) {
-        onPool(failDrop, UndoFinalizationFaultInjector.none(), body);
+        onPool(failDrop ? 1 : 0, UndoFinalizationFaultInjector.none(), body);
     }
 
     private void onPool(boolean failDrop, UndoFinalizationFaultInjector faultInjector, Body body) {
+        onPool(failDrop ? 1 : 0, faultInjector, body);
+    }
+
+    private void onPool(int failOnDropAttempt, Body body) {
+        onPool(failOnDropAttempt, UndoFinalizationFaultInjector.none(), body);
+    }
+
+    private void onPool(int failOnDropAttempt, UndoFinalizationFaultInjector faultInjector, Body body) {
         PageStore store = new FileChannelPageStore();
         try (PageStore ignored = store; BufferPool pool = new LruBufferPool(store, PS, 128)) {
-            body.run(new Ctx(store, pool, failDrop, faultInjector));
+            body.run(new Ctx(store, pool, failOnDropAttempt, faultInjector));
         }
     }
 
@@ -456,11 +470,13 @@ class PurgeCoordinatorTest {
     /** 仅在 dropUndoSegment 抛错的分配器包装，用于 per-entry 原子测试；create/allocate 透传真实分配器。 */
     private static final class FailingDropAllocator implements UndoSpaceAllocator {
         private final UndoSpaceAllocator delegate;
+        private final int failOnAttempt;
         /** 记录是否有重复终结越过运行期 lease 到达物理 allocator。 */
         private final AtomicInteger dropAttempts = new AtomicInteger();
 
-        private FailingDropAllocator(UndoSpaceAllocator delegate) {
+        private FailingDropAllocator(UndoSpaceAllocator delegate, int failOnAttempt) {
             this.delegate = delegate;
+            this.failOnAttempt = failOnAttempt;
         }
 
         @Override
@@ -486,8 +502,11 @@ class PurgeCoordinatorTest {
 
         @Override
         public void dropUndoSegment(MiniTransaction mtr, UndoSegmentHandle handle) {
-            dropAttempts.incrementAndGet();
-            throw new DatabaseRuntimeException("injected dropUndoSegment failure");
+            int attempt = dropAttempts.incrementAndGet();
+            if (attempt == failOnAttempt) {
+                throw new DatabaseRuntimeException("injected dropUndoSegment failure");
+            }
+            delegate.dropUndoSegment(mtr, handle);
         }
 
         private int dropAttempts() {
@@ -514,17 +533,18 @@ class PurgeCoordinatorTest {
         private SegmentRef nonLeafSegment;
         private PageId rootPageId;
 
-        private Ctx(PageStore store, BufferPool pool, boolean failDrop,
+        private Ctx(PageStore store, BufferPool pool, int failOnDropAttempt,
                     UndoFinalizationFaultInjector faultInjector) {
             this.pool = pool;
             this.disk = new DiskSpaceManager(pool, store, PS);
             this.access = new IndexPageAccess(pool, PS);
             UndoSpaceAllocator real = new DiskSpaceUndoAllocator(disk);
-            this.undoAllocator = failDrop ? new FailingDropAllocator(real) : real;
+            this.undoAllocator = failOnDropAttempt > 0
+                    ? new FailingDropAllocator(real, failOnDropAttempt) : real;
             this.undoAccess = new UndoLogSegmentAccess(pool, PS, undoAllocator, registry);
             this.slots = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 64);
             this.finalization = UndoFinalizationTestSupport.create(
-                    mgr, pool, PS, undoAccess, undoAllocator, slots, faultInjector);
+                    mgr, pool, PS, undoAccess, undoAllocator, slots, faultInjector, 0);
             this.undoMgr = finalization.manager(undoAccess, UNDO_SPACE, history, mgr);
             this.svc = new SplitCapableBTreeIndexService(access, disk, registry);
             this.rollbackService = new RollbackService(
@@ -558,7 +578,7 @@ class PurgeCoordinatorTest {
 
         private void insert(BTreeIndex index, Transaction txn, long id) {
             MiniTransaction m = mgr.begin();
-            RollPointer rp = undoMgr.beforeInsert(txn, m, TABLE_ID, INDEX_ID, key(id), index.keyDef(), index.schema());
+            RollPointer rp = UndoTestWrites.insert(undoMgr, txn, m, TABLE_ID, INDEX_ID, key(id), index.keyDef(), index.schema());
             svc.insertClustered(m, index, row(id), txn.transactionId(), rp);
             mgr.commit(m);
         }
@@ -569,7 +589,7 @@ class PurgeCoordinatorTest {
             mgr.commit(read);
             HiddenColumns oldHidden = old.record().hiddenColumns();
             MiniTransaction m = mgr.begin();
-            RollPointer delRp = undoMgr.beforeDelete(txn, m, TABLE_ID, INDEX_ID, key(id),
+            RollPointer delRp = UndoTestWrites.delete(undoMgr, txn, m, TABLE_ID, INDEX_ID, key(id),
                     old.record().columnValues(), oldHidden, index.keyDef(), index.schema());
             svc.setClusteredDeleteMark(m, index, search(id), true,
                     new HiddenColumns(txn.transactionId(), delRp), oldHidden.dbTrxId(), oldHidden.dbRollPtr());
@@ -583,7 +603,7 @@ class PurgeCoordinatorTest {
             mgr.commit(read);
             HiddenColumns oldHidden = old.record().hiddenColumns();
             MiniTransaction m = mgr.begin();
-            RollPointer newRp = undoMgr.beforeUpdate(txn, m, TABLE_ID, INDEX_ID, key(id),
+            RollPointer newRp = UndoTestWrites.update(undoMgr, txn, m, TABLE_ID, INDEX_ID, key(id),
                     old.record().columnValues(), oldHidden, index.keyDef(), index.schema());
             svc.replaceClustered(m, index, search(id),
                     new LogicalRecord(1, List.of(new ColumnValue.IntValue(id), new ColumnValue.StringValue(payload)),

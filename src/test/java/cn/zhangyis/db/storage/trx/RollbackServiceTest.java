@@ -51,10 +51,10 @@ import cn.zhangyis.db.storage.redo.TransactionStateDeltaReason;
 import cn.zhangyis.db.storage.redo.TransactionStateDeltaRecord;
 import cn.zhangyis.db.storage.redo.TransactionStateDeltaState;
 import cn.zhangyis.db.storage.undo.UndoLogicalHead;
-import cn.zhangyis.db.storage.undo.UndoLogicalHeadConflictException;
 import cn.zhangyis.db.storage.undo.UndoLogFormatException;
 import cn.zhangyis.db.storage.undo.UndoLogSegment;
 import cn.zhangyis.db.storage.undo.UndoLogSegmentAccess;
+import cn.zhangyis.db.storage.undo.UndoLogKind;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -70,7 +70,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * T1.3d RollbackService：反向走 INSERT undo 链物理删除未提交聚簇行 + 回收内存 slot。整栈 test-wired
- * （assignWriteId → beforeInsert → insertClustered → rollback），无生产组合根。覆盖：单行/多行 full rollback、
+ * （assignWriteId → planInsert/appendPlanned → insertClustered → rollback），无生产组合根。覆盖：单行/多行 full rollback、
  * orphan undo 幂等、只读/未写事务仅翻状态。
  *
  * <p><b>当前覆盖</b>：完整 rollback、INSERT/UPDATE/DELETE_MARK 反向命令、精确 savepoint 与一次性空边界 rollback。
@@ -101,7 +101,7 @@ class RollbackServiceTest {
             Transaction txn = ctx.txnMgr.begin(TransactionOptions.defaults());
             TransactionId wid = ctx.txnMgr.assignWriteId(txn);
             MiniTransaction m = ctx.mgr.begin();
-            RollPointer rp = ctx.undoMgr.beforeInsert(txn, m, TABLE_ID, INDEX_ID,
+            RollPointer rp = UndoTestWrites.insert(ctx.undoMgr, txn, m, TABLE_ID, INDEX_ID,
                     key(1), index.keyDef(), index.schema());
             svc.insertClustered(m, index, row(1), wid, rp);
             ctx.mgr.commit(m);
@@ -135,7 +135,7 @@ class RollbackServiceTest {
             Transaction txn = ctx.txnMgr.begin(TransactionOptions.defaults());
             TransactionId wid = ctx.txnMgr.assignWriteId(txn);
             MiniTransaction write = ctx.mgr.begin();
-            RollPointer pointer = ctx.undoMgr.beforeInsert(txn, write, TABLE_ID, INDEX_ID,
+            RollPointer pointer = UndoTestWrites.insert(ctx.undoMgr, txn, write, TABLE_ID, INDEX_ID,
                     key(1), index.keyDef(), index.schema());
             svc.insertClustered(write, index, row(1), wid, pointer);
             ctx.mgr.commit(write);
@@ -159,12 +159,12 @@ class RollbackServiceTest {
             Transaction txn = ctx.txnMgr.begin(TransactionOptions.defaults());
             TransactionId wid = ctx.txnMgr.assignWriteId(txn);
             MiniTransaction first = ctx.mgr.begin();
-            RollPointer rp1 = ctx.undoMgr.beforeInsert(txn, first, TABLE_ID, INDEX_ID,
+            RollPointer rp1 = UndoTestWrites.insert(ctx.undoMgr, txn, first, TABLE_ID, INDEX_ID,
                     key(1), index.keyDef(), index.schema());
             svc.insertClustered(first, index, row(1), wid, rp1);
             ctx.mgr.commit(first);
             MiniTransaction second = ctx.mgr.begin();
-            RollPointer rp2 = ctx.undoMgr.beforeInsert(txn, second, TABLE_ID, INDEX_ID,
+            RollPointer rp2 = UndoTestWrites.insert(ctx.undoMgr, txn, second, TABLE_ID, INDEX_ID,
                     key(2), index.keyDef(), index.schema());
             svc.insertClustered(second, index, row(2), wid, rp2);
             ctx.mgr.commit(second);
@@ -193,7 +193,7 @@ class RollbackServiceTest {
             TransactionId wid = ctx.txnMgr.assignWriteId(txn);
             for (int i = 1; i <= 3; i++) {
                 MiniTransaction m = ctx.mgr.begin();
-                RollPointer rp = ctx.undoMgr.beforeInsert(txn, m, TABLE_ID, INDEX_ID,
+                RollPointer rp = UndoTestWrites.insert(ctx.undoMgr, txn, m, TABLE_ID, INDEX_ID,
                         key(i), index.keyDef(), index.schema());
                 BTreeInsertResult res = svc.insertClustered(m, index, row(i), wid, rp);
                 index = res.indexAfterInsert();
@@ -234,9 +234,9 @@ class RollbackServiceTest {
 
             UndoLogicalHead originalHead = new UndoLogicalHead(UndoNo.of(3), fixture.pointers().get(2));
             assertEquals(TransactionState.ROLLING_BACK, fixture.transaction().state());
-            assertEquals(originalHead, fixture.transaction().undoContext().logicalHead(),
+            assertEquals(originalHead, UndoTestContexts.head(fixture.transaction().undoContext()),
                     "memory head must not move before the marker commits");
-            assertEquals(originalHead, readLogicalHead(ctx, fixture.transaction().undoContext().undoFirstPageId()),
+            assertEquals(originalHead, readLogicalHead(ctx, UndoTestContexts.firstPage(fixture.transaction().undoContext())),
                     "persistent head must still point at the already-inversed row3");
             assertEquals(1, ctx.slots.activeSlotCount(), "non-terminal rollback keeps the undo slot");
             assertRowsPresent(ctx, fixture.index(), true, true, false);
@@ -272,8 +272,8 @@ class RollbackServiceTest {
 
             UndoLogicalHead progressed = new UndoLogicalHead(UndoNo.of(2), fixture.pointers().get(1));
             assertEquals(TransactionState.ROLLING_BACK, fixture.transaction().state());
-            assertEquals(progressed, fixture.transaction().undoContext().logicalHead());
-            assertEquals(progressed, readLogicalHead(ctx, fixture.transaction().undoContext().undoFirstPageId()));
+            assertEquals(progressed, UndoTestContexts.head(fixture.transaction().undoContext()));
+            assertEquals(progressed, readLogicalHead(ctx, UndoTestContexts.firstPage(fixture.transaction().undoContext())));
             assertEquals(1, ctx.slots.activeSlotCount());
             assertRowsPresent(ctx, fixture.index(), true, true, false);
 
@@ -303,9 +303,9 @@ class RollbackServiceTest {
                     () -> crashable.rollback(fixture.transaction(), fixture.index()));
 
             assertEquals(TransactionState.ROLLING_BACK, fixture.transaction().state());
-            assertEquals(UndoLogicalHead.EMPTY, fixture.transaction().undoContext().logicalHead());
+            assertEquals(UndoLogicalHead.EMPTY, UndoTestContexts.head(fixture.transaction().undoContext()));
             assertEquals(UndoLogicalHead.EMPTY,
-                    readLogicalHead(ctx, fixture.transaction().undoContext().undoFirstPageId()));
+                    readLogicalHead(ctx, UndoTestContexts.firstPage(fixture.transaction().undoContext())));
             assertEquals(1, ctx.slots.activeSlotCount(), "terminal resources wait until rollback finalization");
 
             RollbackSummary retried = crashable.rollback(fixture.transaction(), fixture.index());
@@ -330,19 +330,19 @@ class RollbackServiceTest {
                 }
             });
             UndoContext undoContext = fixture.transaction().undoContext();
-            PageId firstPageId = undoContext.undoFirstPageId();
+            PageId firstPageId = UndoTestContexts.firstPage(undoContext);
 
             assertThrows(SimulatedRollbackCrashException.class,
-                    () -> crashable.rollbackRecovered(undoContext.slotId(), firstPageId,
+                    () -> crashable.rollbackRecovered(UndoTestContexts.slot(undoContext), firstPageId,
                             fixture.transaction().transactionId(), fixture.index()));
             assertEquals(new UndoLogicalHead(UndoNo.of(2), fixture.pointers().get(1)),
                     readLogicalHead(ctx, firstPageId));
 
-            RollbackSummary resumed = ctx.rollbackService.rollbackRecovered(undoContext.slotId(), firstPageId,
+            RollbackSummary resumed = ctx.rollbackService.rollbackRecovered(UndoTestContexts.slot(undoContext), firstPageId,
                     fixture.transaction().transactionId(), fixture.index());
 
             assertEquals(2, resumed.undoRecordsApplied());
-            assertFalse(ctx.slots.isOccupied(undoContext.slotId()),
+            assertFalse(ctx.slots.isOccupied(UndoTestContexts.slot(undoContext)),
                     "recovery rollback finalization releases the recovered slot");
             assertRowsPresent(ctx, fixture.index(), false, false, false);
             assertTrue(ctx.mgr.redoLogManager().bufferedRecords().stream()
@@ -366,13 +366,12 @@ class RollbackServiceTest {
 
             assertThrows(UndoLogFormatException.class,
                     () -> ctx.finalization.finalizer().finalizeRecoveredRollback(
-                            undoContext.slotId(), undoContext.undoFirstPageId(),
-                            fixture.transaction().transactionId()));
+                            undoContext.bindings(), fixture.transaction().transactionId()));
 
-            assertTrue(ctx.slots.isOccupied(undoContext.slotId()),
+            assertTrue(ctx.slots.isOccupied(UndoTestContexts.slot(undoContext)),
                     "preflight refusal keeps the in-memory recovery owner");
             assertEquals(new UndoLogicalHead(UndoNo.of(1), fixture.pointers().getFirst()),
-                    readLogicalHead(ctx, undoContext.undoFirstPageId()),
+                    readLogicalHead(ctx, UndoTestContexts.firstPage(undoContext)),
                     "preflight refusal cannot move or drop the persisted logical chain");
         });
     }
@@ -387,14 +386,14 @@ class RollbackServiceTest {
             Transaction txn = ctx.txnMgr.begin(TransactionOptions.defaults());
             TransactionId wid = ctx.txnMgr.assignWriteId(txn);
             MiniTransaction first = ctx.mgr.begin();
-            RollPointer rp1 = ctx.undoMgr.beforeInsert(txn, first, TABLE_ID, INDEX_ID,
+            RollPointer rp1 = UndoTestWrites.insert(ctx.undoMgr, txn, first, TABLE_ID, INDEX_ID,
                     key(1), index.keyDef(), index.schema());
             svc.insertClustered(first, index, row(1), wid, rp1);
             ctx.mgr.commit(first);
             TransactionSavepoint savepoint = ctx.rollbackService.createSavepoint(txn);
 
             MiniTransaction second = ctx.mgr.begin();
-            RollPointer rp2 = ctx.undoMgr.beforeInsert(txn, second, TABLE_ID, INDEX_ID,
+            RollPointer rp2 = UndoTestWrites.insert(ctx.undoMgr, txn, second, TABLE_ID, INDEX_ID,
                     key(2), index.keyDef(), index.schema());
             svc.insertClustered(second, index, row(2), wid, rp2);
             ctx.mgr.commit(second);
@@ -404,7 +403,7 @@ class RollbackServiceTest {
             assertEquals(1, summary.undoRecordsApplied(), "only undo after the savepoint is applied");
             MiniTransaction headRead = ctx.mgr.begin();
             UndoLogicalHead persisted = ctx.undoAccess.open(
-                    headRead, txn.undoContext().undoFirstPageId(),
+                    headRead, UndoTestContexts.firstPage(txn.undoContext()),
                     cn.zhangyis.db.storage.buf.PageLatchMode.SHARED).logicalHead();
             ctx.mgr.commit(headRead);
             assertEquals(new UndoLogicalHead(UndoNo.of(1), rp1), persisted,
@@ -432,14 +431,14 @@ class RollbackServiceTest {
             TransactionId wid = ctx.txnMgr.assignWriteId(txn);
 
             MiniTransaction first = ctx.mgr.begin();
-            RollPointer rp1 = ctx.undoMgr.beforeInsert(txn, first, TABLE_ID, INDEX_ID,
+            RollPointer rp1 = UndoTestWrites.insert(ctx.undoMgr, txn, first, TABLE_ID, INDEX_ID,
                     key(1), index.keyDef(), index.schema());
             svc.insertClustered(first, index, row(1), wid, rp1);
             ctx.mgr.commit(first);
             TransactionSavepoint savepoint = ctx.rollbackService.createSavepoint(txn);
 
             MiniTransaction second = ctx.mgr.begin();
-            RollPointer rp2 = ctx.undoMgr.beforeInsert(txn, second, TABLE_ID, INDEX_ID,
+            RollPointer rp2 = UndoTestWrites.insert(ctx.undoMgr, txn, second, TABLE_ID, INDEX_ID,
                     key(2), index.keyDef(), index.schema());
             svc.insertClustered(second, index, row(2), wid, rp2);
             ctx.mgr.commit(second);
@@ -447,11 +446,11 @@ class RollbackServiceTest {
 
             UndoContext undoContext = txn.undoContext();
             RollbackSummary recovered = ctx.rollbackService.rollbackRecovered(
-                    undoContext.slotId(), undoContext.undoFirstPageId(), txn.transactionId(), index);
+                    UndoTestContexts.slot(undoContext), UndoTestContexts.firstPage(undoContext), txn.transactionId(), index);
 
             assertEquals(1, recovered.undoRecordsApplied(),
                     "recovery must follow rp1 only; detached physical rp2 was already rolled back");
-            assertFalse(ctx.slots.isOccupied(undoContext.slotId()),
+            assertFalse(ctx.slots.isOccupied(UndoTestContexts.slot(undoContext)),
                     "successful recovery removes the page3/in-memory recovery authority");
             MiniTransaction read = ctx.mgr.begin();
             assertTrue(svc.lookupIncludingDeleted(read, index, search(1)).isEmpty());
@@ -473,12 +472,12 @@ class RollbackServiceTest {
             Transaction txn = ctx.txnMgr.begin(TransactionOptions.defaults());
             TransactionId wid = ctx.txnMgr.assignWriteId(txn);
             MiniTransaction first = ctx.mgr.begin();
-            RollPointer rp1 = ctx.undoMgr.beforeInsert(txn, first, TABLE_ID, INDEX_ID,
+            RollPointer rp1 = UndoTestWrites.insert(ctx.undoMgr, txn, first, TABLE_ID, INDEX_ID,
                     key(1), index.keyDef(), index.schema());
             svc.insertClustered(first, index, row(1), wid, rp1);
             ctx.mgr.commit(first);
             MiniTransaction second = ctx.mgr.begin();
-            RollPointer rp2 = ctx.undoMgr.beforeInsert(txn, second, TABLE_ID, INDEX_ID,
+            RollPointer rp2 = UndoTestWrites.insert(ctx.undoMgr, txn, second, TABLE_ID, INDEX_ID,
                     key(2), index.keyDef(), index.schema());
             svc.insertClustered(second, index, row(2), wid, rp2);
             ctx.mgr.commit(second);
@@ -490,7 +489,7 @@ class RollbackServiceTest {
 
             UndoContext undoContext = txn.undoContext();
             RollbackSummary recovered = ctx.rollbackService.rollbackRecovered(
-                    undoContext.slotId(), undoContext.undoFirstPageId(), txn.transactionId(), index);
+                    UndoTestContexts.slot(undoContext), UndoTestContexts.firstPage(undoContext), txn.transactionId(), index);
 
             assertEquals(2, recovered.undoRecordsApplied(), "stale marker makes recovery revisit rp2 then rp1");
             MiniTransaction read = ctx.mgr.begin();
@@ -500,7 +499,7 @@ class RollbackServiceTest {
         });
     }
 
-    /** marker CAS 发现页内头已变化时必须在写 header 前失败，且不能提前移动运行期 context。 */
+    /** preflight 发现页内头已变化时必须在任何 inverse 前失败，且不能移动运行期 context。 */
     @Test
     void stalePersistentHeadRejectsMarkerWithoutMovingUndoContext() {
         onPool(ctx -> {
@@ -510,30 +509,34 @@ class RollbackServiceTest {
             Transaction txn = ctx.txnMgr.begin(TransactionOptions.defaults());
             TransactionId wid = ctx.txnMgr.assignWriteId(txn);
             MiniTransaction first = ctx.mgr.begin();
-            RollPointer rp1 = ctx.undoMgr.beforeInsert(txn, first, TABLE_ID, INDEX_ID,
+            RollPointer rp1 = UndoTestWrites.insert(ctx.undoMgr, txn, first, TABLE_ID, INDEX_ID,
                     key(1), index.keyDef(), index.schema());
             svc.insertClustered(first, index, row(1), wid, rp1);
             ctx.mgr.commit(first);
             TransactionSavepoint savepoint = ctx.rollbackService.createSavepoint(txn);
             MiniTransaction second = ctx.mgr.begin();
-            RollPointer rp2 = ctx.undoMgr.beforeInsert(txn, second, TABLE_ID, INDEX_ID,
+            RollPointer rp2 = UndoTestWrites.insert(ctx.undoMgr, txn, second, TABLE_ID, INDEX_ID,
                     key(2), index.keyDef(), index.schema());
             svc.insertClustered(second, index, row(2), wid, rp2);
             ctx.mgr.commit(second);
 
             // 模拟另一个写者已把 persistent head 改到 rp1，但运行期 context 仍认为 rp2 是旧头。
             MiniTransaction tamper = ctx.mgr.begin();
-            ctx.undoAccess.open(tamper, txn.undoContext().undoFirstPageId(),
+            ctx.undoAccess.open(tamper, UndoTestContexts.firstPage(txn.undoContext()),
                             cn.zhangyis.db.storage.buf.PageLatchMode.EXCLUSIVE)
                     .updateLogicalHead(new UndoLogicalHead(UndoNo.of(2), rp2),
                             new UndoLogicalHead(UndoNo.of(1), rp1), index.keyDef(), index.schema());
             ctx.mgr.commit(tamper);
 
-            assertThrows(UndoLogicalHeadConflictException.class,
+            assertThrows(UndoLogFormatException.class,
                     () -> ctx.rollbackService.rollbackToSavepoint(txn, index, savepoint));
-            assertEquals(UndoNo.of(2), txn.undoContext().logicalLastUndoNo());
-            assertEquals(rp2, txn.undoContext().lastRollPointer(),
-                    "marker failure must not publish the target into in-memory context");
+            assertEquals(UndoNo.of(2), UndoTestContexts.logicalUndoNo(txn.undoContext()));
+            assertEquals(rp2, UndoTestContexts.rollPointer(txn.undoContext()),
+                    "preflight failure must not publish the target into in-memory context");
+            MiniTransaction verify = ctx.mgr.beginReadOnly();
+            assertTrue(svc.lookup(verify, index, search(2)).isPresent(),
+                    "persistent/context mismatch must be rejected before deleting row 2");
+            ctx.mgr.commit(verify);
         });
     }
 
@@ -546,11 +549,12 @@ class RollbackServiceTest {
             Transaction txn = ctx.txnMgr.begin(TransactionOptions.defaults());
             TransactionId wid = ctx.txnMgr.assignWriteId(txn);
             MiniTransaction m = ctx.mgr.begin();
-            RollPointer rp = ctx.undoMgr.beforeInsert(txn, m, TABLE_ID, INDEX_ID,
+            RollPointer rp = UndoTestWrites.insert(ctx.undoMgr, txn, m, TABLE_ID, INDEX_ID,
                     key(1), index.keyDef(), index.schema());
             svc.insertClustered(m, index, row(1), wid, rp);
             ctx.mgr.commit(m);
-            TransactionSavepoint foreign = new TransactionSavepoint(txn, UndoNo.NONE, RollPointer.NULL, 99);
+            TransactionSavepoint foreign = new TransactionSavepoint(
+                    txn, UndoLogicalHead.EMPTY, UndoLogicalHead.EMPTY, 99);
 
             assertThrows(DatabaseValidationException.class,
                     () -> ctx.rollbackService.rollbackToSavepoint(txn, index, foreign));
@@ -572,23 +576,24 @@ class RollbackServiceTest {
             Transaction txn = ctx.txnMgr.begin(TransactionOptions.defaults());
             TransactionId wid = ctx.txnMgr.assignWriteId(txn);
             MiniTransaction first = ctx.mgr.begin();
-            RollPointer rp1 = ctx.undoMgr.beforeInsert(txn, first, TABLE_ID, INDEX_ID,
+            RollPointer rp1 = UndoTestWrites.insert(ctx.undoMgr, txn, first, TABLE_ID, INDEX_ID,
                     key(1), index.keyDef(), index.schema());
             svc.insertClustered(first, index, row(1), wid, rp1);
             ctx.mgr.commit(first);
             MiniTransaction second = ctx.mgr.begin();
-            RollPointer rp2 = ctx.undoMgr.beforeInsert(txn, second, TABLE_ID, INDEX_ID,
+            RollPointer rp2 = UndoTestWrites.insert(ctx.undoMgr, txn, second, TABLE_ID, INDEX_ID,
                     key(2), index.keyDef(), index.schema());
             svc.insertClustered(second, index, row(2), wid, rp2);
             ctx.mgr.commit(second);
             TransactionSavepoint savepoint = txn.undoContext().createSavepoint(txn);
 
             // 模拟逻辑链损坏：当前入口直接跳到保存点之前，目标 rp2 已不再从链头可达。
-            txn.undoContext().setLastRollPointer(rp1);
+            txn.undoContext().binding(UndoLogKind.INSERT)
+                    .publishHead(new UndoLogicalHead(UndoNo.of(1), rp1));
 
             assertThrows(DatabaseRuntimeException.class,
                     () -> ctx.rollbackService.rollbackToSavepoint(txn, index, savepoint));
-            assertEquals(rp1, txn.undoContext().lastRollPointer(),
+            assertEquals(rp1, UndoTestContexts.rollPointer(txn.undoContext()),
                     "unreachable savepoint must not resurrect its detached roll pointer");
             MiniTransaction read = ctx.mgr.begin();
             assertTrue(svc.lookup(read, index, search(1)).isPresent());
@@ -611,20 +616,20 @@ class RollbackServiceTest {
             TransactionId wid = ctx.txnMgr.assignWriteId(txn);
 
             MiniTransaction first = ctx.mgr.begin();
-            RollPointer rp1 = ctx.undoMgr.beforeInsert(txn, first, TABLE_ID, INDEX_ID,
+            RollPointer rp1 = UndoTestWrites.insert(ctx.undoMgr, txn, first, TABLE_ID, INDEX_ID,
                     key(1), index.keyDef(), index.schema());
             svc.insertClustered(first, index, row(1), wid, rp1);
             ctx.mgr.commit(first);
 
             MiniTransaction second = ctx.mgr.begin();
-            RollPointer rp2 = ctx.undoMgr.beforeInsert(txn, second, TABLE_ID, INDEX_ID,
+            RollPointer rp2 = UndoTestWrites.insert(ctx.undoMgr, txn, second, TABLE_ID, INDEX_ID,
                     key(2), index.keyDef(), index.schema());
             svc.insertClustered(second, index, row(2), wid, rp2);
             ctx.mgr.commit(second);
             TransactionSavepoint savepoint = ctx.rollbackService.createSavepoint(txn);
 
             MiniTransaction branch = ctx.mgr.begin();
-            RollPointer rp3 = ctx.undoMgr.beforeInsert(txn, branch, TABLE_ID, INDEX_ID,
+            RollPointer rp3 = UndoTestWrites.insert(ctx.undoMgr, txn, branch, TABLE_ID, INDEX_ID,
                     key(3), index.keyDef(), index.schema());
             svc.insertClustered(branch, index, row(3), wid, rp3);
             ctx.mgr.commit(branch);
@@ -673,16 +678,15 @@ class RollbackServiceTest {
             EmptyUndoBoundary boundary = rollback.createEmptyStatementBoundary(txn);
             UndoSlotId slot = fixture.slotId();
             slots.restore(slot, fixture.undoFirstPageId());
-            UndoContext restored = new UndoContext(slots.rollbackSegmentId(), slot, fixture.undoFirstPageId());
-            restored.setLastUndoNo(fixture.lastUndoNo());
-            restored.setLastRollPointer(fixture.lastRollPointer());
-            restored.markHasUpdateUndo();
+            UndoContext restored = UndoTestContexts.restored(slots.rollbackSegmentId(), UndoLogKind.UPDATE,
+                    slot, fixture.undoFirstPageId(), fixture.lastUndoNo(),
+                    new UndoLogicalHead(fixture.lastUndoNo(), fixture.lastRollPointer()));
             txn.setUndoContext(restored);
 
             RollbackSummary summary = rollback.rollbackToEmptyStatementBoundary(txn, fixture.index(), boundary);
 
             assertEquals(10, summary.undoRecordsApplied());
-            assertTrue(restored.lastRollPointer().isNull());
+            assertTrue(UndoTestContexts.rollPointer(restored).isNull());
         }
     }
 
@@ -727,7 +731,7 @@ class RollbackServiceTest {
             EmptyUndoBoundary boundary = ctx.rollbackService.createEmptyStatementBoundary(txn);
             TransactionId wid = ctx.txnMgr.assignWriteId(txn);
             MiniTransaction insert = ctx.mgr.begin();
-            RollPointer rp = ctx.undoMgr.beforeInsert(txn, insert, TABLE_ID, INDEX_ID,
+            RollPointer rp = UndoTestWrites.insert(ctx.undoMgr, txn, insert, TABLE_ID, INDEX_ID,
                     key(1), index.keyDef(), index.schema());
             svc.insertClustered(insert, index, row(1), wid, rp);
             ctx.mgr.commit(insert);
@@ -742,7 +746,7 @@ class RollbackServiceTest {
             assertEquals(TransactionState.ACTIVE, txn.state());
             MiniTransaction headRead = ctx.mgr.begin();
             UndoLogicalHead persisted = ctx.undoAccess.open(
-                    headRead, txn.undoContext().undoFirstPageId(),
+                    headRead, UndoTestContexts.firstPage(txn.undoContext()),
                     cn.zhangyis.db.storage.buf.PageLatchMode.SHARED).logicalHead();
             ctx.mgr.commit(headRead);
             assertEquals(UndoLogicalHead.EMPTY, persisted,
@@ -762,7 +766,7 @@ class RollbackServiceTest {
             Transaction txn = ctx.txnMgr.begin(TransactionOptions.defaults());
             TransactionId wid = ctx.txnMgr.assignWriteId(txn);
             MiniTransaction m = ctx.mgr.begin();
-            RollPointer rp = ctx.undoMgr.beforeInsert(txn, m, TABLE_ID, INDEX_ID,
+            RollPointer rp = UndoTestWrites.insert(ctx.undoMgr, txn, m, TABLE_ID, INDEX_ID,
                     key(1), index.keyDef(), index.schema());
             svc.insertClustered(m, index, row(1), wid, rp);
             ctx.mgr.commit(m);
@@ -790,7 +794,7 @@ class RollbackServiceTest {
             Transaction txn = ctx.txnMgr.begin(TransactionOptions.defaults());
             TransactionId wid = ctx.txnMgr.assignWriteId(txn);
             MiniTransaction insert = ctx.mgr.begin();
-            RollPointer insRp = ctx.undoMgr.beforeInsert(txn, insert, TABLE_ID, INDEX_ID,
+            RollPointer insRp = UndoTestWrites.insert(ctx.undoMgr, txn, insert, TABLE_ID, INDEX_ID,
                     key(1), index.keyDef(), index.schema());
             svc.insertClustered(insert, index, row(1), wid, insRp);
             ctx.mgr.commit(insert);
@@ -805,14 +809,14 @@ class RollbackServiceTest {
             ctx.mgr.commit(chk);
             assertEquals(UndoNo.of(2), txn.undoContext().lastUndoNo(),
                     "rolled-back update undo remains part of append history");
-            assertEquals(UndoNo.of(1), txn.undoContext().logicalLastUndoNo(),
+            assertEquals(UndoNo.of(1), UndoTestContexts.logicalUndoNo(txn.undoContext()),
                     "logical chain returns to the insert boundary");
 
             updateRow(ctx, svc, index, txn, wid, 1, "v3");
 
             assertEquals(UndoNo.of(3), txn.undoContext().lastUndoNo(),
                     "next write must allocate a fresh undoNo instead of reusing the rolled-back update undoNo");
-            assertEquals(UndoNo.of(3), txn.undoContext().logicalLastUndoNo());
+            assertEquals(UndoNo.of(3), UndoTestContexts.logicalUndoNo(txn.undoContext()));
         });
     }
 
@@ -825,7 +829,7 @@ class RollbackServiceTest {
             Transaction txn = ctx.txnMgr.begin(TransactionOptions.defaults());
             TransactionId wid = ctx.txnMgr.assignWriteId(txn);
             MiniTransaction insert = ctx.mgr.begin();
-            RollPointer insRp = ctx.undoMgr.beforeInsert(txn, insert, TABLE_ID, INDEX_ID,
+            RollPointer insRp = UndoTestWrites.insert(ctx.undoMgr, txn, insert, TABLE_ID, INDEX_ID,
                     key(1), index.keyDef(), index.schema());
             svc.insertClustered(insert, index, row(1), wid, insRp);
             ctx.mgr.commit(insert);
@@ -854,26 +858,26 @@ class RollbackServiceTest {
             Transaction txn = ctx.txnMgr.begin(TransactionOptions.defaults());
             TransactionId wid = ctx.txnMgr.assignWriteId(txn);
             MiniTransaction first = ctx.mgr.begin();
-            RollPointer rp1 = ctx.undoMgr.beforeInsert(txn, first, TABLE_ID, INDEX_ID,
+            RollPointer rp1 = UndoTestWrites.insert(ctx.undoMgr, txn, first, TABLE_ID, INDEX_ID,
                     key(1), index.keyDef(), index.schema());
             svc.insertClustered(first, index, row(1), wid, rp1);
             ctx.mgr.commit(first);
             TransactionSavepoint savepoint = txn.undoContext().createSavepoint(txn);
             MiniTransaction second = ctx.mgr.begin();
-            RollPointer rp2 = ctx.undoMgr.beforeInsert(txn, second, TABLE_ID, INDEX_ID,
+            RollPointer rp2 = UndoTestWrites.insert(ctx.undoMgr, txn, second, TABLE_ID, INDEX_ID,
                     key(2), index.keyDef(), index.schema());
             svc.insertClustered(second, index, row(2), wid, rp2);
             ctx.mgr.commit(second);
             ctx.rollbackService.rollbackToSavepoint(txn, index, savepoint);
             MiniTransaction third = ctx.mgr.begin();
-            RollPointer rp3 = ctx.undoMgr.beforeInsert(txn, third, TABLE_ID, INDEX_ID,
+            RollPointer rp3 = UndoTestWrites.insert(ctx.undoMgr, txn, third, TABLE_ID, INDEX_ID,
                     key(3), index.keyDef(), index.schema());
             svc.insertClustered(third, index, row(3), wid, rp3);
             ctx.mgr.commit(third);
 
             MiniTransaction chainRead = ctx.mgr.begin();
             UndoLogSegment persisted = ctx.undoAccess.open(
-                    chainRead, txn.undoContext().undoFirstPageId(),
+                    chainRead, UndoTestContexts.firstPage(txn.undoContext()),
                     cn.zhangyis.db.storage.buf.PageLatchMode.SHARED);
             assertEquals(new UndoLogicalHead(UndoNo.of(3), rp3), persisted.logicalHead());
             assertEquals(rp1, persisted.readRecord(rp3, index.keyDef(), index.schema()).prevRollPointer(),
@@ -906,19 +910,19 @@ class RollbackServiceTest {
             Transaction txn = ctx.txnMgr.begin(TransactionOptions.defaults());
             TransactionId wid = ctx.txnMgr.assignWriteId(txn);
             MiniTransaction first = ctx.mgr.begin();
-            RollPointer rp1 = ctx.undoMgr.beforeInsert(txn, first, TABLE_ID, INDEX_ID,
+            RollPointer rp1 = UndoTestWrites.insert(ctx.undoMgr, txn, first, TABLE_ID, INDEX_ID,
                     key(1), index.keyDef(), index.schema());
             svc.insertClustered(first, index, row(1), wid, rp1);
             ctx.mgr.commit(first);
             TransactionSavepoint savepoint = txn.undoContext().createSavepoint(txn);
             MiniTransaction second = ctx.mgr.begin();
-            RollPointer rp2 = ctx.undoMgr.beforeInsert(txn, second, TABLE_ID, INDEX_ID,
+            RollPointer rp2 = UndoTestWrites.insert(ctx.undoMgr, txn, second, TABLE_ID, INDEX_ID,
                     key(2), index.keyDef(), index.schema());
             svc.insertClustered(second, index, row(2), wid, rp2);
             ctx.mgr.commit(second);
             ctx.rollbackService.rollbackToSavepoint(txn, index, savepoint);
             MiniTransaction third = ctx.mgr.begin();
-            RollPointer rp3 = ctx.undoMgr.beforeInsert(txn, third, TABLE_ID, INDEX_ID,
+            RollPointer rp3 = UndoTestWrites.insert(ctx.undoMgr, txn, third, TABLE_ID, INDEX_ID,
                     key(3), index.keyDef(), index.schema());
             svc.insertClustered(third, index, row(3), wid, rp3);
             ctx.mgr.commit(third);
@@ -933,8 +937,8 @@ class RollbackServiceTest {
             assertThrows(SimulatedRollbackCrashException.class, () -> crashable.rollback(txn, index));
 
             UndoLogicalHead expected = new UndoLogicalHead(UndoNo.of(1), rp1);
-            assertEquals(expected, txn.undoContext().logicalHead());
-            assertEquals(expected, readLogicalHead(ctx, txn.undoContext().undoFirstPageId()));
+            assertEquals(expected, UndoTestContexts.head(txn.undoContext()));
+            assertEquals(expected, readLogicalHead(ctx, UndoTestContexts.firstPage(txn.undoContext())));
             assertEquals(UndoNo.of(3), txn.undoContext().lastUndoNo(),
                     "physical append high-water must not rewind with rollback progress");
 
@@ -955,7 +959,7 @@ class RollbackServiceTest {
             ctx.txnMgr.assignWriteId(txn);
             // 只写 undo，不写聚簇行：模拟「失败插入」留下的 orphan undo
             MiniTransaction m = ctx.mgr.begin();
-            ctx.undoMgr.beforeInsert(txn, m, TABLE_ID, INDEX_ID, key(1), index.keyDef(), index.schema());
+            UndoTestWrites.insert(ctx.undoMgr, txn, m, TABLE_ID, INDEX_ID, key(1), index.keyDef(), index.schema());
             ctx.mgr.commit(m);
             assertEquals(1, ctx.slots.activeSlotCount());
 
@@ -993,7 +997,7 @@ class RollbackServiceTest {
             Transaction txn = ctx.txnMgr.begin(TransactionOptions.defaults());
             TransactionId wid = ctx.txnMgr.assignWriteId(txn);
             MiniTransaction m = ctx.mgr.begin();
-            RollPointer insRp = ctx.undoMgr.beforeInsert(txn, m, TABLE_ID, INDEX_ID, key(1), index.keyDef(), index.schema());
+            RollPointer insRp = UndoTestWrites.insert(ctx.undoMgr, txn, m, TABLE_ID, INDEX_ID, key(1), index.keyDef(), index.schema());
             svc.insertClustered(m, index, row(1), wid, insRp);
             ctx.mgr.commit(m);
             updateRow(ctx, svc, index, txn, wid, 1, "v2");
@@ -1020,7 +1024,7 @@ class RollbackServiceTest {
             Transaction txn = ctx.txnMgr.begin(TransactionOptions.defaults());
             TransactionId wid = ctx.txnMgr.assignWriteId(txn);
             MiniTransaction m = ctx.mgr.begin();
-            RollPointer insRp = ctx.undoMgr.beforeInsert(txn, m, TABLE_ID, INDEX_ID, key(1), index.keyDef(), index.schema());
+            RollPointer insRp = UndoTestWrites.insert(ctx.undoMgr, txn, m, TABLE_ID, INDEX_ID, key(1), index.keyDef(), index.schema());
             svc.insertClustered(m, index, row(1), wid, insRp); // payload-1
             ctx.mgr.commit(m);
             updateRow(ctx, svc, index, txn, wid, 1, "v2");
@@ -1049,7 +1053,7 @@ class RollbackServiceTest {
             Transaction t1 = ctx.txnMgr.begin(TransactionOptions.defaults());
             TransactionId w1 = ctx.txnMgr.assignWriteId(t1);
             MiniTransaction m = ctx.mgr.begin();
-            RollPointer insRp = ctx.undoMgr.beforeInsert(t1, m, TABLE_ID, INDEX_ID, key(1), index.keyDef(), index.schema());
+            RollPointer insRp = UndoTestWrites.insert(ctx.undoMgr, t1, m, TABLE_ID, INDEX_ID, key(1), index.keyDef(), index.schema());
             svc.insertClustered(m, index, row(1), w1, insRp);
             ctx.mgr.commit(m);
             ctx.txnMgr.prepareCommit(t1);
@@ -1084,7 +1088,7 @@ class RollbackServiceTest {
             Transaction txn = ctx.txnMgr.begin(TransactionOptions.defaults());
             TransactionId wid = ctx.txnMgr.assignWriteId(txn);
             MiniTransaction m = ctx.mgr.begin();
-            RollPointer insRp = ctx.undoMgr.beforeInsert(txn, m, TABLE_ID, INDEX_ID, key(1), index.keyDef(), index.schema());
+            RollPointer insRp = UndoTestWrites.insert(ctx.undoMgr, txn, m, TABLE_ID, INDEX_ID, key(1), index.keyDef(), index.schema());
             svc.insertClustered(m, index, row(1), wid, insRp);
             ctx.mgr.commit(m);
             deleteMarkRow(ctx, svc, index, txn, wid, 1); // 同事务内 insert→delete-mark
@@ -1101,7 +1105,7 @@ class RollbackServiceTest {
 
     // ---- helpers ----
 
-    /** 前向 DELETE-mark 编排（test-wired，§16.3）：读存活当前版本 → beforeDelete 写 DELETE_MARK undo → setClusteredDeleteMark 置删除位。 */
+    /** 前向 DELETE-mark 编排（test-wired，§16.3）：读存活当前版本 → planDelete/appendPlanned 写 DELETE_MARK undo → setClusteredDeleteMark 置删除位。 */
     private void deleteMarkRow(Ctx ctx, SplitCapableBTreeIndexService svc, BTreeIndex index, Transaction txn,
                               TransactionId wid, long id) {
         MiniTransaction read = ctx.mgr.begin();
@@ -1109,7 +1113,7 @@ class RollbackServiceTest {
         ctx.mgr.commit(read);
         HiddenColumns oldHidden = old.record().hiddenColumns();
         MiniTransaction m = ctx.mgr.begin();
-        RollPointer delRp = ctx.undoMgr.beforeDelete(txn, m, TABLE_ID, INDEX_ID, key(id),
+        RollPointer delRp = UndoTestWrites.delete(ctx.undoMgr, txn, m, TABLE_ID, INDEX_ID, key(id),
                 old.record().columnValues(), oldHidden, index.keyDef(), index.schema());
         BTreeDeleteMarkResult res = svc.setClusteredDeleteMark(m, index, search(id), true,
                 new HiddenColumns(wid, delRp), oldHidden.dbTrxId(), oldHidden.dbRollPtr());
@@ -1117,7 +1121,7 @@ class RollbackServiceTest {
         assertTrue(res.changed(), "delete-mark applied");
     }
 
-    /** 前向 UPDATE 编排（test-wired，§7.3）：读旧 image → beforeUpdate 写 UPDATE undo → replaceClustered 盖新值。 */
+    /** 前向 UPDATE 编排（test-wired，§7.3）：读旧 image → planUpdate/appendPlanned 写 UPDATE undo → replaceClustered 盖新值。 */
     private void updateRow(Ctx ctx, SplitCapableBTreeIndexService svc, BTreeIndex index, Transaction txn,
                            TransactionId wid, long id, String newPayload) {
         MiniTransaction read = ctx.mgr.begin();
@@ -1125,7 +1129,7 @@ class RollbackServiceTest {
         ctx.mgr.commit(read);
         HiddenColumns oldHidden = old.record().hiddenColumns();
         MiniTransaction m = ctx.mgr.begin();
-        RollPointer newRp = ctx.undoMgr.beforeUpdate(txn, m, TABLE_ID, INDEX_ID, key(id),
+        RollPointer newRp = UndoTestWrites.update(ctx.undoMgr, txn, m, TABLE_ID, INDEX_ID, key(id),
                 old.record().columnValues(), oldHidden, index.keyDef(), index.schema());
         svc.replaceClustered(m, index, search(id),
                 new LogicalRecord(1, List.of(new ColumnValue.IntValue(id), new ColumnValue.StringValue(newPayload)),
@@ -1170,7 +1174,7 @@ class RollbackServiceTest {
         java.util.ArrayList<RollPointer> pointers = new java.util.ArrayList<>(count);
         for (int i = 1; i <= count; i++) {
             MiniTransaction write = ctx.mgr.begin();
-            RollPointer pointer = ctx.undoMgr.beforeInsert(txn, write, TABLE_ID, INDEX_ID,
+            RollPointer pointer = UndoTestWrites.insert(ctx.undoMgr, txn, write, TABLE_ID, INDEX_ID,
                     key(i), index.keyDef(), index.schema());
             BTreeInsertResult inserted = svc.insertClustered(write, index, row(i), wid, pointer);
             index = inserted.indexAfterInsert();
@@ -1249,7 +1253,7 @@ class RollbackServiceTest {
             String largeValue = "x".repeat(7_000);
             for (int i = 1; i <= 10; i++) {
                 MiniTransaction write = mgr.begin();
-                undoMgr.beforeUpdate(txn, write, TABLE_ID, INDEX_ID, key(i),
+                UndoTestWrites.update(undoMgr, txn, write, TABLE_ID, INDEX_ID, key(i),
                         List.of(new ColumnValue.IntValue(i), new ColumnValue.StringValue(largeValue)),
                         new HiddenColumns(wid, RollPointer.NULL), keyDef, schema);
                 mgr.commit(write);
@@ -1260,8 +1264,9 @@ class RollbackServiceTest {
                     new NoDoublewriteStrategy(), Duration.ofMillis(100));
             coordinator.flushList(Lsn.of(Long.MAX_VALUE), pool.capacity());
             return new MultiPageRollbackFixture(
-                    index, ctx.slotId(), txn.transactionId(), ctx.undoFirstPageId(),
-                    ctx.lastUndoNo(), ctx.lastRollPointer());
+                    index, ctx.binding(UndoLogKind.UPDATE).slotId(), txn.transactionId(),
+                    ctx.binding(UndoLogKind.UPDATE).firstPageId(), ctx.lastUndoNo(),
+                    ctx.head(UndoLogKind.UPDATE).rollPointer());
         }
     }
 

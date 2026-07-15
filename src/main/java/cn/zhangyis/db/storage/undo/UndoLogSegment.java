@@ -159,8 +159,7 @@ public final class UndoLogSegment {
         } catch (UndoPageOverflowException overflow) {
             off = growAndAppendReserved(payload, rec.transactionId(), rec.undoNo(), overflow);
         }
-        // RollPointer.insert 标志按记录类型决定（T1.3e）：INSERT_ROW→true、UPDATE_ROW→false。混合段中段头
-        // UndoLogKind 不权威，insert 标志与每条记录的 UndoRecordType 一致，供 MVCC/版本链区分 insert vs update undo。
+        // 独立 log 中 kind 与 record type 已在 preflight 相互校验；insert bit 仍保持原有编码，供 MVCC 快速判断。
         boolean insert = rec.type() == UndoRecordType.INSERT_ROW;
         RollPointer pointer = new RollPointer(insert, current.pageId().pageNo(), off);
         UndoLogicalHead newHead = new UndoLogicalHead(rec.undoNo(), pointer);
@@ -200,14 +199,14 @@ public final class UndoLogSegment {
             throw new DatabaseValidationException("undo append indexId " + rec.indexId()
                     + " != key definition " + keyDef.indexId());
         }
+        UndoLogSegmentAccess.requireRecordKind(firstPage.undoKind(), rec.type(), "undo append");
         UndoNo physicalHighWater = firstPage.logLastUndoNo();
         if (physicalHighWater.value() == Long.MAX_VALUE) {
             throw new DatabaseValidationException("undo append high-water exhausted at Long.MAX_VALUE");
         }
-        long expectedUndoNo = physicalHighWater.value() + 1;
-        if (rec.undoNo().value() != expectedUndoNo) {
+        if (rec.undoNo().value() <= physicalHighWater.value()) {
             throw new DatabaseValidationException("undo append number " + rec.undoNo().value()
-                    + " must equal physical high-water successor " + expectedUndoNo);
+                    + " must be greater than local physical high-water " + physicalHighWater.value());
         }
         long recordCount = firstPage.logRecordCount();
         if (recordCount < 0) {
@@ -299,7 +298,7 @@ public final class UndoLogSegment {
     private UndoPage createChainPageForAppend(PageId newId) {
         try (var ignored = mtr.allowOutOfOrderPageLatch(
                 "undo grow format: freshly allocated chain page is not visible to other undo readers yet")) {
-            return pageAccess.createChainPage(mtr, newId, handle);
+            return pageAccess.createChainPage(mtr, newId, firstPage.undoKind(), handle);
         }
     }
 
@@ -334,6 +333,35 @@ public final class UndoLogSegment {
         return firstPage.state() == UndoPageLayout.STATE_COMMITTED;
     }
 
+    /** 是否为 page3 cached 栈持久拥有、当前没有事务 owner 的单页 segment。 */
+    public boolean isCached() {
+        return firstPage.state() == UndoPageLayout.STATE_CACHED;
+    }
+
+    /**
+     * finalization 在 page3 active→cache transition 的同一 MTR 内重置首页。调用方必须已由 FSP drop plan
+     * 证明该 segment 只占一个 fragment 页；本方法再校验页链与 kind，避免把外部 payload/chain 残留伪装成缓存。
+     */
+    public void resetForCache() {
+        if (mode != PageLatchMode.EXCLUSIVE) {
+            throw new DatabaseValidationException("cache reset requires an EXCLUSIVE undo segment session");
+        }
+        firstPage.resetForCache(firstPage.undoKind(), handle);
+    }
+
+    /** 校验 shared/exclusive 会话观察到的是指定 kind 的空 CACHED segment。 */
+    public void requireCached(UndoLogKind expectedKind) {
+        firstPage.requireCachedEmpty(expectedKind, handle);
+    }
+
+    /** 用新事务激活已校验的 CACHED segment；首条 append 仍由调用方在同一业务 MTR 中完成。 */
+    public void activateCached(TransactionId transactionId, UndoLogKind expectedKind) {
+        if (mode != PageLatchMode.EXCLUSIVE) {
+            throw new DatabaseValidationException("cache activation requires an EXCLUSIVE undo segment session");
+        }
+        firstPage.activateCached(expectedKind, transactionId, handle);
+    }
+
     /** 提交序号（R 1.3）；仅 COMMITTED 段有意义，恢复重建 history 用。 */
     public TransactionNo committedTransactionNo() {
         return TransactionNo.of(firstPage.commitNo());
@@ -357,9 +385,11 @@ public final class UndoLogSegment {
         }
         UndoPage page = resolvePage(rp.pageNo());
         requireSameSegment(page, "roll pointer page " + rp.pageNo());
+        requireSameKind(page, "roll pointer page " + rp.pageNo());
         byte[] payload = page.recordAt(rp.offset());
         UndoRecord record = storedRecordResolver.resolve(mtr, handle.spaceId(), segmentIdentity(page),
                 payload, keyDef, schema);
+        UndoLogSegmentAccess.requireRecordKind(page.undoKind(), record.type(), "undo segment read");
         requirePointerMatchesRecord(rp, record, keyDef);
         return record;
     }
@@ -453,12 +483,14 @@ public final class UndoLogSegment {
         while (true) {
             UndoPage page = resolvePage(PageNo.of(pageNoVal));
             requireSameSegment(page, "undo chain page " + pageNoVal);
+            requireSameKind(page, "undo chain page " + pageNoVal);
             int free = page.freeOffset();
             int off = UndoPageLayout.RECORD_AREA_START;
             while (off < free) {
                 byte[] payload = page.recordAt(off);
                 UndoRecord rec = storedRecordResolver.resolve(mtr, handle.spaceId(), segmentIdentity(page),
                         payload, keyDef, schema);
+                UndoLogSegmentAccess.requireRecordKind(page.undoKind(), rec.type(), "undo segment traversal");
                 // 该 record 的地址 = 写入时返回的 RollPointer：insert 标志按类型（INSERT_ROW→true，其余 false），
                 // 与 append/聚簇记录 DB_ROLL_PTR 编码一致，供 purge 严格比对。
                 boolean insert = rec.type() == UndoRecordType.INSERT_ROW;
@@ -515,7 +547,7 @@ public final class UndoLogSegment {
     public UndoAppendSnapshot appendSnapshot() {
         return new UndoAppendSnapshot(handle.firstPageId(), handle.lastPageId(), handle.segmentId(),
                 handle.inodeSlot(), firstPage.transactionId(), firstPage.logLastUndoNo(), firstPage.logicalHead(),
-                firstPage.logRecordCount(), current.freeOffset());
+                firstPage.undoKind(), firstPage.logRecordCount(), current.freeOffset());
     }
 
     private void requirePointerMatchesRecord(RollPointer pointer, UndoRecord record, IndexKeyDef keyDef) {
@@ -562,6 +594,13 @@ public final class UndoLogSegment {
         if (!page.segmentId().equals(handle.segmentId()) || page.inodeSlot() != handle.inodeSlot()) {
             throw new UndoLogFormatException(what + " not in undo segment " + handle.segmentId().value()
                     + "/slot " + handle.inodeSlot());
+        }
+    }
+
+    private void requireSameKind(UndoPage page, String what) {
+        if (page.undoKind() != firstPage.undoKind()) {
+            throw new UndoLogFormatException(what + " kind " + page.undoKind()
+                    + " differs from segment kind " + firstPage.undoKind());
         }
     }
 

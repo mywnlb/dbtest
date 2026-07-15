@@ -12,8 +12,8 @@ import cn.zhangyis.db.domain.TransactionNo;
  * （ReadView 推迟到可见性片）。
  *
  * <p>T1.3c 起，事务聚合挂一个惰性 {@link UndoContext}（事务运行时 undo 子状态），由 {@code UndoLogManager} 在
- * 首写时经包内可见 {@link #setUndoContext} 绑定；首写前为 {@code null}，表示尚未建 insert undo segment。
- * {@code UndoContext} 的内部推进（{@code lastUndoNo}/{@code lastRollPointer}）由 {@code UndoLogManager} 调其
+ * 首次普通 undo 写时经包内可见 {@link #setUndoContext} 绑定；此前为 {@code null}，表示尚未建任何 undo log。
+ * {@code UndoContext} 的内部推进（事务全局 {@code lastUndoNo} 与 INSERT/UPDATE 两个局部 head）由 {@code UndoLogManager} 调其
  * 包内 setter 完成，不经本类。
  */
 public final class Transaction {
@@ -39,7 +39,7 @@ public final class Transaction {
     private boolean rollbackOnly;
     /** 首次把事务置为 rollback-only 的领域原因，供拒绝提交和恢复诊断；正常事务为空字符串。 */
     private String rollbackOnlyReason = "";
-    /** 事务 undo 子状态：惰性绑定，首写前为 {@code null}（未建 insert undo segment）。仅 UndoLogManager 修改。 */
+    /** 事务 undo 子状态：惰性绑定，首写前为 {@code null}（未建任何 INSERT/UPDATE log）。仅 UndoLogManager 修改。 */
     private UndoContext undoContext;
     /**
      * 一致性读快照（T1.4）：RR 事务级复用——首次一致性读经 {@code ReadViewManager.openReadView} 绑定，
@@ -92,7 +92,7 @@ public final class Transaction {
         return rollbackOnlyReason;
     }
 
-    /** 事务 undo 子状态；首写前为 {@code null}（未建 insert undo segment）。 */
+    /** 事务 undo 子状态；首写前为 {@code null}（未建任何普通 undo log）。 */
     public UndoContext undoContext() {
         return undoContext;
     }
@@ -113,7 +113,7 @@ public final class Transaction {
     }
 
     /**
-     * 绑定事务 undo 子状态。由 {@code UndoLogManager.ensureUndoContext} 在首写时调用；Java null 引用必须拒绝
+     * 绑定事务 undo 子状态。由 {@code UndoLogManager.appendPlanned} 在首条任意 kind undo 成功后调用；Java null 引用必须拒绝
      * （避免隐藏 NPE），但调用方控制单次绑定，本 mutator 不强制单次以保持生命周期约束集中在 manager。
      *
      * @param ctx undo 子状态，不能为 null。

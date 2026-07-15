@@ -57,8 +57,11 @@ class UndoPageTest {
     @Test
     void formatFirstPageInitsBothHeaders() {
         onFirstPage((page, handle) -> {
-            assertEquals(120, UndoPageLayout.RECORD_AREA_START,
-                    "persistent-head page format reserves a 15-byte logical head");
+            assertEquals(136, UndoPageLayout.RECORD_AREA_START,
+                    "v3 page format reserves logical head plus persistent history links");
+            assertEquals(120, UndoPageLayout.HISTORY_PREV_PAGE_NO);
+            assertEquals(128, UndoPageLayout.HISTORY_NEXT_PAGE_NO);
+            assertEquals(3, UndoPageLayout.CURRENT_FORMAT_VERSION);
             assertEquals(UndoPageLayout.RECORD_AREA_START, page.freeOffset());
             assertEquals(0, page.recordCount());
             assertEquals(0L, page.pageLastUndoNo().value());
@@ -72,6 +75,8 @@ class UndoPageTest {
             assertEquals(0L, page.logRecordCount());
             assertEquals(0L, page.logLastUndoNo().value());
             assertEquals(UndoLogicalHead.EMPTY, page.logicalHead());
+            assertEquals(cn.zhangyis.db.storage.page.FilePageHeader.FIL_NULL, page.historyPrevPageNo());
+            assertEquals(cn.zhangyis.db.storage.page.FilePageHeader.FIL_NULL, page.historyNextPageNo());
             assertEquals(UndoPageLayout.CURRENT_FORMAT_VERSION, page.formatVersion());
         });
     }
@@ -149,13 +154,14 @@ class UndoPageTest {
             PageId p2 = disk.allocatePage(m, seg);
             UndoSegmentHandle handle = new UndoSegmentHandle(UNDO_SPACE, seg.inodeSlot(), seg.segmentId(), p1, p1);
             undoAccess.createFirstPage(m, p1, UndoLogKind.INSERT, TransactionId.of(7), handle);
-            UndoPage chain = undoAccess.createChainPage(m, p2, handle);
+            UndoPage chain = undoAccess.createChainPage(m, p2, UndoLogKind.INSERT, handle);
             assertFalse(chain.isFirstPage());
             assertEquals(UndoPageLayout.RECORD_AREA_START, chain.freeOffset());
             assertEquals(UndoPageLayout.CURRENT_FORMAT_VERSION, chain.formatVersion());
             assertEquals(handle.segmentId().value(), chain.segmentId().value());
             assertThrows(UndoLogFormatException.class, chain::transactionId);
-            assertThrows(UndoLogFormatException.class, chain::undoKind);
+            assertEquals(UndoLogKind.INSERT, chain.undoKind(),
+                    "v3 copies the authoritative log kind to every ordinary undo page");
             assertThrows(UndoLogFormatException.class, chain::logRecordCount);
             assertThrows(UndoLogFormatException.class, () -> chain.setLastPageNo(PageNo.of(5)));
             mgr.commit(m);
@@ -171,7 +177,7 @@ class UndoPageTest {
             PageId p2 = disk.allocatePage(m, seg);
             UndoSegmentHandle handle = new UndoSegmentHandle(UNDO_SPACE, seg.inodeSlot(), seg.segmentId(), p1, p1);
             UndoPage first = undoAccess.createFirstPage(m, p1, UndoLogKind.INSERT, TransactionId.of(7), handle);
-            UndoPage chain = undoAccess.createChainPage(m, p2, handle);
+            UndoPage chain = undoAccess.createChainPage(m, p2, UndoLogKind.INSERT, handle);
             first.linkNextTo(p2.pageNo());
             chain.linkPrevTo(p1.pageNo());
             assertEquals(p2.pageNo().value(), first.nextPageNo());
@@ -227,11 +233,37 @@ class UndoPageTest {
             mgr.commit(create);
 
             MiniTransaction corrupt = mgr.begin();
+            int legacyV1Flags = (1 << UndoPageLayout.FORMAT_VERSION_SHIFT) | UndoPageLayout.FLAG_FIRST_PAGE;
             corrupt.getPage(pool, pid, PageLatchMode.EXCLUSIVE).writeBytes(
-                    UndoPageLayout.PAGE_FLAGS, new byte[]{(byte) UndoPageLayout.FLAG_FIRST_PAGE});
+                    UndoPageLayout.PAGE_FLAGS, new byte[]{(byte) legacyV1Flags});
             mgr.commit(corrupt);
 
             MiniTransaction read = mgr.begin();
+            assertThrows(UndoLogFormatException.class,
+                    () -> undoAccess.openUndoPage(read, pid, PageLatchMode.SHARED));
+            mgr.rollbackUncommitted(read);
+        });
+    }
+
+    /** v2 的 record area 从 120 开始，不能被 v3 当成带 history links 的页面打开。 */
+    @Test
+    void openUndoPageRejectsLegacyV2FormatVersion() {
+        onPool((mgr, disk, undoAccess, pool) -> {
+            MiniTransaction create = mgr.begin();
+            SegmentRef seg = disk.createSegment(create, UNDO_SPACE, SegmentPurpose.UNDO);
+            PageId pid = disk.allocatePage(create, seg);
+            UndoSegmentHandle handle = new UndoSegmentHandle(
+                    UNDO_SPACE, seg.inodeSlot(), seg.segmentId(), pid, pid);
+            undoAccess.createFirstPage(create, pid, UndoLogKind.UPDATE, TransactionId.of(7), handle);
+            mgr.commit(create);
+
+            MiniTransaction corrupt = mgr.begin();
+            int legacyV2Flags = (2 << UndoPageLayout.FORMAT_VERSION_SHIFT) | UndoPageLayout.FLAG_FIRST_PAGE;
+            corrupt.getPage(pool, pid, PageLatchMode.EXCLUSIVE).writeBytes(
+                    UndoPageLayout.PAGE_FLAGS, new byte[]{(byte) legacyV2Flags});
+            mgr.commit(corrupt);
+
+            MiniTransaction read = mgr.beginReadOnly();
             assertThrows(UndoLogFormatException.class,
                     () -> undoAccess.openUndoPage(read, pid, PageLatchMode.SHARED));
             mgr.rollbackUncommitted(read);
@@ -251,7 +283,8 @@ class UndoPageTest {
             mgr.commit(create);
 
             MiniTransaction corrupt = mgr.begin();
-            int unknownFlags = (2 << UndoPageLayout.FORMAT_VERSION_SHIFT) | UndoPageLayout.FLAG_FIRST_PAGE;
+            int unknownFlags = ((UndoPageLayout.CURRENT_FORMAT_VERSION + 1)
+                    << UndoPageLayout.FORMAT_VERSION_SHIFT) | UndoPageLayout.FLAG_FIRST_PAGE;
             corrupt.getPage(pool, pid, PageLatchMode.EXCLUSIVE).writeBytes(
                     UndoPageLayout.PAGE_FLAGS, new byte[]{(byte) unknownFlags});
             mgr.commit(corrupt);

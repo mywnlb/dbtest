@@ -4,14 +4,14 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.Lsn;
 import cn.zhangyis.db.domain.TransactionId;
 import cn.zhangyis.db.domain.TransactionNo;
+import cn.zhangyis.db.storage.undo.UndoLogKind;
 
 import java.util.ArrayList;
-import java.util.HashSet;
+import java.util.EnumMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.Set;
 
 /**
  * checkpoint/redo snapshot 与 page3 undo slot 的纯内存交叉校验器。
@@ -33,17 +33,13 @@ public final class RecoveredTransactionReconciler {
                 new LinkedHashMap<>(redoSnapshot.entries());
         List<RecoveredUndoSlotEvidence> active = new ArrayList<>();
         List<RecoveredUndoSlotEvidence> committed = new ArrayList<>();
-        Set<TransactionId> page3Creators = new HashSet<>();
+        validateCreatorGroups(page3Slots);
         long nextId = redoSnapshot.nextTransactionId().value();
         long nextNo = redoSnapshot.nextTransactionNo().value();
 
         for (RecoveredUndoSlotEvidence slot : page3Slots) {
             if (slot == null) {
                 throw new DatabaseValidationException("recovered page3 slot evidence must not be null");
-            }
-            if (!page3Creators.add(slot.creatorTransactionId())) {
-                throw new TransactionRecoveryException(
-                        "duplicate page3 creator transaction id: " + slot.creatorTransactionId().value());
             }
             nextId = Math.max(nextId, increment(slot.creatorTransactionId().value(), "transaction id"));
             Optional<RecoveredTransactionEntry> redoEntry =
@@ -63,6 +59,36 @@ public final class RecoveredTransactionReconciler {
                 redoSnapshot.baselineNextTransactionId(), redoSnapshot.baselineNextTransactionNo(),
                 TransactionId.of(nextId), TransactionNo.of(nextNo), merged);
         return new RecoveredTransactionReconciliation(snapshot, active, committed);
+    }
+
+    /** 一个 creator 最多各有一条 INSERT/UPDATE ACTIVE log；COMMITTED 只能是单独的 UPDATE log。 */
+    private static void validateCreatorGroups(List<RecoveredUndoSlotEvidence> slots) {
+        Map<TransactionId, EnumMap<UndoLogKind, RecoveredUndoSlotEvidence>> groups = new LinkedHashMap<>();
+        for (RecoveredUndoSlotEvidence slot : slots) {
+            if (slot == null) {
+                throw new DatabaseValidationException("recovered page3 slot evidence must not be null");
+            }
+            EnumMap<UndoLogKind, RecoveredUndoSlotEvidence> byKind = groups.computeIfAbsent(
+                    slot.creatorTransactionId(), ignored -> new EnumMap<>(UndoLogKind.class));
+            if (byKind.putIfAbsent(slot.kind(), slot) != null) {
+                throw new TransactionRecoveryException("duplicate " + slot.kind()
+                        + " undo log for recovered transaction " + slot.creatorTransactionId().value());
+            }
+        }
+        for (Map.Entry<TransactionId, EnumMap<UndoLogKind, RecoveredUndoSlotEvidence>> group : groups.entrySet()) {
+            boolean hasActive = group.getValue().values().stream()
+                    .anyMatch(slot -> slot.state() == RecoveredUndoState.ACTIVE);
+            boolean hasCommitted = group.getValue().values().stream()
+                    .anyMatch(slot -> slot.state() == RecoveredUndoState.COMMITTED);
+            if (hasActive && hasCommitted) {
+                throw new TransactionRecoveryException("recovered transaction mixes ACTIVE and COMMITTED undo: "
+                        + group.getKey().value());
+            }
+            if (hasCommitted && group.getValue().size() != 1) {
+                throw new TransactionRecoveryException("COMMITTED transaction must retain only one UPDATE undo log: "
+                        + group.getKey().value());
+            }
+        }
     }
 
     private static void reconcileActive(

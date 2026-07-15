@@ -2,74 +2,86 @@ package cn.zhangyis.db.storage.trx;
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageId;
-import cn.zhangyis.db.domain.RollPointer;
 import cn.zhangyis.db.domain.TransactionId;
 import cn.zhangyis.db.domain.UndoNo;
 import cn.zhangyis.db.storage.redo.RedoBudgetWorkload;
 import cn.zhangyis.db.storage.undo.UndoAppendSnapshot;
+import cn.zhangyis.db.storage.undo.UndoLogKind;
+import cn.zhangyis.db.storage.undo.UndoLogicalHead;
 import cn.zhangyis.db.storage.undo.UndoRecordWritePlan;
 
 /**
- * 事务层不可变 undo 写计划。它把事务内存链入口、持久 segment 快照和物理编码计划冻结在 redo admission 之前；
- * 执行器只接受同一 transaction id 且仍匹配该快照的计划。
+ * 事务层不可变 undo 写计划。它同时冻结事务全局 undoNo 高水位与目标 kind 的局部 binding/header 快照，
+ * 从而允许 INSERT/UPDATE log 的本地序号有间隙，又能在进入物理写前拒绝同事务的陈旧计划。
  */
 public final class UndoWritePlan {
 
     private final TransactionId transactionId;
-    private final boolean firstWrite;
+    private final UndoLogKind kind;
+    private final UndoSegmentAcquisition acquisition;
     private final PageId expectedFirstPageId;
-    private final UndoNo expectedLastUndoNo;
-    private final UndoNo expectedLogicalLastUndoNo;
-    private final RollPointer expectedLastRollPointer;
+    private final UndoNo expectedGlobalLastUndoNo;
+    private final UndoLogicalHead expectedLogicalHead;
     private final UndoAppendSnapshot persistentSnapshot;
+    private final UndoSegmentCacheDirectory.CacheCandidate cachedCandidate;
     private final UndoRecordWritePlan recordPlan;
     private final int pagesToReserve;
     private final RedoBudgetWorkload redoWorkload;
 
-    UndoWritePlan(TransactionId transactionId, boolean firstWrite, PageId expectedFirstPageId,
-                  UndoNo expectedLastUndoNo, RollPointer expectedLastRollPointer,
-                  UndoNo expectedLogicalLastUndoNo,
-                  UndoAppendSnapshot persistentSnapshot, UndoRecordWritePlan recordPlan,
-                  int pagesToReserve, RedoBudgetWorkload redoWorkload) {
-        if (transactionId == null || expectedLastUndoNo == null || expectedLogicalLastUndoNo == null
-                || expectedLastRollPointer == null
-                || recordPlan == null || redoWorkload == null) {
+    UndoWritePlan(TransactionId transactionId, UndoLogKind kind, UndoSegmentAcquisition acquisition,
+                  PageId expectedFirstPageId,
+                   UndoNo expectedGlobalLastUndoNo, UndoLogicalHead expectedLogicalHead,
+                   UndoAppendSnapshot persistentSnapshot,
+                   UndoSegmentCacheDirectory.CacheCandidate cachedCandidate,
+                   UndoRecordWritePlan recordPlan,
+                   int pagesToReserve, RedoBudgetWorkload redoWorkload) {
+        if (transactionId == null || kind == null || acquisition == null || expectedGlobalLastUndoNo == null
+                || expectedLogicalHead == null || recordPlan == null || redoWorkload == null) {
             throw new DatabaseValidationException("undo write plan fields must not be null");
         }
-        if (transactionId.isNone() || pagesToReserve < 0
-                || (firstWrite && (expectedFirstPageId != null || persistentSnapshot != null))
-                || (!firstWrite && (expectedFirstPageId == null || persistentSnapshot == null))) {
+        boolean invalidTarget = switch (acquisition) {
+            case ALLOCATE_NEW -> expectedFirstPageId != null || persistentSnapshot != null
+                    || cachedCandidate != null || !expectedLogicalHead.isEmpty();
+            case REUSE_CACHED -> expectedFirstPageId == null || persistentSnapshot != null
+                    || cachedCandidate == null || !expectedLogicalHead.isEmpty()
+                    || !expectedFirstPageId.equals(cachedCandidate.segment().handle().firstPageId())
+                    || cachedCandidate.segment().kind() != kind;
+            case APPEND_EXISTING -> expectedFirstPageId == null || persistentSnapshot == null
+                    || cachedCandidate != null;
+        };
+        if (transactionId.isNone() || kind == UndoLogKind.TEMPORARY || pagesToReserve < 0 || invalidTarget) {
             throw new DatabaseValidationException("invalid undo write plan snapshot/bounds");
         }
         this.transactionId = transactionId;
-        this.firstWrite = firstWrite;
+        this.kind = kind;
+        this.acquisition = acquisition;
         this.expectedFirstPageId = expectedFirstPageId;
-        this.expectedLastUndoNo = expectedLastUndoNo;
-        this.expectedLogicalLastUndoNo = expectedLogicalLastUndoNo;
-        this.expectedLastRollPointer = expectedLastRollPointer;
+        this.expectedGlobalLastUndoNo = expectedGlobalLastUndoNo;
+        this.expectedLogicalHead = expectedLogicalHead;
         this.persistentSnapshot = persistentSnapshot;
+        this.cachedCandidate = cachedCandidate;
         this.recordPlan = recordPlan;
         this.pagesToReserve = pagesToReserve;
         this.redoWorkload = redoWorkload;
     }
 
-    /** 返回计划绑定的事务 id；执行时必须与目标事务精确一致。 */
     public TransactionId transactionId() { return transactionId; }
-    /** 是否为该事务第一次创建 undo segment 的写入。 */
-    public boolean firstWrite() { return firstWrite; }
-    /** 本次 root/create/grow 与 payload 合计需要预留的新页数。 */
+    public UndoLogKind kind() { return kind; }
+    /** 本次 append 的 segment 获取方式。 */
+    public UndoSegmentAcquisition acquisition() { return acquisition; }
+    /** 是否为目标 kind 开启新的事务局部 undo log（fresh allocation 与 cached reuse 都为 true）。 */
+    public boolean startsNewLogicalLog() { return acquisition.startsNewLogicalLog(); }
+    /** 兼容旧调用名称；语义等同于 {@link #startsNewLogicalLog()}。 */
+    public boolean newLog() { return startsNewLogicalLog(); }
     public int pagesToReserve() { return pagesToReserve; }
-    /** 交给 DML/MTR admission 的 undo 子工作量。 */
     public RedoBudgetWorkload redoWorkload() { return redoWorkload; }
-    /** 完整 record 编码是否采用 external payload。 */
     public boolean external() { return recordPlan.external(); }
-    /** external payload 精确页数；inline 返回 0。 */
     public int externalPageCount() { return recordPlan.externalPageCount(); }
 
     PageId expectedFirstPageId() { return expectedFirstPageId; }
-    UndoNo expectedLastUndoNo() { return expectedLastUndoNo; }
-    UndoNo expectedLogicalLastUndoNo() { return expectedLogicalLastUndoNo; }
-    RollPointer expectedLastRollPointer() { return expectedLastRollPointer; }
+    UndoNo expectedGlobalLastUndoNo() { return expectedGlobalLastUndoNo; }
+    UndoLogicalHead expectedLogicalHead() { return expectedLogicalHead; }
     UndoAppendSnapshot persistentSnapshot() { return persistentSnapshot; }
+    UndoSegmentCacheDirectory.CacheCandidate cachedCandidate() { return cachedCandidate; }
     UndoRecordWritePlan recordPlan() { return recordPlan; }
 }

@@ -2,7 +2,8 @@ package cn.zhangyis.db.storage.undo;
 
 /**
  * undo log 种类（对齐 InnoDB insert/update/temporary undo）。ordinal 落盘到 undo page header UNDO_KIND 字段，
- * 顺序不可改（{@code UndoRecordCodecTest} 钉死）。本片 header 恒写 {@code INSERT}；UPDATE/TEMPORARY 留 T1.3b/d。
+ * 顺序不可改（{@code UndoRecordCodecTest} 钉死）。v2 把 kind 复制到 first/chain 每张普通 UNDO 页；TEMPORARY
+ * 仍未接入普通 undo tablespace。
  */
 public enum UndoLogKind {
     /** insert undo：只服务事务回滚，提交后即可释放，不进 history list。 */

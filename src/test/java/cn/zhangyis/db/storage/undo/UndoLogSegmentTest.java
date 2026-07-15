@@ -128,17 +128,16 @@ class UndoLogSegmentTest {
             assertThrows(DatabaseValidationException.class,
                     () -> seg.append(rec(2, 101, RollPointer.NULL), keyDef(), schema()),
                     "predecessor must equal the persistent logical head");
-            assertThrows(DatabaseValidationException.class,
-                    () -> seg.append(rec(3, 101, rp1), keyDef(), schema()),
-                    "undoNo must advance the physical high-water by exactly one");
-            UndoRecord foreignTxn = UndoRecord.insert(UndoNo.of(2), TransactionId.of(8),
-                    1L, 9L, List.of(new ColumnValue.IntValue(101)), rp1);
+            RollPointer rp3 = seg.append(rec(3, 101, rp1), keyDef(), schema());
+            UndoRecord foreignTxn = UndoRecord.insert(UndoNo.of(4), TransactionId.of(8),
+                    1L, 9L, List.of(new ColumnValue.IntValue(101)), rp3);
             assertThrows(DatabaseValidationException.class,
                     () -> seg.append(foreignTxn, keyDef(), schema()));
 
-            assertEquals(1L, seg.logRecordCount());
-            assertEquals(UndoNo.of(1), seg.logLastUndoNo());
-            assertEquals(originalHead, seg.logicalHead());
+            assertEquals(2L, seg.logRecordCount());
+            assertEquals(UndoNo.of(3), seg.logLastUndoNo(),
+                    "independent logs may have local undoNo gaps");
+            assertEquals(new UndoLogicalHead(UndoNo.of(3), rp3), seg.logicalHead());
             assertEquals(rec(1, 100, RollPointer.NULL), seg.readRecord(rp1, keyDef(), schema()));
         });
     }
@@ -148,7 +147,7 @@ class UndoLogSegmentTest {
     void appendWritesLogicalHeadAsSingleMetadataDelta() {
         onAccess((mgr, access) -> {
             MiniTransaction create = mgr.begin();
-            UndoLogSegment created = access.create(create, UNDO_SPACE, TransactionId.of(7));
+            UndoLogSegment created = access.create(create, UNDO_SPACE, TransactionId.of(7), UndoLogKind.INSERT);
             PageId firstPageId = created.firstPageId();
             mgr.commit(create);
             int baseline = mgr.redoLogManager().bufferedRecords().size();
@@ -242,7 +241,7 @@ class UndoLogSegmentTest {
     void markCommittedAppendsUndoMetadataDeltaRedoForStateAndCommitNo() {
         onAccess((mgr, access) -> {
             MiniTransaction m = mgr.begin();
-            UndoLogSegment seg = access.create(m, UNDO_SPACE, TransactionId.of(7));
+            UndoLogSegment seg = access.create(m, UNDO_SPACE, TransactionId.of(7), UndoLogKind.INSERT);
             seg.markCommitted(TransactionNo.of(42));
             mgr.commit(m);
 
@@ -267,7 +266,7 @@ class UndoLogSegmentTest {
     void appendRecordPayloadUsesLogicalRedoWithoutPhysicalSlotBytes() {
         onAccess((mgr, access) -> {
             MiniTransaction m = mgr.begin();
-            UndoLogSegment seg = access.create(m, UNDO_SPACE, TransactionId.of(7));
+            UndoLogSegment seg = access.create(m, UNDO_SPACE, TransactionId.of(7), UndoLogKind.INSERT);
             RollPointer rp = seg.append(rec(1, 100, RollPointer.NULL), keyDef(), schema());
             PageId firstPage = seg.firstPageId();
             mgr.commit(m);
@@ -339,7 +338,7 @@ class UndoLogSegmentTest {
             mgr.commit(boot);
 
             MiniTransaction m = mgr.begin();
-            UndoLogSegment seg = access.create(m, UNDO_SPACE, TransactionId.of(7));
+            UndoLogSegment seg = access.create(m, UNDO_SPACE, TransactionId.of(7), UndoLogKind.INSERT);
             RollPointer rp1 = seg.append(bigRec(1, bigKey(1), RollPointer.NULL), bigKeyDef(), bigSchema());
             RollPointer rp2 = seg.append(bigRec(2, bigKey(2), rp1), bigKeyDef(), bigSchema());
             RollPointer rp3 = seg.append(bigRec(3, bigKey(3), rp2), bigKeyDef(), bigSchema());
@@ -382,7 +381,7 @@ class UndoLogSegmentTest {
             MiniTransaction m = mgr.begin();
             boolean committed = false;
             try {
-                UndoLogSegment seg = access.create(m, UNDO_SPACE, TransactionId.of(7));
+                UndoLogSegment seg = access.create(m, UNDO_SPACE, TransactionId.of(7), UndoLogKind.INSERT);
                 List<UndoRecord> expected = new ArrayList<>();
                 RollPointer previous = RollPointer.NULL;
                 for (long i = 1; i <= 3; i++) {
@@ -468,12 +467,12 @@ class UndoLogSegmentTest {
     void readRecordRejectsPointerFromOtherSegment() {
         onAccess((mgr, access) -> {
             MiniTransaction m1 = mgr.begin();
-            UndoLogSegment segB = access.create(m1, UNDO_SPACE, TransactionId.of(7));
+            UndoLogSegment segB = access.create(m1, UNDO_SPACE, TransactionId.of(7), UndoLogKind.INSERT);
             RollPointer rpB = segB.append(rec(1, 100, RollPointer.NULL), keyDef(), schema());
             mgr.commit(m1);
 
             MiniTransaction m2 = mgr.begin();
-            UndoLogSegment segA = access.create(m2, UNDO_SPACE, TransactionId.of(7));
+            UndoLogSegment segA = access.create(m2, UNDO_SPACE, TransactionId.of(7), UndoLogKind.INSERT);
             assertThrows(UndoLogFormatException.class, () -> segA.readRecord(rpB, keyDef(), schema()));
             mgr.commit(m2);
         });
@@ -491,11 +490,21 @@ class UndoLogSegmentTest {
     @Test
     void readRecordByRollPointerReadsInsertAndUpdate() {
         onAccess((mgr, access) -> {
-            MiniTransaction m = mgr.begin();
-            UndoLogSegment seg = access.create(m, UNDO_SPACE, TransactionId.of(7));
-            RollPointer insRp = seg.append(rec(1, 100, RollPointer.NULL), keyDef(), schema());
-            RollPointer updRp = seg.append(updateRec(2, 100, insRp), keyDef(), schema());
-            mgr.commit(m);
+            MiniTransaction insertMtr = mgr.begin();
+            UndoLogSegment insertLog = access.create(
+                    insertMtr, UNDO_SPACE, TransactionId.of(7), UndoLogKind.INSERT);
+            RollPointer insRp = insertLog.append(rec(1, 100, RollPointer.NULL), keyDef(), schema());
+            mgr.commit(insertMtr);
+            MiniTransaction updateMtr = mgr.begin();
+            UndoLogSegment updateLog = access.create(
+                    updateMtr, UNDO_SPACE, TransactionId.of(7), UndoLogKind.UPDATE);
+            UndoRecord update = UndoRecord.update(UndoNo.of(2), TransactionId.of(7), 1L, 9L,
+                    List.of(new ColumnValue.IntValue(100)),
+                    List.of(new ColumnValue.IntValue(100), new ColumnValue.StringValue("old-100")),
+                    new cn.zhangyis.db.storage.record.format.HiddenColumns(TransactionId.of(3), insRp),
+                    RollPointer.NULL);
+            RollPointer updRp = updateLog.append(update, keyDef(), schema());
+            mgr.commit(updateMtr);
 
             MiniTransaction r = mgr.begin();
             UndoRecord ins = access.readRecordByRollPointer(r, UNDO_SPACE, insRp, keyDef(), schema());
@@ -513,7 +522,7 @@ class UndoLogSegmentTest {
     void readRecordByRollPointerRejectsCorruption() {
         onAccess((mgr, access) -> {
             MiniTransaction m = mgr.begin();
-            UndoLogSegment seg = access.create(m, UNDO_SPACE, TransactionId.of(7));
+            UndoLogSegment seg = access.create(m, UNDO_SPACE, TransactionId.of(7), UndoLogKind.INSERT);
             RollPointer insRp = seg.append(rec(1, 100, RollPointer.NULL), keyDef(), schema());
             mgr.commit(m);
 
@@ -540,19 +549,47 @@ class UndoLogSegmentTest {
 
     @Test
     void appendStampsRollPointerInsertFlagByRecordType() {
-        onSegment(seg -> {
-            // INSERT_ROW → insert flag true（不变）
-            RollPointer insRp = seg.append(rec(1, 100, RollPointer.NULL), keyDef(), schema());
+        onAccess((mgr, access) -> {
+            MiniTransaction insertMtr = mgr.begin();
+            UndoLogSegment insertLog = access.create(
+                    insertMtr, UNDO_SPACE, TransactionId.of(7), UndoLogKind.INSERT);
+            RollPointer insRp = insertLog.append(rec(1, 100, RollPointer.NULL), keyDef(), schema());
             assertTrue(insRp.insert(), "INSERT_ROW append must stamp insert=true");
-            // UPDATE_ROW → insert flag false（T1.3e：供 MVCC/版本链区分 insert vs update undo）
+            mgr.commit(insertMtr);
+
+            MiniTransaction updateMtr = mgr.begin();
+            UndoLogSegment updateLog = access.create(
+                    updateMtr, UNDO_SPACE, TransactionId.of(7), UndoLogKind.UPDATE);
             UndoRecord upd = UndoRecord.update(UndoNo.of(2), TransactionId.of(7), 1L, 9L,
                     List.of(new ColumnValue.IntValue(100)),
                     List.of(new ColumnValue.IntValue(100), new ColumnValue.StringValue("old")),
                     new cn.zhangyis.db.storage.record.format.HiddenColumns(
                             TransactionId.of(3), new RollPointer(false, PageNo.of(65), 1)),
-                    insRp);
-            RollPointer updRp = seg.append(upd, keyDef(), schema());
+                    RollPointer.NULL);
+            RollPointer updRp = updateLog.append(upd, keyDef(), schema());
             assertFalse(updRp.insert(), "UPDATE_ROW append must stamp insert=false");
+            mgr.commit(updateMtr);
+        });
+    }
+
+    /** v2 segment kind 是持久格式边界，不能靠 RollPointer.insert 位事后猜测或容忍混写。 */
+    @Test
+    void appendRejectsRecordTypeThatDoesNotBelongToSegmentKind() {
+        onAccess((mgr, access) -> {
+            UndoRecord update = updateRec(1, 100, RollPointer.NULL);
+            MiniTransaction insertMtr = mgr.begin();
+            UndoLogSegment insertLog = access.create(
+                    insertMtr, UNDO_SPACE, TransactionId.of(7), UndoLogKind.INSERT);
+            assertThrows(UndoLogFormatException.class,
+                    () -> insertLog.append(update, keyDef(), schema()));
+            mgr.rollbackUncommitted(insertMtr);
+
+            MiniTransaction updateMtr = mgr.begin();
+            UndoLogSegment updateLog = access.create(
+                    updateMtr, UNDO_SPACE, TransactionId.of(7), UndoLogKind.UPDATE);
+            assertThrows(UndoLogFormatException.class,
+                    () -> updateLog.append(rec(1, 100, RollPointer.NULL), keyDef(), schema()));
+            mgr.rollbackUncommitted(updateMtr);
         });
     }
 
@@ -586,7 +623,7 @@ class UndoLogSegmentTest {
     private void onSegment(SegmentBody body) {
         onAccess((mgr, access) -> {
             MiniTransaction m = mgr.begin();
-            UndoLogSegment seg = access.create(m, UNDO_SPACE, TransactionId.of(7));
+            UndoLogSegment seg = access.create(m, UNDO_SPACE, TransactionId.of(7), UndoLogKind.INSERT);
             body.run(seg);
             mgr.commit(m);
         });

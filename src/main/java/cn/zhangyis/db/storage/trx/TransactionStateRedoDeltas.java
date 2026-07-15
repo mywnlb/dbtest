@@ -45,7 +45,7 @@ final class TransactionStateRedoDeltas {
 
     /**
      * 在 recovery rollback 的原子终结 MTR 中追加终态证据。恢复期没有 live {@link Transaction}，因此显式使用
-     * 已由 page3/undo first-page 交叉校验的 creator id；提交号固定 NONE。该 record 与 drop segment + clear slot
+     * 已由 page3/undo first-page 交叉校验的 creator id；提交号固定 NONE。该 record 与 cache/drop segment + owner 转移
      * 同批，下一次 crash 即使 page3 已清也能从 redo 保留 id 高水位和 ROLLED_BACK 终态。
      *
      * @param mtr recovery finalization MTR。

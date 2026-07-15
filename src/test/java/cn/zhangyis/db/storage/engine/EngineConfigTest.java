@@ -44,6 +44,33 @@ class EngineConfigTest {
         assertEquals(c.flushTimeout(), c.backgroundFlushStopTimeout());
         assertEquals(16, c.maxExternalUndoPayloadPages(),
                 "外置 undo 默认上限兼顾宽行教学场景与损坏链的读取边界");
+        assertEquals(8, c.undoCachedSegmentsPerKind(), "INSERT/UPDATE 默认各保留八个 cached segment");
+        assertEquals(Duration.ofSeconds(5), c.undoHistoryTransitionTimeout());
+    }
+
+    @Test
+    void historyTransitionTimeoutIsIndependentAndValidated() {
+        EngineConfig original = valid();
+        EngineConfig configured = original.withUndoHistoryTransitionTimeout(Duration.ofMillis(75));
+        assertEquals(Duration.ofMillis(75), configured.undoHistoryTransitionTimeout());
+        assertEquals(Duration.ofSeconds(5), original.undoHistoryTransitionTimeout());
+        assertThrows(DatabaseValidationException.class,
+                () -> original.withUndoHistoryTransitionTimeout(Duration.ZERO));
+        assertThrows(DatabaseValidationException.class,
+                () -> original.withUndoHistoryTransitionTimeout(null));
+    }
+
+    @Test
+    void undoCacheCapacityCanBeDisabledAndMustFitRollbackHeaderPage() {
+        EngineConfig config = valid();
+        assertEquals(0, config.withUndoCachedSegmentsPerKind(0).undoCachedSegmentsPerKind(),
+                "0 是显式禁用，终结路径退回物理 drop");
+        assertEquals(3, config.withUndoCachedSegmentsPerKind(3).undoCachedSegmentsPerKind());
+        assertThrows(DatabaseValidationException.class,
+                () -> config.withUndoCachedSegmentsPerKind(-1));
+        assertThrows(DatabaseValidationException.class,
+                () -> config.withUndoCachedSegmentsPerKind(2_000),
+                "slot array 与两个 cache array 的组合布局不能越过 FIL trailer");
     }
 
     @Test

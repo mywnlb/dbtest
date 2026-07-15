@@ -14,6 +14,7 @@ import cn.zhangyis.db.domain.UndoNo;
  * @param segmentId     FSP segment identity，external payload 页必须匹配。
  * @param inodeSlot     FSP inode slot，和 segmentId 共同拒绝跨段拼链。
  * @param transactionId 该 undo segment 的创建事务。
+ * @param kind           v2 每页复制的 log kind；执行计划必须与目标 binding 精确一致。
  * @param lastUndoNo    物理 append 高水位，partial rollback 后不回退。
  * @param logicalHead   当前持久有效 rollback 链头。
  * @param recordCount   已物理追加的 root record 数量。
@@ -21,15 +22,16 @@ import cn.zhangyis.db.domain.UndoNo;
  */
 public record UndoAppendSnapshot(PageId firstPageId, PageId lastPageId, SegmentId segmentId, int inodeSlot,
                                  TransactionId transactionId, UndoNo lastUndoNo, UndoLogicalHead logicalHead,
-                                 long recordCount, int tailFreeOffset) {
+                                 UndoLogKind kind, long recordCount, int tailFreeOffset) {
 
     public UndoAppendSnapshot {
         if (firstPageId == null || lastPageId == null || segmentId == null || transactionId == null
-                || lastUndoNo == null || logicalHead == null) {
+                || lastUndoNo == null || logicalHead == null || kind == null) {
             throw new DatabaseValidationException("undo append snapshot fields must not be null");
         }
         if (!firstPageId.spaceId().equals(lastPageId.spaceId()) || segmentId.value() <= 0 || inodeSlot < 0
-                || transactionId.isNone() || recordCount < 0 || tailFreeOffset < UndoPageLayout.RECORD_AREA_START) {
+                || transactionId.isNone() || kind == UndoLogKind.TEMPORARY
+                || recordCount < 0 || tailFreeOffset < UndoPageLayout.RECORD_AREA_START) {
             throw new DatabaseValidationException("invalid undo append snapshot bounds");
         }
     }

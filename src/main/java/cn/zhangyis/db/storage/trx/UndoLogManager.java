@@ -10,9 +10,6 @@ import cn.zhangyis.db.domain.UndoNo;
 import cn.zhangyis.db.domain.UndoSlotId;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
-import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
-import cn.zhangyis.db.storage.mtr.MiniTransactionState;
-import cn.zhangyis.db.storage.redo.RedoBudgetPurpose;
 import cn.zhangyis.db.storage.record.format.HiddenColumns;
 import cn.zhangyis.db.storage.record.schema.IndexKeyDef;
 import cn.zhangyis.db.storage.record.schema.TableSchema;
@@ -22,6 +19,7 @@ import cn.zhangyis.db.storage.undo.UndoAppendSnapshot;
 import cn.zhangyis.db.storage.undo.UndoLogSegment;
 import cn.zhangyis.db.storage.undo.UndoLogSegmentAccess;
 import cn.zhangyis.db.storage.undo.UndoLogicalHead;
+import cn.zhangyis.db.storage.undo.UndoLogKind;
 import cn.zhangyis.db.storage.undo.UndoRecord;
 import cn.zhangyis.db.storage.undo.UndoRecordType;
 import cn.zhangyis.db.storage.undo.UndoRecordWritePlan;
@@ -39,10 +37,10 @@ import java.util.List;
  * {@link UndoLogSegmentAccess}/{@link UndoRecord}（undo 物理设施）与 record schema/type；不反向暴露
  * {@link Transaction} 内部给 undo。{@code storage.undo} 不 import 本类或 {@code Transaction}。
  *
- * <p><b>当前范围</b>：生产 DML 通过 {@code planInsert/planUpdate/planDelete + appendPlanned} 在业务 MTR
- * admission 前冻结持久头快照、inline/external 编码、精确 reservation 与 redo workload；兼容入口
- * {@code beforeInsert/beforeUpdate/beforeDelete} 只供既有低层调用在已开启 MTR 内直接追加。commit、持久 rseg
- * header、savepoint/statement/full/recovery rollback 已接；prepared transaction 与多 rseg 调度仍留后续切片。
+ * <p><b>当前范围</b>：生产 DML 与测试协作者统一通过
+ * {@code planInsert/planUpdate/planDelete + appendPlanned} 在业务 MTR admission 前冻结目标 kind、持久头快照、
+ * inline/external 编码、精确 reservation 与 redo workload。INSERT/UPDATE 首写分别惰性创建独立 slot/segment；
+ * prepared transaction 与多 rseg 调度仍留后续切片。
  *
  * <p><b>WAL/失败边界</b>（§7.2）：生产 append 与聚簇修改仍在同一 MTR，undo root/payload redo 与 index redo
  * 同批提交。stale/编码/配置错误在 reservation 前拒绝；进入 segment/payload 物理修改后，或 undo 已写而聚簇修改
@@ -50,44 +48,43 @@ import java.util.List;
  *
  * <p><b>并发</b>：slot 认领由 {@link RollbackSegmentSlotManager} 的 {@code ReentrantLock} 串行，锁内不分配页、
  * 不访问 BufferPool、不等待 IO；页分配（{@link UndoLogSegmentAccess#create}）在 slot 锁外完成。本片单 writer
- * 假设：同一 undo segment 同时只有一个 EXCLUSIVE append 会话（同事务串行 beforeInsert）。
+ * 假设：同一事务/undo segment 同时只有一个 EXCLUSIVE append 会话。
  */
 public final class UndoLogManager {
 
-    /** undo 物理设施入口；生产 plan/append 与兼容 beforeX 均经它 create/open/resolve undo segment。 */
+    /** undo 物理设施入口；生产 plan/append 均经它 create/open/resolve undo segment。 */
     private final UndoLogSegmentAccess access;
-    /** 内存 rseg slot 目录；首写时认领 slot 登记 insert undo 首页。固定单一默认 rseg。 */
+    /** 内存 rseg slot 目录；每个 kind 首写时各认领一个 slot。固定单一默认 rseg。 */
     private final RollbackSegmentSlotManager slotManager;
-    /** undo 表空间；planned first write 或兼容 {@code ensureUndoContext} 首写建段时使用。 */
+    /** undo 表空间；目标 kind 尚无 binding 时由 planned append 在此空间惰性建段。 */
     private final SpaceId undoSpace;
-    /** 已提交 update/delete undo 的 history list；纯 insert undo 在 commit finalization 中直接物理回收。 */
+    /** 已提交 update/delete undo 的 history list；纯 insert undo 在 commit finalization 中按条件缓存或回收。 */
     private final HistoryList history;
     /**
      * 持久 rseg header 仓储。首写 claim 与 undo segment 创建同一 MTR；终态 clear 统一交给 finalizer。
      */
     private final RollbackSegmentHeaderRepository headerRepo;
-    /** 短 MTR 来源；update/delete commit 写 COMMITTED header 与 transaction-state redo 使用。 */
-    private final MiniTransactionManager mtrManager;
-    /** 四条 undo 终态共享的 atomic drop+page3-clear 协作者。 */
+    /** commit/rollback/purge 共享的 atomic cache/drop + page3 owner 转移协作者。 */
     private final UndoSegmentFinalizer finalizer;
+    /** page3 cached INSERT/UPDATE segment 的运行期 LIFO 投影。 */
+    private final UndoSegmentCacheDirectory cacheDirectory;
 
     /**
      * 构造生产 undo 门面。slot claim 必须持久到 page3；纯 insert commit 必须经 finalizer 在同一 redo batch
-     * drop segment + clear slot，故不再提供绕过持久生命周期的构造方式。
+     * cache/drop segment + 转移 page3 owner，故不再提供绕过持久生命周期的构造方式。
      *
      * @param access      undo 物理设施入口，不能为 null。
      * @param slotManager 内存 rseg slot 目录，不能为 null。
      * @param undoSpace   undo 表空间，不能为 null。
      * @param history     已提交 undo log 的 history list，不能为 null。
      * @param headerRepo  持久 rseg header 仓储。
-     * @param mtrManager  短 MTR 来源。
      * @param finalizer   atomic undo segment 终态协作者。
      */
     public UndoLogManager(UndoLogSegmentAccess access, RollbackSegmentSlotManager slotManager, SpaceId undoSpace,
                            HistoryList history, RollbackSegmentHeaderRepository headerRepo,
-                           MiniTransactionManager mtrManager, UndoSegmentFinalizer finalizer) {
+                           UndoSegmentFinalizer finalizer, UndoSegmentCacheDirectory cacheDirectory) {
         if (access == null || slotManager == null || undoSpace == null || history == null
-                || headerRepo == null || mtrManager == null || finalizer == null) {
+                || headerRepo == null || finalizer == null || cacheDirectory == null) {
             throw new DatabaseValidationException("undo log manager args must not be null");
         }
         this.access = access;
@@ -95,120 +92,8 @@ public final class UndoLogManager {
         this.undoSpace = undoSpace;
         this.history = history;
         this.headerRepo = headerRepo;
-        this.mtrManager = mtrManager;
         this.finalizer = finalizer;
-    }
-
-    /**
-     * 兼容 INSERT undo 写路径（§7.2 步骤 3）。生产 DML 使用 {@link #planInsert} + {@link #appendPlanned}；
-     * 本入口保留给已经持有业务 MTR 的低层测试/协作者。数据流：
-     * <ol>
-     *   <li>校验事务 ACTIVE 且已分配写 id（{@code assignWriteId} 须先于本方法）。</li>
-     *   <li>{@code ensureUndoContext}：首写时 {@link UndoLogSegmentAccess#create} 建 insert undo segment +
-     *       {@link RollbackSegmentSlotManager#claim} 占内存 slot + 构造 {@link UndoContext} 绑定到事务；
-     *       后续写 {@link UndoLogSegmentAccess#open} 按 {@code ctx.undoFirstPageId} 重开 EXCLUSIVE 续 append。</li>
-     *   <li>分配 {@code undoNo = ctx.lastUndoNo + 1}（首条为 1）。</li>
-     *   <li>组 {@link UndoRecord}（INSERT_ROW，{@code prevRollPointer = ctx.lastRollPointer}，首条为 NULL）。</li>
-     *   <li>{@link UndoLogSegment#append} 写入 undo 页（同 MTR redo），返回 insert {@link RollPointer}。</li>
-     *   <li>推进 {@code ctx.lastUndoNo/lastRollPointer}，返回 roll pointer 供聚簇记录盖 {@code DB_ROLL_PTR}。</li>
-     * </ol>
-     *
-     * <p>该兼容入口不具备 planned API 的跨模块 fail-stop 包装；append 后异常时调用方必须结束进程或按既有恢复
-     * 流程处理，不能把 {@code rollbackUncommitted} 误认为 content undo。
-     *
-     * @param txn        当前事务，必须 ACTIVE 且已分配写 id。
-     * @param mtr        当前物理短事务；undo append 与聚簇写同 MTR，commit 同批 redo。
-     * @param tableId    表 id（rollback 定位用）。
-     * @param indexId    聚簇索引 id（rollback 定位用）。
-     * @param clusterKey 主键列值，顺序对应 {@code keyDef.parts()}；可含 {@link ColumnValue.NullValue}。
-     * @param keyDef     聚簇索引 key 定义。
-     * @param schema     表 schema（codec 按 columnId 解析类型）。
-     * @return 指向刚追加的 INSERT undo record 的 roll pointer（非 NULL，insert flag=true）。
-     */
-    public RollPointer beforeInsert(Transaction txn, MiniTransaction mtr, long tableId, long indexId,
-                                    List<ColumnValue> clusterKey, IndexKeyDef keyDef, TableSchema schema) {
-        if (txn == null || mtr == null || clusterKey == null || keyDef == null || schema == null) {
-            throw new TransactionStateException("beforeInsert args (txn/mtr/clusterKey/keyDef/schema) must not be null");
-        }
-        requireActiveTransaction(txn);
-        TransactionId txnId = txn.transactionId();
-        UndoLogSegment segment = ensureUndoContext(txn, mtr, txnId);
-        UndoContext context = txn.undoContext();
-        UndoNo undoNo = UndoNo.of(context.lastUndoNo().value() + 1L);
-        UndoRecord record = UndoRecord.insert(undoNo, txnId, tableId, indexId, clusterKey,
-                context.lastRollPointer());
-        RollPointer pointer = segment.append(record, keyDef, schema);
-        context.setLastUndoNo(undoNo);
-        context.setLastRollPointer(pointer);
-        return pointer;
-    }
-
-    /**
-     * 兼容 UPDATE undo 写路径（§7.3，T1.3e）。生产 DML 使用 {@link #planUpdate} + {@link #appendPlanned}；本入口
-     * 在聚簇记录被本事务更新前记录**全量旧 image**并返回新 roll pointer。数据流与 {@link #beforeInsert} 同构：
-     * ensure context → 分配单调 undoNo → 组 {@link UndoRecord#update} → inline/external append → 推进 ctx。
-     *
-     * <p><b>两条链</b>：返回的 rp 是记录的新 {@code DB_ROLL_PTR}；undo 内 {@code oldHiddenColumns.dbRollPtr()} 是
-     * 记录版本链的上一版本指针（T1.4 MVCC 用）；{@code prevRollPointer} 是事务回滚链（RollbackService 用）。两者不同。
-     *
-     * <p>1.6 起超单页完整编码会保存到 external undo payload 页链；只有超过配置页数上限时才在写前拒绝。
-     *
-     * @param oldColumnValues  更新前全列值（按 schema 列序），不能为 null。
-     * @param oldHiddenColumns 更新前隐藏列（旧 DB_TRX_ID/DB_ROLL_PTR），不能为 null。
-     * @return 指向刚追加 UPDATE undo record 的 roll pointer（非 NULL，insert flag=false）。
-     */
-    public RollPointer beforeUpdate(Transaction txn, MiniTransaction mtr, long tableId, long indexId,
-                                    List<ColumnValue> clusterKey, List<ColumnValue> oldColumnValues,
-                                    HiddenColumns oldHiddenColumns, IndexKeyDef keyDef, TableSchema schema) {
-        if (txn == null || mtr == null || clusterKey == null || oldColumnValues == null
-                || oldHiddenColumns == null || keyDef == null || schema == null) {
-            throw new TransactionStateException(
-                    "beforeUpdate args (txn/mtr/clusterKey/oldColumnValues/oldHiddenColumns/keyDef/schema) must not be null");
-        }
-        requireActiveTransaction(txn);
-        TransactionId txnId = txn.transactionId();
-        UndoLogSegment segment = ensureUndoContext(txn, mtr, txnId);
-        UndoContext context = txn.undoContext();
-        UndoNo undoNo = UndoNo.of(context.lastUndoNo().value() + 1L);
-        UndoRecord record = UndoRecord.update(undoNo, txnId, tableId, indexId, clusterKey,
-                oldColumnValues, oldHiddenColumns, context.lastRollPointer());
-        RollPointer pointer = segment.append(record, keyDef, schema);
-        context.setLastUndoNo(undoNo);
-        context.setLastRollPointer(pointer);
-        context.markHasUpdateUndo();
-        return pointer;
-    }
-
-    /**
-     * DELETE-mark undo 写路径（§7.3/§16.3，T1.3f）。在聚簇记录被本事务 delete-mark 前调用，记录删除前**存活**版本的
-     * 全量旧 image（列不变 + 旧隐藏列），返回新 roll pointer 供盖入记录的 {@code DB_ROLL_PTR}（连同删除位）。与
-     * {@link #beforeUpdate} 同构（仅 undo 类型为 DELETE_MARK）：返回 insert=false 的 rp，标 {@code hasUpdateUndo}
-     * （delete undo 服务旧 ReadView/purge，commit 不回收 slot）；版本链遍历与 UPDATE 同路（{@code oldHidden.dbRollPtr}）。
-     *
-     * @param oldColumnValues  删除前全列值（按 schema 列序），不能为 null。
-     * @param oldHiddenColumns 删除前隐藏列（旧 DB_TRX_ID/DB_ROLL_PTR），不能为 null。
-     * @return 指向刚追加 DELETE_MARK undo record 的 roll pointer（非 NULL，insert flag=false）。
-     */
-    public RollPointer beforeDelete(Transaction txn, MiniTransaction mtr, long tableId, long indexId,
-                                    List<ColumnValue> clusterKey, List<ColumnValue> oldColumnValues,
-                                    HiddenColumns oldHiddenColumns, IndexKeyDef keyDef, TableSchema schema) {
-        if (txn == null || mtr == null || clusterKey == null || oldColumnValues == null
-                || oldHiddenColumns == null || keyDef == null || schema == null) {
-            throw new TransactionStateException(
-                    "beforeDelete args (txn/mtr/clusterKey/oldColumnValues/oldHiddenColumns/keyDef/schema) must not be null");
-        }
-        requireActiveTransaction(txn);
-        TransactionId txnId = txn.transactionId();
-        UndoLogSegment segment = ensureUndoContext(txn, mtr, txnId);
-        UndoContext context = txn.undoContext();
-        UndoNo undoNo = UndoNo.of(context.lastUndoNo().value() + 1L);
-        UndoRecord record = UndoRecord.deleteMark(undoNo, txnId, tableId, indexId, clusterKey,
-                oldColumnValues, oldHiddenColumns, context.lastRollPointer());
-        RollPointer pointer = segment.append(record, keyDef, schema);
-        context.setLastUndoNo(undoNo);
-        context.setLastRollPointer(pointer);
-        context.markHasUpdateUndo();
-        return pointer;
+        this.cacheDirectory = cacheDirectory;
     }
 
     /** 在写 MTR admission 前规划 INSERT undo。 */
@@ -217,9 +102,9 @@ public final class UndoLogManager {
         if (clusterKey == null || keyDef == null || schema == null) {
             throw new TransactionStateException("planInsert clusterKey/keyDef/schema must not be null");
         }
-        PlanningContext context = planningContext(txn);
+        PlanningContext context = planningContext(txn, UndoLogKind.INSERT);
         UndoRecord record = UndoRecord.insert(context.nextUndoNo(), context.transactionId(), tableId, indexId,
-                clusterKey, context.lastRollPointer());
+                clusterKey, context.logicalHead().rollPointer());
         return buildPlan(context, record, keyDef, schema);
     }
 
@@ -231,9 +116,9 @@ public final class UndoLogManager {
                 || keyDef == null || schema == null) {
             throw new TransactionStateException("planUpdate old image/key/schema args must not be null");
         }
-        PlanningContext context = planningContext(txn);
+        PlanningContext context = planningContext(txn, UndoLogKind.UPDATE);
         UndoRecord record = UndoRecord.update(context.nextUndoNo(), context.transactionId(), tableId, indexId,
-                clusterKey, oldColumnValues, oldHiddenColumns, context.lastRollPointer());
+                clusterKey, oldColumnValues, oldHiddenColumns, context.logicalHead().rollPointer());
         return buildPlan(context, record, keyDef, schema);
     }
 
@@ -245,9 +130,9 @@ public final class UndoLogManager {
                 || keyDef == null || schema == null) {
             throw new TransactionStateException("planDelete old image/key/schema args must not be null");
         }
-        PlanningContext context = planningContext(txn);
+        PlanningContext context = planningContext(txn, UndoLogKind.UPDATE);
         UndoRecord record = UndoRecord.deleteMark(context.nextUndoNo(), context.transactionId(), tableId, indexId,
-                clusterKey, oldColumnValues, oldHiddenColumns, context.lastRollPointer());
+                clusterKey, oldColumnValues, oldHiddenColumns, context.logicalHead().rollPointer());
         return buildPlan(context, record, keyDef, schema);
     }
 
@@ -263,55 +148,65 @@ public final class UndoLogManager {
         if (!txn.transactionId().equals(plan.transactionId())) {
             throw new UndoWriteStalePlanException("undo plan transaction id no longer matches target transaction");
         }
-        return plan.firstWrite() ? appendFirstPlanned(txn, mtr, plan) : appendExistingPlanned(txn, mtr, plan);
+        return switch (plan.acquisition()) {
+            case ALLOCATE_NEW -> appendAllocatedLogPlanned(txn, mtr, plan);
+            case REUSE_CACHED -> appendCachedLogPlanned(txn, mtr, plan);
+            case APPEND_EXISTING -> appendExistingPlanned(txn, mtr, plan);
+        };
     }
 
     private UndoWritePlan buildPlan(PlanningContext context, UndoRecord record,
                                     IndexKeyDef keyDef, TableSchema schema) {
         UndoRecordWritePlan physical = access.planRecord(record, keyDef, schema);
-        int pages = access.plannedNewPages(context.firstWrite(), context.persistentSnapshot(), physical);
-        return new UndoWritePlan(context.transactionId(), context.firstWrite(), context.firstPageId(),
-                context.lastUndoNo(), context.lastRollPointer(), context.logicalLastUndoNo(),
-                context.persistentSnapshot(), physical, pages,
-                UndoRedoBudgetEstimator.append(context.firstWrite(), physical.externalPageCount()));
+        int pages = switch (context.acquisition()) {
+            case ALLOCATE_NEW -> access.plannedNewPages(true, null, physical);
+            case REUSE_CACHED -> physical.externalPageCount();
+            case APPEND_EXISTING -> access.plannedNewPages(false, context.persistentSnapshot(), physical);
+        };
+        return new UndoWritePlan(context.transactionId(), context.kind(), context.acquisition(), context.firstPageId(),
+                context.globalLastUndoNo(), context.logicalHead(), context.persistentSnapshot(),
+                context.cachedCandidate(), physical, pages,
+                UndoRedoBudgetEstimator.append(context.acquisition(), physical.externalPageCount()));
     }
 
-    private PlanningContext planningContext(Transaction txn) {
+    private PlanningContext planningContext(Transaction txn, UndoLogKind kind) {
         requireActiveTransaction(txn);
         TransactionId txnId = txn.transactionId();
         UndoContext context = txn.undoContext();
-        if (context == null) {
-            return new PlanningContext(txnId, true, null, UndoNo.NONE, UndoNo.NONE, RollPointer.NULL, null);
+        UndoNo globalLast = context == null ? UndoNo.NONE : context.lastUndoNo();
+        UndoLogBinding binding = context == null ? null : context.binding(kind);
+        if (binding == null) {
+            UndoSegmentCacheDirectory.CacheCandidate candidate = cacheDirectory.peek(kind).orElse(null);
+            UndoSegmentAcquisition acquisition = candidate == null
+                    ? UndoSegmentAcquisition.ALLOCATE_NEW : UndoSegmentAcquisition.REUSE_CACHED;
+            PageId firstPage = candidate == null ? null : candidate.segment().handle().firstPageId();
+            return new PlanningContext(txnId, kind, acquisition, firstPage, globalLast,
+                    UndoLogicalHead.EMPTY, null, candidate);
         }
-        MiniTransaction read = mtrManager.beginReadOnly();
-        try {
-            UndoAppendSnapshot snapshot = access.inspectAppendSnapshot(read, context.undoFirstPageId());
-            mtrManager.commit(read);
-            UndoLogicalHead expectedHead = context.logicalHead();
-            if (!snapshot.transactionId().equals(txnId) || !snapshot.firstPageId().equals(context.undoFirstPageId())
-                    || !snapshot.lastUndoNo().equals(context.lastUndoNo())
-                    || !snapshot.logicalHead().equals(expectedHead)) {
-                throw new UndoWriteStalePlanException("transaction undo context differs from persistent append head");
-            }
-            return new PlanningContext(txnId, false, context.undoFirstPageId(), context.lastUndoNo(),
-                    context.logicalLastUndoNo(), context.lastRollPointer(), snapshot);
-        } catch (RuntimeException error) {
-            rollbackActiveMtr(read, error);
-            throw error;
+        UndoAppendSnapshot snapshot = binding.appendSnapshot();
+        if (snapshot == null || !snapshot.transactionId().equals(txnId)
+                || !snapshot.firstPageId().equals(binding.firstPageId())
+                || snapshot.kind() != kind
+                || !snapshot.logicalHead().equals(binding.logicalHead())) {
+            throw new UndoWriteStalePlanException("transaction undo binding lacks a current append snapshot");
         }
+        return new PlanningContext(txnId, kind, UndoSegmentAcquisition.APPEND_EXISTING,
+                binding.firstPageId(), globalLast, binding.logicalHead(), snapshot, null);
     }
 
-    private RollPointer appendFirstPlanned(Transaction txn, MiniTransaction mtr, UndoWritePlan plan) {
-        if (txn.undoContext() != null || !plan.expectedLastUndoNo().isNone()
-                || !plan.expectedLogicalLastUndoNo().isNone() || !plan.expectedLastRollPointer().isNull()) {
-            throw new UndoWriteStalePlanException("first undo plan is stale because transaction already has undo");
+    private RollPointer appendAllocatedLogPlanned(Transaction txn, MiniTransaction mtr, UndoWritePlan plan) {
+        UndoContext current = txn.undoContext();
+        UndoNo currentGlobal = current == null ? UndoNo.NONE : current.lastUndoNo();
+        if (!currentGlobal.equals(plan.expectedGlobalLastUndoNo())
+                || (current != null && current.hasBinding(plan.kind()))) {
+            throw new UndoWriteStalePlanException("new undo log plan is stale because transaction state changed");
         }
         try (RollbackSegmentSlotManager.ClaimLease claim = slotManager.reserveClaim()) {
             requirePersistentSlotFree(mtr, claim.slotId());
             UndoSpaceReservation reservation = access.reservePages(mtr, undoSpace, plan.pagesToReserve());
             claim.physicalMutationStarted();
             try (reservation) {
-                    UndoLogSegment segment = access.create(mtr, undoSpace, plan.transactionId());
+                    UndoLogSegment segment = access.create(mtr, undoSpace, plan.transactionId(), plan.kind());
                     if (segment.requiredNewPages(plan.recordPlan()) != plan.recordPlan().externalPageCount()) {
                         throw new UndoWriteFatalException("new undo segment page requirement differs from plan");
                     }
@@ -319,8 +214,11 @@ public final class UndoLogManager {
                     PageId firstPageId = segment.firstPageId();
                     claim.bind(firstPageId);
                     claimRsegSlotAfterUndoPage(mtr, claim.slotId(), firstPageId);
-                    UndoContext context = new UndoContext(slotManager.rollbackSegmentId(), claim.slotId(), firstPageId);
-                    publishContextAfterAppend(txn, context, plan, pointer);
+                    UndoContext context = current == null
+                            ? new UndoContext(slotManager.rollbackSegmentId()) : current;
+                    context.attach(new UndoLogBinding(plan.kind(), claim.slotId(), firstPageId,
+                            UndoLogicalHead.EMPTY));
+                    publishContextAfterAppend(txn, context, plan, pointer, segment.appendSnapshot());
                     return pointer;
             } catch (RuntimeException error) {
                 throw fatalAfterMutation("first undo write failed after physical mutation started", error);
@@ -328,23 +226,68 @@ public final class UndoLogManager {
         }
     }
 
+    /**
+     * 用 page3 cached top 开启事务的新 kind-local undo log。cache pop、active slot claim、首页激活与首条 append
+     * 处于同一业务 MTR；进入物理边界后的任何异常均 fail-stop，不能把同一 inode 同时重新发布到 cache/active。
+     */
+    private RollPointer appendCachedLogPlanned(Transaction txn, MiniTransaction mtr, UndoWritePlan plan) {
+        UndoContext current = txn.undoContext();
+        UndoNo currentGlobal = current == null ? UndoNo.NONE : current.lastUndoNo();
+        if (!currentGlobal.equals(plan.expectedGlobalLastUndoNo())
+                || (current != null && current.hasBinding(plan.kind()))) {
+            throw new UndoWriteStalePlanException("cached undo plan is stale because transaction state changed");
+        }
+        try (RollbackSegmentSlotManager.ClaimLease claim = slotManager.reserveClaim();
+             UndoSegmentCacheDirectory.PopLease cachePop = cacheDirectory.reservePop(plan.cachedCandidate())) {
+            requirePersistentSlotFree(mtr, claim.slotId());
+            UndoSpaceReservation reservation = plan.pagesToReserve() == 0
+                    ? null : access.reservePages(mtr, undoSpace, plan.pagesToReserve());
+            try (reservation) {
+                claim.physicalMutationStarted();
+                cachePop.physicalMutationStarted();
+                try {
+                    var candidate = cachePop.candidate();
+                    headerRepo.moveCachedTopToActiveSlot(mtr, undoSpace, plan.kind(),
+                            candidate.expectedCount(), candidate.segment().handle().firstPageId(), claim.slotId());
+                    UndoLogSegment segment = access.activateCached(mtr, candidate.segment(), plan.transactionId());
+                    if (segment.requiredNewPages(plan.recordPlan()) != plan.pagesToReserve()) {
+                        throw new UndoWriteFatalException("cached undo segment page requirement differs from plan");
+                    }
+                    RollPointer pointer = segment.appendPlanned(plan.recordPlan());
+                    PageId firstPageId = segment.firstPageId();
+                    claim.bind(firstPageId);
+                    cachePop.complete();
+                    UndoContext context = current == null
+                            ? new UndoContext(slotManager.rollbackSegmentId()) : current;
+                    context.attach(new UndoLogBinding(plan.kind(), claim.slotId(), firstPageId,
+                            UndoLogicalHead.EMPTY));
+                    publishContextAfterAppend(txn, context, plan, pointer, segment.appendSnapshot());
+                    return pointer;
+                } catch (RuntimeException error) {
+                    throw fatalAfterMutation("cached undo first write failed after owner transition began", error);
+                }
+            }
+        }
+    }
+
     private RollPointer appendExistingPlanned(Transaction txn, MiniTransaction mtr, UndoWritePlan plan) {
         UndoContext context = txn.undoContext();
         requireMatchingContext(context, plan);
-        UndoLogSegment segment = access.open(mtr, plan.expectedFirstPageId(), PageLatchMode.EXCLUSIVE);
-        if (!segment.appendSnapshot().equals(plan.persistentSnapshot())) {
-            throw new UndoWriteStalePlanException("persistent undo append snapshot changed before execution");
-        }
-        int actualPages = segment.requiredNewPages(plan.recordPlan());
-        if (actualPages != plan.pagesToReserve()) {
-            throw new UndoWriteStalePlanException("undo root placement changed before execution");
-        }
-        UndoSpaceReservation reservation = actualPages == 0
+        // 预留必须先于 undo 尾页 X latch；FSP page0/page2 的页号低于普通 undo 页，反序会形成统一 latch-order 违规。
+        UndoSpaceReservation reservation = plan.pagesToReserve() == 0
                 ? null
-                : access.reservePages(mtr, undoSpace, actualPages);
+                : access.reservePages(mtr, undoSpace, plan.pagesToReserve());
         try (reservation) {
+            UndoLogSegment segment = access.open(mtr, plan.expectedFirstPageId(), PageLatchMode.EXCLUSIVE);
+            if (!segment.appendSnapshot().equals(plan.persistentSnapshot())) {
+                throw new UndoWriteStalePlanException("persistent undo append snapshot changed before execution");
+            }
+            int actualPages = segment.requiredNewPages(plan.recordPlan());
+            if (actualPages != plan.pagesToReserve()) {
+                throw new UndoWriteStalePlanException("undo root placement changed before execution");
+            }
             RollPointer pointer = segment.appendPlanned(plan.recordPlan());
-            publishContextAfterAppend(txn, context, plan, pointer);
+            publishContextAfterAppend(txn, context, plan, pointer, segment.appendSnapshot());
             return pointer;
         } catch (RuntimeException error) {
             throw fatalAfterMutation("existing undo write failed after physical mutation started", error);
@@ -352,22 +295,19 @@ public final class UndoLogManager {
     }
 
     private void publishContextAfterAppend(Transaction txn, UndoContext context,
-                                           UndoWritePlan plan, RollPointer pointer) {
-        context.setLastUndoNo(plan.recordPlan().record().undoNo());
-        context.setLastRollPointer(pointer);
-        if (plan.recordPlan().record().type() != UndoRecordType.INSERT_ROW) {
-            context.markHasUpdateUndo();
-        }
+                                           UndoWritePlan plan, RollPointer pointer,
+                                           UndoAppendSnapshot snapshot) {
+        context.publishAppend(plan.kind(), plan.recordPlan().record().undoNo(), pointer, snapshot);
         if (txn.undoContext() == null) {
             txn.setUndoContext(context);
         }
     }
 
     private static void requireMatchingContext(UndoContext context, UndoWritePlan plan) {
-        if (context == null || !context.undoFirstPageId().equals(plan.expectedFirstPageId())
-                || !context.lastUndoNo().equals(plan.expectedLastUndoNo())
-                || !context.logicalLastUndoNo().equals(plan.expectedLogicalLastUndoNo())
-                || !context.lastRollPointer().equals(plan.expectedLastRollPointer())) {
+        UndoLogBinding binding = context == null ? null : context.binding(plan.kind());
+        if (binding == null || !binding.firstPageId().equals(plan.expectedFirstPageId())
+                || !context.lastUndoNo().equals(plan.expectedGlobalLastUndoNo())
+                || !binding.logicalHead().equals(plan.expectedLogicalHead())) {
             throw new UndoWriteStalePlanException("transaction undo context changed before planned append");
         }
     }
@@ -392,14 +332,16 @@ public final class UndoLogManager {
     }
 
     /** 规划期冻结的事务链入口。 */
-    private record PlanningContext(TransactionId transactionId, boolean firstWrite, PageId firstPageId,
-                                   UndoNo lastUndoNo, UndoNo logicalLastUndoNo, RollPointer lastRollPointer,
-                                   UndoAppendSnapshot persistentSnapshot) {
+    private record PlanningContext(TransactionId transactionId, UndoLogKind kind,
+                                   UndoSegmentAcquisition acquisition,
+                                    PageId firstPageId, UndoNo globalLastUndoNo, UndoLogicalHead logicalHead,
+                                    UndoAppendSnapshot persistentSnapshot,
+                                    UndoSegmentCacheDirectory.CacheCandidate cachedCandidate) {
         private UndoNo nextUndoNo() {
-            if (lastUndoNo.value() == Long.MAX_VALUE) {
+            if (globalLastUndoNo.value() == Long.MAX_VALUE) {
                 throw new TransactionStateException("undo number exhausted at Long.MAX_VALUE");
             }
-            return UndoNo.of(lastUndoNo.value() + 1L);
+            return UndoNo.of(globalLastUndoNo.value() + 1L);
         }
     }
 
@@ -407,16 +349,15 @@ public final class UndoLogManager {
      * 提交 undo 生命周期（对齐 InnoDB {@code trx_undo_insert_cleanup} / history 挂接思想）。数据流：
      * <ul>
      *   <li>未写事务（{@code undoContext()==null}）：no-op。</li>
-     *   <li>纯 insert 事务（{@code !hasUpdateUndo()}）：insert undo 提交后不再服务一致性读，经
-     *       {@link UndoSegmentFinalizer} 同批 drop 段、CAS 清 page3、写正式 commit 终态/高水位 redo，提交后释放内存 slot。</li>
-     *   <li>含 update undo 事务（{@code hasUpdateUndo()}，T1.3e）：**保留** slot/段——committed update undo 仍可能被
-     *       T1.4 MVCC 旧版本读 / purge 需要，不能在 commit 即回收；后续由 purge 走同一 finalizer 回收。</li>
+     *   <li>INSERT-only：单 fragment 段尝试进入 INSERT cache，其余 drop；同时写正式 commit 终态。</li>
+     *   <li>UPDATE-only：把 UPDATE log 标为 COMMITTED 并挂 history，留给 MVCC/purge。</li>
+     *   <li>mixed：同一 MTR cache/drop INSERT、标记 UPDATE COMMITTED，并只写一次 commit 终态。</li>
      * </ul>
      *
      * <p><b>commit 编排</b>：{@code TransactionManager.commit()} 保持纯内存状态、**不**自动调用本方法；2.1 起
      * {@code ClusteredDmlService.commit} 先通过 {@code TransactionManager.prepareCommit(txn)} 预留提交号，
-     * 再调用本方法持久化 undo 终态，最后才 {@code commit(txn)} 移出 active table。纯 insert 在此物理回收；
-     * update/delete 只标 COMMITTED 并挂内存 history，保留给 MVCC/purge。
+     * 再调用本方法持久化 undo 终态，最后才 {@code commit(txn)} 移出 active table。纯 insert 在此缓存或回收；
+     * update/delete 原子更新 page3 base 与 first-page links 后才发布内存 history 投影，保留给 MVCC/purge。
      *
      * @param txn 提交中的事务，不能为 null。
      */
@@ -433,88 +374,19 @@ public final class UndoLogManager {
             throw new TransactionStateException(
                     "onCommit requires an assigned TransactionNo; call TransactionManager.prepareCommit first");
         }
-        if (ctx.hasUpdateUndo()) {
-            // update/delete undo 仍服务 MVCC：以 COMMITTED+COMMIT_NO 留在 page3，恢复可据此重建 history。
-            MiniTransaction commitMtr = mtrManager.begin(
-                    mtrManager.budgetFor(RedoBudgetPurpose.UNDO_COMMIT));
-            try {
-                // R 1.3：STATE 与提交序号同 MTR，供恢复重建 committed history。
-                access.open(commitMtr, ctx.undoFirstPageId(), PageLatchMode.EXCLUSIVE)
-                        .markCommitted(no);
-                TransactionStateRedoDeltas.appendCommit(commitMtr, txn);
-                mtrManager.commit(commitMtr);
-            } catch (RuntimeException e) {
-                rollbackActiveMtr(commitMtr, e);
-                throw e;
-            }
-            // history 是内存投影；若 submit 前 crash，page3 COMMITTED header 会在恢复期重建。
-            history.submitCommitted(new HistoryEntry(no, txn.transactionId(), undoSpace,
-                    ctx.undoFirstPageId(), ctx.slotId()));
-        } else {
-            // INSERT roll pointer 的 insert bit 足以让旧 ReadView 判“不存在”；无需保留 undo record。finalizer 同一 MTR
-            // drop segment + clear page3 + append recovery table 的正式 commit 证据，commit 后才释放内存 slot。
-            finalizer.finalizeInsertCommit(txn, ctx);
-        }
-    }
-
-    /** MTR 仍 ACTIVE 时释放 memo；提交阶段已开始则保留原始结果不确定状态。 */
-    private void rollbackActiveMtr(MiniTransaction mtr, RuntimeException original) {
-        if (mtr.state() != MiniTransactionState.ACTIVE) {
+        UndoLogBinding update = ctx.binding(UndoLogKind.UPDATE);
+        if (update == null) {
+            finalizer.finalizeCommit(txn, ctx, null);
             return;
         }
-        try {
-            mtrManager.rollbackUncommitted(mtr);
-        } catch (RuntimeException rollbackError) {
-            original.addSuppressed(rollbackError);
+        HistoryEntry entry = new HistoryEntry(no, txn.transactionId(), undoSpace,
+                update.firstPageId(), update.slotId());
+        // transition 在任何 page/FSP 写前取得；timeout/interrupt 不会留下半持久 commit，可由上层重试。
+        try (HistoryList.AppendLease lease = history.beginAppend(entry)) {
+            finalizer.finalizeCommit(txn, ctx, lease);
         }
     }
 
-    /**
-     * 惰性确保事务有 {@link UndoContext} 与可写 insert undo segment。数据流：
-     * <ul>
-     *   <li>事务首写（{@code txn.undoContext() == null}）：内存 slot 先进入 RESERVED → 当前业务 MTR 以 page3 S latch
-     *       预检持久槽为空并立即释放 → {@link UndoLogSegmentAccess#create} 建 insert undo segment（含首页格式化，X 持）→
-     *       reservation 绑定首页成为 ACTIVE → page3 X-latch CAS 持久登记 → 构造 {@link UndoContext}
-     *       （rseg=slotManager 默认 rseg，slot，首页，NONE/NULL 初值）→ {@link Transaction#setUndoContext} 绑定。</li>
-     *   <li>后续写：{@link UndoLogSegmentAccess#open} 按 {@code ctx.undoFirstPageId} 重开 EXCLUSIVE 续 append。</li>
-     * </ul>
-     * <p>所有 slot 状态转换都在内存短锁内，page3/FSP/undo IO 均在锁外。page3 预检 S latch 在 FSP page0/page2
-     * 分配前释放，避免逆序持锁；创建后持久 claim 仍做 CAS，发现异常漂移时保留 ACTIVE owner 而不做不安全补偿。
-     *
-     * @return 当前 MTR 内可写（EXCLUSIVE）的 undo segment 句柄。
-     */
-    private UndoLogSegment ensureUndoContext(Transaction txn, MiniTransaction mtr, TransactionId txnId) {
-        UndoContext existing = txn.undoContext();
-        if (existing != null) {
-            return access.open(mtr, existing.undoFirstPageId(), PageLatchMode.EXCLUSIVE);
-        }
-        try (RollbackSegmentSlotManager.ClaimLease claim = slotManager.reserveClaim()) {
-            // page3 冲突必须发生在段分配前；lease 尚未 bind，异常 close 会安全取消 RESERVED。
-            requirePersistentSlotFree(mtr, claim.slotId());
-
-            UndoLogSegment seg = access.create(mtr, undoSpace, txnId);
-            PageId firstPageId = seg.firstPageId();
-            claim.bind(firstPageId);
-
-            try {
-                // 与 undo segment 创建同批 redo；预检与 claim 间若发生异常 owner 漂移，ACTIVE 保持占用以 fail-closed。
-                claimRsegSlotAfterUndoPage(mtr, claim.slotId(), firstPageId);
-                UndoContext ctx = new UndoContext(slotManager.rollbackSegmentId(), claim.slotId(), firstPageId);
-                txn.setUndoContext(ctx);
-                return seg;
-            } catch (RuntimeException error) {
-                // bind 后 MTR 无 content undo，既不能释放 ACTIVE 槽，也不能允许同进程把该事务当成可重试错误继续。
-                throw new UndoClaimPublicationException(
-                        "undo segment was bound but owner publication failed: slot=" + claim.slotId().value()
-                                + ", firstPage=" + firstPageId + ", transactionId=" + txnId.value(), error);
-            }
-        }
-    }
-
-    /**
-     * 用当前业务 MTR 检查 page3 slot 为空。生产 DML 在新建 MTR 后先调用 undo，再触碰 B+Tree 页；repository 又在
-     * 返回前提前释放 page3 S latch，因此随后的 FSP page0/page2 分配没有遗留高页号 latch，也不需要隐式嵌套 MTR。
-     */
     private void requirePersistentSlotFree(MiniTransaction mtr, UndoSlotId slot) {
         headerRepo.requireSlotFree(mtr, undoSpace, slot);
     }

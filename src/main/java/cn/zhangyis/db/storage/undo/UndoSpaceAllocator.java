@@ -58,7 +58,7 @@ public interface UndoSpaceAllocator {
 
     /**
      * 回收（drop）一个 UNDO segment：归还其全部 fragment 页/extent 给 FSP free list 并清空 inode 槽。purge 在某已提交
-     * undo log 处理完毕、或纯 insert undo 提交后调用，物理回收 undo 段空间。只用 undo 自有 {@link UndoSegmentHandle}
+     * undo log 处理完毕且终态策略未选择缓存时调用，物理回收 undo 段空间。只用 undo 自有 {@link UndoSegmentHandle}
      * （提供 inodeSlot/segmentId），不暴露 {@code storage.api.SegmentRef}，维持 undo → api 端口的依赖方向。
      *
      * @param mtr    当前物理短事务，承载 FSP 元页（page0/page2/XDES）修改。

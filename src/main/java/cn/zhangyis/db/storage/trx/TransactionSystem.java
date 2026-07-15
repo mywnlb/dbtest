@@ -199,4 +199,37 @@ public final class TransactionSystem {
             lock.unlock();
         }
     }
+
+    /**
+     * 对一个 history head 做最终 purge 安全复核。仅比较 {@code commitNo < lowLimitNo} 不足以覆盖“提交号已分配、
+     * 物理 commit 尚未落盘”窗口：此时新 ReadView 的 lowLimitNo 可能已越过该号，但 creator 仍在 activeIds 中。
+     * 因而本方法在同一短锁内同时要求 creator 已从 active table 移除、提交号低于所有快照边界，且 creator
+     * 对每个存活 ReadView 均已可见。active 检查不可省略：live 集合为空时，单靠“对所有快照可见”会真空成立。
+     *
+     * <p>锁内只读不可变 ReadView 和计数器，不执行 IO；purge 在调用后仍须通过 history lease 串行化物理 unlink。
+     */
+    public boolean isPurgeEligible(TransactionNo commitNo, TransactionId creatorTransactionId) {
+        if (commitNo == null || commitNo.isNone() || creatorTransactionId == null
+                || creatorTransactionId.isNone()) {
+            throw new TransactionStateException("purge eligibility requires assigned transaction no/id");
+        }
+        lock.lock();
+        try {
+            if (active.contains(creatorTransactionId.value())) {
+                return false;
+            }
+            long low = nextTransactionNo;
+            for (ReadView view : liveReadViews) {
+                if (view.lowLimitNo() < low) {
+                    low = view.lowLimitNo();
+                }
+                if (!view.isVisible(creatorTransactionId)) {
+                    return false;
+                }
+            }
+            return commitNo.value() < low;
+        } finally {
+            lock.unlock();
+        }
+    }
 }

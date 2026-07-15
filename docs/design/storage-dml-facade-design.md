@@ -20,7 +20,7 @@
 | `innodb-record-design.md` | Record 只提供隐藏列、delete-mark、当前记录镜像；DML 等待行锁前必须释放 RecordCursor/page latch/buffer fix；事务锁由事务结束释放。 |
 | `innodb-btree-design.md` | INSERT 做 current read 唯一检查与 insert intention；UPDATE/DELETE 用 current read 锁；等待后重新定位；B+Tree 不决定 MVCC/deadlock victim。 |
 | `innodb-transaction-mvcc-design.md` | 事务生命周期、ReadView、undo、rollback、purge、row lock 必须集中在 transaction/storage facade；写入前分配 DB_TRX_ID；commit 分配 TransactionNo。 |
-| `innodb-undo-log-purge-design.md` | beforeInsert/beforeUpdate/beforeDelete 必须在记录修改前写 undo；commit 对 update/delete undo 入 history；rollback 按 undo 链反向应用。 |
+| `innodb-undo-log-purge-design.md` | planX 必须在 MTR 外冻结写计划，appendPlanned 必须在记录修改前写 undo；commit 只让 update/delete undo 入 history；rollback 归并两条局部链反向应用。 |
 | `innodb-redo-log-design.md` | DML 不让 redo 理解 SQL/MVCC；MTR 产生物理 redo；commit 层消费 `DurabilityPolicy` 等待 write/flush/background。 |
 | `innodb-flush-checkpoint-doublewrite-design.md` | flush/checkpoint 不执行事务 commit/rollback；DML commit 只能等待 redo durable，不能绕过 FlushService/WAL gate。 |
 | `innodb-crash-recovery-design.md` | 开放用户流量前必须完成 redo replay、active rollback、purge resume；普通 DML 入口应尊重 `RecoveryTrafficGate` 状态。 |
@@ -38,9 +38,9 @@
 
 1. 在 `storage.api.dml` 下新增单表/单聚簇索引 DML facade，作为未来 SQL executor 的稳定 storage 写入口。
 2. 覆盖 INSERT、UPDATE、DELETE、COMMIT、ROLLBACK 的最小完整生产链路。
-3. INSERT 链路串起 `assignWriteId -> unique current-read / insert intention -> beforeInsert -> insertClustered -> MTR commit`。
-4. UPDATE 链路串起 `current-read X lock -> beforeUpdate(old image) -> replaceClustered(new hidden) -> MTR commit`。
-5. DELETE 链路串起 `current-read X lock -> beforeDelete(old image) -> setClusteredDeleteMark -> MTR commit`。
+3. INSERT 链路串起 `assignWriteId -> unique current-read / insert intention -> planInsert -> begin -> appendPlanned -> insertClustered -> MTR commit`。
+4. UPDATE 链路串起 `current-read X lock -> planUpdate(old image) -> begin -> appendPlanned -> replaceClustered(new hidden) -> MTR commit`。
+5. DELETE 链路串起 `current-read X lock -> planDelete(old image) -> begin -> appendPlanned -> setClusteredDeleteMark -> MTR commit`。
 6. COMMIT 链路串起 `TransactionManager.prepareCommit -> UndoLogManager.onCommit -> TransactionManager.commit -> DurabilityPolicy.awaitCommitDurable -> LockManager.releaseAll`。
 7. ROLLBACK 链路串起 `RollbackService.rollback -> LockManager.releaseAll`，确保 undo 反向应用后事务锁释放。
 8. 所有可能等待 row lock 的路径必须使用现有 `BTreeCurrentReadService`，等待期间不持 page latch、record cursor、buffer fix 或 undo page latch。
@@ -114,7 +114,7 @@
 | 参数 | 来源 | 用途 |
 | --- | --- | --- |
 | `TransactionManager transactionManager` | `StorageEngine` | begin/assignWriteId/commit/rollback state machine。 |
-| `UndoLogManager undoLogManager` | `StorageEngine` | beforeInsert/beforeUpdate/beforeDelete/onCommit。 |
+| `UndoLogManager undoLogManager` | `StorageEngine` | planInsert/planUpdate/planDelete、appendPlanned、onCommit。 |
 | `MiniTransactionManager mtrManager` | `StorageEngine` | 每条聚簇写操作一个短 MTR。 |
 | `SplitCapableBTreeIndexService btree` | `StorageEngine` | insert/replace/delete-mark。 |
 | `BTreeCurrentReadService currentRead` | `StorageEngine` | unique check、UPDATE/DELETE point X lock。 |
@@ -176,7 +176,7 @@ public final class ClusteredDmlService {
 3. 调 `currentRead.checkUniqueForInsert(index,key,request)`，物理 duplicate 命中则返回 duplicate/no-op 或抛 duplicate 异常。推荐第一阶段抛 `DmlOperationException`，避免静默覆盖。
 4. 该 unique check 会在短 MTR 定位后释放 page latch，再进入 LockManager 等待，成功锁由事务持有直到 commit/rollback。
 5. 开启业务写 MTR。
-6. 调 `undoLogManager.beforeInsert(txn,mtr,tableId,index.indexId(),key.parts,index.keyDef(),index.schema())` 写 insert undo，返回 insert `RollPointer`。
+6. MTR 外调 `planInsert`，按计划预算 begin；MTR 内调 `appendPlanned` 写 INSERT undo，返回 insert `RollPointer`。
 7. 调 `btree.insertClustered(mtr,index,record,txnId,rollPointer)`，B+Tree 盖隐藏列并插入。
 8. `mtrManager.commit(mtr)`，返回 end LSN，释放 page latch/buffer fix/tablespace lease。
 9. 返回 `DmlWriteResult(affectedRows=1,endLsn,txnId)`。
@@ -191,7 +191,7 @@ public final class ClusteredDmlService {
 4. 若未命中，返回 `affectedRows=0`。
 5. 从 `BTreeLookupResult.record()` 取得旧完整 `LogicalRecord`、旧 `HiddenColumns` 和旧 delete flag；delete-marked 记录按当前读不命中。
 6. 开启业务写 MTR。
-7. 调 `undoLogManager.beforeUpdate` 写全量旧 image 和旧隐藏列，得到 update roll pointer。
+7. MTR 外调 `planUpdate` 冻结全量旧 image 和旧隐藏列；MTR 内 `appendPlanned` 得到 UPDATE roll pointer。
 8. 构造带新隐藏列 `(txnId, updateRollPointer)` 的 `LogicalRecord`。
 9. 调 `btree.replaceClustered(mtr,index,key,stampedNewRecord, oldHidden.dbTrxId(), oldHidden.dbRollPtr())`。
 10. 提交 MTR，返回 affected rows。若 `replaceClustered` 返回 `replaced=false`，说明 current-read 锁后重定位仍发生版本变化或所有权不匹配，facade 第一阶段返回 0 并保留 undo orphan，由事务 rollback 幂等清理；后续可升级为 retry/statement rollback。
@@ -204,7 +204,7 @@ public final class ClusteredDmlService {
 4. 未命中返回 `affectedRows=0`。
 5. 从当前记录取旧完整 row 和旧隐藏列。
 6. 开启业务写 MTR。
-7. 调 `undoLogManager.beforeDelete` 写 delete-mark undo。
+7. MTR 外调 `planDelete`，MTR 内先 `appendPlanned` 写 DELETE_MARK undo。
 8. 构造新隐藏列 `(txnId, deleteRollPointer)`。
 9. 调 `btree.setClusteredDeleteMark(mtr,index,key,true,newHidden,oldHidden.dbTrxId(),oldHidden.dbRollPtr())`。
 10. 提交 MTR，返回 affected rows。物理删除由 purge driver 后续按 history/purge low water 执行。
@@ -215,7 +215,8 @@ public final class ClusteredDmlService {
 
 1. 校验 gate、事务 ACTIVE。
 2. 调 `transactionManager.prepareCommit(txn)`：读写事务预留 `TransactionNo`，但仍保持 ACTIVE、仍在 active table、仍持有 row locks。
-3. 调 `undoLogManager.onCommit(txn)`：标 undo first page COMMITTED/COMMIT_NO；纯 insert 清 page3 slot 并入 insert reclaim；update/delete undo 入 history list。
+3. 调 `undoLogManager.onCommit(txn)`：UPDATE 先取得有界 history append lease，再用一个 MTR 原子更新
+   page3 base、旧 tail/new first-page links 与 COMMITTED/COMMIT_NO；纯 INSERT 同批按 eligibility 移入 cache 或 drop。
 4. 调 `transactionManager.commit(txn)`：ACTIVE -> COMMITTING -> COMMITTED；读写事务移出 active table；释放 ReadView。
 5. 取 redo `currentLsn()` 作为 commit 需要覆盖的 LSN。说明：当前没有独立 transaction commit redo record，DML MTR 已经在 step 2 前提交并分配 LSN；`onCommit` 自身也可能提交短 MTR 写 undo state。用 onCommit 后的 `redo.currentLsn()` 覆盖本事务所有 MTR。
 6. 调 `durabilityPolicy.awaitCommitDurable(redo, commitLsn, timeout)`。
@@ -223,7 +224,10 @@ public final class ClusteredDmlService {
 8. 调 `lockManager.releaseAll(txn.transactionId())`，释放 row locks。
 9. 返回 `DmlCommitResult(transactionNo,durable, releasedLockCount)`。
 
-为什么先 prepare/onCommit 再真正 commit：`UndoLogManager.onCommit` 对 update/delete undo 依赖 `TransactionNo`，且会追加 undo state redo；但在 undo commit marker 持久化前不能把事务移出 active table 或释放 row locks，否则 `onCommit` 失败后崩溃恢复会把已对外提交的事务按 ACTIVE undo 回滚。durability 等待必须发生在 onCommit 和状态 commit 之后，覆盖所有本事务 MTR redo。
+为什么先 prepare/onCommit 再真正 commit：`UndoLogManager.onCommit` 对 update/delete undo 依赖 `TransactionNo`，
+且会原子持久化 undo state、history links/base 与 terminal redo；在该 MTR 提交前不能把事务移出 active table 或释放 row locks，
+否则恢复可能把已对外提交的事务按 ACTIVE undo 回滚。durability 等待必须发生在 onCommit 和状态 commit 之后，
+覆盖所有本事务 MTR redo。
 
 ### 8.5 ROLLBACK
 

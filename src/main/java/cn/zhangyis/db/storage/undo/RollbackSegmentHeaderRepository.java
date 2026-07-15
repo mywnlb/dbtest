@@ -6,6 +6,7 @@ import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.RollbackSegmentId;
 import cn.zhangyis.db.domain.SpaceId;
+import cn.zhangyis.db.domain.TransactionNo;
 import cn.zhangyis.db.domain.UndoSlotId;
 import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.PageGuard;
@@ -13,21 +14,29 @@ import cn.zhangyis.db.storage.buf.PageLatchMode;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.page.FilePageHeader;
 import cn.zhangyis.db.storage.page.PageEnvelope;
-import cn.zhangyis.db.storage.page.PageEnvelopeLayout;
 import cn.zhangyis.db.storage.page.PageType;
 import cn.zhangyis.db.storage.redo.UndoMetadataDeltaKind;
 
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.Optional;
 
 /**
- * undo 表空间 page3 上 rollback segment header 的仓储（设计 §6.3，0.3）。经 MTR 持页 latch 读写 slot 目录
- * （slot -> insert-undo segment 首页），所有写都进 MTR redo（page3 物理 crash-safe）。形态仿
+ * undo 表空间 page3 上 rollback segment header 的仓储（设计 §6.3）。经 MTR 持页 latch 读写 active slot 目录
+ * 与 INSERT/UPDATE cached segment 栈，所有写都进 MTR redo（page3 物理 crash-safe）。形态仿
  * {@code SpaceHeaderRepository}：只管理页内布局读写，不分配页、不决定 slot 生命周期。
  *
- * <p>本片只持久 slot array；§6.3 的 history list base / cached·free segment list / lastTransactionNo 留后续片。
+ * <p>cached 栈只保存 first pageNo，segmentId/inodeSlot 由恢复期从 first page 重建并与 FSP inode 交叉校验。
+ * v3 history base 与 active/cache 目录同页，因此 commit append 与 purge unlink 可在同一 MTR 中原子改写。
  */
 public final class RollbackSegmentHeaderRepository {
+
+    /** 兼容旧测试/嵌入式调用的默认每类缓存容量；生产组合根始终显式传 EngineConfig 值。 */
+    private static final int DEFAULT_CACHE_CAPACITY_PER_KIND = 8;
 
     /** 受控页来源；只经 MTR 取 page3 的 PageGuard。 */
     private final BufferPool pool;
@@ -51,19 +60,20 @@ public final class RollbackSegmentHeaderRepository {
     }
 
     /**
-     * 格式化空 rseg header 页（page3）：写 FSP_HDR 之外的 RSEG_HEADER 信封 + magic/format/rsegId/slotCapacity +
-     * 全槽置 {@code FIL_NULL}（空）。slotCapacity 必须为正且 slot array 不越过页尾 trailer。
+     * 格式化空 rseg header 页（page3）：写 RSEG_HEADER 信封、固定 shape、空 history base/事务号高水位，
+     * 再把 active slots 与双 cache arrays 全部置空。shape 必须能整体装入页尾 trailer 之前。
      *
      * <p>经 {@code newPage} 清零并产 PAGE_INIT redo，再经写字段产 PAGE_BYTES redo——page3 物理 crash-safe。
      * undo 表空间创建与 truncate rebuild 都在同一 MTR 内调用本方法。
      */
-    public void format(MiniTransaction mtr, SpaceId spaceId, RollbackSegmentId rsegId, int slotCapacity) {
+    public void format(MiniTransaction mtr, SpaceId spaceId, RollbackSegmentId rsegId,
+                       int slotCapacity, int cacheCapacityPerKind) {
         requireMtr(mtr);
         requireSpace(spaceId);
         if (rsegId == null) {
             throw new DatabaseValidationException("rollback segment id must not be null");
         }
-        validateCapacity(slotCapacity);
+        RollbackSegmentHeaderCapacity.validate(pageSize, slotCapacity, cacheCapacityPerKind);
         PageId pageId = headerPage(spaceId);
         PageGuard g = mtr.newPage(pool, pageId, PageLatchMode.EXCLUSIVE, PageType.RSEG_HEADER);
         PageEnvelope.writeHeader(g, new FilePageHeader(spaceId, RollbackSegmentHeaderLayout.RSEG_HEADER_PAGE_NO,
@@ -80,11 +90,35 @@ public final class RollbackSegmentHeaderRepository {
         UndoRedoDeltas.writeInt(mtr, g, pageId, UndoMetadataDeltaKind.RSEG_HEADER_FIELD,
                 rsegId.value(), 0, RollbackSegmentHeaderLayout.SLOT_CAPACITY,
                 slotCapacity, "format rseg slot capacity");
+        UndoRedoDeltas.writeInt(mtr, g, pageId, UndoMetadataDeltaKind.RSEG_HEADER_FIELD,
+                rsegId.value(), 0, RollbackSegmentHeaderLayout.CACHE_CAPACITY_PER_KIND,
+                cacheCapacityPerKind, "format rseg cache capacity");
+        writeCacheCount(mtr, g, rsegId.value(), UndoLogKind.INSERT, 0);
+        writeCacheCount(mtr, g, rsegId.value(), UndoLogKind.UPDATE, 0);
+        writeHistoryLong(mtr, g, rsegId.value(), RollbackSegmentHeaderLayout.HISTORY_HEAD_PAGE_NO,
+                FilePageHeader.FIL_NULL, "format empty rseg history head");
+        writeHistoryLong(mtr, g, rsegId.value(), RollbackSegmentHeaderLayout.HISTORY_TAIL_PAGE_NO,
+                FilePageHeader.FIL_NULL, "format empty rseg history tail");
+        writeHistoryLong(mtr, g, rsegId.value(), RollbackSegmentHeaderLayout.HISTORY_LENGTH,
+                0L, "format empty rseg history length");
+        writeHistoryLong(mtr, g, rsegId.value(), RollbackSegmentHeaderLayout.LAST_TRANSACTION_NO,
+                0L, "format rseg transaction number high-water");
         for (int i = 0; i < slotCapacity; i++) {
             UndoRedoDeltas.writeLong(mtr, g, pageId, UndoMetadataDeltaKind.RSEG_SLOT,
                     rsegId.value(), i, RollbackSegmentHeaderLayout.slotOffset(i),
                     FilePageHeader.FIL_NULL, "format empty rseg slot");
         }
+        for (UndoLogKind kind : List.of(UndoLogKind.INSERT, UndoLogKind.UPDATE)) {
+            for (int i = 0; i < cacheCapacityPerKind; i++) {
+                writeCachePageNo(mtr, g, rsegId.value(), kind, slotCapacity,
+                        cacheCapacityPerKind, i, FilePageHeader.FIL_NULL, "format empty rseg cache entry");
+            }
+        }
+    }
+
+    /** 兼容旧四参调用；新生产代码应显式传入持久 cache 容量，history 字段始终按 v3 初始化。 */
+    public void format(MiniTransaction mtr, SpaceId spaceId, RollbackSegmentId rsegId, int slotCapacity) {
+        format(mtr, spaceId, rsegId, slotCapacity, DEFAULT_CACHE_CAPACITY_PER_KIND);
     }
 
     /**
@@ -125,7 +159,8 @@ public final class RollbackSegmentHeaderRepository {
         PageId pageId = headerPage(spaceId);
         PageGuard guard = mtr.getPage(pool, pageId, PageLatchMode.SHARED);
         try {
-            int capacity = validateHeaderAndReadCapacity(guard);
+            HeaderShape shape = validateHeaderAndReadShape(guard);
+            int capacity = shape.slotCapacity();
             int idx = slot.value();
             if (idx < 0 || idx >= capacity) {
                 throw new UndoLogFormatException("rseg slot out of range: " + idx + " capacity=" + capacity);
@@ -172,12 +207,13 @@ public final class RollbackSegmentHeaderRepository {
             throw new DatabaseValidationException("rseg slot first page must be in the undo space: " + firstPage);
         }
         PageGuard guard = mtr.getPage(pool, headerPage(spaceId), PageLatchMode.EXCLUSIVE);
-        int capacity = validateHeaderAndReadCapacity(guard);
+        HeaderShape shape = validateHeaderAndReadShape(guard);
+        int capacity = shape.slotCapacity();
         int idx = slot.value();
         if (idx < 0 || idx >= capacity) {
             throw new UndoLogFormatException("rseg slot out of range: " + idx + " capacity=" + capacity);
         }
-        long rsegId = guard.readInt(RollbackSegmentHeaderLayout.RSEG_ID) & 0xFFFFFFFFL;
+        long rsegId = shape.rsegId();
         return new SlotWrite(guard, idx, RollbackSegmentHeaderLayout.slotOffset(idx), rsegId);
     }
 
@@ -192,6 +228,184 @@ public final class RollbackSegmentHeaderRepository {
     }
 
     /**
+     * finalization 中一条 active slot → cached stack transition。expectedCacheCount 来自内存 cache lease，
+     * repository 会与 page3 当前 count 交叉校验，防止 stale finalizer 覆盖并发 push/pop。
+     */
+    public record CachePush(UndoSlotId activeSlot, PageId expectedFirstPage,
+                            UndoLogKind kind, int expectedCacheCount) {
+        public CachePush {
+            if (activeSlot == null || expectedFirstPage == null || kind == null) {
+                throw new DatabaseValidationException("rseg cache push fields must not be null");
+            }
+            if (kind == UndoLogKind.TEMPORARY || expectedCacheCount < 0) {
+                throw new DatabaseValidationException("invalid rseg cache push kind/count");
+            }
+        }
+    }
+
+    /** truncate 单批从一个 kind 栈顶移除的 pageNo 列表；列表顺序必须是栈顶到栈底。 */
+    public record CacheTopRemoval(UndoLogKind kind, int expectedCacheCount,
+                                  List<PageId> topFirstPages) {
+        public CacheTopRemoval {
+            if (kind == null || topFirstPages == null || topFirstPages.isEmpty()
+                    || topFirstPages.stream().anyMatch(java.util.Objects::isNull)) {
+                throw new DatabaseValidationException("rseg cache removal fields must not be empty");
+            }
+            if (kind == UndoLogKind.TEMPORARY || expectedCacheCount < topFirstPages.size()) {
+                throw new DatabaseValidationException("invalid rseg cache removal kind/count");
+            }
+            topFirstPages = List.copyOf(topFirstPages);
+        }
+    }
+
+    /**
+     * 同一 finalization MTR 中把一个或两个 active owner 原子移入各自 kind 的 cached stack。方法先验证全部
+     * active owner、count 和目标空槽，再开始任何 page3 写，避免 mixed rollback 只发布一半目录状态。
+     */
+    public void moveActiveSlotsToCache(MiniTransaction mtr, SpaceId spaceId, List<CachePush> pushes) {
+        requireMtr(mtr);
+        requireSpace(spaceId);
+        if (pushes == null || pushes.isEmpty() || pushes.size() > 2
+                || pushes.stream().anyMatch(java.util.Objects::isNull)) {
+            throw new DatabaseValidationException("rseg cache pushes must contain one or two items");
+        }
+        PageGuard guard = mtr.getPage(pool, headerPage(spaceId), PageLatchMode.EXCLUSIVE);
+        HeaderShape shape = validateHeaderAndReadShape(guard);
+        Set<Integer> activeSlots = new HashSet<>();
+        Set<UndoLogKind> kinds = new HashSet<>();
+        Set<Long> pageNos = new HashSet<>();
+        for (CachePush push : pushes) {
+            requirePageInSpace(spaceId, push.expectedFirstPage(), "cache push");
+            int slot = push.activeSlot().value();
+            if (slot < 0 || slot >= shape.slotCapacity() || !activeSlots.add(slot)
+                    || !kinds.add(push.kind()) || !pageNos.add(push.expectedFirstPage().pageNo().value())) {
+                throw new UndoLogFormatException("duplicate/out-of-range rseg cache push target");
+            }
+            long activeOwner = guard.readLong(RollbackSegmentHeaderLayout.slotOffset(slot));
+            if (activeOwner != push.expectedFirstPage().pageNo().value()) {
+                throw new UndoLogFormatException("cache push active owner mismatch: slot=" + slot
+                        + ", expected=" + push.expectedFirstPage().pageNo().value()
+                        + ", current=" + activeOwner);
+            }
+            int count = readCacheCount(guard, shape, push.kind());
+            if (count != push.expectedCacheCount() || count >= shape.cacheCapacityPerKind()) {
+                throw new UndoLogFormatException("cache push count/capacity mismatch for " + push.kind()
+                        + ": expected=" + push.expectedCacheCount() + ", current=" + count
+                        + ", capacity=" + shape.cacheCapacityPerKind());
+            }
+            int targetOffset = RollbackSegmentHeaderLayout.cacheOffset(push.kind(), shape.slotCapacity(),
+                    shape.cacheCapacityPerKind(), count);
+            if (guard.readLong(targetOffset) != FilePageHeader.FIL_NULL) {
+                throw new UndoLogFormatException("cache push target entry is not empty for " + push.kind()
+                        + " index=" + count);
+            }
+            requireNotInCachedStacks(guard, shape, push.expectedFirstPage().pageNo().value());
+        }
+        for (CachePush push : pushes) {
+            int count = push.expectedCacheCount();
+            writeCachePageNo(mtr, guard, shape.rsegId(), push.kind(), shape.slotCapacity(),
+                    shape.cacheCapacityPerKind(), count, push.expectedFirstPage().pageNo().value(),
+                    "push finalized undo segment into rseg cache");
+            writeCacheCount(mtr, guard, shape.rsegId(), push.kind(), count + 1);
+            UndoRedoDeltas.writeLong(mtr, guard, guard.pageId(), UndoMetadataDeltaKind.RSEG_SLOT,
+                    shape.rsegId(), push.activeSlot().value(),
+                    RollbackSegmentHeaderLayout.slotOffset(push.activeSlot().value()),
+                    FilePageHeader.FIL_NULL, "move active rseg slot owner into cache");
+        }
+    }
+
+    /**
+     * 首写复用时原子弹出 cached top 并写入预留的 active slot。首页激活和 record append 随后仍在同一业务 MTR，
+     * 因此 crash 只能看到旧 cached owner 或新 active owner，不会出现 FSP inode 无持久归属。
+     */
+    public void moveCachedTopToActiveSlot(MiniTransaction mtr, SpaceId spaceId, UndoLogKind kind,
+                                          int expectedCacheCount, PageId expectedFirstPage,
+                                          UndoSlotId activeSlot) {
+        requireMtr(mtr);
+        requireSpace(spaceId);
+        requirePageInSpace(spaceId, expectedFirstPage, "cache reuse");
+        if (kind == null || kind == UndoLogKind.TEMPORARY || activeSlot == null || expectedCacheCount <= 0) {
+            throw new DatabaseValidationException("invalid rseg cached-to-active transition");
+        }
+        PageGuard guard = mtr.getPage(pool, headerPage(spaceId), PageLatchMode.EXCLUSIVE);
+        HeaderShape shape = validateHeaderAndReadShape(guard);
+        int slot = activeSlot.value();
+        if (slot < 0 || slot >= shape.slotCapacity()
+                || guard.readLong(RollbackSegmentHeaderLayout.slotOffset(slot)) != FilePageHeader.FIL_NULL) {
+            throw new UndoLogFormatException("cache reuse target active slot is not free: " + slot);
+        }
+        int count = readCacheCount(guard, shape, kind);
+        if (count != expectedCacheCount) {
+            throw new UndoLogFormatException("cache reuse count changed for " + kind + ": expected="
+                    + expectedCacheCount + ", current=" + count);
+        }
+        int top = count - 1;
+        int offset = RollbackSegmentHeaderLayout.cacheOffset(kind, shape.slotCapacity(),
+                shape.cacheCapacityPerKind(), top);
+        long current = guard.readLong(offset);
+        if (current != expectedFirstPage.pageNo().value()) {
+            throw new UndoLogFormatException("cache reuse top owner mismatch for " + kind + ": expected="
+                    + expectedFirstPage.pageNo().value() + ", current=" + current);
+        }
+        writeCachePageNo(mtr, guard, shape.rsegId(), kind, shape.slotCapacity(),
+                shape.cacheCapacityPerKind(), top, FilePageHeader.FIL_NULL,
+                "pop reused undo segment from rseg cache");
+        writeCacheCount(mtr, guard, shape.rsegId(), kind, top);
+        UndoRedoDeltas.writeLong(mtr, guard, guard.pageId(), UndoMetadataDeltaKind.RSEG_SLOT,
+                shape.rsegId(), slot, RollbackSegmentHeaderLayout.slotOffset(slot),
+                expectedFirstPage.pageNo().value(), "move cached undo owner into active rseg slot");
+    }
+
+    /**
+     * truncate drain 在 FSP drop 后按 expected top 列表缩短一个或两个 cache 栈。全部 count/top 校验先完成，
+     * 再清 entry/count；调用方以独立只读预检保证 FSP 写前已经发现可预测的目录损坏。
+     */
+    public void removeCachedTops(MiniTransaction mtr, SpaceId spaceId, List<CacheTopRemoval> removals) {
+        requireMtr(mtr);
+        requireSpace(spaceId);
+        if (removals == null || removals.isEmpty() || removals.size() > 2
+                || removals.stream().anyMatch(java.util.Objects::isNull)) {
+            throw new DatabaseValidationException("rseg cache removals must contain one or two kinds");
+        }
+        PageGuard guard = mtr.getPage(pool, headerPage(spaceId), PageLatchMode.EXCLUSIVE);
+        HeaderShape shape = validateHeaderAndReadShape(guard);
+        Set<UndoLogKind> kinds = new HashSet<>();
+        for (CacheTopRemoval removal : removals) {
+            if (!kinds.add(removal.kind())) {
+                throw new DatabaseValidationException("duplicate rseg cache removal kind: " + removal.kind());
+            }
+            int count = readCacheCount(guard, shape, removal.kind());
+            if (count != removal.expectedCacheCount()) {
+                throw new UndoLogFormatException("cache drain count changed for " + removal.kind()
+                        + ": expected=" + removal.expectedCacheCount() + ", current=" + count);
+            }
+            for (int i = 0; i < removal.topFirstPages().size(); i++) {
+                PageId expected = removal.topFirstPages().get(i);
+                requirePageInSpace(spaceId, expected, "cache drain");
+                int index = count - 1 - i;
+                long current = guard.readLong(RollbackSegmentHeaderLayout.cacheOffset(removal.kind(),
+                        shape.slotCapacity(), shape.cacheCapacityPerKind(), index));
+                if (current != expected.pageNo().value()) {
+                    throw new UndoLogFormatException("cache drain top mismatch for " + removal.kind()
+                            + " index=" + index + ": expected=" + expected.pageNo().value()
+                            + ", current=" + current);
+                }
+            }
+        }
+        for (CacheTopRemoval removal : removals) {
+            int count = removal.expectedCacheCount();
+            for (int i = 0; i < removal.topFirstPages().size(); i++) {
+                int index = count - 1 - i;
+                writeCachePageNo(mtr, guard, shape.rsegId(), removal.kind(), shape.slotCapacity(),
+                        shape.cacheCapacityPerKind(), index, FilePageHeader.FIL_NULL,
+                        "remove dropped undo segment from rseg cache");
+            }
+            writeCacheCount(mtr, guard, shape.rsegId(), removal.kind(),
+                    count - removal.topFirstPages().size());
+        }
+    }
+
+    /**
      * 读 rseg header 快照并校验：page type 必须 RSEG_HEADER、magic/format 正确、rsegId 与 slotCapacity 与
      * 期望（配置）一致——任一不符抛 {@link UndoLogFormatException}。占用槽收集为 {@code slot -> 首页}。
      *
@@ -199,17 +413,23 @@ public final class RollbackSegmentHeaderRepository {
      * @param expectedCapacity 期望 slot 容量（配置）。
      */
     public RollbackSegmentHeaderSnapshot read(MiniTransaction mtr, SpaceId spaceId,
-                                              RollbackSegmentId expectedRsegId, int expectedCapacity) {
+                                              RollbackSegmentId expectedRsegId, int expectedCapacity,
+                                              int expectedCacheCapacityPerKind) {
         requireMtr(mtr);
         requireSpace(spaceId);
         if (expectedRsegId == null) {
             throw new DatabaseValidationException("expected rollback segment id must not be null");
         }
         PageGuard g = mtr.getPage(pool, headerPage(spaceId), PageLatchMode.SHARED);
-        int capacity = validateHeaderAndReadCapacity(g);
+        HeaderShape shape = validateHeaderAndReadShape(g);
+        int capacity = shape.slotCapacity();
         if (capacity != expectedCapacity) {
             throw new UndoLogFormatException("rseg slotCapacity mismatch: disk=" + capacity
                     + " expected=" + expectedCapacity);
+        }
+        if (shape.cacheCapacityPerKind() != expectedCacheCapacityPerKind) {
+            throw new UndoLogFormatException("rseg cache capacity mismatch: disk="
+                    + shape.cacheCapacityPerKind() + " expected=" + expectedCacheCapacityPerKind);
         }
         int rsegId = g.readInt(RollbackSegmentHeaderLayout.RSEG_ID);
         if (rsegId != expectedRsegId.value()) {
@@ -217,17 +437,35 @@ public final class RollbackSegmentHeaderRepository {
                     + " expected=" + expectedRsegId.value());
         }
         Map<UndoSlotId, PageId> occupied = new LinkedHashMap<>();
+        Set<Long> owners = new HashSet<>();
         for (int i = 0; i < capacity; i++) {
             long pageNo = g.readLong(RollbackSegmentHeaderLayout.slotOffset(i));
             if (pageNo != FilePageHeader.FIL_NULL) {
+                requireUniqueOwner(owners, pageNo, "active slot " + i);
                 occupied.put(UndoSlotId.of(i), PageId.of(spaceId, PageNo.of(pageNo)));
             }
         }
-        return new RollbackSegmentHeaderSnapshot(expectedRsegId, capacity, occupied);
+        List<PageId> insert = readCacheStack(g, spaceId, shape, UndoLogKind.INSERT, owners);
+        List<PageId> update = readCacheStack(g, spaceId, shape, UndoLogKind.UPDATE, owners);
+        RollbackSegmentHistoryBase historyBase = readHistoryBase(g, spaceId, shape);
+        if (historyBase.length() > occupied.size()
+                || historyBase.headPageId().filter(page -> !occupied.containsValue(page)).isPresent()
+                || historyBase.tailPageId().filter(page -> !occupied.containsValue(page)).isPresent()) {
+            throw new UndoLogFormatException("rseg history endpoints/length are not covered by active slots: base="
+                    + historyBase + ", activeOwners=" + occupied.size());
+        }
+        return new RollbackSegmentHeaderSnapshot(expectedRsegId, capacity,
+                shape.cacheCapacityPerKind(), occupied, insert, update, historyBase);
     }
 
-    /** 校验 page type/magic/format 并返回页上 slotCapacity。 */
-    private int validateHeaderAndReadCapacity(PageGuard g) {
+    /** 兼容旧四参读取；新生产代码应使用显式 cache 容量完成 v3 shape 守门。 */
+    public RollbackSegmentHeaderSnapshot read(MiniTransaction mtr, SpaceId spaceId,
+                                               RollbackSegmentId expectedRsegId, int expectedCapacity) {
+        return read(mtr, spaceId, expectedRsegId, expectedCapacity, DEFAULT_CACHE_CAPACITY_PER_KIND);
+    }
+
+    /** 校验 page type/magic/format 与两个容量字段，并返回页上 v2 布局。 */
+    private HeaderShape validateHeaderAndReadShape(PageGuard g) {
         FilePageHeader header = PageEnvelope.readHeader(g);
         if (header.pageType() != PageType.RSEG_HEADER) {
             throw new UndoLogFormatException("rseg header page type mismatch: " + header.pageType());
@@ -241,23 +479,231 @@ public final class RollbackSegmentHeaderRepository {
             throw new UndoLogFormatException("rseg header format mismatch: " + format);
         }
         int capacity = g.readInt(RollbackSegmentHeaderLayout.SLOT_CAPACITY);
-        if (capacity <= 0) {
-            throw new UndoLogFormatException("rseg header slotCapacity must be positive: " + capacity);
+        int cacheCapacity = g.readInt(RollbackSegmentHeaderLayout.CACHE_CAPACITY_PER_KIND);
+        try {
+            RollbackSegmentHeaderCapacity.validate(pageSize, capacity, cacheCapacity);
+        } catch (DatabaseValidationException invalid) {
+            throw new UndoLogFormatException("invalid rseg header capacity: slots=" + capacity
+                    + ", cachePerKind=" + cacheCapacity, invalid);
         }
-        return capacity;
+        long rsegId = g.readInt(RollbackSegmentHeaderLayout.RSEG_ID) & 0xFFFFFFFFL;
+        return new HeaderShape(capacity, cacheCapacity, rsegId);
     }
 
-    /** slotCapacity 必须为正，且 slot array 不越过页尾 trailer。 */
-    private void validateCapacity(int slotCapacity) {
-        if (slotCapacity <= 0) {
-            throw new DatabaseValidationException("rseg slot capacity must be positive: " + slotCapacity);
+    private List<PageId> readCacheStack(PageGuard guard, SpaceId spaceId, HeaderShape shape,
+                                        UndoLogKind kind, Set<Long> owners) {
+        int count = readCacheCount(guard, shape, kind);
+        List<PageId> result = new ArrayList<>(count);
+        for (int i = 0; i < shape.cacheCapacityPerKind(); i++) {
+            long pageNo = guard.readLong(RollbackSegmentHeaderLayout.cacheOffset(kind,
+                    shape.slotCapacity(), shape.cacheCapacityPerKind(), i));
+            if (i < count) {
+                if (pageNo == FilePageHeader.FIL_NULL) {
+                    throw new UndoLogFormatException(kind + " cache stack contains a hole at " + i);
+                }
+                requireUniqueOwner(owners, pageNo, kind + " cache entry " + i);
+                result.add(PageId.of(spaceId, PageNo.of(pageNo)));
+            } else if (pageNo != FilePageHeader.FIL_NULL) {
+                throw new UndoLogFormatException(kind + " cache tail entry must be empty at " + i
+                        + ": current=" + pageNo);
+            }
         }
-        int end = RollbackSegmentHeaderLayout.slotArrayEnd(slotCapacity);
-        int limit = pageSize.bytes() - PageEnvelopeLayout.FIL_PAGE_TRAILER_BYTES;
-        if (end > limit) {
-            throw new DatabaseValidationException("rseg slot capacity " + slotCapacity
-                    + " overflows page: needs " + end + " > " + limit);
+        return List.copyOf(result);
+    }
+
+    /**
+     * 在已持 page3 latch 时读取并校验 v3 history base。这里只校验页内结构；节点闭包由 recovery 遍历 first page
+     * 后交叉验证，避免 page3 latch 下再获取普通 undo 页 latch。
+     */
+    private RollbackSegmentHistoryBase readHistoryBase(PageGuard guard, SpaceId spaceId, HeaderShape shape) {
+        long head = guard.readLong(RollbackSegmentHeaderLayout.HISTORY_HEAD_PAGE_NO);
+        long tail = guard.readLong(RollbackSegmentHeaderLayout.HISTORY_TAIL_PAGE_NO);
+        long length = guard.readLong(RollbackSegmentHeaderLayout.HISTORY_LENGTH);
+        long lastTransactionNo = guard.readLong(RollbackSegmentHeaderLayout.LAST_TRANSACTION_NO);
+        if (length < 0 || length > shape.slotCapacity() || lastTransactionNo < 0) {
+            throw new UndoLogFormatException("invalid rseg history length/high-water: length=" + length
+                    + ", lastTransactionNo=" + lastTransactionNo + ", slots=" + shape.slotCapacity());
         }
+        boolean emptyEndpoints = head == FilePageHeader.FIL_NULL && tail == FilePageHeader.FIL_NULL;
+        if ((head == FilePageHeader.FIL_NULL) != (tail == FilePageHeader.FIL_NULL)
+                || (length == 0) != emptyEndpoints) {
+            throw new UndoLogFormatException("rseg history endpoints/length are inconsistent: head=" + head
+                    + ", tail=" + tail + ", length=" + length);
+        }
+        if (!emptyEndpoints && (head < 0 || tail < 0
+                || head == RollbackSegmentHeaderLayout.RSEG_HEADER_PAGE_NO
+                || tail == RollbackSegmentHeaderLayout.RSEG_HEADER_PAGE_NO)) {
+            throw new UndoLogFormatException("invalid rseg history endpoint: head=" + head + ", tail=" + tail);
+        }
+        Optional<PageId> headId = emptyEndpoints ? Optional.empty()
+                : Optional.of(PageId.of(spaceId, PageNo.of(head)));
+        Optional<PageId> tailId = emptyEndpoints ? Optional.empty()
+                : Optional.of(PageId.of(spaceId, PageNo.of(tail)));
+        return new RollbackSegmentHistoryBase(headId, tailId, length, TransactionNo.of(lastTransactionNo));
+    }
+
+    /**
+     * 在 commit MTR 中把 UPDATE undo first page 追加到持久 history 尾部。调用方须先完成 first-page/旧尾预检；
+     * 本方法在任何写入前再次核对 page3 base 与 active slot owner，防止并发 finalizer 覆盖彼此的链端点。
+     */
+    public RollbackSegmentHistoryBase appendHistory(MiniTransaction mtr, SpaceId spaceId,
+                                                     RollbackSegmentHistoryBase expected,
+                                                     UndoSlotId activeSlot, PageId newTail,
+                                                     TransactionNo transactionNo) {
+        requireMtr(mtr);
+        requireSpace(spaceId);
+        if (expected == null || activeSlot == null || newTail == null || transactionNo == null
+                || transactionNo.isNone()) {
+            throw new DatabaseValidationException("rseg history append arguments are invalid");
+        }
+        requirePageInSpace(spaceId, newTail, "history append");
+        PageGuard guard = mtr.getPage(pool, headerPage(spaceId), PageLatchMode.EXCLUSIVE);
+        HeaderShape shape = validateHeaderAndReadShape(guard);
+        RollbackSegmentHistoryBase current = readHistoryBase(guard, spaceId, shape);
+        if (!current.equals(expected)) {
+            throw new UndoLogFormatException("rseg history base changed before append: expected="
+                    + expected + ", current=" + current);
+        }
+        int slot = activeSlot.value();
+        if (slot < 0 || slot >= shape.slotCapacity()
+                || guard.readLong(RollbackSegmentHeaderLayout.slotOffset(slot)) != newTail.pageNo().value()) {
+            throw new UndoLogFormatException("history append active owner mismatch: slot=" + slot
+                    + ", firstPage=" + newTail);
+        }
+        if (current.length() >= shape.slotCapacity()) {
+            throw new UndoLogFormatException("rseg history length exceeds active slot capacity");
+        }
+        PageId head = current.headPageId().orElse(newTail);
+        RollbackSegmentHistoryBase updated = new RollbackSegmentHistoryBase(Optional.of(head), Optional.of(newTail),
+                current.length() + 1L,
+                TransactionNo.of(Math.max(current.lastTransactionNo().value(), transactionNo.value())));
+        writeHistoryBase(mtr, guard, shape.rsegId(), updated);
+        return updated;
+    }
+
+    /**
+     * 在 purge finalization MTR 中摘除持久 history 队首。lastTransactionNo 是提交号高水位，摘链时保持不变。
+     */
+    public RollbackSegmentHistoryBase removeHistoryHead(MiniTransaction mtr, SpaceId spaceId,
+                                                         RollbackSegmentHistoryBase expected,
+                                                         UndoSlotId activeSlot, PageId removedHead,
+                                                         Optional<PageId> newHead) {
+        requireMtr(mtr);
+        requireSpace(spaceId);
+        if (expected == null || activeSlot == null || removedHead == null || newHead == null
+                || expected.length() <= 0 || !expected.headPageId().equals(Optional.of(removedHead))) {
+            throw new DatabaseValidationException("rseg history head removal arguments are invalid");
+        }
+        requirePageInSpace(spaceId, removedHead, "history head removal");
+        newHead.ifPresent(page -> requirePageInSpace(spaceId, page, "history new head"));
+        PageGuard guard = mtr.getPage(pool, headerPage(spaceId), PageLatchMode.EXCLUSIVE);
+        HeaderShape shape = validateHeaderAndReadShape(guard);
+        RollbackSegmentHistoryBase current = readHistoryBase(guard, spaceId, shape);
+        if (!current.equals(expected)) {
+            throw new UndoLogFormatException("rseg history base changed before head removal: expected="
+                    + expected + ", current=" + current);
+        }
+        int slot = activeSlot.value();
+        if (slot < 0 || slot >= shape.slotCapacity()
+                || guard.readLong(RollbackSegmentHeaderLayout.slotOffset(slot)) != removedHead.pageNo().value()) {
+            throw new UndoLogFormatException("history removal active owner mismatch: slot=" + slot
+                    + ", firstPage=" + removedHead);
+        }
+        long nextLength = current.length() - 1L;
+        if ((nextLength == 0) != newHead.isEmpty()) {
+            throw new UndoLogFormatException("history removal new head is inconsistent with remaining length");
+        }
+        Optional<PageId> newTail = nextLength == 0 ? Optional.empty() : current.tailPageId();
+        RollbackSegmentHistoryBase updated = new RollbackSegmentHistoryBase(newHead, newTail, nextLength,
+                current.lastTransactionNo());
+        writeHistoryBase(mtr, guard, shape.rsegId(), updated);
+        return updated;
+    }
+
+    /** 把已验证的 history base 写成四个独立物理 redo after-image；MTR commit 是其原子可见边界。 */
+    private static void writeHistoryBase(MiniTransaction mtr, PageGuard guard, long rsegId,
+                                         RollbackSegmentHistoryBase base) {
+        writeHistoryLong(mtr, guard, rsegId, RollbackSegmentHeaderLayout.HISTORY_HEAD_PAGE_NO,
+                base.headPageId().map(p -> p.pageNo().value()).orElse(FilePageHeader.FIL_NULL),
+                "write rseg history head");
+        writeHistoryLong(mtr, guard, rsegId, RollbackSegmentHeaderLayout.HISTORY_TAIL_PAGE_NO,
+                base.tailPageId().map(p -> p.pageNo().value()).orElse(FilePageHeader.FIL_NULL),
+                "write rseg history tail");
+        writeHistoryLong(mtr, guard, rsegId, RollbackSegmentHeaderLayout.HISTORY_LENGTH,
+                base.length(), "write rseg history length");
+        writeHistoryLong(mtr, guard, rsegId, RollbackSegmentHeaderLayout.LAST_TRANSACTION_NO,
+                base.lastTransactionNo().value(), "write rseg transaction number high-water");
+    }
+
+    private static void writeHistoryLong(MiniTransaction mtr, PageGuard guard, long rsegId,
+                                         int offset, long value, String reason) {
+        UndoRedoDeltas.writeLong(mtr, guard, guard.pageId(), UndoMetadataDeltaKind.RSEG_HISTORY_BASE,
+                rsegId, 0, offset, value, reason);
+    }
+
+    private int readCacheCount(PageGuard guard, HeaderShape shape, UndoLogKind kind) {
+        int count = guard.readInt(cacheCountOffset(kind));
+        if (count < 0 || count > shape.cacheCapacityPerKind()) {
+            throw new UndoLogFormatException(kind + " cache count out of range: " + count
+                    + " capacity=" + shape.cacheCapacityPerKind());
+        }
+        return count;
+    }
+
+    private void requireNotInCachedStacks(PageGuard guard, HeaderShape shape, long pageNo) {
+        for (UndoLogKind kind : List.of(UndoLogKind.INSERT, UndoLogKind.UPDATE)) {
+            int count = readCacheCount(guard, shape, kind);
+            for (int i = 0; i < count; i++) {
+                long current = guard.readLong(RollbackSegmentHeaderLayout.cacheOffset(kind,
+                        shape.slotCapacity(), shape.cacheCapacityPerKind(), i));
+                if (current == pageNo) {
+                    throw new UndoLogFormatException("active owner is already present in " + kind
+                            + " cache at index " + i + ": " + pageNo);
+                }
+            }
+        }
+    }
+
+    private static void requireUniqueOwner(Set<Long> owners, long pageNo, String location) {
+        if (pageNo < 0 || !owners.add(pageNo)) {
+            throw new UndoLogFormatException("duplicate/invalid rseg owner at " + location + ": " + pageNo);
+        }
+    }
+
+    private static void requirePageInSpace(SpaceId spaceId, PageId pageId, String operation) {
+        if (pageId == null || !pageId.spaceId().equals(spaceId)) {
+            throw new DatabaseValidationException(operation + " first page must belong to undo space");
+        }
+    }
+
+    private static int cacheCountOffset(UndoLogKind kind) {
+        if (kind == null) {
+            throw new DatabaseValidationException("rseg cache kind must not be null");
+        }
+        return switch (kind) {
+            case INSERT -> RollbackSegmentHeaderLayout.INSERT_CACHE_COUNT;
+            case UPDATE -> RollbackSegmentHeaderLayout.UPDATE_CACHE_COUNT;
+            case TEMPORARY -> throw new DatabaseValidationException("temporary undo has no persistent cache count");
+        };
+    }
+
+    private static void writeCacheCount(MiniTransaction mtr, PageGuard guard, long rsegId,
+                                        UndoLogKind kind, int count) {
+        UndoRedoDeltas.writeInt(mtr, guard, guard.pageId(), UndoMetadataDeltaKind.RSEG_CACHE_COUNT,
+                rsegId, kind.ordinal(), cacheCountOffset(kind), count,
+                "write " + kind + " rseg cache count");
+    }
+
+    private static void writeCachePageNo(MiniTransaction mtr, PageGuard guard, long rsegId,
+                                         UndoLogKind kind, int slotCapacity, int cacheCapacityPerKind,
+                                         int index, long pageNo, String reason) {
+        UndoRedoDeltas.writeLong(mtr, guard, guard.pageId(), UndoMetadataDeltaKind.RSEG_CACHE_ENTRY,
+                rsegId, index, RollbackSegmentHeaderLayout.cacheOffset(kind, slotCapacity,
+                        cacheCapacityPerKind, index), pageNo, reason + " (" + kind + ")");
+    }
+
+    /** 已校验 page3 v3 的动态布局。 */
+    private record HeaderShape(int slotCapacity, int cacheCapacityPerKind, long rsegId) {
     }
 
     private static void requireMtr(MiniTransaction mtr) {

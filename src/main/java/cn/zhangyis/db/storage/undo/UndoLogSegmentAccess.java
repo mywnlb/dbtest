@@ -7,14 +7,23 @@ import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.RollPointer;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.domain.TransactionId;
+import cn.zhangyis.db.domain.TransactionNo;
 import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
 import cn.zhangyis.db.storage.fil.meta.TablespaceRegistry;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
+import cn.zhangyis.db.storage.page.FilePageHeader;
 import cn.zhangyis.db.storage.page.PageEnvelopeLayout;
 import cn.zhangyis.db.storage.record.schema.IndexKeyDef;
 import cn.zhangyis.db.storage.record.schema.TableSchema;
 import cn.zhangyis.db.storage.record.type.TypeCodecRegistry;
+
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 
 /**
  * 跨页 undo log segment 的 MTR 生产入口。它只依赖 {@link UndoSpaceAllocator} 端口进行页分配，
@@ -84,18 +93,22 @@ public final class UndoLogSegmentAccess {
     }
 
     /**
-     * 创建一条新的 INSERT undo log segment。数据流：分配端口建 UNDO segment 和首页（此时页类型为
+     * 创建一条新的 INSERT 或 UPDATE undo log segment。数据流：分配端口建 UNDO segment 和首页（此时页类型为
      * ALLOCATED）→ 同一 MTR 内把首页重初始化为 UNDO first 页 → 返回 EXCLUSIVE 段句柄，current=first。
      *
      * <p>同页两次 newPage（ALLOCATED→UNDO）复用 T1.3a 的物理 redo 顺序，最终页类型由后一条 PAGE_INIT/bytes
      * 决定，本片不新增 redo 类型。
      */
-    public UndoLogSegment create(MiniTransaction mtr, SpaceId undoSpace, TransactionId txnId) {
-        if (mtr == null || undoSpace == null || txnId == null) {
+    public UndoLogSegment create(MiniTransaction mtr, SpaceId undoSpace, TransactionId txnId,
+                                 UndoLogKind kind) {
+        if (mtr == null || undoSpace == null || txnId == null || kind == null) {
             throw new DatabaseValidationException("undo log segment create args must not be null");
         }
+        if (kind == UndoLogKind.TEMPORARY) {
+            throw new DatabaseValidationException("temporary undo log is not supported by ordinary undo tablespace");
+        }
         UndoSegmentHandle handle = allocator.createUndoSegment(mtr, undoSpace);
-        UndoPage firstPage = pageAccess.createFirstPage(mtr, handle.firstPageId(), UndoLogKind.INSERT, txnId, handle);
+        UndoPage firstPage = pageAccess.createFirstPage(mtr, handle.firstPageId(), kind, txnId, handle);
         return new UndoLogSegment(mtr, pageSize, allocator, codec, pageAccess, payloadStorage,
                 storedRecordResolver, maxExternalPages, handle, firstPage, firstPage, PageLatchMode.EXCLUSIVE);
     }
@@ -130,10 +143,225 @@ public final class UndoLogSegmentAccess {
                 throw new UndoLogFormatException("undo last page " + lastPageId + " segment mismatch with "
                         + handle.segmentId().value() + "/slot " + handle.inodeSlot());
             }
+            if (last.undoKind() != firstPage.undoKind()) {
+                throw new UndoLogFormatException("undo last page " + lastPageId + " kind " + last.undoKind()
+                        + " differs from first page " + firstPage.undoKind());
+            }
             current = last;
         }
         return new UndoLogSegment(mtr, pageSize, allocator, codec, pageAccess, payloadStorage,
                 storedRecordResolver, maxExternalPages, handle, firstPage, current, mode);
+    }
+
+    /**
+     * 恢复/规划辅助：只读打开 page3 cached first page，验证它是空单页 owner，并复制可跨 MTR 使用的 handle。
+     * FSP used-page/extent 账本由调用方在独立只读 MTR 中继续交叉校验，避免 first-page latch 与 page2 逆序。
+     */
+    public CachedUndoSegmentRef inspectCached(MiniTransaction mtr, PageId firstPageId, UndoLogKind expectedKind) {
+        if (mtr == null || firstPageId == null || expectedKind == null
+                || expectedKind == UndoLogKind.TEMPORARY) {
+            throw new DatabaseValidationException("cached undo inspection args are invalid");
+        }
+        UndoLogSegment segment = open(mtr, firstPageId, PageLatchMode.SHARED);
+        segment.requireCached(expectedKind);
+        return new CachedUndoSegmentRef(expectedKind, segment.handle());
+    }
+
+    /**
+     * 只读一张 first page 的 history/recovery header，不跟随 LAST_PAGE_NO 打开段尾。该入口用于持久 history 遍历，
+     * 保证每个节点都在独立短 MTR 内读取，不把整条跨事务链的 page fix 同时压在 buffer pool 上。
+     */
+    public UndoHistoryNodeSnapshot inspectHistoryNode(MiniTransaction mtr, PageId firstPageId) {
+        if (mtr == null || firstPageId == null) {
+            throw new DatabaseValidationException("undo history node inspection args must not be null");
+        }
+        UndoPage page = pageAccess.openUndoPage(mtr, firstPageId, PageLatchMode.SHARED);
+        if (!page.isFirstPage() || page.firstPageNo() != firstPageId.pageNo().value()) {
+            throw new UndoLogFormatException("history node is not an undo first page: " + firstPageId);
+        }
+        long lastPageNo = page.lastPageNo();
+        UndoSegmentHandle handle = new UndoSegmentHandle(firstPageId.spaceId(), page.inodeSlot(), page.segmentId(),
+                firstPageId, PageId.of(firstPageId.spaceId(), PageNo.of(lastPageNo)));
+        return new UndoHistoryNodeSnapshot(firstPageId, handle, page.undoKind(),
+                UndoLogState.fromPhysical(page.state()), page.transactionId(),
+                TransactionNo.of(page.commitNo()), historyLink(firstPageId, page.historyPrevPageNo()),
+                historyLink(firstPageId, page.historyNextPageNo()), page.logicalHead());
+    }
+
+    /**
+     * commit 最终 MTR 的 first-page-only 批处理：按 pageNo 升序获取旧 tail 与新 UPDATE 首页，避免普通
+     * {@link #open} 因跟随新节点 LAST_PAGE_NO 而越过另一 first page。全部状态校验先完成，之后才写双向链接和提交头。
+     */
+    public void appendHistoryNode(MiniTransaction mtr, Optional<PageId> oldTailPageId,
+                                  PageId newTailPageId, TransactionId creatorTransactionId,
+                                  TransactionNo transactionNo) {
+        appendHistoryNode(mtr, oldTailPageId, newTailPageId, creatorTransactionId, transactionNo, List.of());
+    }
+
+    /**
+     * mixed commit 变体：除 history old/new first page 外，同时按同一全局 pageNo 顺序打开需要重置的 INSERT
+     * cached first page。这样 page3 后的普通 undo latch 顺序不依赖各 segment 的分配先后。
+     */
+    public void appendHistoryNode(MiniTransaction mtr, Optional<PageId> oldTailPageId,
+                                  PageId newTailPageId, TransactionId creatorTransactionId,
+                                  TransactionNo transactionNo,
+                                  List<CachedUndoSegmentRef> cacheResets) {
+        if (mtr == null || oldTailPageId == null || newTailPageId == null
+                || creatorTransactionId == null || creatorTransactionId.isNone()
+                || transactionNo == null || transactionNo.isNone() || cacheResets == null
+                || cacheResets.stream().anyMatch(java.util.Objects::isNull)) {
+            throw new DatabaseValidationException("undo history append batch arguments are invalid");
+        }
+        oldTailPageId.ifPresent(old -> requireSameHistorySpace(old, newTailPageId));
+        if (oldTailPageId.equals(Optional.of(newTailPageId))) {
+            throw new DatabaseValidationException("undo history append cannot link a page to itself");
+        }
+        List<PageId> pageIds = new ArrayList<>();
+        oldTailPageId.ifPresent(pageIds::add);
+        pageIds.add(newTailPageId);
+        cacheResets.stream().map(item -> item.handle().firstPageId()).forEach(pageIds::add);
+        if (pageIds.stream().distinct().count() != pageIds.size()) {
+            throw new DatabaseValidationException("history append/cache reset first pages must be distinct");
+        }
+        Map<PageId, UndoPage> pages = openFirstPagesSorted(mtr, pageIds);
+        UndoPage newTail = pages.get(newTailPageId);
+        requireHistoryFirstPage(newTail, newTailPageId);
+        if (newTail.undoKind() != UndoLogKind.UPDATE || newTail.state() != UndoPageLayout.STATE_ACTIVE
+                || !newTail.transactionId().equals(creatorTransactionId) || newTail.commitNo() != 0L
+                || newTail.historyPrevPageNo() != FilePageHeader.FIL_NULL
+                || newTail.historyNextPageNo() != FilePageHeader.FIL_NULL) {
+            throw new UndoLogFormatException("new history tail must be an unlinked ACTIVE UPDATE undo page: "
+                    + newTailPageId);
+        }
+        if (oldTailPageId.isPresent()) {
+            UndoPage oldTail = pages.get(oldTailPageId.orElseThrow());
+            requireHistoryFirstPage(oldTail, oldTailPageId.orElseThrow());
+            if (oldTail.undoKind() != UndoLogKind.UPDATE
+                    || oldTail.state() != UndoPageLayout.STATE_COMMITTED
+                    || oldTail.commitNo() == 0L
+                    || oldTail.historyNextPageNo() != FilePageHeader.FIL_NULL) {
+                throw new UndoLogFormatException("old history tail is not a terminal COMMITTED UPDATE node: "
+                        + oldTailPageId.orElseThrow());
+            }
+        }
+        for (CachedUndoSegmentRef reset : cacheResets) {
+            UndoPage page = pages.get(reset.handle().firstPageId());
+            requireHistoryFirstPage(page, reset.handle().firstPageId());
+            if (reset.kind() == UndoLogKind.TEMPORARY || page.undoKind() != reset.kind()
+                    || page.state() != UndoPageLayout.STATE_ACTIVE
+                    || !page.transactionId().equals(creatorTransactionId)
+                    || page.historyPrevPageNo() != FilePageHeader.FIL_NULL
+                    || page.historyNextPageNo() != FilePageHeader.FIL_NULL) {
+                throw new UndoLogFormatException("mixed commit cache reset target changed: "
+                        + reset.handle().firstPageId());
+            }
+        }
+        oldTailPageId.ifPresent(old -> pages.get(old).setHistoryNextPageNo(newTailPageId.pageNo().value()));
+        newTail.setHistoryLinks(oldTailPageId.map(page -> page.pageNo().value()).orElse(FilePageHeader.FIL_NULL),
+                FilePageHeader.FIL_NULL);
+        newTail.setLogState(UndoPageLayout.STATE_COMMITTED);
+        newTail.setCommitNo(transactionNo.value());
+        for (CachedUndoSegmentRef reset : cacheResets) {
+            pages.get(reset.handle().firstPageId()).resetForCache(reset.kind(), reset.handle());
+        }
+    }
+
+    /**
+     * purge 最终 MTR 的 first-page-only 批处理。非缓存路径只触碰新 head；被回收首页已经由 FSP drop，不再获取其
+     * latch。缓存路径同时按页号排序打开 removed/new head，把 removed 重置为 CACHED 并清除 history links。
+     */
+    public void unlinkHistoryHead(MiniTransaction mtr, UndoHistoryNodeSnapshot removed,
+                                  Optional<UndoHistoryNodeSnapshot> newHead, boolean cacheRemoved) {
+        if (mtr == null || removed == null || newHead == null || !removed.isCommitted()
+                || removed.kind() != UndoLogKind.UPDATE) {
+            throw new DatabaseValidationException("undo history unlink batch arguments are invalid");
+        }
+        if (!removed.previousHistoryPageId().isEmpty()
+                || !removed.nextHistoryPageId().equals(newHead.map(UndoHistoryNodeSnapshot::firstPageId))) {
+            throw new UndoLogFormatException("removed history head links do not match the frozen successor");
+        }
+        newHead.ifPresent(next -> {
+            requireSameHistorySpace(removed.firstPageId(), next.firstPageId());
+            if (!next.isCommitted() || next.kind() != UndoLogKind.UPDATE
+                    || !next.previousHistoryPageId().equals(Optional.of(removed.firstPageId()))) {
+                throw new UndoLogFormatException("new history head does not point back to removed node");
+            }
+        });
+        List<PageId> ids = new ArrayList<>();
+        newHead.map(UndoHistoryNodeSnapshot::firstPageId).ifPresent(ids::add);
+        if (cacheRemoved) {
+            ids.add(removed.firstPageId());
+        }
+        Map<PageId, UndoPage> pages = openFirstPagesSorted(mtr, ids);
+        newHead.ifPresent(snapshot -> {
+            UndoPage page = pages.get(snapshot.firstPageId());
+            requireHistoryFirstPage(page, snapshot.firstPageId());
+            if (page.state() != UndoPageLayout.STATE_COMMITTED
+                    || page.historyPrevPageNo() != removed.firstPageId().pageNo().value()) {
+                throw new UndoLogFormatException("new history head changed before unlink");
+            }
+            page.setHistoryPrevPageNo(FilePageHeader.FIL_NULL);
+        });
+        if (cacheRemoved) {
+            UndoPage page = pages.get(removed.firstPageId());
+            requireHistoryFirstPage(page, removed.firstPageId());
+            if (page.state() != UndoPageLayout.STATE_COMMITTED
+                    || page.commitNo() != removed.committedTransactionNo().value()) {
+                throw new UndoLogFormatException("removed history node changed before cache reset");
+            }
+            page.resetForCache(UndoLogKind.UPDATE, removed.handle());
+        }
+    }
+
+    private Map<PageId, UndoPage> openFirstPagesSorted(MiniTransaction mtr, List<PageId> firstPageIds) {
+        Map<PageId, UndoPage> pages = new LinkedHashMap<>();
+        firstPageIds.stream().distinct()
+                .sorted(Comparator.comparingInt((PageId page) -> page.spaceId().value())
+                        .thenComparingLong(page -> page.pageNo().value()))
+                .forEach(pageId -> pages.put(pageId,
+                        pageAccess.openUndoPage(mtr, pageId, PageLatchMode.EXCLUSIVE)));
+        return pages;
+    }
+
+    private static void requireHistoryFirstPage(UndoPage page, PageId expectedPageId) {
+        if (page == null || !page.pageId().equals(expectedPageId) || !page.isFirstPage()) {
+            throw new UndoLogFormatException("history batch target is not the expected first page: "
+                    + expectedPageId);
+        }
+    }
+
+    private static Optional<PageId> historyLink(PageId owner, long linkedPageNo) {
+        if (linkedPageNo == FilePageHeader.FIL_NULL) {
+            return Optional.empty();
+        }
+        if (linkedPageNo < 0 || linkedPageNo > FilePageHeader.FIL_NULL) {
+            throw new UndoLogFormatException("invalid undo history link on " + owner + ": " + linkedPageNo);
+        }
+        return Optional.of(PageId.of(owner.spaceId(), PageNo.of(linkedPageNo)));
+    }
+
+    private static void requireSameHistorySpace(PageId left, PageId right) {
+        if (!left.spaceId().equals(right.spaceId())) {
+            throw new DatabaseValidationException("undo history links cannot cross tablespaces");
+        }
+    }
+
+    /**
+     * 复用 cached segment：按 page3/内存冻结的 handle 重新 X-open、逐字段验证，再重置为新事务 ACTIVE 首页。
+     */
+    public UndoLogSegment activateCached(MiniTransaction mtr, CachedUndoSegmentRef cached,
+                                         TransactionId transactionId) {
+        if (mtr == null || cached == null || transactionId == null || transactionId.isNone()) {
+            throw new DatabaseValidationException("cached undo activation args are invalid");
+        }
+        UndoLogSegment segment = open(mtr, cached.handle().firstPageId(), PageLatchMode.EXCLUSIVE);
+        if (!segment.handle().equals(cached.handle())) {
+            throw new UndoLogFormatException("cached undo handle changed before activation: expected="
+                    + cached.handle() + ", current=" + segment.handle());
+        }
+        segment.requireCached(cached.kind());
+        segment.activateCached(transactionId, cached.kind());
+        return segment;
     }
 
     /**
@@ -171,6 +399,7 @@ public final class UndoLogSegmentAccess {
         UndoRecord rec = storedRecordResolver.resolve(mtr, undoSpace,
                 new UndoPayloadStorage.SegmentIdentity(page.segmentId(), page.inodeSlot()),
                 payload, keyDef, schema);
+        requireRecordKind(page.undoKind(), rec.type(), "direct roll-pointer read");
         boolean expectInsert = rec.type() == UndoRecordType.INSERT_ROW;
         if (rollPtr.insert() != expectInsert) {
             throw new UndoLogFormatException("roll pointer insert bit " + rollPtr.insert()
@@ -183,18 +412,30 @@ public final class UndoLogSegmentAccess {
         return rec;
     }
 
+    static void requireRecordKind(UndoLogKind kind, UndoRecordType type, String operation) {
+        boolean valid = switch (kind) {
+            case INSERT -> type == UndoRecordType.INSERT_ROW;
+            case UPDATE -> type == UndoRecordType.UPDATE_ROW || type == UndoRecordType.DELETE_MARK;
+            case TEMPORARY -> false;
+        };
+        if (!valid) {
+            throw new UndoLogFormatException(operation + " found record type " + type
+                    + " in " + kind + " undo log");
+        }
+    }
+
     /** 在写 MTR admission 前冻结一条 record 的编码与 external 页数。 */
     public UndoRecordWritePlan planRecord(UndoRecord record, IndexKeyDef keyDef, TableSchema schema) {
         return UndoRecordWritePlan.create(codec, pageSize, record, keyDef, schema, maxExternalPages);
     }
 
     /** 根据规划快照精确计算本次会消费的 segment 首页、普通 root grow 和 external payload 页总数。 */
-    public int plannedNewPages(boolean firstWrite, UndoAppendSnapshot snapshot, UndoRecordWritePlan recordPlan) {
-        if (recordPlan == null || (!firstWrite && snapshot == null)) {
+    public int plannedNewPages(boolean newLog, UndoAppendSnapshot snapshot, UndoRecordWritePlan recordPlan) {
+        if (recordPlan == null || (!newLog && snapshot == null)) {
             throw new DatabaseValidationException("undo planned page calculation args invalid");
         }
         int rootPages;
-        if (firstWrite) {
+        if (newLog) {
             rootPages = 1;
         } else {
             int limit = pageSize.bytes() - PageEnvelopeLayout.FIL_PAGE_TRAILER_BYTES;
@@ -235,7 +476,7 @@ public final class UndoLogSegmentAccess {
             }
         }
         return new UndoAppendSnapshot(firstPageId, tailId, first.segmentId(), first.inodeSlot(),
-                first.transactionId(), first.logLastUndoNo(), first.logicalHead(), first.logRecordCount(),
-                tail.freeOffset());
+                first.transactionId(), first.logLastUndoNo(), first.logicalHead(), first.undoKind(),
+                first.logRecordCount(), tail.freeOffset());
     }
 }

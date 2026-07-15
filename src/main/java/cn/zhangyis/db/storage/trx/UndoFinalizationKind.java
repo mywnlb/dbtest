@@ -7,6 +7,8 @@ package cn.zhangyis.db.storage.trx;
 enum UndoFinalizationKind {
     /** 纯 INSERT 事务提交，insert undo 不再服务 MVCC。 */
     INSERT_COMMIT,
+    /** 含 UPDATE undo 的提交已原子挂入持久 history 链。 */
+    UPDATE_COMMIT,
     /** live 事务完整回滚到 EMPTY 后回收。 */
     LIVE_ROLLBACK,
     /** crash recovery 把 ACTIVE undo 回滚到 EMPTY 后回收。 */

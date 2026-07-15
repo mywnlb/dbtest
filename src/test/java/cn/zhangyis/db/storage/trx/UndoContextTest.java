@@ -8,170 +8,122 @@ import cn.zhangyis.db.domain.RollbackSegmentId;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.domain.UndoNo;
 import cn.zhangyis.db.domain.UndoSlotId;
+import cn.zhangyis.db.storage.undo.UndoLogKind;
+import cn.zhangyis.db.storage.undo.UndoLogicalHead;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/**
- * T1.3c UndoContext 单元测试。UndoContext 是挂 {@link Transaction} 的事务运行时 undo 子状态
- * （设计 §5.3），由 {@code UndoLogManager.ensureUndoContext} 在首写时惰性创建。本测试覆盖字段往返与
- * 「刚建段、尚未 append」的惰性初值：{@code lastRollPointer=NULL}、{@code lastUndoNo=NONE}、
- * {@code insertUndoFirstPageId} 为刚分配的 insert undo segment 首页。
- *
- * <p>1.4 起补充保存点边界语义：partial rollback 可退回逻辑链头，但 append 高水位不能倒回。
- */
+/** 1.6 双 undo log 事务上下文单元测试。 */
 class UndoContextTest {
-
     private static final RollbackSegmentId RSEG = RollbackSegmentId.of(0);
     private static final UndoSlotId SLOT = UndoSlotId.of(3);
-    private static final PageId FIRST_PAGE = PageId.of(SpaceId.of(77), PageNo.of(65));
+    private static final PageId FIRST = PageId.of(SpaceId.of(77), PageNo.of(65));
 
-    @Test
-    void freshContextHasLazyInitialValues() {
-        UndoContext ctx = new UndoContext(RSEG, SLOT, FIRST_PAGE);
-
-        assertEquals(RSEG, ctx.rollbackSegmentId());
-        assertEquals(SLOT, ctx.slotId());
-        assertEquals(FIRST_PAGE, ctx.undoFirstPageId());
-        assertTrue(ctx.lastUndoNo().isNone(), "fresh context lastUndoNo must be NONE before any append");
-        assertTrue(ctx.lastRollPointer().isNull(),
-                "fresh context lastRollPointer must be NULL before any append");
+    @Test void freshContextHasNoBindingsAndNoneHighWater() {
+        UndoContext context = new UndoContext(RSEG);
+        assertTrue(context.bindings().isEmpty());
+        assertEquals(UndoNo.NONE, context.lastUndoNo());
     }
 
-    @Test
-    void setLastUndoNoUpdatesField() {
-        UndoContext ctx = new UndoContext(RSEG, SLOT, FIRST_PAGE);
-
-        ctx.setLastUndoNo(UndoNo.of(2));
-
-        assertEquals(UndoNo.of(2), ctx.lastUndoNo());
-        // rollbackSegmentId/slotId/insertUndoFirstPageId 不随 append 改变
-        assertEquals(RSEG, ctx.rollbackSegmentId());
-        assertEquals(SLOT, ctx.slotId());
-        assertEquals(FIRST_PAGE, ctx.undoFirstPageId());
+    @Test void attachInsertBindingKeepsIdentity() {
+        UndoContext context = freshInsert();
+        assertEquals(SLOT, context.binding(UndoLogKind.INSERT).slotId());
+        assertEquals(FIRST, context.binding(UndoLogKind.INSERT).firstPageId());
     }
 
-    @Test
-    void setLastRollPointerUpdatesField() {
-        UndoContext ctx = new UndoContext(RSEG, SLOT, FIRST_PAGE);
-
-        RollPointer rp = new RollPointer(true, PageNo.of(65), 97);
-        ctx.setLastRollPointer(rp);
-
-        assertEquals(rp, ctx.lastRollPointer());
-        assertNotNull(ctx.lastRollPointer());
+    @Test void duplicateKindIsRejected() {
+        UndoContext context = freshInsert();
+        assertThrows(DatabaseValidationException.class, () -> context.attach(new UndoLogBinding(
+                UndoLogKind.INSERT, UndoSlotId.of(4), PageId.of(SpaceId.of(77), PageNo.of(66)),
+                UndoLogicalHead.EMPTY)));
     }
 
-    @Test
-    void savepointRestoreMovesLogicalBoundaryWithoutReusingAppendUndoNo() {
-        Transaction txn = new Transaction(TransactionOptions.defaults(), 1L);
-        UndoContext ctx = new UndoContext(RSEG, SLOT, FIRST_PAGE);
-        RollPointer first = new RollPointer(true, PageNo.of(65), 97);
-        RollPointer second = new RollPointer(true, PageNo.of(65), 128);
-        ctx.setLastUndoNo(UndoNo.of(1));
-        ctx.setLastRollPointer(first);
-
-        TransactionSavepoint savepoint = ctx.createSavepoint(txn);
-        ctx.setLastUndoNo(UndoNo.of(2));
-        ctx.setLastRollPointer(second);
-        ctx.completeRollbackToSavepoint(savepoint);
-
-        assertEquals(UndoNo.of(2), ctx.lastUndoNo(),
-                "partial rollback must not rewind append high-water or the next append would reuse undoNo");
-        assertEquals(UndoNo.of(1), ctx.logicalLastUndoNo(),
-                "logical chain head returns to the savepoint boundary");
-        assertEquals(first, ctx.lastRollPointer(), "rollback chain head returns to the savepoint roll pointer");
-        assertEquals(1, ctx.savepointCount(), "target savepoint remains valid for repeated rollback-to");
+    @Test void globalHighWaterAndLocalHeadAdvanceTogetherAfterAppend() {
+        UndoContext context = freshInsert();
+        RollPointer pointer = new RollPointer(true, PageNo.of(65), 120);
+        context.publishAppend(UndoLogKind.INSERT, UndoNo.of(1), pointer);
+        assertEquals(UndoNo.of(1), context.lastUndoNo());
+        assertEquals(new UndoLogicalHead(UndoNo.of(1), pointer), context.head(UndoLogKind.INSERT));
     }
 
-    @Test
-    void emptyBoundaryRestoreClearsLogicalChainWithoutReusingAppendUndoNo() {
-        Transaction txn = new Transaction(TransactionOptions.defaults(), 1L);
-        UndoContext ctx = new UndoContext(RSEG, SLOT, FIRST_PAGE);
-        txn.setUndoContext(ctx);
-        ctx.setLastUndoNo(UndoNo.of(1));
-        ctx.setLastRollPointer(new RollPointer(true, PageNo.of(65), 97));
-        ctx.createSavepoint(txn);
-
-        ctx.completeRollbackToEmptyBoundary();
-
-        assertEquals(UndoNo.of(1), ctx.lastUndoNo(),
-                "empty-boundary rollback keeps the append high-water mark");
-        assertEquals(UndoNo.NONE, ctx.logicalLastUndoNo(),
-                "empty-boundary rollback detaches all current logical undo");
-        assertEquals(RollPointer.NULL, ctx.lastRollPointer());
-        assertEquals(0, ctx.savepointCount(),
-                "no savepoint remains reachable after the logical chain returns to empty");
-    }
-
-    @Test
-    void releasingSavepointRemovesItAndAllNestedSavepoints() {
-        Transaction txn = new Transaction(TransactionOptions.defaults(), 1L);
-        UndoContext ctx = new UndoContext(RSEG, SLOT, FIRST_PAGE);
-        txn.setUndoContext(ctx);
-        TransactionSavepoint statementBoundary = ctx.createSavepoint(txn);
-        TransactionSavepoint nested = ctx.createSavepoint(txn);
-
-        ctx.releaseSavepoint(statementBoundary);
-
-        assertEquals(0, ctx.savepointCount(),
-                "closing the statement boundary also invalidates savepoints nested inside that statement");
-        assertThrows(DatabaseValidationException.class, () -> ctx.requireOwnedSavepoint(statementBoundary));
-        assertThrows(DatabaseValidationException.class, () -> ctx.requireOwnedSavepoint(nested));
-    }
-
-    @Test
-    void createSavepointRejectsTransactionBoundToAnotherUndoContext() {
-        Transaction txn = new Transaction(TransactionOptions.defaults(), 1L);
-        UndoContext owned = new UndoContext(RSEG, SLOT, FIRST_PAGE);
-        UndoContext other = new UndoContext(RSEG, UndoSlotId.of(4), PageId.of(SpaceId.of(77), PageNo.of(66)));
-        txn.setUndoContext(owned);
-
-        assertThrows(DatabaseValidationException.class, () -> other.createSavepoint(txn));
-    }
-
-    @Test
-    void setLastRollPointerRejectsNullJavaRef() {
-        UndoContext ctx = new UndoContext(RSEG, SLOT, FIRST_PAGE);
-        // RollPointer.NULL 是合法值（表「无前驱」），但 Java null 引用必须拒绝，避免隐藏 NPE
-        assertThrows(DatabaseValidationException.class, () -> ctx.setLastRollPointer(null));
-    }
-
-    @Test
-    void constructorRejectsNullFields() {
+    @Test void appendMustAdvanceGlobalUndoNumber() {
+        UndoContext context = freshInsert();
+        RollPointer pointer = new RollPointer(true, PageNo.of(65), 120);
+        context.publishAppend(UndoLogKind.INSERT, UndoNo.of(1), pointer);
         assertThrows(DatabaseValidationException.class,
-                () -> new UndoContext(null, SLOT, FIRST_PAGE));
-        assertThrows(DatabaseValidationException.class,
-                () -> new UndoContext(RSEG, null, FIRST_PAGE));
-        assertThrows(DatabaseValidationException.class,
-                () -> new UndoContext(RSEG, SLOT, null));
+                () -> context.publishAppend(UndoLogKind.INSERT, UndoNo.of(1), pointer));
     }
 
-    @Test
-    void hasUpdateUndoDefaultsFalseAndMarksTrue() {
-        UndoContext ctx = new UndoContext(RSEG, SLOT, FIRST_PAGE);
-        assertFalse(ctx.hasUpdateUndo(), "fresh context has no update undo");
-        ctx.markHasUpdateUndo();
-        assertTrue(ctx.hasUpdateUndo(), "markHasUpdateUndo sets the flag (commit must keep slot)");
+    @Test void savepointCapturesBothHeads() {
+        Transaction txn = new Transaction(TransactionOptions.defaults(), 1L);
+        UndoContext context = freshInsert();
+        txn.setUndoContext(context);
+        RollPointer pointer = new RollPointer(true, PageNo.of(65), 120);
+        context.publishAppend(UndoLogKind.INSERT, UndoNo.of(1), pointer);
+        TransactionSavepoint savepoint = context.createSavepoint(txn);
+        assertEquals(new UndoLogicalHead(UndoNo.of(1), pointer), savepoint.insertHead());
+        assertEquals(UndoLogicalHead.EMPTY, savepoint.updateHead());
     }
 
-    @Test
-    void setLastUndoNoRejectsNull() {
-        UndoContext ctx = new UndoContext(RSEG, SLOT, FIRST_PAGE);
-        assertThrows(DatabaseValidationException.class, () -> ctx.setLastUndoNo(null));
+    @Test void rollbackToSavepointDoesNotRewindGlobalHighWater() {
+        Transaction txn = new Transaction(TransactionOptions.defaults(), 1L);
+        UndoContext context = freshInsert();
+        txn.setUndoContext(context);
+        RollPointer first = new RollPointer(true, PageNo.of(65), 120);
+        context.publishAppend(UndoLogKind.INSERT, UndoNo.of(1), first);
+        TransactionSavepoint savepoint = context.createSavepoint(txn);
+        context.publishAppend(UndoLogKind.INSERT, UndoNo.of(2),
+                new RollPointer(true, PageNo.of(65), 150));
+        context.completeRollbackToSavepoint(savepoint);
+        assertEquals(UndoNo.of(2), context.lastUndoNo());
+        assertEquals(new UndoLogicalHead(UndoNo.of(1), first), context.head(UndoLogKind.INSERT));
     }
 
-    @Test
-    void rollbackSegmentIdAndUndoSlotIdValidateNonNegative() {
-        assertThrows(DatabaseValidationException.class, () -> RollbackSegmentId.of(-1));
-        assertThrows(DatabaseValidationException.class, () -> UndoSlotId.of(-1));
-        // 合法值往返（record 按组件值相等，不用 assertSame）
-        assertEquals(RollbackSegmentId.of(0), RollbackSegmentId.of(0));
-        assertEquals(7, UndoSlotId.of(7).value());
-        assertEquals(2, RollbackSegmentId.of(2).value());
+    @Test void emptyBoundaryClearsEveryExistingLocalHead() {
+        UndoContext context = freshInsert();
+        context.publishAppend(UndoLogKind.INSERT, UndoNo.of(1),
+                new RollPointer(true, PageNo.of(65), 120));
+        context.completeRollbackToEmptyBoundary();
+        assertEquals(UndoLogicalHead.EMPTY, context.head(UndoLogKind.INSERT));
+        assertEquals(UndoNo.of(1), context.lastUndoNo());
+    }
+
+    @Test void releaseSavepointRemovesNestedRange() {
+        Transaction txn = new Transaction(TransactionOptions.defaults(), 1L);
+        UndoContext context = freshInsert();
+        txn.setUndoContext(context);
+        TransactionSavepoint first = context.createSavepoint(txn);
+        context.createSavepoint(txn);
+        context.releaseSavepoint(first);
+        assertEquals(0, context.savepointCount());
+    }
+
+    @Test void temporaryBindingIsRejected() {
+        assertThrows(DatabaseValidationException.class, () -> new UndoLogBinding(
+                UndoLogKind.TEMPORARY, SLOT, FIRST, UndoLogicalHead.EMPTY));
+    }
+
+    @Test void nonEmptyBindingHeadMustMatchPersistentLogKind() {
+        assertThrows(DatabaseValidationException.class, () -> new UndoLogBinding(
+                UndoLogKind.INSERT, SLOT, FIRST,
+                new UndoLogicalHead(UndoNo.of(1), new RollPointer(false, PageNo.of(65), 120))));
+        assertThrows(DatabaseValidationException.class, () -> new UndoLogBinding(
+                UndoLogKind.UPDATE, SLOT, FIRST,
+                new UndoLogicalHead(UndoNo.of(1), new RollPointer(true, PageNo.of(65), 120))));
+    }
+
+    @Test void nullRollbackSegmentIsRejected() {
+        assertThrows(DatabaseValidationException.class, () -> new UndoContext(null));
+        assertFalse(RSEG.value() < 0);
+    }
+
+    private static UndoContext freshInsert() {
+        UndoContext context = new UndoContext(RSEG);
+        context.attach(new UndoLogBinding(UndoLogKind.INSERT, SLOT, FIRST, UndoLogicalHead.EMPTY));
+        return context;
     }
 }

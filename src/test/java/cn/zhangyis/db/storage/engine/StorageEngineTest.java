@@ -47,6 +47,10 @@ import cn.zhangyis.db.storage.trx.Transaction;
 import cn.zhangyis.db.storage.trx.TransactionManager;
 import cn.zhangyis.db.storage.trx.TransactionOptions;
 import cn.zhangyis.db.storage.trx.UndoLogManager;
+import cn.zhangyis.db.storage.trx.UndoSegmentAcquisition;
+import cn.zhangyis.db.storage.trx.UndoTestWrites;
+import cn.zhangyis.db.storage.trx.UndoWritePlan;
+import cn.zhangyis.db.storage.undo.UndoLogKind;
 import cn.zhangyis.db.storage.trx.lock.RecordLockKey;
 import cn.zhangyis.db.storage.trx.lock.TransactionLockMode;
 import cn.zhangyis.db.storage.record.format.HiddenColumns;
@@ -712,7 +716,7 @@ class StorageEngineTest {
         MiniTransaction m = e1.miniTransactionManager().begin(
                 e1.miniTransactionManager().budgetFor(RedoBudgetPurpose.CLUSTERED_INSERT,
                         UndoRedoBudgetEstimator.append(true)));
-        e1.undoLogManager().beforeInsert(txn, m, TABLE_ID, INDEX_ID,
+        UndoTestWrites.insert(e1.undoLogManager(), txn, m, TABLE_ID, INDEX_ID,
                 List.of(new ColumnValue.IntValue(1)), idKey(), clusteredSchema());
         e1.miniTransactionManager().commit(m);
         // 不 commit/onCommit：模拟 active 事务
@@ -729,7 +733,7 @@ class StorageEngineTest {
         e2.close();
     }
 
-    /** 纯 insert 事务 commit（onCommit 释放→page3 清空）后重启，该 slot 不应被恢复为 active。 */
+    /** 纯 insert commit 把 page3 owner 从 active slot 移入 cache；重启不得恢复为 active，并应复用同一段。 */
     @Test
     void committedInsertTxnSlotClearedOnPage3AndNotRestored() {
         EngineConfig cfg = config();
@@ -741,11 +745,12 @@ class StorageEngineTest {
         MiniTransaction m = e1.miniTransactionManager().begin(
                 e1.miniTransactionManager().budgetFor(RedoBudgetPurpose.CLUSTERED_INSERT,
                         UndoRedoBudgetEstimator.append(true)));
-        e1.undoLogManager().beforeInsert(txn, m, TABLE_ID, INDEX_ID,
+        UndoTestWrites.insert(e1.undoLogManager(), txn, m, TABLE_ID, INDEX_ID,
                 List.of(new ColumnValue.IntValue(1)), idKey(), clusteredSchema());
         e1.miniTransactionManager().commit(m);
+        PageId cachedFirstPage = txn.undoContext().binding(UndoLogKind.INSERT).firstPageId();
         e1.transactionManager().prepareCommit(txn);
-        e1.undoLogManager().onCommit(txn); // 纯 insert → 释放并清空 page3 该 slot
+        e1.undoLogManager().onCommit(txn); // 纯 insert → active owner 转入 page3 cache
         e1.transactionManager().commit(txn);
         TransactionId committedId = txn.transactionId();
         TransactionNo committedNo = txn.transactionNo();
@@ -759,12 +764,23 @@ class StorageEngineTest {
                 "committed insert txn slot cleared on page3, not restored");
         Transaction next = e2.transactionManager().begin(TransactionOptions.defaults());
         e2.transactionManager().assignWriteId(next);
+        UndoWritePlan reusePlan = e2.undoLogManager().planInsert(next, TABLE_ID, INDEX_ID,
+                List.of(new ColumnValue.IntValue(2)), idKey(), clusteredSchema());
+        assertEquals(UndoSegmentAcquisition.REUSE_CACHED, reusePlan.acquisition(),
+                "recovery must validate page3/undo/FSP evidence and rebuild the cached stack");
+        MiniTransaction reuseMtr = e2.miniTransactionManager().begin(
+                e2.miniTransactionManager().budgetFor(RedoBudgetPurpose.CLUSTERED_INSERT,
+                        reusePlan.redoWorkload()));
+        e2.undoLogManager().appendPlanned(next, reuseMtr, reusePlan);
+        e2.miniTransactionManager().commit(reuseMtr);
+        assertEquals(cachedFirstPage, next.undoContext().binding(UndoLogKind.INSERT).firstPageId());
         e2.transactionManager().prepareCommit(next);
         assertTrue(next.transactionId().value() > committedId.value(),
                 "checkpointed pure INSERT transaction id must not be reused after its page3 slot was cleared");
         assertTrue(next.transactionNo().value() > committedNo.value(),
                 "checkpointed pure INSERT commit number must not be reused after redo recycling");
-        e2.transactionManager().rollback(next);
+        e2.undoLogManager().onCommit(next);
+        e2.transactionManager().commit(next);
         e2.close();
     }
 
@@ -772,7 +788,7 @@ class StorageEngineTest {
 
     /**
      * money test：同一 active 事务插三行（写 undo + insertClustered）→ 不 commit → checkpoint → close → 重开（注入
-     * recoveryRollbackIndex）→ 恢复逐条回滚到 EMPTY 并原子 drop+清 page3；再次重启不得再发现 slot、重复 inverse
+     * recoveryRollbackIndex）→ 恢复逐条回滚到 EMPTY 并原子 cache/drop、转移 page3 owner；再次重启不得再发现 active slot、重复 inverse
      * 或复活数据。
      */
     @Test
@@ -821,7 +837,68 @@ class StorageEngineTest {
         e3.close();
     }
 
-    /** 对照：committed insert 的 onCommit 原子 drop undo + 清 page3，重启后数据保留且不会被恢复误删。 */
+    /**
+     * 同一 active 事务先 INSERT 再 UPDATE 同一行会留下两个独立 slot/segment。重启恢复必须按全局 undoNo
+     * 先撤销 UPDATE、再撤销 INSERT，并在一个批终结边界清空两个 slot；否则会残留插入版本或孤儿 owner。
+     */
+    @Test
+    void recoveryMergesIndependentActiveInsertAndUpdateLogsOnRestart() {
+        Path dataPath = dir.resolve("data-dual-undo-rollback.ibd");
+        EngineConfig cfg = configWithRecoveryTablespace(dataPath);
+
+        StorageEngine e1 = new StorageEngine(cfg);
+        e1.open();
+        BTreeIndex index = createClusteredIndex(e1, dataPath);
+        Transaction txn = e1.transactionManager().begin(TransactionOptions.defaults());
+        e1.transactionManager().assignWriteId(txn);
+
+        UndoWritePlan insertPlan = e1.undoLogManager().planInsert(txn, TABLE_ID, INDEX_ID,
+                List.of(new ColumnValue.IntValue(1)), index.keyDef(), index.schema());
+        MiniTransaction insertMtr = e1.miniTransactionManager().begin(
+                e1.miniTransactionManager().budgetFor(RedoBudgetPurpose.CLUSTERED_INSERT,
+                        BTreeRedoBudgetEstimator.insert(index.rootLevel()).plus(insertPlan.redoWorkload())));
+        RollPointer insertPointer = e1.undoLogManager().appendPlanned(txn, insertMtr, insertPlan);
+        e1.btreeService().insertClustered(insertMtr, index, row(1, "inserted"),
+                txn.transactionId(), insertPointer);
+        e1.miniTransactionManager().commit(insertMtr);
+
+        MiniTransaction readOld = e1.miniTransactionManager().beginReadOnly();
+        BTreeLookupResult old = e1.btreeService().lookup(readOld, index, search(1)).orElseThrow();
+        e1.miniTransactionManager().commit(readOld);
+        HiddenColumns oldHidden = old.record().hiddenColumns();
+
+        UndoWritePlan updatePlan = e1.undoLogManager().planUpdate(txn, TABLE_ID, INDEX_ID,
+                List.of(new ColumnValue.IntValue(1)), old.record().columnValues(), oldHidden,
+                index.keyDef(), index.schema());
+        MiniTransaction updateMtr = e1.miniTransactionManager().begin(
+                e1.miniTransactionManager().budgetFor(RedoBudgetPurpose.CLUSTERED_UPDATE,
+                        BTreeRedoBudgetEstimator.pointRewrite().plus(updatePlan.redoWorkload())));
+        RollPointer updatePointer = e1.undoLogManager().appendPlanned(txn, updateMtr, updatePlan);
+        LogicalRecord updated = new LogicalRecord(1, row(1, "updated").columnValues(), false,
+                RecordType.CONVENTIONAL, new HiddenColumns(txn.transactionId(), updatePointer));
+        assertTrue(e1.btreeService().replaceClustered(updateMtr, index, search(1), updated,
+                oldHidden.dbTrxId(), oldHidden.dbRollPtr()).replaced());
+        e1.miniTransactionManager().commit(updateMtr);
+
+        assertEquals(2, e1.rollbackSegmentSlotManager().activeSlotCount(),
+                "independent INSERT and UPDATE logs must own separate ACTIVE slots");
+        e1.checkpoint();
+        e1.close();
+
+        StorageEngine e2 = new StorageEngine(cfg);
+        e2.configureClusteredIndex(index);
+        e2.open();
+        assertStageBeforeOpen(e2, RecoveryStageName.UNDO_ROLLBACK);
+        assertEquals(0, e2.rollbackSegmentSlotManager().activeSlotCount(),
+                "dual-log recovery batch must release both persistent owners");
+        MiniTransaction readRecovered = e2.miniTransactionManager().beginReadOnly();
+        assertTrue(e2.btreeService().lookup(readRecovered, index, search(1)).isEmpty(),
+                "merge rollback must restore INSERT state before removing the uncommitted row");
+        e2.miniTransactionManager().commit(readRecovered);
+        e2.close();
+    }
+
+    /** 对照：committed insert 的 onCommit 原子 cache/drop undo owner，重启后数据保留且不会被恢复误删。 */
     @Test
     void recoveryPreservesCommittedInsertOnRestart() {
         Path dataPath = dir.resolve("data-keep.ibd");
@@ -856,7 +933,7 @@ class StorageEngineTest {
             MiniTransaction m = mtrMgr.begin(mtrMgr.budgetFor(RedoBudgetPurpose.CLUSTERED_INSERT,
                     BTreeRedoBudgetEstimator.insert(index.rootLevel())
                             .plus(UndoRedoBudgetEstimator.append(id == 1))));
-            RollPointer rp = undoMgr.beforeInsert(txn, m, TABLE_ID, INDEX_ID,
+            RollPointer rp = UndoTestWrites.insert(undoMgr, txn, m, TABLE_ID, INDEX_ID,
                     List.of(new ColumnValue.IntValue(id)), index.keyDef(), index.schema());
             svc.insertClustered(m, index, row(id, "v" + id), txn.transactionId(), rp);
             mtrMgr.commit(m);
@@ -946,7 +1023,7 @@ class StorageEngineTest {
                 stage + " must complete before user traffic opens");
     }
 
-    /** 提交一条 delete-mark 事务（lookup 旧 image → beforeDelete → setClusteredDeleteMark → commit + onCommit）。 */
+    /** 提交一条 delete-mark 事务（lookup 旧 image → planDelete/appendPlanned → setClusteredDeleteMark → commit + onCommit）。 */
     private void deleteMarkRow(StorageEngine engine, BTreeIndex index, long id) {
         TransactionManager txnMgr = engine.transactionManager();
         MiniTransactionManager mtrMgr = engine.miniTransactionManager();
@@ -960,7 +1037,7 @@ class StorageEngineTest {
         HiddenColumns oldHidden = old.record().hiddenColumns();
         MiniTransaction m = mtrMgr.begin(mtrMgr.budgetFor(RedoBudgetPurpose.CLUSTERED_DELETE,
                 BTreeRedoBudgetEstimator.pointRewrite().plus(UndoRedoBudgetEstimator.append(true))));
-        RollPointer delRp = undoMgr.beforeDelete(txn, m, TABLE_ID, INDEX_ID,
+        RollPointer delRp = UndoTestWrites.delete(undoMgr, txn, m, TABLE_ID, INDEX_ID,
                 List.of(new ColumnValue.IntValue(id)), old.record().columnValues(), oldHidden,
                 index.keyDef(), index.schema());
         svc.setClusteredDeleteMark(m, index, search(id), true,
@@ -1020,7 +1097,7 @@ class StorageEngineTest {
         MiniTransaction m = mtrMgr.begin(mtrMgr.budgetFor(RedoBudgetPurpose.CLUSTERED_INSERT,
                 BTreeRedoBudgetEstimator.insert(index.rootLevel())
                         .plus(UndoRedoBudgetEstimator.append(true))));
-        RollPointer rp = undoMgr.beforeInsert(txn, m, TABLE_ID, INDEX_ID,
+        RollPointer rp = UndoTestWrites.insert(undoMgr, txn, m, TABLE_ID, INDEX_ID,
                 List.of(new ColumnValue.IntValue(id)), index.keyDef(), index.schema());
         svc.insertClustered(m, index, row(id, payload), txn.transactionId(), rp);
         mtrMgr.commit(m);

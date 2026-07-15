@@ -7,8 +7,8 @@ import java.util.TreeSet;
  * 活跃读写事务 id 注册表（innodb-transaction-mvcc-design §5.3）。
  *
  * <p><b>非线程安全</b>：本对象**只由 {@link TransactionSystem} 在其 {@code ReentrantLock} 内调用**，
- * 不对外暴露为独立可变 owner，避免双重 owner。有序集合（{@link TreeSet}）便于后续 ReadView 取最小活跃 id
- * 作 up-limit（本片无 ReadView 消费，仅供测试断言与下一片预留）。
+ * 不对外暴露为独立可变 owner，避免双重 owner。有序集合（{@link TreeSet}）供 ReadView 取最小活跃 id
+ * 作 up-limit，也供 purge 在同一事务系统短锁内拒绝尚未完成终态发布的 creator。
  */
 final class ActiveTransactionTable {
 
@@ -23,6 +23,11 @@ final class ActiveTransactionTable {
     /** 移除（commit/rollback 读写事务）。 */
     void remove(long txnId) {
         activeReadWriteIds.remove(txnId);
+    }
+
+    /** 判断事务是否仍处于活跃写集合；调用方必须持有 TransactionSystem 短锁。 */
+    boolean contains(long txnId) {
+        return activeReadWriteIds.contains(txnId);
     }
 
     /** 不可变拷贝快照。 */

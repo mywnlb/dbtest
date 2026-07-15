@@ -36,7 +36,7 @@ import java.util.List;
  * @param clusterKey      主键列值，顺序对应 IndexKeyDef.parts()；可含 {@link ColumnValue.NullValue}。
  * @param oldColumnValues UPDATE_ROW 的更新前全列值（按 schema 列序）；INSERT_ROW 必为 null。
  * @param oldHiddenColumns UPDATE_ROW 的更新前隐藏列；INSERT_ROW 必为 null。
- * @param prevRollPointer 事务反向 undo 链前驱（= 写入时 ctx.lastRollPointer）。
+ * @param prevRollPointer 同 kind undo log 的事务回滚局部链前驱；记录版本链前驱保存在 oldHiddenColumns.dbRollPtr。
  */
 public record UndoRecord(UndoRecordType type, UndoNo undoNo, TransactionId transactionId,
                          long tableId, long indexId, List<ColumnValue> clusterKey,

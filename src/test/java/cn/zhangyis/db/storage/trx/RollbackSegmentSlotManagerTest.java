@@ -6,6 +6,8 @@ import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.RollbackSegmentId;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.domain.UndoSlotId;
+import cn.zhangyis.db.storage.undo.UndoLogKind;
+import cn.zhangyis.db.storage.undo.UndoLogicalHead;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
@@ -25,7 +27,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * T1.3c 内存 rollback segment slot 目录。固定单一默认 {@link RollbackSegmentId}，slot array 记录
- * {@code UndoSlotId -> insertUndoFirstPageId}，一把 {@link java.util.concurrent.locks.ReentrantLock} 串行
+ * {@code UndoSlotId -> undoFirstPageId}，一把 {@link java.util.concurrent.locks.ReentrantLock} 串行
  * 「扫空槽→登记 firstPageId」，锁内不分配页、不访问 BufferPool、不等待 IO。
  *
  * <p>不测试 reload 持久性、slot 回收（非目标，留 T1.3d+）。
@@ -69,7 +71,7 @@ class RollbackSegmentSlotManagerTest {
 
         UndoSlotId slot = mgr.claim(page(65));
 
-        assertEquals(page(65), mgr.insertUndoFirstPageId(slot));
+        assertEquals(page(65), mgr.undoFirstPageId(slot));
         assertTrue(mgr.isOccupied(slot));
     }
 
@@ -141,7 +143,7 @@ class RollbackSegmentSlotManagerTest {
             assertEquals(1, mgr.activeSlotCount(), "RESERVED slot prevents false empty diagnostics");
             assertThrows(UndoSlotExhaustedException.class, mgr::reserveClaim,
                     "a concurrent claim cannot reuse a RESERVED slot");
-            assertThrows(DatabaseRuntimeException.class, () -> mgr.insertUndoFirstPageId(claim.slotId()),
+            assertThrows(DatabaseRuntimeException.class, () -> mgr.undoFirstPageId(claim.slotId()),
                     "RESERVED has no segment owner before bind");
         }
 
@@ -161,7 +163,7 @@ class RollbackSegmentSlotManagerTest {
         }
 
         assertTrue(mgr.isOccupied(slot));
-        assertEquals(page(65), mgr.insertUndoFirstPageId(slot));
+        assertEquals(page(65), mgr.undoFirstPageId(slot));
         assertEquals(1, mgr.activeSlotCount());
     }
 
@@ -177,7 +179,7 @@ class RollbackSegmentSlotManagerTest {
                     "duplicate terminal command must fail before touching physical pages");
         }
 
-        assertEquals(page(65), mgr.insertUndoFirstPageId(slot),
+        assertEquals(page(65), mgr.undoFirstPageId(slot),
                 "pre-physical failure keeps the original ACTIVE owner retryable");
     }
 
@@ -224,16 +226,16 @@ class RollbackSegmentSlotManagerTest {
 
         assertEquals(oldSlot, reused, "first-fit reuses the completed slot");
         assertThrows(DatabaseRuntimeException.class, () -> mgr.beginFinalization(oldSlot, page(65)));
-        assertEquals(page(66), mgr.insertUndoFirstPageId(reused), "stale command leaves the new owner untouched");
+        assertEquals(page(66), mgr.undoFirstPageId(reused), "stale command leaves the new owner untouched");
     }
 
     @Test
-    void insertUndoFirstPageIdRejectsUnoccupiedOrOutOfRange() {
+    void undoFirstPageIdRejectsUnoccupiedOrOutOfRange() {
         RollbackSegmentSlotManager mgr = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 4);
         // 未认领的 slot 查询必须失败，不能返回 stale/null 静默
-        assertThrows(DatabaseRuntimeException.class, () -> mgr.insertUndoFirstPageId(UndoSlotId.of(0)));
+        assertThrows(DatabaseRuntimeException.class, () -> mgr.undoFirstPageId(UndoSlotId.of(0)));
         // 越界 slot 查询失败
-        assertThrows(DatabaseRuntimeException.class, () -> mgr.insertUndoFirstPageId(UndoSlotId.of(99)));
+        assertThrows(DatabaseRuntimeException.class, () -> mgr.undoFirstPageId(UndoSlotId.of(99)));
     }
 
     // ---- T1.3d：slot 回收（commit/rollback 后释放，供后续事务重认领） ----
@@ -250,7 +252,7 @@ class RollbackSegmentSlotManagerTest {
         assertFalse(mgr.isOccupied(s0), "released slot must be free");
         UndoSlotId reclaimed = mgr.claim(page(67));
         assertEquals(s0, reclaimed, "release makes the lowest slot reusable (first-fit)");
-        assertEquals(page(67), mgr.insertUndoFirstPageId(reclaimed), "reclaimed slot points to new first page");
+        assertEquals(page(67), mgr.undoFirstPageId(reclaimed), "reclaimed slot points to new first page");
     }
 
     @Test
@@ -292,7 +294,7 @@ class RollbackSegmentSlotManagerTest {
         mgr.restore(UndoSlotId.of(3), page(70));
 
         assertTrue(mgr.isOccupied(UndoSlotId.of(3)));
-        assertEquals(page(70), mgr.insertUndoFirstPageId(UndoSlotId.of(3)));
+        assertEquals(page(70), mgr.undoFirstPageId(UndoSlotId.of(3)));
         assertEquals(1, mgr.activeSlotCount());
         // 恢复后续认领走未占用空槽（first-fit 从 0），不影响已 restore 的 slot
         assertEquals(UndoSlotId.of(0), mgr.claim(page(71)));
@@ -305,6 +307,43 @@ class RollbackSegmentSlotManagerTest {
         assertThrows(DatabaseRuntimeException.class, () -> mgr.restore(UndoSlotId.of(1), page(71)));
         assertThrows(DatabaseRuntimeException.class, () -> mgr.restore(UndoSlotId.of(99), page(72)));
         assertThrows(DatabaseRuntimeException.class, () -> mgr.restore(UndoSlotId.of(2), null));
+    }
+
+    @Test
+    void batchFinalizationCompletesAllSlotsAtomically() {
+        RollbackSegmentSlotManager mgr = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 4);
+        UndoSlotId insertSlot = mgr.claim(page(65));
+        UndoSlotId updateSlot = mgr.claim(page(66));
+        List<UndoLogBinding> bindings = List.of(
+                new UndoLogBinding(UndoLogKind.INSERT, insertSlot, page(65), UndoLogicalHead.EMPTY),
+                new UndoLogBinding(UndoLogKind.UPDATE, updateSlot, page(66), UndoLogicalHead.EMPTY));
+
+        try (RollbackSegmentSlotManager.BatchFinalizationLease lease = mgr.beginBatchFinalization(bindings)) {
+            lease.physicalMutationStarted();
+            lease.complete();
+        }
+
+        assertEquals(0, mgr.activeSlotCount());
+        assertFalse(mgr.isOccupied(insertSlot));
+        assertFalse(mgr.isOccupied(updateSlot));
+    }
+
+    @Test
+    void batchFinalizationBeforePhysicalMutationRestoresEveryOwner() {
+        RollbackSegmentSlotManager mgr = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 4);
+        UndoSlotId insertSlot = mgr.claim(page(65));
+        UndoSlotId updateSlot = mgr.claim(page(66));
+        List<UndoLogBinding> bindings = List.of(
+                new UndoLogBinding(UndoLogKind.INSERT, insertSlot, page(65), UndoLogicalHead.EMPTY),
+                new UndoLogBinding(UndoLogKind.UPDATE, updateSlot, page(66), UndoLogicalHead.EMPTY));
+
+        try (RollbackSegmentSlotManager.BatchFinalizationLease ignored = mgr.beginBatchFinalization(bindings)) {
+            // 物理写前退出必须恢复整批 ACTIVE。
+        }
+
+        assertEquals(2, mgr.activeSlotCount());
+        assertEquals(page(65), mgr.undoFirstPageId(insertSlot));
+        assertEquals(page(66), mgr.undoFirstPageId(updateSlot));
     }
 
     /** 测试侧按真实状态机发布一次已成功持久化的终结。 */

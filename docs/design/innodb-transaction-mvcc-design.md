@@ -192,6 +192,11 @@
 4. `activeTransactionIds` 包含 `recordTrxId`：不可见。
 5. 其它情况：可见。
 
+Purge 不能只比较 `lowLimitNo`。事务可能已经分配 `TransactionNo` 并持久化 UPDATE history，
+但仍处于 prepare/onCommit 与从 active table 移除之间；最终摘除 head 前必须在事务系统短锁内复核：
+creator 已离开 active table、提交号低于所有 live ReadView 的 low limit，且每个 live ReadView 都把该 creator
+transaction 视为可见。即使 live 集合为空，也不能省略 active 检查。
+
 隔离级别策略：
 
 - `READ_UNCOMMITTED`：可直接读最新版本，但 delete-mark 记录仍需按当前语义处理。
@@ -312,7 +317,7 @@ insert undo 与 update undo 区别：
 1. 禁止事务继续获取新锁和新 undo。
 2. 提交当前语句 MTR，确保所有页修改已有 redo。
 3. 为事务分配 `transactionNo`。
-4. 将 update undo log header 挂入 history list；insert undo 标记可释放。
+4. UPDATE log header 与 page3 history base 在同一 commit MTR 持久链接；INSERT log 同批 cache 或释放。
 5. 将事务状态设为 `COMMITTING`。
 6. 写事务 commit redo 或事务系统状态 redo。
 7. 根据 durability policy 等待 redo durable。
@@ -333,11 +338,11 @@ insert undo 与 update undo 区别：
 回滚路径：
 
 1. 状态改为 `ROLLING_BACK`，禁止新操作。
-2. 从事务 undo log 最新记录向前扫描。
+2. 在独立 INSERT/UPDATE logs 的两个局部头之间按全局 undoNo 归并扫描。
 3. 每条 undo record 以独立 MTR 应用反向修改。
 4. insert undo：删除本事务插入且未提交的记录。
 5. update undo：恢复旧列值、旧 `DB_TRX_ID`、旧 `DB_ROLL_PTR`、旧 delete flag。
-6. 清理 insert undo；update undo 根据是否已暴露给其它 ReadView 决定进入 history 或直接释放。
+6. 双 head 到 EMPTY 后同批清理两条 logs；未提交 UPDATE 不进入 history。
 7. 释放锁，关闭 ReadView。
 8. 从 active transaction table 移除。
 9. 状态改为 `ROLLED_BACK`。
@@ -416,9 +421,8 @@ MiniMySQL 第一阶段可不实现完整 XA，但设计保留：
 
 `UndoLogManager` 对外能力：
 
-- `assignUndoLog(Transaction, UndoKind)`
-- `appendInsertUndo(Transaction, RecordRef, InsertUndoPayload, MTR)`
-- `appendUpdateUndo(Transaction, RecordRef, UpdateUndoPayload, MTR)`
+- `planInsert/planUpdate/planDelete(Transaction, BeforeImage)`
+- `appendPlanned(Transaction, MTR, UndoWritePlan)`
 - `rollbackTo(Transaction, UndoNo)`
 - `cleanupOnCommit(Transaction)`
 - `scanHistory(PurgeCursor)`
@@ -435,9 +439,9 @@ Undo 写入必须通过 MTR：
 
 每次更新聚簇记录：
 
-1. 新 undo record 的 `prevRollPointer = 当前记录.DB_ROLL_PTR`。
+1. 新 undo record 的 `prevRollPointer = 同 kind undo log 当前局部 head`。
 2. 记录当前列值或差异。
-3. 聚簇记录的 `DB_ROLL_PTR` 更新为新 undo record。
+3. 聚簇记录的 `DB_ROLL_PTR` 更新为新 undo record；update undo 的旧版本指针另存于 old hidden columns。
 4. 聚簇记录的 `DB_TRX_ID` 更新为当前事务 ID。
 
 这样每条聚簇记录形成从最新版本向旧版本回溯的版本链。
@@ -448,7 +452,7 @@ Undo 写入必须通过 MTR：
 
 - insert undo 可释放或缓存。
 - update undo 挂入 rollback segment history list。
-- history list 按事务提交序号大致有序。
+- history list 保持真实 commit append 的物理顺序，不按事务提交序号重排；`lastTransactionNo` 只保存最大高水位。
 - purge cursor 从最老可清理位置向前推进。
 
 history list 不等同于版本链。版本链通过记录的 `DB_ROLL_PTR` 串起来；history list 用于后台找到可 purge 的 undo log。
@@ -552,9 +556,9 @@ Lock request 状态图见 [transaction-lock-request-state.mmd](diagrams/transact
 `PurgeCoordinator` 后台执行：
 
 1. 从 `ReadViewManager` 获取最老 ReadView。
-2. 计算 `purgeLimit = oldestReadView.lowLimitNo`。
+2. 计算提交号 low water，并在最终摘除前复核候选 creator 已非 active 且对所有 live ReadView 可见。
 3. 从 rollback segment history list 取可候选 undo log。
-4. 如果 undo record 的事务提交序号仍被某个 ReadView 需要，停止推进。
+4. 如果物理 head 的提交序号或 creator visibility 仍被某个 ReadView 阻挡，停止推进；不能越过 head 重排。
 5. 对 delete-mark 记录，调用 B+Tree 删除物理记录和对应二级索引项。
 6. 清理不再需要的 update undo record。
 7. 回收空 undo page 或 undo segment。
@@ -573,7 +577,8 @@ purge 安全条件：
 
 1. redo recovery 先恢复物理页，包括 undo page、聚簇索引页、事务系统页。
 2. `TransactionRecoveryService` 扫描事务系统页和 undo log header。
-3. 重建 active、prepared、history list、rollback segment 内存态。
+3. 从 page3 history base 沿 UPDATE first-page 双向链按物理顺序重建 history，并与 occupied slots、
+   undo header 状态及 transaction counter 证据交叉校验后，再发布 rollback segment 内存态。
 4. 对 recovered active transaction 执行 rollback。
 5. 对 prepared transaction 保留 `PREPARED`，等待上层事务协调器决定。
 6. 初始化 ReadViewManager，启动时没有用户 ReadView。
@@ -615,9 +620,8 @@ purge 安全条件：
 
 写路径接口：
 
-- `beforeInsert(Transaction, RecordRef, RecordImage, MTR)`
-- `beforeUpdate(Transaction, RecordRef, RecordImage, ChangedColumns, MTR)`
-- `beforeDelete(Transaction, RecordRef, RecordImage, MTR)`
+- `planInsert/planUpdate/planDelete(Transaction, RecordImage)`
+- `appendPlanned(Transaction, MTR, UndoWritePlan)`
 - `rollback(Transaction)`
 - `rollbackTo(Transaction, TransactionSavepoint)`
 
@@ -720,7 +724,7 @@ purge 安全条件：
 
 1. 用户调用 rollback 或事务被死锁检测选为 victim。
 2. TransactionState 进入 `ROLLING_BACK`。
-3. UndoLogManager 从最新 undo record 反向扫描。
+3. UndoLogManager 从 INSERT/UPDATE 两个局部头中选择 undoNo 较大者反向扫描。
 4. 对 insert undo 删除未提交插入。
 5. 对 update undo 恢复旧值和旧隐藏列。
 6. 每次物理修改用独立 MTR 写 redo。

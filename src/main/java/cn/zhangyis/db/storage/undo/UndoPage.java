@@ -21,8 +21,8 @@ import java.nio.ByteBuffer;
  * undo 页视图（PageGuard 之上）。所有状态都在页字节中，写入经 MTR 持有的 X latch guard 产生
  * PAGE_BYTES redo，commit 时由 MTR 盖 pageLSN。
  *
- * <p>本类只表达页内物理格式：page header 每页都有，log header 仅 first 页可读写；chain 页清零 log
- * header 预留区，避免旧字节被误解释。FIL prev/next 负责页链链接，first 页 log header 另存链端点和整链计数。
+ * <p>本类只表达页内物理格式：page header 每页都有，log header 仅 first 页完整可读写；v3 chain 页在其余
+ * 预留字节清零后复制 kind，既避免旧字节误解释，也支持 direct RollPointer 类型守门。
  */
 public final class UndoPage {
 
@@ -54,8 +54,8 @@ public final class UndoPage {
      * 格式化 undo log first 页。数据流：写每页 page header（含 segment 归属和 first 标志）→ 写 log header
      * 的事务、类型、状态与链端点 → 初始化整链计数。调用方必须已通过 {@link UndoPageAccess} 写好 UNDO 页信封。
      *
-     * @param kind   undo log 类型；本片仅写 INSERT。
-     * @param txnId  所属事务 id，仅作为物理 header 测试字段，尚不接事务系统。
+     * @param kind   独立 undo log 类型；普通表空间只使用 INSERT/UPDATE。
+     * @param txnId  所属事务 id；恢复用它把 ACTIVE/COMMITTED first page 与事务证据交叉校验。
      * @param handle segment 定位；first 页必须位于 handle 所属表空间。
      */
     void formatFirstPage(UndoLogKind kind, TransactionId txnId, UndoSegmentHandle handle) {
@@ -63,34 +63,95 @@ public final class UndoPage {
             throw new DatabaseValidationException("undo first page format args must not be null");
         }
         requireHandleSpace(handle);
-        writePageHeader(handle, true);
-        writeLogHeaderLong(handle, UndoPageLayout.TRANSACTION_ID, txnId.value(), "format undo transaction id");
-        writeLogHeaderU8(handle, UndoPageLayout.UNDO_KIND, kind.ordinal(), "format undo log kind");
-        writeLogHeaderU8(handle, UndoPageLayout.STATE, UndoPageLayout.STATE_ACTIVE, "format undo log active state");
-        long self = guard.pageId().pageNo().value();
-        writeLogHeaderU32(handle, UndoPageLayout.FIRST_PAGE_NO, self, "format undo first page no");
-        writeLogHeaderU32(handle, UndoPageLayout.LAST_PAGE_NO, self, "format undo last page no");
-        writeLogHeaderLong(handle, UndoPageLayout.LOG_RECORD_COUNT, 0L, "format undo log record count");
-        writeLogHeaderLong(handle, UndoPageLayout.LOG_LAST_UNDO_NO, 0L, "format undo log last undo no");
-        writeLogHeaderLong(handle, UndoPageLayout.COMMIT_NO, 0L, "format undo commit no");
-        setLogicalHead(UndoLogicalHead.EMPTY);
+        rewriteFirstPage(kind, txnId, UndoPageLayout.STATE_ACTIVE, handle, "format undo first page");
     }
 
     /**
-     * 格式化 undo chain 页。chain 页仍预留 log header 宽度并清零 {@code [63,120)}，这样 record area 起点
-     * 与 first 页完全一致；first-only 访问器会通过 {@link #isFirstPage()} 拒绝解析这些清零字节。
+     * 把已结束且只有一个普通页的 segment 重置为 CACHED。record area 不全页清零：freeOffset 回到起点后旧槽
+     * 不再可达，下一次激活/append 会从头覆盖；这是教学实现相对 InnoDB 更简单的缓存清理策略。
+     */
+    void resetForCache(UndoLogKind kind, UndoSegmentHandle handle) {
+        if (kind == null || handle == null || kind == UndoLogKind.TEMPORARY) {
+            throw new DatabaseValidationException("undo cache reset kind/handle is invalid");
+        }
+        requireFirstPage();
+        requireHandleSpace(handle);
+        if (!guard.pageId().equals(handle.firstPageId()) || !handle.firstPageId().equals(handle.lastPageId())
+                || undoKind() != kind || lastPageNo() != guard.pageId().pageNo().value()
+                || prevPageNo() != FilePageHeader.FIL_NULL || nextPageNo() != FilePageHeader.FIL_NULL) {
+            throw new UndoLogFormatException("only a self-linked single-page undo segment can enter cache: "
+                    + guard.pageId());
+        }
+        rewriteFirstPage(kind, TransactionId.NONE, UndoPageLayout.STATE_CACHED, handle,
+                "reset finalized undo first page for cache");
+    }
+
+    /** 用新的事务 owner 激活 CACHED 首页；调用方随后在同一业务 MTR 追加首条 undo record。 */
+    void activateCached(UndoLogKind kind, TransactionId txnId, UndoSegmentHandle handle) {
+        if (kind == null || txnId == null || handle == null || txnId.isNone()
+                || kind == UndoLogKind.TEMPORARY) {
+            throw new DatabaseValidationException("undo cache activation args are invalid");
+        }
+        requireCachedEmpty(kind, handle);
+        rewriteFirstPage(kind, txnId, UndoPageLayout.STATE_ACTIVE, handle,
+                "activate cached undo first page");
+    }
+
+    /** 校验 CACHED 首页的全部可复用边界；恢复与运行期 pop 共用。 */
+    void requireCachedEmpty(UndoLogKind expectedKind, UndoSegmentHandle handle) {
+        requireFirstPage();
+        requireHandleSpace(handle);
+        if (expectedKind == null || expectedKind == UndoLogKind.TEMPORARY
+                || state() != UndoPageLayout.STATE_CACHED || undoKind() != expectedKind
+                || !transactionId().isNone() || commitNo() != 0L
+                || freeOffset() != UndoPageLayout.RECORD_AREA_START || recordCount() != 0
+                || pageLastUndoNo().value() != 0L || logRecordCount() != 0L
+                || logLastUndoNo().value() != 0L || !logicalHead().isEmpty()
+                || historyPrevPageNo() != FilePageHeader.FIL_NULL
+                || historyNextPageNo() != FilePageHeader.FIL_NULL
+                || !guard.pageId().equals(handle.firstPageId()) || !handle.firstPageId().equals(handle.lastPageId())
+                || firstPageNo() != guard.pageId().pageNo().value()
+                || lastPageNo() != guard.pageId().pageNo().value()
+                || prevPageNo() != FilePageHeader.FIL_NULL || nextPageNo() != FilePageHeader.FIL_NULL) {
+            throw new UndoLogFormatException("cached undo first page is not an empty single-page owner: "
+                    + guard.pageId());
+        }
+    }
+
+    private void rewriteFirstPage(UndoLogKind kind, TransactionId txnId, int state,
+                                  UndoSegmentHandle handle, String reason) {
+        writePageHeader(handle, true);
+        PageEnvelope.writeSiblingLinks(guard, FilePageHeader.FIL_NULL, FilePageHeader.FIL_NULL);
+        writeLogHeaderLong(handle, UndoPageLayout.TRANSACTION_ID, txnId.value(), reason + " transaction id");
+        writeLogHeaderU8(handle, UndoPageLayout.UNDO_KIND, kind.ordinal(), reason + " kind");
+        writeLogHeaderU8(handle, UndoPageLayout.STATE, state, reason + " state");
+        long self = guard.pageId().pageNo().value();
+        writeLogHeaderU32(handle, UndoPageLayout.FIRST_PAGE_NO, self, reason + " first page no");
+        writeLogHeaderU32(handle, UndoPageLayout.LAST_PAGE_NO, self, reason + " last page no");
+        writeLogHeaderLong(handle, UndoPageLayout.LOG_RECORD_COUNT, 0L, reason + " log record count");
+        writeLogHeaderLong(handle, UndoPageLayout.LOG_LAST_UNDO_NO, 0L, reason + " log last undo no");
+        writeLogHeaderLong(handle, UndoPageLayout.COMMIT_NO, 0L, reason + " commit no");
+        setLogicalHead(UndoLogicalHead.EMPTY);
+        setHistoryLinks(FilePageHeader.FIL_NULL, FilePageHeader.FIL_NULL);
+    }
+
+    /**
+     * 格式化 undo chain 页。chain 页预留 log header 宽度，先清零 {@code [63,136)} 再写入复制的 kind，
+     * 使 record area 起点与 first 页一致；其余 first-only 访问器仍通过 {@link #isFirstPage()} 拒绝。
      *
      * @param handle segment 定位；页必须与 handle 所属表空间一致。
      */
-    void formatChainPage(UndoSegmentHandle handle) {
-        if (handle == null) {
-            throw new DatabaseValidationException("undo chain page format handle must not be null");
+    void formatChainPage(UndoLogKind kind, UndoSegmentHandle handle) {
+        if (kind == null || handle == null) {
+            throw new DatabaseValidationException("undo chain page format kind/handle must not be null");
         }
         requireHandleSpace(handle);
         writePageHeader(handle, false);
         UndoRedoDeltas.withUndoCategory(mtr, "clear undo chain page log header reservation",
                 () -> guard.writeBytes(UndoPageLayout.TRANSACTION_ID,
                         new byte[UndoPageLayout.LOG_HEADER_END - UndoPageLayout.TRANSACTION_ID]));
+        writeLogHeaderU8(handle, UndoPageLayout.UNDO_KIND, kind.ordinal(),
+                "copy undo log kind to chain page");
     }
 
     /**
@@ -238,8 +299,8 @@ public final class UndoPage {
     }
 
     /**
-     * 打开既有页时统一执行版本守门。旧格式的 record area 从 105 开始，若按当前 120 偏移继续解析会把
-     * 旧 record 误当 header 或跳过，因此 legacy/未知版本都必须快速失败，不能猜测兼容。
+     * 打开既有页时统一执行版本守门。v1/v2 的 record area 分别从 105/120 开始，若按当前 136 偏移继续解析会把
+     * 旧 record 误当 history header 或跳过，因此 legacy/未知版本都必须快速失败，不能猜测兼容。
      */
     void requireCurrentFormat() {
         int version = formatVersion();
@@ -280,9 +341,8 @@ public final class UndoPage {
         return TransactionId.of(guard.readLong(UndoPageLayout.TRANSACTION_ID));
     }
 
-    /** first 页 log header 中的 undo log 类型。 */
+    /** 当前普通 UNDO 页携带的 log 类型；v3 在 first/chain 页都必须可独立读取。 */
     UndoLogKind undoKind() {
-        requireFirstPage();
         int idx = getU8(UndoPageLayout.UNDO_KIND);
         UndoLogKind[] all = UndoLogKind.values();
         if (idx < 0 || idx >= all.length) {
@@ -291,7 +351,7 @@ public final class UndoPage {
         return all[idx];
     }
 
-    /** first 页 log header 中的 undo log 状态（ACTIVE/COMMITTED）。 */
+    /** first 页 log header 中的 undo log 状态（ACTIVE/COMMITTED/CACHED）。 */
     int state() {
         requireFirstPage();
         return getU8(UndoPageLayout.STATE);
@@ -300,6 +360,10 @@ public final class UndoPage {
     /** 写 first 页 log header 状态（X，R 1.2）。commit 时标 COMMITTED，使恢复期能据此跳过已提交事务回滚。 */
     void setLogState(int state) {
         requireFirstPage();
+        if (state != UndoPageLayout.STATE_ACTIVE && state != UndoPageLayout.STATE_COMMITTED
+                && state != UndoPageLayout.STATE_CACHED) {
+            throw new DatabaseValidationException("unknown undo log state: " + state);
+        }
         writeLogHeaderU8(UndoPageLayout.STATE, state, "write undo log state");
     }
 
@@ -313,6 +377,48 @@ public final class UndoPage {
     void setCommitNo(long commitNo) {
         requireFirstPage();
         writeLogHeaderLong(UndoPageLayout.COMMIT_NO, commitNo, "write undo commit no");
+    }
+
+    /** first 页在 rollback-segment history 双向链中的前驱 pageNo；无前驱为 FIL_NULL。 */
+    long historyPrevPageNo() {
+        requireFirstPage();
+        return guard.readLong(UndoPageLayout.HISTORY_PREV_PAGE_NO);
+    }
+
+    /** first 页在 rollback-segment history 双向链中的后继 pageNo；无后继为 FIL_NULL。 */
+    long historyNextPageNo() {
+        requireFirstPage();
+        return guard.readLong(UndoPageLayout.HISTORY_NEXT_PAGE_NO);
+    }
+
+    /**
+     * 更新 first 页的 history prev/next。该链接与 FIL sibling links 无关：FIL 链连接同一 undo segment 的页，
+     * history 链连接不同事务的 UPDATE undo first page；二者不能混用。
+     */
+    void setHistoryLinks(long prevPageNo, long nextPageNo) {
+        requireFirstPage();
+        validateHistoryPageNo(prevPageNo);
+        validateHistoryPageNo(nextPageNo);
+        writeHistoryLinkLong(UndoPageLayout.HISTORY_PREV_PAGE_NO, prevPageNo,
+                "write undo history prev link");
+        writeHistoryLinkLong(UndoPageLayout.HISTORY_NEXT_PAGE_NO, nextPageNo,
+                "write undo history next link");
+    }
+
+    /** purge 摘头时把新 head.prev 清为 FIL_NULL。 */
+    void setHistoryPrevPageNo(long prevPageNo) {
+        requireFirstPage();
+        validateHistoryPageNo(prevPageNo);
+        writeHistoryLinkLong(UndoPageLayout.HISTORY_PREV_PAGE_NO, prevPageNo,
+                "write undo history prev link");
+    }
+
+    /** commit append 时把旧 tail.next 指向新节点。 */
+    void setHistoryNextPageNo(long nextPageNo) {
+        requireFirstPage();
+        validateHistoryPageNo(nextPageNo);
+        writeHistoryLinkLong(UndoPageLayout.HISTORY_NEXT_PAGE_NO, nextPageNo,
+                "write undo history next link");
     }
 
     /** first 页 log header 中的链首页号。 */
@@ -458,6 +564,18 @@ public final class UndoPage {
     private void writeLogHeaderBytes(int offset, byte[] value, String reason) {
         UndoRedoDeltas.writeBytes(mtr, guard, guard.pageId(), UndoMetadataDeltaKind.UNDO_LOG_HEADER_FIELD,
                 segmentId().value(), inodeSlot(), offset, value, reason);
+    }
+
+    /** history 链接使用独立 redo 分类，恢复期可区分事务状态与跨事务节点链接。 */
+    private void writeHistoryLinkLong(int offset, long value, String reason) {
+        UndoRedoDeltas.writeLong(mtr, guard, guard.pageId(), UndoMetadataDeltaKind.UNDO_HISTORY_LINK_FIELD,
+                segmentId().value(), inodeSlot(), offset, value, reason);
+    }
+
+    private static void validateHistoryPageNo(long pageNo) {
+        if (pageNo < 0 || pageNo > FilePageHeader.FIL_NULL) {
+            throw new DatabaseValidationException("undo history page no is out of range: " + pageNo);
+        }
     }
 
     private void requireHandleSpace(UndoSegmentHandle handle) {

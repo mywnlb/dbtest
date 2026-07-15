@@ -37,6 +37,8 @@ import cn.zhangyis.db.storage.record.type.ColumnValue;
 import cn.zhangyis.db.storage.record.type.TypeCodecRegistry;
 import cn.zhangyis.db.storage.undo.UndoLogSegment;
 import cn.zhangyis.db.storage.undo.UndoLogSegmentAccess;
+import cn.zhangyis.db.storage.undo.UndoLogKind;
+import cn.zhangyis.db.storage.undo.UndoLogicalHead;
 import cn.zhangyis.db.storage.undo.UndoLogFormatException;
 import cn.zhangyis.db.storage.undo.UndoPageOverflowException;
 import cn.zhangyis.db.storage.undo.UndoRecord;
@@ -125,21 +127,21 @@ class UndoLogManagerTest {
             h.txnMgr.assignWriteId(txn);
 
             MiniTransaction m = h.mgr.begin();
-            RollPointer rp = h.undoMgr.beforeInsert(txn, m, TABLE_ID, INDEX_ID, keyOf(100), keyDef(), schema());
+            RollPointer rp = UndoTestWrites.insert(h.undoMgr, txn, m, TABLE_ID, INDEX_ID, keyOf(100), keyDef(), schema());
             h.mgr.commit(m);
 
             assertFalse(rp.isNull(), "first write must return a non-NULL insert roll pointer");
             assertTrue(rp.insert(), "insert undo roll pointer must have insert flag set");
 
             UndoContext ctx = txn.undoContext();
-            assertNotNull(ctx, "ensureUndoContext must bind an UndoContext on first write");
+            assertNotNull(ctx, "planned append must bind an UndoContext on first write");
             assertEquals(UndoNo.of(1), ctx.lastUndoNo(), "first append advances lastUndoNo to 1");
-            assertEquals(rp, ctx.lastRollPointer(), "ctx.lastRollPointer is the just-returned roll pointer");
+            assertEquals(rp, UndoTestContexts.rollPointer(ctx), "newest local head is the returned pointer");
             // roll pointer 指向 undo segment 首页（单条记录不跨页）
-            assertEquals(ctx.undoFirstPageId().pageNo(), rp.pageNo());
+            assertEquals(UndoTestContexts.firstPage(ctx).pageNo(), rp.pageNo());
             // 内存 rseg slot 落该段首页
-            assertEquals(ctx.undoFirstPageId(),
-                    h.slots.insertUndoFirstPageId(ctx.slotId()),
+            assertEquals(UndoTestContexts.firstPage(ctx),
+                    h.slots.undoFirstPageId(UndoTestContexts.slot(ctx)),
                     "in-memory rseg slot must point to the insert undo segment first page");
             assertEquals(RollbackSegmentId.of(0), ctx.rollbackSegmentId(),
                     "ctx rseg id comes from the slot manager's fixed default rseg");
@@ -166,7 +168,7 @@ class UndoLogManagerTest {
             h.txnMgr.assignWriteId(txn);
             MiniTransaction write = h.mgr.begin();
             assertThrows(UndoSlotOwnershipConflictException.class,
-                    () -> h.undoMgr.beforeInsert(txn, write, TABLE_ID, INDEX_ID,
+                    () -> UndoTestWrites.insert(h.undoMgr, txn, write, TABLE_ID, INDEX_ID,
                             keyOf(100), keyDef(), schema()));
             h.mgr.rollbackUncommitted(write);
 
@@ -198,7 +200,7 @@ class UndoLogManagerTest {
                 Future<?> writer = executor.submit(() -> {
                     MiniTransaction write = h.mgr.begin();
                     try {
-                        h.undoMgr.beforeInsert(txn, write, TABLE_ID, INDEX_ID,
+                        UndoTestWrites.insert(h.undoMgr, txn, write, TABLE_ID, INDEX_ID,
                                 keyOf(100), keyDef(), schema());
                         h.mgr.commit(write);
                     } catch (RuntimeException error) {
@@ -216,8 +218,8 @@ class UndoLogManagerTest {
 
                 ExecutionException failure = assertThrows(ExecutionException.class,
                         () -> writer.get(5, TimeUnit.SECONDS));
-                assertTrue(failure.getCause() instanceof UndoClaimPublicationException,
-                        "post-bind publication conflict is fatal, not a retryable format error");
+                assertTrue(failure.getCause() instanceof UndoWriteFatalException,
+                        "post-bind publication conflict is a fail-stop physical write error");
                 assertEquals(1, h.slots.activeSlotCount(), "bound ACTIVE slot remains fenced");
                 assertNull(txn.undoContext(), "context is not published after persistent claim failure");
                 assertEquals(1, blocking[0].createAttempts(), "same-process recovery does not recreate the segment");
@@ -242,7 +244,7 @@ class UndoLogManagerTest {
             Transaction txn = h.txnMgr.begin(TransactionOptions.defaults());
             h.txnMgr.assignWriteId(txn);
             MiniTransaction write = h.mgr.begin();
-            h.undoMgr.beforeInsert(txn, write, TABLE_ID, INDEX_ID, keyOf(101), keyDef(), schema());
+            UndoTestWrites.insert(h.undoMgr, txn, write, TABLE_ID, INDEX_ID, keyOf(101), keyDef(), schema());
             h.mgr.commit(write);
             h.txnMgr.prepareCommit(txn);
 
@@ -250,11 +252,11 @@ class UndoLogManagerTest {
             ExecutorService executor = Executors.newFixedThreadPool(2);
             try {
                 Future<?> first = executor.submit(
-                        () -> h.finalization.finalizer().finalizeInsertCommit(txn, context));
+                        () -> h.finalization.finalizer().finalizeCommit(txn, context, null));
                 assertTrue(blocking[0].awaitFirstDrop(), "first terminal command reached the drop boundary");
 
                 Future<?> duplicate = executor.submit(
-                        () -> h.finalization.finalizer().finalizeInsertCommit(txn, context));
+                        () -> h.finalization.finalizer().finalizeCommit(txn, context, null));
                 ExecutionException duplicateFailure = assertThrows(ExecutionException.class,
                         () -> duplicate.get(5, TimeUnit.SECONDS));
                 assertTrue(duplicateFailure.getCause() instanceof DatabaseRuntimeException,
@@ -280,14 +282,14 @@ class UndoLogManagerTest {
             Transaction txn = h.txnMgr.begin(TransactionOptions.defaults());
             TransactionId creator = h.txnMgr.assignWriteId(txn);
             MiniTransaction write = h.mgr.begin();
-            h.undoMgr.beforeInsert(txn, write, TABLE_ID, INDEX_ID, keyOf(102), keyDef(), schema());
+            UndoTestWrites.insert(h.undoMgr, txn, write, TABLE_ID, INDEX_ID, keyOf(102), keyDef(), schema());
             h.mgr.commit(write);
             UndoContext context = txn.undoContext();
 
             assertThrows(UndoLogFormatException.class,
                     () -> h.finalization.finalizer().finalizeRecoveredRollback(
-                            context.slotId(), context.undoFirstPageId(), TransactionId.of(creator.value() + 1)));
-            assertEquals(context.undoFirstPageId(), h.slots.insertUndoFirstPageId(context.slotId()),
+                            context.bindings(), TransactionId.of(creator.value() + 1)));
+            assertEquals(UndoTestContexts.firstPage(context), h.slots.undoFirstPageId(UndoTestContexts.slot(context)),
                     "pre-physical identity failure restores the original ACTIVE owner");
 
             h.txnMgr.prepareCommit(txn);
@@ -307,7 +309,7 @@ class UndoLogManagerTest {
             Transaction oldTxn = h.txnMgr.begin(TransactionOptions.defaults());
             TransactionId oldCreator = h.txnMgr.assignWriteId(oldTxn);
             MiniTransaction oldWrite = h.mgr.begin();
-            h.undoMgr.beforeInsert(oldTxn, oldWrite, TABLE_ID, INDEX_ID, keyOf(103), keyDef(), schema());
+            UndoTestWrites.insert(h.undoMgr, oldTxn, oldWrite, TABLE_ID, INDEX_ID, keyOf(103), keyDef(), schema());
             h.mgr.commit(oldWrite);
             UndoContext oldContext = oldTxn.undoContext();
             h.txnMgr.prepareCommit(oldTxn);
@@ -318,17 +320,17 @@ class UndoLogManagerTest {
             Transaction newTxn = h.txnMgr.begin(TransactionOptions.defaults());
             h.txnMgr.assignWriteId(newTxn);
             MiniTransaction newWrite = h.mgr.begin();
-            h.undoMgr.beforeInsert(newTxn, newWrite, TABLE_ID, INDEX_ID, keyOf(104), keyDef(), schema());
+            UndoTestWrites.insert(h.undoMgr, newTxn, newWrite, TABLE_ID, INDEX_ID, keyOf(104), keyDef(), schema());
             h.mgr.commit(newWrite);
             UndoContext newContext = newTxn.undoContext();
-            assertEquals(oldContext.slotId(), newContext.slotId(), "completed slot is reused by first-fit");
+            assertEquals(UndoTestContexts.slot(oldContext), UndoTestContexts.slot(newContext), "completed slot is reused by first-fit");
 
             assertThrows(DatabaseRuntimeException.class,
                     () -> h.finalization.finalizer().finalizeRecoveredRollback(
-                            oldContext.slotId(), oldContext.undoFirstPageId(), oldCreator));
+                            oldContext.bindings(), oldCreator));
             assertEquals(1, counting[0].dropAttempts(),
                     "stale finalizer is rejected before touching the new segment inode/pages");
-            assertEquals(newContext.undoFirstPageId(), h.slots.insertUndoFirstPageId(newContext.slotId()));
+            assertEquals(UndoTestContexts.firstPage(newContext), h.slots.undoFirstPageId(UndoTestContexts.slot(newContext)));
 
             h.txnMgr.prepareCommit(newTxn);
             h.undoMgr.onCommit(newTxn);
@@ -346,17 +348,17 @@ class UndoLogManagerTest {
             RollPointer[] rps = new RollPointer[3];
             for (int i = 0; i < 3; i++) {
                 MiniTransaction m = h.mgr.begin();
-                rps[i] = h.undoMgr.beforeInsert(txn, m, TABLE_ID, INDEX_ID, keyOf(100 + i), keyDef(), schema());
+                rps[i] = UndoTestWrites.insert(h.undoMgr, txn, m, TABLE_ID, INDEX_ID, keyOf(100 + i), keyDef(), schema());
                 h.mgr.commit(m);
             }
 
             UndoContext ctx = txn.undoContext();
             assertEquals(UndoNo.of(3), ctx.lastUndoNo(), "lastUndoNo increments across inserts");
-            assertEquals(rps[2], ctx.lastRollPointer());
+            assertEquals(rps[2], UndoTestContexts.rollPointer(ctx));
 
             // 读回验证 undoNo 递增 + prevRollPointer 串链
             MiniTransaction read = h.mgr.begin();
-            UndoLogSegment seg = h.access.open(read, ctx.undoFirstPageId(), PageLatchMode.SHARED);
+            UndoLogSegment seg = h.access.open(read, UndoTestContexts.firstPage(ctx), PageLatchMode.SHARED);
             UndoRecord r1 = seg.readRecord(rps[0], keyDef(), schema());
             UndoRecord r2 = seg.readRecord(rps[1], keyDef(), schema());
             UndoRecord r3 = seg.readRecord(rps[2], keyDef(), schema());
@@ -396,7 +398,8 @@ class UndoLogManagerTest {
             RollbackSegmentSlotManager slots = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), SLOT_CAPACITY);
             UndoFinalizationTestSupport.Components finalization = UndoFinalizationTestSupport.create(
                     mgr, pool, PS, access, allocator, slots);
-            UndoLogManager undoMgr = finalization.manager(access, UNDO_SPACE, new HistoryList(), mgr);
+            HistoryList history = new HistoryList();
+            UndoLogManager undoMgr = finalization.manager(access, UNDO_SPACE, history, mgr);
             TransactionManager txnMgr = new TransactionManager(new TransactionSystem());
 
             MiniTransaction boot = mgr.begin();
@@ -407,8 +410,8 @@ class UndoLogManagerTest {
             Transaction txn = txnMgr.begin(TransactionOptions.defaults());
             widHolder[0] = txnMgr.assignWriteId(txn);
             MiniTransaction m = mgr.begin();
-            holder[0] = undoMgr.beforeInsert(txn, m, TABLE_ID, INDEX_ID, keyOf(700), keyDef(), schema());
-            firstPageHolder[0] = txn.undoContext().undoFirstPageId();
+            holder[0] = UndoTestWrites.insert(undoMgr, txn, m, TABLE_ID, INDEX_ID, keyOf(700), keyDef(), schema());
+            firstPageHolder[0] = UndoTestContexts.firstPage(txn.undoContext());
             mgr.commit(m);
             txnMgr.commit(txn);
             flushAllDirty(pool, store, redo);
@@ -445,7 +448,7 @@ class UndoLogManagerTest {
             // 未 assignWriteId → transactionId 为 NONE
             MiniTransaction m = h.mgr.begin();
             assertThrows(TransactionStateException.class,
-                    () -> h.undoMgr.beforeInsert(txn, m, TABLE_ID, INDEX_ID, keyOf(1), keyDef(), schema()));
+                    () -> UndoTestWrites.insert(h.undoMgr, txn, m, TABLE_ID, INDEX_ID, keyOf(1), keyDef(), schema()));
             h.mgr.rollbackUncommitted(m);
         });
     }
@@ -459,7 +462,7 @@ class UndoLogManagerTest {
 
             MiniTransaction m = h.mgr.begin();
             assertThrows(TransactionStateException.class,
-                    () -> h.undoMgr.beforeInsert(txn, m, TABLE_ID, INDEX_ID, keyOf(1), keyDef(), schema()));
+                    () -> UndoTestWrites.insert(h.undoMgr, txn, m, TABLE_ID, INDEX_ID, keyOf(1), keyDef(), schema()));
             h.mgr.rollbackUncommitted(m);
         });
     }
@@ -471,11 +474,11 @@ class UndoLogManagerTest {
             h.txnMgr.assignWriteId(txn);
             MiniTransaction m = h.mgr.begin();
             assertThrows(TransactionStateException.class,
-                    () -> h.undoMgr.beforeInsert(null, m, TABLE_ID, INDEX_ID, keyOf(1), keyDef(), schema()));
+                    () -> UndoTestWrites.insert(h.undoMgr, null, m, TABLE_ID, INDEX_ID, keyOf(1), keyDef(), schema()));
             assertThrows(TransactionStateException.class,
-                    () -> h.undoMgr.beforeInsert(txn, null, TABLE_ID, INDEX_ID, keyOf(1), keyDef(), schema()));
+                    () -> UndoTestWrites.insert(h.undoMgr, txn, null, TABLE_ID, INDEX_ID, keyOf(1), keyDef(), schema()));
             assertThrows(TransactionStateException.class,
-                    () -> h.undoMgr.beforeInsert(txn, m, TABLE_ID, INDEX_ID, null, keyDef(), schema()));
+                    () -> UndoTestWrites.insert(h.undoMgr, txn, m, TABLE_ID, INDEX_ID, null, keyDef(), schema()));
             h.mgr.rollbackUncommitted(m);
         });
     }
@@ -488,7 +491,7 @@ class UndoLogManagerTest {
             Transaction txn = h.txnMgr.begin(TransactionOptions.defaults());
             h.txnMgr.assignWriteId(txn);
             MiniTransaction m = h.mgr.begin();
-            h.undoMgr.beforeInsert(txn, m, TABLE_ID, INDEX_ID, keyOf(100), keyDef(), schema());
+            UndoTestWrites.insert(h.undoMgr, txn, m, TABLE_ID, INDEX_ID, keyOf(100), keyDef(), schema());
             h.mgr.commit(m);
             assertEquals(1, h.slots.activeSlotCount(), "slot claimed on first write");
 
@@ -503,7 +506,7 @@ class UndoLogManagerTest {
             Transaction txn2 = h.txnMgr.begin(TransactionOptions.defaults());
             h.txnMgr.assignWriteId(txn2);
             MiniTransaction m2 = h.mgr.begin();
-            h.undoMgr.beforeInsert(txn2, m2, TABLE_ID, INDEX_ID, keyOf(200), keyDef(), schema());
+            UndoTestWrites.insert(h.undoMgr, txn2, m2, TABLE_ID, INDEX_ID, keyOf(200), keyDef(), schema());
             h.mgr.commit(m2);
             assertEquals(1, h.slots.activeSlotCount(), "released slot reusable by next txn");
             h.txnMgr.prepareCommit(txn2);
@@ -527,7 +530,7 @@ class UndoLogManagerTest {
             Transaction txn = h.txnMgr.begin(TransactionOptions.defaults());
             h.txnMgr.assignWriteId(txn);
             MiniTransaction write = h.mgr.begin();
-            h.undoMgr.beforeInsert(txn, write, TABLE_ID, INDEX_ID, keyOf(100), keyDef(), schema());
+            UndoTestWrites.insert(h.undoMgr, txn, write, TABLE_ID, INDEX_ID, keyOf(100), keyDef(), schema());
             h.mgr.commit(write);
             UndoContext context = txn.undoContext();
             int batchesBeforeFinalization = h.mgr.redoLogManager().bufferedBatches().size();
@@ -536,15 +539,16 @@ class UndoLogManagerTest {
             assertThrows(SimulatedFinalizationCrashException.class, () -> h.undoMgr.onCommit(txn));
 
             assertEquals(TransactionState.ACTIVE, txn.state(), "transaction terminal state was not published");
-            assertTrue(h.slots.isOccupied(context.slotId()),
+            assertTrue(h.slots.isOccupied(UndoTestContexts.slot(context)),
                     "simulated old process still has the pre-crash memory projection");
             assertThrows(DatabaseValidationException.class, () -> h.undoMgr.onCommit(txn),
                     "post-commit crash leaves FINALIZING and rejects same-process retry before page access");
             MiniTransaction read = h.mgr.begin();
             var snapshot = h.finalization.header().read(read, UNDO_SPACE,
-                    h.slots.rollbackSegmentId(), h.slots.slotCapacity());
+                    h.slots.rollbackSegmentId(), h.slots.slotCapacity(),
+                    h.finalization.cache().capacityPerKind());
             h.mgr.commit(read);
-            assertFalse(snapshot.occupiedSlots().containsKey(context.slotId()),
+            assertFalse(snapshot.occupiedSlots().containsKey(UndoTestContexts.slot(context)),
                     "page3 is recovery authority and was cleared before the simulated crash");
 
             List<RedoLogBatch> batches = h.mgr.redoLogManager().bufferedBatches();
@@ -557,12 +561,49 @@ class UndoLogManagerTest {
                     "the same batch contains the undo page free intent");
             assertTrue(records.stream().anyMatch(record -> record instanceof UndoMetadataDeltaRecord delta
                             && delta.kind() == UndoMetadataDeltaKind.RSEG_SLOT
-                            && delta.subIndex() == context.slotId().value()),
+                            && delta.subIndex() == UndoTestContexts.slot(context).value()),
                     "the same batch clears the exact page3 owner slot");
             assertTrue(records.stream().anyMatch(record -> record instanceof TransactionStateDeltaRecord delta
                             && delta.reason() == TransactionStateDeltaReason.COMMIT
                             && delta.toState() == TransactionStateDeltaState.COMMITTED),
                     "the same batch records the insert commit diagnostic boundary");
+        });
+    }
+
+    /** UPDATE commit 的 crash point 位于持久挂链之后、内存 history 发布之前；重启必须能仅凭磁盘链恢复。 */
+    @Test
+    void crashAfterPersistentUpdateHistoryAppendLeavesRecoverableChain() {
+        AtomicBoolean injected = new AtomicBoolean();
+        onPool((kind, slotId, firstPageId) -> {
+            if (kind == UndoFinalizationKind.UPDATE_COMMIT && injected.compareAndSet(false, true)) {
+                throw new SimulatedFinalizationCrashException("crash after UPDATE history append commit");
+            }
+        }, h -> {
+            Transaction txn = h.txnMgr.begin(TransactionOptions.defaults());
+            h.txnMgr.assignWriteId(txn);
+            MiniTransaction write = h.mgr.begin();
+            UndoTestWrites.update(h.undoMgr, txn, write, TABLE_ID, INDEX_ID, keyOf(100), keyOf(100),
+                    new HiddenColumns(txn.transactionId(), RollPointer.NULL), keyDef(), schema());
+            h.mgr.commit(write);
+            UndoLogBinding update = txn.undoContext().binding(UndoLogKind.UPDATE);
+
+            h.txnMgr.prepareCommit(txn);
+            assertThrows(SimulatedFinalizationCrashException.class, () -> h.undoMgr.onCommit(txn));
+
+            assertEquals(0, h.history.committedSize(),
+                    "old process did not publish the runtime projection before the simulated crash");
+            assertTrue(h.slots.isOccupied(update.slotId()), "old slot projection is intentionally stale");
+            MiniTransaction read = h.mgr.beginReadOnly();
+            var page3 = h.finalization.header().read(read, UNDO_SPACE,
+                    h.slots.rollbackSegmentId(), h.slots.slotCapacity(),
+                    h.finalization.cache().capacityPerKind());
+            var node = h.access.inspectHistoryNode(read, update.firstPageId());
+            h.mgr.commit(read);
+            assertEquals(1L, page3.historyBase().length());
+            assertEquals(java.util.Optional.of(update.firstPageId()), page3.historyBase().headPageId());
+            assertEquals(txn.transactionNo(), page3.historyBase().lastTransactionNo());
+            assertTrue(node.isCommitted());
+            assertEquals(txn.transactionNo(), node.committedTransactionNo());
         });
     }
 
@@ -577,18 +618,18 @@ class UndoLogManagerTest {
         });
     }
 
-    // ---- T1.3e：beforeUpdate（UPDATE undo 写）+ onCommit 含 update 不回收 slot ----
+    // ---- T1.3e：planUpdate/appendPlanned（UPDATE undo 写）+ onCommit 含 update 不回收 slot ----
 
     @Test
-    void beforeUpdateWritesUpdateUndoChainsAndCarriesOldImage() {
+    void plannedUpdateWritesUpdateUndoChainsAndCarriesOldImage() {
         onPool(h -> {
             Transaction txn = h.txnMgr.begin(TransactionOptions.defaults());
             TransactionId wid = h.txnMgr.assignWriteId(txn);
             MiniTransaction m = h.mgr.begin();
-            RollPointer insRp = h.undoMgr.beforeInsert(txn, m, TABLE_ID, INDEX_ID, keyOf(100), keyDef(), schema());
+            RollPointer insRp = UndoTestWrites.insert(h.undoMgr, txn, m, TABLE_ID, INDEX_ID, keyOf(100), keyDef(), schema());
             // 该行被本事务更新：旧 image = 更新前全列值 + 更新前隐藏列（DB_ROLL_PTR=insRp，即版本链上一版本）
             HiddenColumns oldHidden = new HiddenColumns(wid, insRp);
-            RollPointer updRp = h.undoMgr.beforeUpdate(txn, m, TABLE_ID, INDEX_ID, keyOf(100),
+            RollPointer updRp = UndoTestWrites.update(h.undoMgr, txn, m, TABLE_ID, INDEX_ID, keyOf(100),
                     List.of(new ColumnValue.IntValue(100)), oldHidden, keyDef(), schema());
             h.mgr.commit(m);
 
@@ -596,16 +637,17 @@ class UndoLogManagerTest {
             assertFalse(updRp.insert(), "update undo roll pointer insert flag must be false");
             UndoContext ctx = txn.undoContext();
             assertEquals(UndoNo.of(2), ctx.lastUndoNo(), "undoNo increments across insert+update");
-            assertEquals(updRp, ctx.lastRollPointer());
-            assertTrue(ctx.hasUpdateUndo(), "beforeUpdate marks hasUpdateUndo");
+            assertEquals(updRp, ctx.head(UndoLogKind.UPDATE).rollPointer());
+            assertTrue(ctx.hasBinding(UndoLogKind.UPDATE));
 
             // 读回 update undo：prevRollPointer 串事务回滚链(=insRp)，旧 image 等值
             MiniTransaction r = h.mgr.begin();
-            UndoLogSegment seg = h.access.open(r, ctx.undoFirstPageId(), PageLatchMode.SHARED);
+            UndoLogSegment seg = h.access.open(r, ctx.binding(UndoLogKind.UPDATE).firstPageId(), PageLatchMode.SHARED);
             UndoRecord rec = seg.readRecord(updRp, keyDef(), schema());
             h.mgr.rollbackUncommitted(r);
             assertEquals(UndoRecordType.UPDATE_ROW, rec.type());
-            assertEquals(insRp, rec.prevRollPointer(), "update undo prevRollPointer chains tx rollback chain");
+            assertEquals(RollPointer.NULL, rec.prevRollPointer(),
+                    "first UPDATE record starts its independent local rollback chain");
             assertEquals(oldHidden, rec.oldHiddenColumns(), "old hidden = pre-update version pointer (版本链)");
             assertEquals(List.of(new ColumnValue.IntValue(100)), rec.oldColumnValues());
             h.txnMgr.commit(txn);
@@ -613,14 +655,14 @@ class UndoLogManagerTest {
     }
 
     @Test
-    void beforeDeleteWritesDeleteMarkUndoChainsAndKeepsSlotOnCommit() {
+    void plannedDeleteWritesDeleteMarkUndoChainsAndKeepsSlotOnCommit() {
         onPool(h -> {
             Transaction txn = h.txnMgr.begin(TransactionOptions.defaults());
             TransactionId wid = h.txnMgr.assignWriteId(txn);
             MiniTransaction m = h.mgr.begin();
-            RollPointer insRp = h.undoMgr.beforeInsert(txn, m, TABLE_ID, INDEX_ID, keyOf(100), keyDef(), schema());
+            RollPointer insRp = UndoTestWrites.insert(h.undoMgr, txn, m, TABLE_ID, INDEX_ID, keyOf(100), keyDef(), schema());
             HiddenColumns oldHidden = new HiddenColumns(wid, insRp);
-            RollPointer delRp = h.undoMgr.beforeDelete(txn, m, TABLE_ID, INDEX_ID, keyOf(100),
+            RollPointer delRp = UndoTestWrites.delete(h.undoMgr, txn, m, TABLE_ID, INDEX_ID, keyOf(100),
                     List.of(new ColumnValue.IntValue(100)), oldHidden, keyDef(), schema());
             h.mgr.commit(m);
 
@@ -628,21 +670,23 @@ class UndoLogManagerTest {
             assertFalse(delRp.insert(), "delete-mark undo roll pointer insert flag must be false");
             UndoContext ctx = txn.undoContext();
             assertEquals(UndoNo.of(2), ctx.lastUndoNo());
-            assertTrue(ctx.hasUpdateUndo(), "beforeDelete marks hasUpdateUndo (delete undo must survive commit)");
+            assertTrue(ctx.hasBinding(UndoLogKind.UPDATE), "delete undo uses the UPDATE log");
 
             MiniTransaction r = h.mgr.begin();
-            UndoLogSegment seg = h.access.open(r, ctx.undoFirstPageId(), PageLatchMode.SHARED);
+            UndoLogSegment seg = h.access.open(r, ctx.binding(UndoLogKind.UPDATE).firstPageId(), PageLatchMode.SHARED);
             UndoRecord rec = seg.readRecord(delRp, keyDef(), schema());
             h.mgr.rollbackUncommitted(r);
             assertEquals(UndoRecordType.DELETE_MARK, rec.type());
-            assertEquals(insRp, rec.prevRollPointer(), "delete-mark undo chains tx rollback chain");
+            assertEquals(RollPointer.NULL, rec.prevRollPointer(),
+                    "first DELETE_MARK starts the independent UPDATE-log chain");
             assertEquals(oldHidden, rec.oldHiddenColumns());
 
             // commit 不回收含 delete undo 事务的 slot
             h.txnMgr.prepareCommit(txn);
             h.undoMgr.onCommit(txn);
             h.txnMgr.commit(txn);
-            assertEquals(1, h.slots.activeSlotCount(), "slot retained when txn wrote DELETE_MARK undo");
+            assertEquals(1, h.slots.activeSlotCount(),
+                    "mixed commit drops INSERT slot and retains only committed UPDATE slot");
         });
     }
 
@@ -652,17 +696,17 @@ class UndoLogManagerTest {
             Transaction txn = h.txnMgr.begin(TransactionOptions.defaults());
             TransactionId wid = h.txnMgr.assignWriteId(txn);
             MiniTransaction m = h.mgr.begin();
-            RollPointer insRp = h.undoMgr.beforeInsert(txn, m, TABLE_ID, INDEX_ID, keyOf(100), keyDef(), schema());
-            h.undoMgr.beforeUpdate(txn, m, TABLE_ID, INDEX_ID, keyOf(100),
+            RollPointer insRp = UndoTestWrites.insert(h.undoMgr, txn, m, TABLE_ID, INDEX_ID, keyOf(100), keyDef(), schema());
+            UndoTestWrites.update(h.undoMgr, txn, m, TABLE_ID, INDEX_ID, keyOf(100),
                     List.of(new ColumnValue.IntValue(100)), new HiddenColumns(wid, insRp), keyDef(), schema());
             h.mgr.commit(m);
-            assertEquals(1, h.slots.activeSlotCount());
+            assertEquals(2, h.slots.activeSlotCount(), "mixed transaction owns one slot per undo kind");
 
             h.txnMgr.prepareCommit(txn);
             h.undoMgr.onCommit(txn);
             h.txnMgr.commit(txn);
             assertEquals(1, h.slots.activeSlotCount(),
-                    "slot retained when txn wrote UPDATE undo (T1.4 MVCC/purge needs it)");
+                    "commit drops INSERT slot and retains UPDATE undo for MVCC/purge");
         });
     }
 
@@ -673,7 +717,7 @@ class UndoLogManagerTest {
             Transaction txn = h.txnMgr.begin(TransactionOptions.defaults());
             h.txnMgr.assignWriteId(txn);
             MiniTransaction m = h.mgr.begin();
-            durableUndo.beforeInsert(txn, m, TABLE_ID, INDEX_ID, keyOf(100), keyDef(), schema());
+            UndoTestWrites.insert(durableUndo, txn, m, TABLE_ID, INDEX_ID, keyOf(100), keyDef(), schema());
             h.mgr.commit(m);
 
             h.txnMgr.prepareCommit(txn);
@@ -702,7 +746,6 @@ class UndoLogManagerTest {
                 new ColumnValue.StringValue("reopen".repeat(2_800)));
         RollPointer[] ins = new RollPointer[1];
         RollPointer[] upd = new RollPointer[1];
-        PageId[] firstPage = new PageId[1];
         TransactionId[] widHolder = new TransactionId[1];
 
         try (PageStore store = new FileChannelPageStore();
@@ -716,7 +759,8 @@ class UndoLogManagerTest {
             RollbackSegmentSlotManager slots = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), SLOT_CAPACITY);
             UndoFinalizationTestSupport.Components finalization = UndoFinalizationTestSupport.create(
                     mgr, pool, PS, access, allocator, slots);
-            UndoLogManager undoMgr = finalization.manager(access, UNDO_SPACE, new HistoryList(), mgr);
+            HistoryList history = new HistoryList();
+            UndoLogManager undoMgr = finalization.manager(access, UNDO_SPACE, history, mgr);
             TransactionManager txnMgr = new TransactionManager(new TransactionSystem());
 
             MiniTransaction boot = mgr.begin();
@@ -727,10 +771,9 @@ class UndoLogManagerTest {
             Transaction txn = txnMgr.begin(TransactionOptions.defaults());
             widHolder[0] = txnMgr.assignWriteId(txn);
             MiniTransaction m = mgr.begin();
-            ins[0] = undoMgr.beforeInsert(txn, m, TABLE_ID, INDEX_ID, keyOf(700), wideKey, wideSchema);
-            upd[0] = undoMgr.beforeUpdate(txn, m, TABLE_ID, INDEX_ID, keyOf(700),
+            ins[0] = UndoTestWrites.insert(undoMgr, txn, m, TABLE_ID, INDEX_ID, keyOf(700), wideKey, wideSchema);
+            upd[0] = UndoTestWrites.update(undoMgr, txn, m, TABLE_ID, INDEX_ID, keyOf(700),
                     hugeOldRow, new HiddenColumns(widHolder[0], ins[0]), wideKey, wideSchema);
-            firstPage[0] = txn.undoContext().undoFirstPageId();
             mgr.commit(m);
             txnMgr.commit(txn);
             flushAllDirty(pool, store, redo);
@@ -744,9 +787,8 @@ class UndoLogManagerTest {
             UndoLogSegmentAccess access = new UndoLogSegmentAccess(pool, PS, new DiskSpaceUndoAllocator(disk), registry);
 
             MiniTransaction read = mgr.begin();
-            UndoLogSegment seg = access.open(read, firstPage[0], PageLatchMode.SHARED);
-            UndoRecord insRec = seg.readRecord(ins[0], wideKey, wideSchema);
-            UndoRecord updRec = seg.readRecord(upd[0], wideKey, wideSchema);
+            UndoRecord insRec = access.readRecordByRollPointer(read, UNDO_SPACE, ins[0], wideKey, wideSchema);
+            UndoRecord updRec = access.readRecordByRollPointer(read, UNDO_SPACE, upd[0], wideKey, wideSchema);
             mgr.rollbackUncommitted(read);
 
             assertEquals(UndoRecordType.INSERT_ROW, insRec.type(), "reopen reads insert undo by its roll pointer");
@@ -760,7 +802,7 @@ class UndoLogManagerTest {
     }
 
     @Test
-    void beforeUpdateOversizedOldImageUsesExternalUndoPayload() {
+    void plannedUpdateOversizedOldImageUsesExternalUndoPayload() {
         onPool(h -> {
             TableSchema wide = new TableSchema(1, List.of(
                     new ColumnDef(new ColumnId(0), "id", ColumnType.intType(false, false), 0),
@@ -773,7 +815,7 @@ class UndoLogManagerTest {
             // 全量旧 image 超单页时，普通 UNDO 页只保存 descriptor，完整编码进入同 segment payload 页链。
             List<ColumnValue> hugeRow = List.of(new ColumnValue.IntValue(1),
                     new ColumnValue.StringValue("y".repeat(16300)));
-            RollPointer pointer = h.undoMgr.beforeUpdate(txn, m, TABLE_ID, INDEX_ID,
+            RollPointer pointer = UndoTestWrites.update(h.undoMgr, txn, m, TABLE_ID, INDEX_ID,
                     List.of(new ColumnValue.IntValue(1)), hugeRow,
                     new HiddenColumns(txn.transactionId(), RollPointer.NULL), wideKey, wide);
             h.mgr.commit(m);
@@ -803,7 +845,7 @@ class UndoLogManagerTest {
             UndoWritePlan plan = h.undoMgr.planUpdate(txn, TABLE_ID, INDEX_ID,
                     List.of(new ColumnValue.IntValue(1)), oldRow,
                     new HiddenColumns(txn.transactionId(), RollPointer.NULL), wideKey, wide);
-            assertTrue(plan.firstWrite());
+            assertTrue(plan.newLog());
             assertTrue(plan.external());
             assertTrue(plan.externalPageCount() >= 2);
             assertEquals(1 + plan.externalPageCount(), plan.pagesToReserve(),
@@ -846,10 +888,149 @@ class UndoLogManagerTest {
             h.mgr.rollbackUncommitted(second);
 
             assertEquals(UndoNo.of(1), txn.undoContext().lastUndoNo());
-            assertEquals(published, txn.undoContext().lastRollPointer());
+            assertEquals(published, txn.undoContext().head(UndoLogKind.INSERT).rollPointer());
             assertEquals(1, h.slots.activeSlotCount(),
                     "stale plan must not reserve a second slot or overwrite the first owner");
         });
+    }
+
+    /** INSERT/UPDATE 各自形成局部链；事务全局序号按真实 DML 顺序归并，局部 header 允许出现间隙。 */
+    @Test
+    void plannedWritesCreateIndependentInsertAndUpdateLogsWithGlobalUndoOrder() {
+        onPool(h -> {
+            Transaction txn = h.txnMgr.begin(TransactionOptions.defaults());
+            h.txnMgr.assignWriteId(txn);
+
+            UndoWritePlan insert1 = h.undoMgr.planInsert(
+                    txn, TABLE_ID, INDEX_ID, keyOf(10), keyDef(), schema());
+            MiniTransaction m1 = h.mgr.begin(h.mgr.budgetFor(
+                    RedoBudgetPurpose.CLUSTERED_INSERT, insert1.redoWorkload()));
+            RollPointer insertPointer1 = h.undoMgr.appendPlanned(txn, m1, insert1);
+            h.mgr.commit(m1);
+
+            UndoWritePlan update2 = h.undoMgr.planUpdate(
+                    txn, TABLE_ID, INDEX_ID, keyOf(10),
+                    List.of(new ColumnValue.IntValue(10)),
+                    new HiddenColumns(TransactionId.of(3), RollPointer.NULL), keyDef(), schema());
+            assertTrue(update2.newLog(), "first update creates the second independent log");
+            MiniTransaction m2 = h.mgr.begin(h.mgr.budgetFor(
+                    RedoBudgetPurpose.CLUSTERED_UPDATE, update2.redoWorkload()));
+            RollPointer updatePointer2 = h.undoMgr.appendPlanned(txn, m2, update2);
+            h.mgr.commit(m2);
+
+            UndoWritePlan insert3 = h.undoMgr.planInsert(
+                    txn, TABLE_ID, INDEX_ID, keyOf(11), keyDef(), schema());
+            assertFalse(insert3.newLog());
+            MiniTransaction m3 = h.mgr.begin(h.mgr.budgetFor(
+                    RedoBudgetPurpose.CLUSTERED_INSERT, insert3.redoWorkload()));
+            RollPointer insertPointer3 = h.undoMgr.appendPlanned(txn, m3, insert3);
+            h.mgr.commit(m3);
+
+            UndoContext context = txn.undoContext();
+            assertEquals(2, h.slots.activeSlotCount());
+            assertEquals(UndoNo.of(3), context.lastUndoNo());
+            assertEquals(new UndoLogicalHead(UndoNo.of(3), insertPointer3), context.head(UndoLogKind.INSERT));
+            assertEquals(new UndoLogicalHead(UndoNo.of(2), updatePointer2), context.head(UndoLogKind.UPDATE));
+
+            MiniTransaction read = h.mgr.beginReadOnly();
+            UndoLogSegment insertLog = h.access.open(read,
+                    context.binding(UndoLogKind.INSERT).firstPageId(), PageLatchMode.SHARED);
+            UndoLogSegment updateLog = h.access.open(read,
+                    context.binding(UndoLogKind.UPDATE).firstPageId(), PageLatchMode.SHARED);
+            assertEquals(UndoLogKind.INSERT, insertLog.undoKind());
+            assertEquals(UndoNo.of(3), insertLog.logLastUndoNo(), "local INSERT high-water legally skips 2");
+            assertEquals(UndoLogKind.UPDATE, updateLog.undoKind());
+            assertEquals(UndoNo.of(2), updateLog.logLastUndoNo());
+            assertEquals(insertPointer1,
+                    insertLog.readRecord(insertPointer3, keyDef(), schema()).prevRollPointer(),
+                    "INSERT local predecessor must skip the intervening UPDATE undoNo");
+            assertEquals(RollPointer.NULL,
+                    updateLog.readRecord(updatePointer2, keyDef(), schema()).prevRollPointer());
+            h.mgr.commit(read);
+
+            assertTrue(insertPointer1.insert());
+        });
+    }
+
+    /** U-I-U 顺序必须与 I-U-I 对称：UPDATE 局部链跨过 INSERT 序号，INSERT 首记录仍以 NULL 起链。 */
+    @Test
+    void updateInsertUpdateKeepsKindLocalPredecessorsAndGlobalUndoOrder() {
+        onPool(h -> {
+            Transaction txn = h.txnMgr.begin(TransactionOptions.defaults());
+            h.txnMgr.assignWriteId(txn);
+            HiddenColumns oldHidden = new HiddenColumns(TransactionId.of(3), RollPointer.NULL);
+
+            UndoWritePlan update1 = h.undoMgr.planUpdate(txn, TABLE_ID, INDEX_ID, keyOf(10),
+                    keyOf(10), oldHidden, keyDef(), schema());
+            MiniTransaction m1 = h.mgr.begin(h.mgr.budgetFor(
+                    RedoBudgetPurpose.CLUSTERED_UPDATE, update1.redoWorkload()));
+            RollPointer updatePointer1 = h.undoMgr.appendPlanned(txn, m1, update1);
+            h.mgr.commit(m1);
+
+            UndoWritePlan insert2 = h.undoMgr.planInsert(
+                    txn, TABLE_ID, INDEX_ID, keyOf(20), keyDef(), schema());
+            MiniTransaction m2 = h.mgr.begin(h.mgr.budgetFor(
+                    RedoBudgetPurpose.CLUSTERED_INSERT, insert2.redoWorkload()));
+            RollPointer insertPointer2 = h.undoMgr.appendPlanned(txn, m2, insert2);
+            h.mgr.commit(m2);
+
+            UndoWritePlan update3 = h.undoMgr.planUpdate(txn, TABLE_ID, INDEX_ID, keyOf(11),
+                    keyOf(11), oldHidden, keyDef(), schema());
+            MiniTransaction m3 = h.mgr.begin(h.mgr.budgetFor(
+                    RedoBudgetPurpose.CLUSTERED_UPDATE, update3.redoWorkload()));
+            RollPointer updatePointer3 = h.undoMgr.appendPlanned(txn, m3, update3);
+            h.mgr.commit(m3);
+
+            assertEquals(UndoNo.of(3), txn.undoContext().lastUndoNo());
+            assertEquals(UndoNo.of(2), txn.undoContext().head(UndoLogKind.INSERT).undoNo());
+            assertEquals(UndoNo.of(3), txn.undoContext().head(UndoLogKind.UPDATE).undoNo());
+            MiniTransaction read = h.mgr.beginReadOnly();
+            assertEquals(updatePointer1,
+                    h.access.readRecordByRollPointer(read, UNDO_SPACE, updatePointer3, keyDef(), schema())
+                            .prevRollPointer());
+            assertEquals(RollPointer.NULL,
+                    h.access.readRecordByRollPointer(read, UNDO_SPACE, insertPointer2, keyDef(), schema())
+                            .prevRollPointer());
+            h.mgr.commit(read);
+        });
+    }
+
+    @Test
+    void secondUndoKindFailsSafelyWhenSingleSlotIsAlreadyOwned() {
+        PageStore store = new FileChannelPageStore();
+        try (PageStore ignored = store; BufferPool pool = new LruBufferPool(store, PS, 128)) {
+            MiniTransactionManager mgr = new MiniTransactionManager();
+            DiskSpaceManager disk = new DiskSpaceManager(pool, store, PS);
+            UndoSpaceAllocator allocator = new DiskSpaceUndoAllocator(disk);
+            UndoLogSegmentAccess access = new UndoLogSegmentAccess(pool, PS, allocator, registry);
+            RollbackSegmentSlotManager slots = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 1);
+            UndoFinalizationTestSupport.Components finalization = UndoFinalizationTestSupport.create(
+                    mgr, pool, PS, access, allocator, slots);
+            UndoLogManager manager = finalization.manager(access, UNDO_SPACE, new HistoryList(), mgr);
+            TransactionManager transactions = new TransactionManager(new TransactionSystem());
+            MiniTransaction boot = mgr.begin();
+            disk.createTablespace(boot, UNDO_SPACE, dir.resolve("undo-one-slot.ibu"), PageNo.of(64));
+            finalization.format(boot, UNDO_SPACE);
+            mgr.commit(boot);
+            Transaction txn = transactions.begin(TransactionOptions.defaults());
+            transactions.assignWriteId(txn);
+
+            UndoWritePlan insert = manager.planInsert(txn, TABLE_ID, INDEX_ID, keyOf(1), keyDef(), schema());
+            MiniTransaction insertMtr = mgr.begin();
+            manager.appendPlanned(txn, insertMtr, insert);
+            mgr.commit(insertMtr);
+            UndoWritePlan update = manager.planUpdate(txn, TABLE_ID, INDEX_ID, keyOf(1),
+                    List.of(new ColumnValue.IntValue(1)),
+                    new HiddenColumns(txn.transactionId(), RollPointer.NULL), keyDef(), schema());
+            MiniTransaction updateMtr = mgr.begin();
+            assertThrows(UndoSlotExhaustedException.class,
+                    () -> manager.appendPlanned(txn, updateMtr, update));
+            mgr.rollbackUncommitted(updateMtr);
+
+            assertEquals(1, slots.activeSlotCount());
+            assertEquals(UndoNo.of(1), txn.undoContext().lastUndoNo());
+            assertFalse(txn.undoContext().hasBinding(UndoLogKind.UPDATE));
+        }
     }
 
     // ---- harness ----
@@ -878,8 +1059,9 @@ class UndoLogManagerTest {
             UndoLogSegmentAccess access = new UndoLogSegmentAccess(pool, PS, allocator, registry);
             RollbackSegmentSlotManager slots = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), SLOT_CAPACITY);
             UndoFinalizationTestSupport.Components finalization = UndoFinalizationTestSupport.create(
-                    mgr, pool, PS, access, allocator, slots, faultInjector);
-            UndoLogManager undoMgr = finalization.manager(access, UNDO_SPACE, new HistoryList(), mgr);
+                    mgr, pool, PS, access, allocator, slots, faultInjector, 0);
+            HistoryList history = new HistoryList();
+            UndoLogManager undoMgr = finalization.manager(access, UNDO_SPACE, history, mgr);
             TransactionManager txnMgr = new TransactionManager(new TransactionSystem());
 
             MiniTransaction boot = mgr.begin();
@@ -887,7 +1069,7 @@ class UndoLogManagerTest {
             finalization.format(boot, UNDO_SPACE);
             mgr.commit(boot);
 
-            body.run(new H(mgr, disk, access, slots, undoMgr, txnMgr, finalization));
+            body.run(new H(mgr, disk, access, slots, history, undoMgr, txnMgr, finalization));
         }
     }
 
@@ -1100,18 +1282,20 @@ class UndoLogManagerTest {
         final DiskSpaceManager disk;
         final UndoLogSegmentAccess access;
         final RollbackSegmentSlotManager slots;
+        final HistoryList history;
         final UndoLogManager undoMgr;
         final TransactionManager txnMgr;
         final UndoFinalizationTestSupport.Components finalization;
 
         H(MiniTransactionManager mgr, DiskSpaceManager disk, UndoLogSegmentAccess access,
-          RollbackSegmentSlotManager slots,
+          RollbackSegmentSlotManager slots, HistoryList history,
           UndoLogManager undoMgr, TransactionManager txnMgr,
           UndoFinalizationTestSupport.Components finalization) {
             this.mgr = mgr;
             this.disk = disk;
             this.access = access;
             this.slots = slots;
+            this.history = history;
             this.undoMgr = undoMgr;
             this.txnMgr = txnMgr;
             this.finalization = finalization;

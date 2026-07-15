@@ -4,7 +4,7 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
 
 /**
  * undo record 类型。{@code code} 作为 undo record 首字节落盘（稳定，{@code UndoRecordCodecTest} 钉死）；
- * code 从 1 起（0 留作「非法/零页」可检测）。本片 codec 仅实现 {@code INSERT_ROW}，其余类型 payload 留 T1.3d。
+ * code 从 1 起（0 留作「非法/零页」可检测）。三类 payload 均已实现，并由 v2 {@link UndoLogKind} 同步约束。
  */
 public enum UndoRecordType {
     /** 插入未提交行的撤销：rollback 时按 cluster key 物理删除该插入。 */

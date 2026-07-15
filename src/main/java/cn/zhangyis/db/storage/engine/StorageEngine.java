@@ -22,6 +22,7 @@ import cn.zhangyis.db.storage.api.tablespace.PageZeroTablespaceMetadataLoader;
 import cn.zhangyis.db.storage.api.undotruncate.UndoTablespaceTruncationRecovery;
 import cn.zhangyis.db.storage.api.undotruncate.UndoTablespaceTruncationService;
 import cn.zhangyis.db.storage.api.undotruncate.UndoTruncationFaultInjector;
+import cn.zhangyis.db.storage.api.undotruncate.UndoCachedSegmentTruncationCoordinator;
 import cn.zhangyis.db.storage.btree.BTreeIndex;
 import cn.zhangyis.db.storage.btree.BTreeCurrentReadService;
 import cn.zhangyis.db.storage.btree.SplitCapableBTreeIndexService;
@@ -60,6 +61,7 @@ import cn.zhangyis.db.storage.recovery.RecoveredTransactionReconciler;
 import cn.zhangyis.db.storage.recovery.RecoveredUndoSlotEvidence;
 import cn.zhangyis.db.storage.recovery.RecoveryDiagnosticsSnapshot;
 import cn.zhangyis.db.storage.recovery.RecoveryProgressJournal;
+import cn.zhangyis.db.storage.recovery.PersistentHistoryRecovery;
 import cn.zhangyis.db.storage.recovery.RecoveryReport;
 import cn.zhangyis.db.storage.recovery.RecoveryRequest;
 import cn.zhangyis.db.storage.recovery.RecoveryState;
@@ -90,25 +92,32 @@ import cn.zhangyis.db.storage.trx.PurgeDriverWorker;
 import cn.zhangyis.db.storage.trx.MvccReader;
 import cn.zhangyis.db.storage.trx.RollbackSegmentSlotManager;
 import cn.zhangyis.db.storage.trx.RollbackService;
+import cn.zhangyis.db.storage.trx.RecoveredUndoLogIdentity;
 import cn.zhangyis.db.storage.trx.TransactionManager;
 import cn.zhangyis.db.storage.trx.TransactionCounterSnapshot;
 import cn.zhangyis.db.storage.trx.TransactionSystem;
 import cn.zhangyis.db.storage.trx.UndoLogManager;
 import cn.zhangyis.db.storage.trx.UndoSegmentFinalizer;
+import cn.zhangyis.db.storage.trx.UndoSegmentCacheDirectory;
 import cn.zhangyis.db.storage.trx.lock.LockManager;
 import cn.zhangyis.db.storage.undo.RollbackSegmentHeaderRepository;
 import cn.zhangyis.db.storage.undo.RollbackSegmentHeaderSnapshot;
+import cn.zhangyis.db.storage.undo.RollbackSegmentHistoryBase;
+import cn.zhangyis.db.storage.undo.CachedUndoSegmentRef;
 import cn.zhangyis.db.storage.undo.UndoLogFormatException;
+import cn.zhangyis.db.storage.undo.UndoLogKind;
 import cn.zhangyis.db.storage.undo.UndoLogSegment;
 import cn.zhangyis.db.storage.undo.UndoLogSegmentAccess;
+import cn.zhangyis.db.storage.undo.UndoHistoryNodeSnapshot;
+import cn.zhangyis.db.storage.undo.UndoSegmentDropPlan;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -180,11 +189,13 @@ public final class StorageEngine {
     private RollbackService rollbackService;
     /** 内存 rseg slot 目录；0.3 起 claim/release 持久化到 page3，恢复期扫描重建。 */
     private RollbackSegmentSlotManager rollbackSlots;
+    /** page3 cached INSERT/UPDATE segment 的运行期 LIFO 投影。 */
+    private UndoSegmentCacheDirectory undoSegmentCache;
     /** 持久 rseg header 仓储（page3）；fresh 格式化、claim/release 持久、恢复扫描共用。 */
     private RollbackSegmentHeaderRepository rsegHeaderRepo;
     /** undo 段物理设施；恢复期读 undo 段 state、回滚 ACTIVE 段用。 */
     private UndoLogSegmentAccess undoAccess;
-    /** 四条 undo 终态共享的 FSP drop + page3 clear 原子协调器。 */
+    /** commit、live/recovery rollback 与 purge 共享的单/双段原子终结协调器。 */
     private UndoSegmentFinalizer undoSegmentFinalizer;
     /**
      * 单显式配置聚簇索引（无 DD，open 前 set）：同时服务恢复期回滚（R 1.2）与后台 purge（0.4）。null 时
@@ -353,15 +364,16 @@ public final class StorageEngine {
         this.lobStorage = new LobStorage(diskSpaceManager, pool, config.pageSize(), typeRegistry);
         this.transactionManager = new TransactionManager(txnSystem);
         this.rollbackSlots = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), config.slotCapacity());
+        this.undoSegmentCache = new UndoSegmentCacheDirectory(config.undoCachedSegmentsPerKind());
         this.rsegHeaderRepo = new RollbackSegmentHeaderRepository(pool, config.pageSize());
-        this.history = new HistoryList();
+        this.history = new HistoryList(config.undoHistoryTransitionTimeout());
         this.undoAllocator = new DiskSpaceUndoAllocator(diskSpaceManager);
         this.undoAccess = new UndoLogSegmentAccess(pool, config.pageSize(), undoAllocator, typeRegistry, registry,
                 config.maxExternalUndoPayloadPages());
         this.undoSegmentFinalizer = new UndoSegmentFinalizer(miniTransactionManager, undoAccess, undoAllocator,
-                rsegHeaderRepo, rollbackSlots);
+                rsegHeaderRepo, rollbackSlots, undoSegmentCache);
         this.undoLogManager = new UndoLogManager(undoAccess, rollbackSlots, config.undoSpaceId(), history,
-                rsegHeaderRepo, miniTransactionManager, undoSegmentFinalizer);
+                rsegHeaderRepo, undoSegmentFinalizer, undoSegmentCache);
         this.indexPageAccess = new IndexPageAccess(pool, config.pageSize(), registry);
         this.btreeService = new SplitCapableBTreeIndexService(indexPageAccess, diskSpaceManager, typeRegistry);
         this.lockObservationService = new DefaultLockObservationService();
@@ -387,7 +399,8 @@ public final class StorageEngine {
             diskSpaceManager.createTablespace(boot, config.undoSpaceId(), config.undoFile(),
                     config.undoSpaceInitialPages(), TablespaceType.UNDO);
             // 0.3：同 boot MTR 格式化 page3 rseg header（空 slot 目录，redo 保护），供 claim/release 持久与恢复扫描。
-            rsegHeaderRepo.format(boot, config.undoSpaceId(), rollbackSlots.rollbackSegmentId(), config.slotCapacity());
+            rsegHeaderRepo.format(boot, config.undoSpaceId(), rollbackSlots.rollbackSegmentId(),
+                    config.slotCapacity(), config.undoCachedSegmentsPerKind());
             miniTransactionManager.commit(boot);
             lastRecoveryReport = null;
         } else {
@@ -549,14 +562,19 @@ public final class StorageEngine {
         RollbackSegmentHeaderSnapshot snapshot;
         try {
             snapshot = rsegHeaderRepo.read(scan, config.undoSpaceId(),
-                    rollbackSlots.rollbackSegmentId(), config.slotCapacity());
+                    rollbackSlots.rollbackSegmentId(), config.slotCapacity(),
+                    config.undoCachedSegmentsPerKind());
             miniTransactionManager.commit(scan);
         } catch (RuntimeException error) {
             rollbackRecoveryScanMtr(scan, error);
             throw error;
         }
-        return recoverRollbackSegmentTransactions(
-                recoveredToLsn, transactionSnapshot, snapshot.occupiedSlots());
+        List<CachedUndoSegmentRef> cachedInsert = readRecoveredUndoCache(
+                snapshot.cachedInsertSegments(), UndoLogKind.INSERT);
+        List<CachedUndoSegmentRef> cachedUpdate = readRecoveredUndoCache(
+                snapshot.cachedUpdateSegments(), UndoLogKind.UPDATE);
+        return recoverRollbackSegmentTransactions(recoveredToLsn, transactionSnapshot,
+                snapshot.occupiedSlots(), snapshot.historyBase(), cachedInsert, cachedUpdate);
     }
 
     /**
@@ -570,7 +588,10 @@ public final class StorageEngine {
     private TransactionUndoRecoveryResult recoverRollbackSegmentTransactions(
             Lsn recoveredToLsn,
             RecoveredTransactionSnapshot transactionSnapshot,
-            Map<UndoSlotId, PageId> occupiedSlots) {
+            Map<UndoSlotId, PageId> occupiedSlots,
+            RollbackSegmentHistoryBase historyBase,
+            List<CachedUndoSegmentRef> cachedInsert,
+            List<CachedUndoSegmentRef> cachedUpdate) {
         List<RecoveredUndoSlotEvidence> recoveredSlots = new ArrayList<>();
         for (Map.Entry<UndoSlotId, PageId> entry : occupiedSlots.entrySet()) {
             recoveredSlots.add(readRecoveredUndoSlot(entry.getKey(), entry.getValue()));
@@ -578,35 +599,87 @@ public final class StorageEngine {
         // 所有 header 已在短只读 MTR 中复制并释放 latch；先全量校验，避免冲突中途已经 rollback/history 部分 slot。
         RecoveredTransactionReconciliation reconciliation = new RecoveredTransactionReconciler()
                 .reconcile(transactionSnapshot, recoveredToLsn, recoveredSlots);
+        PersistentHistoryRecovery historyRecovery = new PersistentHistoryRecovery();
+        List<HistoryEntry> committed = historyRecovery.rebuild(
+                historyBase, occupiedSlots, recoveredSlots, this::readRecoveredHistoryNode);
         if (!reconciliation.activeSlots().isEmpty() && clusteredIndex == null) {
             throw new TransactionRecoveryException(
                     "recovered ACTIVE transactions require the configured clustered index; "
                             + "cannot skip undo rollback before opening traffic: activeSlots="
                             + reconciliation.activeSlots().size());
         }
-        txnSystem.restoreCounters(
-                reconciliation.snapshot().nextTransactionId().value(),
-                reconciliation.snapshot().nextTransactionNo().value());
+        // page3 active/cache、undo 首页和 FSP inode 已全部交叉校验后才发布内存投影；失败启动不会留下半个缓存栈。
+        undoSegmentCache.restore(cachedInsert, cachedUpdate);
+        txnSystem.restoreCounters(reconciliation.snapshot().nextTransactionId().value(),
+                historyRecovery.nextTransactionNo(historyBase,
+                        reconciliation.snapshot().nextTransactionNo().value()));
         occupiedSlots.forEach(rollbackSlots::restore);
-
-        List<HistoryEntry> committed = new ArrayList<>();
         int rolledBackActiveSlots = 0;
 
+        Map<TransactionId, List<RecoveredUndoSlotEvidence>> activeGroups = new LinkedHashMap<>();
         for (RecoveredUndoSlotEvidence recovered : reconciliation.activeSlots()) {
-            rollbackService.rollbackRecovered(recovered.slotId(), recovered.firstPageId(),
-                    recovered.creatorTransactionId(), clusteredIndex);
-            rolledBackActiveSlots++;
+            activeGroups.computeIfAbsent(recovered.creatorTransactionId(), ignored -> new ArrayList<>())
+                    .add(recovered);
         }
-        for (RecoveredUndoSlotEvidence recovered : reconciliation.committedSlots()) {
-            committed.add(new HistoryEntry(recovered.transactionNo(), recovered.creatorTransactionId(),
-                    recovered.firstPageId().spaceId(), recovered.firstPageId(), recovered.slotId()));
+        for (Map.Entry<TransactionId, List<RecoveredUndoSlotEvidence>> group : activeGroups.entrySet()) {
+            List<RecoveredUndoLogIdentity> logs = group.getValue().stream()
+                    .map(recovered -> new RecoveredUndoLogIdentity(
+                            recovered.kind(), recovered.slotId(), recovered.firstPageId()))
+                    .toList();
+            rollbackService.rollbackRecovered(logs, group.getKey(), clusteredIndex);
+            rolledBackActiveSlots += logs.size();
         }
-
-        committed.stream()
-                .sorted(Comparator.comparingLong(entry -> entry.transactionNo().value()))
-                .forEach(history::submitCommitted);
+        history.restore(committed);
         return new TransactionUndoRecoveryResult(occupiedSlots.size(), rolledBackActiveSlots,
                 0, committed.size());
+    }
+
+    /** history recovery 每个 first page 使用独立短 MTR，返回后不保留 latch/fix。 */
+    private UndoHistoryNodeSnapshot readRecoveredHistoryNode(PageId firstPageId) {
+        MiniTransaction read = miniTransactionManager.beginReadOnly();
+        try {
+            UndoHistoryNodeSnapshot snapshot = undoAccess.inspectHistoryNode(read, firstPageId);
+            miniTransactionManager.commit(read);
+            return snapshot;
+        } catch (RuntimeException error) {
+            rollbackRecoveryScanMtr(read, error);
+            throw error;
+        }
+    }
+
+    /**
+     * 恢复一个持久 cached 栈。每个 owner 先在短 MTR 中校验空单页 undo header，再在另一个短 MTR 中读取
+     * page0/page2 FSP inode；刻意不同时持有 undo first-page latch 与 FSP latch，维持“空间账本先于数据页”的锁序。
+     * 只有 {@code used=fragment=1, extent=0} 的 segment 才能恢复为可复用缓存，否则 page3 owner 视为损坏。
+     */
+    private List<CachedUndoSegmentRef> readRecoveredUndoCache(List<PageId> firstPages, UndoLogKind kind) {
+        List<CachedUndoSegmentRef> recovered = new ArrayList<>(firstPages.size());
+        for (PageId firstPage : firstPages) {
+            MiniTransaction pageMtr = miniTransactionManager.beginReadOnly();
+            CachedUndoSegmentRef cached;
+            try {
+                cached = undoAccess.inspectCached(pageMtr, firstPage, kind);
+                miniTransactionManager.commit(pageMtr);
+            } catch (RuntimeException error) {
+                rollbackRecoveryScanMtr(pageMtr, error);
+                throw error;
+            }
+
+            MiniTransaction fspMtr = miniTransactionManager.beginReadOnly();
+            try {
+                UndoSegmentDropPlan plan = undoAllocator.inspectDropPlan(fspMtr, cached.handle());
+                if (plan.usedPageCount() != 1L || plan.fragmentPageCount() != 1L || plan.extentCount() != 0L) {
+                    throw new UndoLogFormatException("cached undo segment is not a single fragment owner: firstPage="
+                            + firstPage + ", plan=" + plan);
+                }
+                miniTransactionManager.commit(fspMtr);
+            } catch (RuntimeException error) {
+                rollbackRecoveryScanMtr(fspMtr, error);
+                throw error;
+            }
+            recovered.add(cached);
+        }
+        return List.copyOf(recovered);
     }
 
     /**
@@ -625,9 +698,9 @@ public final class StorageEngine {
             }
             RecoveredUndoSlotEvidence recovered = active
                     ? RecoveredUndoSlotEvidence.active(
-                            slotId, firstPageId, segment.creatorTransactionId())
+                            slotId, firstPageId, segment.undoKind(), segment.creatorTransactionId())
                     : RecoveredUndoSlotEvidence.committed(
-                            slotId, firstPageId, segment.creatorTransactionId(),
+                            slotId, firstPageId, segment.undoKind(), segment.creatorTransactionId(),
                             segment.committedTransactionNo());
             miniTransactionManager.commit(stateMtr);
             return recovered;
@@ -652,9 +725,13 @@ public final class StorageEngine {
      * 最后发布 registry 状态；若这些依赖不是同一实例，普通准入看到的生命周期状态会与恢复写入脱节。
      */
     private UndoTablespaceTruncationRecovery buildUndoTablespaceRecovery() {
+        UndoCachedSegmentTruncationCoordinator cachedSegmentCoordinator =
+                new UndoCachedSegmentTruncationCoordinator(miniTransactionManager, undoAccess, undoAllocator,
+                        rsegHeaderRepo, rollbackSlots.rollbackSegmentId(), config.slotCapacity(),
+                        config.undoCachedSegmentsPerKind(), undoSegmentCache);
         UndoTablespaceTruncationService truncationService = new UndoTablespaceTruncationService(
                 pool, store, config.pageSize(), registry, accessController, miniTransactionManager,
-                flushService, config.flushTimeout(), UndoTruncationFaultInjector.none());
+                flushService, config.flushTimeout(), UndoTruncationFaultInjector.none(), cachedSegmentCoordinator);
         return new UndoTablespaceTruncationRecovery(Set.of(config.undoSpaceId()), store, config.pageSize(),
                 registry, redo, truncationService);
     }

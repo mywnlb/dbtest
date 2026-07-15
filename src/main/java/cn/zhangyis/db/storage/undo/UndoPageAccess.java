@@ -75,16 +75,17 @@ public final class UndoPageAccess {
     }
 
     /**
-     * 建并格式化 undo chain 页。chain 页只有 page header 和清零的 log header 预留区；其 FIL prev/next
+     * 建并格式化 undo chain 页。chain 页保留 page header，并在 log-header 预留区只复制 v2 kind；其 FIL prev/next
      * 由调用方在生长流程中显式链接，确保 preflight 后才产生任何页链副作用。
      */
-    public UndoPage createChainPage(MiniTransaction mtr, PageId pageId, UndoSegmentHandle handle) {
-        if (mtr == null || pageId == null || handle == null) {
+    public UndoPage createChainPage(MiniTransaction mtr, PageId pageId, UndoLogKind kind,
+                                    UndoSegmentHandle handle) {
+        if (mtr == null || pageId == null || kind == null || handle == null) {
             throw new DatabaseValidationException("createChainPage args must not be null");
         }
         PageGuard g = newUndoEnvelope(mtr, pageId);
         UndoPage page = new UndoPage(mtr, g, pageSize);
-        page.formatChainPage(handle);
+        page.formatChainPage(kind, handle);
         return page;
     }
 

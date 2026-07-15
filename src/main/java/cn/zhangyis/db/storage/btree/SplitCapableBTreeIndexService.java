@@ -162,7 +162,7 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
      * DB_ROLL_PTR=rollPointer），再走通用 {@link #insert}。
      *
      * <p>T1.3c 起不再恒写 {@link RollPointer#NULL}：roll pointer 由上层 orchestration
-     * （{@code assignWriteId → UndoLogManager.beforeInsert → insertClustered}）传入，指向本事务刚追加的
+     * （{@code assignWriteId → UndoLogManager.planInsert/appendPlanned → insertClustered}）传入，指向本事务刚追加的
      * INSERT undo record。本方法不 import trx/undo，只收一个 {@link RollPointer} 值对象，保持 B+Tree 与
      * 事务 undo 模块解耦；{@code RollPointer#NULL} 仍合法（表「无 undo」，用于不接 undo 的路径或测试），
      * 但 Java null 引用必须拒绝。

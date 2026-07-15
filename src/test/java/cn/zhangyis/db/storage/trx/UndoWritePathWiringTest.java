@@ -46,13 +46,13 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * T1.3c undo 写路径全栈接线：显式执行 {@code assignWriteId → UndoLogManager.beforeInsert →
+ * T1.3c undo 写路径全栈接线：显式执行 {@code assignWriteId → UndoLogManager.planInsert/appendPlanned →
  * SplitCapableBTreeIndexService.insertClustered}，断言聚簇记录隐藏列 {@code DB_TRX_ID} 为事务写 id、
- * {@code DB_ROLL_PTR} 为 {@code beforeInsert} 返回值。整栈仍 test-wired、无生产组合根，orchestration 由本测试
+ * {@code DB_ROLL_PTR} 为 {@code planInsert/appendPlanned} 返回值。整栈仍 test-wired、无生产组合根，orchestration 由本测试
  * 驱动（不新建 api facade，见 spec 关键决策④）。
  *
  * <p><b>orphan undo 风险（已知缺口，留 T1.3d+）</b>：本片只在成功插入路径接线。MTR rollback 不做 content undo，
- * 若 {@code beforeInsert} 已追加 undo record 后聚簇写失败并 MTR rollback，会留下指向无对应聚簇行的 orphan undo；
+ * 若 {@code planInsert/appendPlanned} 已追加 undo record 后聚簇写失败并 MTR rollback，会留下指向无对应聚簇行的 orphan undo；
  * 失败插入的原子清理（rollback 反向走链 / slot 回收）留 DML facade / rollback 片，并在 current map 标为缺口。
  * 本测试名显式记录该风险，不覆盖失败路径。
  */
@@ -81,7 +81,7 @@ class UndoWritePathWiringTest {
 
             // undo 写路径 + 聚簇写同 MTR（WAL：同 redo batch）
             MiniTransaction m = ctx.mgr.begin();
-            RollPointer rp = ctx.undoMgr.beforeInsert(txn, m, TABLE_ID, INDEX_ID,
+            RollPointer rp = UndoTestWrites.insert(ctx.undoMgr, txn, m, TABLE_ID, INDEX_ID,
                     clusterKey(1), index.keyDef(), index.schema());
             svc.insertClustered(m, index, row(1), wid, rp);
             ctx.mgr.commit(m);
@@ -94,7 +94,7 @@ class UndoWritePathWiringTest {
             assertEquals(wid, found.record().hiddenColumns().dbTrxId(),
                     "DB_TRX_ID must be the transaction's assigned write id");
             assertEquals(rp, found.record().hiddenColumns().dbRollPtr(),
-                    "DB_ROLL_PTR must be the roll pointer returned by beforeInsert (not NULL)");
+                    "DB_ROLL_PTR must be the roll pointer returned by planInsert/appendPlanned (not NULL)");
             assertFalse(rp.isNull());
             assertTrue(rp.insert(), "insert undo roll pointer");
             ctx.txnMgr.commit(txn);
@@ -114,14 +114,14 @@ class UndoWritePathWiringTest {
             RollPointer[] rps = new RollPointer[3];
             for (int i = 0; i < 3; i++) {
                 MiniTransaction m = ctx.mgr.begin();
-                rps[i] = ctx.undoMgr.beforeInsert(txn, m, TABLE_ID, INDEX_ID,
+                rps[i] = UndoTestWrites.insert(ctx.undoMgr, txn, m, TABLE_ID, INDEX_ID,
                         clusterKey(10 + i), index.keyDef(), index.schema());
                 BTreeInsertResult res = svc.insertClustered(m, index, row(10 + i), wid, rps[i]);
                 index = res.indexAfterInsert();
                 ctx.mgr.commit(m);
             }
 
-            // 每行的 DB_ROLL_PTR 各等于该行 beforeInsert 返回值；undoNo 在事务内递增
+            // 每行的 DB_ROLL_PTR 各等于该行 planInsert/appendPlanned 返回值；undoNo 在事务内递增
             for (int i = 0; i < 3; i++) {
                 MiniTransaction read = ctx.mgr.begin();
                 BTreeLookupResult found = svc.lookup(read, index, searchKey(10 + i)).orElseThrow();

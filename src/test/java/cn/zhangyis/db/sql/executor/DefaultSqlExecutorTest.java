@@ -30,12 +30,14 @@ class DefaultSqlExecutorTest {
         SqlTransactionHandle handle = new TestHandle();
 
         UpdateResult update = assertInstanceOf(UpdateResult.class, executor.execute(handle,
-                new BoundClusteredInsert(table, List.of(new SqlValue.IntegerValue(BigInteger.ONE))), status));
+                new BoundClusteredInsert(table, List.of(new SqlValue.IntegerValue(BigInteger.ONE))), status,
+                SqlStatementDeadline.after(Duration.ofSeconds(1))));
         assertEquals(1, update.affectedRows());
 
         QueryResult query = assertInstanceOf(QueryResult.class, executor.execute(handle,
                 new BoundPrimaryPointSelect(table, List.of(0),
-                        List.of(new SqlValue.IntegerValue(BigInteger.ONE))), status));
+                        List.of(new SqlValue.IntegerValue(BigInteger.ONE))), status,
+                SqlStatementDeadline.after(Duration.ofSeconds(1))));
         assertEquals("id", query.columns().getFirst().name());
         assertEquals(BigInteger.ONE, assertInstanceOf(SqlValue.IntegerValue.class,
                 query.rows().getFirst().values().getFirst()).value());
@@ -61,11 +63,13 @@ class DefaultSqlExecutorTest {
     private static final class RecordingGateway implements SqlStorageGateway {
         private int calls;
         @Override public SqlTransactionHandle begin(SqlTransactionRequest request) { return new TestHandle(); }
-        @Override public SqlWriteOutcome insert(SqlTransactionHandle transaction, BoundClusteredInsert statement) {
+        @Override public SqlWriteOutcome insert(SqlTransactionHandle transaction, BoundClusteredInsert statement,
+                                                SqlStatementDeadline deadline) {
             calls++; return new SqlWriteOutcome(1, false);
         }
         @Override public Optional<SqlRow> selectPoint(SqlTransactionHandle transaction,
-                                                     BoundPrimaryPointSelect statement) {
+                                                     BoundPrimaryPointSelect statement,
+                                                     SqlStatementDeadline deadline) {
             calls++; return Optional.of(new SqlRow(List.of(new SqlValue.IntegerValue(BigInteger.ONE))));
         }
         @Override public SqlCommitOutcome commit(SqlTransactionHandle transaction, SqlCommitRequest request) {

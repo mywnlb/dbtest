@@ -1,6 +1,6 @@
 package cn.zhangyis.db.sql.binder;
 
-import cn.hutool.json.JSONUtil;
+import cn.zhangyis.db.common.json.StrictJsonValidator;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.dd.domain.ColumnTypeDefinition;
 import cn.zhangyis.db.dd.domain.DictionaryTypeId;
@@ -193,7 +193,7 @@ public final class SqlTypeCoercion {
     private static SqlValue json(LiteralNode literal, ColumnTypeDefinition type) {
         String value = requireString(literal, type);
         try {
-            JSONUtil.parse(value);
+            StrictJsonValidator.validate(value);
         } catch (RuntimeException error) {
             throw new SqlTypeCoercionException("invalid JSON literal", error);
         }

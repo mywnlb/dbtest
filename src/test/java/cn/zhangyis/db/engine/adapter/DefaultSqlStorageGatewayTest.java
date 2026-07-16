@@ -21,6 +21,9 @@ import java.math.BigInteger;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -40,7 +43,8 @@ class DefaultSqlStorageGatewayTest {
                     new SqlValue.IntegerValue(BigInteger.ONE), new SqlValue.StringValue(text)));
             SqlTransactionHandle write = gateway.begin(new SqlTransactionRequest(
                     SqlIsolationLevel.REPEATABLE_READ, false, false));
-            assertEquals(1, gateway.insert(write, insert).affectedRows());
+            assertEquals(1, gateway.insert(write, insert,
+                    SqlStatementDeadline.after(Duration.ofSeconds(2))).affectedRows());
             assertTrue(gateway.commit(write, new SqlCommitRequest(SqlDurabilityMode.FLUSH_ON_COMMIT,
                     Duration.ofSeconds(2))).durable());
             assertThrows(SqlTransactionStateException.class, () -> gateway.rollback(write));
@@ -49,7 +53,8 @@ class DefaultSqlStorageGatewayTest {
                     SqlIsolationLevel.READ_COMMITTED, true, true));
             BoundPrimaryPointSelect select = new BoundPrimaryPointSelect(table, List.of(1, 0),
                     List.of(new SqlValue.IntegerValue(BigInteger.ONE)));
-            SqlRow row = gateway.selectPoint(read, select).orElseThrow();
+            SqlRow row = gateway.selectPoint(read, select,
+                    SqlStatementDeadline.after(Duration.ofSeconds(2))).orElseThrow();
             assertEquals(List.of(new SqlValue.StringValue(text),
                     new SqlValue.IntegerValue(BigInteger.ONE)), row.values());
             gateway.commit(read, new SqlCommitRequest(SqlDurabilityMode.BACKGROUND_FLUSH,
@@ -72,6 +77,43 @@ class DefaultSqlStorageGatewayTest {
             assertThrows(SqlTransactionStateException.class, () -> first.rollback(handle));
             assertThrows(SqlTransactionStateException.class, () -> first.commit(handle,
                     new SqlCommitRequest(SqlDurabilityMode.BACKGROUND_FLUSH, Duration.ofSeconds(1))));
+        }
+    }
+
+    /** statement 的绝对 deadline 必须截断 gateway 自己更长的 handle wait，不能在前序阶段耗时后重新计时。 */
+    @Test
+    void statementDeadlineCapsTransactionHandleWait() throws Exception {
+        try (DatabaseEngine database = openDatabase();
+             var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            TableDefinition table = createTable(database);
+            DefaultSqlStorageGateway gateway = new DefaultSqlStorageGateway(database.storage(),
+                    new DictionaryStorageMetadataMapper(), Duration.ofSeconds(2));
+            EngineSqlTransactionHandle handle = (EngineSqlTransactionHandle) gateway.begin(
+                    new SqlTransactionRequest(SqlIsolationLevel.READ_COMMITTED, true, true));
+            CountDownLatch locked = new CountDownLatch(1);
+            CountDownLatch release = new CountDownLatch(1);
+            var holder = executor.submit(() -> {
+                handle.operationLock.lock();
+                try {
+                    locked.countDown();
+                    assertTrue(release.await(2, TimeUnit.SECONDS));
+                } finally {
+                    handle.operationLock.unlock();
+                }
+                return null;
+            });
+            assertTrue(locked.await(1, TimeUnit.SECONDS));
+            BoundPrimaryPointSelect select = new BoundPrimaryPointSelect(table, List.of(0),
+                    List.of(new SqlValue.IntegerValue(BigInteger.ONE)));
+            long started = System.nanoTime();
+            assertThrows(SqlTransactionStateException.class, () -> gateway.selectPoint(handle, select,
+                    SqlStatementDeadline.after(Duration.ofMillis(80))));
+            Duration elapsed = Duration.ofNanos(System.nanoTime() - started);
+            assertTrue(elapsed.compareTo(Duration.ofMillis(500)) < 0,
+                    () -> "statement deadline was not honored, elapsed=" + elapsed);
+            release.countDown();
+            holder.get(1, TimeUnit.SECONDS);
+            gateway.rollback(handle);
         }
     }
 

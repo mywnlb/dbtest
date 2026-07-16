@@ -3,6 +3,7 @@ package cn.zhangyis.db.session;
 import cn.zhangyis.db.common.exception.DatabaseRuntimeException;
 import cn.zhangyis.db.dd.domain.MdlOwnerId;
 import cn.zhangyis.db.dd.domain.QualifiedTableName;
+import cn.zhangyis.db.dd.exception.MetadataLockTimeoutException;
 import cn.zhangyis.db.engine.DatabaseEngine;
 import cn.zhangyis.db.sql.executor.QueryResult;
 import cn.zhangyis.db.sql.executor.storage.SqlIsolationLevel;
@@ -90,6 +91,26 @@ class SqlSessionMvccConcurrencyTest {
                 assertThrows(TimeoutException.class, () -> drop.get(100, TimeUnit.MILLISECONDS));
                 holder.execute("ROLLBACK");
                 assertTrue(drop.get(1, TimeUnit.SECONDS));
+            }
+        }
+    }
+
+    /** DDL 调用方使用与 SessionId 相同的普通数字时也不能被识别成同一 MDL owner。 */
+    @Test
+    void ddlOwnerCannotAliasSessionOwner() {
+        try (DatabaseEngine database = openWithTables();
+             SqlSession holder = database.openSession(SqlSessionTestSupport.options(false,
+                     SqlIsolationLevel.REPEATABLE_READ, Duration.ofSeconds(1)))) {
+            assertEquals(1L, holder.id().value(), "fixture 的首个 Session 用于复现历史 owner=1 碰撞");
+            holder.execute("SELECT * FROM mdl_t WHERE id=1");
+
+            assertThrows(MetadataLockTimeoutException.class,
+                    () -> database.ddl().dropTable(MdlOwnerId.of(1),
+                            QualifiedTableName.of("app", "mdl_t"), Duration.ofMillis(80)));
+            try (var lease = database.dictionary().openTable(MdlOwnerId.of(30_001),
+                    QualifiedTableName.of("app", "mdl_t"),
+                    cn.zhangyis.db.dd.service.TableAccessIntent.READ, Duration.ofSeconds(1))) {
+                assertEquals(cn.zhangyis.db.dd.domain.TableState.ACTIVE, lease.table().state());
             }
         }
     }

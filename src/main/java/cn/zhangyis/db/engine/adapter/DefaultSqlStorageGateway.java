@@ -1,6 +1,8 @@
 package cn.zhangyis.db.engine.adapter;
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
+import cn.zhangyis.db.common.exception.DatabaseFailureClassifier;
+import cn.zhangyis.db.common.exception.DatabaseFatalException;
 import cn.zhangyis.db.dd.domain.ColumnTypeDefinition;
 import cn.zhangyis.db.dd.domain.DictionaryTypeId;
 import cn.zhangyis.db.sql.binder.bound.BoundClusteredInsert;
@@ -75,21 +77,35 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
     /**
      * 完整行先映射并由 Record codec 在 DML 中最终复核；statement guard 覆盖实际写入和成功 close。任一失败先执行
      * partial rollback，若 rollback 本身失败则保留原始异常并显式报告 rollback-only。
+     * <ol>
+     *     <li>以 statement deadline 限制 opaque handle 准入，并从 exact-version DD definition 映射物理 index/LOB binding。</li>
+     *     <li>把 SQL 值转换成 record 值并派生聚簇 key；转换失败早于 undo、LOB、row 或锁副作用。</li>
+     *     <li>创建 statement guard 后调用 DML facade，row-lock timeout 取配置与 deadline 剩余值的较小者。</li>
+     *     <li>成功关闭 guard 并发布 handle wrote；失败由 guard 做 partial rollback，异常保留 rollback-only/fatal 语义。</li>
+     * </ol>
      */
     @Override
-    public SqlWriteOutcome insert(SqlTransactionHandle transaction, BoundClusteredInsert statement) {
-        if (statement == null) throw new DatabaseValidationException("bound INSERT must not be null");
-        return withActive(transaction, handle -> {
+    public SqlWriteOutcome insert(SqlTransactionHandle transaction, BoundClusteredInsert statement,
+                                  SqlStatementDeadline deadline) {
+        if (statement == null || deadline == null) {
+            throw new DatabaseValidationException("bound INSERT/deadline must not be null");
+        }
+        return withActive(transaction, deadline, handle -> {
+            // 1. mapper 只消费 binder 固定的 DD version，不重新按表名读取可能已变化的 metadata。
             MappedTableStorage mapped = mapper.map(statement.table());
             BTreeIndex index = mapped.clusteredIndex();
+            // 2. record/schema 校验仍在实际业务 MTR 前完成，key 顺序由 index definition 权威决定。
             List<ColumnValue> values = toColumnValues(statement.values(), index);
             SearchKey key = keyFromRow(values, index);
             LogicalRecord record = new LogicalRecord(index.schema().schemaVersion(), values, false,
                     RecordType.CONVENTIONAL);
+            // 3. guard 快照双 undo head；DML 成功前不发布 statement terminal。
             DmlStatementGuard guard = engine.dmlService().beginStatement(handle.transaction, index);
             try {
                 DmlWriteResult result = engine.dmlService().insert(new ClusteredInsertCommand(handle.transaction,
-                        index, key, record, statement.table().id().value(), mapped.lobSegment(), operationTimeout));
+                        index, key, record, statement.table().id().value(), mapped.lobSegment(),
+                        deadline.cap(operationTimeout, "clustered INSERT row-lock wait")));
+                // 4. guard.close 成功才允许 handle 记为已写；失败路径由 catch 汇总 partial rollback 结果。
                 guard.close();
                 handle.wrote |= result.changed();
                 return new SqlWriteOutcome(result.affectedRows(), handle.transaction.rollbackOnly());
@@ -106,38 +122,61 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
         });
     }
 
-    /** RR 复用事务 ReadView，RC 每语句 finally 注销；整行 LOB hydrate 完成后才投影，失败不返回 partial row。 */
+    /**
+     * 聚簇主键点查：RR 复用事务 ReadView，RC 每语句 finally 注销；整行 LOB hydrate 完成后才投影。
+     * <ol>
+     *     <li>在 deadline 内进入 handle，并把 exact DD binding 映射为 index/key。</li>
+     *     <li>创建隔离级别对应的 ReadView；RC view 立即登记到 purge low-water 集合。</li>
+     *     <li>执行 MVCC 点查，并在同一个 view 存活期间用短 MTR hydrate 所有 external LOB。</li>
+     *     <li>完整行 hydration 后才按 projection ordinal 转换公开 SqlValue，避免返回 partial row/reference。</li>
+     *     <li>finally 注销 RC view；读取失败为主异常，close 失败作为 suppressed，fatal 严重度不得降级。</li>
+     * </ol>
+     */
     @Override
-    public Optional<SqlRow> selectPoint(SqlTransactionHandle transaction, BoundPrimaryPointSelect statement) {
-        if (statement == null) throw new DatabaseValidationException("bound SELECT must not be null");
-        return withActive(transaction, handle -> {
+    public Optional<SqlRow> selectPoint(SqlTransactionHandle transaction, BoundPrimaryPointSelect statement,
+                                        SqlStatementDeadline deadline) {
+        if (statement == null || deadline == null) {
+            throw new DatabaseValidationException("bound SELECT/deadline must not be null");
+        }
+        return withActive(transaction, deadline, handle -> {
+            // 1. handle wait 已由 withActive 截断，下面所有 LOB 阶段继续消费同一绝对 deadline。
             MappedTableStorage mapped = mapper.map(statement.table());
             BTreeIndex index = mapped.clusteredIndex();
             SearchKey key = new SearchKey(toKeyValues(statement.keyValues(), index));
             ReadViewManager views = engine.transactionManager().readViewManager();
+            deadline.remaining("primary-point ReadView creation");
+            // 2. TransactionSystem 在此登记 live view，purge 在 closeReadView 前不能越过它。
             ReadView view = views.openReadView(handle.transaction);
-            Optional<LogicalRecord> record = Optional.empty();
             RuntimeException failure = null;
             try {
-                record = engine.mvccReader().read(view, index, key);
+                // 3. view 覆盖版本选择与外置引用解引用，避免 RC 提前注销后 purge 回收旧 LOB ownership。
+                Optional<LogicalRecord> record = engine.mvccReader().read(view, index, key);
+                if (record.isEmpty()) return Optional.empty();
+
+                // RC view 必须覆盖 external chain hydration；否则 purge low water 可能在引用解引用前越过该版本。
+                List<ColumnValue> hydrated = hydrateExternalValues(
+                        record.orElseThrow().columnValues(), index, deadline);
+                // 4. hydration 全部成功后才构造公开结果，storage LobReference 永不越过 gateway。
+                List<SqlValue> projected = new ArrayList<>(statement.projectionOrdinals().size());
+                for (int ordinal : statement.projectionOrdinals()) {
+                    projected.add(toSqlValue(hydrated.get(ordinal), statement.table().columns().get(ordinal).type()));
+                }
+                return Optional.of(new SqlRow(projected));
             } catch (RuntimeException readFailure) {
-                failure = readFailure;
-            }
-            if (handle.transaction.isolationLevel() == IsolationLevel.READ_COMMITTED) {
-                try { views.closeReadView(view); }
-                catch (RuntimeException closeFailure) {
-                    if (failure == null) failure = closeFailure; else failure.addSuppressed(closeFailure);
+                failure = adapt("primary-point MVCC/LOB read failed", readFailure);
+                throw failure;
+            } finally {
+                // 5. RR 由事务终态 release；RC 必须在全部读取工作结束后恰好注销，且不能覆盖主失败。
+                if (handle.transaction.isolationLevel() == IsolationLevel.READ_COMMITTED) {
+                    try {
+                        views.closeReadView(view);
+                    } catch (RuntimeException closeFailure) {
+                        RuntimeException adapted = adapt("close READ COMMITTED ReadView failed", closeFailure);
+                        if (failure == null) throw adapted;
+                        failure.addSuppressed(adapted);
+                    }
                 }
             }
-            if (failure != null) throw adapt("primary-point MVCC read failed", failure);
-            if (record.isEmpty()) return Optional.empty();
-
-            List<ColumnValue> hydrated = hydrateExternalValues(record.orElseThrow().columnValues(), index);
-            List<SqlValue> projected = new ArrayList<>(statement.projectionOrdinals().size());
-            for (int ordinal : statement.projectionOrdinals()) {
-                projected.add(toSqlValue(hydrated.get(ordinal), statement.table().columns().get(ordinal).type()));
-            }
-            return Optional.of(new SqlRow(projected));
         });
     }
 
@@ -145,7 +184,7 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
     @Override
     public SqlCommitOutcome commit(SqlTransactionHandle transaction, SqlCommitRequest request) {
         if (request == null) throw new DatabaseValidationException("SQL commit request must not be null");
-        return withActive(transaction, handle -> {
+        return withActive(transaction, null, handle -> {
             try {
                 SqlCommitOutcome outcome;
                 if (handle.wrote || handle.transaction.undoContext() != null) {
@@ -174,7 +213,7 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
     /** 有 undo 使用 DD resolver 做跨表 full rollback；无 undo 走轻量生命周期，终态后才释放锁。 */
     @Override
     public SqlRollbackOutcome rollback(SqlTransactionHandle transaction) {
-        return withActive(transaction, handle -> {
+        return withActive(transaction, null, handle -> {
             try {
                 SqlRollbackOutcome outcome;
                 if (handle.transaction.undoContext() != null) {
@@ -204,13 +243,15 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
         });
     }
 
-    private <T> T withActive(SqlTransactionHandle candidate,
+    private <T> T withActive(SqlTransactionHandle candidate, SqlStatementDeadline deadline,
                              java.util.function.Function<EngineSqlTransactionHandle, T> action) {
         requireEngineOpen();
         EngineSqlTransactionHandle handle = requireOwned(candidate);
         boolean acquired;
         try {
-            acquired = handle.operationLock.tryLock(operationTimeout.toNanos(), TimeUnit.NANOSECONDS);
+            Duration wait = deadline == null ? operationTimeout
+                    : deadline.cap(operationTimeout, "SQL transaction handle wait");
+            acquired = handle.operationLock.tryLock(wait.toNanos(), TimeUnit.NANOSECONDS);
         } catch (InterruptedException error) {
             Thread.currentThread().interrupt();
             throw new SqlTransactionStateException("interrupted while waiting for SQL transaction handle", error);
@@ -268,15 +309,18 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
                 .map(part -> values.get(part.columnId().value())).toList());
     }
 
-    private List<ColumnValue> hydrateExternalValues(List<ColumnValue> source, BTreeIndex index) {
+    private List<ColumnValue> hydrateExternalValues(List<ColumnValue> source, BTreeIndex index,
+                                                    SqlStatementDeadline deadline) {
         ArrayList<ColumnValue> result = new ArrayList<>(source);
         for (int ordinal = 0; ordinal < result.size(); ordinal++) {
             if (!(result.get(ordinal) instanceof ColumnValue.ExternalValue external)) continue;
+            deadline.remaining("external LOB hydration for column " + ordinal);
             MiniTransaction mtr = engine.miniTransactionManager().beginReadOnly();
             try {
                 ColumnType type = index.schema().column(ordinal).type();
                 ColumnValue value = engine.lobStorage().read(mtr, type, external);
                 engine.miniTransactionManager().commit(mtr);
+                deadline.remaining("external LOB hydration completion for column " + ordinal);
                 result.set(ordinal, value);
             } catch (RuntimeException hydrateFailure) {
                 rollbackMtr(mtr, hydrateFailure);
@@ -369,7 +413,9 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
         };
     }
 
-    private static SqlStorageException adapt(String message, RuntimeException error) {
+    private static RuntimeException adapt(String message, RuntimeException error) {
+        DatabaseFatalException fatal = DatabaseFailureClassifier.preserveFatal(message, error);
+        if (fatal != null) return fatal;
         return error instanceof SqlStorageException storage ? storage : new SqlStorageException(message, error);
     }
 }

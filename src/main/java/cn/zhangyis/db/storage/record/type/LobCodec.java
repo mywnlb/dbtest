@@ -1,6 +1,6 @@
 package cn.zhangyis.db.storage.record.type;
 
-import cn.hutool.json.JSONUtil;
+import cn.zhangyis.db.common.json.StrictJsonValidator;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.LobReference;
 import cn.zhangyis.db.domain.PageNo;
@@ -301,7 +301,7 @@ public final class LobCodec implements TypeCodec {
             throw new InvalidColumnValueException("JSON text must not be blank");
         }
         try {
-            JSONUtil.parse(value);
+            StrictJsonValidator.validate(value);
         } catch (RuntimeException parseFailure) {
             throw new InvalidColumnValueException("invalid JSON text", parseFailure);
         }

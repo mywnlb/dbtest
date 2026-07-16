@@ -448,14 +448,14 @@ flowchart TD
 | Begin | `SessionTransactionPolicy.ensureTransaction` -> `SqlStorageGateway.begin` -> `DefaultSqlStorageGateway.begin` -> `TransactionManager.begin(options)` -> `new Transaction(options, now)` state `ACTIVE`; **no id allocation** (lazy) | Implemented；Session 持 opaque handle，不越层接触 storage transaction；低层调用方仍可显式持事务调用 DML facade |
 | Assign write id | `ClusteredDmlService.insert/update/delete` -> `TransactionManager.assignWriteId(txn)` (`:45`) -> requires `ACTIVE`, rejects read-only -> `system.allocateWriteId()` (`:53`) -> `txn.setTransactionId` (`:54`); idempotent if already set | Implemented; 2.1 production DML caller wired；`allocateWriteId` -> `active.register(id)` (`TransactionSystem.java:33`) |
 | Commit | `ClusteredDmlService.commit` -> `prepareCommit` 分配 no -> `UndoLogManager.onCommit`：有 UPDATE 时先 `HistoryList.beginAppend` 冻结 base -> `UndoSegmentFinalizer.finalizeCommit` 预检 page3/history/free evidence -> 一个 MTR 处理 INSERT cache/free/drop owner、history base、UPDATE history links+COMMITTED 与唯一 terminal delta，并按全局页序写全部普通首页 -> commit 后发布 slot/reuse directory/history -> `TransactionManager.commit` -> durability -> release locks | Implemented for storage DML facade；纯 INSERT 不进 history；mixed 所有 owner/link/terminal 同批；transition lock 不跨 IO，物理前失败可释放，物理后失败保留 fail-stop fence；若 `onCommit` 失败事务保持 ACTIVE 且锁不释放 |
-| Rollback (consume undo, T1.3d/1.4b/1.4c/1.6) | `ClusteredDmlService.rollback` -> `RollbackService.rollback` 预检 INSERT/UPDATE 两个 persistent logical head -> 按全局 `undoNo` 归并逆序执行短 MTR inverse -> 每次 marker commit 后发布所属 binding -> 双链 EMPTY 后 batch finalization 在同一 MTR 按段 active→cache、active→free 或 drop，并写一条 terminal delta | Implemented for live 与 recovery；recovery 按 creator 聚合最多一条 INSERT + 一条 UPDATE ACTIVE evidence 后走同一归并/批终结；marker 永不领先 inverse，物理边界后失败保持 fail-stop |
+| Rollback (consume undo, T1.3d/1.4b/1.4c/1.6) | `ClusteredDmlService.rollback` -> `RollbackService.rollback` 预检 INSERT/UPDATE 两个 persistent logical head -> 按全局 `undoNo` 归并逆序执行短 MTR inverse -> INSERT ownership 的 LOB free 与 logical-head CAS 同属 marker MTR -> marker commit 后发布所属 binding -> 双链 EMPTY 后 batch finalization 在同一 MTR 按段 active→cache、active→free 或 drop，并写一条 terminal delta | Implemented for live 与 recovery；recovery 按 creator 聚合最多一条 INSERT + 一条 UPDATE ACTIVE evidence 后走同一归并/批终结；marker 永不领先 inverse。精确故障测试覆盖 `AFTER_INVERSE_COMMIT`（LOB 仍可读、head 未动、重试幂等 inverse 后 free）与 `AFTER_PROGRESS_COMMIT`（LOB 已释放、head EMPTY、重试只终结） |
 | Statement/savepoint rollback (1.4/1.4b/1.6) | SQL INSERT -> `DefaultSqlStorageGateway.insert` -> `ClusteredDmlService.beginStatement` -> `RollbackService.createSavepoint` 快照 INSERT/UPDATE 双 head；失败 rollback 先分别预检两条局部链，再按全局 `undoNo` 归并执行 inverse -> 一个按 `PageId` 排序的 marker MTR 对变化的 first pages 做 CAS -> commit 后一次发布双 binding head | Implemented for SQL v1 INSERT and explicit storage DML；局部链物理高水位不回退且允许跨 kind 序号间隙；marker/CAS 失败不移动内存 head，Guard 标记 rollback-only；命名 SAVEPOINT 与 savepoint 后锁精细释放未接 |
 | Undo write (INSERT/UPDATE/DELETE) | `ClusteredDmlService.insert/update/delete` -> `UndoLogManager.planX`：已有 binding 冻结 append snapshot；首写依次冻结同 kind cache LIFO、跨 kind free FIFO，否则 ALLOCATE_NEW -> `UndoLogSegmentAccess.planRecord/plannedNewPages` 冻结编码、页数、reservation 与 redo workload -> facade begin 业务 MTR -> `appendPlanned` 重新校验；REUSE_CACHED/REUSE_FREE 同 MTR page3 owner→active slot、首页激活、append，ALLOCATE_NEW 才建 FSP segment，已有 binding 直接 append -> 发布局部 head/全局 high-water -> 聚簇写 | Implemented；`UndoSegmentAcquisition` 精确区分四路；可复用 segment 激活后允许 grow/external，后续多页终结直接 drop；stale cache/free plan 在物理前拒绝 |
 | Slot claim | `RollbackSegmentSlotManager.reserveClaim` 短锁 `FREE -> RESERVED` -> 当前业务 MTR `RollbackSegmentHeaderRepository.requireSlotFree` 以 S latch 预检 page3 并在返回前释放 -> `access.create` -> claim lease `bind(firstPageId)` 变 ACTIVE -> 同一业务 MTR 在局部 latch-order 例外内 `claimSlot(slot,firstPageId)` X-latch CAS -> append/publish context | Implemented；RESERVED 计入占用但无 owner，未 bind lease close 才可退回 FREE；持久 claim 再次 CAS 防异常漂移；page3 header/slot 写有 `UndoMetadataDeltaRecord(RSEG_HEADER_FIELD/RSEG_SLOT)` |
 | Atomic slot release / segment finalization | `RollbackSegmentSlotManager.beginBatchFinalization` all-or-none 取 FINALIZING leases -> `UndoSegmentFinalizer` 短读 owner/kind/drop plan/history/free evidence -> 精确单 fragment 先尝试同 kind cache，未接纳则进入 free FIFO，其余 drop -> 动态预算 MTR 固定 FSP page0/page2→page3→全部普通 first pages 全局排序，原子修改 owner、history/free base/link 与 terminal delta -> commit 后发布 slot/reuse directory/history | Implemented for INSERT/mixed commit、live/recovery 双段 rollback、committed UPDATE purge；cache 容量满/0/transition busy 可降级 free，只有不合格 segment 才 drop；history/reuse lease 不持锁跨 IO；物理前失败恢复运行时 transition，物理后失败保留 fail-stop fence |
-| ReadView 创建 (T1.4) | `ReadViewManager.openReadView(txn)` -> 按隔离级别 RR 缓存到 `Transaction.readView` / RC 新建 / RU·SERIALIZABLE 抛 -> `TransactionSystem.openReadViewSnapshot(txn)`（锁内：可写事务分配 creator id + 原子捕获 {activeIds, nextId, **nextTransactionNo→`ReadView.lowLimitNo`**} 建 `ReadView` 并**登记 live 集合**，purge 用） | Implemented (test-only); commit/finishRollback 调 `release` 清 RR 缓存并注销 live view；RC 经 `ReadViewManager.closeReadView` 语句末注销（purge 边界用，T-purge） |
+| ReadView 创建 (T1.4) | `ReadViewManager.openReadView(txn)` -> 按隔离级别 RR 缓存到 `Transaction.readView` / RC 新建 / RU·SERIALIZABLE 抛 -> `TransactionSystem.openReadViewSnapshot(txn)`（锁内：可写事务分配 creator id + 原子捕获 {activeIds, nextId, **nextTransactionNo→ReadView.lowLimitNo**} 建 `ReadView` 并登记 live 集合，purge 用） | Implemented and SQL point-read production-wired；commit/finishRollback 调 `release` 清 RR 缓存并注销 live view；`DefaultSqlStorageGateway.selectPoint` 在 finally 注销 RC view，且 view 生命周期覆盖 MVCC 版本选择、external LOB hydration 与公开行投影 |
 | Purge boundary + 单线程聚簇 purge (T-purge/1.4b) | 取 persistent-chain runtime head -> `TransactionSystem.isPurgeEligible(no,creator)` 在短锁内要求 creator 已离开 active table、no 低于 low water 且对所有 live ReadView 可见 -> 短 MTR 读 logical head/沿 UPDATE 局部 predecessor 收集 DELETE_MARK tasks -> 独立 index MTR purge -> `HistoryList.beginHeadRemoval` -> finalizer 原子 page3 unlink + first-page links + UPDATE cache/free/drop owner -> commit 后发布 slot/reuse directory/history | Implemented；物理链可局部 TransactionNo 倒序，blocked head 不越过；task/预检失败保留 COMMITTED owner 与持久 head；finalization 后 crash 由持久链恢复 |
-| Consistent read (MVCC, T1.4) | SQL point SELECT -> `DefaultSqlStorageGateway.selectPoint` -> RR/RC `ReadViewManager` -> `MvccReader.read(readView, index, key)` -> MTR-1 `btree.lookup` 物化当前版本并提交（释放 index latch）-> 不可见时沿 undo 版本链 -> gateway 用短只读 MTR hydration external LOB -> public `SqlRow` | Implemented for clustered primary-key equality；任一时刻不同持 index+undo latch，结果不暴露 hidden columns/LobReference；range/locking SELECT 未接 |
+| Consistent read (MVCC, T1.4) | SQL point SELECT -> `DefaultSqlStorageGateway.selectPoint` -> RR/RC `ReadViewManager` -> `MvccReader.read(readView, index, key)` -> MTR-1 `btree.lookup` 物化当前版本并提交（释放 index latch）-> 不可见时沿 undo 版本链 -> **同一存活 ReadView 内**由 gateway 用短只读 MTR hydration external LOB -> 完整投影为 public `SqlRow` -> RC finally close view | Implemented for clustered primary-key equality；RC 不会在解引用外置值前提前释放 purge low-water，任一时刻不同持 index+undo latch，结果不暴露 hidden columns/LobReference；range/locking SELECT 未接 |
 | Row-lock diagnostics (2.8a) | `LockManager.acquire/release/releaseAll` -> `RowLockEventSink` 事件端口（端口与事件载荷 `RowLockObservation`/`RowLockBlocker`/`ThreadEventId` 定义在 `storage.trx.lock`，server.lockobs 向下实现，无反向依赖）；`StorageEngine.lockDiagnosticSnapshot` -> `lockManager.snapshot()` -> `DefaultLockObservationService.captureSnapshot` -> `data_locks` / `data_lock_waits` rows | Implemented; row-lock only；不授锁、不 release、不 rollback；session/statement id 为 0，DD 未接所以 schema/table 为空、index 名为 `index#<indexId>` |
 
 ### Package Status
@@ -645,7 +645,7 @@ flowchart TD
 | `dd.ddl/recovery` | `DictionaryDdlService`, `DictionaryTablespaceDiscovery`, `DictionaryDdlRecoveryService` | Partial production-wired | CREATE/DROP 与 lifecycle recovery 已接；ALTER/CREATE INDEX statement/SDI/binlog/独立 DDL_LOG 未接 |
 | `storage.api.catalog` / `storage.fil.catalog` | `InternalCatalogStore`, catalog records/exceptions, `FileInternalCatalogStore` | Implemented v1 | 稳定 storage API 与 file backend；物理实现只依赖 common + storage API，不反向 import DD 异常或 repository |
 | `storage.api.ddl` | storage schema DTO/binding/mapper, `TableDdlStorageService`, `BTreeIndexMetadataFactory` | Implemented v1 + table LOB binding | physical create/drop、redo durability、DISCARDED marker；`TableStorageBinding` 校验 LOB segment 同 space 且不与 index segment alias，CREATE 的 LOB segment 与 indexes 同 MTR 创建；公开 DTO 隔离 DD domain，factory 供 engine adapter 使用 |
-| `engine` | `DatabaseEngine`, `DictionaryIndexMetadataResolver`, `DictionaryStorageMetadataMapper`, `MappedTableStorage`, `DefaultSqlStorageGateway` | Implemented public composition root | DD 先于 storage discovery，storage recovery 先于 DDL cleanup，全部成功后构造 SQL 组件与 Session registry；adapter 把 pinned exact-version DD metadata 映射到 storage，engine close 先并发收敛 Session 再关闭 storage/DD |
+| `engine` | `DatabaseEngine`, `EngineSessionExecutionGate`, `DictionaryIndexMetadataResolver`, `DictionaryStorageMetadataMapper`, `MappedTableStorage`, `DefaultSqlStorageGateway` | Implemented public composition root | DD 先于 storage discovery，storage recovery 先于 DDL cleanup，全部成功后构造 SQL 组件与 Session registry；adapter 把 pinned exact-version DD metadata 映射到 storage；每条 execute 持共享 gate permit，fatal 回调发布 FAILED，close 取得独占 quiescence 后才关闭 Session/storage/DD |
 
 ## SQL Primary-Point + Session Slice
 
@@ -655,41 +655,49 @@ flowchart TD
 flowchart TD
   Engine["DatabaseEngine.openSession"] --> Registry["SessionRegistry"]
   Engine --> Session["DefaultSqlSession"]
+  Engine --> Gate["EngineSessionExecutionGate"]
+  Session -->|"enter / failClosed"| Gate
+  Session --> Deadline["SqlStatementDeadline"]
   Session --> Parser["DefaultSqlParser"]
   Session --> Policy["SessionTransactionPolicy"]
   Session --> Binder["DefaultSqlBinder"]
   Session --> Executor["DefaultSqlExecutor"]
   Policy --> Metadata["TransactionMetadataScope"]
+  Deadline --> Metadata
   Metadata --> DD["DataDictionaryService.openTable READ/WRITE"]
   Executor --> Port["SqlStorageGateway"]
   Port --> Adapter["engine.adapter.DefaultSqlStorageGateway"]
+  Deadline --> Adapter
   Adapter --> Mapper["DictionaryStorageMetadataMapper"]
   Adapter --> DML["ClusteredDmlService INSERT/commit/rollback"]
   Adapter --> MVCC["ReadViewManager + MvccReader"]
   Adapter --> LOB["LobStorage hydration"]
   Engine --> Close["Session snapshot/close before StorageEngine.close"]
+  Close -->|"write quiescence"| Gate
 ```
 
 ### Current Data Chains
 
 | Flow | Current production chain | Current state |
 | --- | --- | --- |
-| Session admission | `DatabaseEngine.openSession` (`DatabaseEngine.java:168`) under lifecycle lock -> `SessionRegistry.register` -> `DefaultSqlSession` | Implemented；只允许 OPEN，close 切 CLOSING 与 session snapshot 同一 lifecycle 临界区，阻止漏入 |
-| Parse / bind | `DefaultSqlSession.execute` (`DefaultSqlSession.java:63`) -> `DefaultSqlParser.parse` (`DefaultSqlParser.java:24`) -> transaction policy -> `DefaultSqlBinder.bind` (`DefaultSqlBinder.java:34`) -> `TransactionMetadataScope.beginStatement` (`TransactionMetadataScope.java:39`) -> `DataDictionaryService.openTable` READ/WRITE | Implemented v1；INSERT single VALUES row 与 clustered primary-key equality SELECT；transaction-duration MDL/pin、READ→WRITE upgrade，statement scope 不提前释放 transaction lease |
-| INSERT | `DefaultSqlExecutor.execute` (`DefaultSqlExecutor.java:22`) -> `SqlStorageGateway.insert` -> `DefaultSqlStorageGateway.insert` (`DefaultSqlStorageGateway.java:80`) -> DD exact mapping -> `DmlStatementGuard` -> `ClusteredDmlService.insert` | Implemented；28 类型、复合 PK、external TEXT/BLOB/JSON、LOB+INSERT undo ownership+row 同 MTR；失败 guard rollback，rollback-only 保留终态资源 |
-| Point SELECT | executor -> `DefaultSqlStorageGateway.selectPoint` (`DefaultSqlStorageGateway.java:111`) -> isolation-specific ReadView -> `MvccReader.read` -> external LOB hydration -> public `QueryResult` | Implemented；RR transaction snapshot 稳定、RC statement snapshot 刷新；只返回投影列完整值，不泄露 storage reference |
+| Session admission | `DatabaseEngine.openSession` under lifecycle lock -> `SessionRegistry.register` -> `DefaultSqlSession`；每次 `execute` 先 `EngineSessionExecutionGate.enter` 取 read permit、再取 Session operation lock | Implemented；只允许 Engine OPEN；close 在 snapshot 同一 lifecycle 临界区切 CLOSING，gate 复核拒绝既有 Session 的新语句；锁序固定 gate→Session，避免 shutdown write gate 反向等待 |
+| Parse / bind | `DefaultSqlSession.execute` -> 单一 `SqlStatementDeadline` -> parser -> transaction policy -> `DefaultSqlBinder.bind` -> `TransactionMetadataScope.beginStatement` -> `DataDictionaryService.openTable` READ/WRITE | Implemented v1；绝对 deadline 从 Engine admission/Session lock 贯穿 MDL、executor、gateway/row lock、LOB/durability；Session MDL owner 使用保留高半区，普通 DDL owner 同数字不能重入；transaction-duration MDL/pin 不被 statement scope 提前释放 |
+| INSERT | `DefaultSqlExecutor.execute` -> `SqlStorageGateway.insert(transaction,bound,deadline)` -> `DefaultSqlStorageGateway.insert` -> deadline-capped handle/row-lock wait -> DD exact mapping -> `DmlStatementGuard` -> `ClusteredDmlService.insert` | Implemented；28 类型、复合 PK、external TEXT/BLOB/JSON、LOB+INSERT undo ownership+row 同 MTR；失败 guard rollback，rollback-only 保留终态资源；宽松 JSON 对象键/单引号/尾逗号/前导零在 binder 与 record 双层拒绝 |
+| Point SELECT | executor -> `DefaultSqlStorageGateway.selectPoint(transaction,bound,deadline)` -> isolation-specific ReadView -> `MvccReader.read` -> view 内 external LOB hydration/完整投影 -> RC finally close -> public `QueryResult` | Implemented；RR transaction snapshot 稳定、RC statement snapshot 刷新且覆盖 LOB 解引用；deadline 限制 handle 与每个 LOB 阶段，只返回投影列完整值，不泄露 storage reference |
 | Transaction terminal | `SessionTransactionPolicy` -> gateway `commit` (`DefaultSqlStorageGateway.java:146`) / `rollback` (`:176`) -> DML facade terminal + durability/row-lock release -> close transaction metadata scope | Implemented；storage 终态先于 MDL/pin 释放；outcome unknown 进入 FAILED；close rollback；rollback-only 只允许 rollback/close |
-| Engine close | `DatabaseEngine.close` -> registry snapshot -> `closeSessions` (`DatabaseEngine.java:234`) virtual-thread bounded convergence -> only after quiescence `StorageEngine.close` -> DD resources | Implemented；超时保持 CLOSING 且不关闭仍可能被 execute 使用的 storage；失败用 suppressed 聚合 |
+| Fatal propagation | storage fatal（即使位于 cause/suppressed）-> `DefaultSqlStorageGateway.adapt` / `DatabaseFailureClassifier` 保持 fatal -> `DefaultSqlSession` 进入 FAILED并 `SessionExecutionAdmission.failClosed` -> `DatabaseEngine` 发布 FAILED | Implemented；fatal 不再降级为可重试 `SqlStorageException`，组合根立即拒绝新 Session/statement；活动线程不递归 close，显式 close 再按 quiescence 顺序收敛 |
+| Engine close | `DatabaseEngine.close` -> lifecycle 发布 CLOSING/snapshot -> `EngineSessionExecutionGate.awaitQuiescence` write permit -> `closeSessions` virtual-thread bounded convergence -> `StorageEngine.close` -> DD resources | Implemented；write permit 证明全部 execute 已退出并覆盖 Session rollback + resource close；timeout 保持 CLOSING 且不关闭 storage；失败用 suppressed 聚合 |
 
 ### Package Status
 
 | Package area | Representative classes | Current state | Notes |
 | --- | --- | --- | --- |
 | `sql.parser` | lexer/token/source position/AST/`DefaultSqlParser` | Implemented v1 | 单语句 INSERT、primary-point SELECT、BEGIN/COMMIT/ROLLBACK、SET autocommit；错误含位置；无 UPDATE/DELETE/DDL/prepared grammar |
-| `sql.binder` | `DefaultSqlBinder`, `SqlTypeCoercion`, bound statements, metadata scopes | Implemented v1 | DD 28 类型转换、schema/name/shape 校验、transaction-duration metadata；无 optimizer/secondary access path |
-| `sql.executor` + `.storage` | public values/results, `DefaultSqlExecutor`, outbound gateway/opaque handle | Implemented v1 | SQL/session 对 storage 零 import；INSERT/point SELECT 分派，transaction control 由 Session policy 执行 |
-| `session` | `DefaultSqlSession`, `SessionTransactionPolicy`, `SessionRegistry`, state/options/snapshot | Implemented in-process v1 | fair explicit lock + bounded wait；autocommit 0/1、implicit/explicit transaction、rollback-only/FAILED/close；无 network connection/prepared statement/plan cache |
-| `engine.adapter` | `DefaultSqlStorageGateway`, `EngineSqlTransactionHandle` | Implemented v1 | 唯一 SQL→storage 映射层；handle 校验 adapter ownership/terminal，精确 DD version 映射；只支持 clustered INSERT/point SELECT |
+| `common.json` | `StrictJsonValidator` | Implemented and production-wired | binder 与 record LOB codec 共享 RFC 8259 严格文本校验；零对象树、保留原始文本/数字精度；拒绝宽松扩展并限制嵌套深度；不实现 MySQL binary JSON |
+| `sql.binder` | `DefaultSqlBinder`, `SqlTypeCoercion`, bound statements, metadata scopes | Implemented v1 | DD 28 类型转换、严格 JSON、schema/name/shape 校验、transaction-duration metadata；无 optimizer/secondary access path |
+| `sql.executor` + `.storage` | public values/results, `DefaultSqlExecutor`, `SqlStatementDeadline`, outbound gateway/opaque handle | Implemented v1 | SQL/session 对 storage 零 import；INSERT/point SELECT 分派并传递单一绝对 deadline，transaction control 由 Session policy 执行 |
+| `session` | `DefaultSqlSession`, `SessionExecutionAdmission`, `SessionTransactionPolicy`, `SessionRegistry`, state/options/snapshot | Implemented in-process v1 | Engine permit→fair Session lock 固定顺序；autocommit 0/1、implicit/explicit transaction、rollback-only/FAILED/fatal fail-close/close；无 network connection/prepared statement/plan cache |
+| `engine.adapter` | `DefaultSqlStorageGateway`, `EngineSqlTransactionHandle` | Implemented v1 | 唯一 SQL→storage 映射层；handle 校验 ownership/terminal 并受 deadline 限制，精确 DD version 映射，RC view 覆盖 LOB hydrate，fatal 严重度保持；只支持 clustered INSERT/point SELECT |
 
 ## Reserved / Unwired Production Types
 
@@ -888,15 +896,15 @@ flowchart TD
 | 单 undo 表空间假设 | `RollPointer` 只编 pageNo+offset；T1.3c 固定单一默认 rseg，rseg/slot 存 `UndoContext` + 内存目录不进指针 | 扩展多 rseg/多 undo 表空间编码 |
 | recovery 已接 DD discovery / table-index resolver / lifecycle DDL，仍缺 DDL_LOG / XA prepared | public engine 可恢复字典发现的多表空间，rollback/purge 按 undo identity 定位索引，DROP_PENDING/orphan 可续作；PREPARED 仍 fail-closed | 接独立 DDL_LOG 阶段机、XA coordinator、object-level force recovery 与 purge-aware DROP barrier |
 
-## 2026-07-16 Primary-Point SQL / Session v1 5-Pass Review Log
+## 2026-07-16 Primary-Point SQL / Session v1 Corrective 5-Pass Review Log
 
 | Pass | Result | Evidence |
 | --- | --- | --- |
-| 1. 生产调用链与分层 | PASS | 从源码核对 `DatabaseEngine.openSession → DefaultSqlSession → parser/policy/binder/executor → SqlStorageGateway → engine.adapter → DD/DML/MVCC/LOB`；SQL/session 对 storage 零 import，storage 无反向 import；optimizer/network/prepared/UPDATE/DELETE/range locking 均未画成实线 |
-| 2. SQL/DD/28 类型 | PASS | 单 Session 真实组合根覆盖 28 DD types、复合 clustered PK、非 UTC TIMESTAMP、BIT declared-width canonical、ENUM/SET、external TEXT/BLOB/JSON 完整返回；transaction metadata scope 覆盖 READ→WRITE upgrade 与 MDL transaction duration |
-| 3. LOB/Undo/Recovery | PASS | INSERT 在同一业务 MTR 写 LOB+ownership undo+row；statement/full/close/recovery rollback 回收 ownership；跨表同-kind undo predecessor 改为 schema-free identity 校验；committed external LOB restart 保留、rolled-back restart 不可见 |
-| 4. Session/并发/engine lifecycle | PASS | autocommit 0/1、BEGIN/COMMIT/ROLLBACK、RR/RC、row-lock/MDL/session timeout、rollback-only/FAILED、engine recovery/closing gate 与先 Session 后 storage close 均有断言；全量回归额外暴露并修复 page-cleaner replacement 发布前旧 IDLE/STOPPED 覆盖 supervisor 权威态的竞态 |
-| 5. 文档/静态/全量 | PASS | current map/backlog/design/显式 implementation plan 同步；2.8 complete，2.2/2.3 与 LOB replacement purge 保持 gap；无 executable Java monitor、裸 runtime exception、TODO/TBD 或越层 import；固定 JDK 25.0.2 + Gradle 9.5.1 `test --rerun-tasks --no-daemon`：264 suites / **1409 tests**，0 failure/error/skip；`git diff --check` 通过 |
+| 1. 生产调用链与分层 | PASS | 从源码重核 `DatabaseEngine.openSession → DefaultSqlSession → parser/policy/binder/executor → SqlStorageGateway → engine.adapter → DD/DML/MVCC/LOB`；新增 deadline/admission 均位于既有向下依赖方向，SQL/session 对 storage 零 import，storage 无反向 import；未把 optimizer/network/prepared/UPDATE/DELETE/range locking 画成实线 |
+| 2. SQL/DD/类型与身份 | PASS | 28 DD types 与 external LOB 既有覆盖保留；JSON 改为 binder/record 共用严格 RFC 8259 validator；Session MDL owner 进入保留高半区，DDL facade 拒绝保留 owner，测试证明相同普通数字不能绕过 MDL 等待 |
+| 3. LOB/MVCC/Undo crash 边界 | PASS | RC ReadView 的 finally 移到 external LOB hydration/投影之后；INSERT ownership rollback 以精确 durable hook 验证 inverse 后 marker 前 LOB 仍可读、marker 后已释放，两侧重试分别幂等重放或只终结，不再用正常 close/reopen 冒充该故障窗口 |
+| 4. Session/Engine/timeout/fatal | PASS | 锁序固定 Engine read permit→Session operation lock；CLOSING 既拒新 Session 也拒既有 Session 新语句，close 持 write quiescence 后才关闭 Session/storage；共享 absolute deadline 贯穿 handle/row lock/LOB；cause/suppressed fatal 保持严重度并发布 Engine FAILED |
+| 5. 文档/静态/全量 | PASS | current map 只更新受影响 SQL/transaction/engine 小节并按 10 项清单复核实线/状态/Reserved/Gap；2.8 保持 complete，2.2/2.3 与 LOB replacement purge 仍是 gap；无 executable Java monitor、裸 runtime exception、TODO/TBD 或越层 import；固定 JDK 25.0.2 + Gradle 9.5.1 `test --rerun-tasks --no-daemon`：267 suites / **1419 tests**，0 failure/error/skip；`git diff --check` 通过（仅 Git CRLF 提示） |
 
 ## 2026-07-15 Data Dictionary + Physical DDL v1 5-Pass Review Log
 

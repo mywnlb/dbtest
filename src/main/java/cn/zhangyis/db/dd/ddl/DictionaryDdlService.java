@@ -296,5 +296,8 @@ public final class DictionaryDdlService {
         if (owner == null || timeout == null || timeout.isZero() || timeout.isNegative()) {
             throw new DatabaseValidationException("DDL owner/positive timeout required");
         }
+        if (owner.sessionOwner()) {
+            throw new DatabaseValidationException("public DDL cannot reuse a reserved Session MDL owner");
+        }
     }
 }

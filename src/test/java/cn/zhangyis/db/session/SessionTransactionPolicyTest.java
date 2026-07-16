@@ -79,11 +79,13 @@ class SessionTransactionPolicyTest {
         @Override public SqlTransactionHandle begin(SqlTransactionRequest request) {
             events.add("begin:" + (request.readOnly() ? "RO" : "RW")); return new Handle(++next);
         }
-        @Override public SqlWriteOutcome insert(SqlTransactionHandle transaction, BoundClusteredInsert statement) {
+        @Override public SqlWriteOutcome insert(SqlTransactionHandle transaction, BoundClusteredInsert statement,
+                                                SqlStatementDeadline deadline) {
             events.add("insert"); return new SqlWriteOutcome(1, false);
         }
         @Override public Optional<SqlRow> selectPoint(SqlTransactionHandle transaction,
-                                                     BoundPrimaryPointSelect statement) {
+                                                     BoundPrimaryPointSelect statement,
+                                                     SqlStatementDeadline deadline) {
             events.add("select"); return Optional.empty();
         }
         @Override public SqlCommitOutcome commit(SqlTransactionHandle transaction, SqlCommitRequest request) {

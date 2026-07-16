@@ -63,20 +63,47 @@ public final class TableDdlStorageService {
     }
 
     /**
-     * 创建可立即打开的物理表。一个 MTR 同时初始化 page0/FSP、每个索引的两个 segment 与稳定 root，commit 后
-     * 通过 flushThrough 建立 redo→data/checkpoint 屏障，只有该屏障成功才向 DD 返回 binding。
+     * 创建可由上层数据字典发布并立即打开的物理表。
+     *
+     * <p>本方法只负责 {@code storage.api} 范围内的物理 DDL，不获取 MDL，也不发布 {@code ACTIVE}
+     * 字典版本；调用方必须先独占目标表名，并且只能在本方法成功返回 binding 后提交字典事务。</p>
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>在产生文件、页或 redo 副作用前，校验请求并把每个索引映射为 record schema/key，确保列类型、
+     *     key part 和聚簇索引布局能够被存储层解释；同时判断该表是否需要共享的表级 LOB segment。</li>
+     *     <li>按 page0/FSP、每索引 leaf/non-leaf segment、root page 以及可选 LOB segment 的最坏页镜像数
+     *     申请 DDL redo admission 预算；算术溢出或预算不足时不得创建 tablespace。</li>
+     *     <li>在同一个 MTR 中创建 GENERAL tablespace，并为每个索引分配 leaf/non-leaf segment 与 level-0
+     *     稳定 root；LOB-capable 列只额外创建一个全表共享的 LOB segment，所有页修改共同形成一个物理原子单元。</li>
+     *     <li>提交 MTR，将同批 redo 的结束 LSN 写入被修改页并释放 fix/latch；物理初始化或 commit 调用抛错时，
+     *     只回滚仍处于 ACTIVE 的 MTR，并尽力 discard、失效、关闭和删除未完成 tablespace，清理失败作为
+     *     suppressed exception 保留。</li>
+     *     <li>对 commit LSN 执行 {@code flushThrough}，先满足 WAL，再刷出受该 LSN 约束的脏页并推进 checkpoint，
+     *     随后 force 目标 tablespace。只有屏障全部成功才返回不可变 binding；若提交后的持久化阶段失败，则保留物理文件
+     *     供 crash recovery 或受控 orphan cleanup 判定，不能把已经进入 redo 历史的建表动作当作未提交 MTR 直接删除。</li>
+     * </ol>
+     *
+     * <p>与 MySQL/InnoDB 的差异：当前 v1 没有独立 {@code dd_ddl_log} 和 SDI，物理完成与字典发布之间的崩溃窗口
+     * 依靠已提交 catalog binding 与受控命名 orphan discovery 收敛，而不是重放完整 Atomic DDL participant 状态机。</p>
+     *
+     * @param definition 已由 DD 分配稳定 table/space/index identity 的物理建表请求；不能为 {@code null}
+     * @return 包含 tablespace、各索引 root/segment 以及可选 LOB segment 的稳定物理绑定
+     * @throws DatabaseValidationException 请求为空、schema/key 无法映射或 redo 工作量计算溢出时抛出；这些失败不产生物理副作用
      */
     public TableStorageBinding createTable(StorageTableDefinition definition) {
+        // 1. 先完成所有无副作用的 schema/key 可实现性校验；任何失败都必须早于文件创建和 MTR 页修改。
         if (definition == null) {
             throw new DatabaseValidationException("storage table definition must not be null");
         }
-        // 所有纯 schema/key 校验必须早于建文件和 MTR 页修改；失败时磁盘上不得出现半初始化 tablespace。
         for (StorageIndexDefinition index : definition.indexes()) {
             schemaMapper.tableSchema(definition, index.clustered());
             schemaMapper.indexKey(definition, index);
         }
         boolean requiresLobSegment = definition.columns().stream()
                 .anyMatch(column -> isLobCapable(column.type().typeId()));
+
+        // 2. 以本次 DDL 可能产生的最坏页镜像量申请 redo admission；预算不可表达时禁止进入物理创建阶段。
         long pageImages;
         try {
             long indexImages = Math.multiplyExact(6L, definition.indexes().size());
@@ -91,6 +118,7 @@ public final class TableDdlStorageService {
         Optional<SegmentRef> lobSegment = Optional.empty();
         Lsn commitLsn;
         try {
+            // 3. 所有 tablespace/FSP/segment/root 初始化都归属同一个 MTR，避免向 DD 暴露部分建成的索引集合。
             disk.createTablespace(mtr, definition.spaceId(), definition.path(), definition.initialSizeInPages(),
                     TablespaceType.GENERAL);
             for (StorageIndexDefinition index : definition.indexes()) {
@@ -103,11 +131,15 @@ public final class TableDdlStorageService {
             if (requiresLobSegment) {
                 lobSegment = Optional.of(disk.createSegment(mtr, definition.spaceId(), SegmentPurpose.LOB));
             }
+
+            // 4. commit 为全部物理页分配统一结束 LSN 并释放 MTR 资源；正常返回前抛错则进入未完成建表补偿分支。
             commitLsn = mtrManager.commit(mtr);
         } catch (RuntimeException failure) {
             rollbackAndRemoveFailedCreate(mtr, definition, failure);
             throw failure;
         }
+
+        // 5. 先让 redo、相关脏页与 checkpoint 覆盖 commit LSN，再 force 目标文件；屏障成功后 binding 才可供 DD 发布。
         flush.flushThrough(commitLsn, Duration.ofSeconds(30));
         store.force(definition.spaceId());
         log.info("created physical table: table={} space={} path={} indexes={} lobSegment={}", definition.tableId(),

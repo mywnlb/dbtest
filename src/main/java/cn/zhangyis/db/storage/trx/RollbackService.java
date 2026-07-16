@@ -126,6 +126,21 @@ public final class RollbackService {
                 null, null, null);
     }
 
+    /**
+     * 复制当前生产 wiring 并只替换逐记录 crash hook。该包内接缝让故障测试复用真实 DD target 与 LOB storage，
+     * 不修改原实例，也不允许上层把 injector 当成运行期配置；正常组合根始终持有 no-op 实例。
+     *
+     * @param injector 仅在已提交的 inverse/progress 边界后触发的故障注入器。
+     * @return 与当前实例共享无状态协作者、但使用指定 crash hook 的独立回滚执行器。
+     */
+    RollbackService withProgressFaultInjectorForTest(RollbackProgressFaultInjector injector) {
+        if (injector == null) {
+            throw new DatabaseValidationException("rollback progress fault injector must not be null");
+        }
+        return new RollbackService(btree, undoAccess, txnMgr, mtrMgr, finalizer, injector,
+                indexResolver, targetResolver, lobStorage);
+    }
+
     private RollbackService(SplitCapableBTreeIndexService btree, UndoLogSegmentAccess undoAccess,
                     TransactionManager txnMgr, MiniTransactionManager mtrMgr,
                     UndoSegmentFinalizer finalizer, RollbackProgressFaultInjector progressFaultInjector,

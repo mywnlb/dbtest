@@ -4,6 +4,7 @@ import cn.zhangyis.db.common.exception.DatabaseRuntimeException;
 import cn.zhangyis.db.dd.domain.ColumnTypeDefinition;
 import cn.zhangyis.db.dd.domain.DictionaryTypeId;
 import cn.zhangyis.db.sql.executor.SqlValue;
+import cn.zhangyis.db.sql.binder.exception.SqlTypeCoercionException;
 import cn.zhangyis.db.sql.parser.SourcePosition;
 import cn.zhangyis.db.sql.parser.ast.*;
 import org.junit.jupiter.api.Test;
@@ -18,6 +19,20 @@ import static org.junit.jupiter.api.Assertions.*;
 class SqlTypeCoercionTest {
     private static final SourcePosition P = new SourcePosition(0, 1, 1);
     private final SqlTypeCoercion coercion = new SqlTypeCoercion();
+
+    /** JSON v1 是严格 RFC 8259 文本；Hutool 宽松对象键、单引号和尾逗号都必须在 Binder 拒绝。 */
+    @Test
+    void rejectsLenientNonStandardJsonSyntax() {
+        ColumnTypeDefinition json = definition(DictionaryTypeId.JSON);
+        assertThrows(SqlTypeCoercionException.class,
+                () -> coercion.coerce(str("{foo:1}"), json, ZoneId.of("UTC"), false));
+        assertThrows(SqlTypeCoercionException.class,
+                () -> coercion.coerce(str("{'a':1}"), json, ZoneId.of("UTC"), false));
+        assertThrows(SqlTypeCoercionException.class,
+                () -> coercion.coerce(str("[1,]"), json, ZoneId.of("UTC"), false));
+        assertThrows(SqlTypeCoercionException.class,
+                () -> coercion.coerce(str("01"), json, ZoneId.of("UTC"), false));
+    }
 
     @Test
     void supportsEveryDictionaryTypeWithoutStorageValues() {

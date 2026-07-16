@@ -63,6 +63,8 @@ public final class DatabaseEngine implements AutoCloseable {
     /** 序列化可能跨 lifecycle lock 外等待 Session 的 close 尝试；使用有界 tryLock。 */
     private final ReentrantLock closeWorkLock = new ReentrantLock(true);
     private final EngineConfig baseConfig;
+    /** 用户语句并发 read / shutdown write gate；不串行不同 Session。 */
+    private final EngineSessionExecutionGate sessionExecutionGate;
 
     private volatile DatabaseEngineState state = DatabaseEngineState.NEW;
     private FileInternalCatalogStore catalogStore;
@@ -86,6 +88,7 @@ public final class DatabaseEngine implements AutoCloseable {
             throw new DatabaseValidationException("undo space id conflicts with dictionary space id");
         }
         this.baseConfig = config;
+        this.sessionExecutionGate = new EngineSessionExecutionGate(this::state, this::failClosed);
     }
 
     /**
@@ -174,7 +177,8 @@ public final class DatabaseEngine implements AutoCloseable {
             DefaultSqlStorageGateway gateway = new DefaultSqlStorageGateway(storage, sqlMetadataMapper,
                     options.rowLockTimeout());
             DefaultSqlSession session = new DefaultSqlSession(id, options, dictionary, sqlParser, sqlBinder,
-                    new DefaultSqlExecutor(gateway), gateway, () -> sessions.deregister(id));
+                    new DefaultSqlExecutor(gateway), gateway, sessionExecutionGate,
+                    () -> sessions.deregister(id));
             sessions.register(session);
             return session;
         } finally {
@@ -188,11 +192,19 @@ public final class DatabaseEngine implements AutoCloseable {
     }
 
     /**
-     * 关闭顺序：切 CLOSING 拒绝新流量 → lifecycle lock 外并发等待 Session rollback/quiesce → StorageEngine flush/close
-     * → DD sidecar。若 Session 在总 timeout 内未退出，保持 CLOSING 且绝不关闭仍可能被执行线程访问的 storage。
+     * 关闭数据库组合根。
+     * <ol>
+     *     <li>有界取得 close owner 锁，拒绝两个线程同时执行资源终结。</li>
+     *     <li>在 lifecycle 短锁内切 CLOSING 并冻结 Session 快照；从此 openSession 和新 execute 均被拒绝。</li>
+     *     <li>在 lifecycle 锁外取得 statement gate write permit，有界等待所有已准入 execute 完整退出。</li>
+     *     <li>持 write permit 并发关闭快照 Session，使活动事务先 rollback、再释放 transaction-duration MDL/pin。</li>
+     *     <li>仅在语句已静默后关闭 StorageEngine 与 DD sidecar，发布 CLOSED；任一 close 异常用 suppressed 聚合。</li>
+     * </ol>
+     * 若第 1、3、4 步 timeout，保持 CLOSING 且绝不关闭仍可能被执行线程访问的 storage。
      */
     @Override
     public void close() {
+        // 1. closeWorkLock 只串行 shutdown owner，不保护 storage/session 内部状态。
         boolean closeOwner;
         try {
             closeOwner = closeWorkLock.tryLock(baseConfig.flushTimeout().toNanos(), TimeUnit.NANOSECONDS);
@@ -202,6 +214,7 @@ public final class DatabaseEngine implements AutoCloseable {
         }
         if (!closeOwner) throw new DatabaseRuntimeException("database close already in progress beyond timeout");
         try {
+            // 2. 状态与 snapshot 同批发布，消除 openSession 漏入关闭快照的窗口。
             List<SqlSession> snapshot;
             lifecycleLock.lock();
             try {
@@ -212,16 +225,20 @@ public final class DatabaseEngine implements AutoCloseable {
                 lifecycleLock.unlock();
             }
 
-            SessionCloseResult sessionResult = closeSessions(snapshot, baseConfig.flushTimeout());
-            if (!sessionResult.quiesced()) {
-                // storage/catalog 保持原样；调用方可在活动 execute 退出后重试 close。
-                throw sessionResult.failure();
+            // 3. write permit 覆盖后续 Session rollback 与 storage/DD close；timeout 时不触碰任何下游资源。
+            try (var ignored = sessionExecutionGate.awaitQuiescence(baseConfig.flushTimeout())) {
+                // 4. 此时不存在持 operationLock 的 execute，Session.close 不会与 gate 形成反向锁序。
+                SessionCloseResult sessionResult = closeSessions(snapshot, baseConfig.flushTimeout());
+                if (!sessionResult.quiesced()) {
+                    throw sessionResult.failure();
+                }
+                // 5. storage 关闭异常仍继续清 DD sidecar，并在 CLOSED 发布后把聚合错误返回调用方。
+                RuntimeException aggregate = closeResources(sessionResult.failure());
+                lifecycleLock.lock();
+                try { state = DatabaseEngineState.CLOSED; }
+                finally { lifecycleLock.unlock(); }
+                if (aggregate != null) throw aggregate;
             }
-            RuntimeException aggregate = closeResources(sessionResult.failure());
-            lifecycleLock.lock();
-            try { state = DatabaseEngineState.CLOSED; }
-            finally { lifecycleLock.unlock(); }
-            if (aggregate != null) throw aggregate;
         } finally {
             closeWorkLock.unlock();
         }
@@ -290,6 +307,22 @@ public final class DatabaseEngine implements AutoCloseable {
         failure = closeOne(catalogStore, failure);
         catalogStore = null;
         return failure;
+    }
+
+    /**
+     * 任一 Session 观察到 DatabaseFatalException 时立即关闭新 Session/statement 准入。这里只发布状态并记录根因，
+     * 不在活动 execute 线程中递归 close/flush；调用方随后显式 close，由 statement gate 先完成 quiescence。
+     */
+    private void failClosed(cn.zhangyis.db.common.exception.DatabaseFatalException failure) {
+        lifecycleLock.lock();
+        try {
+            if (state == DatabaseEngineState.OPEN) {
+                state = DatabaseEngineState.FAILED;
+                log.error("database engine entered FAILED after a fail-stop statement error", failure);
+            }
+        } finally {
+            lifecycleLock.unlock();
+        }
     }
 
     private static RuntimeException closeOne(AutoCloseable resource, RuntimeException failure) {

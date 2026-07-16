@@ -60,10 +60,21 @@ class LobCodecTest {
         ColumnType type = ColumnType.json(false);
         assertEquals(new ColumnValue.StringValue("{\"a\":[1,true,null]}"), roundTrip(
                 new ColumnValue.StringValue("{\"a\":[1,true,null]}"), type));
+        assertEquals(new ColumnValue.StringValue("{\"n\":-1.25e+3,\"s\":\"\\uD83D\\uDE00\"}"),
+                roundTrip(new ColumnValue.StringValue(
+                        "{\"n\":-1.25e+3,\"s\":\"\\uD83D\\uDE00\"}"), type));
         assertThrows(InvalidColumnValueException.class,
                 () -> registry.validate(new ColumnValue.StringValue("{broken"), type));
         assertThrows(InvalidColumnValueException.class,
                 () -> registry.validate(new ColumnValue.StringValue("  "), type));
+        assertThrows(InvalidColumnValueException.class,
+                () -> registry.validate(new ColumnValue.StringValue("{foo:1}"), type));
+        assertThrows(InvalidColumnValueException.class,
+                () -> registry.validate(new ColumnValue.StringValue("{'foo':1}"), type));
+        assertThrows(InvalidColumnValueException.class,
+                () -> registry.validate(new ColumnValue.StringValue("{\"foo\":1,}"), type));
+        assertThrows(InvalidColumnValueException.class,
+                () -> registry.validate(new ColumnValue.StringValue("[01]"), type));
 
         byte[] encoded = encode(new ColumnValue.StringValue("{}"), type);
         assertThrows(UnsupportedColumnTypeException.class, () -> registry.codecFor(type).compareKeyPart(

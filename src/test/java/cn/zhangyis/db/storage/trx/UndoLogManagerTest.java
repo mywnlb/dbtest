@@ -244,7 +244,10 @@ class UndoLogManagerTest {
             Transaction txn = h.txnMgr.begin(TransactionOptions.defaults());
             h.txnMgr.assignWriteId(txn);
             MiniTransaction write = h.mgr.begin();
-            UndoTestWrites.insert(h.undoMgr, txn, write, TABLE_ID, INDEX_ID, keyOf(101), keyDef(), schema());
+            for (int i = 0; i < 500; i++) {
+                UndoTestWrites.insert(h.undoMgr, txn, write, TABLE_ID, INDEX_ID,
+                        keyOf(10_000 + i), keyDef(), schema());
+            }
             h.mgr.commit(write);
             h.txnMgr.prepareCommit(txn);
 
@@ -309,7 +312,10 @@ class UndoLogManagerTest {
             Transaction oldTxn = h.txnMgr.begin(TransactionOptions.defaults());
             TransactionId oldCreator = h.txnMgr.assignWriteId(oldTxn);
             MiniTransaction oldWrite = h.mgr.begin();
-            UndoTestWrites.insert(h.undoMgr, oldTxn, oldWrite, TABLE_ID, INDEX_ID, keyOf(103), keyDef(), schema());
+            for (int i = 0; i < 500; i++) {
+                UndoTestWrites.insert(h.undoMgr, oldTxn, oldWrite, TABLE_ID, INDEX_ID,
+                        keyOf(20_000 + i), keyDef(), schema());
+            }
             h.mgr.commit(oldWrite);
             UndoContext oldContext = oldTxn.undoContext();
             h.txnMgr.prepareCommit(oldTxn);
@@ -335,7 +341,8 @@ class UndoLogManagerTest {
             h.txnMgr.prepareCommit(newTxn);
             h.undoMgr.onCommit(newTxn);
             h.txnMgr.commit(newTxn);
-            assertEquals(2, counting[0].dropAttempts(), "the new owner can still finalize normally");
+            assertEquals(1, counting[0].dropAttempts(),
+                    "the new eligible owner can still finalize normally into free FIFO without another FSP drop");
         });
     }
 
@@ -533,6 +540,13 @@ class UndoLogManagerTest {
             UndoTestWrites.insert(h.undoMgr, txn, write, TABLE_ID, INDEX_ID, keyOf(100), keyDef(), schema());
             h.mgr.commit(write);
             UndoContext context = txn.undoContext();
+            // 多页 segment 不满足 v1 free/cache 资格，保留本回归对真实 FSP drop 原子批次的检查。
+            for (int i = 0; i < 500; i++) {
+                MiniTransaction grow = h.mgr.begin();
+                UndoTestWrites.insert(h.undoMgr, txn, grow, TABLE_ID, INDEX_ID,
+                        keyOf(30_000 + i), keyDef(), schema());
+                h.mgr.commit(grow);
+            }
             int batchesBeforeFinalization = h.mgr.redoLogManager().bufferedBatches().size();
 
             h.txnMgr.prepareCommit(txn);

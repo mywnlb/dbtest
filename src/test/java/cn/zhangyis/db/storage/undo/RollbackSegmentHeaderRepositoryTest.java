@@ -47,12 +47,15 @@ class RollbackSegmentHeaderRepositoryTest {
 
     @Test
     void formatThenReadEmptyDirectory() {
-        assertEquals(3, RollbackSegmentHeaderLayout.FORMAT_VERSION);
+        assertEquals(4, RollbackSegmentHeaderLayout.FORMAT_VERSION);
         assertEquals(66, RollbackSegmentHeaderLayout.HISTORY_HEAD_PAGE_NO);
         assertEquals(74, RollbackSegmentHeaderLayout.HISTORY_TAIL_PAGE_NO);
         assertEquals(82, RollbackSegmentHeaderLayout.HISTORY_LENGTH);
         assertEquals(90, RollbackSegmentHeaderLayout.LAST_TRANSACTION_NO);
-        assertEquals(98, RollbackSegmentHeaderLayout.SLOT_ARRAY_BASE);
+        assertEquals(98, RollbackSegmentHeaderLayout.FREE_HEAD_PAGE_NO);
+        assertEquals(106, RollbackSegmentHeaderLayout.FREE_TAIL_PAGE_NO);
+        assertEquals(114, RollbackSegmentHeaderLayout.FREE_LENGTH);
+        assertEquals(122, RollbackSegmentHeaderLayout.SLOT_ARRAY_BASE);
         withRepo((repo, mgr) -> {
             MiniTransaction w = mgr.begin();
             repo.format(w, UNDO, RSEG, 8);
@@ -65,6 +68,48 @@ class RollbackSegmentHeaderRepositoryTest {
             assertEquals(8, snap.slotCapacity());
             assertTrue(snap.occupiedSlots().isEmpty());
             assertEquals(RollbackSegmentHistoryBase.empty(), snap.historyBase());
+            assertEquals(RollbackSegmentFreeListBase.empty(), snap.freeListBase());
+        });
+    }
+
+    /** page3 v4 的 free owner 采用尾插头摘；owner 在 active slot 与 free base 之间原子迁移。 */
+    @Test
+    void activeOwnersAppendToFreeFifoAndHeadMovesBackToActive() {
+        withRepo((repo, mgr) -> {
+            PageId first = PageId.of(UNDO, PageNo.of(7));
+            PageId second = PageId.of(UNDO, PageNo.of(6));
+            MiniTransaction write = mgr.begin();
+            repo.format(write, UNDO, RSEG, 8, 0);
+            repo.claimSlot(write, UNDO, UndoSlotId.of(0), first);
+            RollbackSegmentFreeListBase one = repo.moveActiveSlotsToFree(write, UNDO,
+                    RollbackSegmentFreeListBase.empty(), List.of(
+                            new RollbackSegmentHeaderRepository.FreePush(UndoSlotId.of(0), first)));
+            repo.claimSlot(write, UNDO, UndoSlotId.of(1), second);
+            RollbackSegmentFreeListBase two = repo.moveActiveSlotsToFree(write, UNDO, one, List.of(
+                    new RollbackSegmentHeaderRepository.FreePush(UndoSlotId.of(1), second)));
+            mgr.commit(write);
+
+            assertEquals(first, two.headPageId().orElseThrow());
+            assertEquals(second, two.tailPageId().orElseThrow());
+            assertEquals(2L, two.length());
+
+            MiniTransaction reuse = mgr.begin();
+            RollbackSegmentFreeListBase remaining = repo.moveFreeHeadToActiveSlot(reuse, UNDO, two,
+                    first, Optional.of(second), UndoSlotId.of(3));
+            mgr.commit(reuse);
+
+            MiniTransaction read = mgr.beginReadOnly();
+            RollbackSegmentHeaderSnapshot snapshot = repo.read(read, UNDO, RSEG, 8, 0);
+            mgr.commit(read);
+            assertEquals(Map.of(UndoSlotId.of(3), first), snapshot.occupiedSlots());
+            assertEquals(remaining, snapshot.freeListBase());
+            assertEquals(second, remaining.headPageId().orElseThrow());
+            assertEquals(second, remaining.tailPageId().orElseThrow());
+            assertEquals(1L, remaining.length());
+            assertTrue(mgr.redoLogManager().bufferedRecords().stream()
+                    .filter(UndoMetadataDeltaRecord.class::isInstance)
+                    .map(UndoMetadataDeltaRecord.class::cast)
+                    .anyMatch(delta -> delta.kind() == UndoMetadataDeltaKind.RSEG_FREE_BASE));
         });
     }
 
@@ -114,7 +159,7 @@ class RollbackSegmentHeaderRepositoryTest {
         });
     }
 
-    /** page3 v3 的 active/cache owner 转移必须保持 LIFO，且 owner 任一时刻只出现在一个目录。 */
+    /** page3 v4 的 active/cache owner 转移必须保持 LIFO，且 owner 任一时刻只出现在一个目录。 */
     @Test
     void activeOwnersMoveToCacheAndLifoTopMovesBackToActive() {
         withRepo((repo, mgr) -> {
@@ -352,6 +397,29 @@ class RollbackSegmentHeaderRepositoryTest {
             MiniTransaction corrupt = mgr.begin();
             corrupt.getPage(pool, RollbackSegmentHeaderRepository.headerPage(UNDO), PageLatchMode.EXCLUSIVE)
                     .writeInt(RollbackSegmentHeaderLayout.FORMAT, 2);
+            mgr.commit(corrupt);
+
+            MiniTransaction read = mgr.beginReadOnly();
+            assertThrows(UndoLogFormatException.class, () -> repo.read(read, UNDO, RSEG, 8, 2));
+            mgr.rollbackUncommitted(read);
+        }
+    }
+
+    /** page3 v3 没有持久 free base，v4 进程必须 fail-closed。 */
+    @Test
+    void readRejectsLegacyV3HeaderFailClosed() {
+        PageStore store = new FileChannelPageStore();
+        store.create(UNDO, dir.resolve("undo-v3.ibu"), PS, PageNo.of(8));
+        try (PageStore ignored = store; BufferPool pool = new LruBufferPool(store, PS, 8)) {
+            RollbackSegmentHeaderRepository repo = new RollbackSegmentHeaderRepository(pool, PS);
+            MiniTransactionManager mgr = new MiniTransactionManager();
+            MiniTransaction format = mgr.begin();
+            repo.format(format, UNDO, RSEG, 8, 2);
+            mgr.commit(format);
+
+            MiniTransaction corrupt = mgr.begin();
+            corrupt.getPage(pool, RollbackSegmentHeaderRepository.headerPage(UNDO),
+                    PageLatchMode.EXCLUSIVE).writeInt(RollbackSegmentHeaderLayout.FORMAT, 3);
             mgr.commit(corrupt);
 
             MiniTransaction read = mgr.beginReadOnly();

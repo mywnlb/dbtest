@@ -81,6 +81,34 @@ class UndoPageTest {
         });
     }
 
+    /** FREE 保留 FSP identity 但清空事务/记录 owner，并允许下一事务跨 kind 激活。 */
+    @Test
+    void resetForFreeThenActivateWithDifferentKind() {
+        onFirstPage((page, handle) -> {
+            page.appendRecord(new byte[]{1, 2, 3}, TransactionId.of(7), UndoNo.of(1));
+            page.setLogRecordCount(1);
+            page.setLogLastUndoNo(1);
+            page.setLogicalHead(new UndoLogicalHead(UndoNo.of(1),
+                    new RollPointer(true, page.pageId().pageNo(), UndoPageLayout.RECORD_AREA_START)));
+
+            page.resetForFree(handle, FilePageHeader.FIL_NULL, FilePageHeader.FIL_NULL);
+
+            assertEquals(UndoLogState.FREE, UndoLogState.fromPhysical(page.state()));
+            assertTrue(page.transactionId().isNone());
+            assertEquals(UndoPageLayout.RECORD_AREA_START, page.freeOffset());
+            assertEquals(0, page.recordCount());
+            assertEquals(UndoLogicalHead.EMPTY, page.logicalHead());
+            assertEquals(FilePageHeader.FIL_NULL, page.freePrevPageNo());
+            assertEquals(FilePageHeader.FIL_NULL, page.freeNextPageNo());
+
+            page.activateFree(UndoLogKind.UPDATE, TransactionId.of(9), handle);
+
+            assertEquals(UndoLogState.ACTIVE, UndoLogState.fromPhysical(page.state()));
+            assertEquals(UndoLogKind.UPDATE, page.undoKind());
+            assertEquals(TransactionId.of(9), page.transactionId());
+        });
+    }
+
     @Test
     void appendAdvancesPageHeaderOnlyAndReadsBack() {
         onFirstPage((page, handle) -> {

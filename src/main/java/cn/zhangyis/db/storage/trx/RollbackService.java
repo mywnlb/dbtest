@@ -9,6 +9,7 @@ import cn.zhangyis.db.domain.UndoNo;
 import cn.zhangyis.db.domain.UndoSlotId;
 import cn.zhangyis.db.storage.btree.BTreeIndex;
 import cn.zhangyis.db.storage.btree.SplitCapableBTreeIndexService;
+import cn.zhangyis.db.storage.btree.IndexMetadataResolver;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
@@ -44,7 +45,7 @@ import java.util.Collection;
  *
  * <p><b>状态机两阶段</b>：{@code rollback} 在 ACTIVE 状态先预检整条逻辑链，再经
  * {@link TransactionManager#beginRollback} 进入 ROLLING_BACK；已处于 ROLLING_BACK 的失败重试直接恢复走链。
- * 走完链并经 finalizer 同批 cache/drop segment、转移 page3 owner、写 rollback-complete 正式恢复证据后，才调用
+ * 走完链并经 finalizer 同批 cache/free/drop segment、转移 page3 owner、写 rollback-complete 正式恢复证据后，才调用
  * {@link TransactionManager#finishRollback}（removeActive + →ROLLED_BACK）。
  *
  * <p><b>每条 undo 短读 + 独立写 MTR</b>（§7.6 step 6）：先分别用短只读 MTR 物化当前 record 与真实前驱，
@@ -56,8 +57,9 @@ import java.util.Collection;
  * （已写 undo 但无对应聚簇行）由本走链幂等清理；1.4 起 statement/savepoint 边界可由 storage DML Guard
  * 显式回退。
  *
- * <p><b>单聚簇索引假设</b>：用传入 {@code clusteredIndex} 的 keyDef/schema 解码所有 undo（T1 无 data dictionary）；
- * 多索引解析、二级索引删除、SQL/session 自动 statement 生命周期与 savepoint lock scope 留后续。
+ * <p><b>索引解析</b>：legacy 调用继续显式传单聚簇索引；DatabaseEngine 注入 {@link IndexMetadataResolver} 后，
+ * 每条 undo 先读取固定前缀 tableId/indexId，再解析对应 keyDef/schema/root。二级索引 undo 尚未生成；SQL/session
+ * 自动 statement 生命周期与 savepoint lock scope 留后续。
  */
 public final class RollbackService {
 
@@ -69,10 +71,12 @@ public final class RollbackService {
     private final TransactionManager txnMgr;
     /** 物理短事务工厂；每条 undo 至少一个短读 MTR，反向修改另用独立 index MTR。 */
     private final MiniTransactionManager mtrMgr;
-    /** 完整/恢复回滚到 EMPTY 后执行 atomic cache/drop + page3 owner 转移的终态协作者。 */
+    /** 完整/恢复回滚到 EMPTY 后执行 atomic cache/free/drop + page3 owner 转移的终态协作者。 */
     private final UndoSegmentFinalizer finalizer;
     /** 包内 crash-point 测试接缝；生产公开构造器固定注入 no-op，不改变正常控制流。 */
     private final RollbackProgressFaultInjector progressFaultInjector;
+    /** 非 null 时每条 undo 按固定前缀身份解析真实索引；null 保留旧显式单索引调用兼容。 */
+    private final IndexMetadataResolver indexResolver;
 
     /**
      * 构造生产 rollback 执行器；逐记录 progress hook 固定为 no-op，完整终结必须使用共享 finalizer。
@@ -86,7 +90,14 @@ public final class RollbackService {
     public RollbackService(SplitCapableBTreeIndexService btree, UndoLogSegmentAccess undoAccess,
                            TransactionManager txnMgr, MiniTransactionManager mtrMgr,
                            UndoSegmentFinalizer finalizer) {
-        this(btree, undoAccess, txnMgr, mtrMgr, finalizer, RollbackProgressFaultInjector.none());
+        this(btree, undoAccess, txnMgr, mtrMgr, finalizer, RollbackProgressFaultInjector.none(), null);
+    }
+
+    /** DD 模式构造器：rollback/recovery 逐条解析 undo 的 tableId/indexId。 */
+    public RollbackService(SplitCapableBTreeIndexService btree, UndoLogSegmentAccess undoAccess,
+                           TransactionManager txnMgr, MiniTransactionManager mtrMgr,
+                           UndoSegmentFinalizer finalizer, IndexMetadataResolver indexResolver) {
+        this(btree, undoAccess, txnMgr, mtrMgr, finalizer, RollbackProgressFaultInjector.none(), indexResolver);
     }
 
     /**
@@ -95,6 +106,13 @@ public final class RollbackService {
     RollbackService(SplitCapableBTreeIndexService btree, UndoLogSegmentAccess undoAccess,
                     TransactionManager txnMgr, MiniTransactionManager mtrMgr,
                     UndoSegmentFinalizer finalizer, RollbackProgressFaultInjector progressFaultInjector) {
+        this(btree, undoAccess, txnMgr, mtrMgr, finalizer, progressFaultInjector, null);
+    }
+
+    private RollbackService(SplitCapableBTreeIndexService btree, UndoLogSegmentAccess undoAccess,
+                    TransactionManager txnMgr, MiniTransactionManager mtrMgr,
+                    UndoSegmentFinalizer finalizer, RollbackProgressFaultInjector progressFaultInjector,
+                    IndexMetadataResolver indexResolver) {
         if (btree == null || undoAccess == null || txnMgr == null || mtrMgr == null
                 || finalizer == null || progressFaultInjector == null) {
             throw new DatabaseValidationException("rollback service collaborators must not be null");
@@ -105,6 +123,7 @@ public final class RollbackService {
         this.mtrMgr = mtrMgr;
         this.finalizer = finalizer;
         this.progressFaultInjector = progressFaultInjector;
+        this.indexResolver = indexResolver;
     }
 
     /**
@@ -115,7 +134,7 @@ public final class RollbackService {
      *   <li>若有 {@link UndoContext}：从当前 logical head 反向走链；每条在两个短只读 MTR 中物化 current/前驱，
      *       再以独立 index MTR 执行 inverse，随后独立 marker MTR CAS 后退持久头。</li>
      *   <li>marker commit 后才发布内存 context；两次成功 commit 之间 crash 时，重启最多重复当前 inverse。</li>
-     *   <li>走到 {@code prev=NULL} 后由 finalizer 在同一 MTR cache/drop segment、CAS 转移 page3 owner，并追加 recovery table
+     *   <li>走到 {@code prev=NULL} 后由 finalizer 在同一 MTR cache/free/drop segment、CAS 转移 page3 owner，并追加 recovery table
      *       消费的 rollback-complete 终态/高水位证据；提交成功后才发布内存 slot 释放。</li>
      *   <li>{@code finishRollback}：removeActive + ROLLING_BACK→ROLLED_BACK；若此前失败，后续调用可从
      *       ROLLING_BACK 幂等重走链。</li>
@@ -158,7 +177,7 @@ public final class RollbackService {
                 applyUndoRecordInOwnMtr(current, clusteredIndex);
                 applied++;
                 progressFaultInjector.after(RollbackProgressPhase.AFTER_INVERSE_COMMIT, expectedHead);
-                persistLogicalHead(binding.firstPageId(), expectedHead, targetHead, clusteredIndex);
+                persistLogicalHead(binding.firstPageId(), expectedHead, targetHead, current.index());
                 // marker 已提交后只发布无 IO 的内存 pair；测试 hook 放在发布之后，异常也不会制造持久/内存撕裂。
                 ctx.publishRollbackProgress(binding.kind(), targetHead);
                 progressFaultInjector.after(RollbackProgressPhase.AFTER_PROGRESS_COMMIT, targetHead);
@@ -510,9 +529,11 @@ public final class RollbackService {
         MiniTransaction readMtr = mtrMgr.beginReadOnly();
         try {
             UndoLogSegment seg = undoAccess.open(readMtr, firstPageId, PageLatchMode.SHARED);
-            UndoRecord record = seg.readRecord(rp, clusteredIndex.keyDef(), clusteredIndex.schema());
+            var identity = seg.readRecordIdentity(rp);
+            BTreeIndex resolved = resolveIndex(identity.tableId(), identity.indexId(), clusteredIndex);
+            UndoRecord record = seg.readRecord(rp, resolved.keyDef(), resolved.schema());
             mtrMgr.commit(readMtr);
-            return new RecordAt(record, rp);
+            return new RecordAt(record, rp, resolved);
         } catch (RuntimeException e) {
             if (readMtr.state() == MiniTransactionState.ACTIVE) {
                 try {
@@ -552,11 +573,12 @@ public final class RollbackService {
 
     /** 单条 inverse 的独立 index MTR；异常时只释放当前物理资源，已提交的前序 record 保持可恢复。 */
     private void applyUndoRecordInOwnMtr(RecordAt at, BTreeIndex clusteredIndex) {
+        BTreeIndex resolved = at.index();
         MiniTransaction inverseMtr = mtrMgr.begin(mtrMgr.budgetFor(
                 RedoBudgetPurpose.ROLLBACK_INVERSE,
-                rollbackInverseWorkload(at.record(), clusteredIndex)));
+                rollbackInverseWorkload(at.record(), resolved)));
         try {
-            applyUndoRecord(inverseMtr, at.record(), at.pointer(), clusteredIndex);
+            applyUndoRecord(inverseMtr, at.record(), at.pointer(), resolved);
             mtrMgr.commit(inverseMtr);
         } catch (RuntimeException e) {
             rollbackActiveStateMtr(inverseMtr, e);
@@ -571,13 +593,16 @@ public final class RollbackService {
      */
     private void persistLogicalHead(PageId firstPageId, UndoLogicalHead expectedHead,
                                      UndoLogicalHead targetHead, BTreeIndex clusteredIndex) {
+        BTreeIndex markerIndex = targetHead.isEmpty()
+                ? requireFallbackIndex(clusteredIndex)
+                : resolveIndexAt(firstPageId, targetHead.rollPointer(), clusteredIndex);
         MiniTransaction markerMtr = mtrMgr.begin(
                 mtrMgr.budgetFor(RedoBudgetPurpose.ROLLBACK_MARKER));
         try {
             UndoLogSegment writable = undoAccess.open(
                     markerMtr, firstPageId, PageLatchMode.EXCLUSIVE);
             writable.updateLogicalHead(expectedHead, targetHead,
-                    clusteredIndex.keyDef(), clusteredIndex.schema());
+                    markerIndex.keyDef(), markerIndex.schema());
             mtrMgr.commit(markerMtr);
         } catch (RuntimeException e) {
             rollbackActiveStateMtr(markerMtr, e);
@@ -593,18 +618,22 @@ public final class RollbackService {
         if (updates.isEmpty()) {
             return;
         }
-        List<HeadUpdate> ordered = updates.stream()
-                .sorted(Comparator.comparingInt((HeadUpdate item) -> item.firstPageId().spaceId().value())
+        List<ResolvedHeadUpdate> ordered = updates.stream()
+                .map(update -> new ResolvedHeadUpdate(update,
+                        update.target().isEmpty() ? requireFallbackIndex(clusteredIndex)
+                                : resolveIndexAt(update.firstPageId(), update.target().rollPointer(), clusteredIndex)))
+                .sorted(Comparator.comparingInt((ResolvedHeadUpdate item) -> item.firstPageId().spaceId().value())
                         .thenComparingLong(item -> item.firstPageId().pageNo().value()))
                 .toList();
         MiniTransaction marker = mtrMgr.begin(mtrMgr.budgetFor(RedoBudgetPurpose.ROLLBACK_MARKER));
         try {
             try (var ignored = marker.allowOutOfOrderPageLatch(
                     "dual undo marker: target records may live on non-monotonic chain pages after sorted first pages")) {
-                for (HeadUpdate update : ordered) {
+                for (ResolvedHeadUpdate resolved : ordered) {
+                    HeadUpdate update = resolved.update();
                     undoAccess.open(marker, update.firstPageId(), PageLatchMode.EXCLUSIVE)
                             .updateLogicalHead(update.expected(), update.target(),
-                                    clusteredIndex.keyDef(), clusteredIndex.schema());
+                                    resolved.index().keyDef(), resolved.index().schema());
                 }
             }
             mtrMgr.commit(marker);
@@ -652,10 +681,10 @@ public final class RollbackService {
      *   <li>每条 inverse 提交后，以独立 marker MTR 后退持久 logical head，再处理下一条。</li>
      * </ol>
      * 由正式 UNDO_ROLLBACK 阶段从 page3 重建出的、且 undo 段 state=ACTIVE 的 slot 调用；不走 Transaction 状态机
-     * （前台 {@link #rollback} 才走）。逻辑头到 EMPTY 后，本方法经 finalizer 原子 cache/drop segment + CAS 转移 page3 owner，
+     * （前台 {@link #rollback} 才走）。逻辑头到 EMPTY 后，本方法经 finalizer 原子 cache/free/drop segment + CAS 转移 page3 owner，
      * 提交成功后才释放恢复期内存 slot，因此重启不会重新发现已终结段。
      *
-     * <p><b>单显式聚簇索引假设</b>（无 DD）：用 {@code clusteredIndex} 的 keyDef/schema 解码所有 undo；
+     * <p>legacy 模式使用 {@code clusteredIndex}；DD 模式允许其为 null，由 resolver 逐条解析。
      * {@code rec.indexId() != index.indexId()} 抛。<b>幂等</b>：`deleteClustered`/`replaceClustered`/`setClusteredDeleteMark`
      * 未命中即 no-op，故二次崩溃重复回滚安全。
      *
@@ -667,7 +696,8 @@ public final class RollbackService {
      */
     public RollbackSummary rollbackRecovered(UndoSlotId slotId, PageId firstPageId,
                                                TransactionId creatorTrxId, BTreeIndex clusteredIndex) {
-        if (slotId == null || firstPageId == null || creatorTrxId == null || clusteredIndex == null) {
+        if (slotId == null || firstPageId == null || creatorTrxId == null
+                || clusteredIndex == null && indexResolver == null) {
             throw new DatabaseValidationException(
                     "rollbackRecovered slot/firstPage/creator/clusteredIndex must not be null");
         }
@@ -680,7 +710,8 @@ public final class RollbackService {
     public RollbackSummary rollbackRecovered(Collection<RecoveredUndoLogIdentity> logs,
                                               TransactionId creatorTrxId,
                                               BTreeIndex clusteredIndex) {
-        if (logs == null || logs.isEmpty() || creatorTrxId == null || clusteredIndex == null) {
+        if (logs == null || logs.isEmpty() || creatorTrxId == null
+                || clusteredIndex == null && indexResolver == null) {
             throw new DatabaseValidationException("recovered rollback group fields must not be empty/null");
         }
         List<UndoLogBinding> bindings = new ArrayList<>();
@@ -708,7 +739,7 @@ public final class RollbackService {
             applyUndoRecordInOwnMtr(current, clusteredIndex);
             applied++;
             progressFaultInjector.after(RollbackProgressPhase.AFTER_INVERSE_COMMIT, expectedHead);
-            persistLogicalHead(binding.firstPageId(), expectedHead, targetHead, clusteredIndex);
+            persistLogicalHead(binding.firstPageId(), expectedHead, targetHead, current.index());
             binding.publishHead(targetHead);
             progressFaultInjector.after(RollbackProgressPhase.AFTER_PROGRESS_COMMIT, targetHead);
         }
@@ -772,10 +803,46 @@ public final class RollbackService {
     }
 
     /** 短只读 MTR 已物化并释放 undo 页资源的 (undo record, 其自身 roll pointer) 对。 */
-    private record RecordAt(UndoRecord record, RollPointer pointer) {
+    private BTreeIndex resolveIndexAt(PageId firstPageId, RollPointer pointer, BTreeIndex fallback) {
+        MiniTransaction read = mtrMgr.beginReadOnly();
+        try {
+            var identity = undoAccess.open(read, firstPageId, PageLatchMode.SHARED).readRecordIdentity(pointer);
+            BTreeIndex index = resolveIndex(identity.tableId(), identity.indexId(), fallback);
+            mtrMgr.commit(read);
+            return index;
+        } catch (RuntimeException error) {
+            rollbackActiveStateMtr(read, error);
+            throw error;
+        }
+    }
+
+    private BTreeIndex resolveIndex(long tableId, long indexId, BTreeIndex fallback) {
+        BTreeIndex index = indexResolver == null ? requireFallbackIndex(fallback)
+                : indexResolver.resolve(tableId, indexId);
+        if (index.indexId() != indexId || !index.clustered()) {
+            throw new UndoLogFormatException("undo identity resolved wrong/non-clustered index: table="
+                    + tableId + " index=" + indexId + " resolved=" + index.indexId());
+        }
+        return index;
+    }
+
+    private static BTreeIndex requireFallbackIndex(BTreeIndex fallback) {
+        if (fallback == null) {
+            throw new DatabaseValidationException("rollback requires an index resolver or fallback index");
+        }
+        return fallback;
+    }
+
+    private record RecordAt(UndoRecord record, RollPointer pointer, BTreeIndex index) {
     }
 
     private record HeadUpdate(PageId firstPageId, UndoLogicalHead expected, UndoLogicalHead target) {
+    }
+
+    private record ResolvedHeadUpdate(HeadUpdate update, BTreeIndex index) {
+        PageId firstPageId() {
+            return update.firstPageId();
+        }
     }
 
     /**

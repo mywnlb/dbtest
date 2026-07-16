@@ -25,17 +25,36 @@ final class UndoStoredRecordResolver {
     /** 解码 record 槽；external 模式先完整验证页链，再校验 descriptor 与最终 UndoRecord 身份一致。 */
     UndoRecord resolve(MiniTransaction mtr, SpaceId spaceId, UndoPayloadStorage.SegmentIdentity owner,
                        byte[] storedPayload, IndexKeyDef keyDef, TableSchema schema) {
-        if (!UndoPayloadDescriptor.isExternal(storedPayload)) {
-            return codec.decode(storedPayload, 0, keyDef, schema);
-        }
-        UndoPayloadDescriptor descriptor = UndoPayloadDescriptor.decode(storedPayload);
-        byte[] encoded = payloadStorage.read(mtr, spaceId, owner, descriptor, maxExternalPages);
+        UndoPayloadDescriptor descriptor = UndoPayloadDescriptor.isExternal(storedPayload)
+                ? UndoPayloadDescriptor.decode(storedPayload) : null;
+        byte[] encoded = materialize(mtr, spaceId, owner, storedPayload, descriptor);
         UndoRecord record = codec.decode(encoded, 0, keyDef, schema);
-        if (record.type() != descriptor.type()
+        if (descriptor != null && (record.type() != descriptor.type()
                 || !record.transactionId().equals(descriptor.transactionId())
-                || !record.undoNo().equals(descriptor.undoNo())) {
+                || !record.undoNo().equals(descriptor.undoNo()))) {
             throw new UndoLogFormatException("external undo descriptor does not match decoded record identity");
         }
         return record;
+    }
+
+    /** 在完整 typed decode 前只解析 table/index identity；external 页链仍执行同样的 owner/长度/hash 校验。 */
+    UndoRecordIdentity identity(MiniTransaction mtr, SpaceId spaceId, UndoPayloadStorage.SegmentIdentity owner,
+                                byte[] storedPayload) {
+        UndoPayloadDescriptor descriptor = UndoPayloadDescriptor.isExternal(storedPayload)
+                ? UndoPayloadDescriptor.decode(storedPayload) : null;
+        byte[] encoded = materialize(mtr, spaceId, owner, storedPayload, descriptor);
+        UndoRecordIdentity identity = codec.peekIdentity(encoded, 0);
+        if (descriptor != null && (identity.type() != descriptor.type()
+                || !identity.transactionId().equals(descriptor.transactionId())
+                || !identity.undoNo().equals(descriptor.undoNo()))) {
+            throw new UndoLogFormatException("external undo descriptor does not match identity prefix");
+        }
+        return identity;
+    }
+
+    private byte[] materialize(MiniTransaction mtr, SpaceId spaceId, UndoPayloadStorage.SegmentIdentity owner,
+                               byte[] storedPayload, UndoPayloadDescriptor descriptor) {
+        return descriptor == null ? storedPayload
+                : payloadStorage.read(mtr, spaceId, owner, descriptor, maxExternalPages);
     }
 }

@@ -574,7 +574,29 @@ Atomic DDL recovery 流程见 [atomic-ddl-recovery-flow.mmd](diagrams/atomic-ddl
 | 14 | 异常与恢复 | 已给出异常类型、DDL log recovery、orphan cleanup、SDI mismatch 处理 |
 | 15 | 测试与顺序 | 已给出测试设计、后续实现顺序，并确认没有未完成标记或空白项 |
 
-## 19. 参考链接
+## 19. 2026-07-15 当前实现落点
+
+本节只记录已从源码和测试核对的 v1 落点；前文仍是长期目标设计。
+
+- `cn.zhangyis.db.dd.domain/repo/tx/cache/mdl/service/ddl/recovery` 已落地 schema/table/index 不可变定义、repository、版本 cache、MDL 和 CREATE/DROP TABLE。
+- `mysql.dd.ctrl` 使用双 4 KiB CRC32C 槽保存 ID/version high-water；启动时以已提交 catalog 反向校正 high-water，防止新槽损坏导致 ID 复用。
+- `mysql.ibd` v1 实际是页对齐 append-only catalog sidecar，使用 frame CRC 和 batch SHA manifest；它尚不是前文目标中经 Buffer Pool/MTR/redo 管理的 InnoDB 字典 B+Tree。
+- 字典 version 只要比已发布版本大即合法；先保留后 crash 会留下可解释的版本间隙，不得回退复用。
+- `DataDictionaryService.openTable` 按 schema→table 获取 MDL，再持有 cache pin；`TableMetadataLease.close` 统一逆序释放。
+- CREATE 先用单个 MTR 创建 GENERAL tablespace、每索引 leaf/non-leaf segment 和 root，等 redo durable 后发布 ACTIVE 字典版本。
+- CREATE 的 catalog append 若向调用方报错，v1 无法判定 header force 是否已经成功，因此不得立即补偿删除物理文件；启动时已提交 ACTIVE 继续使用，未提交的受控命名文件才按 orphan 清理。
+- DROP 在 table X 下先建立带版本的 cache 准入屏障，再发布 `DROP_PENDING` 并等待旧 pin；publish 结果不确定时屏障保持 fail-closed 到重启，防止旧 repository snapshot 复活 ACTIVE。物理阶段先复核 binding/opened path 一致，再写 durable `DISCARDED` page0 marker、flush/invalidate/close/delete，最后发布 `DROPPED`。
+- DD discovery 从 ACTIVE/DROP_PENDING table 只返回稳定 storage API binding；公共 `cn.zhangyis.db.engine.DatabaseEngine` 再转换 recovery tablespace 配置，在 storage recovery 后续作 pending drop 与受控命名 orphan cleanup，全部完成后才发布 OPEN。
+- `UndoRecordCodec.peekIdentity`、`IndexMetadataResolver` 和 `engine.adapter.DictionaryIndexMetadataResolver` 已让 rollback/purge 按 tableId/indexId 解析目标 B+Tree，legacy 单索引构造仅供低层兼容。
+
+明确保留的差异：
+
+- `DdlId` 当前只作日志诊断，v1 没有独立 `dd_ddl_log` 实体；最新 control 槽损坏时其 high-water 可能回退复用，恢复只依据 table lifecycle、storage binding 和 orphan discovery，不得依赖 DdlId 唯一性。
+- SDI、binlog participant、online DDL、ALTER TABLE、独立 CREATE INDEX 和 foreign key 未实现。
+- DROP 已与 statement metadata pin 协调，但尚无表级持久 purge-history barrier；在该屏障落地前，不应将长运行多表 purge 与并发 DROP 宣称为生产完整语义。
+- orphan cleanup 只处理 `tables/` 下符合受控命名规则且未被 catalog 引用的文件，不扫描或删除任意路径。
+
+## 20. 参考链接
 
 - MySQL 8.0 Reference Manual - MySQL Data Dictionary: https://dev.mysql.com/doc/refman/8.0/en/data-dictionary.html
 - MySQL 8.0 Reference Manual - Transactional Storage of Dictionary Data: https://dev.mysql.com/doc/refman/8.0/en/data-dictionary-transactional-storage.html

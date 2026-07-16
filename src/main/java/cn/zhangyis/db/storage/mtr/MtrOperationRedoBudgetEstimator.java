@@ -33,13 +33,15 @@ final class MtrOperationRedoBudgetEstimator {
             throw new DatabaseValidationException("production write requires a concrete redo budget purpose");
         }
         int pageImageEquivalents = switch (purpose) {
-            case ENGINE_BOOT -> 8;
+            case ENGINE_BOOT -> 9;
             case ROLLBACK_MARKER -> 6;
             case TRANSACTION_STATE -> 1;
             case UNDO_TRUNCATE_LIFECYCLE -> 4;
-            case UNDO_TRUNCATE_REBUILD -> 24;
+            case UNDO_TRUNCATE_REBUILD -> 25;
+            case DDL_TABLE_DROP -> 4;
             case CLUSTERED_INSERT, CLUSTERED_UPDATE, CLUSTERED_DELETE, PURGE_INDEX,
-                    ROLLBACK_INVERSE, UNDO_COMMIT, UNDO_FINALIZATION, LOB_WRITE, LOB_FREE -> throw new DatabaseValidationException(
+                    ROLLBACK_INVERSE, UNDO_COMMIT, UNDO_FINALIZATION, LOB_WRITE, LOB_FREE,
+                    DDL_TABLE_CREATE -> throw new DatabaseValidationException(
                     "dynamic redo budget purpose requires a domain workload: " + purpose);
             case READ_ONLY, TEST_UNBOUNDED -> throw new DatabaseValidationException(
                     "non-write redo purpose has no production profile: " + purpose);
@@ -57,7 +59,8 @@ final class MtrOperationRedoBudgetEstimator {
         }
         switch (purpose) {
             case CLUSTERED_INSERT, CLUSTERED_UPDATE, CLUSTERED_DELETE, PURGE_INDEX,
-                    ROLLBACK_INVERSE, UNDO_COMMIT, UNDO_FINALIZATION, LOB_WRITE, LOB_FREE -> {
+                    ROLLBACK_INVERSE, UNDO_COMMIT, UNDO_FINALIZATION, LOB_WRITE, LOB_FREE,
+                    DDL_TABLE_CREATE -> {
                 // 这些操作的上界依赖领域事实；固定布局 purpose 必须继续走权威固定 profile。
             }
             default -> throw new DatabaseValidationException(

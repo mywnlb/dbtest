@@ -21,6 +21,7 @@ public final class UndoRedoBudgetEstimator {
         return RedoBudgetWorkload.pageImages(switch (acquisition) {
             case ALLOCATE_NEW -> 12L;
             case REUSE_CACHED -> 8L;
+            case REUSE_FREE -> 10L;
             case APPEND_EXISTING -> 4L;
         });
     }
@@ -46,6 +47,7 @@ public final class UndoRedoBudgetEstimator {
             long base = switch (acquisition) {
                 case ALLOCATE_NEW -> 12L;
                 case REUSE_CACHED -> 8L;
+                case REUSE_FREE -> 10L;
                 case APPEND_EXISTING -> 4L;
             };
             return RedoBudgetWorkload.pageImages(Math.addExact(base,
@@ -98,14 +100,22 @@ public final class UndoRedoBudgetEstimator {
     }
 
     /**
-     * cache/drop 混合终结预算。drop 继续按 fragment/extent 规模计费；每个 cached segment 额外覆盖 page3 owner
+     * cache/free/drop 混合终结预算。drop 继续按 fragment/extent 规模计费；每个 reusable segment 额外覆盖 page3 owner
      * transition、首页 header reset 与重复 metadata delta 余量。允许 droppedPlans 为空，但 cachedCount 必须为正。
      */
     public static RedoBudgetWorkload finalization(Collection<UndoSegmentDropPlan> droppedPlans,
                                                    int cachedCount,
                                                    boolean includesTerminalDelta) {
+        return finalization(droppedPlans, cachedCount, 0, includesTerminalDelta);
+    }
+
+    /** cache/free/drop 混合终结预算；FREE 每段覆盖 page3 base、首页 reset 与相邻节点 relink。 */
+    public static RedoBudgetWorkload finalization(Collection<UndoSegmentDropPlan> droppedPlans,
+                                                   int cachedCount, int freeCount,
+                                                   boolean includesTerminalDelta) {
         if (droppedPlans == null || droppedPlans.stream().anyMatch(java.util.Objects::isNull)
-                || cachedCount < 0 || droppedPlans.isEmpty() && cachedCount == 0) {
+                || cachedCount < 0 || freeCount < 0
+                || droppedPlans.isEmpty() && cachedCount == 0 && freeCount == 0) {
             throw new DatabaseValidationException("mixed undo finalization workload is invalid");
         }
         try {
@@ -116,6 +126,7 @@ public final class UndoRedoBudgetEstimator {
                 pages = Math.addExact(pages, 2L);
             }
             pages = Math.addExact(pages, Math.multiplyExact(4L, cachedCount));
+            pages = Math.addExact(pages, Math.multiplyExact(6L, freeCount));
             if (includesTerminalDelta) {
                 pages = Math.addExact(pages, 1L);
             }
@@ -135,12 +146,20 @@ public final class UndoRedoBudgetEstimator {
 
     /** mixed/INSERT commit 根据最终 disposition 选择 drop 或 cached header reset 上界。 */
     public static RedoBudgetWorkload commit(UndoSegmentDropPlan insertPlan, boolean cacheInsert) {
+        return commit(insertPlan, cacheInsert, false);
+    }
+
+    /** mixed/INSERT commit 根据最终 cache/free/drop disposition 选择完整终结预算。 */
+    public static RedoBudgetWorkload commit(UndoSegmentDropPlan insertPlan,
+                                            boolean cacheInsert, boolean freeInsert) {
         if (insertPlan == null) {
             return commit(null);
         }
-        if (cacheInsert) {
-            return finalization(List.of(), 1, true).plus(RedoBudgetWorkload.pageImages(2L));
+        if (cacheInsert && freeInsert) {
+            throw new DatabaseValidationException("one undo segment cannot be both cached and free");
         }
-        return finalization(List.of(insertPlan), 0, true).plus(RedoBudgetWorkload.pageImages(2L));
+        return finalization(cacheInsert || freeInsert ? List.of() : List.of(insertPlan),
+                cacheInsert ? 1 : 0, freeInsert ? 1 : 0, true)
+                .plus(RedoBudgetWorkload.pageImages(2L));
     }
 }

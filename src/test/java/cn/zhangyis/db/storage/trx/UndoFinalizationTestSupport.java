@@ -47,7 +47,7 @@ final class UndoFinalizationTestSupport {
                              RollbackSegmentSlotManager slots, UndoFinalizationFaultInjector faultInjector,
                              int cacheCapacityPerKind) {
         RollbackSegmentHeaderRepository header = new RollbackSegmentHeaderRepository(pool, pageSize);
-        UndoSegmentCacheDirectory cache = new UndoSegmentCacheDirectory(cacheCapacityPerKind);
+        UndoSegmentReuseDirectory cache = new UndoSegmentReuseDirectory(cacheCapacityPerKind);
         return new Components(header,
                 new UndoSegmentFinalizer(manager, access, allocator, header, slots, cache, faultInjector),
                 slots, cache);
@@ -55,7 +55,7 @@ final class UndoFinalizationTestSupport {
 
     /** 测试组合件；format 与 tablespace create 使用同一 boot MTR。 */
     record Components(RollbackSegmentHeaderRepository header, UndoSegmentFinalizer finalizer,
-                      RollbackSegmentSlotManager slots, UndoSegmentCacheDirectory cache) {
+                      RollbackSegmentSlotManager slots, UndoSegmentReuseDirectory cache) {
 
         void format(MiniTransaction bootMtr, SpaceId undoSpace) {
             header.format(bootMtr, undoSpace, slots.rollbackSegmentId(), slots.slotCapacity(),

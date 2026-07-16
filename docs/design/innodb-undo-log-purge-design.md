@@ -361,9 +361,10 @@ rollback segment header 包含：
 
 rollback segment header 只维护元数据，不保存 record old image。
 
-当前单 rseg 教学实现使用 page3 v3：head/tail/length/lastTransactionNo 位于 slot array 之前，
-active slot、INSERT cache、UPDATE cache 紧随其后。v1/v2 不含完整 history base，直接 fail-closed；
-free undo segment list 与多 rseg directory 仍是后续扩展。
+当前单 rseg 教学实现使用 page3 v4：history head/tail/length/lastTransactionNo 与 free
+head/tail/length 位于 slot array 之前，active slot、INSERT cache、UPDATE cache 紧随其后。v1-v3
+不含完整 owner 区，直接 fail-closed。free list v1 仅接纳 `used=fragment=1, extent=0` 的单普通页 segment，
+按尾插头摘 FIFO 跨 kind 复用；多页 shrink 与多 rseg directory 仍是后续扩展。
 
 ### 6.4 Undo Page 与 Undo Log Header
 
@@ -373,7 +374,7 @@ undo page 逻辑格式：
 | --- | --- | --- |
 | page header | `pageType=UNDO`, `pageLsn`, `pageNo`, `prevPage`, `nextPage` | 页链和恢复幂等 |
 | undo page header | `formatVersion=3`, `segmentId`, `undoLogKind`, `freeOffset`, `recordCount`, `lastUndoNo` | segment 内分配；first/chain page 都自描述 kind |
-| undo log header | `transactionId`, `undoLogKind`, `state`, `commitNo`, `logicalHead`, `historyPrev`, `historyNext` | 一个事务的一条 undo log；history link 仅 first page 有效 |
+| undo log header | `transactionId`, `undoLogKind`, `state`, `commitNo`, `logicalHead`, `historyPrev/freePrev`, `historyNext/freeNext` | 一个事务的一条 undo log；COMMITTED 解释为 history link，FREE 解释为 free link，仅 first page 有效 |
 | undo record area | 变长 undo record | 按 undoNo 串联 |
 | free area | 追加空间 | 不跨页写半条 record |
 | trailer | checksum、end marker | 恢复扫描校验 |
@@ -470,14 +471,14 @@ UPDATE/DELETE 当前读流程：
 1. 事务状态进入 `COMMITTING`，禁止创建新 undo。
 2. 分配 `TransactionNo`。
 3. UPDATE 事务先取得 history append transition lease，冻结当前 head/tail/count；锁不跨 IO 持有。
-4. 当前实现对单 fragment INSERT segment 尝试移入固定容量 insert undo cache；容量满、忙或多页段则 drop。
-5. 同一 MTR 将 update undo header 置 COMMITTED、链接旧 tail/new node、更新 page3 head/tail/length/lastTransactionNo。
-6. mixed transaction 在该 MTR 中同时 cache/drop INSERT、完成 UPDATE link，并只写一次事务 terminal redo。
+4. 当前实现对合格的单 fragment INSERT segment 先尝试移入固定容量 insert undo cache；cache 未接纳则尾插持久 free FIFO，不合格的多页/external/extent segment 才 drop。
+5. 同一 MTR 将 update undo header 置 COMMITTED、链接旧 tail/new node、更新 page3 history/free base 与 lastTransactionNo。
+6. mixed transaction 在该 MTR 中同时 cache/free/drop INSERT、完成 UPDATE link，并只写一次事务 terminal redo；所有普通 undo 首页按全局页号升序获取。
 7. 从 active transaction table 移除事务。
 8. 关闭 ReadView，释放锁。
 9. 唤醒 `PurgeCoordinator`。
 
-MTR commit 后才发布 slot/cache/history 内存投影。提交时只挂 update undo log header，不逐条扫描 undo record；
+MTR commit 后才发布 slot/reuse directory/history 内存投影。提交时只挂 update undo log header，不逐条扫描 undo record；
 purge 后续按持久物理链顺序处理。
 
 ### 7.5 MVCC 旧版本遍历
@@ -659,16 +660,16 @@ commit 顺序：
 2. 分配 `TransactionNo`。
 3. `HistoryListMutex` 短持有取得 append lease 后立即释放；超时/中断发生在任何物理修改前。
 4. 预检 page3 base/active owner、旧 tail 与新 UPDATE first page 后释放所有读 MTR。
-5. 最终 MTR 按 FSP（若 drop INSERT）→page3→普通 UNDO pageNo 排序修改 owner、base 和节点链接，并写 terminal redo。
-6. MTR commit 后发布 slot/cache/history；随后从 active table 移除、关闭 ReadView、释放事务锁并唤醒 purge。
+5. 最终 MTR 按 FSP（若 drop）→page3→全部普通 UNDO 首页的全局 pageNo 排序修改 owner、history/free base 和节点链接，并写 terminal redo。
+6. MTR commit 后发布 slot/reuse directory/history；随后从 active table 移除、关闭 ReadView、释放事务锁并唤醒 purge。
 
 purge 顺序：
 
 1. `PurgeCoordinator` 取运行时 head，并在事务系统短锁内复核 creator 已非 active、low water 与所有 live ReadView 可见性。
 2. worker 通过 B+Tree purge-safe API 定位并清理 delete-mark；期间不持有 history transition。
 3. B+Tree tasks 全部成功后，短持有 `HistoryListMutex` 取得 head-removal lease。
-4. 预检 page3 base/head owner、removed/new-head first page；最终 MTR 原子 unlink、cache/drop owner 并写 redo。
-5. MTR commit 后才发布 slot/cache/history；失败前不移动内存 head，越过物理边界失败进入 fail-stop fence。
+4. 预检 page3 history/free base、head owner、removed/new-head first page；最终 MTR 原子 unlink、cache/free/drop owner 并写 redo。
+5. MTR commit 后才发布 slot/reuse directory/history；失败前不移动内存 head，越过物理边界失败进入 fail-stop fence。
 6. 可选 `UndoTablespaceLifecycleLock X` 执行 truncate；获取前必须释放所有 page latch、history mutex 和 purge queue mutex。
 
 recovery 顺序：

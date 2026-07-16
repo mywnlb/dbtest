@@ -280,6 +280,30 @@ public final class DiskSpaceManager {
     }
 
     /**
+     * 在 DROP 的独占 operation lease 内持久标记 GENERAL 表空间为 DISCARDED。数据流为：当前 MTR 先取得可重入
+     * shared lease 并复核 NORMAL → page0 X latch 读取权威大小/类型 → 写 DISCARDED lifecycle → 发布 registry
+     * DISCARDED。marker commit/flush 前不得关闭或删除文件；若后续删除失败，recovery 可据 marker 续作清理。
+     *
+     * @param mtr DROP marker 的写 MTR。
+     * @param spaceId 目标 GENERAL 表空间。
+     */
+    public void markTablespaceDiscarded(MiniTransaction mtr, SpaceId spaceId) {
+        requireMtr(mtr);
+        requireSpace(spaceId);
+        requireOrdinaryAccess(mtr, spaceId);
+        SpaceHeaderSnapshot snapshot = headerRepo.readForUpdate(mtr, spaceId);
+        TablespaceType type = TablespaceTypeFlags.decode(snapshot.spaceFlags());
+        if (type != TablespaceType.GENERAL) {
+            throw new DatabaseValidationException(
+                    "persistent discarded marker is only supported for GENERAL tablespace: " + type);
+        }
+        headerRepo.writeLifecycle(mtr, spaceId, new TablespaceLifecycleHeader(
+                TablespaceState.DISCARDED, snapshot.currentSizeInPages(), 0L,
+                snapshot.currentSizeInPages(), TablespaceState.NORMAL));
+        registry.markDiscarded(spaceId);
+    }
+
+    /**
      * 查询 runtime registry 中的表空间状态。该方法不触发 loader，避免诊断路径隐式打开或注册表空间。
      *
      * @param spaceId 表空间编号。

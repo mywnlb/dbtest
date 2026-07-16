@@ -103,6 +103,12 @@ public final class RollbackSegmentHeaderRepository {
                 0L, "format empty rseg history length");
         writeHistoryLong(mtr, g, rsegId.value(), RollbackSegmentHeaderLayout.LAST_TRANSACTION_NO,
                 0L, "format rseg transaction number high-water");
+        writeFreeBaseLong(mtr, g, rsegId.value(), RollbackSegmentHeaderLayout.FREE_HEAD_PAGE_NO,
+                FilePageHeader.FIL_NULL, "format empty rseg free head");
+        writeFreeBaseLong(mtr, g, rsegId.value(), RollbackSegmentHeaderLayout.FREE_TAIL_PAGE_NO,
+                FilePageHeader.FIL_NULL, "format empty rseg free tail");
+        writeFreeBaseLong(mtr, g, rsegId.value(), RollbackSegmentHeaderLayout.FREE_LENGTH,
+                0L, "format empty rseg free length");
         for (int i = 0; i < slotCapacity; i++) {
             UndoRedoDeltas.writeLong(mtr, g, pageId, UndoMetadataDeltaKind.RSEG_SLOT,
                     rsegId.value(), i, RollbackSegmentHeaderLayout.slotOffset(i),
@@ -116,7 +122,7 @@ public final class RollbackSegmentHeaderRepository {
         }
     }
 
-    /** 兼容旧四参调用；新生产代码应显式传入持久 cache 容量，history 字段始终按 v3 初始化。 */
+    /** 兼容旧四参调用；新生产代码应显式传入持久 cache 容量，owner 字段始终按 v4 初始化。 */
     public void format(MiniTransaction mtr, SpaceId spaceId, RollbackSegmentId rsegId, int slotCapacity) {
         format(mtr, spaceId, rsegId, slotCapacity, DEFAULT_CACHE_CAPACITY_PER_KIND);
     }
@@ -256,6 +262,135 @@ public final class RollbackSegmentHeaderRepository {
             }
             topFirstPages = List.copyOf(topFirstPages);
         }
+    }
+
+    /** finalization 中一条 active slot → free FIFO transition。页链接由同一 MTR 的 first-page batch 写入。 */
+    public record FreePush(UndoSlotId activeSlot, PageId expectedFirstPage) {
+        public FreePush {
+            if (activeSlot == null || expectedFirstPage == null) {
+                throw new DatabaseValidationException("rseg free push fields must not be null");
+            }
+        }
+    }
+
+    /**
+     * 把一条或两条 active owner 依次尾插持久 free FIFO。方法先验证 page3 base、全部 slot owner 与重复页，
+     * 再统一改写 base 和 slots；普通 undo 首页链接必须由调用方在同一 MTR 中完成。
+     */
+    public RollbackSegmentFreeListBase moveActiveSlotsToFree(MiniTransaction mtr, SpaceId spaceId,
+                                                              RollbackSegmentFreeListBase expected,
+                                                              List<FreePush> pushes) {
+        requireMtr(mtr);
+        requireSpace(spaceId);
+        if (expected == null || pushes == null || pushes.isEmpty() || pushes.size() > 2
+                || pushes.stream().anyMatch(java.util.Objects::isNull)) {
+            throw new DatabaseValidationException("rseg free pushes must contain one or two items");
+        }
+        if ((long) pushes.size() + expected.length() > Integer.MAX_VALUE) {
+            throw new UndoLogFormatException("rseg free-list runtime length would overflow");
+        }
+        PageGuard guard = mtr.getPage(pool, headerPage(spaceId), PageLatchMode.EXCLUSIVE);
+        HeaderShape shape = validateHeaderAndReadShape(guard);
+        requireFreeBase(guard, spaceId, expected);
+        Set<Integer> slots = new HashSet<>();
+        Set<Long> pageNos = new HashSet<>();
+        for (FreePush push : pushes) {
+            requirePageInSpace(spaceId, push.expectedFirstPage(), "free push");
+            int slot = push.activeSlot().value();
+            long pageNo = push.expectedFirstPage().pageNo().value();
+            if (slot < 0 || slot >= shape.slotCapacity() || !slots.add(slot) || !pageNos.add(pageNo)) {
+                throw new UndoLogFormatException("duplicate/out-of-range rseg free push target");
+            }
+            if (guard.readLong(RollbackSegmentHeaderLayout.slotOffset(slot)) != pageNo) {
+                throw new UndoLogFormatException("free push active owner mismatch: slot=" + slot
+                        + ", expected=" + pageNo);
+            }
+            requireNotInCachedStacks(guard, shape, pageNo);
+            requireNotFreeEndpoint(expected, pageNo);
+        }
+        PageId newHead = expected.headPageId().orElse(pushes.getFirst().expectedFirstPage());
+        PageId newTail = pushes.getLast().expectedFirstPage();
+        RollbackSegmentFreeListBase next = new RollbackSegmentFreeListBase(
+                Optional.of(newHead), Optional.of(newTail), expected.length() + pushes.size());
+        writeFreeBase(mtr, guard, shape.rsegId(), next);
+        for (FreePush push : pushes) {
+            UndoRedoDeltas.writeLong(mtr, guard, guard.pageId(), UndoMetadataDeltaKind.RSEG_SLOT,
+                    shape.rsegId(), push.activeSlot().value(),
+                    RollbackSegmentHeaderLayout.slotOffset(push.activeSlot().value()),
+                    FilePageHeader.FIL_NULL, "move active rseg slot owner into free list");
+        }
+        return next;
+    }
+
+    /**
+     * 以 page3 base CAS 语义把 free head 移入预留 active slot。successor 必须与冻结 length 一致；首页摘链与激活
+     * 由调用方在同一业务 MTR 中完成。
+     */
+    public RollbackSegmentFreeListBase moveFreeHeadToActiveSlot(MiniTransaction mtr, SpaceId spaceId,
+                                                                 RollbackSegmentFreeListBase expected,
+                                                                 PageId expectedHead,
+                                                                 Optional<PageId> successor,
+                                                                 UndoSlotId activeSlot) {
+        requireMtr(mtr);
+        requireSpace(spaceId);
+        if (expected == null || expectedHead == null || successor == null || activeSlot == null
+                || expected.length() <= 0 || !expected.headPageId().equals(Optional.of(expectedHead))) {
+            throw new DatabaseValidationException("invalid rseg free-to-active transition");
+        }
+        requirePageInSpace(spaceId, expectedHead, "free reuse");
+        successor.ifPresent(page -> requirePageInSpace(spaceId, page, "free reuse successor"));
+        if ((expected.length() == 1) != successor.isEmpty()) {
+            throw new DatabaseValidationException("free successor does not match expected length");
+        }
+        PageGuard guard = mtr.getPage(pool, headerPage(spaceId), PageLatchMode.EXCLUSIVE);
+        HeaderShape shape = validateHeaderAndReadShape(guard);
+        requireFreeBase(guard, spaceId, expected);
+        int slot = activeSlot.value();
+        if (slot < 0 || slot >= shape.slotCapacity()
+                || guard.readLong(RollbackSegmentHeaderLayout.slotOffset(slot)) != FilePageHeader.FIL_NULL) {
+            throw new UndoLogFormatException("free reuse target active slot is not free: " + slot);
+        }
+        RollbackSegmentFreeListBase next = expected.length() == 1
+                ? RollbackSegmentFreeListBase.empty()
+                : new RollbackSegmentFreeListBase(successor, expected.tailPageId(), expected.length() - 1);
+        writeFreeBase(mtr, guard, shape.rsegId(), next);
+        UndoRedoDeltas.writeLong(mtr, guard, guard.pageId(), UndoMetadataDeltaKind.RSEG_SLOT,
+                shape.rsegId(), slot, RollbackSegmentHeaderLayout.slotOffset(slot),
+                expectedHead.pageNo().value(), "move free undo owner into active rseg slot");
+        return next;
+    }
+
+    /**
+     * truncate 在已 drop 队首 segment 后按冻结顺序缩短 free FIFO。remainingHead 是未被 drop 的新队首；其 prev
+     * 清理由调用方在同一 MTR、page3 之后执行。
+     */
+    public RollbackSegmentFreeListBase removeFreeHeads(MiniTransaction mtr, SpaceId spaceId,
+                                                       RollbackSegmentFreeListBase expected,
+                                                       List<PageId> removedHeadFirst,
+                                                       Optional<PageId> remainingHead) {
+        requireMtr(mtr);
+        requireSpace(spaceId);
+        if (expected == null || removedHeadFirst == null || removedHeadFirst.isEmpty()
+                || removedHeadFirst.stream().anyMatch(java.util.Objects::isNull)
+                || remainingHead == null || removedHeadFirst.size() > expected.length()
+                || !expected.headPageId().equals(Optional.of(removedHeadFirst.getFirst()))) {
+            throw new DatabaseValidationException("invalid rseg free-head removal");
+        }
+        removedHeadFirst.forEach(page -> requirePageInSpace(spaceId, page, "free drain"));
+        if (removedHeadFirst.stream().distinct().count() != removedHeadFirst.size()
+                || ((long) removedHeadFirst.size() == expected.length()) != remainingHead.isEmpty()) {
+            throw new DatabaseValidationException("rseg free-head removal closure is inconsistent");
+        }
+        remainingHead.ifPresent(page -> requirePageInSpace(spaceId, page, "free drain remaining head"));
+        PageGuard guard = mtr.getPage(pool, headerPage(spaceId), PageLatchMode.EXCLUSIVE);
+        HeaderShape shape = validateHeaderAndReadShape(guard);
+        requireFreeBase(guard, spaceId, expected);
+        RollbackSegmentFreeListBase next = remainingHead.isEmpty()
+                ? RollbackSegmentFreeListBase.empty()
+                : new RollbackSegmentFreeListBase(remainingHead, expected.tailPageId(),
+                expected.length() - removedHeadFirst.size());
+        writeFreeBase(mtr, guard, shape.rsegId(), next);
+        return next;
     }
 
     /**
@@ -448,14 +583,18 @@ public final class RollbackSegmentHeaderRepository {
         List<PageId> insert = readCacheStack(g, spaceId, shape, UndoLogKind.INSERT, owners);
         List<PageId> update = readCacheStack(g, spaceId, shape, UndoLogKind.UPDATE, owners);
         RollbackSegmentHistoryBase historyBase = readHistoryBase(g, spaceId, shape);
+        RollbackSegmentFreeListBase freeListBase = readFreeBase(g, spaceId);
         if (historyBase.length() > occupied.size()
                 || historyBase.headPageId().filter(page -> !occupied.containsValue(page)).isPresent()
                 || historyBase.tailPageId().filter(page -> !occupied.containsValue(page)).isPresent()) {
             throw new UndoLogFormatException("rseg history endpoints/length are not covered by active slots: base="
                     + historyBase + ", activeOwners=" + occupied.size());
         }
+        freeListBase.headPageId().ifPresent(page -> requireOwnerOutsideDirectories(owners, page, "free head"));
+        freeListBase.tailPageId().filter(page -> !freeListBase.headPageId().equals(Optional.of(page)))
+                .ifPresent(page -> requireOwnerOutsideDirectories(owners, page, "free tail"));
         return new RollbackSegmentHeaderSnapshot(expectedRsegId, capacity,
-                shape.cacheCapacityPerKind(), occupied, insert, update, historyBase);
+                shape.cacheCapacityPerKind(), occupied, insert, update, historyBase, freeListBase);
     }
 
     /** 兼容旧四参读取；新生产代码应使用显式 cache 容量完成 v3 shape 守门。 */
@@ -540,6 +679,30 @@ public final class RollbackSegmentHeaderRepository {
         Optional<PageId> tailId = emptyEndpoints ? Optional.empty()
                 : Optional.of(PageId.of(spaceId, PageNo.of(tail)));
         return new RollbackSegmentHistoryBase(headId, tailId, length, TransactionNo.of(lastTransactionNo));
+    }
+
+    /** 在 page3 latch 下读取 v4 free base；节点闭包和 FSP 资格由 recovery 在短 MTR 中逐节点验证。 */
+    private RollbackSegmentFreeListBase readFreeBase(PageGuard guard, SpaceId spaceId) {
+        long head = guard.readLong(RollbackSegmentHeaderLayout.FREE_HEAD_PAGE_NO);
+        long tail = guard.readLong(RollbackSegmentHeaderLayout.FREE_TAIL_PAGE_NO);
+        long length = guard.readLong(RollbackSegmentHeaderLayout.FREE_LENGTH);
+        boolean emptyEndpoints = head == FilePageHeader.FIL_NULL && tail == FilePageHeader.FIL_NULL;
+        if (length < 0 || length > Integer.MAX_VALUE
+                || (head == FilePageHeader.FIL_NULL) != (tail == FilePageHeader.FIL_NULL)
+                || (length == 0) != emptyEndpoints) {
+            throw new UndoLogFormatException("rseg free endpoints/length are inconsistent: head=" + head
+                    + ", tail=" + tail + ", length=" + length);
+        }
+        if (!emptyEndpoints && (head < 0 || tail < 0
+                || head == RollbackSegmentHeaderLayout.RSEG_HEADER_PAGE_NO
+                || tail == RollbackSegmentHeaderLayout.RSEG_HEADER_PAGE_NO)) {
+            throw new UndoLogFormatException("invalid rseg free endpoint: head=" + head + ", tail=" + tail);
+        }
+        Optional<PageId> headId = emptyEndpoints ? Optional.empty()
+                : Optional.of(PageId.of(spaceId, PageNo.of(head)));
+        Optional<PageId> tailId = emptyEndpoints ? Optional.empty()
+                : Optional.of(PageId.of(spaceId, PageNo.of(tail)));
+        return new RollbackSegmentFreeListBase(headId, tailId, length);
     }
 
     /**
@@ -664,6 +827,25 @@ public final class RollbackSegmentHeaderRepository {
         }
     }
 
+    /** 比较调用方冻结的 free base 与 page3 当前权威值；任何漂移都必须在写 owner 前失败。 */
+    private void requireFreeBase(PageGuard guard, SpaceId spaceId, RollbackSegmentFreeListBase expected) {
+        RollbackSegmentFreeListBase current = readFreeBase(guard, spaceId);
+        if (!current.equals(expected)) {
+            throw new UndoLogFormatException("rseg free base changed: expected=" + expected + ", current=" + current);
+        }
+    }
+
+    private static void requireNotFreeEndpoint(RollbackSegmentFreeListBase base, long pageNo) {
+        if (base.headPageId().filter(page -> page.pageNo().value() == pageNo).isPresent()
+                || base.tailPageId().filter(page -> page.pageNo().value() == pageNo).isPresent()) {
+            throw new UndoLogFormatException("active owner is already a free-list endpoint: " + pageNo);
+        }
+    }
+
+    private static void requireOwnerOutsideDirectories(Set<Long> owners, PageId page, String location) {
+        requireUniqueOwner(owners, page.pageNo().value(), location);
+    }
+
     private static void requireUniqueOwner(Set<Long> owners, long pageNo, String location) {
         if (pageNo < 0 || !owners.add(pageNo)) {
             throw new UndoLogFormatException("duplicate/invalid rseg owner at " + location + ": " + pageNo);
@@ -699,10 +881,29 @@ public final class RollbackSegmentHeaderRepository {
                                          int index, long pageNo, String reason) {
         UndoRedoDeltas.writeLong(mtr, guard, guard.pageId(), UndoMetadataDeltaKind.RSEG_CACHE_ENTRY,
                 rsegId, index, RollbackSegmentHeaderLayout.cacheOffset(kind, slotCapacity,
-                        cacheCapacityPerKind, index), pageNo, reason + " (" + kind + ")");
+                cacheCapacityPerKind, index), pageNo, reason + " (" + kind + ")");
     }
 
-    /** 已校验 page3 v3 的动态布局。 */
+    /** 同一页内依次写 head/tail/length；MTR redo batch 保证 crash 后只观察完整 committed owner 迁移。 */
+    private static void writeFreeBase(MiniTransaction mtr, PageGuard guard, long rsegId,
+                                      RollbackSegmentFreeListBase base) {
+        writeFreeBaseLong(mtr, guard, rsegId, RollbackSegmentHeaderLayout.FREE_HEAD_PAGE_NO,
+                base.headPageId().map(page -> page.pageNo().value()).orElse(FilePageHeader.FIL_NULL),
+                "write rseg free head");
+        writeFreeBaseLong(mtr, guard, rsegId, RollbackSegmentHeaderLayout.FREE_TAIL_PAGE_NO,
+                base.tailPageId().map(page -> page.pageNo().value()).orElse(FilePageHeader.FIL_NULL),
+                "write rseg free tail");
+        writeFreeBaseLong(mtr, guard, rsegId, RollbackSegmentHeaderLayout.FREE_LENGTH,
+                base.length(), "write rseg free length");
+    }
+
+    private static void writeFreeBaseLong(MiniTransaction mtr, PageGuard guard, long rsegId,
+                                          int offset, long value, String reason) {
+        UndoRedoDeltas.writeLong(mtr, guard, guard.pageId(), UndoMetadataDeltaKind.RSEG_FREE_BASE,
+                rsegId, 0, offset, value, reason);
+    }
+
+    /** 已校验 page3 v4 的动态布局。 */
     private record HeaderShape(int slotCapacity, int cacheCapacityPerKind, long rsegId) {
     }
 

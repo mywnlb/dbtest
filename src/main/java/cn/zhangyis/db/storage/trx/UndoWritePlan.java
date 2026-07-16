@@ -23,7 +23,8 @@ public final class UndoWritePlan {
     private final UndoNo expectedGlobalLastUndoNo;
     private final UndoLogicalHead expectedLogicalHead;
     private final UndoAppendSnapshot persistentSnapshot;
-    private final UndoSegmentCacheDirectory.CacheCandidate cachedCandidate;
+    private final UndoSegmentReuseDirectory.CacheCandidate cachedCandidate;
+    private final UndoSegmentReuseDirectory.FreeCandidate freeCandidate;
     private final UndoRecordWritePlan recordPlan;
     private final int pagesToReserve;
     private final RedoBudgetWorkload redoWorkload;
@@ -32,7 +33,8 @@ public final class UndoWritePlan {
                   PageId expectedFirstPageId,
                    UndoNo expectedGlobalLastUndoNo, UndoLogicalHead expectedLogicalHead,
                    UndoAppendSnapshot persistentSnapshot,
-                   UndoSegmentCacheDirectory.CacheCandidate cachedCandidate,
+                   UndoSegmentReuseDirectory.CacheCandidate cachedCandidate,
+                   UndoSegmentReuseDirectory.FreeCandidate freeCandidate,
                    UndoRecordWritePlan recordPlan,
                    int pagesToReserve, RedoBudgetWorkload redoWorkload) {
         if (transactionId == null || kind == null || acquisition == null || expectedGlobalLastUndoNo == null
@@ -41,13 +43,16 @@ public final class UndoWritePlan {
         }
         boolean invalidTarget = switch (acquisition) {
             case ALLOCATE_NEW -> expectedFirstPageId != null || persistentSnapshot != null
-                    || cachedCandidate != null || !expectedLogicalHead.isEmpty();
+                    || cachedCandidate != null || freeCandidate != null || !expectedLogicalHead.isEmpty();
             case REUSE_CACHED -> expectedFirstPageId == null || persistentSnapshot != null
-                    || cachedCandidate == null || !expectedLogicalHead.isEmpty()
+                    || cachedCandidate == null || freeCandidate != null || !expectedLogicalHead.isEmpty()
                     || !expectedFirstPageId.equals(cachedCandidate.segment().handle().firstPageId())
                     || cachedCandidate.segment().kind() != kind;
+            case REUSE_FREE -> expectedFirstPageId == null || persistentSnapshot != null
+                    || cachedCandidate != null || freeCandidate == null || !expectedLogicalHead.isEmpty()
+                    || !expectedFirstPageId.equals(freeCandidate.segment().handle().firstPageId());
             case APPEND_EXISTING -> expectedFirstPageId == null || persistentSnapshot == null
-                    || cachedCandidate != null;
+                    || cachedCandidate != null || freeCandidate != null;
         };
         if (transactionId.isNone() || kind == UndoLogKind.TEMPORARY || pagesToReserve < 0 || invalidTarget) {
             throw new DatabaseValidationException("invalid undo write plan snapshot/bounds");
@@ -60,6 +65,7 @@ public final class UndoWritePlan {
         this.expectedLogicalHead = expectedLogicalHead;
         this.persistentSnapshot = persistentSnapshot;
         this.cachedCandidate = cachedCandidate;
+        this.freeCandidate = freeCandidate;
         this.recordPlan = recordPlan;
         this.pagesToReserve = pagesToReserve;
         this.redoWorkload = redoWorkload;
@@ -82,6 +88,7 @@ public final class UndoWritePlan {
     UndoNo expectedGlobalLastUndoNo() { return expectedGlobalLastUndoNo; }
     UndoLogicalHead expectedLogicalHead() { return expectedLogicalHead; }
     UndoAppendSnapshot persistentSnapshot() { return persistentSnapshot; }
-    UndoSegmentCacheDirectory.CacheCandidate cachedCandidate() { return cachedCandidate; }
+    UndoSegmentReuseDirectory.CacheCandidate cachedCandidate() { return cachedCandidate; }
+    UndoSegmentReuseDirectory.FreeCandidate freeCandidate() { return freeCandidate; }
     UndoRecordWritePlan recordPlan() { return recordPlan; }
 }

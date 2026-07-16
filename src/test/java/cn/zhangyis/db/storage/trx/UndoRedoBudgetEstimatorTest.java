@@ -14,6 +14,8 @@ class UndoRedoBudgetEstimatorTest {
     void firstAppendCostsMoreThanExistingSegmentAppend() {
         assertTrue(UndoRedoBudgetEstimator.append(true).pageImageEquivalents()
                 > UndoRedoBudgetEstimator.append(false).pageImageEquivalents());
+        assertEquals(10L, UndoRedoBudgetEstimator.append(UndoSegmentAcquisition.REUSE_FREE)
+                .pageImageEquivalents());
     }
 
     @Test
@@ -32,5 +34,13 @@ class UndoRedoBudgetEstimatorTest {
         assertEquals(21, purge.pageImageEquivalents());
         assertTrue(fragments.pageImageEquivalents() > empty.pageImageEquivalents());
         assertTrue(extents.pageImageEquivalents() > fragments.pageImageEquivalents());
+    }
+
+    @Test
+    void reusableFinalizationBudgetsCacheAndFreeSeparately() {
+        assertEquals(11L, UndoRedoBudgetEstimator.finalization(java.util.List.of(), 1, 0, false)
+                .pageImageEquivalents());
+        assertEquals(13L, UndoRedoBudgetEstimator.finalization(java.util.List.of(), 0, 1, false)
+                .pageImageEquivalents());
     }
 }

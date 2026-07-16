@@ -9,6 +9,8 @@ public enum UndoSegmentAcquisition {
     ALLOCATE_NEW,
     /** 目标 kind 尚无 binding，复用 page3 cached 栈顶的现有单页 FSP segment。 */
     REUSE_CACHED,
+    /** 目标 kind 尚无 binding，复用 page3 free FIFO 队首并在激活时重新分类。 */
+    REUSE_FREE,
     /** 事务已经拥有该 kind 的 ACTIVE segment，向现有尾页追加。 */
     APPEND_EXISTING;
 

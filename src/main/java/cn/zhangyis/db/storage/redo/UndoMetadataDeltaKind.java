@@ -24,7 +24,11 @@ public enum UndoMetadataDeltaKind {
     /** rollback segment page3 v3 的持久 history base 字段。 */
     RSEG_HISTORY_BASE((byte) 8),
     /** undo first page v3 的 history prev/next 链接字段。 */
-    UNDO_HISTORY_LINK_FIELD((byte) 9);
+    UNDO_HISTORY_LINK_FIELD((byte) 9),
+    /** rollback-segment page3 v4 的 free FIFO base 字段。 */
+    RSEG_FREE_BASE((byte) 10),
+    /** FREE undo first page 的 prev/next 链接字段。 */
+    UNDO_FREE_LINK_FIELD((byte) 11);
 
     /** redo 文件中的稳定 1 字节分类码；只能追加，不能重排。 */
     private final byte code;

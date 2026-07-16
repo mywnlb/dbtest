@@ -62,6 +62,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -122,6 +123,35 @@ class RollbackServiceTest {
             MiniTransaction r = ctx.mgr.begin();
             assertTrue(svc.lookup(r, index, search(1)).isEmpty(), "inserted row removed by rollback");
             ctx.mgr.commit(r);
+        });
+    }
+
+    /** DD 模式必须从 undo 固定前缀把真实 table/index identity 交给 resolver，而不是盲用 fallback。 */
+    @Test
+    void rollbackResolvesIndexFromEachUndoIdentity() {
+        onPool(ctx -> {
+            ctx.boot();
+            BTreeIndex index = ctx.clusteredIndex();
+            Transaction txn = ctx.txnMgr.begin(TransactionOptions.defaults());
+            TransactionId wid = ctx.txnMgr.assignWriteId(txn);
+            MiniTransaction write = ctx.mgr.begin();
+            RollPointer pointer = UndoTestWrites.insert(ctx.undoMgr, txn, write, TABLE_ID, INDEX_ID,
+                    key(1), index.keyDef(), index.schema());
+            ctx.service().insertClustered(write, index, row(1), wid, pointer);
+            ctx.mgr.commit(write);
+            AtomicLong resolvedTable = new AtomicLong();
+            AtomicLong resolvedIndex = new AtomicLong();
+            RollbackService resolverRollback = new RollbackService(ctx.service(), ctx.undoAccess,
+                    ctx.txnMgr, ctx.mgr, ctx.finalization.finalizer(), (tableId, indexId) -> {
+                        resolvedTable.set(tableId);
+                        resolvedIndex.set(indexId);
+                        return index;
+                    });
+
+            resolverRollback.rollback(txn, index);
+
+            assertEquals(TABLE_ID, resolvedTable.get());
+            assertEquals(INDEX_ID, resolvedIndex.get());
         });
     }
 

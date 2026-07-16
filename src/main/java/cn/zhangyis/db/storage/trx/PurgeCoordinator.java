@@ -6,6 +6,7 @@ import cn.zhangyis.db.domain.RollPointer;
 import cn.zhangyis.db.storage.btree.BTreeDeleteResult;
 import cn.zhangyis.db.storage.btree.BTreeIndex;
 import cn.zhangyis.db.storage.btree.SplitCapableBTreeIndexService;
+import cn.zhangyis.db.storage.btree.IndexMetadataResolver;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
@@ -42,7 +43,7 @@ import java.util.Optional;
  *
  * <p><b>per-entry 失败边界</b>：committed 队列先 peek，只有 index tasks 与 finalization 全部成功后才按 expected
  * identity 摘队首。task 中途失败保留 page3 COMMITTED slot，重启可重建并 stale-skip 已完成任务；finalization 的
- * cache/drop + page3 owner 转移同批提交后，即使在内存 complete 前 crash，恢复也只依据持久 owner 重建。
+ * cache/free/drop + page3 owner 转移同批提交后，即使在内存 complete 前 crash，恢复也只依据持久 owner 重建。
  *
  * <p><b>当前范围</b>：协调器自身同步串行，生产由单 daemon driver 周期调用；单聚簇索引、内存 history，
  * recovery 会从仍占用 page3 的 COMMITTED header 重建队列。二级索引 purge、多 worker、多 rseg 留后续片。
@@ -57,12 +58,12 @@ public final class PurgeCoordinator implements PurgeTarget {
     private final HistoryList history;
     /** 逐 pointer 读取 committed undo logical chain 的入口。 */
     private final UndoLogSegmentAccess undoAccess;
-    /** tasks 完成后原子 cache/drop segment + 转移 page3 owner 的终态协作者。 */
+    /** tasks 完成后原子 cache/free/drop segment + 转移 page3 owner 的终态协作者。 */
     private final UndoSegmentFinalizer finalizer;
     /** 物理删除仍匹配 creator/roll-pointer 的 delete-marked 聚簇记录。 */
     private final SplitCapableBTreeIndexService btree;
-    /** 当前无 DD 时显式配置的唯一聚簇索引。 */
-    private final BTreeIndex clusteredIndex;
+    /** 按 undo 固定前缀 tableId/indexId 解析索引；不得回退不匹配的全局索引。 */
+    private final IndexMetadataResolver indexResolver;
 
     /**
      * 构造单线程 purge 协调器；所有依赖必须属于同一 engine/undo tablespace 生命周期。
@@ -79,12 +80,17 @@ public final class PurgeCoordinator implements PurgeTarget {
                             UndoLogSegmentAccess undoAccess, UndoSegmentFinalizer finalizer,
                             SplitCapableBTreeIndexService btree,
                             BTreeIndex clusteredIndex) {
+        this(mgr, system, history, undoAccess, finalizer, btree, legacyResolver(clusteredIndex));
+    }
+
+    /** DD 模式构造器：每条 undo 独立按 table/index identity 解析 BTreeIndex。 */
+    public PurgeCoordinator(MiniTransactionManager mgr, TransactionSystem system, HistoryList history,
+                            UndoLogSegmentAccess undoAccess, UndoSegmentFinalizer finalizer,
+                            SplitCapableBTreeIndexService btree,
+                            IndexMetadataResolver indexResolver) {
         if (mgr == null || system == null || history == null || undoAccess == null || finalizer == null
-                || btree == null || clusteredIndex == null) {
+                || btree == null || indexResolver == null) {
             throw new DatabaseValidationException("purge coordinator collaborators must not be null");
-        }
-        if (!clusteredIndex.clustered()) {
-            throw new DatabaseValidationException("purge requires a clustered index: " + clusteredIndex.indexId());
         }
         this.mgr = mgr;
         this.system = system;
@@ -92,7 +98,7 @@ public final class PurgeCoordinator implements PurgeTarget {
         this.undoAccess = undoAccess;
         this.finalizer = finalizer;
         this.btree = btree;
-        this.clusteredIndex = clusteredIndex;
+        this.indexResolver = indexResolver;
     }
 
     /**
@@ -152,11 +158,11 @@ public final class PurgeCoordinator implements PurgeTarget {
         int removed = 0;
         for (DeleteTask task : tasks) {
             MiniTransaction ix = mgr.begin(mgr.budgetFor(RedoBudgetPurpose.PURGE_INDEX,
-                    BTreeRedoBudgetEstimator.structuralDelete(clusteredIndex.rootLevel())));
+                    BTreeRedoBudgetEstimator.structuralDelete(task.index().rootLevel())));
             BTreeDeleteResult res;
             try {
                 // expected = (删除事务 id, 该 DELETE_MARK undo 记录地址)；严格：仅移除仍 delete-marked 且隐藏列匹配的行
-                res = btree.purgeDeleteMarkedClustered(ix, clusteredIndex, task.key(),
+                res = btree.purgeDeleteMarkedClustered(ix, task.index(), task.key(),
                         entry.creatorTrxId(), task.rollPointer());
             } catch (RuntimeException e) {
                 mgr.rollbackUncommitted(ix);
@@ -185,7 +191,8 @@ public final class PurgeCoordinator implements PurgeTarget {
         long previousUndoNo = 0L;
         boolean first = true;
         while (!pointer.isNull()) {
-            UndoRecord record = readLogicalRecord(entry.undoFirstPageId(), pointer);
+            ResolvedUndo recordAt = readLogicalRecord(entry.undoFirstPageId(), pointer);
+            UndoRecord record = recordAt.record();
             long undoNo = record.undoNo().value();
             if (first) {
                 if (undoNo != head.undoNo().value()) {
@@ -201,7 +208,7 @@ public final class PurgeCoordinator implements PurgeTarget {
                         + record.transactionId().value() + " != history creator " + entry.creatorTrxId().value());
             }
             if (record.type() == UndoRecordType.DELETE_MARK) {
-                tasks.add(new DeleteTask(new SearchKey(record.clusterKey()), pointer));
+                tasks.add(new DeleteTask(new SearchKey(record.clusterKey()), pointer, recordAt.index()));
             }
             first = false;
             previousUndoNo = undoNo;
@@ -211,13 +218,18 @@ public final class PurgeCoordinator implements PurgeTarget {
     }
 
     /** 读取逻辑链单条 record；返回前已提交只读 MTR并释放 first/record 页 latch 与 buffer fix。 */
-    private UndoRecord readLogicalRecord(PageId firstPageId, RollPointer pointer) {
+    private ResolvedUndo readLogicalRecord(PageId firstPageId, RollPointer pointer) {
         MiniTransaction read = mgr.beginReadOnly();
         try {
-            UndoRecord record = undoAccess.open(read, firstPageId, PageLatchMode.SHARED)
-                    .readRecord(pointer, clusteredIndex.keyDef(), clusteredIndex.schema());
+            UndoLogSegment segment = undoAccess.open(read, firstPageId, PageLatchMode.SHARED);
+            var identity = segment.readRecordIdentity(pointer);
+            BTreeIndex index = indexResolver.resolve(identity.tableId(), identity.indexId());
+            if (!index.clustered()) {
+                throw new UndoLogFormatException("purge undo references non-clustered index: " + index.indexId());
+            }
+            UndoRecord record = segment.readRecord(pointer, index.keyDef(), index.schema());
             mgr.commit(read);
-            return record;
+            return new ResolvedUndo(record, index);
         } catch (RuntimeException e) {
             rollbackReadMtr(read, e);
             throw e;
@@ -237,7 +249,23 @@ public final class PurgeCoordinator implements PurgeTarget {
     }
 
     /** 一条待移除的 delete-marked 聚簇记录：搜索 key + 该 DELETE_MARK undo 记录自身地址（= 记录应有的 DB_ROLL_PTR）。 */
-    private record DeleteTask(SearchKey key, RollPointer rollPointer) {
+    private static IndexMetadataResolver legacyResolver(BTreeIndex clusteredIndex) {
+        if (clusteredIndex == null || !clusteredIndex.clustered()) {
+            throw new DatabaseValidationException("purge requires a clustered index");
+        }
+        return (tableId, indexId) -> {
+            if (clusteredIndex.indexId() != indexId) {
+                throw new UndoLogFormatException("undo indexId " + indexId
+                        + " != configured purge index " + clusteredIndex.indexId());
+            }
+            return clusteredIndex;
+        };
+    }
+
+    private record DeleteTask(SearchKey key, RollPointer rollPointer, BTreeIndex index) {
+    }
+
+    private record ResolvedUndo(UndoRecord record, BTreeIndex index) {
     }
 
     /** 一次短读取得的持久逻辑链入口。 */

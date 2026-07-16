@@ -15,14 +15,16 @@ import cn.zhangyis.db.server.lockobs.api.SnapshotRequest;
 import cn.zhangyis.db.server.lockobs.snapshot.LockDiagnosticSnapshot;
 import cn.zhangyis.db.storage.api.DiskSpaceManager;
 import cn.zhangyis.db.storage.api.DiskSpaceUndoAllocator;
+import cn.zhangyis.db.storage.api.ddl.TableDdlStorageService;
 import cn.zhangyis.db.storage.api.index.IndexPageAccess;
+import cn.zhangyis.db.storage.btree.IndexMetadataResolver;
 import cn.zhangyis.db.storage.api.lob.LobStorage;
 import cn.zhangyis.db.storage.api.dml.ClusteredDmlService;
 import cn.zhangyis.db.storage.api.tablespace.PageZeroTablespaceMetadataLoader;
 import cn.zhangyis.db.storage.api.undotruncate.UndoTablespaceTruncationRecovery;
 import cn.zhangyis.db.storage.api.undotruncate.UndoTablespaceTruncationService;
 import cn.zhangyis.db.storage.api.undotruncate.UndoTruncationFaultInjector;
-import cn.zhangyis.db.storage.api.undotruncate.UndoCachedSegmentTruncationCoordinator;
+import cn.zhangyis.db.storage.api.undotruncate.UndoReusableSegmentTruncationCoordinator;
 import cn.zhangyis.db.storage.btree.BTreeIndex;
 import cn.zhangyis.db.storage.btree.BTreeCurrentReadService;
 import cn.zhangyis.db.storage.btree.SplitCapableBTreeIndexService;
@@ -98,12 +100,15 @@ import cn.zhangyis.db.storage.trx.TransactionCounterSnapshot;
 import cn.zhangyis.db.storage.trx.TransactionSystem;
 import cn.zhangyis.db.storage.trx.UndoLogManager;
 import cn.zhangyis.db.storage.trx.UndoSegmentFinalizer;
-import cn.zhangyis.db.storage.trx.UndoSegmentCacheDirectory;
+import cn.zhangyis.db.storage.trx.UndoSegmentReuseDirectory;
 import cn.zhangyis.db.storage.trx.lock.LockManager;
 import cn.zhangyis.db.storage.undo.RollbackSegmentHeaderRepository;
 import cn.zhangyis.db.storage.undo.RollbackSegmentHeaderSnapshot;
 import cn.zhangyis.db.storage.undo.RollbackSegmentHistoryBase;
 import cn.zhangyis.db.storage.undo.CachedUndoSegmentRef;
+import cn.zhangyis.db.storage.undo.FreeUndoSegmentRef;
+import cn.zhangyis.db.storage.undo.RollbackSegmentFreeListBase;
+import cn.zhangyis.db.storage.undo.UndoFreeListNodeSnapshot;
 import cn.zhangyis.db.storage.undo.UndoLogFormatException;
 import cn.zhangyis.db.storage.undo.UndoLogKind;
 import cn.zhangyis.db.storage.undo.UndoLogSegment;
@@ -115,6 +120,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.LinkedHashMap;
@@ -133,10 +139,10 @@ import java.util.Set;
  * {@link FlushService#flushThrough} 按 WAL 顺序持久（先 redo.flush 再刷脏页再持久 checkpoint），close 末关闭
  * AutoCloseable 句柄。
  *
- * <p><b>当前限制</b>：启动后已有后台 redo flusher、单线程 page cleaner；配置单聚簇索引时会启动
+ * <p><b>当前限制</b>：启动后已有后台 redo flusher、单线程 page cleaner；配置 legacy 单聚簇索引或 DD resolver 时会启动
  * {@code PurgeCoordinator} + purge driver。后台 worker 失败仍无 supervisor 重启；事务 UNDO_ROLLBACK / RESUME_PURGE
- * 已作为正式 recovery stage 接入，但仍依赖显式单聚簇索引，未接 DD/多索引/prepared transaction；DDL_RECOVERY 仍未
- * 接入。doublewrite 已常开为 {@link RecoverableDoublewriteStrategy}，但恢复页列表来自 doublewrite 文件有效 slot 并
+ * 已作为正式 recovery stage 接入并支持逐 undo table/index 解析，prepared transaction 尚未实现；DDL 收敛由上层
+ * DatabaseEngine 在本存储恢复成功后执行。doublewrite 已常开为 {@link RecoverableDoublewriteStrategy}，但恢复页列表来自 doublewrite 文件有效 slot 并
  * 过滤到 recovery 已打开空间，仍没有全空间 checksum discovery。
  *
  * <p>访问器暴露已接线的事务/disk/btree/undo/mvcc/rollback/DML facade 服务；本类只负责组合根与生命周期，
@@ -185,12 +191,14 @@ public final class StorageEngine {
     /** 单聚簇索引 DML facade；只做 storage 内事务/undo/B+Tree/redo 编排，不包含 SQL/DD/session 语义。 */
     private ClusteredDmlService dmlService;
     private IndexPageAccess indexPageAccess;
+    /** DD/DDL 上层唯一可调用的物理 CREATE/DROP TABLE facade。 */
+    private TableDdlStorageService tableDdlStorageService;
     private MvccReader mvccReader;
     private RollbackService rollbackService;
     /** 内存 rseg slot 目录；0.3 起 claim/release 持久化到 page3，恢复期扫描重建。 */
     private RollbackSegmentSlotManager rollbackSlots;
-    /** page3 cached INSERT/UPDATE segment 的运行期 LIFO 投影。 */
-    private UndoSegmentCacheDirectory undoSegmentCache;
+    /** page3 cache/free owner 的统一运行期投影。 */
+    private UndoSegmentReuseDirectory undoSegmentReuse;
     /** 持久 rseg header 仓储（page3）；fresh 格式化、claim/release 持久、恢复扫描共用。 */
     private RollbackSegmentHeaderRepository rsegHeaderRepo;
     /** undo 段物理设施；恢复期读 undo 段 state、回滚 ACTIVE 段用。 */
@@ -198,10 +206,14 @@ public final class StorageEngine {
     /** commit、live/recovery rollback 与 purge 共享的单/双段原子终结协调器。 */
     private UndoSegmentFinalizer undoSegmentFinalizer;
     /**
-     * 单显式配置聚簇索引（无 DD，open 前 set）：同时服务恢复期回滚（R 1.2）与后台 purge（0.4）。null 时
-     * 不启动 purge；若 existing-open 发现 ACTIVE undo，恢复必须 fail-closed，不能跳过 rollback 后开放流量。
+     * 兼容模式的单显式聚簇索引：在不使用公共 {@code DatabaseEngine}/DD 组合根的低层测试中，
+     * 同时服务恢复期回滚（R 1.2）与后台 purge（0.4）。DD 模式优先使用
+     * {@link #indexMetadataResolver}逐条定位索引；两者都为 null 时不启动 purge，existing-open 发现 ACTIVE undo 则
+     * fail-closed，不能跳过 rollback 后开放流量。
      */
     private BTreeIndex clusteredIndex;
+    /** DD 模式按 undo tableId/indexId 解析索引；在 open 前注入，优先于 legacy 单索引。 */
+    private IndexMetadataResolver indexMetadataResolver;
     /** 事务系统（id/no 分配 + active 表 + purge low water）；purge boundary 来源。 */
     private TransactionSystem txnSystem;
     /** 已提交 undo 的 history list；undoLogManager 写入、purge 读出，须同一实例。 */
@@ -364,26 +376,31 @@ public final class StorageEngine {
         this.lobStorage = new LobStorage(diskSpaceManager, pool, config.pageSize(), typeRegistry);
         this.transactionManager = new TransactionManager(txnSystem);
         this.rollbackSlots = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), config.slotCapacity());
-        this.undoSegmentCache = new UndoSegmentCacheDirectory(config.undoCachedSegmentsPerKind());
+        this.undoSegmentReuse = new UndoSegmentReuseDirectory(config.undoCachedSegmentsPerKind());
         this.rsegHeaderRepo = new RollbackSegmentHeaderRepository(pool, config.pageSize());
         this.history = new HistoryList(config.undoHistoryTransitionTimeout());
         this.undoAllocator = new DiskSpaceUndoAllocator(diskSpaceManager);
         this.undoAccess = new UndoLogSegmentAccess(pool, config.pageSize(), undoAllocator, typeRegistry, registry,
                 config.maxExternalUndoPayloadPages());
         this.undoSegmentFinalizer = new UndoSegmentFinalizer(miniTransactionManager, undoAccess, undoAllocator,
-                rsegHeaderRepo, rollbackSlots, undoSegmentCache);
+                rsegHeaderRepo, rollbackSlots, undoSegmentReuse);
         this.undoLogManager = new UndoLogManager(undoAccess, rollbackSlots, config.undoSpaceId(), history,
-                rsegHeaderRepo, undoSegmentFinalizer, undoSegmentCache);
+                rsegHeaderRepo, undoSegmentFinalizer, undoSegmentReuse);
         this.indexPageAccess = new IndexPageAccess(pool, config.pageSize(), registry);
         this.btreeService = new SplitCapableBTreeIndexService(indexPageAccess, diskSpaceManager, typeRegistry);
+        this.tableDdlStorageService = new TableDdlStorageService(miniTransactionManager, diskSpaceManager,
+                indexPageAccess, pool, store, flushService, accessController);
         this.lockObservationService = new DefaultLockObservationService();
         this.lockManager = new LockManager(lockObservationService);
         this.btreeCurrentReadService =
                 new BTreeCurrentReadService(miniTransactionManager, btreeService, lockManager);
         this.mvccReader = new MvccReader(miniTransactionManager, btreeService, undoAccess,
                 config.undoSpaceId(), config.maxVersionHops());
-        this.rollbackService = new RollbackService(btreeService, undoAccess, transactionManager,
-                miniTransactionManager, undoSegmentFinalizer);
+        this.rollbackService = indexMetadataResolver == null
+                ? new RollbackService(btreeService, undoAccess, transactionManager,
+                        miniTransactionManager, undoSegmentFinalizer)
+                : new RollbackService(btreeService, undoAccess, transactionManager,
+                        miniTransactionManager, undoSegmentFinalizer, indexMetadataResolver);
         this.dmlService = new ClusteredDmlService(transactionManager, undoLogManager, miniTransactionManager,
                 btreeService, btreeCurrentReadService, rollbackService, lockManager, redo, recoveryGate);
 
@@ -474,8 +491,8 @@ public final class StorageEngine {
      *
      * <p>简化点：当前引擎已使用 {@link RecoverableDoublewriteStrategy} 并携带
      * {@link DoublewriteRecoveryScanner}/page 列表，但 page 列表只来自 doublewrite 文件中的有效 slot，且仅覆盖启动恢复
-     * 已打开的系统 undo 与显式配置数据表空间；没有 data dictionary / 全空间 checksum discovery。事务 UNDO_ROLLBACK
-     * / RESUME_PURGE 已进入恢复服务阶段链，但仍依赖显式单聚簇索引；DDL_RECOVERY 仍未接入。
+     * 已打开的系统 undo 与显式配置数据表空间；没有全空间 checksum discovery。事务 UNDO_ROLLBACK
+     * / RESUME_PURGE 已进入恢复服务阶段链，索引可由 legacy 单索引或 DD resolver 提供；DDL 收敛属于 DatabaseEngine 上层阶段。
      */
     private void recoverExisting() {
         diskSpaceManager.openTablespaceForRecovery(config.undoSpaceId(), config.undoFile());
@@ -542,12 +559,12 @@ public final class StorageEngine {
     /**
      * 正式 UNDO_ROLLBACK / RESUME_PURGE 阶段参与者。redo 重放和 UNDO tablespace 续作完成后，page3 与 undo first
      * 页已经恢复到物理一致状态；本方法扫描 rseg header 重建内存 slot 目录，再逐 slot 读取 undo first 页 header。
-     * ACTIVE 段在配置单聚簇索引时执行恢复期 rollback；COMMITTED 段按 {@code COMMIT_NO} 重建 committed history，
+     * ACTIVE 段在配置 legacy 单索引或 DD resolver 时执行恢复期 rollback；COMMITTED 段按 {@code COMMIT_NO} 重建 committed history，
      * 并复位事务 id/no 高水位，供启动后的后台 purge driver 续作。
      *
      * <p>简化点：未引入独立 {@code UndoRecoveryService} 类；当前仍由 engine 组合根作为
-     * {@code TransactionUndoRecoveryParticipant} 实现阶段端口。无 DD 时只支持显式单聚簇索引；若发现 ACTIVE
-     * 但未配置该索引，恢复 fail-closed，绝不保留未回滚 slot 后开放流量。
+     * {@code TransactionUndoRecoveryParticipant} 实现阶段端口。若发现 ACTIVE 但既无 legacy 索引也无 DD resolver，
+     * 恢复 fail-closed，绝不保留未回滚 slot 后开放流量。
      *
      * @param recoveredToLsn redo replay 连续恢复边界；作为 page3 合成证据 LSN，并用于 sidecar/redo 覆盖诊断。
      * @param transactionSnapshot checkpoint/redo 合并后的不可变事务证据；page3 扫描必须与它交叉校验。
@@ -573,8 +590,10 @@ public final class StorageEngine {
                 snapshot.cachedInsertSegments(), UndoLogKind.INSERT);
         List<CachedUndoSegmentRef> cachedUpdate = readRecoveredUndoCache(
                 snapshot.cachedUpdateSegments(), UndoLogKind.UPDATE);
+        List<FreeUndoSegmentRef> free = readRecoveredUndoFree(snapshot.freeListBase(),
+                snapshot.occupiedSlots().values(), cachedInsert, cachedUpdate);
         return recoverRollbackSegmentTransactions(recoveredToLsn, transactionSnapshot,
-                snapshot.occupiedSlots(), snapshot.historyBase(), cachedInsert, cachedUpdate);
+                snapshot.occupiedSlots(), snapshot.historyBase(), cachedInsert, cachedUpdate, free);
     }
 
     /**
@@ -591,7 +610,8 @@ public final class StorageEngine {
             Map<UndoSlotId, PageId> occupiedSlots,
             RollbackSegmentHistoryBase historyBase,
             List<CachedUndoSegmentRef> cachedInsert,
-            List<CachedUndoSegmentRef> cachedUpdate) {
+            List<CachedUndoSegmentRef> cachedUpdate,
+            List<FreeUndoSegmentRef> free) {
         List<RecoveredUndoSlotEvidence> recoveredSlots = new ArrayList<>();
         for (Map.Entry<UndoSlotId, PageId> entry : occupiedSlots.entrySet()) {
             recoveredSlots.add(readRecoveredUndoSlot(entry.getKey(), entry.getValue()));
@@ -602,14 +622,14 @@ public final class StorageEngine {
         PersistentHistoryRecovery historyRecovery = new PersistentHistoryRecovery();
         List<HistoryEntry> committed = historyRecovery.rebuild(
                 historyBase, occupiedSlots, recoveredSlots, this::readRecoveredHistoryNode);
-        if (!reconciliation.activeSlots().isEmpty() && clusteredIndex == null) {
+        if (!reconciliation.activeSlots().isEmpty() && clusteredIndex == null && indexMetadataResolver == null) {
             throw new TransactionRecoveryException(
                     "recovered ACTIVE transactions require the configured clustered index; "
                             + "cannot skip undo rollback before opening traffic: activeSlots="
                             + reconciliation.activeSlots().size());
         }
         // page3 active/cache、undo 首页和 FSP inode 已全部交叉校验后才发布内存投影；失败启动不会留下半个缓存栈。
-        undoSegmentCache.restore(cachedInsert, cachedUpdate);
+        undoSegmentReuse.restore(cachedInsert, cachedUpdate, free);
         txnSystem.restoreCounters(reconciliation.snapshot().nextTransactionId().value(),
                 historyRecovery.nextTransactionNo(historyBase,
                         reconciliation.snapshot().nextTransactionNo().value()));
@@ -683,6 +703,72 @@ public final class StorageEngine {
     }
 
     /**
+     * 按 page3 v4 length 有界恢复 free FIFO。每个节点使用独立首页 MTR，FSP identity 再用另一个 MTR 校验；
+     * prev/next、cycle、tail、资格或与 active/cache owner 重复时一律 fail-closed。
+     */
+    private List<FreeUndoSegmentRef> readRecoveredUndoFree(
+            RollbackSegmentFreeListBase base, Collection<PageId> activeOwners,
+            List<CachedUndoSegmentRef> cachedInsert, List<CachedUndoSegmentRef> cachedUpdate) {
+        if (base == null || activeOwners == null || cachedInsert == null || cachedUpdate == null) {
+            throw new DatabaseValidationException("recovered undo free inputs must not be null");
+        }
+        if (base.length() == 0L) {
+            return List.of();
+        }
+        Set<PageId> owners = new LinkedHashSet<>(activeOwners);
+        cachedInsert.forEach(item -> owners.add(item.handle().firstPageId()));
+        cachedUpdate.forEach(item -> owners.add(item.handle().firstPageId()));
+        List<FreeUndoSegmentRef> recovered = new ArrayList<>((int) base.length());
+        Optional<PageId> expectedPrevious = Optional.empty();
+        PageId current = base.headPageId().orElseThrow();
+        for (int index = 0; index < (int) base.length(); index++) {
+            if (!owners.add(current)) {
+                throw new UndoLogFormatException("duplicate/cyclic recovered free undo owner: " + current);
+            }
+            MiniTransaction pageMtr = miniTransactionManager.beginReadOnly();
+            UndoFreeListNodeSnapshot node;
+            try {
+                node = undoAccess.inspectFree(pageMtr, current);
+                miniTransactionManager.commit(pageMtr);
+            } catch (RuntimeException error) {
+                rollbackRecoveryScanMtr(pageMtr, error);
+                throw error;
+            }
+            if (!node.previousFreePageId().equals(expectedPrevious)) {
+                throw new UndoLogFormatException("recovered free prev link mismatch at " + current
+                        + ": expected=" + expectedPrevious + ", current=" + node.previousFreePageId());
+            }
+            boolean last = index + 1 == (int) base.length();
+            if (last) {
+                if (node.nextFreePageId().isPresent() || !base.tailPageId().equals(Optional.of(current))) {
+                    throw new UndoLogFormatException("recovered free tail/length mismatch at " + current);
+                }
+            } else if (node.nextFreePageId().isEmpty()) {
+                throw new UndoLogFormatException("recovered free chain ended before persisted length at " + current);
+            }
+
+            MiniTransaction fspMtr = miniTransactionManager.beginReadOnly();
+            try {
+                UndoSegmentDropPlan plan = undoAllocator.inspectDropPlan(fspMtr, node.segment().handle());
+                if (plan.usedPageCount() != 1L || plan.fragmentPageCount() != 1L || plan.extentCount() != 0L) {
+                    throw new UndoLogFormatException("free undo segment is not a single fragment owner: firstPage="
+                            + current + ", plan=" + plan);
+                }
+                miniTransactionManager.commit(fspMtr);
+            } catch (RuntimeException error) {
+                rollbackRecoveryScanMtr(fspMtr, error);
+                throw error;
+            }
+            recovered.add(node.segment());
+            expectedPrevious = Optional.of(current);
+            if (!last) {
+                current = node.nextFreePageId().orElseThrow();
+            }
+        }
+        return List.copyOf(recovered);
+    }
+
+    /**
      * 只读读取一个 restored undo slot 的恢复 header。异常时回滚该只读 MTR，避免损坏 undo 页导致 guard/lease 泄漏。
      * 返回值只含内存快照，不持有 page latch；调用方可安全地在之后进入 B+Tree rollback 或 history 入队。
      */
@@ -725,10 +811,10 @@ public final class StorageEngine {
      * 最后发布 registry 状态；若这些依赖不是同一实例，普通准入看到的生命周期状态会与恢复写入脱节。
      */
     private UndoTablespaceTruncationRecovery buildUndoTablespaceRecovery() {
-        UndoCachedSegmentTruncationCoordinator cachedSegmentCoordinator =
-                new UndoCachedSegmentTruncationCoordinator(miniTransactionManager, undoAccess, undoAllocator,
+        UndoReusableSegmentTruncationCoordinator cachedSegmentCoordinator =
+                new UndoReusableSegmentTruncationCoordinator(miniTransactionManager, undoAccess, undoAllocator,
                         rsegHeaderRepo, rollbackSlots.rollbackSegmentId(), config.slotCapacity(),
-                        config.undoCachedSegmentsPerKind(), undoSegmentCache);
+                        config.undoCachedSegmentsPerKind(), undoSegmentReuse);
         UndoTablespaceTruncationService truncationService = new UndoTablespaceTruncationService(
                 pool, store, config.pageSize(), registry, accessController, miniTransactionManager,
                 flushService, config.flushTimeout(), UndoTruncationFaultInjector.none(), cachedSegmentCoordinator);
@@ -791,15 +877,19 @@ public final class StorageEngine {
     }
 
     /**
-     * 0.4：启动后台 purge driver。仅在后台启用且已配置单聚簇索引时构造 {@link PurgeCoordinator}（无 DD，单表）+ driver。
-     * 未配置索引（既有 engine 测试）则不启动，purge 不跑、行为不变。
+     * 0.4：启动后台 purge driver。DD 组合根传入 resolver 时，每条 undo 按 tableId/indexId 定位聚簇索引；
+     * 低层兼容构造则仍可使用单显式索引。后台未启用或两种元数据来源都缺失时不启动，
+     * 避免在不能确认目标索引的情况下物理移除记录。
      */
     private void startBackgroundPurgeDriver() {
-        if (!config.backgroundFlushEnabled() || clusteredIndex == null) {
+        if (!config.backgroundFlushEnabled() || clusteredIndex == null && indexMetadataResolver == null) {
             return;
         }
-        PurgeCoordinator coordinator = new PurgeCoordinator(miniTransactionManager, txnSystem, history,
-                undoAccess, undoSegmentFinalizer, btreeService, clusteredIndex);
+        PurgeCoordinator coordinator = indexMetadataResolver == null
+                ? new PurgeCoordinator(miniTransactionManager, txnSystem, history,
+                        undoAccess, undoSegmentFinalizer, btreeService, clusteredIndex)
+                : new PurgeCoordinator(miniTransactionManager, txnSystem, history,
+                        undoAccess, undoSegmentFinalizer, btreeService, indexMetadataResolver);
         purgeDriverWorker = new PurgeDriverWorker(coordinator, config.slotCapacity(), config.backgroundFlushInterval());
         purgeDriverWorker.start();
     }
@@ -1014,10 +1104,16 @@ public final class StorageEngine {
         return lockObservationService.captureSnapshot(lockManager.snapshot(), request);
     }
 
-    /** 索引页格式化入口（建聚簇/二级索引 root 页用）。无 DD 前仍由测试与上层显式格式化索引页。 */
+    /** 索引页格式化入口；物理 DDL 用它初始化聚簇/二级索引 root，低层页格式测试也可显式调用。 */
     public IndexPageAccess indexPageAccess() {
         requireOpen();
         return indexPageAccess;
+    }
+
+    /** 物理 CREATE/DROP TABLE 门面；DD/MDL publish 由更上层 {@code DatabaseEngine} 协调。 */
+    public TableDdlStorageService tableDdlStorageService() {
+        requireOpen();
+        return tableDdlStorageService;
     }
 
     public UndoLogManager undoLogManager() {
@@ -1032,7 +1128,7 @@ public final class StorageEngine {
     }
 
     /**
-     * 配置本 engine 的单聚簇索引（无 DD 前由测试/上层显式注入），**必须在 {@link #open()} 之前**调用。
+     * 配置本 engine 的兼容单聚簇索引（主要供不经 DD 组合根的低层测试），**必须在 {@link #open()} 之前**调用。
      * 同时服务恢复期回滚（R 1.2）与后台 purge driver（0.4）。未配置时不启动 purge；existing-open 仅在
      * 未发现 ACTIVE undo 时可继续，发现 ACTIVE 则 fail-closed，绝不以缺少索引为由跳过恢复回滚。
      */
@@ -1041,6 +1137,20 @@ public final class StorageEngine {
             throw new EngineStateException("clustered index must be configured before open(): " + state);
         }
         this.clusteredIndex = clusteredIndex;
+    }
+
+    /**
+     * 配置 DD 索引解析器，必须早于 open/recovery。ACTIVE undo rollback 与后台 purge 会逐条读取 undo identity，
+     * 解析器返回错误/缺失索引时启动 fail-closed，绝不回退 legacy 全局索引。
+     */
+    public void configureIndexMetadataResolver(IndexMetadataResolver resolver) {
+        if (state != EngineState.NEW) {
+            throw new EngineStateException("index metadata resolver must be configured before open(): " + state);
+        }
+        if (resolver == null) {
+            throw new DatabaseValidationException("index metadata resolver must not be null");
+        }
+        this.indexMetadataResolver = resolver;
     }
 
     public MvccReader mvccReader() {

@@ -97,6 +97,64 @@ public final class UndoPage {
                 "activate cached undo first page");
     }
 
+    /**
+     * 把已结束且物理上只有一个 ordinary page 的 segment 重置为 FREE，并写入 free FIFO 双向链接。
+     * 最近一次 kind 只留作诊断；FREE owner 本身不按 kind 分区。
+     */
+    void resetForFree(UndoSegmentHandle handle, long previousFreePageNo, long nextFreePageNo) {
+        if (handle == null) {
+            throw new DatabaseValidationException("undo free reset handle must not be null");
+        }
+        requireFirstPage();
+        requireHandleSpace(handle);
+        validateFreePageNo(previousFreePageNo);
+        validateFreePageNo(nextFreePageNo);
+        if (!guard.pageId().equals(handle.firstPageId()) || !handle.firstPageId().equals(handle.lastPageId())
+                || lastPageNo() != guard.pageId().pageNo().value()
+                || prevPageNo() != FilePageHeader.FIL_NULL || nextPageNo() != FilePageHeader.FIL_NULL) {
+            throw new UndoLogFormatException("only a self-linked single-page undo segment can enter free list: "
+                    + guard.pageId());
+        }
+        UndoLogKind retainedKind = undoKind();
+        if (retainedKind == UndoLogKind.TEMPORARY) {
+            throw new UndoLogFormatException("temporary undo cannot enter persistent free list: " + guard.pageId());
+        }
+        rewriteFirstPage(retainedKind, TransactionId.NONE, UndoPageLayout.STATE_FREE, handle,
+                "reset finalized undo first page for free list");
+        setFreeLinks(previousFreePageNo, nextFreePageNo);
+    }
+
+    /** 用新事务和新 kind 激活 FREE 首页；调用方随后在同一业务 MTR 追加首条记录。 */
+    void activateFree(UndoLogKind kind, TransactionId txnId, UndoSegmentHandle handle) {
+        if (kind == null || txnId == null || handle == null || txnId.isNone()
+                || kind == UndoLogKind.TEMPORARY) {
+            throw new DatabaseValidationException("undo free activation args are invalid");
+        }
+        requireFreeEmpty(handle);
+        rewriteFirstPage(kind, txnId, UndoPageLayout.STATE_ACTIVE, handle,
+                "activate free undo first page");
+    }
+
+    /** 校验 FREE 首页的可复用物理边界；prev/next 可以指向同一持久 FIFO 中的相邻节点。 */
+    void requireFreeEmpty(UndoSegmentHandle handle) {
+        requireFirstPage();
+        requireHandleSpace(handle);
+        if (state() != UndoPageLayout.STATE_FREE || !transactionId().isNone() || commitNo() != 0L
+                || undoKind() == UndoLogKind.TEMPORARY
+                || freeOffset() != UndoPageLayout.RECORD_AREA_START || recordCount() != 0
+                || pageLastUndoNo().value() != 0L || logRecordCount() != 0L
+                || logLastUndoNo().value() != 0L || !logicalHead().isEmpty()
+                || !guard.pageId().equals(handle.firstPageId()) || !handle.firstPageId().equals(handle.lastPageId())
+                || firstPageNo() != guard.pageId().pageNo().value()
+                || lastPageNo() != guard.pageId().pageNo().value()
+                || prevPageNo() != FilePageHeader.FIL_NULL || nextPageNo() != FilePageHeader.FIL_NULL) {
+            throw new UndoLogFormatException("free undo first page is not an empty single-page owner: "
+                    + guard.pageId());
+        }
+        validateFreePageNo(freePrevPageNo());
+        validateFreePageNo(freeNextPageNo());
+    }
+
     /** 校验 CACHED 首页的全部可复用边界；恢复与运行期 pop 共用。 */
     void requireCachedEmpty(UndoLogKind expectedKind, UndoSegmentHandle handle) {
         requireFirstPage();
@@ -361,7 +419,7 @@ public final class UndoPage {
     void setLogState(int state) {
         requireFirstPage();
         if (state != UndoPageLayout.STATE_ACTIVE && state != UndoPageLayout.STATE_COMMITTED
-                && state != UndoPageLayout.STATE_CACHED) {
+                && state != UndoPageLayout.STATE_CACHED && state != UndoPageLayout.STATE_FREE) {
             throw new DatabaseValidationException("unknown undo log state: " + state);
         }
         writeLogHeaderU8(UndoPageLayout.STATE, state, "write undo log state");
@@ -419,6 +477,45 @@ public final class UndoPage {
         validateHistoryPageNo(nextPageNo);
         writeHistoryLinkLong(UndoPageLayout.HISTORY_NEXT_PAGE_NO, nextPageNo,
                 "write undo history next link");
+    }
+
+    /** FREE 状态下的前驱 pageNo；与 history prev 共用物理槽，但使用独立 redo 分类。 */
+    long freePrevPageNo() {
+        requireFreeState();
+        return guard.readLong(UndoPageLayout.HISTORY_PREV_PAGE_NO);
+    }
+
+    /** FREE 状态下的后继 pageNo；与 history next 共用物理槽，但使用独立 redo 分类。 */
+    long freeNextPageNo() {
+        requireFreeState();
+        return guard.readLong(UndoPageLayout.HISTORY_NEXT_PAGE_NO);
+    }
+
+    /** FREE 入队时一次写入 prev/next；调用方已按全局 PageId 顺序持有相关首页 X latch。 */
+    void setFreeLinks(long previousPageNo, long nextPageNo) {
+        requireFreeState();
+        validateFreePageNo(previousPageNo);
+        validateFreePageNo(nextPageNo);
+        writeFreeLinkLong(UndoPageLayout.HISTORY_PREV_PAGE_NO, previousPageNo,
+                "write undo free prev link");
+        writeFreeLinkLong(UndoPageLayout.HISTORY_NEXT_PAGE_NO, nextPageNo,
+                "write undo free next link");
+    }
+
+    /** 摘除 free head 后清空新 head.prev。 */
+    void setFreePrevPageNo(long previousPageNo) {
+        requireFreeState();
+        validateFreePageNo(previousPageNo);
+        writeFreeLinkLong(UndoPageLayout.HISTORY_PREV_PAGE_NO, previousPageNo,
+                "write undo free prev link");
+    }
+
+    /** 尾插 free node 时把旧 tail.next 指向新节点。 */
+    void setFreeNextPageNo(long nextPageNo) {
+        requireFreeState();
+        validateFreePageNo(nextPageNo);
+        writeFreeLinkLong(UndoPageLayout.HISTORY_NEXT_PAGE_NO, nextPageNo,
+                "write undo free next link");
     }
 
     /** first 页 log header 中的链首页号。 */
@@ -572,9 +669,28 @@ public final class UndoPage {
                 segmentId().value(), inodeSlot(), offset, value, reason);
     }
 
+    /** FREE 链链接独立分类，避免 recovery 把状态复用字段误解释成 history 关系。 */
+    private void writeFreeLinkLong(int offset, long value, String reason) {
+        UndoRedoDeltas.writeLong(mtr, guard, guard.pageId(), UndoMetadataDeltaKind.UNDO_FREE_LINK_FIELD,
+                segmentId().value(), inodeSlot(), offset, value, reason);
+    }
+
     private static void validateHistoryPageNo(long pageNo) {
         if (pageNo < 0 || pageNo > FilePageHeader.FIL_NULL) {
             throw new DatabaseValidationException("undo history page no is out of range: " + pageNo);
+        }
+    }
+
+    private static void validateFreePageNo(long pageNo) {
+        if (pageNo < 0 || pageNo > FilePageHeader.FIL_NULL) {
+            throw new DatabaseValidationException("undo free-list page no is out of range: " + pageNo);
+        }
+    }
+
+    private void requireFreeState() {
+        requireFirstPage();
+        if (state() != UndoPageLayout.STATE_FREE) {
+            throw new UndoLogFormatException("undo page is not FREE: " + guard.pageId());
         }
     }
 

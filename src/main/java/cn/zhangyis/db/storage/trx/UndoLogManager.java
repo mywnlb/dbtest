@@ -15,6 +15,7 @@ import cn.zhangyis.db.storage.record.schema.IndexKeyDef;
 import cn.zhangyis.db.storage.record.schema.TableSchema;
 import cn.zhangyis.db.storage.record.type.ColumnValue;
 import cn.zhangyis.db.storage.undo.RollbackSegmentHeaderRepository;
+import cn.zhangyis.db.storage.undo.RollbackSegmentFreeListBase;
 import cn.zhangyis.db.storage.undo.UndoAppendSnapshot;
 import cn.zhangyis.db.storage.undo.UndoLogSegment;
 import cn.zhangyis.db.storage.undo.UndoLogSegmentAccess;
@@ -26,6 +27,7 @@ import cn.zhangyis.db.storage.undo.UndoRecordWritePlan;
 import cn.zhangyis.db.storage.undo.UndoSpaceReservation;
 
 import java.util.List;
+import java.util.Optional;
 
 /**
  * 事务 undo 门面（设计 §5.2/§7.1/§7.2）。在 {@code storage.trx} 持事务语义，调用
@@ -64,14 +66,14 @@ public final class UndoLogManager {
      * 持久 rseg header 仓储。首写 claim 与 undo segment 创建同一 MTR；终态 clear 统一交给 finalizer。
      */
     private final RollbackSegmentHeaderRepository headerRepo;
-    /** commit/rollback/purge 共享的 atomic cache/drop + page3 owner 转移协作者。 */
+    /** commit/rollback/purge 共享的 atomic cache/free/drop + page3 owner 转移协作者。 */
     private final UndoSegmentFinalizer finalizer;
-    /** page3 cached INSERT/UPDATE segment 的运行期 LIFO 投影。 */
-    private final UndoSegmentCacheDirectory cacheDirectory;
+    /** page3 cache/free owner 的统一运行期投影。 */
+    private final UndoSegmentReuseDirectory reuseDirectory;
 
     /**
      * 构造生产 undo 门面。slot claim 必须持久到 page3；纯 insert commit 必须经 finalizer 在同一 redo batch
-     * cache/drop segment + 转移 page3 owner，故不再提供绕过持久生命周期的构造方式。
+     * cache/free/drop segment + 转移 page3 owner，故不再提供绕过持久生命周期的构造方式。
      *
      * @param access      undo 物理设施入口，不能为 null。
      * @param slotManager 内存 rseg slot 目录，不能为 null。
@@ -82,9 +84,9 @@ public final class UndoLogManager {
      */
     public UndoLogManager(UndoLogSegmentAccess access, RollbackSegmentSlotManager slotManager, SpaceId undoSpace,
                            HistoryList history, RollbackSegmentHeaderRepository headerRepo,
-                           UndoSegmentFinalizer finalizer, UndoSegmentCacheDirectory cacheDirectory) {
+                           UndoSegmentFinalizer finalizer, UndoSegmentReuseDirectory reuseDirectory) {
         if (access == null || slotManager == null || undoSpace == null || history == null
-                || headerRepo == null || finalizer == null || cacheDirectory == null) {
+                || headerRepo == null || finalizer == null || reuseDirectory == null) {
             throw new DatabaseValidationException("undo log manager args must not be null");
         }
         this.access = access;
@@ -93,7 +95,7 @@ public final class UndoLogManager {
         this.history = history;
         this.headerRepo = headerRepo;
         this.finalizer = finalizer;
-        this.cacheDirectory = cacheDirectory;
+        this.reuseDirectory = reuseDirectory;
     }
 
     /** 在写 MTR admission 前规划 INSERT undo。 */
@@ -151,6 +153,7 @@ public final class UndoLogManager {
         return switch (plan.acquisition()) {
             case ALLOCATE_NEW -> appendAllocatedLogPlanned(txn, mtr, plan);
             case REUSE_CACHED -> appendCachedLogPlanned(txn, mtr, plan);
+            case REUSE_FREE -> appendFreeLogPlanned(txn, mtr, plan);
             case APPEND_EXISTING -> appendExistingPlanned(txn, mtr, plan);
         };
     }
@@ -160,12 +163,12 @@ public final class UndoLogManager {
         UndoRecordWritePlan physical = access.planRecord(record, keyDef, schema);
         int pages = switch (context.acquisition()) {
             case ALLOCATE_NEW -> access.plannedNewPages(true, null, physical);
-            case REUSE_CACHED -> physical.externalPageCount();
+            case REUSE_CACHED, REUSE_FREE -> physical.externalPageCount();
             case APPEND_EXISTING -> access.plannedNewPages(false, context.persistentSnapshot(), physical);
         };
         return new UndoWritePlan(context.transactionId(), context.kind(), context.acquisition(), context.firstPageId(),
                 context.globalLastUndoNo(), context.logicalHead(), context.persistentSnapshot(),
-                context.cachedCandidate(), physical, pages,
+                context.cachedCandidate(), context.freeCandidate(), physical, pages,
                 UndoRedoBudgetEstimator.append(context.acquisition(), physical.externalPageCount()));
     }
 
@@ -176,12 +179,16 @@ public final class UndoLogManager {
         UndoNo globalLast = context == null ? UndoNo.NONE : context.lastUndoNo();
         UndoLogBinding binding = context == null ? null : context.binding(kind);
         if (binding == null) {
-            UndoSegmentCacheDirectory.CacheCandidate candidate = cacheDirectory.peek(kind).orElse(null);
-            UndoSegmentAcquisition acquisition = candidate == null
-                    ? UndoSegmentAcquisition.ALLOCATE_NEW : UndoSegmentAcquisition.REUSE_CACHED;
-            PageId firstPage = candidate == null ? null : candidate.segment().handle().firstPageId();
+            UndoSegmentReuseDirectory.CacheCandidate candidate = reuseDirectory.peekCache(kind).orElse(null);
+            UndoSegmentReuseDirectory.FreeCandidate freeCandidate = candidate == null
+                    ? reuseDirectory.peekFree().orElse(null) : null;
+            UndoSegmentAcquisition acquisition = candidate != null ? UndoSegmentAcquisition.REUSE_CACHED
+                    : freeCandidate != null ? UndoSegmentAcquisition.REUSE_FREE
+                    : UndoSegmentAcquisition.ALLOCATE_NEW;
+            PageId firstPage = candidate != null ? candidate.segment().handle().firstPageId()
+                    : freeCandidate == null ? null : freeCandidate.segment().handle().firstPageId();
             return new PlanningContext(txnId, kind, acquisition, firstPage, globalLast,
-                    UndoLogicalHead.EMPTY, null, candidate);
+                    UndoLogicalHead.EMPTY, null, candidate, freeCandidate);
         }
         UndoAppendSnapshot snapshot = binding.appendSnapshot();
         if (snapshot == null || !snapshot.transactionId().equals(txnId)
@@ -191,7 +198,7 @@ public final class UndoLogManager {
             throw new UndoWriteStalePlanException("transaction undo binding lacks a current append snapshot");
         }
         return new PlanningContext(txnId, kind, UndoSegmentAcquisition.APPEND_EXISTING,
-                binding.firstPageId(), globalLast, binding.logicalHead(), snapshot, null);
+                binding.firstPageId(), globalLast, binding.logicalHead(), snapshot, null, null);
     }
 
     private RollPointer appendAllocatedLogPlanned(Transaction txn, MiniTransaction mtr, UndoWritePlan plan) {
@@ -238,7 +245,8 @@ public final class UndoLogManager {
             throw new UndoWriteStalePlanException("cached undo plan is stale because transaction state changed");
         }
         try (RollbackSegmentSlotManager.ClaimLease claim = slotManager.reserveClaim();
-             UndoSegmentCacheDirectory.PopLease cachePop = cacheDirectory.reservePop(plan.cachedCandidate())) {
+             UndoSegmentReuseDirectory.CachePopLease cachePop = reuseDirectory.reserveCachePop(
+                     plan.cachedCandidate())) {
             requirePersistentSlotFree(mtr, claim.slotId());
             UndoSpaceReservation reservation = plan.pagesToReserve() == 0
                     ? null : access.reservePages(mtr, undoSpace, plan.pagesToReserve());
@@ -265,6 +273,57 @@ public final class UndoLogManager {
                     return pointer;
                 } catch (RuntimeException error) {
                     throw fatalAfterMutation("cached undo first write failed after owner transition began", error);
+                }
+            }
+        }
+    }
+
+    /**
+     * 用跨 kind free FIFO 队首开启事务的新 undo log。page3 摘头/slot claim、successor.prev 清空、首页激活和首条
+     * append 同属一个业务 MTR；物理边界后的异常保留 free/slot fence 并转 fatal。
+     */
+    private RollPointer appendFreeLogPlanned(Transaction txn, MiniTransaction mtr, UndoWritePlan plan) {
+        UndoContext current = txn.undoContext();
+        UndoNo currentGlobal = current == null ? UndoNo.NONE : current.lastUndoNo();
+        if (!currentGlobal.equals(plan.expectedGlobalLastUndoNo())
+                || (current != null && current.hasBinding(plan.kind()))) {
+            throw new UndoWriteStalePlanException("free undo plan is stale because transaction state changed");
+        }
+        try (RollbackSegmentSlotManager.ClaimLease claim = slotManager.reserveClaim();
+             UndoSegmentReuseDirectory.FreePopLease freePop = reuseDirectory.reserveFreePop(plan.freeCandidate())) {
+            requirePersistentSlotFree(mtr, claim.slotId());
+            UndoSpaceReservation reservation = plan.pagesToReserve() == 0
+                    ? null : access.reservePages(mtr, undoSpace, plan.pagesToReserve());
+            try (reservation) {
+                claim.physicalMutationStarted();
+                freePop.physicalMutationStarted();
+                try {
+                    var candidate = freePop.candidate();
+                    RollbackSegmentFreeListBase expectedBase = new RollbackSegmentFreeListBase(
+                            Optional.of(candidate.segment().handle().firstPageId()),
+                            Optional.of(candidate.expectedTail().handle().firstPageId()),
+                            candidate.expectedCount());
+                    Optional<PageId> successor = candidate.successor()
+                            .map(item -> item.handle().firstPageId());
+                    headerRepo.moveFreeHeadToActiveSlot(mtr, undoSpace, expectedBase,
+                            candidate.segment().handle().firstPageId(), successor, claim.slotId());
+                    UndoLogSegment segment = access.activateFree(mtr, candidate.segment(), candidate.successor(),
+                            plan.transactionId(), plan.kind());
+                    if (segment.requiredNewPages(plan.recordPlan()) != plan.pagesToReserve()) {
+                        throw new UndoWriteFatalException("free undo segment page requirement differs from plan");
+                    }
+                    RollPointer pointer = segment.appendPlanned(plan.recordPlan());
+                    PageId firstPageId = segment.firstPageId();
+                    claim.bind(firstPageId);
+                    freePop.complete();
+                    UndoContext context = current == null
+                            ? new UndoContext(slotManager.rollbackSegmentId()) : current;
+                    context.attach(new UndoLogBinding(plan.kind(), claim.slotId(), firstPageId,
+                            UndoLogicalHead.EMPTY));
+                    publishContextAfterAppend(txn, context, plan, pointer, segment.appendSnapshot());
+                    return pointer;
+                } catch (RuntimeException error) {
+                    throw fatalAfterMutation("free undo first write failed after owner transition began", error);
                 }
             }
         }
@@ -336,7 +395,8 @@ public final class UndoLogManager {
                                    UndoSegmentAcquisition acquisition,
                                     PageId firstPageId, UndoNo globalLastUndoNo, UndoLogicalHead logicalHead,
                                     UndoAppendSnapshot persistentSnapshot,
-                                    UndoSegmentCacheDirectory.CacheCandidate cachedCandidate) {
+                                    UndoSegmentReuseDirectory.CacheCandidate cachedCandidate,
+                                    UndoSegmentReuseDirectory.FreeCandidate freeCandidate) {
         private UndoNo nextUndoNo() {
             if (globalLastUndoNo.value() == Long.MAX_VALUE) {
                 throw new TransactionStateException("undo number exhausted at Long.MAX_VALUE");
@@ -349,9 +409,9 @@ public final class UndoLogManager {
      * 提交 undo 生命周期（对齐 InnoDB {@code trx_undo_insert_cleanup} / history 挂接思想）。数据流：
      * <ul>
      *   <li>未写事务（{@code undoContext()==null}）：no-op。</li>
-     *   <li>INSERT-only：单 fragment 段尝试进入 INSERT cache，其余 drop；同时写正式 commit 终态。</li>
+     *   <li>INSERT-only：合格单 fragment 段先尝试进入 INSERT cache，未接纳则进入 free FIFO，不合格段 drop；同时写正式 commit 终态。</li>
      *   <li>UPDATE-only：把 UPDATE log 标为 COMMITTED 并挂 history，留给 MVCC/purge。</li>
-     *   <li>mixed：同一 MTR cache/drop INSERT、标记 UPDATE COMMITTED，并只写一次 commit 终态。</li>
+     *   <li>mixed：同一 MTR cache/free/drop INSERT、标记 UPDATE COMMITTED，并只写一次 commit 终态。</li>
      * </ul>
      *
      * <p><b>commit 编排</b>：{@code TransactionManager.commit()} 保持纯内存状态、**不**自动调用本方法；2.1 起

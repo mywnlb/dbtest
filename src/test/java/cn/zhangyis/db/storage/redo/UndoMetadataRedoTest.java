@@ -27,8 +27,8 @@ class UndoMetadataRedoTest {
     private static final PageSize PS = PageSize.ofBytes(16 * 1024);
     private static final SpaceId SPACE = SpaceId.of(9);
     private static final PageId RSEG_PAGE = PageId.of(SPACE, PageNo.of(3));
-    /** rseg page3 v3 slot array 起点：固定头 + cache count + history base/high-water。 */
-    private static final int RSEG_SLOT_0 = 98;
+    /** rseg page3 v4 slot array 起点：固定头 + history base/high-water + free base。 */
+    private static final int RSEG_SLOT_0 = 122;
     /** undo first-page v3 中 logical pair 起点；history links 紧随其后。 */
     private static final int LOGICAL_HEAD_OFFSET = 105;
 
@@ -56,8 +56,14 @@ class UndoMetadataRedoTest {
                 UndoMetadataDeltaKind.fromCode((byte) 8));
         assertEquals(UndoMetadataDeltaKind.UNDO_HISTORY_LINK_FIELD,
                 UndoMetadataDeltaKind.fromCode((byte) 9));
+        assertEquals(10, UndoMetadataDeltaKind.RSEG_FREE_BASE.code());
+        assertEquals(11, UndoMetadataDeltaKind.UNDO_FREE_LINK_FIELD.code());
+        assertEquals(UndoMetadataDeltaKind.RSEG_FREE_BASE,
+                UndoMetadataDeltaKind.fromCode((byte) 10));
+        assertEquals(UndoMetadataDeltaKind.UNDO_FREE_LINK_FIELD,
+                UndoMetadataDeltaKind.fromCode((byte) 11));
         assertThrows(RedoLogCorruptedException.class,
-                () -> UndoMetadataDeltaKind.fromCode((byte) 10));
+                () -> UndoMetadataDeltaKind.fromCode((byte) 12));
     }
 
     @Test

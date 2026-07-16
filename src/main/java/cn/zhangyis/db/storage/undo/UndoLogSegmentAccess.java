@@ -168,6 +168,21 @@ public final class UndoLogSegmentAccess {
     }
 
     /**
+     * recovery/规划辅助：只读验证 page3 free FIFO 节点是空单页 owner，并读取状态复用的 prev/next 链接。
+     * FSP fragment/extent 资格由调用方在独立 MTR 中交叉验证。
+     */
+    public UndoFreeListNodeSnapshot inspectFree(MiniTransaction mtr, PageId firstPageId) {
+        if (mtr == null || firstPageId == null) {
+            throw new DatabaseValidationException("free undo inspection args must not be null");
+        }
+        UndoLogSegment segment = open(mtr, firstPageId, PageLatchMode.SHARED);
+        segment.requireFree();
+        UndoPage page = pageAccess.openUndoPage(mtr, firstPageId, PageLatchMode.SHARED);
+        return new UndoFreeListNodeSnapshot(new FreeUndoSegmentRef(segment.handle()), page.undoKind(),
+                freeLink(firstPageId, page.freePrevPageNo()), freeLink(firstPageId, page.freeNextPageNo()));
+    }
+
+    /**
      * 只读一张 first page 的 history/recovery header，不跟随 LAST_PAGE_NO 打开段尾。该入口用于持久 history 遍历，
      * 保证每个节点都在独立短 MTR 内读取，不把整条跨事务链的 page fix 同时压在 buffer pool 上。
      */
@@ -206,10 +221,25 @@ public final class UndoLogSegmentAccess {
                                   PageId newTailPageId, TransactionId creatorTransactionId,
                                   TransactionNo transactionNo,
                                   List<CachedUndoSegmentRef> cacheResets) {
+        appendHistoryNode(mtr, oldTailPageId, newTailPageId, creatorTransactionId, transactionNo,
+                cacheResets, List.of(), Optional.empty());
+    }
+
+    /**
+     * mixed commit 完整首页批处理：history old/new、cache reset、free old tail/new nodes 一次收集并全局排序。
+     * 页内全部预检完成后才写 history、cache 与 free 链，避免多个局部 helper 各自取得不相容的页序。
+     */
+    public void appendHistoryNode(MiniTransaction mtr, Optional<PageId> oldTailPageId,
+                                  PageId newTailPageId, TransactionId creatorTransactionId,
+                                  TransactionNo transactionNo, List<CachedUndoSegmentRef> cacheResets,
+                                  List<FreeUndoSegmentRef> freeResets,
+                                  Optional<FreeUndoSegmentRef> oldFreeTail) {
         if (mtr == null || oldTailPageId == null || newTailPageId == null
                 || creatorTransactionId == null || creatorTransactionId.isNone()
                 || transactionNo == null || transactionNo.isNone() || cacheResets == null
-                || cacheResets.stream().anyMatch(java.util.Objects::isNull)) {
+                || freeResets == null || oldFreeTail == null
+                || cacheResets.stream().anyMatch(java.util.Objects::isNull)
+                || freeResets.stream().anyMatch(java.util.Objects::isNull)) {
             throw new DatabaseValidationException("undo history append batch arguments are invalid");
         }
         oldTailPageId.ifPresent(old -> requireSameHistorySpace(old, newTailPageId));
@@ -220,6 +250,8 @@ public final class UndoLogSegmentAccess {
         oldTailPageId.ifPresent(pageIds::add);
         pageIds.add(newTailPageId);
         cacheResets.stream().map(item -> item.handle().firstPageId()).forEach(pageIds::add);
+        oldFreeTail.map(item -> item.handle().firstPageId()).ifPresent(pageIds::add);
+        freeResets.stream().map(item -> item.handle().firstPageId()).forEach(pageIds::add);
         if (pageIds.stream().distinct().count() != pageIds.size()) {
             throw new DatabaseValidationException("history append/cache reset first pages must be distinct");
         }
@@ -256,6 +288,7 @@ public final class UndoLogSegmentAccess {
                         + reset.handle().firstPageId());
             }
         }
+        validateFreeAppendTargets(pages, oldFreeTail, freeResets, creatorTransactionId);
         oldTailPageId.ifPresent(old -> pages.get(old).setHistoryNextPageNo(newTailPageId.pageNo().value()));
         newTail.setHistoryLinks(oldTailPageId.map(page -> page.pageNo().value()).orElse(FilePageHeader.FIL_NULL),
                 FilePageHeader.FIL_NULL);
@@ -264,6 +297,40 @@ public final class UndoLogSegmentAccess {
         for (CachedUndoSegmentRef reset : cacheResets) {
             pages.get(reset.handle().firstPageId()).resetForCache(reset.kind(), reset.handle());
         }
+        appendFreeLinks(pages, oldFreeTail, freeResets);
+    }
+
+    /**
+     * rollback/recovery rollback 的普通首页批处理。cache 与 free 目标及旧 free tail 一次按全局 PageId 排序，
+     * 所有目标必须仍是同一 creator 的 ACTIVE 单页 segment。
+     */
+    public void finalizeActiveReusablePages(MiniTransaction mtr, TransactionId creatorTransactionId,
+                                            List<CachedUndoSegmentRef> cacheResets,
+                                            List<FreeUndoSegmentRef> freeResets,
+                                            Optional<FreeUndoSegmentRef> oldFreeTail) {
+        if (mtr == null || creatorTransactionId == null || creatorTransactionId.isNone()
+                || cacheResets == null || freeResets == null || oldFreeTail == null
+                || cacheResets.stream().anyMatch(java.util.Objects::isNull)
+                || freeResets.stream().anyMatch(java.util.Objects::isNull)) {
+            throw new DatabaseValidationException("active undo reusable-page batch arguments are invalid");
+        }
+        List<PageId> ids = new ArrayList<>();
+        cacheResets.stream().map(item -> item.handle().firstPageId()).forEach(ids::add);
+        oldFreeTail.map(item -> item.handle().firstPageId()).ifPresent(ids::add);
+        freeResets.stream().map(item -> item.handle().firstPageId()).forEach(ids::add);
+        if (ids.stream().distinct().count() != ids.size()) {
+            throw new DatabaseValidationException("active reusable-page batch targets must be distinct");
+        }
+        Map<PageId, UndoPage> pages = openFirstPagesSorted(mtr, ids);
+        for (CachedUndoSegmentRef reset : cacheResets) {
+            UndoPage page = pages.get(reset.handle().firstPageId());
+            requireActiveReusablePage(page, reset.handle(), creatorTransactionId, reset.kind());
+        }
+        validateFreeAppendTargets(pages, oldFreeTail, freeResets, creatorTransactionId);
+        for (CachedUndoSegmentRef reset : cacheResets) {
+            pages.get(reset.handle().firstPageId()).resetForCache(reset.kind(), reset.handle());
+        }
+        appendFreeLinks(pages, oldFreeTail, freeResets);
     }
 
     /**
@@ -272,8 +339,16 @@ public final class UndoLogSegmentAccess {
      */
     public void unlinkHistoryHead(MiniTransaction mtr, UndoHistoryNodeSnapshot removed,
                                   Optional<UndoHistoryNodeSnapshot> newHead, boolean cacheRemoved) {
+        unlinkHistoryHead(mtr, removed, newHead, cacheRemoved, false, Optional.empty());
+    }
+
+    /** purge 完整首页批处理：history successor 与 reusable reset/free tail 一次按全局页序获取。 */
+    public void unlinkHistoryHead(MiniTransaction mtr, UndoHistoryNodeSnapshot removed,
+                                  Optional<UndoHistoryNodeSnapshot> newHead, boolean cacheRemoved,
+                                  boolean freeRemoved, Optional<FreeUndoSegmentRef> oldFreeTail) {
         if (mtr == null || removed == null || newHead == null || !removed.isCommitted()
-                || removed.kind() != UndoLogKind.UPDATE) {
+                || removed.kind() != UndoLogKind.UPDATE || oldFreeTail == null
+                || cacheRemoved && freeRemoved || !freeRemoved && oldFreeTail.isPresent()) {
             throw new DatabaseValidationException("undo history unlink batch arguments are invalid");
         }
         if (!removed.previousHistoryPageId().isEmpty()
@@ -291,6 +366,13 @@ public final class UndoLogSegmentAccess {
         newHead.map(UndoHistoryNodeSnapshot::firstPageId).ifPresent(ids::add);
         if (cacheRemoved) {
             ids.add(removed.firstPageId());
+        }
+        if (freeRemoved) {
+            ids.add(removed.firstPageId());
+            oldFreeTail.map(item -> item.handle().firstPageId()).ifPresent(ids::add);
+        }
+        if (ids.stream().distinct().count() != ids.size()) {
+            throw new DatabaseValidationException("purge history/reuse page targets must be distinct");
         }
         Map<PageId, UndoPage> pages = openFirstPagesSorted(mtr, ids);
         newHead.ifPresent(snapshot -> {
@@ -310,6 +392,83 @@ public final class UndoLogSegmentAccess {
                 throw new UndoLogFormatException("removed history node changed before cache reset");
             }
             page.resetForCache(UndoLogKind.UPDATE, removed.handle());
+        }
+        if (freeRemoved) {
+            UndoPage page = pages.get(removed.firstPageId());
+            requireHistoryFirstPage(page, removed.firstPageId());
+            if (page.state() != UndoPageLayout.STATE_COMMITTED
+                    || page.commitNo() != removed.committedTransactionNo().value()) {
+                throw new UndoLogFormatException("removed history node changed before free reset");
+            }
+            validateOldFreeTail(pages, oldFreeTail);
+            long previous = oldFreeTail.map(item -> item.handle().firstPageId().pageNo().value())
+                    .orElse(FilePageHeader.FIL_NULL);
+            oldFreeTail.ifPresent(tail -> pages.get(tail.handle().firstPageId())
+                    .setFreeNextPageNo(removed.firstPageId().pageNo().value()));
+            page.resetForFree(removed.handle(), previous, FilePageHeader.FIL_NULL);
+        }
+    }
+
+    private static void requireActiveReusablePage(UndoPage page, UndoSegmentHandle handle,
+                                                   TransactionId creator, UndoLogKind kind) {
+        requireHistoryFirstPage(page, handle.firstPageId());
+        if (kind == UndoLogKind.TEMPORARY || page.state() != UndoPageLayout.STATE_ACTIVE
+                || page.undoKind() != kind || !page.transactionId().equals(creator)
+                || page.historyPrevPageNo() != FilePageHeader.FIL_NULL
+                || page.historyNextPageNo() != FilePageHeader.FIL_NULL
+                || !handle.firstPageId().equals(handle.lastPageId())) {
+            throw new UndoLogFormatException("active reusable undo first page changed: " + handle.firstPageId());
+        }
+    }
+
+    private static void validateFreeAppendTargets(Map<PageId, UndoPage> pages,
+                                                  Optional<FreeUndoSegmentRef> oldFreeTail,
+                                                  List<FreeUndoSegmentRef> freeResets,
+                                                  TransactionId creator) {
+        validateOldFreeTail(pages, oldFreeTail);
+        for (FreeUndoSegmentRef reset : freeResets) {
+            UndoPage page = pages.get(reset.handle().firstPageId());
+            requireHistoryFirstPage(page, reset.handle().firstPageId());
+            if (page.state() != UndoPageLayout.STATE_ACTIVE || !page.transactionId().equals(creator)
+                    || page.undoKind() == UndoLogKind.TEMPORARY
+                    || page.historyPrevPageNo() != FilePageHeader.FIL_NULL
+                    || page.historyNextPageNo() != FilePageHeader.FIL_NULL
+                    || !reset.handle().firstPageId().equals(reset.handle().lastPageId())) {
+                throw new UndoLogFormatException("free reset target changed: " + reset.handle().firstPageId());
+            }
+        }
+    }
+
+    private static void validateOldFreeTail(Map<PageId, UndoPage> pages,
+                                            Optional<FreeUndoSegmentRef> oldFreeTail) {
+        oldFreeTail.ifPresent(ref -> {
+            UndoPage page = pages.get(ref.handle().firstPageId());
+            requireHistoryFirstPage(page, ref.handle().firstPageId());
+            page.requireFreeEmpty(ref.handle());
+            if (page.freeNextPageNo() != FilePageHeader.FIL_NULL) {
+                throw new UndoLogFormatException("old free tail is not terminal: " + page.pageId());
+            }
+        });
+    }
+
+    private static void appendFreeLinks(Map<PageId, UndoPage> pages,
+                                        Optional<FreeUndoSegmentRef> oldFreeTail,
+                                        List<FreeUndoSegmentRef> freeResets) {
+        if (freeResets.isEmpty()) {
+            return;
+        }
+        PageId first = freeResets.getFirst().handle().firstPageId();
+        oldFreeTail.ifPresent(ref -> pages.get(ref.handle().firstPageId())
+                .setFreeNextPageNo(first.pageNo().value()));
+        for (int i = 0; i < freeResets.size(); i++) {
+            FreeUndoSegmentRef reset = freeResets.get(i);
+            long previous = i == 0
+                    ? oldFreeTail.map(item -> item.handle().firstPageId().pageNo().value())
+                    .orElse(FilePageHeader.FIL_NULL)
+                    : freeResets.get(i - 1).handle().firstPageId().pageNo().value();
+            long next = i + 1 == freeResets.size() ? FilePageHeader.FIL_NULL
+                    : freeResets.get(i + 1).handle().firstPageId().pageNo().value();
+            pages.get(reset.handle().firstPageId()).resetForFree(reset.handle(), previous, next);
         }
     }
 
@@ -340,6 +499,16 @@ public final class UndoLogSegmentAccess {
         return Optional.of(PageId.of(owner.spaceId(), PageNo.of(linkedPageNo)));
     }
 
+    private static Optional<PageId> freeLink(PageId owner, long linkedPageNo) {
+        if (linkedPageNo == FilePageHeader.FIL_NULL) {
+            return Optional.empty();
+        }
+        if (linkedPageNo < 0 || linkedPageNo > FilePageHeader.FIL_NULL) {
+            throw new UndoLogFormatException("invalid undo free link on " + owner + ": " + linkedPageNo);
+        }
+        return Optional.of(PageId.of(owner.spaceId(), PageNo.of(linkedPageNo)));
+    }
+
     private static void requireSameHistorySpace(PageId left, PageId right) {
         if (!left.spaceId().equals(right.spaceId())) {
             throw new DatabaseValidationException("undo history links cannot cross tablespaces");
@@ -362,6 +531,69 @@ public final class UndoLogSegmentAccess {
         segment.requireCached(cached.kind());
         segment.activateCached(transactionId, cached.kind());
         return segment;
+    }
+
+    /**
+     * 复用 free head：一次收集 candidate 与可选 successor，按全局 PageId 升序持 X latch；先验证冻结的链关系，
+     * 再清 successor.prev 并把 candidate 以新事务/kind 激活。page3 base 已由同一 MTR 的调用方先 CAS。
+     */
+    public UndoLogSegment activateFree(MiniTransaction mtr, FreeUndoSegmentRef candidate,
+                                       Optional<FreeUndoSegmentRef> successor,
+                                       TransactionId transactionId, UndoLogKind kind) {
+        if (mtr == null || candidate == null || successor == null || transactionId == null
+                || transactionId.isNone() || kind == null || kind == UndoLogKind.TEMPORARY) {
+            throw new DatabaseValidationException("free undo activation args are invalid");
+        }
+        List<PageId> ids = new ArrayList<>();
+        ids.add(candidate.handle().firstPageId());
+        successor.map(item -> item.handle().firstPageId()).ifPresent(ids::add);
+        if (ids.stream().distinct().count() != ids.size()) {
+            throw new DatabaseValidationException("free undo head cannot be its own successor");
+        }
+        Map<PageId, UndoPage> pages = openFirstPagesSorted(mtr, ids);
+        UndoPage head = pages.get(candidate.handle().firstPageId());
+        requireHistoryFirstPage(head, candidate.handle().firstPageId());
+        if (!head.segmentId().equals(candidate.handle().segmentId())
+                || head.inodeSlot() != candidate.handle().inodeSlot()) {
+            throw new UndoLogFormatException("free undo handle changed before activation: "
+                    + candidate.handle().firstPageId());
+        }
+        head.requireFreeEmpty(candidate.handle());
+        Optional<PageId> expectedSuccessor = successor.map(item -> item.handle().firstPageId());
+        if (head.freePrevPageNo() != FilePageHeader.FIL_NULL
+                || !freeLink(head.pageId(), head.freeNextPageNo()).equals(expectedSuccessor)) {
+            throw new UndoLogFormatException("free undo head links changed before activation: " + head.pageId());
+        }
+        successor.ifPresent(ref -> {
+            UndoPage next = pages.get(ref.handle().firstPageId());
+            requireHistoryFirstPage(next, ref.handle().firstPageId());
+            next.requireFreeEmpty(ref.handle());
+            if (next.freePrevPageNo() != head.pageId().pageNo().value()) {
+                throw new UndoLogFormatException("free undo successor does not point back to head: " + next.pageId());
+            }
+            next.setFreePrevPageNo(FilePageHeader.FIL_NULL);
+        });
+        head.activateFree(kind, transactionId, candidate.handle());
+        return new UndoLogSegment(mtr, pageSize, allocator, codec, pageAccess, payloadStorage,
+                storedRecordResolver, maxExternalPages, candidate.handle(), head, head, PageLatchMode.EXCLUSIVE);
+    }
+
+    /** truncate 摘除若干 free heads 后校验剩余新 head 的旧前驱并清空 prev。 */
+    public void relinkFreeHeadAfterDrain(MiniTransaction mtr, FreeUndoSegmentRef remainingHead,
+                                         PageId expectedRemovedPredecessor) {
+        if (mtr == null || remainingHead == null || expectedRemovedPredecessor == null) {
+            throw new DatabaseValidationException("free drain relink args must not be null");
+        }
+        UndoLogSegment segment = open(mtr, remainingHead.handle().firstPageId(), PageLatchMode.EXCLUSIVE);
+        if (!segment.handle().equals(remainingHead.handle())) {
+            throw new UndoLogFormatException("remaining free head handle changed before drain relink");
+        }
+        segment.requireFree();
+        UndoPage page = pageAccess.openUndoPage(mtr, remainingHead.handle().firstPageId(), PageLatchMode.EXCLUSIVE);
+        if (page.freePrevPageNo() != expectedRemovedPredecessor.pageNo().value()) {
+            throw new UndoLogFormatException("remaining free head predecessor changed before drain relink");
+        }
+        page.setFreePrevPageNo(FilePageHeader.FIL_NULL);
     }
 
     /**

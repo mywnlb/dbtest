@@ -17,7 +17,7 @@ import java.util.Set;
  * {@link StorageEngine} 启动配置（E1/E2/E3a）。固定文件布局在 {@code baseDir} 下：redo 日志 {@code redo.log}、
  * redo control（checkpoint label）{@code redo-control}、事务恢复高水位 sidecar
  * {@code transaction-recovery-control}、系统 undo 表空间 {@code undo_<undoSpaceId>.ibu}；
- * 数据表空间文件路径由调用方建/开（本片无 data dictionary）。
+ * 数据表空间文件路径由调用方建/开；公共 {@code DatabaseEngine} 组合根会先从 DD 发现并填入该列表。
  *
  * @param baseDir                  引擎数据目录（redo/control/undo 文件所在）。
  * @param pageSize                 实例页大小。
@@ -28,7 +28,7 @@ import java.util.Set;
  * @param maxVersionHops           MVCC 版本链最大跳数（{@code MvccReader} 防环）。
  * @param flushTimeout             {@code FlushService.flushThrough} 的等待超时。
  * @param redoCapacityBytes        redo 容量策略字节数（{@code RedoCapacityPolicy.fixed}）。
- * @param recoveryTablespaces      E2 启动恢复期显式打开的数据表空间；无 DD discovery 前只能恢复这些空间。
+ * @param recoveryTablespaces      E2 启动恢复期打开的数据表空间；可由低层调用方显式给出，也可由公共组合根从 DD 发现。
  * @param backgroundFlushEnabled   E3a 是否在 open 成功后启动后台 page cleaner；禁用仅用于定向测试或故障隔离。
  * @param pageCleanerQueueCapacity 显式 flush 请求队列容量，防止后台线程停滞时无限积压。
  * @param backgroundFlushInterval  后台 page cleaner 空闲 tick 间隔；tick 会评估 redo capacity 并尝试推进 checkpoint。
@@ -323,6 +323,19 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, bufferPoolInstanceCount, mode,
                 forceSkippedSpaces, maxExternalUndoPayloadPages, undoCachedSegmentsPerKind,
+                undoHistoryTransitionTimeout);
+    }
+
+    /**
+     * 派生由 DD discovery 计算出的 existing-open 表空间集合；调用方无需重建二十余个无关配置字段。
+     * fresh open 也允许携带空集合，真正的 fresh/existing 判定仍由 {@link StorageEngine} 根据 redo/undo 文件完成。
+     */
+    public EngineConfig withRecoveryTablespaces(List<EngineTablespaceConfig> tablespaces) {
+        return new EngineConfig(baseDir, pageSize, bufferPoolCapacityFrames, undoSpaceId, undoSpaceInitialPages,
+                slotCapacity, maxVersionHops, flushTimeout, redoCapacityBytes, tablespaces,
+                backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
+                backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, bufferPoolInstanceCount,
+                recoveryMode, forceSkippedSpaces, maxExternalUndoPayloadPages, undoCachedSegmentsPerKind,
                 undoHistoryTransitionTimeout);
     }
 

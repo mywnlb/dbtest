@@ -130,13 +130,14 @@ public final class PageZeroTablespaceMetadataLoader implements TablespaceMetadat
     }
 
     /**
-     * 根据表空间类型校验 page0 lifecycle 状态。GENERAL 只接受稳定 NORMAL/CORRUPTED；UNDO 只接受 ACTIVE/
+     * 根据表空间类型校验 page0 lifecycle 状态。GENERAL 只接受稳定 NORMAL/DISCARDED/CORRUPTED；UNDO 只接受 ACTIVE/
      * INACTIVE/TRUNCATING；其它类型首版不支持 lifecycle marker。这样避免把一个模块的生命周期协议误解释成另一个模块的状态。
      */
     private void validateLifecycleState(SpaceId spaceId, TablespaceType type,
                                         TablespaceState state, boolean lifecyclePresent) {
         if (type == TablespaceType.GENERAL) {
-            if (state != TablespaceState.NORMAL && state != TablespaceState.CORRUPTED) {
+            if (state != TablespaceState.NORMAL && state != TablespaceState.DISCARDED
+                    && state != TablespaceState.CORRUPTED) {
                 throw new DatabaseValidationException("invalid GENERAL lifecycle state for space "
                         + spaceId.value() + ": " + state);
             }

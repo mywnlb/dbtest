@@ -62,7 +62,7 @@ import cn.zhangyis.db.storage.trx.TransactionManager;
 import cn.zhangyis.db.storage.trx.TransactionOptions;
 import cn.zhangyis.db.storage.trx.TransactionSystem;
 import cn.zhangyis.db.storage.trx.UndoLogManager;
-import cn.zhangyis.db.storage.trx.UndoSegmentCacheDirectory;
+import cn.zhangyis.db.storage.trx.UndoSegmentReuseDirectory;
 import cn.zhangyis.db.storage.trx.UndoSegmentFinalizer;
 import cn.zhangyis.db.storage.undo.RollbackSegmentHeaderRepository;
 import cn.zhangyis.db.storage.undo.RollbackSegmentHeaderSnapshot;
@@ -87,7 +87,7 @@ class UndoTablespaceTruncationServiceTest {
     private static final PageSize PS = PageSize.ofBytes(16 * 1024);
     private static final SpaceId SPACE = SpaceId.of(90);
     private static final RollbackSegmentId RSEG = RollbackSegmentId.of(0);
-    private static final int SLOT_CAPACITY = 8;
+    private static final int SLOT_CAPACITY = 16;
     private static final int CACHE_CAPACITY_PER_KIND = 8;
 
     @TempDir
@@ -391,6 +391,30 @@ class UndoTablespaceTruncationServiceTest {
         }
     }
 
+    /** mixed cache/free owners 必须跨多个最多八段的批次全部 drain，marker 后重建 page3 v4 空 owner。 */
+    @Test
+    void truncateDrainsCacheAndFreeOwnersAcrossBatches() {
+        try (Fixture fixture = new Fixture(dir.resolve("reuse-drain"))) {
+            fixture.growUndoSpace();
+            List<Transaction> owners = new java.util.ArrayList<>();
+            for (int i = 0; i < CACHE_CAPACITY_PER_KIND + 2; i++) {
+                owners.add(fixture.undo.appendActiveInsert(100 + i));
+            }
+            owners.forEach(fixture.undo::commit);
+            RollbackSegmentHeaderSnapshot before = fixture.undo.snapshot();
+            assertEquals(CACHE_CAPACITY_PER_KIND, before.cachedInsertSegments().size());
+            assertEquals(2L, before.freeListBase().length());
+
+            fixture.service(UndoTruncationFaultInjector.none()).truncate(SPACE, TablespaceState.ACTIVE);
+
+            RollbackSegmentHeaderSnapshot rebuilt = fixture.undo.snapshot();
+            assertTrue(rebuilt.cachedInsertSegments().isEmpty());
+            assertEquals(0L, rebuilt.freeListBase().length());
+            assertEquals(0, fixture.undo.cache().freeCount());
+            assertEquals(PageNo.of(64), fixture.store.currentSizeInPages(SPACE));
+        }
+    }
+
     @Test
     void activeSlotRejectsTruncateBeforeExistingCacheIsDropped() {
         try (Fixture fixture = new Fixture(dir.resolve("active-before-cache"))) {
@@ -467,7 +491,7 @@ class UndoTablespaceTruncationServiceTest {
         UndoLogSegmentAccess access = new UndoLogSegmentAccess(
                 pool, PS, allocator, new TypeCodecRegistry(), registry);
         RollbackSegmentHeaderRepository header = new RollbackSegmentHeaderRepository(pool, PS);
-        UndoSegmentCacheDirectory cache = new UndoSegmentCacheDirectory(CACHE_CAPACITY_PER_KIND);
+        UndoSegmentReuseDirectory cache = new UndoSegmentReuseDirectory(CACHE_CAPACITY_PER_KIND);
         RollbackSegmentSlotManager slots = new RollbackSegmentSlotManager(RSEG, SLOT_CAPACITY);
         UndoSegmentFinalizer finalizer = new UndoSegmentFinalizer(
                 manager, access, allocator, header, slots, cache);
@@ -476,18 +500,18 @@ class UndoTablespaceTruncationServiceTest {
                 access, slots, SPACE, history, header, finalizer, cache);
         TransactionManager transactions = new TransactionManager(new TransactionSystem());
         return new TruncationUndoComponents(header, cache, manager, allocator, access, undoManager, transactions,
-                new UndoCachedSegmentTruncationCoordinator(manager, access, allocator, header, RSEG,
+                new UndoReusableSegmentTruncationCoordinator(manager, access, allocator, header, RSEG,
                         SLOT_CAPACITY, CACHE_CAPACITY_PER_KIND, cache));
     }
 
     private record TruncationUndoComponents(RollbackSegmentHeaderRepository header,
-                                            UndoSegmentCacheDirectory cache,
+                                            UndoSegmentReuseDirectory cache,
                                             MiniTransactionManager manager,
                                             DiskSpaceUndoAllocator allocator,
                                             UndoLogSegmentAccess access,
                                             UndoLogManager undoManager,
                                             TransactionManager transactions,
-                                            UndoCachedSegmentTruncationCoordinator coordinator) {
+                                            UndoReusableSegmentTruncationCoordinator coordinator) {
         void format(MiniTransaction mtr, SpaceId spaceId) {
             header.format(mtr, spaceId, RSEG, SLOT_CAPACITY, CACHE_CAPACITY_PER_KIND);
         }

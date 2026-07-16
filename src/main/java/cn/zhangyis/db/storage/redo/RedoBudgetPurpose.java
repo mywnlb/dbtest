@@ -35,6 +35,10 @@ public enum RedoBudgetPurpose {
     LOB_WRITE,
     /** 校验并释放一条 off-page LOB 页链。 */
     LOB_FREE,
+    /** CREATE TABLE 初始化 GENERAL/FSP、index segment 与 root；上界随索引数动态计算。 */
+    DDL_TABLE_CREATE,
+    /** DROP TABLE 写 page0 DISCARDED lifecycle marker。 */
+    DDL_TABLE_DROP,
     /** 仅供 no-op manager 的页原语测试；生产 capacity-aware manager 禁止隐式使用。 */
     TEST_UNBOUNDED
 }

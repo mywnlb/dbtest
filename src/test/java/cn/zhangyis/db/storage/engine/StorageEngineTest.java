@@ -784,11 +784,53 @@ class StorageEngineTest {
         e2.close();
     }
 
+    /** page3 v4 的 free FIFO 必须跨重启恢复，并允许最近 kind=INSERT 的节点为 UPDATE 首写重新分类。 */
+    @Test
+    void persistentFreeUndoSegmentIsRecoveredAndReusedAcrossKinds() {
+        EngineConfig cfg = config().withUndoCachedSegmentsPerKind(0);
+        StorageEngine first = new StorageEngine(cfg);
+        first.open();
+        Transaction owner = first.transactionManager().begin(TransactionOptions.defaults());
+        first.transactionManager().assignWriteId(owner);
+        UndoWritePlan initial = first.undoLogManager().planInsert(owner, TABLE_ID, INDEX_ID,
+                List.of(new ColumnValue.IntValue(81)), idKey(), clusteredSchema());
+        MiniTransaction write = first.miniTransactionManager().begin(
+                first.miniTransactionManager().budgetFor(RedoBudgetPurpose.CLUSTERED_INSERT,
+                        initial.redoWorkload()));
+        first.undoLogManager().appendPlanned(owner, write, initial);
+        first.miniTransactionManager().commit(write);
+        PageId freeFirstPage = owner.undoContext().binding(UndoLogKind.INSERT).firstPageId();
+        first.transactionManager().prepareCommit(owner);
+        first.undoLogManager().onCommit(owner);
+        first.transactionManager().commit(owner);
+        first.checkpoint();
+        first.close();
+
+        StorageEngine reopened = new StorageEngine(cfg);
+        reopened.open();
+        Transaction update = reopened.transactionManager().begin(TransactionOptions.defaults());
+        reopened.transactionManager().assignWriteId(update);
+        UndoWritePlan reuse = reopened.undoLogManager().planUpdate(update, TABLE_ID, INDEX_ID,
+                List.of(new ColumnValue.IntValue(81)), List.of(new ColumnValue.IntValue(81)),
+                new HiddenColumns(update.transactionId(), RollPointer.NULL), idKey(), clusteredSchema());
+        assertEquals(UndoSegmentAcquisition.REUSE_FREE, reuse.acquisition());
+        MiniTransaction reuseMtr = reopened.miniTransactionManager().begin(
+                reopened.miniTransactionManager().budgetFor(RedoBudgetPurpose.CLUSTERED_UPDATE,
+                        reuse.redoWorkload()));
+        reopened.undoLogManager().appendPlanned(update, reuseMtr, reuse);
+        reopened.miniTransactionManager().commit(reuseMtr);
+        assertEquals(freeFirstPage, update.undoContext().binding(UndoLogKind.UPDATE).firstPageId());
+        reopened.transactionManager().prepareCommit(update);
+        reopened.undoLogManager().onCommit(update);
+        reopened.transactionManager().commit(update);
+        reopened.close();
+    }
+
     // ---- R 1.2：恢复期回滚未提交事务 ----
 
     /**
      * money test：同一 active 事务插三行（写 undo + insertClustered）→ 不 commit → checkpoint → close → 重开（注入
-     * recoveryRollbackIndex）→ 恢复逐条回滚到 EMPTY 并原子 cache/drop、转移 page3 owner；再次重启不得再发现 active slot、重复 inverse
+     * recoveryRollbackIndex）→ 恢复逐条回滚到 EMPTY 并原子 cache/free/drop、转移 page3 owner；再次重启不得再发现 active slot、重复 inverse
      * 或复活数据。
      */
     @Test
@@ -898,7 +940,7 @@ class StorageEngineTest {
         e2.close();
     }
 
-    /** 对照：committed insert 的 onCommit 原子 cache/drop undo owner，重启后数据保留且不会被恢复误删。 */
+    /** 对照：committed insert 的 onCommit 原子 cache/free/drop undo owner，重启后数据保留且不会被恢复误删。 */
     @Test
     void recoveryPreservesCommittedInsertOnRestart() {
         Path dataPath = dir.resolve("data-keep.ibd");

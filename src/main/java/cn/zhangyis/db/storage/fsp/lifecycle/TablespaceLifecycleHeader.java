@@ -8,7 +8,7 @@ import cn.zhangyis.db.storage.fil.state.TablespaceState;
  * page-0 保留区中的表空间生命周期快照。
  *
  * <p>该 marker 同时覆盖 GENERAL 的稳定生命周期和 UNDO truncate 生命周期。GENERAL 仅允许
- * {@link TablespaceState#NORMAL}/{@link TablespaceState#CORRUPTED}，其 {@code truncateEpoch=0}、
+ * {@link TablespaceState#NORMAL}/{@link TablespaceState#DISCARDED}/{@link TablespaceState#CORRUPTED}，其 {@code truncateEpoch=0}、
  * {@code targetSizeInPages=initialSizeInPages}、{@code finishState=NORMAL}，只表达可用/损坏状态。
  * UNDO 则继续使用 ACTIVE/INACTIVE/TRUNCATING 表达可恢复截断流程。旧表空间没有该头时由仓储返回空值明确区分。
  *
@@ -38,7 +38,8 @@ public record TablespaceLifecycleHeader(
         if (truncateEpoch < 0) {
             throw new DatabaseValidationException("truncate epoch must not be negative: " + truncateEpoch);
         }
-        boolean stableGeneralState = state == TablespaceState.NORMAL || state == TablespaceState.CORRUPTED;
+        boolean stableGeneralState = state == TablespaceState.NORMAL || state == TablespaceState.DISCARDED
+                || state == TablespaceState.CORRUPTED;
         boolean undoLifecycleState = state == TablespaceState.ACTIVE
                 || state == TablespaceState.INACTIVE
                 || state == TablespaceState.TRUNCATING;

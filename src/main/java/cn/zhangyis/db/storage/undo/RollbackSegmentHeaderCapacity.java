@@ -5,7 +5,7 @@ import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.storage.page.PageEnvelopeLayout;
 
 /**
- * rollback segment page3 v3 定长目录的容量校验器。配置层与 repository 共用同一公式，避免一处接受的
+ * rollback segment page3 v4 定长目录的容量校验器。配置层与 repository 共用同一公式，避免一处接受的
  * slot/cache 组合在真正格式化 page3 时才发现越过 trailer。
  */
 public final class RollbackSegmentHeaderCapacity {

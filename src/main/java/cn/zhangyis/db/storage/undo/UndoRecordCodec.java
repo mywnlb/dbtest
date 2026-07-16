@@ -162,6 +162,24 @@ public final class UndoRecordCodec {
                 oldRow, oldHidden, prev);
     }
 
+    /**
+     * 只读取固定 33B 前缀中的 type/undoNo/trxId/tableId/indexId，不触碰依赖 schema 的 key/old-image。
+     * 截断或未知类型按磁盘格式损坏处理，禁止调用方猜测默认索引继续解码。
+     */
+    public UndoRecordIdentity peekIdentity(byte[] buf, int off) {
+        if (buf == null || off < 0) {
+            throw new DatabaseValidationException("undo identity buffer/offset invalid");
+        }
+        int[] cursor = {off};
+        int typeCode = readU8(buf, cursor);
+        if (typeCode != UndoRecordType.INSERT_ROW.code() && typeCode != UndoRecordType.UPDATE_ROW.code()
+                && typeCode != UndoRecordType.DELETE_MARK.code()) {
+            throw new UndoLogFormatException("unknown undo record type in identity prefix: " + typeCode);
+        }
+        return new UndoRecordIdentity(UndoRecordType.fromCode(typeCode), UndoNo.of(readU64(buf, cursor)),
+                TransactionId.of(readU64(buf, cursor)), readU64(buf, cursor), readU64(buf, cursor));
+    }
+
     /** record 槽长度是物理 framing 的权威边界；尾随字节不能被静默忽略，否则损坏 descriptor 可藏在合法前缀后。 */
     private static void requireFullyConsumed(byte[] buf, int cursor) {
         if (cursor != buf.length) {

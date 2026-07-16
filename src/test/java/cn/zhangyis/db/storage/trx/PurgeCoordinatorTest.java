@@ -63,6 +63,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -109,6 +110,35 @@ class PurgeCoordinatorTest {
             MiniTransaction r = ctx.mgr.begin();
             assertTrue(ctx.svc.lookupIncludingDeleted(r, index, search(1)).isEmpty(), "row gone after purge");
             ctx.mgr.commit(r);
+        });
+    }
+
+    /** DD 模式的 purge 必须使用 DELETE_MARK undo 里的真实 table/index identity，不能暗中回退全局单索引。 */
+    @Test
+    void purgeResolvesIndexFromDeleteUndoIdentity() {
+        onPool(false, ctx -> {
+            ctx.boot();
+            BTreeIndex index = ctx.clusteredIndex();
+            Transaction creator = ctx.beginRw();
+            ctx.insert(index, creator, 1);
+            ctx.commit(creator);
+            Transaction deleting = ctx.beginRw();
+            ctx.deleteMark(index, deleting, 1);
+            ctx.commit(deleting);
+            AtomicLong resolvedTable = new AtomicLong();
+            AtomicLong resolvedIndex = new AtomicLong();
+            ctx.purge = new PurgeCoordinator(ctx.mgr, ctx.txnMgr.system(), ctx.history, ctx.undoAccess,
+                    ctx.finalization.finalizer(), ctx.svc, (tableId, indexId) -> {
+                        resolvedTable.set(tableId);
+                        resolvedIndex.set(indexId);
+                        return index;
+                    });
+
+            PurgeSummary summary = ctx.purge.runBatch(10);
+
+            assertEquals(1, summary.removedRecords());
+            assertEquals(TABLE_ID, resolvedTable.get());
+            assertEquals(INDEX_ID, resolvedIndex.get());
         });
     }
 
@@ -273,6 +303,7 @@ class PurgeCoordinatorTest {
             BTreeIndex index = ctx.clusteredIndex();
             Transaction txn = ctx.beginRw();
             ctx.insert(index, txn, 1);
+            ctx.makeUndoSegmentIneligible(txn, UndoLogKind.INSERT);
 
             assertThrows(UndoFinalizationException.class, () -> ctx.commit(txn));
 
@@ -287,10 +318,12 @@ class PurgeCoordinatorTest {
         onPool(2, ctx -> { // mixed commit 的第 1 次 drop 成功，purge 的第 2 次 drop 注入失败
             ctx.boot();
             BTreeIndex index = ctx.clusteredIndex();
-            // 单事务 insert+delete-mark → 提交为含 delete undo 的 committed log（无独立 insert-reclaim）
+            // 两类 inode 都额外占一张 fragment 页，保留“commit drop 成功、purge drop 失败”的物理边界注入。
             Transaction t1 = ctx.beginRw();
             ctx.insert(index, t1, 1);
             ctx.deleteMark(index, t1, 1);
+            ctx.makeUndoSegmentIneligible(t1, UndoLogKind.INSERT);
+            ctx.makeUndoSegmentIneligible(t1, UndoLogKind.UPDATE);
             ctx.commit(t1);
             assertEquals(1, ctx.history.committedSize());
 
@@ -611,6 +644,20 @@ class PurgeCoordinatorTest {
                     oldHidden.dbTrxId(), oldHidden.dbRollPtr());
             mgr.commit(m);
             return newRp;
+        }
+
+        /**
+         * 测试专用：在不改变逻辑 undo 链的前提下给 inode 增加一张 fragment 页，使 segment 不满足 v1 cache/free
+         * 单页资格；最终 drop 仍须回收该页，便于精确注入 FSP 失败边界。
+         */
+        private void makeUndoSegmentIneligible(Transaction txn, UndoLogKind kind) {
+            PageId firstPage = txn.undoContext().binding(kind).firstPageId();
+            MiniTransaction read = mgr.beginReadOnly();
+            var handle = undoAccess.open(read, firstPage, PageLatchMode.SHARED).handle();
+            mgr.commit(read);
+            MiniTransaction allocate = mgr.begin();
+            undoAllocator.allocatePage(allocate, handle.spaceId(), handle.inodeSlot(), handle.segmentId());
+            mgr.commit(allocate);
         }
 
         /** 只破坏已被持久 logical head 摘除的槽，验证 purge 不再读取无效物理分支。 */

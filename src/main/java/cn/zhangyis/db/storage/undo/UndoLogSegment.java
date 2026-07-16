@@ -338,8 +338,13 @@ public final class UndoLogSegment {
         return firstPage.state() == UndoPageLayout.STATE_CACHED;
     }
 
+    /** 是否由 page3 free FIFO 持久拥有、当前没有事务 owner。 */
+    public boolean isFree() {
+        return firstPage.state() == UndoPageLayout.STATE_FREE;
+    }
+
     /**
-     * finalization 在 page3 active→cache transition 的同一 MTR 内重置首页。调用方必须已由 FSP drop plan
+     * finalization 在 page3 active→cache/free transition 的同一 MTR 内重置首页。调用方必须已由 FSP drop plan
      * 证明该 segment 只占一个 fragment 页；本方法再校验页链与 kind，避免把外部 payload/chain 残留伪装成缓存。
      */
     public void resetForCache() {
@@ -360,6 +365,27 @@ public final class UndoLogSegment {
             throw new DatabaseValidationException("cache activation requires an EXCLUSIVE undo segment session");
         }
         firstPage.activateCached(expectedKind, transactionId, handle);
+    }
+
+    /** finalization 在 active→free owner transition 的同一 MTR 内重置首页及 free 链接。 */
+    public void resetForFree(long previousFreePageNo, long nextFreePageNo) {
+        if (mode != PageLatchMode.EXCLUSIVE) {
+            throw new DatabaseValidationException("free reset requires an EXCLUSIVE undo segment session");
+        }
+        firstPage.resetForFree(handle, previousFreePageNo, nextFreePageNo);
+    }
+
+    /** 校验 shared/exclusive 会话观察到的是空 FREE 单页 segment。 */
+    public void requireFree() {
+        firstPage.requireFreeEmpty(handle);
+    }
+
+    /** 用新事务和 kind 激活已校验的 FREE segment。 */
+    public void activateFree(TransactionId transactionId, UndoLogKind kind) {
+        if (mode != PageLatchMode.EXCLUSIVE) {
+            throw new DatabaseValidationException("free activation requires an EXCLUSIVE undo segment session");
+        }
+        firstPage.activateFree(kind, transactionId, handle);
     }
 
     /** 提交序号（R 1.3）；仅 COMMITTED 段有意义，恢复重建 history 用。 */
@@ -392,6 +418,29 @@ public final class UndoLogSegment {
         UndoLogSegmentAccess.requireRecordKind(page.undoKind(), record.type(), "undo segment read");
         requirePointerMatchesRecord(rp, record, keyDef);
         return record;
+    }
+
+    /**
+     * 不依赖 schema 读取一条 record 的 table/index identity。与 {@link #readRecord} 共用 pointer/segment/kind
+     * 校验和 inline/external materialization，供多表 rollback/purge 先解析元数据再完整解码。
+     */
+    public UndoRecordIdentity readRecordIdentity(RollPointer rp) {
+        if (rp == null) {
+            throw new DatabaseValidationException("undo identity roll pointer must not be null");
+        }
+        if (rp.isNull()) {
+            throw new UndoLogFormatException("cannot read undo identity from NULL roll pointer");
+        }
+        UndoPage page = resolvePage(rp.pageNo());
+        requireSameSegment(page, "identity roll pointer page " + rp.pageNo());
+        requireSameKind(page, "identity roll pointer page " + rp.pageNo());
+        UndoRecordIdentity identity = storedRecordResolver.identity(mtr, handle.spaceId(), segmentIdentity(page),
+                page.recordAt(rp.offset()));
+        UndoLogSegmentAccess.requireRecordKind(page.undoKind(), identity.type(), "undo identity read");
+        if (rp.insert() != (identity.type() == UndoRecordType.INSERT_ROW)) {
+            throw new UndoLogFormatException("roll pointer kind does not match undo identity type");
+        }
+        return identity;
     }
 
     /**

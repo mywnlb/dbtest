@@ -50,7 +50,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * cached undo segment 生产链协作测试：终结时 active→cache、LIFO 首写复用、容量满降级 drop，以及多页段拒绝缓存。
+ * undo segment reuse 生产链协作测试：终结时 active→cache/free、cache LIFO 与 free FIFO 复用，以及多页段拒绝复用。
  */
 class UndoSegmentCacheIntegrationTest {
 
@@ -210,7 +210,7 @@ class UndoSegmentCacheIntegrationTest {
     }
 
     @Test
-    void fullCacheKeepsExistingTopAndDropsNewlyFinalizedSegment() {
+    void fullCacheKeepsExistingTopAndMovesNewlyFinalizedSegmentToFreeFifo() {
         withHarness(1, h -> {
             Transaction first = h.newWriter();
             Transaction second = h.newWriter();
@@ -222,17 +222,18 @@ class UndoSegmentCacheIntegrationTest {
             h.commit(second);
 
             assertEquals(List.of(firstPage), h.snapshot().cachedInsertSegments(),
-                    "容量满时保留已有 top，新终结段直接走 drop，不替换缓存");
+                    "容量满时保留已有 top，新终结段进入跨 kind free FIFO");
+            assertEquals(java.util.Optional.of(secondHandle.firstPageId()),
+                    h.snapshot().freeListBase().headPageId());
             MiniTransaction inspect = h.mtrManager.beginReadOnly();
-            assertThrows(DatabaseRuntimeException.class,
-                    () -> h.allocator.inspectDropPlan(inspect, secondHandle),
-                    "被降级 drop 的 inode 不得继续可定位");
-            h.mtrManager.rollbackUncommitted(inspect);
+            assertEquals(1L, h.allocator.inspectDropPlan(inspect, secondHandle).usedPageCount(),
+                    "free owner 必须继续保留可复用的 FSP inode");
+            h.mtrManager.commit(inspect);
         });
     }
 
     @Test
-    void zeroCapacityDisablesCachingAndPreservesDropSemantics() {
+    void zeroCacheCapacityStillRetainsEligibleSegmentInFreeFifo() {
         withHarness(0, h -> {
             Transaction transaction = h.newWriter();
             h.appendInsert(transaction, 20);
@@ -241,10 +242,40 @@ class UndoSegmentCacheIntegrationTest {
             h.commit(transaction);
 
             assertTrue(h.snapshot().cachedInsertSegments().isEmpty());
+            assertEquals(java.util.Optional.of(handle.firstPageId()), h.snapshot().freeListBase().headPageId());
             MiniTransaction inspect = h.mtrManager.beginReadOnly();
-            assertThrows(DatabaseRuntimeException.class,
-                    () -> h.allocator.inspectDropPlan(inspect, handle));
-            h.mtrManager.rollbackUncommitted(inspect);
+            assertEquals(1L, h.allocator.inspectDropPlan(inspect, handle).usedPageCount());
+            h.mtrManager.commit(inspect);
+        });
+    }
+
+    /** 同 kind cache 优先保留；目标 kind 无 cache 时，free head 可跨 INSERT→UPDATE 重新分类并保持 FIFO。 */
+    @Test
+    void freeHeadIsReusedAcrossKindsAfterSameKindCacheMiss() {
+        withHarness(1, h -> {
+            Transaction cachedOwner = h.newWriter();
+            Transaction freeOwner = h.newWriter();
+            PageId cachedPage = h.appendInsert(cachedOwner, 21);
+            PageId freePage = h.appendInsert(freeOwner, 22);
+            h.commit(cachedOwner);
+            h.commit(freeOwner);
+
+            assertEquals(List.of(cachedPage), h.snapshot().cachedInsertSegments());
+            assertEquals(java.util.Optional.of(freePage), h.snapshot().freeListBase().headPageId());
+
+            Transaction update = h.newWriter();
+            UndoWritePlan plan = h.undoManager.planUpdate(update, TABLE_ID, INDEX_ID, key(22), key(22),
+                    new HiddenColumns(update.transactionId(), RollPointer.NULL), keyDef(), schema());
+            assertEquals(UndoSegmentAcquisition.REUSE_FREE, plan.acquisition());
+            assertEquals(freePage, plan.expectedFirstPageId());
+            MiniTransaction append = h.mtrManager.begin();
+            h.undoManager.appendPlanned(update, append, plan);
+            h.mtrManager.commit(append);
+
+            assertEquals(freePage, update.undoContext().binding(UndoLogKind.UPDATE).firstPageId());
+            assertEquals(List.of(cachedPage), h.snapshot().cachedInsertSegments(),
+                    "跨 kind free reuse 不得消费 INSERT cache top");
+            assertEquals(0L, h.snapshot().freeListBase().length());
         });
     }
 

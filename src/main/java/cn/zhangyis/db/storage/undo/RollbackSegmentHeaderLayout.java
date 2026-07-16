@@ -6,7 +6,7 @@ import cn.zhangyis.db.storage.page.PageEnvelopeLayout;
  * Rollback segment header 页（undo 表空间固定 page3）物理布局（设计 §6.3，0.3 简化版）。在 38 字节 FIL 信封头之后
  * 保存 rseg 元数据、active slot array 与 INSERT/UPDATE 两个 cached segment 栈。cached 栈以
  * {@code [0,count)} 连续数组落盘，既能在恢复后保持 LIFO，也避免仅靠内存目录造成 FSP inode 失去持久 owner。
- * v3 还保存持久 history 双向链的 base 与事务号高水位；链节点位于各 UPDATE undo first page。
+ * v3 保存持久 history 双向链；v4 追加跨 kind 的 free undo segment FIFO base。
  *
  * <p>page3 由 {@code ExtentDescriptorRepository.reserveSystemExtent} 预留为系统页（page0..3），不会被 undo segment
  * 分配占用，故可作固定 rseg header 家（同 page0=FSP_HDR / page2=INODE 的约定）。
@@ -21,8 +21,8 @@ final class RollbackSegmentHeaderLayout {
 
     /** 魔数 "RSEG"，区分未格式化/错页。 */
     static final int MAGIC_VALUE = 0x52534547;
-    /** 当前格式版本；v1/v2 不含持久 history base，本实现不做在线迁移。 */
-    static final int FORMAT_VERSION = 3;
+    /** 当前格式版本；旧版不含完整持久 owner 区，本实现不做在线迁移。 */
+    static final int FORMAT_VERSION = 4;
 
     /** 魔数（u32），信封头之后第一字段。 */
     static final int MAGIC = PageEnvelopeLayout.FIL_PAGE_HEADER_BYTES;  // 38
@@ -46,8 +46,14 @@ final class RollbackSegmentHeaderLayout {
     static final int HISTORY_LENGTH = HISTORY_TAIL_PAGE_NO + 8;        // 82
     /** 曾成功挂入 history 的最大 TransactionNo；purge 不回退该高水位。 */
     static final int LAST_TRANSACTION_NO = HISTORY_LENGTH + 8;         // 90
+    /** 持久 free FIFO 首页 pageNo（u64）；空链为 FIL_NULL。 */
+    static final int FREE_HEAD_PAGE_NO = LAST_TRANSACTION_NO + 8;      // 98
+    /** 持久 free FIFO 尾页 pageNo（u64）；空链为 FIL_NULL。 */
+    static final int FREE_TAIL_PAGE_NO = FREE_HEAD_PAGE_NO + 8;        // 106
+    /** 持久 free FIFO 节点数（u64）；恢复期按此值做有界遍历。 */
+    static final int FREE_LENGTH = FREE_TAIL_PAGE_NO + 8;              // 114
     /** active slot array 起点；每槽 u64 pageNo，{@code FIL_NULL}=空。 */
-    static final int SLOT_ARRAY_BASE = LAST_TRANSACTION_NO + 8;        // 98
+    static final int SLOT_ARRAY_BASE = FREE_LENGTH + 8;                // 122
 
     /** 第 idx 个 slot 的页内偏移。 */
     static int slotOffset(int idx) {
@@ -79,7 +85,7 @@ final class RollbackSegmentHeaderLayout {
         return base + index * Long.BYTES;
     }
 
-    /** page3 v3 全部定长数组结束位置。 */
+    /** page3 v4 全部定长数组结束位置。 */
     static int layoutEnd(int slotCapacity, int cacheCapacityPerKind) {
         return updateCacheBase(slotCapacity, cacheCapacityPerKind)
                 + cacheCapacityPerKind * Long.BYTES;

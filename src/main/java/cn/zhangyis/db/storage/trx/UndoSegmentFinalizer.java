@@ -12,7 +12,9 @@ import cn.zhangyis.db.storage.redo.RedoBudgetPurpose;
 import cn.zhangyis.db.storage.undo.RollbackSegmentHeaderRepository;
 import cn.zhangyis.db.storage.undo.RollbackSegmentHeaderSnapshot;
 import cn.zhangyis.db.storage.undo.RollbackSegmentHistoryBase;
+import cn.zhangyis.db.storage.undo.RollbackSegmentFreeListBase;
 import cn.zhangyis.db.storage.undo.CachedUndoSegmentRef;
+import cn.zhangyis.db.storage.undo.FreeUndoSegmentRef;
 import cn.zhangyis.db.storage.undo.UndoLogFormatException;
 import cn.zhangyis.db.storage.undo.UndoLogSegment;
 import cn.zhangyis.db.storage.undo.UndoLogSegmentAccess;
@@ -29,8 +31,8 @@ import java.util.List;
 import java.util.Optional;
 
 /**
- * undo segment 终态协调器。它按 eligibility 把 FSP segment drop 或 page3 active→cache owner 转移放入同一
- * MTR/redo batch，并在 commit 后才发布内存 slot/cache，闭合 INSERT commit、live/recovery rollback 与
+ * undo segment 终态协调器。它按 eligibility 把 FSP segment drop 或 page3 active→cache/free owner 转移放入同一
+ * MTR/redo batch，并在 commit 后才发布内存 slot/reuse directory，闭合 INSERT commit、live/recovery rollback 与
  * committed purge 的 crash 边界。
  *
  * <p><b>锁序</b>：预检 MTR 先读 page3、再读普通 undo first page；返回前释放二者。随后独立只读 MTR 读取
@@ -53,8 +55,8 @@ public final class UndoSegmentFinalizer {
     private final RollbackSegmentHeaderRepository headerRepository;
     /** page3 提交成功后发布释放的运行期 slot 投影。 */
     private final RollbackSegmentSlotManager slotManager;
-    /** INSERT/UPDATE cached segment 的运行期 LIFO 投影与 transition lease 来源。 */
-    private final UndoSegmentCacheDirectory cacheDirectory;
+    /** cache/free owner 的统一运行期投影与 transition lease 来源。 */
+    private final UndoSegmentReuseDirectory reuseDirectory;
     /** 仅测试使用的 commit 后 crash point；生产构造固定 no-op。 */
     private final UndoFinalizationFaultInjector faultInjector;
 
@@ -71,8 +73,8 @@ public final class UndoSegmentFinalizer {
                                  UndoSpaceAllocator undoAllocator,
                                  RollbackSegmentHeaderRepository headerRepository,
                                  RollbackSegmentSlotManager slotManager,
-                                 UndoSegmentCacheDirectory cacheDirectory) {
-        this(mtrManager, undoAccess, undoAllocator, headerRepository, slotManager, cacheDirectory,
+                                 UndoSegmentReuseDirectory reuseDirectory) {
+        this(mtrManager, undoAccess, undoAllocator, headerRepository, slotManager, reuseDirectory,
                 UndoFinalizationFaultInjector.none());
     }
 
@@ -81,10 +83,10 @@ public final class UndoSegmentFinalizer {
                           UndoSpaceAllocator undoAllocator,
                           RollbackSegmentHeaderRepository headerRepository,
                           RollbackSegmentSlotManager slotManager,
-                          UndoSegmentCacheDirectory cacheDirectory,
+                          UndoSegmentReuseDirectory reuseDirectory,
                           UndoFinalizationFaultInjector faultInjector) {
         if (mtrManager == null || undoAccess == null || undoAllocator == null || headerRepository == null
-                || slotManager == null || cacheDirectory == null || faultInjector == null) {
+                || slotManager == null || reuseDirectory == null || faultInjector == null) {
             throw new DatabaseValidationException("undo finalizer collaborators must not be null");
         }
         this.mtrManager = mtrManager;
@@ -92,12 +94,12 @@ public final class UndoSegmentFinalizer {
         this.undoAllocator = undoAllocator;
         this.headerRepository = headerRepository;
         this.slotManager = slotManager;
-        this.cacheDirectory = cacheDirectory;
+        this.reuseDirectory = reuseDirectory;
         this.faultInjector = faultInjector;
     }
 
     /**
-     * 原子提交事务拥有的独立 undo logs。INSERT-only 按 eligibility cache/drop；UPDATE-only 只写 COMMITTED
+     * 原子提交事务拥有的独立 undo logs。INSERT-only 按 eligibility cache/free/drop；UPDATE-only 只写 COMMITTED
      * header；mixed 在同一 MTR 中先终结 INSERT owner，再写 UPDATE header，最后只追加一次事务 commit delta。
      */
     void finalizeCommit(Transaction transaction, UndoContext context, HistoryList.AppendLease historyLease) {
@@ -123,33 +125,40 @@ public final class UndoSegmentFinalizer {
                      slotManager.beginBatchFinalization(List.of(insert))) {
             PreparedActive insertPrepared = prepareActive(insert, transaction.transactionId(), false);
             UndoSegmentDropPlan insertDrop = inspectDropPlan(insertPrepared.handle());
-            UndoSegmentCacheDirectory.PushLease cachePush = reserveCachePush(insertPrepared, insertDrop);
-            try (cachePush) {
-                boolean cached = cachePush != null;
+            try (ReusePushGroup reusePushes = reserveReusePushes(
+                    List.of(insertPrepared), List.of(insertDrop))) {
+                FinalizationDisposition insertDisposition = reusePushes.dispositions().getFirst();
+                boolean cached = insertDisposition.cachePush() != null;
+                boolean free = insertDisposition.free();
                 MiniTransaction mtr = mtrManager.begin(mtrManager.budgetFor(
-                        RedoBudgetPurpose.UNDO_COMMIT, UndoRedoBudgetEstimator.commit(insertDrop, cached)));
+                        RedoBudgetPurpose.UNDO_COMMIT,
+                        UndoRedoBudgetEstimator.commit(insertDrop, cached, free)));
                 try {
                     if (historyLease != null) {
                         historyLease.physicalMutationStarted();
                     }
                     lease.physicalMutationStarted();
-                    if (cachePush != null) {
-                        cachePush.physicalMutationStarted();
-                    } else {
+                    reusePushes.physicalMutationStarted();
+                    if (!insertDisposition.retained()) {
                         undoAllocator.dropUndoSegment(mtr, insertPrepared.handle());
                     }
-                    FinalizationDisposition insertDisposition = new FinalizationDisposition(
-                            insertPrepared, insertDrop, cachePush);
-                    publishFinalizationOwners(mtr, List.of(insertDisposition), update == null);
+                    publishFinalizationOwners(mtr, List.of(insertDisposition));
+                    List<CachedUndoSegmentRef> cacheResets = cached
+                            ? List.of(new CachedUndoSegmentRef(UndoLogKind.INSERT, insertPrepared.handle()))
+                            : List.of();
+                    List<FreeUndoSegmentRef> freeResets = free
+                            ? List.of(new FreeUndoSegmentRef(insertPrepared.handle())) : List.of();
                     if (update != null) {
                         headerRepository.appendHistory(mtr, update.firstPageId().spaceId(),
                                 historyAppend.base(), update.slotId(), update.firstPageId(),
                                 transaction.transactionNo());
-                        List<CachedUndoSegmentRef> resets = cachePush == null ? List.of()
-                                : List.of(new CachedUndoSegmentRef(UndoLogKind.INSERT, insertPrepared.handle()));
                         undoAccess.appendHistoryNode(mtr,
                                 historyAppend.oldTail().map(UndoHistoryNodeSnapshot::firstPageId),
-                                update.firstPageId(), transaction.transactionId(), transaction.transactionNo(), resets);
+                                update.firstPageId(), transaction.transactionId(), transaction.transactionNo(),
+                                cacheResets, freeResets, reusePushes.oldFreeTail());
+                    } else if (insertDisposition.retained()) {
+                        undoAccess.finalizeActiveReusablePages(mtr, transaction.transactionId(),
+                                cacheResets, freeResets, reusePushes.oldFreeTail());
                     }
                     TransactionStateRedoDeltas.appendCommit(mtr, transaction);
                     mtrManager.commit(mtr);
@@ -162,9 +171,7 @@ public final class UndoSegmentFinalizer {
                                 : UndoFinalizationKind.UPDATE_COMMIT,
                         diagnostic.slotId(), diagnostic.firstPageId());
                 try {
-                    if (cachePush != null) {
-                        cachePush.complete();
-                    }
+                    reusePushes.complete();
                     lease.complete();
                     if (historyLease != null) {
                         historyLease.complete();
@@ -223,7 +230,7 @@ public final class UndoSegmentFinalizer {
                 transaction.transactionId(), transaction);
     }
 
-    /** recovery 对同一 creator 的 INSERT/UPDATE slots 做一次原子 cache/drop owner 终结与 terminal delta。 */
+    /** recovery 对同一 creator 的 INSERT/UPDATE slots 做一次原子 cache/free/drop owner 终结与 terminal delta。 */
     void finalizeRecoveredRollback(Collection<UndoLogBinding> bindings, TransactionId creatorTransactionId) {
         finalizeActiveBatch(UndoFinalizationKind.RECOVERY_ROLLBACK, bindings, creatorTransactionId, null);
     }
@@ -245,26 +252,39 @@ public final class UndoSegmentFinalizer {
             List<UndoSegmentDropPlan> plans = prepared.stream()
                     .map(item -> inspectDropPlan(item.handle()))
                     .toList();
-            try (CachePushGroup cachePushes = reserveCachePushes(prepared, plans)) {
-                List<FinalizationDisposition> dispositions = cachePushes.dispositions();
+            try (ReusePushGroup reusePushes = reserveReusePushes(prepared, plans)) {
+                List<FinalizationDisposition> dispositions = reusePushes.dispositions();
                 List<UndoSegmentDropPlan> droppedPlans = dispositions.stream()
-                        .filter(item -> item.cachePush() == null)
+                        .filter(item -> !item.retained())
                         .map(FinalizationDisposition::dropPlan)
                         .toList();
-                int cachedCount = dispositions.size() - droppedPlans.size();
+                int cachedCount = (int) dispositions.stream().filter(item -> item.cachePush() != null).count();
+                int freeCount = (int) dispositions.stream().filter(FinalizationDisposition::free).count();
                 MiniTransaction mtr = mtrManager.begin(mtrManager.budgetFor(
                         RedoBudgetPurpose.UNDO_FINALIZATION,
-                        UndoRedoBudgetEstimator.finalization(droppedPlans, cachedCount, true)));
+                        UndoRedoBudgetEstimator.finalization(droppedPlans, cachedCount, freeCount, true)));
                 try {
                     lease.physicalMutationStarted();
+                    reusePushes.physicalMutationStarted();
                     for (FinalizationDisposition disposition : dispositions) {
-                        if (disposition.cachePush() == null) {
+                        if (!disposition.retained()) {
                             undoAllocator.dropUndoSegment(mtr, disposition.prepared().handle());
-                        } else {
-                            disposition.cachePush().physicalMutationStarted();
                         }
                     }
                     publishFinalizationOwners(mtr, dispositions);
+                    List<CachedUndoSegmentRef> cacheResets = dispositions.stream()
+                            .filter(item -> item.cachePush() != null)
+                            .map(item -> new CachedUndoSegmentRef(item.prepared().binding().kind(),
+                                    item.prepared().handle()))
+                            .toList();
+                    List<FreeUndoSegmentRef> freeResets = dispositions.stream()
+                            .filter(FinalizationDisposition::free)
+                            .map(item -> new FreeUndoSegmentRef(item.prepared().handle()))
+                            .toList();
+                    if (!cacheResets.isEmpty() || !freeResets.isEmpty()) {
+                        undoAccess.finalizeActiveReusablePages(mtr, creator, cacheResets, freeResets,
+                                reusePushes.oldFreeTail());
+                    }
                     if (kind == UndoFinalizationKind.LIVE_ROLLBACK) {
                         TransactionStateRedoDeltas.appendRollbackComplete(mtr, transaction);
                     } else {
@@ -278,7 +298,7 @@ public final class UndoSegmentFinalizer {
                 UndoLogBinding diagnostic = ordered.getFirst();
                 faultInjector.afterCommit(kind, diagnostic.slotId(), diagnostic.firstPageId());
                 try {
-                    cachePushes.complete();
+                    reusePushes.complete();
                     lease.complete();
                 } catch (RuntimeException error) {
                     throw new UndoFinalizationException(
@@ -299,7 +319,7 @@ public final class UndoSegmentFinalizer {
         try {
             RollbackSegmentHeaderSnapshot snapshot = headerRepository.read(read,
                     binding.firstPageId().spaceId(), slotManager.rollbackSegmentId(), slotManager.slotCapacity(),
-                    cacheDirectory.capacityPerKind());
+                    reuseDirectory.capacityPerKind());
             if (!binding.firstPageId().equals(snapshot.occupiedSlots().get(binding.slotId()))) {
                 throw new UndoLogFormatException("persistent rseg slot owner mismatch for " + binding.kind());
             }
@@ -313,7 +333,7 @@ public final class UndoSegmentFinalizer {
             }
             UndoSegmentHandle handle = segment.handle();
             mtrManager.commit(read);
-            return new PreparedActive(binding, handle);
+            return new PreparedActive(binding, handle, snapshot.freeListBase());
         } catch (RuntimeException error) {
             rollbackActiveMtr(read, error);
             throw error;
@@ -343,7 +363,7 @@ public final class UndoSegmentFinalizer {
         MiniTransaction page3Read = mtrManager.beginReadOnly();
         try {
             header = headerRepository.read(page3Read, update.firstPageId().spaceId(),
-                    slotManager.rollbackSegmentId(), slotManager.slotCapacity(), cacheDirectory.capacityPerKind());
+                    slotManager.rollbackSegmentId(), slotManager.slotCapacity(), reuseDirectory.capacityPerKind());
             mtrManager.commit(page3Read);
         } catch (RuntimeException error) {
             rollbackActiveMtr(page3Read, error);
@@ -373,7 +393,7 @@ public final class UndoSegmentFinalizer {
                 throw new UndoLogFormatException("persistent history tail differs from runtime projection");
             }
         }
-        return new PreparedHistoryAppend(new PreparedActive(update, newNode.handle()),
+        return new PreparedHistoryAppend(new PreparedActive(update, newNode.handle(), header.freeListBase()),
                 header.historyBase(), oldTail);
     }
 
@@ -418,28 +438,28 @@ public final class UndoSegmentFinalizer {
             UndoSegmentDropPlan dropPlan = inspectDropPlan(prepared.removed().handle());
             PreparedActive active = new PreparedActive(
                     new UndoLogBinding(UndoLogKind.UPDATE, entry.slotId(), entry.undoFirstPageId(),
-                            prepared.removed().logicalHead()), prepared.removed().handle());
-            UndoSegmentCacheDirectory.PushLease cachePush = reserveCachePush(active, dropPlan);
-            try (cachePush) {
-                boolean cached = cachePush != null;
+                            prepared.removed().logicalHead()), prepared.removed().handle(), prepared.freeBase());
+            try (ReusePushGroup reusePushes = reserveReusePushes(List.of(active), List.of(dropPlan))) {
+                FinalizationDisposition disposition = reusePushes.dispositions().getFirst();
+                boolean cached = disposition.cachePush() != null;
+                boolean free = disposition.free();
                 MiniTransaction mtr = mtrManager.begin(mtrManager.budgetFor(
                         RedoBudgetPurpose.UNDO_FINALIZATION,
-                        UndoRedoBudgetEstimator.finalization(cached ? List.of() : List.of(dropPlan),
-                                cached ? 1 : 0, false)));
+                        UndoRedoBudgetEstimator.finalization(disposition.retained() ? List.of() : List.of(dropPlan),
+                                cached ? 1 : 0, free ? 1 : 0, false)));
                 try {
                     historyLease.physicalMutationStarted();
                     slotLease.physicalMutationStarted();
-                    if (cachePush == null) {
+                    reusePushes.physicalMutationStarted();
+                    if (!disposition.retained()) {
                         undoAllocator.dropUndoSegment(mtr, prepared.removed().handle());
-                    } else {
-                        cachePush.physicalMutationStarted();
                     }
                     headerRepository.removeHistoryHead(mtr, entry.undoSpaceId(), prepared.base(),
                             entry.slotId(), entry.undoFirstPageId(),
                             prepared.newHead().map(UndoHistoryNodeSnapshot::firstPageId));
-                    publishFinalizationOwners(mtr,
-                            List.of(new FinalizationDisposition(active, dropPlan, cachePush)), false);
-                    undoAccess.unlinkHistoryHead(mtr, prepared.removed(), prepared.newHead(), cached);
+                    publishFinalizationOwners(mtr, List.of(disposition));
+                    undoAccess.unlinkHistoryHead(mtr, prepared.removed(), prepared.newHead(), cached,
+                            free, reusePushes.oldFreeTail());
                     mtrManager.commit(mtr);
                 } catch (RuntimeException error) {
                     rollbackActiveMtr(mtr, error);
@@ -450,9 +470,7 @@ public final class UndoSegmentFinalizer {
                 faultInjector.afterCommit(UndoFinalizationKind.PURGE, entry.slotId(), entry.undoFirstPageId());
                 try {
                     // 新 runtime head 暴露前先完成其旧 owner 的 slot/cache 投影发布。
-                    if (cachePush != null) {
-                        cachePush.complete();
-                    }
+                    reusePushes.complete();
                     slotLease.complete();
                     historyLease.complete();
                 } catch (RuntimeException error) {
@@ -473,7 +491,7 @@ public final class UndoSegmentFinalizer {
         MiniTransaction page3Read = mtrManager.beginReadOnly();
         try {
             header = headerRepository.read(page3Read, entry.undoSpaceId(), slotManager.rollbackSegmentId(),
-                    slotManager.slotCapacity(), cacheDirectory.capacityPerKind());
+                    slotManager.slotCapacity(), reuseDirectory.capacityPerKind());
             mtrManager.commit(page3Read);
         } catch (RuntimeException error) {
             rollbackActiveMtr(page3Read, error);
@@ -502,7 +520,7 @@ public final class UndoSegmentFinalizer {
                 throw new UndoLogFormatException("persistent history successor does not point back to head");
             }
         }
-        return new PreparedPurge(header.historyBase(), removed, newHead);
+        return new PreparedPurge(header.historyBase(), header.freeListBase(), removed, newHead);
     }
 
     /**
@@ -525,32 +543,59 @@ public final class UndoSegmentFinalizer {
      * 尝试为单 fragment 页 segment 取得 cache push lease。缓存容量满、drain 或同 kind transition 正忙时返回 null，
      * finalizer 沿用 drop；不等待 cache 短状态，避免终态 IO 被性能优化反向阻塞。
      */
-    private UndoSegmentCacheDirectory.PushLease reserveCachePush(PreparedActive prepared,
+    private UndoSegmentReuseDirectory.CachePushLease reserveCachePush(PreparedActive prepared,
                                                                   UndoSegmentDropPlan plan) {
         if (!isCacheEligible(prepared.handle(), plan)) {
             return null;
         }
         CachedUndoSegmentRef cached = new CachedUndoSegmentRef(prepared.binding().kind(), prepared.handle());
-        return cacheDirectory.tryReservePush(cached).orElse(null);
+        return reuseDirectory.tryReserveCachePush(cached).orElse(null);
     }
 
-    private CachePushGroup reserveCachePushes(List<PreparedActive> prepared,
-                                               List<UndoSegmentDropPlan> plans) {
+    private ReusePushGroup reserveReusePushes(List<PreparedActive> prepared,
+                                              List<UndoSegmentDropPlan> plans) {
         if (prepared.size() != plans.size()) {
             throw new DatabaseValidationException("undo finalization prepared/plan size mismatch");
         }
-        List<FinalizationDisposition> dispositions = new ArrayList<>(prepared.size());
-        List<UndoSegmentCacheDirectory.PushLease> acquired = new ArrayList<>();
+        List<UndoSegmentReuseDirectory.CachePushLease> acquired = new ArrayList<>();
+        UndoSegmentReuseDirectory.FreePushLease freeLease = null;
         try {
+            List<PreparedActive> freeCandidates = new ArrayList<>();
             for (int i = 0; i < prepared.size(); i++) {
-                UndoSegmentCacheDirectory.PushLease push = reserveCachePush(prepared.get(i), plans.get(i));
+                UndoSegmentReuseDirectory.CachePushLease push = reserveCachePush(prepared.get(i), plans.get(i));
                 if (push != null) {
                     acquired.add(push);
+                } else if (isCacheEligible(prepared.get(i).handle(), plans.get(i))) {
+                    freeCandidates.add(prepared.get(i));
                 }
-                dispositions.add(new FinalizationDisposition(prepared.get(i), plans.get(i), push));
             }
-            return new CachePushGroup(dispositions, acquired);
+            if (!freeCandidates.isEmpty()) {
+                List<FreeUndoSegmentRef> refs = freeCandidates.stream()
+                        .map(item -> new FreeUndoSegmentRef(item.handle())).toList();
+                freeLease = reuseDirectory.tryReserveFreePush(refs).orElse(null);
+                if (freeLease != null) {
+                    requireFreeProjectionMatchesPage3(freeCandidates, freeLease);
+                }
+            }
+            UndoSegmentReuseDirectory.FreePushLease reservedFree = freeLease;
+            List<FinalizationDisposition> dispositions = new ArrayList<>(prepared.size());
+            for (int i = 0; i < prepared.size(); i++) {
+                PreparedActive item = prepared.get(i);
+                UndoSegmentReuseDirectory.CachePushLease cache = acquired.stream()
+                        .filter(lease -> lease.segment().handle().equals(item.handle())).findFirst().orElse(null);
+                boolean free = reservedFree != null && reservedFree.segments().stream()
+                        .anyMatch(ref -> ref.handle().equals(item.handle()));
+                dispositions.add(new FinalizationDisposition(item, plans.get(i), cache, free));
+            }
+            return new ReusePushGroup(dispositions, acquired, freeLease);
         } catch (RuntimeException failure) {
+            if (freeLease != null) {
+                try {
+                    freeLease.close();
+                } catch (RuntimeException closeFailure) {
+                    failure.addSuppressed(closeFailure);
+                }
+            }
             for (int i = acquired.size() - 1; i >= 0; i--) {
                 try {
                     acquired.get(i).close();
@@ -562,6 +607,19 @@ public final class UndoSegmentFinalizer {
         }
     }
 
+    /** 运行期 free tail/count 必须与所有预检看到的 page3 base 一致，不能把 stale 目录直接写回磁盘。 */
+    private static void requireFreeProjectionMatchesPage3(List<PreparedActive> candidates,
+                                                          UndoSegmentReuseDirectory.FreePushLease lease) {
+        RollbackSegmentFreeListBase base = candidates.getFirst().freeBase();
+        if (candidates.stream().anyMatch(item -> !item.freeBase().equals(base))
+                || base.length() != lease.expectedCount()
+                || !base.tailPageId().equals(lease.expectedTail()
+                .map(item -> item.handle().firstPageId()))) {
+            throw new UndoLogFormatException("runtime free projection differs from page3 base: base=" + base
+                    + ", runtimeCount=" + lease.expectedCount() + ", runtimeTail=" + lease.expectedTail());
+        }
+    }
+
     private static boolean isCacheEligible(UndoSegmentHandle handle, UndoSegmentDropPlan plan) {
         return handle.firstPageId().equals(handle.lastPageId())
                 && plan.usedPageCount() == 1L
@@ -570,21 +628,11 @@ public final class UndoSegmentFinalizer {
     }
 
     /**
-     * 发布 finalization 的持久 owner：drop 目标清 active slot，cache 目标执行 active→cache push；随后才按页号升序
+     * 发布 finalization 的持久 owner：drop 目标清 active slot，cache/free 目标执行 active owner 转移；随后才按页号升序
      * 重置 cached first page。调用方已经先完成所有 FSP drop，因此整体页序为 page0/page2→page3→普通 undo 页。
      */
     private void publishFinalizationOwners(MiniTransaction mtr,
                                             List<FinalizationDisposition> dispositions) {
-        publishFinalizationOwners(mtr, dispositions, true);
-    }
-
-    /**
-     * 发布 page3 owner，并按调用方选择是否在本方法内重置 cached first page。mixed UPDATE commit 把 reset 合并到
-     * history first-page batch，确保所有普通 undo 页严格按 pageNo 获取。
-     */
-    private void publishFinalizationOwners(MiniTransaction mtr,
-                                            List<FinalizationDisposition> dispositions,
-                                            boolean resetCachedPages) {
         List<RollbackSegmentHeaderRepository.CachePush> pushes = dispositions.stream()
                 .filter(item -> item.cachePush() != null)
                 .map(item -> new RollbackSegmentHeaderRepository.CachePush(
@@ -595,27 +643,22 @@ public final class UndoSegmentFinalizer {
             headerRepository.moveActiveSlotsToCache(mtr,
                     dispositions.getFirst().prepared().binding().firstPageId().spaceId(), pushes);
         }
+        List<FinalizationDisposition> free = dispositions.stream()
+                .filter(FinalizationDisposition::free).toList();
+        if (!free.isEmpty()) {
+            RollbackSegmentFreeListBase expected = free.getFirst().prepared().freeBase();
+            headerRepository.moveActiveSlotsToFree(mtr,
+                    free.getFirst().prepared().binding().firstPageId().spaceId(), expected,
+                    free.stream().map(item -> new RollbackSegmentHeaderRepository.FreePush(
+                            item.prepared().binding().slotId(), item.prepared().binding().firstPageId())).toList());
+        }
         for (FinalizationDisposition item : dispositions.stream()
-                .filter(candidate -> candidate.cachePush() == null)
+                .filter(candidate -> !candidate.retained())
                 .sorted(Comparator.comparingInt(candidate -> candidate.prepared().binding().slotId().value()))
                 .toList()) {
             UndoLogBinding binding = item.prepared().binding();
             headerRepository.clearSlot(mtr, binding.firstPageId().spaceId(),
                     binding.slotId(), binding.firstPageId());
-        }
-        if (!resetCachedPages) {
-            return;
-        }
-        for (FinalizationDisposition item : dispositions.stream()
-                .filter(candidate -> candidate.cachePush() != null)
-                .sorted(Comparator
-                        .comparingInt((FinalizationDisposition candidate) ->
-                                candidate.prepared().binding().firstPageId().spaceId().value())
-                        .thenComparingLong(candidate ->
-                                candidate.prepared().binding().firstPageId().pageNo().value()))
-                .toList()) {
-            undoAccess.open(mtr, item.prepared().binding().firstPageId(), PageLatchMode.EXCLUSIVE)
-                    .resetForCache();
         }
     }
 
@@ -631,7 +674,13 @@ public final class UndoSegmentFinalizer {
         }
     }
 
-    private record PreparedActive(UndoLogBinding binding, UndoSegmentHandle handle) {
+    private record PreparedActive(UndoLogBinding binding, UndoSegmentHandle handle,
+                                  RollbackSegmentFreeListBase freeBase) {
+        private PreparedActive {
+            if (binding == null || handle == null || freeBase == null) {
+                throw new DatabaseValidationException("prepared active undo fields must not be null");
+            }
+        }
     }
 
     private record PreparedHistoryAppend(PreparedActive update, RollbackSegmentHistoryBase base,
@@ -643,48 +692,83 @@ public final class UndoSegmentFinalizer {
         }
     }
 
-    private record PreparedPurge(RollbackSegmentHistoryBase base, UndoHistoryNodeSnapshot removed,
+    private record PreparedPurge(RollbackSegmentHistoryBase base, RollbackSegmentFreeListBase freeBase,
+                                 UndoHistoryNodeSnapshot removed,
                                  Optional<UndoHistoryNodeSnapshot> newHead) {
         private PreparedPurge {
-            if (base == null || removed == null || newHead == null) {
+            if (base == null || freeBase == null || removed == null || newHead == null) {
                 throw new DatabaseValidationException("prepared purge fields must not be null");
             }
         }
     }
 
     private record FinalizationDisposition(PreparedActive prepared, UndoSegmentDropPlan dropPlan,
-                                           UndoSegmentCacheDirectory.PushLease cachePush) {
+                                           UndoSegmentReuseDirectory.CachePushLease cachePush,
+                                           boolean free) {
         private FinalizationDisposition {
             if (prepared == null || dropPlan == null) {
                 throw new DatabaseValidationException("undo finalization disposition fields must not be null");
             }
+            if (cachePush != null && free) {
+                throw new DatabaseValidationException("undo segment cannot enter cache and free simultaneously");
+            }
+        }
+
+        private boolean retained() {
+            return cachePush != null || free;
         }
     }
 
-    /** 动态数量 cache push lease 的 RAII 组合；commit 后统一发布，异常时按各 lease 的物理边界回退或保留 fence。 */
-    private static final class CachePushGroup implements AutoCloseable {
+    /** cache/free push lease 的 RAII 组合；物理写前统一立 fence，commit 后统一发布运行期 owner。 */
+    private static final class ReusePushGroup implements AutoCloseable {
         private final List<FinalizationDisposition> dispositions;
-        private final List<UndoSegmentCacheDirectory.PushLease> leases;
+        private final List<UndoSegmentReuseDirectory.CachePushLease> leases;
+        private final UndoSegmentReuseDirectory.FreePushLease freeLease;
 
-        private CachePushGroup(List<FinalizationDisposition> dispositions,
-                               List<UndoSegmentCacheDirectory.PushLease> leases) {
+        private ReusePushGroup(List<FinalizationDisposition> dispositions,
+                               List<UndoSegmentReuseDirectory.CachePushLease> leases,
+                               UndoSegmentReuseDirectory.FreePushLease freeLease) {
             this.dispositions = List.copyOf(dispositions);
             this.leases = List.copyOf(leases);
+            this.freeLease = freeLease;
         }
 
         private List<FinalizationDisposition> dispositions() {
             return dispositions;
         }
 
+        private Optional<FreeUndoSegmentRef> oldFreeTail() {
+            return freeLease == null ? Optional.empty() : freeLease.expectedTail();
+        }
+
+        private void physicalMutationStarted() {
+            for (UndoSegmentReuseDirectory.CachePushLease lease : leases) {
+                lease.physicalMutationStarted();
+            }
+            if (freeLease != null) {
+                freeLease.physicalMutationStarted();
+            }
+        }
+
         private void complete() {
-            for (UndoSegmentCacheDirectory.PushLease lease : leases) {
+            for (UndoSegmentReuseDirectory.CachePushLease lease : leases) {
                 lease.complete();
+            }
+            if (freeLease != null) {
+                freeLease.complete();
             }
         }
 
         @Override
         public void close() {
             RuntimeException failure = null;
+            if (freeLease != null) {
+                try {
+                    freeLease.close();
+                } catch (RuntimeException closeFailure) {
+                    failure = closeFailure;
+                }
+            }
             for (int i = leases.size() - 1; i >= 0; i--) {
                 try {
                     leases.get(i).close();

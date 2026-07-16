@@ -63,8 +63,8 @@ public final class UndoTablespaceTruncationService {
     private final SpaceHeaderRepository headerRepository;
     private final SegmentInodeRepository inodeRepository;
     private final UndoTablespaceFspRebuilder rebuilder;
-    /** 负责 marker 前验证空 history/排空 cache owner，以及物理重建时恢复 page3 v3 空目录。 */
-    private final UndoCachedSegmentTruncationCoordinator cachedSegmentCoordinator;
+    /** 负责 marker 前验证空 history/排空 cache/free owner，以及物理重建时恢复 page3 v4 空目录。 */
+    private final UndoReusableSegmentTruncationCoordinator cachedSegmentCoordinator;
 
     public UndoTablespaceTruncationService(
             BufferPool bufferPool,
@@ -76,7 +76,7 @@ public final class UndoTablespaceTruncationService {
             FlushService flushService,
             Duration waitTimeout,
             UndoTruncationFaultInjector faultInjector,
-            UndoCachedSegmentTruncationCoordinator cachedSegmentCoordinator) {
+            UndoReusableSegmentTruncationCoordinator cachedSegmentCoordinator) {
         if (bufferPool == null || pageStore == null || pageSize == null || registry == null
                 || accessController == null || mtrManager == null || flushService == null
                 || waitTimeout == null || faultInjector == null || cachedSegmentCoordinator == null) {

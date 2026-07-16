@@ -371,7 +371,7 @@ public final class RollbackSegmentSlotManager {
     }
 
     /**
-     * 终结租约。调用方必须先完成全部只读预检，再调用 {@link #physicalMutationStarted()}，成功提交 cache/drop owner MTR 后
+     * 终结租约。调用方必须先完成全部只读预检，再调用 {@link #physicalMutationStarted()}，成功提交 cache/free/drop owner MTR 后
      * 调用 {@link #complete()}。一旦声明物理修改开始，异常退出会把槽保留为 FINALIZING，防止同进程误复用。
      */
     static final class FinalizationLease implements AutoCloseable {

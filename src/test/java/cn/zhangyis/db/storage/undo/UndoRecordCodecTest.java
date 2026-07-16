@@ -75,6 +75,21 @@ class UndoRecordCodecTest {
         assertEquals(r, back);
     }
 
+    /** resolver 必须能在不知道 table schema/key 类型时先读固定前缀，再选择正确索引元数据。 */
+    @Test void peeksTableAndIndexIdentityWithoutSchema() {
+        UndoRecord expected = rec(List.of(new ColumnValue.IntValue(42),
+                new ColumnValue.StringValue("alice")), RollPointer.NULL);
+        UndoRecordCodec codec = new UndoRecordCodec(registry);
+
+        UndoRecordIdentity identity = codec.peekIdentity(codec.encode(expected, twoColKey(), twoColSchema()), 0);
+
+        assertEquals(expected.type(), identity.type());
+        assertEquals(expected.undoNo(), identity.undoNo());
+        assertEquals(expected.transactionId(), identity.transactionId());
+        assertEquals(7L, identity.tableId());
+        assertEquals(9L, identity.indexId());
+    }
+
     @Test void roundTripsNonNullPrevAndNullKeyColumn() {
         RollPointer prev = new RollPointer(true, PageNo.of(0x01020304L), 0xABCD);
         UndoRecord r = rec(List.of(new ColumnValue.IntValue(1),

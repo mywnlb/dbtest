@@ -3,6 +3,7 @@ package cn.zhangyis.db.storage.trx;
 import cn.zhangyis.db.common.exception.DatabaseRuntimeException;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.Lsn;
+import cn.zhangyis.db.domain.LobReference;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
@@ -36,6 +37,7 @@ import cn.zhangyis.db.storage.record.format.HiddenColumns;
 import cn.zhangyis.db.storage.record.type.ColumnValue;
 import cn.zhangyis.db.storage.record.type.TypeCodecRegistry;
 import cn.zhangyis.db.storage.undo.UndoLogSegment;
+import cn.zhangyis.db.storage.undo.InsertedLobOwnership;
 import cn.zhangyis.db.storage.undo.UndoLogSegmentAccess;
 import cn.zhangyis.db.storage.undo.UndoLogKind;
 import cn.zhangyis.db.storage.undo.UndoLogicalHead;
@@ -118,6 +120,66 @@ class UndoLogManagerTest {
 
     private static List<ColumnValue> keyOf(long id) {
         return List.of(new ColumnValue.IntValue(id));
+    }
+
+    /** deferred INSERT 使用的两列 schema；LOB ownership 固定指向 ordinal=1。 */
+    private static TableSchema lobSchema() {
+        return new TableSchema(1, List.of(
+                new ColumnDef(new ColumnId(0), "id", ColumnType.intType(false, false), 0),
+                new ColumnDef(new ColumnId(1), "payload", ColumnType.text(false), 1)), true);
+    }
+
+    /** 构造只在首页号上不同、其它 identity/shape 完全相同的 external ownership。 */
+    private static InsertedLobOwnership ownership(long firstPageNo, int totalLength) {
+        LobReference reference = new LobReference(SpaceId.of(10), PageNo.of(firstPageNo), totalLength, 1,
+                SegmentId.of(7), 3, 123L);
+        return new InsertedLobOwnership(1,
+                new ColumnValue.ExternalValue(ColumnType.text(false).typeId(), reference, new byte[]{1, 2, 3}));
+    }
+
+    /**
+     * prepared undo 只允许 LOB 分配结果补上真实首页号；所有会影响 record slot/external payload 形状的字段已经冻结。
+     */
+    @Test
+    void deferredInsertPublishesActualLobPageWithoutWritingPlaceholder() {
+        onPool(h -> {
+            Transaction txn = h.txnMgr.begin(TransactionOptions.defaults());
+            h.txnMgr.assignWriteId(txn);
+            DeferredInsertUndoPlan plan = h.undoMgr.planDeferredInsert(txn, TABLE_ID, INDEX_ID,
+                    keyOf(41), List.of(ownership(100, 300)), keyDef(), lobSchema());
+            MiniTransaction write = h.mgr.begin(h.mgr.budgetFor(
+                    RedoBudgetPurpose.CLUSTERED_INSERT, plan.redoWorkload()));
+            RollPointer pointer;
+            try (PreparedUndoAppend prepared = h.undoMgr.prepareUndoAppend(txn, write, plan)) {
+                pointer = prepared.appendActual(List.of(ownership(101, 300)));
+            }
+            h.mgr.commit(write);
+
+            MiniTransaction read = h.mgr.beginReadOnly();
+            UndoRecord restored = h.access.readRecordByRollPointer(read, UNDO_SPACE, pointer, keyDef(), lobSchema());
+            h.mgr.commit(read);
+            assertEquals(PageNo.of(101), restored.insertedLobs().getFirst().value().reference().firstPageNo());
+        });
+    }
+
+    /** ownership 数量与长度漂移必须在 record slot 发布前失败；placeholder 绝不能作为合法 undo 落盘。 */
+    @Test
+    void deferredInsertRejectsOwnershipShapeDriftBeforeUndoPublish() {
+        onPool(h -> {
+            Transaction txn = h.txnMgr.begin(TransactionOptions.defaults());
+            h.txnMgr.assignWriteId(txn);
+            DeferredInsertUndoPlan plan = h.undoMgr.planDeferredInsert(txn, TABLE_ID, INDEX_ID,
+                    keyOf(42), List.of(ownership(110, 300)), keyDef(), lobSchema());
+            MiniTransaction write = h.mgr.begin(h.mgr.budgetFor(
+                    RedoBudgetPurpose.CLUSTERED_INSERT, plan.redoWorkload()));
+            PreparedUndoAppend prepared = h.undoMgr.prepareUndoAppend(txn, write, plan);
+            assertThrows(UndoWriteStalePlanException.class,
+                    () -> prepared.appendActual(List.of(ownership(111, 301))));
+            assertThrows(UndoWriteStalePlanException.class, () -> prepared.appendActual(List.of()));
+            assertThrows(UndoWriteFatalException.class, prepared::close,
+                    "越过 prepare 物理边界但未发布 actual undo 必须 fail-stop");
+            h.mgr.rollbackUncommitted(write);
+        });
     }
 
     @Test

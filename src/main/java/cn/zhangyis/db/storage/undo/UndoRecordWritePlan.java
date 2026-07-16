@@ -20,7 +20,7 @@ public final class UndoRecordWritePlan {
     /** 解码该记录所需的稳定 key/schema。 */
     private final IndexKeyDef keyDef;
     private final TableSchema schema;
-    /** 完整 UndoRecord 编码；不向跨包调用者暴露可变引用。 */
+    /** 完整 UndoRecord 编码（包含非空 INSERT LOB ownership 尾部）；不向跨包调用者暴露可变引用。 */
     private final byte[] encodedPayload;
     /** 是否使用 external descriptor。 */
     private final boolean external;
@@ -82,6 +82,23 @@ public final class UndoRecordWritePlan {
     /** 普通 UNDO 页 record 槽中实际保存的 payload 长度。 */
     public int rootPayloadLength() {
         return external ? UndoPayloadDescriptor.BYTES : encodedPayload.length;
+    }
+
+    /** 返回完整逻辑 UndoRecord 编码长度，用于 deferred placeholder 与实际引用做定长证明。 */
+    public int encodedPayloadLength() {
+        return encodedPayload.length;
+    }
+
+    /**
+     * 判断另一个计划是否可复用本计划已经固定的 root/payload 页布局；内容与 CRC 可以因 LOB 首页号变化，
+     * 但完整长度、inline/external 分支、external 页数与 root descriptor 长度必须完全一致。
+     */
+    public boolean samePhysicalShape(UndoRecordWritePlan other) {
+        return other != null
+                && encodedPayload.length == other.encodedPayload.length
+                && external == other.external
+                && externalPageCount == other.externalPageCount
+                && rootPayloadLength() == other.rootPayloadLength();
     }
 
     /** 跨包只提供防御性副本，避免计划形成后被调用方改写。 */

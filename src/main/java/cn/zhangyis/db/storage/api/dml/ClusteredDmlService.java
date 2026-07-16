@@ -3,6 +3,8 @@ package cn.zhangyis.db.storage.api.dml;
 import cn.zhangyis.db.common.exception.DatabaseRuntimeException;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.Lsn;
+import cn.zhangyis.db.domain.LobReference;
+import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.RollPointer;
 import cn.zhangyis.db.domain.TransactionId;
 import cn.zhangyis.db.storage.btree.BTreeCurrentReadMode;
@@ -13,7 +15,11 @@ import cn.zhangyis.db.storage.btree.BTreeIndex;
 import cn.zhangyis.db.storage.btree.BTreeLookupResult;
 import cn.zhangyis.db.storage.btree.BTreeUpdateResult;
 import cn.zhangyis.db.storage.btree.BTreeUniqueCheckResult;
+import cn.zhangyis.db.storage.btree.PreparedClusteredInsert;
 import cn.zhangyis.db.storage.btree.SplitCapableBTreeIndexService;
+import cn.zhangyis.db.storage.api.lob.LobStorage;
+import cn.zhangyis.db.storage.api.lob.LobWriteAllocation;
+import cn.zhangyis.db.storage.api.lob.LobWritePlan;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
 import cn.zhangyis.db.storage.mtr.MiniTransactionState;
@@ -21,6 +27,8 @@ import cn.zhangyis.db.storage.recovery.RecoveryState;
 import cn.zhangyis.db.storage.recovery.RecoveryTrafficGate;
 import cn.zhangyis.db.storage.record.format.HiddenColumns;
 import cn.zhangyis.db.storage.record.format.LogicalRecord;
+import cn.zhangyis.db.storage.record.schema.StorageKind;
+import cn.zhangyis.db.storage.record.type.ColumnValue;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
 import cn.zhangyis.db.storage.redo.RedoBudgetPurpose;
 import cn.zhangyis.db.storage.trx.EmptyUndoBoundary;
@@ -28,6 +36,8 @@ import cn.zhangyis.db.storage.trx.RollbackService;
 import cn.zhangyis.db.storage.trx.RollbackSummary;
 import cn.zhangyis.db.storage.trx.Transaction;
 import cn.zhangyis.db.storage.trx.TransactionManager;
+import cn.zhangyis.db.storage.trx.DeferredInsertUndoPlan;
+import cn.zhangyis.db.storage.trx.PreparedUndoAppend;
 import cn.zhangyis.db.storage.trx.UndoWriteFatalException;
 import cn.zhangyis.db.storage.trx.UndoWritePlan;
 import cn.zhangyis.db.storage.trx.TransactionSavepoint;
@@ -35,7 +45,10 @@ import cn.zhangyis.db.storage.trx.TransactionState;
 import cn.zhangyis.db.storage.trx.TransactionStateException;
 import cn.zhangyis.db.storage.trx.UndoLogManager;
 import cn.zhangyis.db.storage.trx.lock.LockManager;
+import cn.zhangyis.db.storage.undo.InsertedLobOwnership;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -66,6 +79,8 @@ public final class ClusteredDmlService {
     private final RedoLogManager redo;
     /** 启动恢复流量门控；非 OPEN 时拒绝普通 DML 进入。 */
     private final RecoveryTrafficGate recoveryGate;
+    /** LOB 纯规划、segment purpose 预检、同 MTR allocation 与异常补偿入口。 */
+    private final LobStorage lobStorage;
 
     /**
      * 构造 DML facade。所有 collaborator 都来自 {@code StorageEngine} 组合根，保证 DML 与测试/恢复/后台 purge
@@ -74,10 +89,11 @@ public final class ClusteredDmlService {
     public ClusteredDmlService(TransactionManager transactionManager, UndoLogManager undoLogManager,
                                MiniTransactionManager mtrManager, SplitCapableBTreeIndexService btree,
                                BTreeCurrentReadService currentRead, RollbackService rollbackService,
-                               LockManager lockManager, RedoLogManager redo, RecoveryTrafficGate recoveryGate) {
+                               LockManager lockManager, RedoLogManager redo, RecoveryTrafficGate recoveryGate,
+                               LobStorage lobStorage) {
         if (transactionManager == null || undoLogManager == null || mtrManager == null || btree == null
                 || currentRead == null || rollbackService == null || lockManager == null
-                || redo == null || recoveryGate == null) {
+                || redo == null || recoveryGate == null || lobStorage == null) {
             throw new DatabaseValidationException("clustered DML service collaborators must not be null");
         }
         this.transactionManager = transactionManager;
@@ -89,6 +105,7 @@ public final class ClusteredDmlService {
         this.lockManager = lockManager;
         this.redo = redo;
         this.recoveryGate = recoveryGate;
+        this.lobStorage = lobStorage;
     }
 
     /**
@@ -140,27 +157,55 @@ public final class ClusteredDmlService {
             throw new DmlDuplicateKeyException("duplicate clustered key for index " + command.index().indexId());
         }
 
-        UndoWritePlan undoPlan = undoLogManager.planInsert(txn, command.tableId(), command.index().indexId(),
-                command.key().values(), command.index().keyDef(), command.index().schema());
+        PlannedInsertLobs plannedLobs = planInsertLobs(command);
+        preflightLobSegment(plannedLobs);
+        DeferredInsertUndoPlan undoPlan = undoLogManager.planDeferredInsert(txn, command.tableId(),
+                command.index().indexId(), command.key().values(), plannedLobs.placeholderOwnerships(),
+                command.index().keyDef(), command.index().schema());
         MiniTransaction mtr = mtrManager.begin(mtrManager.budgetFor(
                 RedoBudgetPurpose.CLUSTERED_INSERT,
-                DmlRedoBudgetEstimator.insert(command.index(), undoPlan)));
-        boolean undoWritten = false;
+                DmlRedoBudgetEstimator.insert(command.index(), undoPlan, plannedLobs.writePlans())));
+        PreparedUndoAppend preparedUndo = null;
+        PreparedClusteredInsert preparedInsert = null;
+        List<LobWriteAllocation> allocations = new ArrayList<>(plannedLobs.values().size());
+        boolean preparedBoundary = false;
         try {
-            RollPointer rollPointer = undoLogManager.appendPlanned(txn, mtr, undoPlan);
-            undoWritten = true;
-            btree.insertClustered(mtr, command.index(), command.record(), txnId, rollPointer);
+            preparedUndo = undoLogManager.prepareUndoAppend(txn, mtr, undoPlan);
+            preparedBoundary = true;
+            preparedInsert = btree.prepareClusteredInsert(mtr, command.index(),
+                    plannedLobs.placeholderRecord(), txnId);
+            List<ColumnValue> actualValues = new ArrayList<>(plannedLobs.placeholderRecord().columnValues());
+            List<InsertedLobOwnership> actualOwnerships = new ArrayList<>(plannedLobs.values().size());
+            for (PlannedLobValue planned : plannedLobs.values()) {
+                LobWriteAllocation allocation = lobStorage.writePlanned(mtr, planned.plan());
+                allocations.add(allocation);
+                actualValues.set(planned.columnOrdinal(), allocation.value());
+                actualOwnerships.add(new InsertedLobOwnership(planned.columnOrdinal(), allocation.value()));
+            }
+            LogicalRecord actualRecord = new LogicalRecord(command.record().schemaVersion(), actualValues,
+                    command.record().deleted(), command.record().recordType(), command.record().hiddenColumns());
+            RollPointer rollPointer = preparedUndo.appendActual(actualOwnerships);
+            preparedInsert.publish(actualRecord, rollPointer);
+            for (LobWriteAllocation allocation : allocations) {
+                allocation.transferOwnership();
+            }
+            preparedInsert.close();
+            preparedInsert = null;
+            preparedUndo.close();
+            preparedUndo = null;
             Lsn endLsn = mtrManager.commit(mtr);
             return new DmlWriteResult(true, 1, endLsn, txnId);
         } catch (RuntimeException e) {
-            rollbackActiveMtr(mtr, e);
-            if (undoWritten && !(e instanceof UndoWriteFatalException)) {
-                throw new UndoWriteFatalException("clustered insert failed after undo physical write", e);
+            RuntimeException failure = compensateAndClosePrepared(
+                    allocations, preparedInsert, preparedUndo, e);
+            rollbackActiveMtr(mtr, failure);
+            if (preparedBoundary && !(failure instanceof UndoWriteFatalException)) {
+                throw new UndoWriteFatalException("clustered insert failed after prepare physical boundary", failure);
             }
-            if (e instanceof DatabaseRuntimeException databaseError) {
+            if (failure instanceof DatabaseRuntimeException databaseError) {
                 throw databaseError;
             }
-            throw new DmlOperationException("clustered insert failed", e);
+            throw new DmlOperationException("clustered insert failed", failure);
         }
     }
 
@@ -326,6 +371,32 @@ public final class ClusteredDmlService {
         }
     }
 
+    /**
+     * 通过 undo identity/DD resolver 完整回滚事务。该入口支持同一事务跨多表写入，不接收也不猜测最后一个索引；
+     * 终态后才释放 row locks，失败时保持 ROLLING_BACK/锁所有权供重试。
+     */
+    public DmlRollbackResult rollback(ResolvedDmlRollbackCommand command) {
+        if (command == null) {
+            throw new DatabaseValidationException("resolved DML rollback command must not be null");
+        }
+        requireOpenForDml();
+        Transaction txn = command.transaction();
+        TransactionId txnId = txn.transactionId();
+        try {
+            RollbackSummary summary = rollbackService.rollback(txn);
+            int released = releaseLocks(txnId);
+            return new DmlRollbackResult(summary, released);
+        } catch (RuntimeException error) {
+            if (txn.state() == TransactionState.ROLLED_BACK) {
+                releaseLocksOnFailure(txnId, error);
+            }
+            if (error instanceof DatabaseRuntimeException databaseError) {
+                throw databaseError;
+            }
+            throw new DmlOperationException("resolved DML rollback failed", error);
+        }
+    }
+
     private void requireOpenForDml() {
         RecoveryState state = recoveryGate.state();
         if (state != RecoveryState.OPEN) {
@@ -347,6 +418,120 @@ public final class ClusteredDmlService {
             mtrManager.rollbackUncommitted(mtr);
         } catch (RuntimeException rollbackError) {
             original.addSuppressed(rollbackError);
+        }
+    }
+
+    /**
+     * 在 begin 前把超过 256B 的 LOB raw value 替换为定长 placeholder，并冻结每列写计划/undo ownership。
+     * inline、NULL 和普通类型原样保留；只有确实需要 externalization 时才要求命令携带权威 LOB segment。
+     */
+    private PlannedInsertLobs planInsertLobs(ClusteredInsertCommand command) {
+        List<ColumnValue> source = command.record().columnValues();
+        if (source.size() != command.index().schema().columns().size()) {
+            throw new DatabaseValidationException("clustered INSERT row width differs from table schema");
+        }
+        List<ColumnValue> placeholders = new ArrayList<>(source);
+        List<PlannedLobValue> values = new ArrayList<>();
+        List<InsertedLobOwnership> ownerships = new ArrayList<>();
+        for (int ordinal = 0; ordinal < source.size(); ordinal++) {
+            var column = command.index().schema().column(ordinal);
+            ColumnValue value = source.get(ordinal);
+            if (column.type().storageKind() != StorageKind.OVERFLOW_CAPABLE
+                    || value instanceof ColumnValue.NullValue
+                    || !lobStorage.requiresExternalization(column.type(), value)) {
+                continue;
+            }
+            var segment = command.lobSegment().orElseThrow(() -> new DmlLobBindingException(
+                    "external LOB column requires table LOB segment: " + column.name()));
+            LobWritePlan plan = lobStorage.planWrite(segment, column.type(), value);
+            LobReference placeholderReference = new LobReference(segment.spaceId(), PageNo.of(4L + ordinal),
+                    plan.totalLength(), plan.pageCount(), segment.segmentId(), segment.inodeSlot(), plan.crc32());
+            ColumnValue.ExternalValue placeholder = new ColumnValue.ExternalValue(column.type().typeId(),
+                    placeholderReference, plan.inlinePrefix());
+            placeholders.set(ordinal, placeholder);
+            PlannedLobValue planned = new PlannedLobValue(ordinal, plan);
+            values.add(planned);
+            ownerships.add(new InsertedLobOwnership(ordinal, placeholder));
+        }
+        LogicalRecord placeholderRecord = new LogicalRecord(command.record().schemaVersion(), placeholders,
+                command.record().deleted(), command.record().recordType(), command.record().hiddenColumns());
+        return new PlannedInsertLobs(placeholderRecord, values, ownerships);
+    }
+
+    /** 错误 purpose/binding 在业务写 MTR 与 undo plan execution 前由独立短 MTR fail-closed。 */
+    private void preflightLobSegment(PlannedInsertLobs planned) {
+        if (planned.values().isEmpty()) {
+            return;
+        }
+        MiniTransaction check = mtrManager.beginReadOnly();
+        try {
+            // 每张表只有一个 LOB segment；多列计划复用同一 identity，复核一次即可。
+            lobStorage.preflightSegment(check, planned.values().getFirst().plan().segment());
+            mtrManager.commit(check);
+        } catch (RuntimeException error) {
+            rollbackActiveMtr(check, error);
+            if (error instanceof DatabaseRuntimeException databaseError) {
+                throw databaseError;
+            }
+            throw new DmlLobBindingException("LOB segment preflight failed", error);
+        }
+    }
+
+    /**
+     * 失败收尾顺序：先反序补偿尚未转移的 LOB allocation，再关闭 index prepare scope，最后关闭 undo prepare。
+     * 每个 close 失败作为 suppressed 保留；上层随后 rollback MTR memo，但不会误称页内容已撤销。
+     */
+    private static RuntimeException compensateAndClosePrepared(List<LobWriteAllocation> allocations,
+                                                               PreparedClusteredInsert preparedInsert,
+                                                               PreparedUndoAppend preparedUndo,
+                                                               RuntimeException primary) {
+        for (int i = allocations.size() - 1; i >= 0; i--) {
+            try {
+                allocations.get(i).close();
+            } catch (RuntimeException cleanup) {
+                primary.addSuppressed(cleanup);
+            }
+        }
+        if (preparedInsert != null) {
+            try {
+                preparedInsert.close();
+            } catch (RuntimeException cleanup) {
+                primary.addSuppressed(cleanup);
+            }
+        }
+        if (preparedUndo != null) {
+            try {
+                preparedUndo.close();
+            } catch (RuntimeException cleanup) {
+                primary.addSuppressed(cleanup);
+            }
+        }
+        return primary;
+    }
+
+    /** 单列需要 externalization 的冻结计划。 */
+    private record PlannedLobValue(int columnOrdinal, LobWritePlan plan) {
+        private PlannedLobValue {
+            if (columnOrdinal < 0 || plan == null) {
+                throw new DatabaseValidationException("invalid planned INSERT LOB value");
+            }
+        }
+    }
+
+    /** 一行 INSERT 的 placeholder、逐列 LOB 计划和 placeholder undo ownership。 */
+    private record PlannedInsertLobs(LogicalRecord placeholderRecord, List<PlannedLobValue> values,
+                                     List<InsertedLobOwnership> placeholderOwnerships) {
+        private PlannedInsertLobs {
+            if (placeholderRecord == null || values == null || placeholderOwnerships == null
+                    || values.size() != placeholderOwnerships.size()) {
+                throw new DatabaseValidationException("invalid planned INSERT LOB aggregate");
+            }
+            values = List.copyOf(values);
+            placeholderOwnerships = List.copyOf(placeholderOwnerships);
+        }
+
+        private List<LobWritePlan> writePlans() {
+            return values.stream().map(PlannedLobValue::plan).toList();
         }
     }
 

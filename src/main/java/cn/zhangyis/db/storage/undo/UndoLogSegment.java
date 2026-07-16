@@ -16,6 +16,7 @@ import cn.zhangyis.db.storage.record.schema.IndexKeyDef;
 import cn.zhangyis.db.storage.record.schema.TableSchema;
 
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
@@ -86,6 +87,12 @@ public final class UndoLogSegment {
      */
     private UndoPage current;
 
+    /**
+     * prepare/publish 两阶段之间的 MTR-local 状态。它只保存已经固定的新页和 root slot 起点，不写 placeholder；
+     * 同一 segment session 同时至多存在一个 pending append，且必须由同一对象发布。
+     */
+    private PreparedAppend pendingAppend;
+
     UndoLogSegment(MiniTransaction mtr, PageSize pageSize, UndoSpaceAllocator allocator, UndoRecordCodec codec,
                    UndoPageAccess pageAccess, UndoPayloadStorage payloadStorage,
                    UndoStoredRecordResolver storedRecordResolver, int maxExternalPages,
@@ -145,6 +152,9 @@ public final class UndoLogSegment {
         if (plan == null) {
             throw new DatabaseValidationException("planned undo append plan must not be null");
         }
+        if (pendingAppend != null) {
+            throw new DatabaseValidationException("ordinary undo append cannot bypass a prepared append");
+        }
         UndoRecord rec = plan.record();
         long nextRecordCount = preflightAppend(rec, plan.keyDef(), plan.schema());
         byte[] payload;
@@ -169,6 +179,65 @@ public final class UndoLogSegment {
         return pointer;
     }
 
+    /**
+     * 固定 deferred append 的全部物理位置但不写 placeholder record。数据流：先执行完整 logical preflight，
+     * 再在需要时生长 root chain page，随后为 external payload 分配并 fix 全部新页；记录 slot、payload body 和
+     * first-page logical head 都保持未发布。调用方已经按 {@link #requiredNewPages(UndoRecordWritePlan)} 预留容量。
+     */
+    public void prepareAppend(UndoRecordWritePlan placeholderPlan) {
+        if (mode != PageLatchMode.EXCLUSIVE) {
+            throw new DatabaseValidationException("prepared append requires an EXCLUSIVE undo session");
+        }
+        if (placeholderPlan == null || pendingAppend != null) {
+            throw new DatabaseValidationException("prepared append plan is null or already pending");
+        }
+        UndoRecord placeholder = placeholderPlan.record();
+        long nextRecordCount = preflightAppend(placeholder, placeholderPlan.keyDef(), placeholderPlan.schema());
+        int limit = pageSize.bytes() - PageEnvelopeLayout.FIL_PAGE_TRAILER_BYTES;
+        if (current.freeOffset() + Short.BYTES + placeholderPlan.rootPayloadLength() > limit) {
+            growForPreparedAppend(placeholderPlan.rootPayloadLength());
+        }
+        int expectedOffset = current.freeOffset();
+        List<PageId> payloadPages = placeholderPlan.external()
+                ? payloadStorage.preparePages(mtr, allocator, handle, placeholderPlan.externalPageCount())
+                : List.of();
+        pendingAppend = new PreparedAppend(placeholderPlan, current.pageId(), expectedOffset,
+                nextRecordCount, payloadPages);
+    }
+
+    /**
+     * 在已固定位置写入真实 undo。实际计划必须与 placeholder 物理形状相同，且 current 页/offset 未被其它写者推进；
+     * external body 先落到不可达 prepared 页，最后才发布 root record slot 和 first-page logical head。
+     */
+    public RollPointer appendPrepared(UndoRecordWritePlan actualPlan) {
+        if (actualPlan == null || pendingAppend == null) {
+            throw new DatabaseValidationException("appendPrepared requires an active prepared append");
+        }
+        PreparedAppend prepared = pendingAppend;
+        if (!prepared.placeholderPlan().samePhysicalShape(actualPlan)
+                || !prepared.rootPageId().equals(current.pageId())
+                || prepared.rootOffset() != current.freeOffset()) {
+            throw new UndoLogFormatException("prepared undo root/payload shape changed before publication");
+        }
+        UndoRecord rec = actualPlan.record();
+        long nextRecordCount = preflightAppend(rec, actualPlan.keyDef(), actualPlan.schema());
+        if (nextRecordCount != prepared.nextRecordCount()) {
+            throw new UndoLogFormatException("prepared undo record count changed before publication");
+        }
+        byte[] payload = actualPlan.external()
+                ? payloadStorage.writePrepared(mtr, handle, actualPlan, prepared.payloadPages()).encode()
+                : actualPlan.encodedPayloadUnsafe();
+        int offset = current.appendRecord(payload, rec.transactionId(), rec.undoNo());
+        boolean insert = rec.type() == UndoRecordType.INSERT_ROW;
+        RollPointer pointer = new RollPointer(insert, current.pageId().pageNo(), offset);
+        UndoLogicalHead newHead = new UndoLogicalHead(rec.undoNo(), pointer);
+        firstPage.setLogRecordCount(nextRecordCount);
+        firstPage.setLogLastUndoNo(rec.undoNo().value());
+        firstPage.setLogicalHead(newHead);
+        pendingAppend = null;
+        return pointer;
+    }
+
     /** external 页数加 descriptor/inline root 是否需要一张普通 UNDO grow 页。 */
     public int requiredNewPages(UndoRecordWritePlan plan) {
         if (plan == null) {
@@ -182,7 +251,8 @@ public final class UndoLogSegment {
     /**
      * 在任何 record slot/FIL/header 写入前验证 append 不变量。页内物理高水位必须严格连续，record 事务/索引
      * 必须属于本段，且 record predecessor 必须精确等于持久 logical head；否则一次错误 append 会覆盖链头并让
-     * recovery/purge 永久跳过旧记录。非空持久头也会实际解码并核对 undoNo，避免把损坏 pointer 继续传播到新分支。
+     * recovery/purge 永久跳过旧记录。非空持久头只解析 schema-free identity 前缀并核对 undoNo/creator；同一事务可跨表、
+     * 跨索引写入，绝不能用“本次新 record”的 schema 去完整解码 predecessor 的 payload。
      *
      * @return 校验后的新整链 record count；调用方写槽成功后直接落该值，不再执行可能溢出的加法。
      */
@@ -225,10 +295,10 @@ public final class UndoLogSegment {
                     + " != persistent logical head " + head.rollPointer());
         }
         if (!head.isEmpty()) {
-            UndoRecord headRecord = readRecord(head.rollPointer(), keyDef, schema);
-            if (!headRecord.undoNo().equals(head.undoNo())) {
+            UndoRecordIdentity headIdentity = readRecordIdentity(head.rollPointer());
+            if (!headIdentity.undoNo().equals(head.undoNo())) {
                 throw new UndoLogFormatException("persistent logical head pointer resolves to undoNo "
-                        + headRecord.undoNo().value() + " instead of " + head.undoNo().value());
+                        + headIdentity.undoNo().value() + " instead of " + head.undoNo().value());
             }
         }
         return recordCount + 1;
@@ -263,6 +333,32 @@ public final class UndoLogSegment {
         heldPages.put(newId.pageNo().value(), newPage);
         current = newPage;
         return current.appendRecord(payload, txnId, undoNo);
+    }
+
+    /** prepared 阶段只生长并链接空 root 页，不写任何 record slot。 */
+    private void growForPreparedAppend(int rootPayloadLength) {
+        int need = Short.BYTES + rootPayloadLength;
+        int freshCapacity = pageSize.bytes() - PageEnvelopeLayout.FIL_PAGE_TRAILER_BYTES
+                - UndoPageLayout.RECORD_AREA_START;
+        if (need > freshCapacity) {
+            throw new UndoPageOverflowException("prepared undo root payload exceeds a fresh UNDO page: " + need);
+        }
+        PageId newId = allocateChainPageForAppend();
+        UndoPage newPage = createChainPageForAppend(newId);
+        current.linkNextTo(newId.pageNo());
+        newPage.linkPrevTo(current.pageId().pageNo());
+        firstPage.setLastPageNo(newId.pageNo());
+        handle = handle.withLastPage(newId);
+        heldPages.put(newId.pageNo().value(), newPage);
+        current = newPage;
+    }
+
+    /** prepare 阶段冻结的 root 位置、计数与 external payload 页集合。 */
+    private record PreparedAppend(UndoRecordWritePlan placeholderPlan, PageId rootPageId, int rootOffset,
+                                  long nextRecordCount, List<PageId> payloadPages) {
+        private PreparedAppend {
+            payloadPages = List.copyOf(payloadPages);
+        }
     }
 
     /**
@@ -439,6 +535,10 @@ public final class UndoLogSegment {
         UndoLogSegmentAccess.requireRecordKind(page.undoKind(), identity.type(), "undo identity read");
         if (rp.insert() != (identity.type() == UndoRecordType.INSERT_ROW)) {
             throw new UndoLogFormatException("roll pointer kind does not match undo identity type");
+        }
+        if (!identity.transactionId().equals(firstPage.transactionId())) {
+            throw new UndoLogFormatException("undo identity transaction " + identity.transactionId().value()
+                    + " != segment creator " + firstPage.transactionId().value());
         }
         return identity;
     }

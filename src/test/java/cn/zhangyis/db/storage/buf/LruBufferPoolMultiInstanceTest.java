@@ -25,6 +25,7 @@ import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -322,18 +323,30 @@ class LruBufferPoolMultiInstanceTest {
     private static final class CountingPageStore implements PageStore {
         private final PageStore delegate;
         private final Map<PageId, Integer> reads = new HashMap<>();
+        /** 保护测试计数器；显式锁与生产并发约束保持一致。 */
+        private final ReentrantLock readsLock = new ReentrantLock();
 
         CountingPageStore(PageStore delegate) {
             this.delegate = delegate;
         }
 
-        synchronized int reads(PageId pageId) {
-            return reads.getOrDefault(pageId, 0);
+        int reads(PageId pageId) {
+            readsLock.lock();
+            try {
+                return reads.getOrDefault(pageId, 0);
+            } finally {
+                readsLock.unlock();
+            }
         }
 
         @Override
-        public synchronized void readPage(PageId pageId, ByteBuffer dst) {
-            reads.merge(pageId, 1, Integer::sum);
+        public void readPage(PageId pageId, ByteBuffer dst) {
+            readsLock.lock();
+            try {
+                reads.merge(pageId, 1, Integer::sum);
+            } finally {
+                readsLock.unlock();
+            }
             delegate.readPage(pageId, dst);
         }
 

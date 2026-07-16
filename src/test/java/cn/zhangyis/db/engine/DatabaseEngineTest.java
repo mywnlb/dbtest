@@ -1,5 +1,6 @@
 package cn.zhangyis.db.engine;
 
+import cn.zhangyis.db.common.exception.DatabaseRuntimeException;
 import cn.zhangyis.db.dd.ddl.CreateColumnSpec;
 import cn.zhangyis.db.dd.ddl.CreateIndexKeyPartSpec;
 import cn.zhangyis.db.dd.ddl.CreateIndexSpec;
@@ -11,6 +12,7 @@ import cn.zhangyis.db.dd.domain.ObjectName;
 import cn.zhangyis.db.dd.domain.QualifiedTableName;
 import cn.zhangyis.db.dd.exception.DictionaryObjectNotFoundException;
 import cn.zhangyis.db.dd.recovery.DictionaryRecoveryException;
+import cn.zhangyis.db.dd.service.TableAccessIntent;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.SpaceId;
@@ -27,6 +29,7 @@ import java.nio.channels.FileChannel;
 import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.util.List;
+import cn.zhangyis.db.session.SessionOptions;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -38,6 +41,20 @@ class DatabaseEngineTest {
 
     @TempDir
     Path directory;
+
+    /** Session registry 只在完整 recovery+DDL recovery 后发布；其它生命周期状态一律拒绝。 */
+    @Test
+    void opensSessionsOnlyWhileEngineIsOpen() {
+        DatabaseEngine database = new DatabaseEngine(config());
+        assertThrows(DatabaseRuntimeException.class, () -> database.openSession(SessionOptions.defaults()));
+        database.open();
+        var session = database.openSession(SessionOptions.defaults());
+        assertEquals(DatabaseEngineState.OPEN, database.state());
+        session.close();
+        database.close();
+        assertEquals(DatabaseEngineState.CLOSED, database.state());
+        assertThrows(DatabaseRuntimeException.class, () -> database.openSession(SessionOptions.defaults()));
+    }
 
     /** 建表关闭后无需调用方手工配置 recoveryTablespaces 即可重开 root；DROP 后再次重开仍保持不可见。 */
     @Test
@@ -70,7 +87,8 @@ class DatabaseEngineTest {
 
         try (DatabaseEngine reopened = new DatabaseEngine(config)) {
             reopened.open();
-            try (var lease = reopened.dictionary().openTable(MdlOwnerId.of(2), name, Duration.ofSeconds(2))) {
+            try (var lease = reopened.dictionary().openTable(MdlOwnerId.of(2), name,
+                    TableAccessIntent.READ, Duration.ofSeconds(2))) {
                 var binding = lease.table().storageBinding().orElseThrow().indexes().getFirst();
                 MiniTransaction read = reopened.storage().miniTransactionManager().beginReadOnly();
                 assertEquals(binding.indexId(), reopened.storage().indexPageAccess()
@@ -95,7 +113,7 @@ class DatabaseEngineTest {
         try (DatabaseEngine reopened = new DatabaseEngine(config)) {
             reopened.open();
             assertThrows(DictionaryObjectNotFoundException.class, () -> reopened.dictionary()
-                    .openTable(MdlOwnerId.of(4), name, Duration.ofSeconds(1)));
+                    .openTable(MdlOwnerId.of(4), name, TableAccessIntent.READ, Duration.ofSeconds(1)));
         }
     }
 

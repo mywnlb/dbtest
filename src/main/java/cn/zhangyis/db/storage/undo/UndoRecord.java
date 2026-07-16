@@ -26,9 +26,10 @@ import java.util.List;
  * 串本事务所有 undo by undoNo）；**记录版本链**=聚簇记录 {@code DB_ROLL_PTR} → 本 update undo →
  * {@code oldHiddenColumns.dbRollPtr()}（上一版本）。二者用不同字段表达，勿混用。
  *
- * <p>{@code DELETE_MARK} 仍拒绝（→ T1.3f）。{@code undoNo} 必须 &gt; 0（非 {@code NONE}）。
+ * <p>{@code undoNo} 必须 &gt; 0（非 {@code NONE}）。INSERT 可携带新分配 LOB 的 ownership；UPDATE/DELETE 的
+ * external old image 仍只是旧版本引用，不代表 INSERT ownership，两者不能混用。
  *
- * @param type            undo 类型（INSERT_ROW 或 UPDATE_ROW）。
+ * @param type            undo 类型（INSERT_ROW、UPDATE_ROW 或 DELETE_MARK）。
  * @param undoNo          事务内序号（&gt; 0）。
  * @param transactionId   写入该 undo 的事务 id。
  * @param tableId         表 id（rollback 定位用）。
@@ -36,16 +37,17 @@ import java.util.List;
  * @param clusterKey      主键列值，顺序对应 IndexKeyDef.parts()；可含 {@link ColumnValue.NullValue}。
  * @param oldColumnValues UPDATE_ROW 的更新前全列值（按 schema 列序）；INSERT_ROW 必为 null。
  * @param oldHiddenColumns UPDATE_ROW 的更新前隐藏列；INSERT_ROW 必为 null。
+ * @param insertedLobs    INSERT_ROW 新分配并随记录发布的 LOB ownership，按列 ordinal 严格递增；其它类型必为空。
  * @param prevRollPointer 同 kind undo log 的事务回滚局部链前驱；记录版本链前驱保存在 oldHiddenColumns.dbRollPtr。
  */
 public record UndoRecord(UndoRecordType type, UndoNo undoNo, TransactionId transactionId,
                          long tableId, long indexId, List<ColumnValue> clusterKey,
                          List<ColumnValue> oldColumnValues, HiddenColumns oldHiddenColumns,
-                         RollPointer prevRollPointer) {
+                         List<InsertedLobOwnership> insertedLobs, RollPointer prevRollPointer) {
 
     public UndoRecord {
         if (type == null || undoNo == null || transactionId == null
-                || clusterKey == null || prevRollPointer == null) {
+                || clusterKey == null || insertedLobs == null || prevRollPointer == null) {
             throw new DatabaseValidationException("undo record fields must not be null");
         }
         if (undoNo.isNone()) {
@@ -55,6 +57,15 @@ public record UndoRecord(UndoRecordType type, UndoNo undoNo, TransactionId trans
             throw new DatabaseValidationException("undo record clusterKey must not be empty");
         }
         clusterKey = List.copyOf(clusterKey);
+        insertedLobs = List.copyOf(insertedLobs);
+        int previousOrdinal = -1;
+        for (InsertedLobOwnership ownership : insertedLobs) {
+            if (ownership.columnOrdinal() <= previousOrdinal) {
+                throw new DatabaseValidationException(
+                        "inserted LOB ownership ordinals must be strictly increasing and unique");
+            }
+            previousOrdinal = ownership.columnOrdinal();
+        }
         switch (type) {
             case INSERT_ROW -> {
                 // insert 无旧版本：携带旧 image 是构造错误
@@ -71,6 +82,9 @@ public record UndoRecord(UndoRecordType type, UndoNo undoNo, TransactionId trans
                 if (oldColumnValues.isEmpty()) {
                     throw new DatabaseValidationException(type + " undo oldColumnValues must not be empty");
                 }
+                if (!insertedLobs.isEmpty()) {
+                    throw new DatabaseValidationException(type + " undo must not carry inserted LOB ownership");
+                }
                 oldColumnValues = List.copyOf(oldColumnValues);
             }
         }
@@ -80,7 +94,15 @@ public record UndoRecord(UndoRecordType type, UndoNo undoNo, TransactionId trans
     public static UndoRecord insert(UndoNo undoNo, TransactionId transactionId, long tableId, long indexId,
                                     List<ColumnValue> clusterKey, RollPointer prevRollPointer) {
         return new UndoRecord(UndoRecordType.INSERT_ROW, undoNo, transactionId, tableId, indexId, clusterKey,
-                null, null, prevRollPointer);
+                null, null, List.of(), prevRollPointer);
+    }
+
+    /** 构造携带新 LOB 页链 ownership 的 INSERT_ROW undo；列表必须按 column ordinal 严格递增。 */
+    public static UndoRecord insert(UndoNo undoNo, TransactionId transactionId, long tableId, long indexId,
+                                    List<ColumnValue> clusterKey, List<InsertedLobOwnership> insertedLobs,
+                                    RollPointer prevRollPointer) {
+        return new UndoRecord(UndoRecordType.INSERT_ROW, undoNo, transactionId, tableId, indexId, clusterKey,
+                null, null, insertedLobs, prevRollPointer);
     }
 
     /** 构造 UPDATE_ROW undo（带全量旧 image：旧全列值 + 旧隐藏列）。 */
@@ -88,7 +110,7 @@ public record UndoRecord(UndoRecordType type, UndoNo undoNo, TransactionId trans
                                     List<ColumnValue> clusterKey, List<ColumnValue> oldColumnValues,
                                     HiddenColumns oldHiddenColumns, RollPointer prevRollPointer) {
         return new UndoRecord(UndoRecordType.UPDATE_ROW, undoNo, transactionId, tableId, indexId, clusterKey,
-                oldColumnValues, oldHiddenColumns, prevRollPointer);
+                oldColumnValues, oldHiddenColumns, List.of(), prevRollPointer);
     }
 
     /**
@@ -99,6 +121,6 @@ public record UndoRecord(UndoRecordType type, UndoNo undoNo, TransactionId trans
                                         List<ColumnValue> clusterKey, List<ColumnValue> oldColumnValues,
                                         HiddenColumns oldHiddenColumns, RollPointer prevRollPointer) {
         return new UndoRecord(UndoRecordType.DELETE_MARK, undoNo, transactionId, tableId, indexId, clusterKey,
-                oldColumnValues, oldHiddenColumns, prevRollPointer);
+                oldColumnValues, oldHiddenColumns, List.of(), prevRollPointer);
     }
 }

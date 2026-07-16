@@ -15,6 +15,7 @@ import cn.zhangyis.db.storage.fsp.reservation.SpaceReservation;
 import cn.zhangyis.db.storage.fsp.reservation.SpaceReservationKind;
 import cn.zhangyis.db.storage.fsp.segment.SegmentPurpose;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
+import cn.zhangyis.db.storage.mtr.MiniTransactionState;
 import cn.zhangyis.db.storage.mtr.MtrLatchOrderScope;
 import cn.zhangyis.db.storage.page.FilePageHeader;
 import cn.zhangyis.db.storage.page.PageEnvelope;
@@ -28,6 +29,7 @@ import cn.zhangyis.db.storage.record.type.UnsupportedColumnTypeException;
 import cn.zhangyis.db.storage.redo.RedoBudgetWorkload;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -67,7 +69,107 @@ public final class LobStorage {
     }
 
     /**
-     * 把完整逻辑值写为新的 LOB 页链并返回记录可编码的 external value。
+     * 无 IO 地冻结新的 LOB 页链计划。inline/空值不应进入 externalize 路径；segment purpose 刻意留到
+     * {@link #writePlanned(MiniTransaction, LobWritePlan)} 开始物理动作前复核，使该方法可安全用于 begin admission。
+     *
+     * @param segment 精确 table binding 提供的候选 LOB segment identity。
+     * @param type TEXT/BLOB/JSON family 类型。
+     * @param value 完整 StringValue/BinaryValue，不能是已有 external reference。
+     * @return 冻结 payload、CRC、页数、prefix 与 workload 的纯计划。
+     */
+    public LobWritePlan planWrite(SegmentRef segment, ColumnType type, ColumnValue value) {
+        if (segment == null || type == null || value == null) {
+            throw new DatabaseValidationException("LOB write plan arguments must not be null");
+        }
+        LobCodec codec = requireLobCodec(type);
+        byte[] payload = codec.logicalBytesForStorage(value, type);
+        if (payload.length == 0) {
+            throw new DatabaseValidationException("empty LOB should remain inline instead of allocating a page chain");
+        }
+        if (payload.length <= LobCodec.INLINE_PAYLOAD_LIMIT) {
+            throw new DatabaseValidationException("LOB payload within inline limit must not allocate a page chain: "
+                    + payload.length);
+        }
+        int count = pageCount(payload.length, LobPageLayout.payloadCapacity(pageSize));
+        return new LobWritePlan(segment, type, payload, count, crc32(payload),
+                codec.inlinePrefix(payload, type), writeWorkload(payload.length));
+    }
+
+    /**
+     * 在 DML begin 前验证一个非 NULL LOB 逻辑值并判断是否超过 inline 阈值。该方法无 IO、无 allocation；
+     * 已经 external 的值不是 INSERT raw input，交由 LobCodec 明确拒绝。
+     */
+    public boolean requiresExternalization(ColumnType type, ColumnValue value) {
+        if (type == null || value == null) {
+            throw new DatabaseValidationException("LOB externalization check args must not be null");
+        }
+        LobCodec codec = requireLobCodec(type);
+        return codec.logicalBytesForStorage(value, type).length > LobCodec.INLINE_PAYLOAD_LIMIT;
+    }
+
+    /**
+     * 用短只读 MTR 复核 table binding 指向的 segment identity/purpose。LOB-aware DML 在业务 MTR admission 前调用，
+     * 使旧 catalog 缺 binding 或错误 purpose 不会留下 undo owner、row 或新 LOB 页副作用。
+     */
+    public void preflightSegment(MiniTransaction mtr, SegmentRef segment) {
+        if (mtr == null || segment == null) {
+            throw new DatabaseValidationException("LOB segment preflight args must not be null");
+        }
+        requireLobSegment(mtr, segment);
+    }
+
+    /**
+     * 按冻结计划写出新链并返回仍由调用方持有的 ownership guard。purpose preflight 是本方法的第一项 FSP 行为；
+     * 任一 allocation/format 失败会在同一 active MTR 内尽力反序回收本次已分配页并保留原始失败。
+     */
+    public LobWriteAllocation writePlanned(MiniTransaction mtr, LobWritePlan plan) {
+        if (mtr == null || plan == null) {
+            throw new DatabaseValidationException("planned LOB write arguments must not be null");
+        }
+        if (mtr.state() != MiniTransactionState.ACTIVE) {
+            throw new LobAllocationStateException("planned LOB write requires ACTIVE MTR: " + mtr.state());
+        }
+        validateFrozenPlan(plan);
+        SegmentRef segment = plan.segment();
+        byte[] payload = plan.payloadUnsafe();
+        int capacity = LobPageLayout.payloadCapacity(pageSize);
+        List<PageId> allocated = new ArrayList<>(plan.pageCount());
+
+        // identity/purpose 复核严格早于 reserve/allocate；纯 plan 阶段不读取 inode，也不产生任何物理副作用。
+        requireLobSegment(mtr, segment);
+        try (SpaceReservation ignored = diskSpace.reserveSpace(
+                mtr, segment.spaceId(), SpaceReservationKind.BLOB, plan.pageCount(), 0)) {
+            try {
+                for (int i = 0; i < plan.pageCount(); i++) {
+                    allocated.add(diskSpace.allocatePage(mtr, segment, PageType.BLOB));
+                }
+                for (int i = 0; i < plan.pageCount(); i++) {
+                    int offset = i * capacity;
+                    int length = Math.min(capacity, payload.length - offset);
+                    byte[] chunk = Arrays.copyOfRange(payload, offset, offset + length);
+                    PageId pageId = allocated.get(i);
+                    PageGuard guard = mtr.getPage(pool, pageId, PageLatchMode.EXCLUSIVE);
+                    long previous = i == 0 ? FilePageHeader.FIL_NULL : allocated.get(i - 1).pageNo().value();
+                    long next = i + 1 == plan.pageCount()
+                            ? FilePageHeader.FIL_NULL : allocated.get(i + 1).pageNo().value();
+                    LobPage.format(guard, pageId, previous, next, i, plan.pageCount(),
+                            segment.segmentId(), segment.inodeSlot(), plan.totalLength(), plan.crc32(), chunk);
+                }
+            } catch (RuntimeException writeFailure) {
+                reclaimPartialAllocation(mtr, segment, allocated, writeFailure);
+                throw writeFailure;
+            }
+        }
+        LobReference reference = new LobReference(segment.spaceId(), allocated.getFirst().pageNo(),
+                plan.totalLength(), plan.pageCount(), segment.segmentId(), segment.inodeSlot(), plan.crc32());
+        ColumnValue.ExternalValue external = new ColumnValue.ExternalValue(plan.type().typeId(), reference,
+                plan.inlinePrefix());
+        return new LobWriteAllocation(this, mtr, segment, allocated, external);
+    }
+
+    /**
+     * 把完整逻辑值写为新的 LOB 页链并立即转移 ownership；保留给显式低层调用者。需要和 undo/row 原子发布的上层
+     * 必须直接使用 plan/writePlanned guard，不能通过本便利方法丢失失败补偿窗口。
      *
      * @param mtr 调用方写 MTR；失败时调用方仍必须 rollback，释放 memo 与 redo reservation。
      * @param segment purpose=LOB 的 segment。
@@ -77,46 +179,11 @@ public final class LobStorage {
      */
     public ColumnValue.ExternalValue write(MiniTransaction mtr, SegmentRef segment,
                                            ColumnType type, ColumnValue value) {
-        requireArguments(mtr, segment, type);
-        LobCodec codec = requireLobCodec(type);
-        byte[] payload = codec.logicalBytesForStorage(value, type);
-        if (payload.length == 0) {
-            throw new DatabaseValidationException("empty LOB should remain inline instead of allocating a page chain");
+        try (LobWriteAllocation allocation = writePlanned(mtr, planWrite(segment, type, value))) {
+            ColumnValue.ExternalValue external = allocation.value();
+            allocation.transferOwnership();
+            return external;
         }
-        int capacity = LobPageLayout.payloadCapacity(pageSize);
-        int pageCount = pageCount(payload.length, capacity);
-        long crc32 = crc32(payload);
-        List<PageId> allocated = new ArrayList<>(pageCount);
-
-        // 先只读复核 identity/purpose（page0→page2 X，但不写），错误 segment 不能触发 reserve 扩容或 FSP 变更。
-        requireLobSegment(mtr, segment);
-        try (SpaceReservation ignored = diskSpace.reserveSpace(
-                mtr, segment.spaceId(), SpaceReservationKind.BLOB, pageCount, 0)) {
-            try {
-                for (int i = 0; i < pageCount; i++) {
-                    allocated.add(diskSpace.allocatePage(mtr, segment, PageType.BLOB));
-                }
-                for (int i = 0; i < pageCount; i++) {
-                    int offset = i * capacity;
-                    int length = Math.min(capacity, payload.length - offset);
-                    byte[] chunk = new byte[length];
-                    System.arraycopy(payload, offset, chunk, 0, length);
-                    PageId pageId = allocated.get(i);
-                    PageGuard guard = mtr.getPage(pool, pageId, PageLatchMode.EXCLUSIVE);
-                    long previous = i == 0 ? FilePageHeader.FIL_NULL : allocated.get(i - 1).pageNo().value();
-                    long next = i + 1 == pageCount
-                            ? FilePageHeader.FIL_NULL : allocated.get(i + 1).pageNo().value();
-                    LobPage.format(guard, pageId, previous, next, i, pageCount,
-                            segment.segmentId(), segment.inodeSlot(), payload.length, crc32, chunk);
-                }
-            } catch (RuntimeException writeFailure) {
-                reclaimPartialAllocation(mtr, segment, allocated, writeFailure);
-                throw writeFailure;
-            }
-        }
-        LobReference reference = new LobReference(segment.spaceId(), allocated.get(0).pageNo(),
-                payload.length, pageCount, segment.segmentId(), segment.inodeSlot(), crc32);
-        return new ColumnValue.ExternalValue(type.typeId(), reference, codec.inlinePrefix(payload, type));
     }
 
     /**
@@ -247,16 +314,61 @@ public final class LobStorage {
         }
     }
 
+    /** 执行前重算所有可派生字段，阻止损坏/错误来源的 plan 绕过 canonical pageCount/CRC/prefix/workload。 */
+    private void validateFrozenPlan(LobWritePlan plan) {
+        byte[] payload = plan.payloadUnsafe();
+        int expectedPageCount = pageCount(payload.length, LobPageLayout.payloadCapacity(pageSize));
+        LobCodec codec = requireLobCodec(plan.type());
+        if (payload.length <= LobCodec.INLINE_PAYLOAD_LIMIT
+                || plan.pageCount() != expectedPageCount
+                || plan.crc32() != crc32(payload)
+                || !Arrays.equals(plan.inlinePrefix(), codec.inlinePrefix(payload, plan.type()))
+                || !plan.workload().equals(writeWorkload(payload.length))) {
+            throw new LobAllocationStateException("frozen LOB write plan consistency check failed");
+        }
+    }
+
     /** 写失败后在同一 MTR 尽力归还已记入 FSP 的页；清理失败保留为 suppressed，不能覆盖原始根因。 */
     private void reclaimPartialAllocation(MiniTransaction mtr, SegmentRef segment, List<PageId> allocated,
                                           RuntimeException original) {
-        for (PageId pageId : allocated) {
+        if (allocated.isEmpty()) {
+            return;
+        }
+        try {
+            compensateAllocation(mtr, segment, allocated);
+        } catch (RuntimeException cleanupFailure) {
+            original.addSuppressed(cleanupFailure);
+        }
+    }
+
+    /**
+     * Guard 专用补偿原语：只接受当前 active MTR 刚分配且尚未发布的页，按 allocation 反序 free/reinitialize。
+     * 继续尝试全部页并把后续失败压到首个根因，禁止对已发布普通 LOB 调用。
+     */
+    void compensateAllocation(MiniTransaction mtr, SegmentRef segment, List<PageId> allocated) {
+        if (mtr == null || segment == null || allocated == null || allocated.isEmpty()) {
+            throw new DatabaseValidationException("LOB allocation compensation args must not be null/empty");
+        }
+        if (mtr.state() != MiniTransactionState.ACTIVE) {
+            throw new LobAllocationStateException("LOB allocation compensation requires ACTIVE MTR: " + mtr.state());
+        }
+        RuntimeException firstFailure = null;
+        for (int i = allocated.size() - 1; i >= 0; i--) {
+            PageId pageId = allocated.get(i);
             try {
                 diskSpace.freePage(mtr, segment, pageId);
                 reinitializeFreedPage(mtr, pageId);
             } catch (RuntimeException cleanupFailure) {
-                original.addSuppressed(cleanupFailure);
+                if (firstFailure == null) {
+                    firstFailure = cleanupFailure;
+                } else {
+                    firstFailure.addSuppressed(cleanupFailure);
+                }
             }
+        }
+        if (firstFailure != null) {
+            throw new LobAllocationStateException("failed to compensate newly allocated LOB page chain",
+                    firstFailure);
         }
     }
 

@@ -2,14 +2,19 @@ package cn.zhangyis.db.storage.undo;
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageNo;
+import cn.zhangyis.db.domain.LobReference;
 import cn.zhangyis.db.domain.RollPointer;
+import cn.zhangyis.db.domain.SegmentId;
+import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.domain.TransactionId;
 import cn.zhangyis.db.domain.UndoNo;
 import cn.zhangyis.db.storage.record.format.HiddenColumns;
 import cn.zhangyis.db.storage.record.type.ColumnValue;
+import cn.zhangyis.db.storage.record.schema.TypeId;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.ArrayList;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -52,15 +57,16 @@ class UndoRecordTest {
     void insertWithOldImageRejected() {
         // 直接走 canonical ctor 传 old image 给 INSERT_ROW → 拒绝
         assertThrows(DatabaseValidationException.class, () -> new UndoRecord(
-                UndoRecordType.INSERT_ROW, UndoNo.of(1), TXN, 1L, 9L, KEY, OLD_ROW, OLD_HIDDEN, RollPointer.NULL));
+                UndoRecordType.INSERT_ROW, UndoNo.of(1), TXN, 1L, 9L, KEY, OLD_ROW, OLD_HIDDEN,
+                List.of(), RollPointer.NULL));
     }
 
     @Test
     void updateWithoutOldImageRejected() {
         assertThrows(DatabaseValidationException.class, () -> new UndoRecord(
-                UndoRecordType.UPDATE_ROW, UndoNo.of(2), TXN, 1L, 9L, KEY, null, null, PREV));
+                UndoRecordType.UPDATE_ROW, UndoNo.of(2), TXN, 1L, 9L, KEY, null, null, List.of(), PREV));
         assertThrows(DatabaseValidationException.class, () -> new UndoRecord(
-                UndoRecordType.UPDATE_ROW, UndoNo.of(2), TXN, 1L, 9L, KEY, OLD_ROW, null, PREV));
+                UndoRecordType.UPDATE_ROW, UndoNo.of(2), TXN, 1L, 9L, KEY, OLD_ROW, null, List.of(), PREV));
     }
 
     @Test
@@ -76,7 +82,7 @@ class UndoRecordTest {
     @Test
     void deleteMarkWithoutOldImageRejected() {
         assertThrows(DatabaseValidationException.class, () -> new UndoRecord(
-                UndoRecordType.DELETE_MARK, UndoNo.of(1), TXN, 1L, 9L, KEY, null, null, PREV));
+                UndoRecordType.DELETE_MARK, UndoNo.of(1), TXN, 1L, 9L, KEY, null, null, List.of(), PREV));
     }
 
     @Test
@@ -85,5 +91,50 @@ class UndoRecordTest {
                 () -> UndoRecord.insert(UndoNo.NONE, TXN, 1L, 9L, KEY, RollPointer.NULL));
         assertThrows(DatabaseValidationException.class,
                 () -> UndoRecord.insert(UndoNo.of(1), TXN, 1L, 9L, List.of(), RollPointer.NULL));
+    }
+
+    /** INSERT ownership 以严格递增 column ordinal 冻结，调用方后续修改集合不能改变 undo 语义。 */
+    @Test
+    void insertOwnsImmutableOrderedExternalLobReferences() {
+        List<InsertedLobOwnership> mutable = new ArrayList<>();
+        mutable.add(ownership(1, TypeId.TEXT, 64));
+        mutable.add(ownership(3, TypeId.LONGBLOB, 96));
+
+        UndoRecord record = UndoRecord.insert(UndoNo.of(1), TXN, 1L, 9L, KEY, mutable, RollPointer.NULL);
+        mutable.clear();
+
+        assertEquals(2, record.insertedLobs().size());
+        assertThrows(UnsupportedOperationException.class, () -> record.insertedLobs().clear());
+        assertThrows(DatabaseValidationException.class,
+                () -> new InsertedLobOwnership(-1, external(TypeId.TEXT, 64)));
+        assertThrows(DatabaseValidationException.class,
+                () -> new InsertedLobOwnership(1, null));
+    }
+
+    /** 重复/逆序 ordinal 会让 rollback ownership 含义不确定，非 INSERT 类型则根本不得携带该列表。 */
+    @Test
+    void rejectsDuplicateOutOfOrderOrNonInsertLobOwnership() {
+        assertThrows(DatabaseValidationException.class, () -> UndoRecord.insert(UndoNo.of(1), TXN,
+                1L, 9L, KEY, List.of(ownership(2, TypeId.TEXT, 64), ownership(2, TypeId.TEXT, 65)),
+                RollPointer.NULL));
+        assertThrows(DatabaseValidationException.class, () -> UndoRecord.insert(UndoNo.of(1), TXN,
+                1L, 9L, KEY, List.of(ownership(3, TypeId.TEXT, 64), ownership(1, TypeId.TEXT, 65)),
+                RollPointer.NULL));
+        assertThrows(DatabaseValidationException.class, () -> new UndoRecord(UndoRecordType.UPDATE_ROW,
+                UndoNo.of(2), TXN, 1L, 9L, KEY, OLD_ROW, OLD_HIDDEN,
+                List.of(ownership(1, TypeId.TEXT, 64)), PREV));
+        assertThrows(DatabaseValidationException.class, () -> new UndoRecord(UndoRecordType.DELETE_MARK,
+                UndoNo.of(2), TXN, 1L, 9L, KEY, OLD_ROW, OLD_HIDDEN,
+                List.of(ownership(1, TypeId.TEXT, 64)), PREV));
+    }
+
+    private static InsertedLobOwnership ownership(int ordinal, TypeId typeId, long pageNo) {
+        return new InsertedLobOwnership(ordinal, external(typeId, pageNo));
+    }
+
+    private static ColumnValue.ExternalValue external(TypeId typeId, long pageNo) {
+        return new ColumnValue.ExternalValue(typeId,
+                new LobReference(SpaceId.of(8), PageNo.of(pageNo), 4_096, 1,
+                        SegmentId.of(12), 3, 0x1234_5678L), new byte[]{1, 2, 3});
     }
 }

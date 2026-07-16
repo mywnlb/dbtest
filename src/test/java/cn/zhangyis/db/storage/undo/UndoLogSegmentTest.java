@@ -142,6 +142,26 @@ class UndoLogSegmentTest {
         });
     }
 
+    /** 同一事务 undo 逻辑链允许跨表/索引；append 只能 schema-free 校验 predecessor identity。 */
+    @Test
+    void appendAcceptsPredecessorFromAnotherTableAndIndex() {
+        onSegment(seg -> {
+            RollPointer first = seg.append(rec(1, 100, RollPointer.NULL), keyDef(), schema());
+            IndexKeyDef secondKey = new IndexKeyDef(10L,
+                    List.of(new KeyPartDef(new ColumnId(0), KeyOrder.ASC, 0)));
+            TableSchema secondSchema = new TableSchema(2, List.of(
+                    new ColumnDef(new ColumnId(0), "other_id", ColumnType.intType(false, false), 0)), true);
+            UndoRecord second = UndoRecord.insert(UndoNo.of(2), TransactionId.of(7),
+                    2L, 10L, List.of(new ColumnValue.IntValue(200)), first);
+
+            RollPointer secondPointer = seg.append(second, secondKey, secondSchema);
+
+            assertEquals(second, seg.readRecord(secondPointer, secondKey, secondSchema));
+            assertEquals(rec(1, 100, RollPointer.NULL), seg.readRecord(first, keyDef(), schema()));
+            assertEquals(new UndoLogicalHead(UndoNo.of(2), secondPointer), seg.logicalHead());
+        });
+    }
+
     /** logical pair 必须由一条 15B metadata delta 覆盖，避免 redo 中出现可拆分的半边界。 */
     @Test
     void appendWritesLogicalHeadAsSingleMetadataDelta() {

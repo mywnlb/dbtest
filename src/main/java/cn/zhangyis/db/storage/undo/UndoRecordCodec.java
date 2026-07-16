@@ -1,6 +1,7 @@
 package cn.zhangyis.db.storage.undo;
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
+import cn.zhangyis.db.common.exception.DatabaseRuntimeException;
 import cn.zhangyis.db.domain.RollPointer;
 import cn.zhangyis.db.domain.TransactionId;
 import cn.zhangyis.db.domain.UndoNo;
@@ -9,6 +10,7 @@ import cn.zhangyis.db.storage.record.schema.ColumnType;
 import cn.zhangyis.db.storage.record.schema.IndexKeyDef;
 import cn.zhangyis.db.storage.record.schema.KeyPartDef;
 import cn.zhangyis.db.storage.record.schema.TableSchema;
+import cn.zhangyis.db.storage.record.schema.StorageKind;
 import cn.zhangyis.db.storage.record.type.ColumnValue;
 import cn.zhangyis.db.storage.record.type.FieldSlice;
 import cn.zhangyis.db.storage.record.type.FieldWriter;
@@ -35,6 +37,12 @@ import java.util.List;
  * （columnId==ordinal==列序，由 TableSchema 不变量保证）。
  */
 public final class UndoRecordCodec {
+
+    /** INSERT LOB ownership 尾部 magic：ASCII "LO"；旧记录因 EOF 不含该值。 */
+    private static final int INSERT_LOB_TAIL_MAGIC = 0x4C4F;
+
+    /** ownership 尾部首版；未来扩展必须追加版本并保留 v1 decoder，不能静默重解释。 */
+    private static final int INSERT_LOB_TAIL_VERSION = 1;
 
     private final TypeCodecRegistry registry;
 
@@ -70,6 +78,9 @@ public final class UndoRecordCodec {
             ColumnValue v = rec.clusterKey().get(i);
             ColumnType ct = schema.column(parts.get(i).columnId().value()).type();
             writeFramedColumn(out, v, ct);
+        }
+        if (rec.type() == UndoRecordType.INSERT_ROW && !rec.insertedLobs().isEmpty()) {
+            writeInsertedLobTail(out, rec.insertedLobs(), schema);
         }
         // UPDATE_ROW / DELETE_MARK 尾部：旧隐藏列（版本链上一版本指针）+ 全量旧 image（按 schema 全列序）。INSERT_ROW 无此段。
         if (rec.type() == UndoRecordType.UPDATE_ROW || rec.type() == UndoRecordType.DELETE_MARK) {
@@ -133,8 +144,11 @@ public final class UndoRecordCodec {
             key.add(readFramedColumn(buf, c, schema.column(parts.get(i).columnId().value()).type(), "key col " + i));
         }
         if (typeCode == UndoRecordType.INSERT_ROW.code()) {
+            List<InsertedLobOwnership> ownerships = c[0] == buf.length
+                    ? List.of() : readInsertedLobTail(buf, c, schema);
             requireFullyConsumed(buf, c[0]);
-            return UndoRecord.insert(UndoNo.of(undoNo), TransactionId.of(txn), tableId, indexId, key, prev);
+            return UndoRecord.insert(UndoNo.of(undoNo), TransactionId.of(txn), tableId, indexId, key,
+                    ownerships, prev);
         }
         // UPDATE_ROW / DELETE_MARK 尾部：旧隐藏列 + 全量旧 image（按 schema 全列序）。
         long oldTrx = readU64(buf, c);
@@ -201,6 +215,96 @@ public final class UndoRecordCodec {
         ColumnValue v = registry.codecFor(ct).decode(new FieldSlice(buf, c[0], len), ct);
         c[0] += len;
         return v;
+    }
+
+    /**
+     * 编码 INSERT ownership 尾部。所有 schema/type 校验发生在 UndoRecordWritePlan 冻结、写 MTR admission 之前；
+     * external bytes 复用列自己的 LobCodec envelope，避免形成第二套 LobReference 磁盘协议。
+     */
+    private void writeInsertedLobTail(ByteArrayOutputStream out, List<InsertedLobOwnership> ownerships,
+                                      TableSchema schema) {
+        if (ownerships.size() > 0xFFFF) {
+            throw new DatabaseValidationException("too many inserted LOB ownership entries: " + ownerships.size());
+        }
+        writeU16(out, INSERT_LOB_TAIL_MAGIC);
+        out.write(INSERT_LOB_TAIL_VERSION);
+        writeU16(out, ownerships.size());
+        for (InsertedLobOwnership ownership : ownerships) {
+            int ordinal = ownership.columnOrdinal();
+            if (ordinal > 0xFFFF) {
+                throw new DatabaseValidationException("inserted LOB column ordinal exceeds u16: " + ordinal);
+            }
+            ColumnType columnType = schema.column(ordinal).type();
+            requireLobColumnForEncode(ordinal, columnType);
+            TypeCodec codec = registry.codecFor(columnType);
+            int encodedLength = codec.encodedLength(ownership.value(), columnType);
+            if (encodedLength <= 0 || encodedLength > 0xFFFF) {
+                throw new DatabaseValidationException(
+                        "inserted LOB external envelope length exceeds u16: " + encodedLength);
+            }
+            byte[] encoded = new byte[encodedLength];
+            codec.encode(ownership.value(), columnType, new FieldWriter(encoded, 0));
+            writeU16(out, ordinal);
+            writeU16(out, encodedLength);
+            out.writeBytes(encoded);
+        }
+    }
+
+    /** 有任何剩余字节就必须完整命中 magic/version/count/entries；不存在可跳过的未知扩展。 */
+    private List<InsertedLobOwnership> readInsertedLobTail(byte[] buf, int[] cursor, TableSchema schema) {
+        int magic = readU16(buf, cursor);
+        if (magic != INSERT_LOB_TAIL_MAGIC) {
+            throw new UndoLogFormatException("unknown INSERT LOB ownership tail magic: " + magic);
+        }
+        int version = readU8(buf, cursor);
+        if (version != INSERT_LOB_TAIL_VERSION) {
+            throw new UndoLogFormatException("unknown INSERT LOB ownership tail version: " + version);
+        }
+        int count = readU16(buf, cursor);
+        if (count == 0) {
+            throw new UndoLogFormatException("INSERT LOB ownership tail must not encode an empty list");
+        }
+        List<InsertedLobOwnership> ownerships = new ArrayList<>(count);
+        int previousOrdinal = -1;
+        for (int i = 0; i < count; i++) {
+            int ordinal = readU16(buf, cursor);
+            if (ordinal <= previousOrdinal || ordinal >= schema.columnCount()) {
+                throw new UndoLogFormatException(
+                        "INSERT LOB ownership ordinal is duplicate/out-of-order/out-of-range: " + ordinal);
+            }
+            previousOrdinal = ordinal;
+            ColumnType columnType = schema.column(ordinal).type();
+            if (columnType.storageKind() != StorageKind.OVERFLOW_CAPABLE) {
+                throw new UndoLogFormatException("INSERT LOB ownership targets non-LOB column: " + ordinal);
+            }
+            int encodedLength = readU16(buf, cursor);
+            if (encodedLength <= 0 || cursor[0] + encodedLength > buf.length) {
+                throw new UndoLogFormatException(
+                        "INSERT LOB ownership external envelope is truncated/empty: " + encodedLength);
+            }
+            try {
+                ColumnValue decoded = registry.codecFor(columnType).decode(
+                        new FieldSlice(buf, cursor[0], encodedLength), columnType);
+                if (!(decoded instanceof ColumnValue.ExternalValue external)) {
+                    throw new UndoLogFormatException(
+                            "INSERT LOB ownership contains inline value for column: " + ordinal);
+                }
+                ownerships.add(new InsertedLobOwnership(ordinal, external));
+            } catch (UndoLogFormatException formatFailure) {
+                throw formatFailure;
+            } catch (DatabaseRuntimeException invalidEnvelope) {
+                throw new UndoLogFormatException(
+                        "invalid INSERT LOB ownership envelope for column: " + ordinal, invalidEnvelope);
+            }
+            cursor[0] += encodedLength;
+        }
+        return List.copyOf(ownerships);
+    }
+
+    private static void requireLobColumnForEncode(int ordinal, ColumnType columnType) {
+        if (columnType.storageKind() != StorageKind.OVERFLOW_CAPABLE) {
+            throw new DatabaseValidationException("inserted LOB ownership targets non-LOB column: " + ordinal);
+        }
     }
 
     private static void writeU16(ByteArrayOutputStream out, int v) {

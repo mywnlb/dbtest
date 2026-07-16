@@ -114,7 +114,7 @@ class ClusteredDmlEngineIntegrationTest {
     private static void insertAndCommit(StorageEngine engine, BTreeIndex index, long id, String payload) {
         var txn = engine.transactionManager().begin(TransactionOptions.defaults());
         engine.dmlService().insert(new ClusteredInsertCommand(txn, index, search(id), row(id, payload),
-                TABLE_ID, Duration.ofSeconds(1)));
+                TABLE_ID, Optional.empty(), Duration.ofSeconds(1)));
         engine.dmlService().commit(new DmlCommitCommand(txn, DurabilityPolicy.FLUSH_ON_COMMIT,
                 Duration.ofSeconds(2)));
     }

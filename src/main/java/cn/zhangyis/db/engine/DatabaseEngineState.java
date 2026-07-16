@@ -8,6 +8,8 @@ public enum DatabaseEngineState {
     OPENING,
     /** 所有恢复阶段成功，允许上层取得 facade。 */
     OPEN,
+    /** 已拒绝新 Session/访问器，正在等待活动 Session cooperative close。 */
+    CLOSING,
     /** 启动失败且资源已尽力关闭，不允许重试复用本实例。 */
     FAILED,
     /** 已完成幂等关闭。 */

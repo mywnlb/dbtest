@@ -59,9 +59,9 @@ final class MtrOperationRedoBudgetEstimator {
         }
         switch (purpose) {
             case CLUSTERED_INSERT, CLUSTERED_UPDATE, CLUSTERED_DELETE, PURGE_INDEX,
-                    ROLLBACK_INVERSE, UNDO_COMMIT, UNDO_FINALIZATION, LOB_WRITE, LOB_FREE,
+                    ROLLBACK_INVERSE, ROLLBACK_MARKER, UNDO_COMMIT, UNDO_FINALIZATION, LOB_WRITE, LOB_FREE,
                     DDL_TABLE_CREATE -> {
-                // 这些操作的上界依赖领域事实；固定布局 purpose 必须继续走权威固定 profile。
+                // ROLLBACK_MARKER 无 LOB 时仍可走固定 6-page profile；ownership free 时使用动态合并上界。
             }
             default -> throw new DatabaseValidationException(
                     "fixed redo budget purpose does not accept a domain workload: " + purpose);

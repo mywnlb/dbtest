@@ -2,11 +2,13 @@ package cn.zhangyis.db.storage.api.dml;
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.storage.btree.BTreeIndex;
+import cn.zhangyis.db.storage.api.SegmentRef;
 import cn.zhangyis.db.storage.record.format.LogicalRecord;
 import cn.zhangyis.db.storage.record.page.SearchKey;
 import cn.zhangyis.db.storage.trx.Transaction;
 
 import java.time.Duration;
+import java.util.Optional;
 
 /**
  * 单聚簇索引 INSERT 输入。调用方已经完成 SQL/DD 归一化，facade 只消费显式事务、索引快照、
@@ -17,15 +19,17 @@ import java.time.Duration;
  * @param key             主键查找 key；第一阶段信任调用方保证它与 record 的聚簇 key 一致。
  * @param record          用户逻辑行；可以不带隐藏列，写入时会被重新盖戳。
  * @param tableId         undo record 的表 id；当前无 DD，调用方显式传入且必须非负。
+ * @param lobSegment      精确 table binding 的 LOB segment；没有 OVERFLOW_CAPABLE 列或旧表未接线时显式 empty。
  * @param lockWaitTimeout unique current-read / insert-intention 的等待上限，必须为正。
  */
 public record ClusteredInsertCommand(Transaction transaction, BTreeIndex index, SearchKey key,
-                                     LogicalRecord record, long tableId, Duration lockWaitTimeout) {
+                                     LogicalRecord record, long tableId, Optional<SegmentRef> lobSegment,
+                                     Duration lockWaitTimeout) {
 
     public ClusteredInsertCommand {
         validateCommon(transaction, index, key, tableId, lockWaitTimeout, "insert");
-        if (record == null) {
-            throw new DatabaseValidationException("clustered insert record must not be null");
+        if (record == null || lobSegment == null) {
+            throw new DatabaseValidationException("clustered insert record/lobSegment must not be null");
         }
     }
 

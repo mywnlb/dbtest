@@ -13,6 +13,7 @@ import cn.zhangyis.db.storage.api.DiskSpaceManager;
 import cn.zhangyis.db.storage.api.SegmentRef;
 import cn.zhangyis.db.storage.btree.BTreeIndex;
 import cn.zhangyis.db.storage.btree.BTreeLookupResult;
+import cn.zhangyis.db.storage.btree.IndexMetadataResolver;
 import cn.zhangyis.db.storage.engine.EngineConfig;
 import cn.zhangyis.db.storage.engine.StorageEngine;
 import cn.zhangyis.db.storage.fsp.segment.SegmentPurpose;
@@ -44,6 +45,8 @@ import cn.zhangyis.db.storage.trx.TransactionStateException;
 import cn.zhangyis.db.storage.trx.TransactionSystem;
 import cn.zhangyis.db.storage.trx.UndoContext;
 import cn.zhangyis.db.storage.trx.UndoTestContexts;
+import cn.zhangyis.db.storage.trx.UndoTargetMetadata;
+import cn.zhangyis.db.storage.trx.UndoTargetMetadataResolver;
 import cn.zhangyis.db.storage.undo.UndoLogKind;
 import cn.zhangyis.db.storage.undo.UndoLogicalHead;
 import cn.zhangyis.db.storage.trx.lock.LockWaitTimeoutException;
@@ -58,6 +61,7 @@ import java.util.List;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -105,7 +109,7 @@ class ClusteredDmlServiceTest {
             Transaction txn = engine.transactionManager().begin(TransactionOptions.defaults());
 
             DmlWriteResult result = engine.dmlService().insert(new ClusteredInsertCommand(txn, index,
-                    search(1), row(1, "v1"), TABLE_ID, Duration.ofSeconds(1)));
+                    search(1), row(1, "v1"), TABLE_ID, Optional.empty(), Duration.ofSeconds(1)));
 
             BTreeLookupResult found = lookup(engine, index, 1).orElseThrow();
             HiddenColumns hidden = found.record().hiddenColumns();
@@ -115,6 +119,126 @@ class ClusteredDmlServiceTest {
             assertEquals(txn.transactionId(), hidden.dbTrxId(), "DB_TRX_ID 来自 facade 分配的写事务 id");
             assertFalse(hidden.dbRollPtr().isNull(), "DB_ROLL_PTR 必须指向 planInsert/appendPlanned 产生的真实 undo record");
             assertEquals("v1", payloadOf(found));
+        } finally {
+            engine.close();
+        }
+    }
+
+    /** 超过 inline 阈值的多个 LOB 必须在同一 INSERT MTR externalize，并把完整值留在可校验页链。 */
+    @Test
+    void insertExternalizesMultipleLobsThroughPreparedProtocol() {
+        StorageEngine engine = new StorageEngine(config(dir));
+        engine.open();
+        try {
+            LobIndexSetup setup = createLobClusteredIndex(engine, dir.resolve("dml-lob.ibd"));
+            String text = "界".repeat(120);
+            byte[] binary = new byte[300];
+            java.util.Arrays.fill(binary, (byte) 0x5A);
+            LogicalRecord record = new LogicalRecord(1, List.of(new ColumnValue.IntValue(1),
+                    new ColumnValue.StringValue(text), new ColumnValue.BinaryValue(binary)),
+                    false, RecordType.CONVENTIONAL);
+            Transaction txn = engine.transactionManager().begin(TransactionOptions.defaults());
+
+            engine.dmlService().insert(new ClusteredInsertCommand(txn, setup.index(), search(1), record,
+                    TABLE_ID, Optional.of(setup.lobSegment()), Duration.ofSeconds(1)));
+
+            BTreeLookupResult found = lookup(engine, setup.index(), 1).orElseThrow();
+            assertTrue(found.record().columnValues().get(1) instanceof ColumnValue.ExternalValue);
+            assertTrue(found.record().columnValues().get(2) instanceof ColumnValue.ExternalValue);
+            MiniTransaction read = engine.miniTransactionManager().beginReadOnly();
+            ColumnValue textValue = engine.lobStorage().read(read, lobSchema().column(1).type(),
+                    (ColumnValue.ExternalValue) found.record().columnValues().get(1));
+            ColumnValue binaryValue = engine.lobStorage().read(read, lobSchema().column(2).type(),
+                    (ColumnValue.ExternalValue) found.record().columnValues().get(2));
+            engine.miniTransactionManager().commit(read);
+            assertEquals(text, ((ColumnValue.StringValue) textValue).value());
+            assertArrayEquals(binary, ((ColumnValue.BinaryValue) binaryValue).value());
+        } finally {
+            engine.close();
+        }
+    }
+
+    /** 旧表没有 LOB binding 时必须在业务写 MTR 前拒绝，不能发布 row 或创建 undo context。 */
+    @Test
+    void externalLobWithoutBindingFailsBeforeUndoOrRowSideEffects() {
+        StorageEngine engine = new StorageEngine(config(dir));
+        engine.open();
+        try {
+            LobIndexSetup setup = createLobClusteredIndex(engine, dir.resolve("dml-lob-missing.ibd"));
+            Transaction txn = engine.transactionManager().begin(TransactionOptions.defaults());
+            LogicalRecord record = new LogicalRecord(1, List.of(new ColumnValue.IntValue(2),
+                    new ColumnValue.StringValue("x".repeat(300)), new ColumnValue.BinaryValue(new byte[]{1})),
+                    false, RecordType.CONVENTIONAL);
+
+            assertThrows(DmlLobBindingException.class, () -> engine.dmlService().insert(
+                    new ClusteredInsertCommand(txn, setup.index(), search(2), record,
+                            TABLE_ID, Optional.empty(), Duration.ofSeconds(1))));
+
+            assertNull(txn.undoContext());
+            assertTrue(lookup(engine, setup.index(), 2).isEmpty());
+        } finally {
+            engine.close();
+        }
+    }
+
+    /** full rollback 不接收 last-index fallback，并在 marker MTR 中释放 INSERT ownership 后推进 undo head。 */
+    @Test
+    void resolvedFullRollbackDeletesRowAndReclaimsExternalLob() {
+        StorageEngine engine = new StorageEngine(config(dir));
+        MutableUndoTargetResolver resolver = new MutableUndoTargetResolver();
+        engine.configureIndexMetadataResolver(resolver);
+        engine.open();
+        try {
+            LobIndexSetup setup = createLobClusteredIndex(engine, dir.resolve("dml-lob-rollback.ibd"));
+            resolver.install(new UndoTargetMetadata(setup.index(), Optional.of(setup.lobSegment())));
+            String text = "回滚".repeat(160);
+            LogicalRecord record = new LogicalRecord(1, List.of(new ColumnValue.IntValue(3),
+                    new ColumnValue.StringValue(text), new ColumnValue.BinaryValue(new byte[]{1})),
+                    false, RecordType.CONVENTIONAL);
+            Transaction txn = engine.transactionManager().begin(TransactionOptions.defaults());
+            engine.dmlService().insert(new ClusteredInsertCommand(txn, setup.index(), search(3), record,
+                    TABLE_ID, Optional.of(setup.lobSegment()), Duration.ofSeconds(1)));
+            ColumnValue.ExternalValue external = (ColumnValue.ExternalValue) lookup(engine, setup.index(), 3)
+                    .orElseThrow().record().columnValues().get(1);
+
+            DmlRollbackResult result = engine.dmlService().rollback(new ResolvedDmlRollbackCommand(txn));
+
+            assertEquals(1, result.rollbackSummary().undoRecordsApplied());
+            assertEquals(TransactionState.ROLLED_BACK, txn.state());
+            assertTrue(lookup(engine, setup.index(), 3).isEmpty());
+            MiniTransaction readFreed = engine.miniTransactionManager().beginReadOnly();
+            assertThrows(DatabaseRuntimeException.class,
+                    () -> engine.lobStorage().read(readFreed, lobSchema().column(1).type(), external));
+            engine.miniTransactionManager().rollbackUncommitted(readFreed);
+        } finally {
+            engine.close();
+        }
+    }
+
+    /** statement rollback 与 full/recovery 共用 ownership free+head marker，完成后事务仍保持 ACTIVE。 */
+    @Test
+    void statementRollbackReclaimsExternalLobAndKeepsTransactionActive() {
+        StorageEngine engine = new StorageEngine(config(dir));
+        MutableUndoTargetResolver resolver = new MutableUndoTargetResolver();
+        engine.configureIndexMetadataResolver(resolver);
+        engine.open();
+        try {
+            LobIndexSetup setup = createLobClusteredIndex(engine, dir.resolve("dml-lob-statement.ibd"));
+            resolver.install(new UndoTargetMetadata(setup.index(), Optional.of(setup.lobSegment())));
+            Transaction txn = engine.transactionManager().begin(TransactionOptions.defaults());
+            LogicalRecord record = new LogicalRecord(1, List.of(new ColumnValue.IntValue(4),
+                    new ColumnValue.StringValue("语句".repeat(160)), new ColumnValue.BinaryValue(new byte[]{1})),
+                    false, RecordType.CONVENTIONAL);
+
+            try (DmlStatementGuard statement = engine.dmlService().beginStatement(txn, setup.index())) {
+                engine.dmlService().insert(new ClusteredInsertCommand(txn, setup.index(), search(4), record,
+                        TABLE_ID, Optional.of(setup.lobSegment()), Duration.ofSeconds(1)));
+                assertEquals(1, statement.rollback().undoRecordsApplied());
+            }
+
+            assertEquals(TransactionState.ACTIVE, txn.state());
+            assertTrue(lookup(engine, setup.index(), 4).isEmpty());
+            assertTrue(txn.undoContext().head(UndoLogKind.INSERT).isEmpty());
         } finally {
             engine.close();
         }
@@ -181,7 +305,7 @@ class ClusteredDmlServiceTest {
             BTreeIndex index = createClusteredIndex(engine, dir.resolve("dml-commit.ibd"));
             Transaction txn = engine.transactionManager().begin(TransactionOptions.defaults());
             engine.dmlService().insert(new ClusteredInsertCommand(txn, index, search(1), row(1, "v1"),
-                    TABLE_ID, Duration.ofSeconds(1)));
+                    TABLE_ID, Optional.empty(), Duration.ofSeconds(1)));
             assertTrue(hasGrantedLock(engine, txn), "INSERT unique check keeps its transaction lock until commit");
 
             DmlCommitResult result = engine.dmlService().commit(new DmlCommitCommand(txn,
@@ -207,7 +331,7 @@ class ClusteredDmlServiceTest {
             BTreeIndex index = createClusteredIndex(engine, dir.resolve("dml-commit-timeout.ibd"));
             Transaction txn = engine.transactionManager().begin(TransactionOptions.defaults());
             engine.dmlService().insert(new ClusteredInsertCommand(txn, index, search(1), row(1, "v1"),
-                    TABLE_ID, Duration.ofSeconds(1)));
+                    TABLE_ID, Optional.empty(), Duration.ofSeconds(1)));
             assertTrue(hasGrantedLock(engine, txn), "durability timeout 前事务锁仍由写事务持有");
 
             RedoLogManager neverDurable = new RedoLogManager();
@@ -234,7 +358,7 @@ class ClusteredDmlServiceTest {
             BTreeIndex index = createClusteredIndex(engine, dir.resolve("dml-on-commit-failure.ibd"));
             Transaction txn = engine.transactionManager().begin(TransactionOptions.defaults());
             engine.dmlService().insert(new ClusteredInsertCommand(txn, index, search(1), row(1, "v1"),
-                    TABLE_ID, Duration.ofSeconds(1)));
+                    TABLE_ID, Optional.empty(), Duration.ofSeconds(1)));
             assertTrue(hasGrantedLock(engine, txn), "写事务在 commit 前持有 INSERT/current-read 锁");
 
             replaceUndoContext(txn, UndoTestContexts.restored(RollbackSegmentId.of(0), UndoLogKind.INSERT,
@@ -265,7 +389,7 @@ class ClusteredDmlServiceTest {
             BTreeIndex index = createClusteredIndex(engine, dir.resolve("dml-rollback.ibd"));
             Transaction txn = engine.transactionManager().begin(TransactionOptions.defaults());
             engine.dmlService().insert(new ClusteredInsertCommand(txn, index, search(1), row(1, "v1"),
-                    TABLE_ID, Duration.ofSeconds(1)));
+                    TABLE_ID, Optional.empty(), Duration.ofSeconds(1)));
             engine.dmlService().update(new ClusteredUpdateCommand(txn, index, search(1), row(1, "v2"),
                     TABLE_ID, Duration.ofSeconds(1)));
             engine.dmlService().delete(new ClusteredDeleteCommand(txn, index, search(1),
@@ -296,7 +420,7 @@ class ClusteredDmlServiceTest {
             BTreeIndex index = createClusteredIndex(engine, dir.resolve("dml-rollback-lock-retain.ibd"));
             Transaction txn = engine.transactionManager().begin(TransactionOptions.defaults());
             engine.dmlService().insert(new ClusteredInsertCommand(
-                    txn, index, search(1), row(1, "v1"), TABLE_ID, Duration.ofSeconds(1)));
+                    txn, index, search(1), row(1, "v1"), TABLE_ID, Optional.empty(), Duration.ofSeconds(1)));
             assertTrue(hasGrantedLock(engine, txn));
 
             IndexKeyDef wrongKey = new IndexKeyDef(INDEX_ID + 1, index.keyDef().parts());
@@ -328,13 +452,13 @@ class ClusteredDmlServiceTest {
             BTreeIndex index = createClusteredIndex(engine, dir.resolve("dml-statement-existing.ibd"));
             Transaction txn = engine.transactionManager().begin(TransactionOptions.defaults());
             engine.dmlService().insert(new ClusteredInsertCommand(txn, index, search(1), row(1, "v1"),
-                    TABLE_ID, Duration.ofSeconds(1)));
+                    TABLE_ID, Optional.empty(), Duration.ofSeconds(1)));
 
             DmlStatementGuard guard = engine.dmlService().beginStatement(txn, index);
             engine.dmlService().update(new ClusteredUpdateCommand(txn, index, search(1), row(1, "v2"),
                     TABLE_ID, Duration.ofSeconds(1)));
             engine.dmlService().insert(new ClusteredInsertCommand(txn, index, search(2), row(2, "new"),
-                    TABLE_ID, Duration.ofSeconds(1)));
+                    TABLE_ID, Optional.empty(), Duration.ofSeconds(1)));
 
             var summary = guard.rollback();
 
@@ -366,7 +490,7 @@ class ClusteredDmlServiceTest {
 
             DmlStatementGuard guard = engine.dmlService().beginStatement(txn, index);
             engine.dmlService().insert(new ClusteredInsertCommand(txn, index, search(1), row(1, "rolled-back"),
-                    TABLE_ID, Duration.ofSeconds(1)));
+                    TABLE_ID, Optional.empty(), Duration.ofSeconds(1)));
 
             var summary = guard.rollback();
 
@@ -381,7 +505,7 @@ class ClusteredDmlServiceTest {
             assertTrue(txn.undoContext().head(UndoLogKind.INSERT).rollPointer().isNull());
 
             engine.dmlService().insert(new ClusteredInsertCommand(txn, index, search(2), row(2, "after"),
-                    TABLE_ID, Duration.ofSeconds(1)));
+                    TABLE_ID, Optional.empty(), Duration.ofSeconds(1)));
             assertEquals(UndoNo.of(2), txn.undoContext().lastUndoNo(),
                     "new writes after empty-boundary rollback continue with a fresh undo number");
 
@@ -403,7 +527,7 @@ class ClusteredDmlServiceTest {
             BTreeIndex index = createClusteredIndex(engine, dir.resolve("dml-statement-success.ibd"));
             Transaction txn = engine.transactionManager().begin(TransactionOptions.defaults());
             engine.dmlService().insert(new ClusteredInsertCommand(txn, index, search(1), row(1, "v1"),
-                    TABLE_ID, Duration.ofSeconds(1)));
+                    TABLE_ID, Optional.empty(), Duration.ofSeconds(1)));
 
             try (DmlStatementGuard ignored = engine.dmlService().beginStatement(txn, index)) {
                 engine.dmlService().update(new ClusteredUpdateCommand(txn, index, search(1), row(1, "v2"),
@@ -472,7 +596,7 @@ class ClusteredDmlServiceTest {
             BTreeIndex index = createClusteredIndex(engine, dir.resolve("dml-statement-doomed.ibd"));
             Transaction txn = engine.transactionManager().begin(TransactionOptions.defaults());
             engine.dmlService().insert(new ClusteredInsertCommand(txn, index, search(1), row(1, "v1"),
-                    TABLE_ID, Duration.ofSeconds(1)));
+                    TABLE_ID, Optional.empty(), Duration.ofSeconds(1)));
             TransactionSavepoint real = engine.rollbackService().createSavepoint(txn);
             TransactionSavepoint detached = new TransactionSavepoint(
                     txn, real.insertHead(), real.updateHead(), real.sequence() + 1_000);
@@ -506,7 +630,7 @@ class ClusteredDmlServiceTest {
 
             assertThrows(DmlDuplicateKeyException.class, () -> engine.dmlService().insert(
                     new ClusteredInsertCommand(duplicate, index, search(1), row(1, "v2"),
-                            TABLE_ID, Duration.ofSeconds(1))));
+                            TABLE_ID, Optional.empty(), Duration.ofSeconds(1))));
 
             assertEquals("v1", payloadOf(lookup(engine, index, 1).orElseThrow()));
             engine.lockManager().releaseAll(duplicate.transactionId());
@@ -608,6 +732,22 @@ class ClusteredDmlServiceTest {
         return new BTreeIndex(INDEX_ID, root, 0, idKey(), clusteredSchema(), true, leaf, nonLeaf);
     }
 
+    /** 创建同表空间 leaf/non-leaf/LOB 三 segment 的聚簇索引 fixture。 */
+    private static LobIndexSetup createLobClusteredIndex(StorageEngine engine, Path dataPath) {
+        DiskSpaceManager disk = engine.diskSpaceManager();
+        MiniTransaction boot = engine.miniTransactionManager().begin(
+                engine.miniTransactionManager().budgetFor(RedoBudgetPurpose.ENGINE_BOOT));
+        disk.createTablespace(boot, SPACE, dataPath, PageNo.of(64));
+        SegmentRef leaf = disk.createSegment(boot, SPACE, SegmentPurpose.INDEX_LEAF);
+        SegmentRef nonLeaf = disk.createSegment(boot, SPACE, SegmentPurpose.INDEX_NON_LEAF);
+        SegmentRef lob = disk.createSegment(boot, SPACE, SegmentPurpose.LOB);
+        PageId root = disk.allocatePage(boot, leaf);
+        engine.indexPageAccess().createIndexPage(boot, root, INDEX_ID, 0);
+        engine.miniTransactionManager().commit(boot);
+        return new LobIndexSetup(new BTreeIndex(INDEX_ID, root, 0, idKey(), lobSchema(), true,
+                leaf, nonLeaf), lob);
+    }
+
     private static Optional<BTreeLookupResult> lookup(StorageEngine engine, BTreeIndex index, long id) {
         MiniTransaction read = engine.miniTransactionManager().beginReadOnly();
         try {
@@ -637,7 +777,7 @@ class ClusteredDmlServiceTest {
     private static void insertAndCommit(StorageEngine engine, BTreeIndex index, long id, String payload) {
         Transaction txn = engine.transactionManager().begin(TransactionOptions.defaults());
         engine.dmlService().insert(new ClusteredInsertCommand(txn, index, search(id), row(id, payload),
-                TABLE_ID, Duration.ofSeconds(1)));
+                TABLE_ID, Optional.empty(), Duration.ofSeconds(1)));
         engine.dmlService().commit(new DmlCommitCommand(txn, DurabilityPolicy.FLUSH_ON_COMMIT,
                 Duration.ofSeconds(2)));
     }
@@ -666,14 +806,14 @@ class ClusteredDmlServiceTest {
         gate.openForUserTraffic();
         return new ClusteredDmlService(engine.transactionManager(), engine.undoLogManager(),
                 engine.miniTransactionManager(), engine.btreeService(), engine.btreeCurrentReadService(),
-                engine.rollbackService(), engine.lockManager(), redo, gate);
+                engine.rollbackService(), engine.lockManager(), redo, gate, engine.lobStorage());
     }
 
     private static ClusteredDmlService serviceWithGate(StorageEngine engine, RecoveryTrafficGate gate) {
         return new ClusteredDmlService(engine.transactionManager(), engine.undoLogManager(),
                 engine.miniTransactionManager(), engine.btreeService(), engine.btreeCurrentReadService(),
                 engine.rollbackService(), engine.lockManager(),
-                engine.miniTransactionManager().redoLogManager(), gate);
+                engine.miniTransactionManager().redoLogManager(), gate, engine.lobStorage());
     }
 
     private static BTreeIndex clusteredIndex() {
@@ -689,6 +829,44 @@ class ClusteredDmlServiceTest {
         return new TableSchema(1, List.of(
                 new ColumnDef(new ColumnId(0), "id", ColumnType.intType(false, false), 0),
                 new ColumnDef(new ColumnId(1), "payload", ColumnType.varchar(200, true), 1)), true);
+    }
+
+    private static TableSchema lobSchema() {
+        return new TableSchema(1, List.of(
+                new ColumnDef(new ColumnId(0), "id", ColumnType.intType(false, false), 0),
+                new ColumnDef(new ColumnId(1), "text_value", ColumnType.text(false), 1),
+                new ColumnDef(new ColumnId(2), "blob_value", ColumnType.blob(false), 2)), true);
+    }
+
+    /** LOB DML fixture 的聚簇索引与权威 table LOB segment。 */
+    private record LobIndexSetup(BTreeIndex index, SegmentRef lobSegment) {
+    }
+
+    /** open 前注入、建表后安装精确 target 的测试 resolver；生产 Dictionary adapter 不需要这层可变接缝。 */
+    private static final class MutableUndoTargetResolver
+            implements IndexMetadataResolver, UndoTargetMetadataResolver {
+        private UndoTargetMetadata target;
+
+        private void install(UndoTargetMetadata target) {
+            this.target = target;
+        }
+
+        @Override
+        public BTreeIndex resolve(long tableId, long indexId) {
+            return requireTarget(tableId, indexId).clusteredIndex();
+        }
+
+        @Override
+        public UndoTargetMetadata resolveTarget(long tableId, long indexId) {
+            return requireTarget(tableId, indexId);
+        }
+
+        private UndoTargetMetadata requireTarget(long tableId, long indexId) {
+            if (target == null || tableId != TABLE_ID || target.clusteredIndex().indexId() != indexId) {
+                throw new DatabaseValidationException("unknown test undo target");
+            }
+            return target;
+        }
     }
 
     private static SearchKey search(long id) {

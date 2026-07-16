@@ -74,6 +74,61 @@ final class UndoPayloadStorage {
                 plan.record().undoNo(), pages.get(0).pageNo(), payload.length, pages.size(), plan.crc32());
     }
 
+    /**
+     * prepared append 阶段固定全部 external payload 页并取得 X guard，但不写 placeholder body。新页此时仍不可达；
+     * root descriptor 只会在 {@link #writePrepared(UndoSegmentHandle, UndoRecordWritePlan, List)} 完成真实 body 后发布。
+     */
+    List<PageId> preparePages(MiniTransaction mtr, UndoSpaceAllocator allocator, UndoSegmentHandle handle,
+                              int pageCount) {
+        if (mtr == null || allocator == null || handle == null || pageCount <= 0) {
+            throw new DatabaseValidationException("prepared undo payload page arguments are invalid");
+        }
+        List<PageId> pages = new ArrayList<>(pageCount);
+        try (var ignored = mtr.allowOutOfOrderPageLatch(
+                "prepared external undo pages are fresh and unreachable; FSP never waits for undo page latches")) {
+            for (int i = 0; i < pageCount; i++) {
+                PageId pageId = allocator.allocatePage(mtr, handle.spaceId(), handle.inodeSlot(), handle.segmentId());
+                requireOrdinaryAccess(mtr, pageId.spaceId());
+                mtr.newPage(pool, pageId, PageLatchMode.EXCLUSIVE, PageType.UNDO_PAYLOAD);
+                pages.add(pageId);
+            }
+        }
+        return List.copyOf(pages);
+    }
+
+    /**
+     * 把真实 undo payload 写入 prepare 阶段已经固定的页。页数与 retained X guard 必须精确匹配；任何偏差表示
+     * prepared shape 被破坏，必须在 root descriptor/record slot 发布前拒绝。
+     */
+    UndoPayloadDescriptor writePrepared(MiniTransaction mtr, UndoSegmentHandle handle,
+                                        UndoRecordWritePlan plan, List<PageId> pages) {
+        if (mtr == null || handle == null || plan == null || pages == null || !plan.external()
+                || pages.size() != plan.externalPageCount()) {
+            throw new DatabaseValidationException("prepared undo payload shape mismatch");
+        }
+        byte[] payload = plan.encodedPayloadUnsafe();
+        int capacity = UndoPayloadPageLayout.payloadCapacity(pageSize);
+        for (int i = 0; i < pages.size(); i++) {
+            PageId pageId = pages.get(i);
+            PageGuard guard = mtr.retainedExclusivePage(pageId);
+            if (guard == null) {
+                throw new UndoLogFormatException("prepared undo payload page lost its X guard: " + pageId);
+            }
+            int offset = i * capacity;
+            int length = Math.min(capacity, payload.length - offset);
+            byte[] chunk = new byte[length];
+            System.arraycopy(payload, offset, chunk, 0, length);
+            long previous = i == 0 ? FilePageHeader.FIL_NULL : pages.get(i - 1).pageNo().value();
+            long next = i + 1 == pages.size() ? FilePageHeader.FIL_NULL : pages.get(i + 1).pageNo().value();
+            UndoPayloadPage.format(guard, pageId, previous, next, i, handle,
+                    plan.record().transactionId(), plan.record().undoNo(), payload.length,
+                    pages.size(), plan.crc32(), chunk);
+        }
+        return new UndoPayloadDescriptor(plan.record().type(), plan.record().transactionId(),
+                plan.record().undoNo(), pages.getFirst().pageNo(), payload.length, pages.size(), plan.crc32());
+    }
+
+
     /** 严格读取 descriptor 指向的页链；任何 link、owner、长度、页数或 CRC 不一致都拒绝返回部分记录。 */
     byte[] read(MiniTransaction mtr, SpaceId spaceId, SegmentIdentity owner,
                 UndoPayloadDescriptor descriptor, int maxExternalPages) {

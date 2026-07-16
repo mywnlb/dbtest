@@ -1,6 +1,7 @@
 package cn.zhangyis.db.storage.undo;
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
+import cn.zhangyis.db.common.exception.DatabaseRuntimeException;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.LobReference;
 import cn.zhangyis.db.domain.SegmentId;
@@ -21,6 +22,7 @@ import cn.zhangyis.db.storage.record.type.TemporalKind;
 import cn.zhangyis.db.storage.record.type.TypeCodecRegistry;
 import org.junit.jupiter.api.Test;
 
+import java.io.ByteArrayOutputStream;
 import java.util.Arrays;
 import java.util.List;
 
@@ -265,5 +267,145 @@ class UndoRecordCodecTest {
                 0x01                                               // col0 nullFlag=1 (NULL)
         };
         assertArrayEquals(expected, buf, "INSERT undo framing must stay byte-stable");
+    }
+
+    /** 新 INSERT ownership 尾部复用各目标列 LobCodec，可同时保存多列且 identity peek 仍只读固定前缀。 */
+    @Test
+    void roundTripsMultipleInsertedLobOwnershipsWithoutChangingIdentityPrefix() {
+        UndoRecord expected = lobInsert(List.of(
+                ownership(1, TypeId.TEXT, 64, "hello".getBytes()),
+                ownership(2, TypeId.LONGBLOB, 65, new byte[]{9, 8, 7})));
+        UndoRecordCodec codec = new UndoRecordCodec(registry);
+
+        byte[] encoded = codec.encode(expected, lobKey(), lobSchema());
+        UndoRecord decoded = codec.decode(encoded, 0, lobKey(), lobSchema());
+        UndoRecordIdentity identity = codec.peekIdentity(encoded, 0);
+
+        assertEquals(expected, decoded);
+        assertEquals(expected.undoNo(), identity.undoNo());
+        assertEquals(expected.transactionId(), identity.transactionId());
+        assertEquals(expected.tableId(), identity.tableId());
+        assertEquals(expected.indexId(), identity.indexId());
+    }
+
+    /** magic/version/count/ordinal/length/value tag 的任何歧义都按 undo corruption fail-closed。 */
+    @Test
+    void rejectsCorruptInsertedLobOwnershipTail() {
+        UndoRecordCodec codec = new UndoRecordCodec(registry);
+        UndoRecord one = lobInsert(List.of(ownership(1, TypeId.TEXT, 64, "hello".getBytes())));
+        byte[] legacy = codec.encode(lobInsert(List.of()), lobKey(), lobSchema());
+        byte[] encoded = codec.encode(one, lobKey(), lobSchema());
+        int tail = legacy.length;
+
+        byte[] badMagic = encoded.clone();
+        badMagic[tail] ^= 0x01;
+        byte[] badVersion = encoded.clone();
+        badVersion[tail + 2] = 99;
+        byte[] badCount = encoded.clone();
+        badCount[tail + 3] = 0;
+        badCount[tail + 4] = 2;
+        byte[] nonLobOrdinal = encoded.clone();
+        nonLobOrdinal[tail + 5] = 0;
+        nonLobOrdinal[tail + 6] = 0;
+        byte[] badLength = encoded.clone();
+        badLength[tail + 7] = 0;
+        badLength[tail + 8] = 0;
+        byte[] inlineValue = encoded.clone();
+        inlineValue[tail + 9] = 0;
+        byte[] truncated = Arrays.copyOf(encoded, encoded.length - 1);
+        byte[] trailing = Arrays.copyOf(encoded, encoded.length + 1);
+
+        for (byte[] corrupt : List.of(badMagic, badVersion, badCount, nonLobOrdinal, badLength,
+                inlineValue, truncated, trailing)) {
+            assertThrows(UndoLogFormatException.class,
+                    () -> codec.decode(corrupt, 0, lobKey(), lobSchema()));
+        }
+    }
+
+    /** codec 还要复核 schema/type 与严格递增 ordinal；领域对象本身不持 TableSchema，不能提前完成这两项。 */
+    @Test
+    void rejectsOwnershipTypeMismatchAndDuplicateOrdinalOnDisk() {
+        UndoRecordCodec codec = new UndoRecordCodec(registry);
+        UndoRecord mismatched = lobInsert(List.of(ownership(1, TypeId.LONGBLOB, 64, new byte[]{1, 2})));
+        assertThrows(DatabaseRuntimeException.class, () -> codec.encode(mismatched, lobKey(), lobSchema()));
+
+        byte[] legacy = codec.encode(lobInsert(List.of()), lobKey(), lobSchema());
+        byte[] encoded = codec.encode(lobInsert(List.of(
+                ownership(1, TypeId.TEXT, 64, "a".getBytes()),
+                ownership(2, TypeId.LONGBLOB, 65, new byte[]{2}))), lobKey(), lobSchema());
+        int tail = legacy.length;
+        int firstEncodedLength = ((encoded[tail + 7] & 0xFF) << 8) | (encoded[tail + 8] & 0xFF);
+        int secondOrdinal = tail + 9 + firstEncodedLength;
+        encoded[secondOrdinal] = 0;
+        encoded[secondOrdinal + 1] = 1;
+
+        assertThrows(UndoLogFormatException.class, () -> codec.decode(encoded, 0, lobKey(), lobSchema()));
+    }
+
+    /** UPDATE/DELETE 没有 ownership extension；扩展 INSERT 时不得改动两类既有 old-image golden bytes。 */
+    @Test
+    void updateAndDeleteMarkGoldenBytesRemainUnchanged() {
+        TableSchema schema = new TableSchema(1, List.of(
+                new ColumnDef(new ColumnId(0), "id", ColumnType.intType(false, true), 0)), true);
+        IndexKeyDef key = new IndexKeyDef(9L,
+                List.of(new KeyPartDef(new ColumnId(0), KeyOrder.ASC, 0)));
+        RollPointer prev = RollPointer.NULL;
+        UndoRecord update = UndoRecord.update(UndoNo.of(6), TransactionId.of(0x99), 7, 9,
+                List.of(ColumnValue.NullValue.INSTANCE), List.of(ColumnValue.NullValue.INSTANCE),
+                OLD_HIDDEN, prev);
+        UndoRecord delete = UndoRecord.deleteMark(UndoNo.of(6), TransactionId.of(0x99), 7, 9,
+                List.of(ColumnValue.NullValue.INSTANCE), List.of(ColumnValue.NullValue.INSTANCE),
+                OLD_HIDDEN, prev);
+        UndoRecordCodec codec = new UndoRecordCodec(registry);
+
+        assertArrayEquals(legacyOldImageBytes(UndoRecordType.UPDATE_ROW), codec.encode(update, key, schema));
+        assertArrayEquals(legacyOldImageBytes(UndoRecordType.DELETE_MARK), codec.encode(delete, key, schema));
+    }
+
+    private static TableSchema lobSchema() {
+        return new TableSchema(1, List.of(
+                new ColumnDef(new ColumnId(0), "id", ColumnType.intType(false, false), 0),
+                new ColumnDef(new ColumnId(1), "description", ColumnType.text(true), 1),
+                new ColumnDef(new ColumnId(2), "payload", ColumnType.longBlob(true), 2)), true);
+    }
+
+    private static IndexKeyDef lobKey() {
+        return new IndexKeyDef(9L,
+                List.of(new KeyPartDef(new ColumnId(0), KeyOrder.ASC, 0)));
+    }
+
+    private static UndoRecord lobInsert(List<InsertedLobOwnership> ownerships) {
+        return UndoRecord.insert(UndoNo.of(8), TransactionId.of(0x1122334455L), 7, 9,
+                List.of(new ColumnValue.IntValue(42)), ownerships, RollPointer.NULL);
+    }
+
+    private static InsertedLobOwnership ownership(int ordinal, TypeId typeId, long pageNo, byte[] prefix) {
+        LobReference reference = new LobReference(SpaceId.of(7), PageNo.of(pageNo), 4_096, 1,
+                SegmentId.of(4), 2, 0x1234_5678L);
+        return new InsertedLobOwnership(ordinal, new ColumnValue.ExternalValue(typeId, reference, prefix));
+    }
+
+    /** 独立构造扩展前的 UPDATE/DELETE 简化 golden：key 与 old row 都是 NULL，避免依赖列 codec。 */
+    private static byte[] legacyOldImageBytes(UndoRecordType type) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        out.write(type.code());
+        writeU64(out, 6);
+        writeU64(out, 0x99);
+        writeU64(out, 7);
+        writeU64(out, 9);
+        out.writeBytes(RollPointer.NULL.encode());
+        out.write(1);
+        out.write(1);
+        writeU64(out, OLD_HIDDEN.dbTrxId().value());
+        out.writeBytes(OLD_HIDDEN.dbRollPtr().encode());
+        out.write(1);
+        out.write(1);
+        return out.toByteArray();
+    }
+
+    private static void writeU64(ByteArrayOutputStream out, long value) {
+        for (int shift = 56; shift >= 0; shift -= 8) {
+            out.write((int) ((value >>> shift) & 0xFF));
+        }
     }
 }

@@ -4,6 +4,8 @@ import cn.zhangyis.db.common.exception.DatabaseRuntimeException;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.dd.cache.DictionaryObjectCache;
 import cn.zhangyis.db.engine.adapter.DictionaryIndexMetadataResolver;
+import cn.zhangyis.db.engine.adapter.DictionaryStorageMetadataMapper;
+import cn.zhangyis.db.engine.adapter.DefaultSqlStorageGateway;
 import cn.zhangyis.db.dd.ddl.DictionaryDdlService;
 import cn.zhangyis.db.dd.mdl.MetadataLockManager;
 import cn.zhangyis.db.dd.recovery.DictionaryDdlRecoveryService;
@@ -19,11 +21,27 @@ import cn.zhangyis.db.storage.engine.EngineTablespaceConfig;
 import cn.zhangyis.db.storage.engine.StorageEngine;
 import cn.zhangyis.db.storage.fil.catalog.FileInternalCatalogStore;
 import lombok.extern.slf4j.Slf4j;
+import cn.zhangyis.db.session.DefaultSqlSession;
+import cn.zhangyis.db.session.SessionId;
+import cn.zhangyis.db.session.SessionOptions;
+import cn.zhangyis.db.session.SessionRegistry;
+import cn.zhangyis.db.session.SqlSession;
+import cn.zhangyis.db.sql.binder.DefaultSqlBinder;
+import cn.zhangyis.db.sql.binder.SqlTypeCoercion;
+import cn.zhangyis.db.sql.executor.DefaultSqlExecutor;
+import cn.zhangyis.db.sql.parser.DefaultSqlParser;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.ArrayList;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -42,6 +60,8 @@ public final class DatabaseEngine implements AutoCloseable {
 
     /** 只保护组合根 open/close 状态，不参与任何页、MDL 或事务操作。 */
     private final ReentrantLock lifecycleLock = new ReentrantLock();
+    /** 序列化可能跨 lifecycle lock 外等待 Session 的 close 尝试；使用有界 tryLock。 */
+    private final ReentrantLock closeWorkLock = new ReentrantLock(true);
     private final EngineConfig baseConfig;
 
     private volatile DatabaseEngineState state = DatabaseEngineState.NEW;
@@ -53,6 +73,10 @@ public final class DatabaseEngine implements AutoCloseable {
     private StorageEngine storage;
     private DataDictionaryService dictionary;
     private DictionaryDdlService ddl;
+    private DictionaryStorageMetadataMapper sqlMetadataMapper;
+    private DefaultSqlParser sqlParser;
+    private DefaultSqlBinder sqlBinder;
+    private SessionRegistry sessions;
 
     public DatabaseEngine(EngineConfig config) {
         if (config == null) {
@@ -101,6 +125,11 @@ public final class DatabaseEngine implements AutoCloseable {
                         storage.tableDdlStorageService(), tablesDirectory);
                 new DictionaryDdlRecoveryService(controlStore, repository, cache,
                         storage.tableDdlStorageService(), tablesDirectory).recover(baseConfig.flushTimeout());
+                // SQL/session 只能在 storage recovery 与 DDL recovery 都成功后发布，避免半恢复实例接受用户语句。
+                sqlMetadataMapper = new DictionaryStorageMetadataMapper();
+                sqlParser = new DefaultSqlParser();
+                sqlBinder = new DefaultSqlBinder(new SqlTypeCoercion());
+                sessions = new SessionRegistry();
                 state = DatabaseEngineState.OPEN;
                 log.info("database engine opened: tablespaces={} dictionaryVersion={}", tablespaces.size(),
                         repository.snapshot().publishedVersion().value());
@@ -132,27 +161,114 @@ public final class DatabaseEngine implements AutoCloseable {
         return storage;
     }
 
+    /**
+     * 创建一个进程内 SQL Session。构造、初始 implicit transaction 和 registry publish 都在 lifecycle lock 内，
+     * 因而 close 一旦切到 CLOSING，后续 openSession 不可能漏进 close 快照。
+     */
+    public SqlSession openSession(SessionOptions options) {
+        if (options == null) throw new DatabaseValidationException("session options must not be null");
+        lifecycleLock.lock();
+        try {
+            requireOpen();
+            SessionId id = sessions.nextId();
+            DefaultSqlStorageGateway gateway = new DefaultSqlStorageGateway(storage, sqlMetadataMapper,
+                    options.rowLockTimeout());
+            DefaultSqlSession session = new DefaultSqlSession(id, options, dictionary, sqlParser, sqlBinder,
+                    new DefaultSqlExecutor(gateway), gateway, () -> sessions.deregister(id));
+            sessions.register(session);
+            return session;
+        } finally {
+            lifecycleLock.unlock();
+        }
+    }
+
     /** 返回当前组合根生命周期状态，不触发任何 IO。 */
     public DatabaseEngineState state() {
         return state;
     }
 
-    /** 先关闭会 flush 用户表的 StorageEngine，再关闭 DD sidecar channel；所有失败聚合保留。 */
+    /**
+     * 关闭顺序：切 CLOSING 拒绝新流量 → lifecycle lock 外并发等待 Session rollback/quiesce → StorageEngine flush/close
+     * → DD sidecar。若 Session 在总 timeout 内未退出，保持 CLOSING 且绝不关闭仍可能被执行线程访问的 storage。
+     */
     @Override
     public void close() {
-        lifecycleLock.lock();
+        boolean closeOwner;
         try {
-            if (state == DatabaseEngineState.CLOSED) {
-                return;
-            }
-            RuntimeException aggregate = closeResources(null);
-            state = DatabaseEngineState.CLOSED;
-            if (aggregate != null) {
-                throw aggregate;
-            }
-        } finally {
-            lifecycleLock.unlock();
+            closeOwner = closeWorkLock.tryLock(baseConfig.flushTimeout().toNanos(), TimeUnit.NANOSECONDS);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new DatabaseRuntimeException("database close wait interrupted", interrupted);
         }
+        if (!closeOwner) throw new DatabaseRuntimeException("database close already in progress beyond timeout");
+        try {
+            List<SqlSession> snapshot;
+            lifecycleLock.lock();
+            try {
+                if (state == DatabaseEngineState.CLOSED) return;
+                state = DatabaseEngineState.CLOSING;
+                snapshot = sessions == null ? List.of() : sessions.snapshot();
+            } finally {
+                lifecycleLock.unlock();
+            }
+
+            SessionCloseResult sessionResult = closeSessions(snapshot, baseConfig.flushTimeout());
+            if (!sessionResult.quiesced()) {
+                // storage/catalog 保持原样；调用方可在活动 execute 退出后重试 close。
+                throw sessionResult.failure();
+            }
+            RuntimeException aggregate = closeResources(sessionResult.failure());
+            lifecycleLock.lock();
+            try { state = DatabaseEngineState.CLOSED; }
+            finally { lifecycleLock.unlock(); }
+            if (aggregate != null) throw aggregate;
+        } finally {
+            closeWorkLock.unlock();
+        }
+    }
+
+    /**
+     * 用 virtual thread 并发请求 snapshot 中所有 Session close，共享单一 engine deadline。close 异常只聚合，仍等待
+     * 其它 Session；超时/中断则取消等待并返回 quiesced=false，禁止下游资源关闭。
+     */
+    private static SessionCloseResult closeSessions(List<SqlSession> snapshot, java.time.Duration timeout) {
+        if (snapshot.isEmpty()) return new SessionCloseResult(true, null);
+        ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+        List<Future<RuntimeException>> futures = new ArrayList<>(snapshot.size());
+        for (SqlSession session : snapshot) {
+            futures.add(executor.submit(() -> {
+                try { session.close(); return null; }
+                catch (RuntimeException failure) { return failure; }
+            }));
+        }
+        long deadline = deadline(timeout);
+        RuntimeException failure = null;
+        boolean quiesced = true;
+        try {
+            for (Future<RuntimeException> future : futures) {
+                long remaining = deadline == Long.MAX_VALUE ? Long.MAX_VALUE : deadline - System.nanoTime();
+                if (remaining <= 0) throw new TimeoutException("session close deadline expired");
+                RuntimeException sessionFailure = future.get(remaining, TimeUnit.NANOSECONDS);
+                failure = appendFailure(failure, sessionFailure);
+            }
+        } catch (TimeoutException timeoutFailure) {
+            quiesced = false;
+            failure = appendFailure(failure,
+                    new DatabaseRuntimeException("active sessions did not quiesce before engine close timeout",
+                            timeoutFailure));
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            quiesced = false;
+            failure = appendFailure(failure,
+                    new DatabaseRuntimeException("engine session close wait interrupted", interrupted));
+        } catch (ExecutionException impossible) {
+            failure = appendFailure(failure,
+                    new DatabaseRuntimeException("session close task failed outside captured runtime error", impossible));
+        } finally {
+            if (!quiesced) for (Future<RuntimeException> future : futures) future.cancel(true);
+            executor.shutdownNow();
+        }
+        return new SessionCloseResult(quiesced, failure);
     }
 
     private RuntimeException closeResources(RuntimeException primary) {
@@ -165,6 +281,10 @@ public final class DatabaseEngine implements AutoCloseable {
             }
         }
         storage = null;
+        sqlMetadataMapper = null;
+        sqlParser = null;
+        sqlBinder = null;
+        sessions = null;
         failure = closeOne(controlStore, failure);
         controlStore = null;
         failure = closeOne(catalogStore, failure);
@@ -187,12 +307,21 @@ public final class DatabaseEngine implements AutoCloseable {
     }
 
     private static RuntimeException appendFailure(RuntimeException failure, RuntimeException additional) {
+        if (additional == null) return failure;
         if (failure == null) {
             return additional;
         }
         failure.addSuppressed(additional);
         return failure;
     }
+
+    private static long deadline(java.time.Duration timeout) {
+        long now = System.nanoTime();
+        try { return Math.addExact(now, timeout.toNanos()); }
+        catch (ArithmeticException overflow) { return Long.MAX_VALUE; }
+    }
+
+    private record SessionCloseResult(boolean quiesced, RuntimeException failure) { }
 
     private void ensureBaseDirectory() {
         try {

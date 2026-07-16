@@ -148,7 +148,14 @@ public final class PageCleanerSupervisor implements AutoCloseable {
                     ? new PageCleanerWorkerSnapshot(state, false, 0, 0, false, lastErrorMessage)
                     : worker.snapshot();
             recordSuccessfulCyclesLocked(workerSnapshot);
-            state = workerSnapshot.state();
+            // FAILED 可能表示 supervisor 正在替换已经 STOPPED 的旧 worker；STOPPING/STOPPED 则是 supervisor
+            // 自己发布的终态。这三种状态都比 worker 快照权威，不能被旧 worker 的 STOPPED 或尚未停下的 IDLE
+            // 反向覆盖，否则等待方会把旧状态误认成 replacement 已经发布，甚至在 close 期间重新放行请求。
+            if (state != PageCleanerState.FAILED
+                    && state != PageCleanerState.STOPPING
+                    && state != PageCleanerState.STOPPED) {
+                state = workerSnapshot.state();
+            }
             boolean lastCyclePresent = successfulCycles > 0 || workerSnapshot.lastCyclePresent();
             return new PageCleanerMetricsSnapshot(state, restartCount, successfulCycles,
                     failedCycles, lastCyclePresent, lastErrorMessage,
@@ -242,6 +249,14 @@ public final class PageCleanerSupervisor implements AutoCloseable {
         }
     }
 
+    /**
+     * 收敛失败 worker 并在预算允许时安装 replacement。
+     *
+     * <p>数据流：monitor 提供失败快照；本方法先在 supervisor 锁内累计 metrics，并发布 FAILED 作为重启过渡态，
+     * 再在锁外停止旧 worker、执行有界 backoff 和启动 replacement，最后回到锁内一次发布新 worker 与其状态。
+     * FAILED 必须先于锁外 stop 发布，否则旧 IDLE 会让 {@link #awaitState(PageCleanerState, Duration)} 提前成功；
+     * replacement 发布前也不接受 flush 请求，避免请求落到已停止的旧 worker。
+     */
     private void handleFailedWorker(PageCleanerWorkerSnapshot snapshot) {
         lock.lock();
         try {
@@ -259,6 +274,8 @@ public final class PageCleanerSupervisor implements AutoCloseable {
             }
             restartCount++;
             observedWorkerCycles = 0;
+            state = PageCleanerState.FAILED;
+            stateChanged.signalAll();
         } finally {
             lock.unlock();
         }

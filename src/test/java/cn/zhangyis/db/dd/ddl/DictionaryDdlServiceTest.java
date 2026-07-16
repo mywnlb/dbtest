@@ -13,6 +13,7 @@ import cn.zhangyis.db.dd.repo.DictionaryControlStore;
 import cn.zhangyis.db.dd.repo.PersistentDictionaryRepository;
 import cn.zhangyis.db.dd.recovery.DictionaryDdlRecoveryService;
 import cn.zhangyis.db.dd.service.DataDictionaryService;
+import cn.zhangyis.db.dd.service.TableAccessIntent;
 import cn.zhangyis.db.engine.DatabaseEngine;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
@@ -71,7 +72,8 @@ class DictionaryDdlServiceTest {
             assertEquals(TableState.ACTIVE, repository.findTable(table.id()).orElseThrow().state());
             DataDictionaryService dictionary = new DataDictionaryService(repository, cache, locks);
             try (var lease = dictionary.openTable(MdlOwnerId.of(2),
-                    QualifiedTableName.of("APP", "ORDERS"), Duration.ofSeconds(1))) {
+                    QualifiedTableName.of("APP", "ORDERS"), TableAccessIntent.READ,
+                    Duration.ofSeconds(1))) {
                 assertEquals(table.id(), lease.table().id());
             }
 
@@ -173,7 +175,8 @@ class DictionaryDdlServiceTest {
         try (DatabaseEngine database = new DatabaseEngine(config())) {
             database.open();
             try (var lease = database.dictionary().openTable(MdlOwnerId.of(21),
-                    QualifiedTableName.of("app", "orders"), Duration.ofSeconds(2))) {
+                    QualifiedTableName.of("app", "orders"), TableAccessIntent.READ,
+                    Duration.ofSeconds(2))) {
                 assertEquals(TableState.ACTIVE, lease.table().state());
             }
         }
@@ -212,7 +215,8 @@ class DictionaryDdlServiceTest {
                     MdlOwnerId.of(30), QualifiedTableName.of("app", "orders"), Duration.ofSeconds(5)));
             assertTrue(Files.exists(tableFile), "uncertain DROP publish must not start physical deletion");
             assertThrows(DictionaryObjectNotFoundException.class, () -> liveDictionary.openTable(
-                    MdlOwnerId.of(31), QualifiedTableName.of("app", "orders"), Duration.ofSeconds(2)));
+                    MdlOwnerId.of(31), QualifiedTableName.of("app", "orders"), TableAccessIntent.READ,
+                    Duration.ofSeconds(2)));
         } finally {
             storage.close();
         }
@@ -221,7 +225,8 @@ class DictionaryDdlServiceTest {
             database.open();
             assertFalse(Files.exists(tableFile), "startup must resume durable DROP_PENDING physical deletion");
             assertThrows(DictionaryObjectNotFoundException.class, () -> database.dictionary().openTable(
-                    MdlOwnerId.of(32), QualifiedTableName.of("app", "orders"), Duration.ofSeconds(2)));
+                    MdlOwnerId.of(32), QualifiedTableName.of("app", "orders"), TableAccessIntent.READ,
+                    Duration.ofSeconds(2)));
         }
     }
 

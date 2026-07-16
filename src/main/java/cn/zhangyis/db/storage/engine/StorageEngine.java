@@ -98,6 +98,7 @@ import cn.zhangyis.db.storage.trx.RecoveredUndoLogIdentity;
 import cn.zhangyis.db.storage.trx.TransactionManager;
 import cn.zhangyis.db.storage.trx.TransactionCounterSnapshot;
 import cn.zhangyis.db.storage.trx.TransactionSystem;
+import cn.zhangyis.db.storage.trx.UndoTargetMetadataResolver;
 import cn.zhangyis.db.storage.trx.UndoLogManager;
 import cn.zhangyis.db.storage.trx.UndoSegmentFinalizer;
 import cn.zhangyis.db.storage.trx.UndoSegmentReuseDirectory;
@@ -396,13 +397,17 @@ public final class StorageEngine {
                 new BTreeCurrentReadService(miniTransactionManager, btreeService, lockManager);
         this.mvccReader = new MvccReader(miniTransactionManager, btreeService, undoAccess,
                 config.undoSpaceId(), config.maxVersionHops());
-        this.rollbackService = indexMetadataResolver == null
+        this.rollbackService = indexMetadataResolver instanceof UndoTargetMetadataResolver targetResolver
                 ? new RollbackService(btreeService, undoAccess, transactionManager,
-                        miniTransactionManager, undoSegmentFinalizer)
-                : new RollbackService(btreeService, undoAccess, transactionManager,
-                        miniTransactionManager, undoSegmentFinalizer, indexMetadataResolver);
+                        miniTransactionManager, undoSegmentFinalizer, lobStorage, targetResolver)
+                : indexMetadataResolver == null
+                        ? new RollbackService(btreeService, undoAccess, transactionManager,
+                                miniTransactionManager, undoSegmentFinalizer)
+                        : new RollbackService(btreeService, undoAccess, transactionManager,
+                                miniTransactionManager, undoSegmentFinalizer, indexMetadataResolver);
         this.dmlService = new ClusteredDmlService(transactionManager, undoLogManager, miniTransactionManager,
-                btreeService, btreeCurrentReadService, rollbackService, lockManager, redo, recoveryGate);
+                btreeService, btreeCurrentReadService, rollbackService, lockManager, redo, recoveryGate,
+                lobStorage);
 
         // WAL 安全淘汰：注入淘汰刷盘端口，使脏页淘汰复用 FlushCoordinator 的 WAL gate + checksum + doublewrite
         // 管线。必须在 FlushCoordinator 就绪后、任何可能触发淘汰的 page access（fresh 建系统 undo / recover）之前注入。

@@ -270,6 +270,11 @@ final class DictionaryCatalogCodec {
                     writeSegment(out, index.leafSegment());
                     writeSegment(out, index.nonLeafSegment());
                 }
+                out.writeByte(binding.lobSegment().isPresent() ? 1 : 0);
+                if (binding.lobSegment().isPresent()) {
+                    writeSegment(out, binding.lobSegment().orElseThrow(() ->
+                            new DictionaryCatalogCorruptionException("present LOB segment unexpectedly missing")));
+                }
             }
         });
     }
@@ -305,7 +310,19 @@ final class DictionaryCatalogCodec {
                     bindings.add(new IndexStorageBinding(indexId, root, level,
                             readSegment(in, spaceId), readSegment(in, spaceId)));
                 }
-                binding = Optional.of(new TableStorageBinding(id.value(), spaceId, path, bindings));
+                // 扩展前的 catalog 在最后一个 index binding 后立即 EOF；这是唯一兼容判据，不能按 DD version 猜测。
+                Optional<SegmentRef> lobSegment = Optional.empty();
+                if (in.available() > 0) {
+                    int hasLobSegment = in.readUnsignedByte();
+                    if (hasLobSegment > 1) {
+                        throw new DictionaryCatalogCorruptionException(
+                                "unknown table LOB segment flag: " + hasLobSegment);
+                    }
+                    if (hasLobSegment == 1) {
+                        lobSegment = Optional.of(readSegment(in, spaceId));
+                    }
+                }
+                binding = Optional.of(new TableStorageBinding(id.value(), spaceId, path, bindings, lobSegment));
             }
             return new TableRoot(id, schemaId, name, version, TableState.values()[stateCode],
                     columnCount, indexCount, binding);

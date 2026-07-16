@@ -10,6 +10,7 @@ import org.junit.jupiter.api.Test;
 
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
@@ -50,7 +51,23 @@ class StorageDdlDomainTest {
                 new SegmentRef(tableSpace, 2, SegmentId.of(12)));
 
         assertThrows(DatabaseValidationException.class, () -> new TableStorageBinding(
-                2, tableSpace, Path.of("table.ibd"), List.of(index)));
+                2, tableSpace, Path.of("table.ibd"), List.of(index), Optional.empty()));
+    }
+
+    /** LOB segment 是 table binding 的独占物理资源，不得跨 space 或复用任一 index segment identity。 */
+    @Test
+    void rejectsInvalidOrAliasedTableLobSegment() {
+        SpaceId tableSpace = SpaceId.of(1024);
+        SegmentRef leaf = new SegmentRef(tableSpace, 1, SegmentId.of(11));
+        SegmentRef nonLeaf = new SegmentRef(tableSpace, 2, SegmentId.of(12));
+        IndexStorageBinding index = new IndexStorageBinding(3,
+                PageId.of(tableSpace, PageNo.of(8)), 0, leaf, nonLeaf);
+
+        assertThrows(DatabaseValidationException.class, () -> new TableStorageBinding(
+                2, tableSpace, Path.of("table.ibd"), List.of(index), Optional.of(leaf)));
+        assertThrows(DatabaseValidationException.class, () -> new TableStorageBinding(
+                2, tableSpace, Path.of("table.ibd"), List.of(index), Optional.of(
+                        new SegmentRef(SpaceId.of(2048), 3, SegmentId.of(13)))));
     }
 
     private static List<StorageColumnDefinition> columns() {

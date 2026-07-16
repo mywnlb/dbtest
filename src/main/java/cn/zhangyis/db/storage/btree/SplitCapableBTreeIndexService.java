@@ -197,6 +197,68 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
     }
 
     /**
+     * 为 LOB-aware INSERT 固定聚簇页路径与 SMO 资源，但不发布 placeholder row。placeholder 已包含定长 external
+     * reference；prepare 用 {@link RollPointer#NULL} 盖同宽隐藏列完成 exact encoded-length/fit 判断。若 leaf 需 split，
+     * 在仍持 index X 链时进入显式越序 scope 并预留最坏页数；该 scope 延续到 LOB 分配完成。
+     *
+     * <p>index→FSP/LOB 的无环证明：所有 LOB-aware writer 都先取得 index prepare guard，普通 SMO 也只沿
+     * index→FSP 分配；LOB/FSP 代码不反向获取任何 B+Tree latch，读者只持 index latch 且不等待 FSP，故不存在
+     * FSP→index 的反向等待边。
+     */
+    public PreparedClusteredInsert prepareClusteredInsert(MiniTransaction mtr, BTreeIndex index,
+                                                          LogicalRecord placeholder,
+                                                          TransactionId transactionId) {
+        if (mtr == null || index == null || placeholder == null || transactionId == null) {
+            throw new DatabaseValidationException("prepare clustered insert args must not be null");
+        }
+        if (!index.clustered() || transactionId.isNone()) {
+            throw new DatabaseValidationException("prepare clustered insert requires clustered index/write id");
+        }
+        LogicalRecord stampedPlaceholder = new LogicalRecord(placeholder.schemaVersion(), placeholder.columnValues(),
+                placeholder.deleted(), placeholder.recordType(),
+                new HiddenColumns(transactionId, RollPointer.NULL));
+        SearchKey expectedKey = keyOf(stampedPlaceholder, index);
+        int expectedLength = recordEncoder.encode(stampedPlaceholder, index.schema()).length;
+        List<IndexPageHandle> path = descendPathInsertSafeNode(mtr, index, expectedKey);
+        IndexPageHandle leafHandle = path.getLast();
+        RecordPage leaf = leafHandle.recordPage();
+        ensureUniqueAbsent(leaf, leafHandle.pageId(), index, expectedKey);
+        boolean requiresSplit = expectedLength > leaf.freeSpace();
+
+        var scope = mtr.allowOutOfOrderPageLatch(
+                "prepared clustered insert: all writers acquire index before FSP/LOB; FSP/LOB never wait for index");
+        SpaceReservation reservation = null;
+        try {
+            if (requiresSplit) {
+                reservation = reserveSplitSpace(mtr, index, splitReservationBudget(index, path));
+            }
+            SpaceReservation frozenReservation = reservation;
+            return new PreparedClusteredInsert(mtr, scope, frozenReservation, (actual, rollPointer) -> {
+                LogicalRecord stampedActual = new LogicalRecord(actual.schemaVersion(), actual.columnValues(),
+                        actual.deleted(), actual.recordType(), new HiddenColumns(transactionId, rollPointer));
+                SearchKey actualKey = keyOf(stampedActual, index);
+                int actualLength = recordEncoder.encode(stampedActual, index.schema()).length;
+                if (!actualKey.equals(expectedKey) || actualLength != expectedLength) {
+                    throw new PreparedInsertStateException(
+                            "actual clustered row changed key or encoded length after prepare");
+                }
+                if (requiresSplit) {
+                    return splitLeafAndPropagate(mtr, index, path, stampedActual);
+                }
+                RecordRef ref = inserter.insert(leaf, leafHandle.pageId(), stampedActual,
+                        index.keyDef(), index.schema());
+                return new BTreeInsertResult(index, ref);
+            });
+        } catch (RuntimeException error) {
+            if (reservation != null) {
+                reservation.close();
+            }
+            scope.close();
+            throw error;
+        }
+    }
+
+    /**
      * 聚簇记录物理删除（T1.3d，rollback 反向走链消费 INSERT undo 的删除原语）。数据流：导航到目标 leaf（level 0=root
      * leaf / level 1=chooseChild，X）→ {@code findEqual} 定位 → **所有权校验**（命中记录的 {@code DB_TRX_ID}/
      * {@code DB_ROLL_PTR} 必须同时等于调用方期望值）→ 未标记则 {@code deleteMark} 后 {@code purge}，已标记则跳过

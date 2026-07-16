@@ -3,6 +3,7 @@ package cn.zhangyis.db.dd.repo;
 import cn.zhangyis.db.dd.domain.ColumnDefinition;
 import cn.zhangyis.db.dd.domain.ColumnTypeDefinition;
 import cn.zhangyis.db.dd.domain.DictionaryVersion;
+import cn.zhangyis.db.dd.domain.DictionaryTypeId;
 import cn.zhangyis.db.dd.domain.IndexDefinition;
 import cn.zhangyis.db.dd.domain.IndexId;
 import cn.zhangyis.db.dd.domain.IndexKeyPart;
@@ -20,6 +21,7 @@ import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.SegmentId;
 import cn.zhangyis.db.domain.SpaceId;
+import cn.zhangyis.db.engine.adapter.DictionaryStorageMetadataMapper;
 import cn.zhangyis.db.storage.api.SegmentRef;
 import cn.zhangyis.db.storage.api.catalog.CatalogRecord;
 import cn.zhangyis.db.storage.api.ddl.IndexStorageBinding;
@@ -64,9 +66,13 @@ class PersistentDictionaryRepositoryTest {
         try (FileInternalCatalogStore store = FileInternalCatalogStore.openExisting(path)) {
             PersistentDictionaryRepository reopened = new PersistentDictionaryRepository(store);
             assertEquals("app", reopened.findSchema(ObjectName.of("APP")).orElseThrow().name().canonicalName());
-            assertEquals(1, reopened.findTable(TableId.of(2)).orElseThrow().columns().size());
+            assertEquals(2, reopened.findTable(TableId.of(2)).orElseThrow().columns().size());
             assertEquals(SpaceId.of(1024), reopened.findTable(TableId.of(2)).orElseThrow()
                     .storageBinding().orElseThrow().spaceId());
+            assertEquals(SegmentId.of(13), new DictionaryStorageMetadataMapper()
+                    .map(reopened.findTable(TableId.of(2)).orElseThrow())
+                    .lobSegment().orElseThrow().segmentId(),
+                    "真实 close/reopen 后 mapper 必须得到 catalog 中同一个 LOB segment identity");
             assertEquals(DictionaryVersion.of(2), reopened.snapshot().publishedVersion());
         }
     }
@@ -176,14 +182,18 @@ class PersistentDictionaryRepositoryTest {
     private static TableDefinition table(long version) {
         ColumnDefinition id = new ColumnDefinition(1, ObjectName.of("id"),
                 ColumnTypeDefinition.bigint(false, false), 0);
+        ColumnDefinition body = new ColumnDefinition(2, ObjectName.of("body"),
+                new ColumnTypeDefinition(DictionaryTypeId.TEXT, false, true, 65_535, 0, 1, 1, List.of()), 1);
         IndexDefinition primary = new IndexDefinition(IndexId.of(3), ObjectName.of("PRIMARY"), true, true,
                 List.of(new IndexKeyPart(1, IndexOrder.ASC, 0)));
         SegmentRef leaf = new SegmentRef(SpaceId.of(1024), 1, SegmentId.of(11));
         SegmentRef nonLeaf = new SegmentRef(SpaceId.of(1024), 2, SegmentId.of(12));
+        SegmentRef lob = new SegmentRef(SpaceId.of(1024), 3, SegmentId.of(13));
         TableStorageBinding binding = new TableStorageBinding(2, SpaceId.of(1024),
                 Path.of("app_orders_1024.ibd"), List.of(new IndexStorageBinding(3,
-                PageId.of(SpaceId.of(1024), PageNo.of(64)), 0, leaf, nonLeaf)));
+                PageId.of(SpaceId.of(1024), PageNo.of(64)), 0, leaf, nonLeaf)), Optional.of(lob));
         return new TableDefinition(TableId.of(2), SchemaId.of(1), ObjectName.of("orders"),
-                DictionaryVersion.of(version), TableState.ACTIVE, List.of(id), List.of(primary), Optional.of(binding));
+                DictionaryVersion.of(version), TableState.ACTIVE, List.of(id, body), List.of(primary),
+                Optional.of(binding));
     }
 }

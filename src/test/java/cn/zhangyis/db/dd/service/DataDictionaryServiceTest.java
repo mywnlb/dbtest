@@ -52,7 +52,8 @@ class DataDictionaryServiceTest {
     void tableLeasePinsVersionAndHoldsSharedMetadataLock() throws Exception {
         try (Fixture fixture = fixture()) {
             TableMetadataLease lease = fixture.service.openTable(MdlOwnerId.of(10),
-                    QualifiedTableName.of("APP", "ORDERS"), Duration.ofSeconds(1));
+                    QualifiedTableName.of("APP", "ORDERS"), TableAccessIntent.READ,
+                    Duration.ofSeconds(1));
             assertEquals(TableId.of(2), lease.table().id());
             assertEquals(DictionaryVersion.of(2), lease.version());
 
@@ -67,8 +68,7 @@ class DataDictionaryServiceTest {
                     }
                 });
                 assertTrue(started.await(1, TimeUnit.SECONDS));
-                Thread.sleep(50);
-                assertEquals(1, fixture.locks.snapshot().waiting().size());
+                awaitWaitingRequest(fixture.locks);
 
                 lease.close();
                 assertTrue(exclusive.get(1, TimeUnit.SECONDS));
@@ -83,7 +83,7 @@ class DataDictionaryServiceTest {
         try (Fixture fixture = fixture()) {
             QualifiedTableName missing = QualifiedTableName.of("app", "missing");
             assertThrows(DictionaryObjectNotFoundException.class, () -> fixture.service.openTable(
-                    MdlOwnerId.of(20), missing, Duration.ofSeconds(1)));
+                    MdlOwnerId.of(20), missing, TableAccessIntent.READ, Duration.ofSeconds(1)));
 
             try (var ticket = fixture.locks.acquire(new MdlRequest(MdlOwnerId.of(21),
                     MdlKey.table(missing.canonicalKey()), MdlMode.EXCLUSIVE, MdlDuration.TRANSACTION),
@@ -92,6 +92,71 @@ class DataDictionaryServiceTest {
             }
             assertTrue(fixture.locks.snapshot().granted().isEmpty());
         }
+    }
+
+    /** READ/WRITE intent 只改变 table 级模式；schema 始终用 SR 保持 schema→table 的统一获取顺序。 */
+    @Test
+    void tableAccessIntentSelectsExplicitMetadataLockMode() {
+        try (Fixture fixture = fixture()) {
+            QualifiedTableName name = QualifiedTableName.of("app", "orders");
+            try (TableMetadataLease ignored = fixture.service.openTable(MdlOwnerId.of(30), name,
+                    TableAccessIntent.READ, Duration.ofSeconds(1))) {
+                var grants = fixture.locks.snapshot().granted();
+                assertEquals(MdlMode.SHARED_READ, grants.stream()
+                        .filter(grant -> grant.key().equals(MdlKey.schema("app")))
+                        .findFirst().orElseThrow().mode());
+                assertEquals(MdlMode.SHARED_READ, grants.stream()
+                        .filter(grant -> grant.key().equals(MdlKey.table(name.canonicalKey())))
+                        .findFirst().orElseThrow().mode());
+            }
+            try (TableMetadataLease ignored = fixture.service.openTable(MdlOwnerId.of(31), name,
+                    TableAccessIntent.WRITE, Duration.ofSeconds(1))) {
+                var grants = fixture.locks.snapshot().granted();
+                assertEquals(MdlMode.SHARED_READ, grants.stream()
+                        .filter(grant -> grant.key().equals(MdlKey.schema("app")))
+                        .findFirst().orElseThrow().mode());
+                assertEquals(MdlMode.SHARED_WRITE, grants.stream()
+                        .filter(grant -> grant.key().equals(MdlKey.table(name.canonicalKey())))
+                        .findFirst().orElseThrow().mode());
+            }
+            assertTrue(fixture.locks.snapshot().granted().isEmpty());
+        }
+    }
+
+    /** table 锁等待失败时必须反序释放已经授予的 schema SR，不能留下阻塞后续 DDL 的幽灵 ticket。 */
+    @Test
+    void tableLockTimeoutReleasesPreviouslyGrantedSchemaLock() {
+        try (Fixture fixture = fixture()) {
+            QualifiedTableName name = QualifiedTableName.of("app", "orders");
+            try (var blocker = fixture.locks.acquire(new MdlRequest(MdlOwnerId.of(40),
+                    MdlKey.table(name.canonicalKey()), MdlMode.EXCLUSIVE, MdlDuration.TRANSACTION),
+                    Duration.ofSeconds(1))) {
+                assertThrows(cn.zhangyis.db.dd.exception.MetadataLockTimeoutException.class,
+                        () -> fixture.service.openTable(MdlOwnerId.of(41), name, TableAccessIntent.WRITE,
+                                Duration.ofMillis(20)));
+                assertTrue(fixture.locks.snapshot().granted().stream()
+                        .noneMatch(grant -> grant.owner().equals(MdlOwnerId.of(41))));
+            }
+        }
+    }
+
+    /** 访问意图是显式 API 契约，null 不能被静默解释为 READ。 */
+    @Test
+    void rejectsMissingTableAccessIntent() {
+        try (Fixture fixture = fixture()) {
+            assertThrows(cn.zhangyis.db.common.exception.DatabaseValidationException.class,
+                    () -> fixture.service.openTable(MdlOwnerId.of(50),
+                            QualifiedTableName.of("app", "orders"), null, Duration.ofSeconds(1)));
+            assertTrue(fixture.locks.snapshot().granted().isEmpty());
+        }
+    }
+
+    private static void awaitWaitingRequest(MetadataLockManager locks) {
+        long deadline = System.nanoTime() + Duration.ofSeconds(1).toNanos();
+        while (locks.snapshot().waiting().isEmpty() && System.nanoTime() < deadline) {
+            Thread.onSpinWait();
+        }
+        assertEquals(1, locks.snapshot().waiting().size());
     }
 
     private Fixture fixture() {

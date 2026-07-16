@@ -28,6 +28,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 
 /**
  * storage.api 的物理 DDL Facade。CREATE 负责 GENERAL tablespace/FSP/segment/index root，DROP 负责独占准入、
@@ -74,15 +75,20 @@ public final class TableDdlStorageService {
             schemaMapper.tableSchema(definition, index.clustered());
             schemaMapper.indexKey(definition, index);
         }
+        boolean requiresLobSegment = definition.columns().stream()
+                .anyMatch(column -> isLobCapable(column.type().typeId()));
         long pageImages;
         try {
-            pageImages = Math.addExact(12L, Math.multiplyExact(6L, definition.indexes().size()));
+            long indexImages = Math.multiplyExact(6L, definition.indexes().size());
+            // 一个额外 segment 最坏修改 page0/page2；再保留一个重复物理 delta 等价量，禁止低估 admission。
+            pageImages = Math.addExact(Math.addExact(12L, indexImages), requiresLobSegment ? 3L : 0L);
         } catch (ArithmeticException overflow) {
             throw new DatabaseValidationException("DDL create redo workload overflows", overflow);
         }
         MiniTransaction mtr = mtrManager.begin(mtrManager.budgetFor(RedoBudgetPurpose.DDL_TABLE_CREATE,
                 RedoBudgetWorkload.pageImages(pageImages)));
         List<IndexStorageBinding> indexes = new ArrayList<>(definition.indexes().size());
+        Optional<SegmentRef> lobSegment = Optional.empty();
         Lsn commitLsn;
         try {
             disk.createTablespace(mtr, definition.spaceId(), definition.path(), definition.initialSizeInPages(),
@@ -94,6 +100,9 @@ public final class TableDdlStorageService {
                 indexPages.createIndexPage(mtr, root, index.indexId(), 0);
                 indexes.add(new IndexStorageBinding(index.indexId(), root, 0, leaf, nonLeaf));
             }
+            if (requiresLobSegment) {
+                lobSegment = Optional.of(disk.createSegment(mtr, definition.spaceId(), SegmentPurpose.LOB));
+            }
             commitLsn = mtrManager.commit(mtr);
         } catch (RuntimeException failure) {
             rollbackAndRemoveFailedCreate(mtr, definition, failure);
@@ -101,9 +110,19 @@ public final class TableDdlStorageService {
         }
         flush.flushThrough(commitLsn, Duration.ofSeconds(30));
         store.force(definition.spaceId());
-        log.info("created physical table: table={} space={} path={} indexes={}", definition.tableId(),
-                definition.spaceId().value(), definition.path(), indexes.size());
-        return new TableStorageBinding(definition.tableId(), definition.spaceId(), definition.path(), indexes);
+        log.info("created physical table: table={} space={} path={} indexes={} lobSegment={}", definition.tableId(),
+                definition.spaceId().value(), definition.path(), indexes.size(), lobSegment.isPresent());
+        return new TableStorageBinding(definition.tableId(), definition.spaceId(), definition.path(), indexes,
+                lobSegment);
+    }
+
+    /** TEXT/BLOB/JSON 家族共用一个表级 LOB segment；VARCHAR/VARBINARY 仍只使用页内 variable 编码。 */
+    private static boolean isLobCapable(StorageColumnTypeId typeId) {
+        return switch (typeId) {
+            case TINYTEXT, TEXT, MEDIUMTEXT, LONGTEXT,
+                    TINYBLOB, BLOB, MEDIUMBLOB, LONGBLOB, JSON -> true;
+            default -> false;
+        };
     }
 
     /**

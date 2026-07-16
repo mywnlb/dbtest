@@ -15,6 +15,7 @@ import cn.zhangyis.db.storage.record.schema.IndexKeyDef;
 import cn.zhangyis.db.storage.record.schema.TableSchema;
 import cn.zhangyis.db.storage.record.type.ColumnValue;
 import cn.zhangyis.db.storage.undo.RollbackSegmentHeaderRepository;
+import cn.zhangyis.db.storage.undo.InsertedLobOwnership;
 import cn.zhangyis.db.storage.undo.RollbackSegmentFreeListBase;
 import cn.zhangyis.db.storage.undo.UndoAppendSnapshot;
 import cn.zhangyis.db.storage.undo.UndoLogSegment;
@@ -28,6 +29,7 @@ import cn.zhangyis.db.storage.undo.UndoSpaceReservation;
 
 import java.util.List;
 import java.util.Optional;
+import java.util.ArrayList;
 
 /**
  * 事务 undo 门面（设计 §5.2/§7.1/§7.2）。在 {@code storage.trx} 持事务语义，调用
@@ -110,6 +112,46 @@ public final class UndoLogManager {
         return buildPlan(context, record, keyDef, schema);
     }
 
+    /**
+     * 为 LOB-aware INSERT 冻结 deferred undo。placeholder ownership 必须与稍后实际 allocation 具有同一编码形状；
+     * 它只参与 codec、页数和 admission 计算，绝不会由该接口直接写入普通 UNDO record slot。
+     */
+    public DeferredInsertUndoPlan planDeferredInsert(Transaction txn, long tableId, long indexId,
+                                                     List<ColumnValue> clusterKey,
+                                                     List<InsertedLobOwnership> placeholderOwnerships,
+                                                     IndexKeyDef keyDef, TableSchema schema) {
+        if (clusterKey == null || placeholderOwnerships == null || keyDef == null || schema == null) {
+            throw new TransactionStateException("deferred INSERT undo planning args must not be null");
+        }
+        PlanningContext context = planningContext(txn, UndoLogKind.INSERT);
+        UndoRecord record = UndoRecord.insert(context.nextUndoNo(), context.transactionId(), tableId, indexId,
+                clusterKey, placeholderOwnerships, context.logicalHead().rollPointer());
+        return new DeferredInsertUndoPlan(buildPlan(context, record, keyDef, schema), keyDef, schema,
+                placeholderOwnerships);
+    }
+
+    /**
+     * 在同一业务 MTR 中先固定 undo owner/root/payload 页而不发布 placeholder。调用顺序必须位于 B+Tree prepare 与
+     * LOB allocation 之前；返回 guard 后任何未发布退出均属于 fail-stop 边界。
+     */
+    public PreparedUndoAppend prepareUndoAppend(Transaction txn, MiniTransaction mtr,
+                                                DeferredInsertUndoPlan deferred) {
+        if (txn == null || mtr == null || deferred == null) {
+            throw new TransactionStateException("prepareUndoAppend txn/mtr/plan must not be null");
+        }
+        requireActiveTransaction(txn);
+        UndoWritePlan plan = deferred.placeholderPlan();
+        if (!txn.transactionId().equals(plan.transactionId())) {
+            throw new UndoWriteStalePlanException("deferred undo transaction id no longer matches target");
+        }
+        return switch (plan.acquisition()) {
+            case ALLOCATE_NEW -> prepareAllocatedLog(txn, mtr, deferred);
+            case REUSE_CACHED -> prepareCachedLog(txn, mtr, deferred);
+            case REUSE_FREE -> prepareFreeLog(txn, mtr, deferred);
+            case APPEND_EXISTING -> prepareExistingLog(txn, mtr, deferred);
+        };
+    }
+
     /** 在写 MTR admission 前规划 UPDATE undo，并冻结完整旧行 image 编码。 */
     public UndoWritePlan planUpdate(Transaction txn, long tableId, long indexId,
                                     List<ColumnValue> clusterKey, List<ColumnValue> oldColumnValues,
@@ -170,6 +212,239 @@ public final class UndoLogManager {
                 context.globalLastUndoNo(), context.logicalHead(), context.persistentSnapshot(),
                 context.cachedCandidate(), context.freeCandidate(), physical, pages,
                 UndoRedoBudgetEstimator.append(context.acquisition(), physical.externalPageCount()));
+    }
+
+    /** fresh INSERT log 的 owner/root prepare；segment 首页和 page3 slot 在 actual record 之前先成为稳定 owner。 */
+    private PreparedUndoAppend prepareAllocatedLog(Transaction txn, MiniTransaction mtr,
+                                                   DeferredInsertUndoPlan deferred) {
+        UndoWritePlan plan = deferred.placeholderPlan();
+        UndoContext current = txn.undoContext();
+        UndoNo currentGlobal = current == null ? UndoNo.NONE : current.lastUndoNo();
+        if (!currentGlobal.equals(plan.expectedGlobalLastUndoNo())
+                || current != null && current.hasBinding(plan.kind())) {
+            throw new UndoWriteStalePlanException("new deferred undo log plan is stale");
+        }
+        PreparedResources resources = new PreparedResources();
+        boolean physical = false;
+        try {
+            RollbackSegmentSlotManager.ClaimLease claim = resources.add(slotManager.reserveClaim());
+            requirePersistentSlotFree(mtr, claim.slotId());
+            UndoSpaceReservation reservation = resources.add(access.reservePages(mtr, undoSpace,
+                    plan.pagesToReserve()));
+            claim.physicalMutationStarted();
+            physical = true;
+            UndoLogSegment segment = access.create(mtr, undoSpace, plan.transactionId(), plan.kind());
+            if (segment.requiredNewPages(plan.recordPlan()) != plan.pagesToReserve() - 1) {
+                throw new UndoWriteFatalException("new deferred undo segment page requirement differs from plan");
+            }
+            PageId firstPageId = segment.firstPageId();
+            claim.bind(firstPageId);
+            claimRsegSlotAfterUndoPage(mtr, claim.slotId(), firstPageId);
+            UndoContext context = current == null ? new UndoContext(slotManager.rollbackSegmentId()) : current;
+            context.attach(new UndoLogBinding(plan.kind(), claim.slotId(), firstPageId, UndoLogicalHead.EMPTY));
+            segment.prepareAppend(plan.recordPlan());
+            return preparedHandle(txn, mtr, deferred, plan, segment, context, resources);
+        } catch (RuntimeException error) {
+            resources.closeSuppressing(error);
+            if (physical) {
+                throw fatalAfterMutation("new deferred undo prepare failed after physical mutation", error);
+            }
+            throw error;
+        }
+    }
+
+    /** cached owner transition 与首页激活均在 actual record 之前完成；失败保留 transition fence。 */
+    private PreparedUndoAppend prepareCachedLog(Transaction txn, MiniTransaction mtr,
+                                                DeferredInsertUndoPlan deferred) {
+        UndoWritePlan plan = deferred.placeholderPlan();
+        UndoContext current = requireNoKindBinding(txn, plan, "cached deferred undo");
+        PreparedResources resources = new PreparedResources();
+        boolean physical = false;
+        try {
+            RollbackSegmentSlotManager.ClaimLease claim = resources.add(slotManager.reserveClaim());
+            UndoSegmentReuseDirectory.CachePopLease cachePop = resources.add(
+                    reuseDirectory.reserveCachePop(plan.cachedCandidate()));
+            requirePersistentSlotFree(mtr, claim.slotId());
+            if (plan.pagesToReserve() > 0) {
+                resources.add(access.reservePages(mtr, undoSpace, plan.pagesToReserve()));
+            }
+            claim.physicalMutationStarted();
+            cachePop.physicalMutationStarted();
+            physical = true;
+            var candidate = cachePop.candidate();
+            headerRepo.moveCachedTopToActiveSlot(mtr, undoSpace, plan.kind(), candidate.expectedCount(),
+                    candidate.segment().handle().firstPageId(), claim.slotId());
+            UndoLogSegment segment = access.activateCached(mtr, candidate.segment(), plan.transactionId());
+            if (segment.requiredNewPages(plan.recordPlan()) != plan.pagesToReserve()) {
+                throw new UndoWriteFatalException("cached deferred undo page requirement differs from plan");
+            }
+            PageId firstPageId = segment.firstPageId();
+            claim.bind(firstPageId);
+            cachePop.complete();
+            UndoContext context = current == null ? new UndoContext(slotManager.rollbackSegmentId()) : current;
+            context.attach(new UndoLogBinding(plan.kind(), claim.slotId(), firstPageId, UndoLogicalHead.EMPTY));
+            segment.prepareAppend(plan.recordPlan());
+            return preparedHandle(txn, mtr, deferred, plan, segment, context, resources);
+        } catch (RuntimeException error) {
+            resources.closeSuppressing(error);
+            if (physical) {
+                throw fatalAfterMutation("cached deferred undo prepare failed after owner transition", error);
+            }
+            throw error;
+        }
+    }
+
+    /** free FIFO owner transition 的 deferred prepare，锁序与普通 free reuse 首写保持一致。 */
+    private PreparedUndoAppend prepareFreeLog(Transaction txn, MiniTransaction mtr,
+                                              DeferredInsertUndoPlan deferred) {
+        UndoWritePlan plan = deferred.placeholderPlan();
+        UndoContext current = requireNoKindBinding(txn, plan, "free deferred undo");
+        PreparedResources resources = new PreparedResources();
+        boolean physical = false;
+        try {
+            RollbackSegmentSlotManager.ClaimLease claim = resources.add(slotManager.reserveClaim());
+            UndoSegmentReuseDirectory.FreePopLease freePop = resources.add(
+                    reuseDirectory.reserveFreePop(plan.freeCandidate()));
+            requirePersistentSlotFree(mtr, claim.slotId());
+            if (plan.pagesToReserve() > 0) {
+                resources.add(access.reservePages(mtr, undoSpace, plan.pagesToReserve()));
+            }
+            claim.physicalMutationStarted();
+            freePop.physicalMutationStarted();
+            physical = true;
+            var candidate = freePop.candidate();
+            RollbackSegmentFreeListBase expectedBase = new RollbackSegmentFreeListBase(
+                    Optional.of(candidate.segment().handle().firstPageId()),
+                    Optional.of(candidate.expectedTail().handle().firstPageId()), candidate.expectedCount());
+            Optional<PageId> successor = candidate.successor().map(item -> item.handle().firstPageId());
+            headerRepo.moveFreeHeadToActiveSlot(mtr, undoSpace, expectedBase,
+                    candidate.segment().handle().firstPageId(), successor, claim.slotId());
+            UndoLogSegment segment = access.activateFree(mtr, candidate.segment(), candidate.successor(),
+                    plan.transactionId(), plan.kind());
+            if (segment.requiredNewPages(plan.recordPlan()) != plan.pagesToReserve()) {
+                throw new UndoWriteFatalException("free deferred undo page requirement differs from plan");
+            }
+            PageId firstPageId = segment.firstPageId();
+            claim.bind(firstPageId);
+            freePop.complete();
+            UndoContext context = current == null ? new UndoContext(slotManager.rollbackSegmentId()) : current;
+            context.attach(new UndoLogBinding(plan.kind(), claim.slotId(), firstPageId, UndoLogicalHead.EMPTY));
+            segment.prepareAppend(plan.recordPlan());
+            return preparedHandle(txn, mtr, deferred, plan, segment, context, resources);
+        } catch (RuntimeException error) {
+            resources.closeSuppressing(error);
+            if (physical) {
+                throw fatalAfterMutation("free deferred undo prepare failed after owner transition", error);
+            }
+            throw error;
+        }
+    }
+
+    /** existing log 先 reserve 低位 FSP，再固定 first/current X 与可能的 grow/payload 页。 */
+    private PreparedUndoAppend prepareExistingLog(Transaction txn, MiniTransaction mtr,
+                                                  DeferredInsertUndoPlan deferred) {
+        UndoWritePlan plan = deferred.placeholderPlan();
+        UndoContext context = txn.undoContext();
+        requireMatchingContext(context, plan);
+        PreparedResources resources = new PreparedResources();
+        boolean physical = false;
+        try {
+            if (plan.pagesToReserve() > 0) {
+                resources.add(access.reservePages(mtr, undoSpace, plan.pagesToReserve()));
+            }
+            UndoLogSegment segment = access.open(mtr, plan.expectedFirstPageId(), PageLatchMode.EXCLUSIVE);
+            if (!segment.appendSnapshot().equals(plan.persistentSnapshot())) {
+                throw new UndoWriteStalePlanException("persistent undo snapshot changed before prepare");
+            }
+            if (segment.requiredNewPages(plan.recordPlan()) != plan.pagesToReserve()) {
+                throw new UndoWriteStalePlanException("undo root placement changed before prepare");
+            }
+            physical = true;
+            segment.prepareAppend(plan.recordPlan());
+            return preparedHandle(txn, mtr, deferred, plan, segment, context, resources);
+        } catch (RuntimeException error) {
+            resources.closeSuppressing(error);
+            if (physical) {
+                throw fatalAfterMutation("existing deferred undo prepare failed after physical boundary", error);
+            }
+            throw error;
+        }
+    }
+
+    /** 构造 actual append 闭包；先做 ownership/codec shape 校验，再写 prepared 页并发布内存 logical head。 */
+    private PreparedUndoAppend preparedHandle(Transaction txn, MiniTransaction mtr,
+                                              DeferredInsertUndoPlan deferred, UndoWritePlan plan,
+                                              UndoLogSegment segment, UndoContext context,
+                                              PreparedResources resources) {
+        return new PreparedUndoAppend(mtr, actualOwnerships -> {
+            UndoRecord actualRecord = deferred.actualRecord(actualOwnerships);
+            UndoRecordWritePlan actualPlan = access.planRecord(actualRecord, deferred.keyDef(), deferred.schema());
+            deferred.requireSamePhysicalShape(actualPlan);
+            RollPointer pointer = segment.appendPrepared(actualPlan);
+            publishContextAfterAppend(txn, context, plan, pointer, segment.appendSnapshot());
+            return pointer;
+        }, resources::close);
+    }
+
+    private static UndoContext requireNoKindBinding(Transaction txn, UndoWritePlan plan, String operation) {
+        UndoContext current = txn.undoContext();
+        UndoNo currentGlobal = current == null ? UndoNo.NONE : current.lastUndoNo();
+        if (!currentGlobal.equals(plan.expectedGlobalLastUndoNo())
+                || current != null && current.hasBinding(plan.kind())) {
+            throw new UndoWriteStalePlanException(operation + " plan is stale");
+        }
+        return current;
+    }
+
+    /** prepared handle 跨方法保留的租约集合；按获取逆序关闭并聚合 suppressed。 */
+    private static final class PreparedResources {
+        private final List<AutoCloseable> resources = new ArrayList<>();
+        private boolean closed;
+
+        private <T extends AutoCloseable> T add(T resource) {
+            if (resource != null) {
+                resources.add(resource);
+            }
+            return resource;
+        }
+
+        private void close() {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            RuntimeException first = null;
+            for (int i = resources.size() - 1; i >= 0; i--) {
+                try {
+                    resources.get(i).close();
+                } catch (RuntimeException error) {
+                    if (first == null) {
+                        first = error;
+                    } else {
+                        first.addSuppressed(error);
+                    }
+                } catch (Exception error) {
+                    RuntimeException wrapped = new UndoWriteFatalException(
+                            "prepared undo resource close failed", error);
+                    if (first == null) {
+                        first = wrapped;
+                    } else {
+                        first.addSuppressed(wrapped);
+                    }
+                }
+            }
+            if (first != null) {
+                throw first;
+            }
+        }
+
+        private void closeSuppressing(RuntimeException primary) {
+            try {
+                close();
+            } catch (RuntimeException closeFailure) {
+                primary.addSuppressed(closeFailure);
+            }
+        }
     }
 
     private PlanningContext planningContext(Transaction txn, UndoLogKind kind) {

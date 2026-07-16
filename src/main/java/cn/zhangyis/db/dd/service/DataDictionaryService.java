@@ -42,16 +42,18 @@ public final class DataDictionaryService {
     }
 
     /**
-     * 按 canonical schema/table 名称取得安全访问租约。数据流为：schema SR → table SR → repository 名称解析
-     * → cache 单航班 pin；任何后置步骤失败都会反序释放已经取得的 MDL，不留下幽灵持有者。
+     * 按 canonical schema/table 名称和显式访问意图取得安全访问租约。数据流为：schema SR → table SR/SW
+     * → repository 名称解析 → cache 单航班 pin；任何后置步骤失败都会反序释放已经取得的 MDL，不留下幽灵持有者。
      *
      * @param owner session/transaction 的稳定 MDL owner。
      * @param name 三段限定表名。
+     * @param intent READ 取得 table SR，WRITE 取得 table SW；不能为 null。
      * @param timeout 整个 MDL 与 cache miss 流程共享的等待上限。
      * @return 同时持有名称锁与不可变版本的表访问租约。
      */
-    public TableMetadataLease openTable(MdlOwnerId owner, QualifiedTableName name, Duration timeout) {
-        validateOpen(owner, name, timeout);
+    public TableMetadataLease openTable(MdlOwnerId owner, QualifiedTableName name, TableAccessIntent intent,
+                                        Duration timeout) {
+        validateOpen(owner, name, intent, timeout);
         long deadline = deadline(timeout);
         List<MdlTicket> tickets = new ArrayList<>(2);
         DictionaryPin<TableDefinition> pin = null;
@@ -59,7 +61,7 @@ public final class DataDictionaryService {
             tickets.add(locks.acquire(new MdlRequest(owner, MdlKey.schema(name.schema().canonicalName()),
                     MdlMode.SHARED_READ, MdlDuration.TRANSACTION), remaining(deadline)));
             tickets.add(locks.acquire(new MdlRequest(owner, MdlKey.table(name.canonicalKey()),
-                    MdlMode.SHARED_READ, MdlDuration.TRANSACTION), remaining(deadline)));
+                    intent.tableMode(), MdlDuration.TRANSACTION), remaining(deadline)));
 
             SchemaDefinition schema = repository.findSchema(name.schema())
                     .orElseThrow(() -> new DictionaryObjectNotFoundException(
@@ -88,9 +90,11 @@ public final class DataDictionaryService {
         }
     }
 
-    private static void validateOpen(MdlOwnerId owner, QualifiedTableName name, Duration timeout) {
-        if (owner == null || name == null || timeout == null || timeout.isZero() || timeout.isNegative()) {
-            throw new DatabaseValidationException("table open owner/name/positive timeout required");
+    private static void validateOpen(MdlOwnerId owner, QualifiedTableName name, TableAccessIntent intent,
+                                     Duration timeout) {
+        if (owner == null || name == null || intent == null || timeout == null
+                || timeout.isZero() || timeout.isNegative()) {
+            throw new DatabaseValidationException("table open owner/name/intent/positive timeout required");
         }
     }
 

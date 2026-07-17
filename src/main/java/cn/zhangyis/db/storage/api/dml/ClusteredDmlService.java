@@ -46,13 +46,15 @@ import cn.zhangyis.db.storage.trx.TransactionStateException;
 import cn.zhangyis.db.storage.trx.UndoLogManager;
 import cn.zhangyis.db.storage.trx.lock.LockManager;
 import cn.zhangyis.db.storage.undo.InsertedLobOwnership;
+import cn.zhangyis.db.storage.undo.SecondaryUndoMutation;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 
 /**
- * 单表/单聚簇索引 DML facade。它是 SQL executor 未来进入 storage 层的稳定边界：调用方显式传入事务、
+ * 单表/单聚簇索引 DML 内核 facade。生产 SQL INSERT 由 {@link TableDmlService} 编排全部索引后复用本类作为聚簇 undo anchor；
+ * 低层调用方仍可显式传入事务、
  * 聚簇索引快照和已归一化记录，本服务只编排 transaction、undo、current-read、B+Tree、redo durability
  * 与 row-lock release，不解析 SQL、不访问 BufferFrame/RecordCursor/裸文件。
  */
@@ -140,13 +142,51 @@ public final class ClusteredDmlService {
     }
 
     /**
-     * 执行单聚簇索引 INSERT。数据流为：分配 write id -> unique current-read 取得 duplicate/gap 锁 ->
-     * 在一个业务 MTR 内写 INSERT undo 并插入聚簇记录 -> commit MTR 返回 end LSN。若 unique check 发现物理
-     * 同 key 记录，抛出重复键领域异常，调用方仍需按事务语义决定 commit/rollback。
+     * 执行不携带二级反向证据的单聚簇索引 INSERT；兼容现有 storage API 调用，磁盘 secondary tail 保持为空。
+     *
+     * @param command ACTIVE 事务、聚簇 descriptor、完整主键/行、表 id、可选 LOB segment 与锁等待边界。
+     * @return 插入影响行数、业务 MTR end LSN 与事务 write id。
+     * @throws DatabaseValidationException 命令或内部字段无效时抛出。
+     * @throws DmlDuplicateKeyException 聚簇完整主键已被占用时抛出。
+     * @throws DatabaseRuntimeException 锁等待、undo/LOB/B+Tree/MTR 或 redo 发布失败时抛出。
      */
     public DmlWriteResult insert(ClusteredInsertCommand command) {
+        return insert(command, List.of());
+    }
+
+    /**
+     * 表级 DML 内部入口：聚簇写与二级发布仍分属多个短 MTR，但首个聚簇 MTR 必须把完整 secondary inverse
+     * 列表写进同一逻辑 INSERT undo。仅同包 {@link TableDmlService} 调用；普通单聚簇入口传空列表保持旧磁盘编码。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验命令/secondary mutation 列表和引擎状态，分配 write id，并在无页 latch 时完成聚簇唯一
+     *         current-read；重复键在创建 undo/MTR 前失败。</li>
+     *     <li>规划 LOB inline/external 表示、预检 LOB segment，冻结含 secondary tail 的 deferred INSERT undo，
+     *         再以 undo + B+Tree + LOB 总 workload 申请 redo admission。</li>
+     *     <li>在同一业务 MTR 中 prepare undo append 与聚簇插入槽位；prepare 后失败必须按物理边界规则升级为 fatal。</li>
+     *     <li>写入计划内 LOB 页，把实际 ownership 追加到 undo，再以真实 ExternalValue 和 roll pointer 发布聚簇行；
+     *         ownership 只在聚簇记录可达后转移。</li>
+     *     <li>关闭 guard、提交 MTR 并返回；异常时逆序补偿未转移 LOB/插入槽/undo append，回滚 ACTIVE MTR，
+     *         且保留原始 cause 与 prepared-boundary 安全语义。</li>
+     * </ol>
+     *
+     * @param command            表级 INSERT 已完成基本 schema 校验的聚簇命令。
+     * @param secondaryMutations 按 index id 严格递增的 INSERT_ENTRY 反向证据；构造 undo 时防御性复制。
+     * @return 成功插入一行的结果，包含业务 MTR end LSN 和稳定 write id。
+     * @throws DatabaseValidationException 参数缺失、引擎状态或 mutation/undo 组合无效时抛出。
+     * @throws DmlDuplicateKeyException 聚簇主键已存在时抛出。
+     * @throws UndoWriteFatalException prepare 物理边界或 undo 已写入后后续步骤失败、无法安全继续事务时抛出。
+     * @throws DatabaseRuntimeException 锁、LOB、B+Tree、MTR 或 redo 失败时抛出并保留底层 cause。
+     */
+    DmlWriteResult insert(ClusteredInsertCommand command,
+                          List<SecondaryUndoMutation> secondaryMutations) {
+        // 1. 先完成纯校验和事务锁 current-read；重复键分支尚未创建 MTR、undo slot 或 LOB allocation。
         if (command == null) {
             throw new DatabaseValidationException("clustered insert command must not be null");
+        }
+        if (secondaryMutations == null) {
+            throw new DatabaseValidationException("clustered insert secondary mutations must not be null");
         }
         requireOpenForDml();
         Transaction txn = command.transaction();
@@ -157,11 +197,12 @@ public final class ClusteredDmlService {
             throw new DmlDuplicateKeyException("duplicate clustered key for index " + command.index().indexId());
         }
 
+        // 2. 冻结 LOB、undo secondary tail 与总 redo workload，admission 成功后才接触可写页。
         PlannedInsertLobs plannedLobs = planInsertLobs(command);
         preflightLobSegment(plannedLobs);
         DeferredInsertUndoPlan undoPlan = undoLogManager.planDeferredInsert(txn, command.tableId(),
                 command.index().indexId(), command.key().values(), plannedLobs.placeholderOwnerships(),
-                command.index().keyDef(), command.index().schema());
+                secondaryMutations, command.index().keyDef(), command.index().schema());
         MiniTransaction mtr = mtrManager.begin(mtrManager.budgetFor(
                 RedoBudgetPurpose.CLUSTERED_INSERT,
                 DmlRedoBudgetEstimator.insert(command.index(), undoPlan, plannedLobs.writePlans())));
@@ -170,10 +211,12 @@ public final class ClusteredDmlService {
         List<LobWriteAllocation> allocations = new ArrayList<>(plannedLobs.values().size());
         boolean preparedBoundary = false;
         try {
+            // 3. undo append 与聚簇插入先 prepare；两者的 guard 都由本方法在正常或异常路径显式关闭。
             preparedUndo = undoLogManager.prepareUndoAppend(txn, mtr, undoPlan);
             preparedBoundary = true;
             preparedInsert = btree.prepareClusteredInsert(mtr, command.index(),
                     plannedLobs.placeholderRecord(), txnId);
+            // 4. 外部 LOB 的真实引用先写入 undo ownership，再随 roll pointer 发布聚簇行，最后转移 allocation owner。
             List<ColumnValue> actualValues = new ArrayList<>(plannedLobs.placeholderRecord().columnValues());
             List<InsertedLobOwnership> actualOwnerships = new ArrayList<>(plannedLobs.values().size());
             for (PlannedLobValue planned : plannedLobs.values()) {
@@ -193,9 +236,12 @@ public final class ClusteredDmlService {
             preparedInsert = null;
             preparedUndo.close();
             preparedUndo = null;
+
+            // 5. 所有 prepared guard 已关闭且 ownership 已转移后提交 MTR；返回的 LSN 覆盖本次物理原子组。
             Lsn endLsn = mtrManager.commit(mtr);
             return new DmlWriteResult(true, 1, endLsn, txnId);
         } catch (RuntimeException e) {
+            // 5. 补偿按 allocation -> prepared insert -> prepared undo 逆序执行，再终止 ACTIVE MTR 并保持 cause。
             RuntimeException failure = compensateAndClosePrepared(
                     allocations, preparedInsert, preparedUndo, e);
             rollbackActiveMtr(mtr, failure);
@@ -210,13 +256,45 @@ public final class ClusteredDmlService {
     }
 
     /**
-     * 执行单聚簇索引 UPDATE。数据流为：分配 write id -> point current-read FOR UPDATE 授锁并重定位 ->
-     * miss 返回 affectedRows=0；命中则读取旧隐藏列，在一个业务 MTR 内写 UPDATE undo、盖新 roll pointer、
-     * 替换聚簇记录。当前只支持不改变聚簇 key 的页内/重定位更新。
+     * 执行不携带二级反向证据的单聚簇索引 UPDATE；当前只支持不改变聚簇 key 的页内/重定位更新。
+     *
+     * @param command ACTIVE 事务、聚簇 descriptor、完整定位键、新完整行、表 id 与锁等待边界。
+     * @return 目标不存在时零影响；命中时返回替换结果、业务 MTR end LSN 与事务 write id。
+     * @throws DatabaseValidationException 命令或行/索引形状无效时抛出。
+     * @throws DatabaseRuntimeException current-read、undo、B+Tree、MTR 或 redo 发布失败时抛出。
      */
     public DmlWriteResult update(ClusteredUpdateCommand command) {
+        return update(command, List.of());
+    }
+
+    /**
+     * 表级 UPDATE 的聚簇首 MTR 入口：把全部变键二级证据与聚簇旧 image 写入同一逻辑 undo。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验命令/mutation 与引擎状态，分配 write id，并用 FOR_UPDATE current-read 取得事务行锁和旧记录；
+     *         miss 在任何 undo/MTR 写入前返回零影响。</li>
+     *     <li>校验旧记录隐藏列，冻结全量旧 image 与 CHANGE_KEY secondary tail，并按 point rewrite 总 workload
+     *         申请业务 MTR redo admission。</li>
+     *     <li>先追加 UPDATE undo 取得新 roll pointer，再给新记录盖 write id/roll pointer，并以旧隐藏列作 CAS 证据替换聚簇版本。</li>
+     *     <li>提交 MTR 并返回；异常时终止 ACTIVE MTR，若 undo 已物理写入则升级 fatal，避免事务继续产生不可逆分叉。</li>
+     * </ol>
+     *
+     * @param command            已完成表级 current-read 前置规划的聚簇更新命令。
+     * @param secondaryMutations 按 index id 递增的 CHANGE_KEY 反向证据；空列表保持单聚簇兼容语义。
+     * @return miss 或成功替换的一行结果，包含业务 MTR end LSN/write id。
+     * @throws DatabaseValidationException 参数、隐藏列、mutation 或引擎状态无效时抛出。
+     * @throws UndoWriteFatalException undo 已写入后聚簇替换/提交失败时抛出。
+     * @throws DatabaseRuntimeException current-read、redo admission、B+Tree 或 MTR 操作失败时抛出。
+     */
+    DmlWriteResult update(ClusteredUpdateCommand command,
+                          List<SecondaryUndoMutation> secondaryMutations) {
+        // 1. 所有可能阻塞的事务行锁等待发生在业务 MTR 前；miss 不分配 undo slot。
         if (command == null) {
             throw new DatabaseValidationException("clustered update command must not be null");
+        }
+        if (secondaryMutations == null) {
+            throw new DatabaseValidationException("clustered update secondary mutations must not be null");
         }
         requireOpenForDml();
         Transaction txn = command.transaction();
@@ -227,26 +305,30 @@ public final class ClusteredDmlService {
         if (locked.isEmpty()) {
             return new DmlWriteResult(false, 0, redo.currentLsn(), txnId);
         }
+        // 2. 旧隐藏列是版本 CAS 与 undo 链前驱；secondary tail 与旧 image 一起冻结后再申请 redo admission。
         BTreeLookupResult old = locked.orElseThrow();
         HiddenColumns oldHidden = requireHiddenColumns(old.record(), "update");
 
         UndoWritePlan undoPlan = undoLogManager.planUpdate(txn, command.tableId(), command.index().indexId(),
                 command.key().values(), old.record().columnValues(), oldHidden,
-                command.index().keyDef(), command.index().schema());
+                secondaryMutations, command.index().keyDef(), command.index().schema());
         MiniTransaction mtr = mtrManager.begin(mtrManager.budgetFor(
                 RedoBudgetPurpose.CLUSTERED_UPDATE,
                 DmlRedoBudgetEstimator.pointRewrite(command.index(), undoPlan)));
         boolean undoWritten = false;
         try {
+            // 3. undo 必须先于新聚簇版本发布，roll pointer 将两者连接成可恢复版本链。
             RollPointer rollPointer = undoLogManager.appendPlanned(txn, mtr, undoPlan);
             undoWritten = true;
             LogicalRecord stamped = stampedRecord(command.newRecord(), false,
                     new HiddenColumns(txnId, rollPointer));
             BTreeUpdateResult replaced = btree.replaceClustered(mtr, command.index(), command.key(),
                     stamped, oldHidden.dbTrxId(), oldHidden.dbRollPtr());
+            // 4. 聚簇替换与 undo 属于同一 MTR；提交失败时 catch 不允许事务在已写 undo 后继续运行。
             Lsn endLsn = mtrManager.commit(mtr);
             return new DmlWriteResult(replaced.replaced(), replaced.replaced() ? 1 : 0, endLsn, txnId);
         } catch (RuntimeException e) {
+            // 4. 始终先释放 MTR memo；undo 已物理写入意味着普通可重试异常必须升级为 fatal。
             rollbackActiveMtr(mtr, e);
             if (undoWritten && !(e instanceof UndoWriteFatalException)) {
                 throw new UndoWriteFatalException("clustered update failed after undo physical write", e);
@@ -259,13 +341,44 @@ public final class ClusteredDmlService {
     }
 
     /**
-     * 执行单聚簇索引 DELETE。数据流为：分配 write id -> point current-read FOR UPDATE 授锁并重定位 ->
-     * miss 返回 affectedRows=0；命中则在一个业务 MTR 内写 DELETE_MARK undo，并只翻聚簇记录 delete-mark，
-     * 物理删除留给 purge。
+     * 执行不携带二级反向证据的单聚簇索引 DELETE；只发布 delete mark，物理删除留给 purge。
+     *
+     * @param command ACTIVE 事务、聚簇 descriptor、完整定位键、表 id 与锁等待边界。
+     * @return 目标不存在时零影响；命中时返回标记结果、业务 MTR end LSN 与事务 write id。
+     * @throws DatabaseValidationException 命令或索引/key 形状无效时抛出。
+     * @throws DatabaseRuntimeException current-read、undo、B+Tree、MTR 或 redo 发布失败时抛出。
      */
     public DmlWriteResult delete(ClusteredDeleteCommand command) {
+        return delete(command, List.of());
+    }
+
+    /**
+     * 表级 DELETE 的聚簇首 MTR 入口：把全部二级 delete-mark inverse 与聚簇旧 image 写入同一逻辑 undo。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验命令/mutation 与引擎状态，分配 write id，并用 FOR_UPDATE current-read 取得事务行锁和旧记录；
+     *         miss 在任何 undo/MTR 写入前返回零影响。</li>
+     *     <li>读取删除前存活版本的隐藏列，冻结全量旧 image 与 DELETE_MARK_ENTRY tail，并申请 point rewrite redo admission。</li>
+     *     <li>先追加 DELETE_MARK undo，再以 write id/新 roll pointer 和旧隐藏列 CAS 证据翻转聚簇记录 delete 位。</li>
+     *     <li>提交 MTR 并返回；异常时终止 ACTIVE MTR，undo 已写入后的失败升级 fatal，且本方法不回收物理记录。</li>
+     * </ol>
+     *
+     * @param command            已完成表级规划的聚簇删除命令。
+     * @param secondaryMutations 按 index id 递增的 DELETE_MARK_ENTRY 反向证据；空列表保持单聚簇兼容语义。
+     * @return miss 或成功标记的一行结果，包含业务 MTR end LSN/write id。
+     * @throws DatabaseValidationException 参数、隐藏列、mutation 或引擎状态无效时抛出。
+     * @throws UndoWriteFatalException undo 已写入后聚簇标记/提交失败时抛出。
+     * @throws DatabaseRuntimeException current-read、redo admission、B+Tree 或 MTR 操作失败时抛出。
+     */
+    DmlWriteResult delete(ClusteredDeleteCommand command,
+                          List<SecondaryUndoMutation> secondaryMutations) {
+        // 1. 事务行锁和旧记录物化先于业务 MTR；miss 分支不创建 undo 或 dirty page。
         if (command == null) {
             throw new DatabaseValidationException("clustered delete command must not be null");
+        }
+        if (secondaryMutations == null) {
+            throw new DatabaseValidationException("clustered delete secondary mutations must not be null");
         }
         requireOpenForDml();
         Transaction txn = command.transaction();
@@ -276,24 +389,28 @@ public final class ClusteredDmlService {
         if (locked.isEmpty()) {
             return new DmlWriteResult(false, 0, redo.currentLsn(), txnId);
         }
+        // 2. 删除前隐藏列/全量旧 image/secondary tail 共同定义 rollback revive 所需的完整证据。
         BTreeLookupResult old = locked.orElseThrow();
         HiddenColumns oldHidden = requireHiddenColumns(old.record(), "delete");
 
         UndoWritePlan undoPlan = undoLogManager.planDelete(txn, command.tableId(), command.index().indexId(),
                 command.key().values(), old.record().columnValues(), oldHidden,
-                command.index().keyDef(), command.index().schema());
+                secondaryMutations, command.index().keyDef(), command.index().schema());
         MiniTransaction mtr = mtrManager.begin(mtrManager.budgetFor(
                 RedoBudgetPurpose.CLUSTERED_DELETE,
                 DmlRedoBudgetEstimator.pointRewrite(command.index(), undoPlan)));
         boolean undoWritten = false;
         try {
+            // 3. 先固化 undo 并取得 roll pointer，再以旧隐藏列作 CAS 证据发布聚簇 delete mark。
             RollPointer rollPointer = undoLogManager.appendPlanned(txn, mtr, undoPlan);
             undoWritten = true;
             BTreeDeleteMarkResult marked = btree.setClusteredDeleteMark(mtr, command.index(), command.key(),
                     true, new HiddenColumns(txnId, rollPointer), oldHidden.dbTrxId(), oldHidden.dbRollPtr());
+            // 4. commit 封闭 undo + 聚簇页物理原子组；本阶段不会释放 leaf page 给 FSP。
             Lsn endLsn = mtrManager.commit(mtr);
             return new DmlWriteResult(marked.changed(), marked.changed() ? 1 : 0, endLsn, txnId);
         } catch (RuntimeException e) {
+            // 4. 异常先终止 ACTIVE MTR；undo 已写入后的失败不能降级为普通 statement 可重试错误。
             rollbackActiveMtr(mtr, e);
             if (undoWritten && !(e instanceof UndoWriteFatalException)) {
                 throw new UndoWriteFatalException("clustered delete failed after undo physical write", e);

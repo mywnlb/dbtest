@@ -1,7 +1,7 @@
 package cn.zhangyis.db.sql.executor.storage;
 
 import cn.zhangyis.db.sql.binder.bound.BoundClusteredInsert;
-import cn.zhangyis.db.sql.binder.bound.BoundPrimaryPointSelect;
+import cn.zhangyis.db.sql.binder.bound.BoundPointSelect;
 import cn.zhangyis.db.sql.executor.SqlRow;
 
 import java.util.Optional;
@@ -21,7 +21,7 @@ public interface SqlStorageGateway {
     /**
      * 执行已绑定的聚簇主键点查。RC ReadView 必须存活到 external LOB hydrate 和公开行投影都完成后。
      */
-    Optional<SqlRow> selectPoint(SqlTransactionHandle transaction, BoundPrimaryPointSelect statement,
+    Optional<SqlRow> selectPoint(SqlTransactionHandle transaction, BoundPointSelect statement,
                                  SqlStatementDeadline deadline);
 
     /** 提交不透明事务；request 的 timeout 约束 durability 等待，终态结果必须说明是否已持久化。 */

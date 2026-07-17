@@ -49,6 +49,10 @@ public final class DictionaryIndexMetadataResolver implements IndexMetadataResol
                         new DictionaryObjectNotFoundException("undo index metadata not found: table="
                                 + tableId + " index=" + indexId));
         MappedTableStorage mapped = mapper.map(table);
-        return new UndoTargetMetadata(mapped.index(indexId), mapped.lobSegment());
+        if (mapped.clusteredIndex().indexId() != indexId) {
+            throw new DictionaryObjectNotFoundException("undo index is not the clustered index: table="
+                    + tableId + " index=" + indexId);
+        }
+        return new UndoTargetMetadata(mapped.tableIndexes(), mapped.lobSegment());
     }
 }

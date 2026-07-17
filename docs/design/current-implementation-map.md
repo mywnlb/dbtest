@@ -71,7 +71,7 @@ flowchart TD
 | `storage.api.undotruncate` lifecycle orchestration | `UndoTablespaceTruncationService`, `UndoTablespaceTruncationRecovery`, `UndoReusableSegmentTruncationCoordinator` | Implemented; recovery wired by `StorageEngine` E2 | 可恢复 UNDO 物理收缩与 cache/free owner 排空；E2 existing open 构造恢复参与者用于 TRUNCATING 续作；主动 truncate 仍待 purge/DML 调度 |
 | `storage.api.index` typed index page entry | `IndexPageAccess`, `IndexPageHandle` | Implemented | Bridges B+Tree/record code to `MiniTransaction`-owned page guards；生产三参构造注入 registry 后先 lease+require 再 fix/new page |
 | `storage.api.tablespace` metadata adapter | `PageZeroTablespaceMetadataLoader` | Implemented | Registry 懒加载协作者；留在 api 侧以避免 `fil` 直接编排 `fsp` page0/lifecycle codec；打开/恢复时先做 page0 FSP_HDR 信封校验(pageType/pageNo)，再做 checksum/trailer 校验；GENERAL marker 接受 NORMAL/CORRUPTED/DISCARDED，UNDO marker 只接受 ACTIVE/INACTIVE/TRUNCATING；历史未盖 checksum 的 page0 仅在两个 checksum 字段同为 0 时兼容 |
-| `storage.api.dml` single-clustered DML facade | `ClusteredDmlService`, `DmlStatementGuard`, `ClusteredInsertCommand`, `ClusteredUpdateCommand`, `ClusteredDeleteCommand`, `DmlCommitCommand`, `DmlRollbackCommand`, result/exception records | Implemented; production-wired by `StorageEngine` and SQL gateway | 2.1：单表/单聚簇索引 INSERT/UPDATE/DELETE/COMMIT/ROLLBACK 编排入口；2.8 起 SQL gateway 以 DD exact-version binding 驱动 INSERT/statement guard/commit/rollback，并把 oversized LOB、INSERT undo ownership 与聚簇行纳入同一业务 MTR；SQL UPDATE/DELETE、多索引和二级索引仍未接 |
+| `storage.api.dml` table/clustered DML facades | `TableDmlService`, `ClusteredDmlService`, table/clustered commands, `DmlStatementGuard`, terminal commands/results | Implemented; production-wired by `StorageEngine` and SQL gateway | `TableDmlService` 以聚簇 undo 为逻辑 anchor，按 index id 用独立短 MTR 维护全部 secondary；logical unique prefix lock、NULL 语义、statement/full/recovery multi-index rollback 已接。`ClusteredDmlService` 保留聚簇/LOB/事务终态内核与低层兼容入口；SQL INSERT 已走表级服务，SQL UPDATE/DELETE grammar 仍未接 |
 | `storage.fsp.flst` file-list primitives | `FileAddress`, `Flst`, `FlstBase`, `FlstNode` | Implemented | FSP/XDES/INODE 链表指针与 base/node 编解码；不接触文件 IO；0.19c 起 FLST base/node 写入经 `FspRedoDeltas` 追加 metadata delta，0.19d 起对应物理 `PAGE_BYTES` 被提交过滤器替代 |
 | `storage.fsp.header` space header | `SpaceHeaderRepository`, `SpaceHeaderSnapshot`, `SpaceHeaderRawCodec`, `SpaceHeaderPhysical` | Implemented | page0 header 读写与 raw metadata 加载；`initialize` 盖 page0 FSP_HDR FilePageHeader 信封头；layout 常量供 extent/lifecycle codec 共享；0.19c 起 space header 字段写入追加 `FspMetadataDeltaRecord`，0.19d 起被 delta 覆盖的字段字节不再持久化 `PAGE_BYTES`；lifecycle truncate marker 和 page0 信封仍走物理 `PAGE_BYTES` |
 | `storage.fsp.reservation` space reservation | `SpaceReservationService`, `SpaceReservation`, `SpaceReservationKind` | Implemented | `DiskSpaceManager.reserveSpace` 生产接线；内存态容量账本，预扩物理文件/page0 currentSize；0.14b 已接 B+Tree split/root split 与 Undo grow 真实消费者；2026-07-03 修正锁边界：reserve 不持账本锁等待 page0/FLST，consume 不取全局账本锁而只改当前 reservation 原子页额度 |
@@ -234,9 +234,13 @@ flowchart TD
   Split --> Descend["findLeaf / descendPath (N 层导航)"]
   Split --> SplitEngine["splitLeafAndPropagate / insertSeparator / growRootWithInternal (自底向上 split + 原地 root split)"]
   Engine["StorageEngine"] --> CurrentRead["BTreeCurrentReadService (2.7a point/unique + 2.7b range)"]
-  Engine --> DML["storage.api.dml ClusteredDmlService (2.1 single clustered DML)"]
+  Engine --> DML["storage.api.dml TableDmlService"]
+  Engine --> ClusteredDML["ClusteredDmlService anchor/terminal"]
+  DML --> ClusteredDML
   DML --> CurrentRead
   DML --> Split
+  Engine --> SecondaryMvcc["SecondaryMvccReader"]
+  SecondaryMvcc --> Split
   CurrentRead --> Split
   CurrentRead --> LockMgr["storage.trx.lock LockManager"]
   Tests["tests only"] --> Facade
@@ -250,6 +254,7 @@ flowchart TD
 | Point lookup | `BTreeIndexService.lookup` -> SplitCapable `findLeafSharedCrab`（N 层 `chooseChild` **S-crab** 下降：持父 S→latch 子 S→放父 S，祖先早释放，0.13c）-> `search.findEqual` -> `RecordCursor` -> `materialize` | Implemented；SplitCapable 任意高度（0.11）；读路径 S-crab（0.13c）；LeafOnly 仍 level 0 |
 | Point current-read (2.7a) | `BTreeCurrentReadService.lockPoint` -> 短 MTR `SplitCapableBTreeIndexService.locatePointForCurrentRead`（S 定位 record/gap，构造 `RecordLockKey`/`GapLockKey`/`NextKeyLockKey`）-> commit 释放 page latch/fix -> `LockManager.acquire` -> 短 MTR 重新定位校验；RC miss 不锁 gap，RR miss 按模式锁 gap | Implemented；SQL INSERT 经 `ClusteredDmlService` 消费 unique-check/insert-intention 分支；普通 SELECT 走 MVCC，SQL locking point SELECT 与 UPDATE/DELETE 尚未接 |
 | Unique insert current-read check (2.7a) | `BTreeCurrentReadService.checkUniqueForInsert` -> 物理 duplicate 命中取 `REC_S` 并重定位确认；miss 取 `INSERT_INTENTION` 到目标 gap 并重定位确认 -> `BTreeUniqueCheckResult` | Implemented；2.1 起 `ClusteredDmlService.insert` 调用；仍是物理唯一检查（delete-marked 同 key 算 duplicate），不做 MVCC 逻辑唯一 |
+| Secondary logical unique check | `TableDmlService.insert/update` (`TableDmlService.java:130/193`) -> `SecondaryUniqueCheckService.check` (`SecondaryUniqueCheckService.java:84`) 以 collation/prefix 规范化 logical key -> `SecondaryUniqueKeyLockKey` X 锁（事务终态释放）-> `scanSecondaryPrefixIncludingDeleted` -> 同主键 marked 可 revive、其它主键 live/marked 保守 duplicate；任一 NULL part 跳过 logical 冲突锁 | Implemented；不同主键并发等价 key 只有一个越过检查；完整 physical key 仍由 B+Tree `physicalUnique` 保护 |
 | Range current-read (2.7b) | `BTreeCurrentReadService.lockRange` -> 短 MTR `SplitCapableBTreeIndexService.locateRangeForCurrentRead`（扫描 range records，构造 `RecordLockKey`/`NextKeyLockKey` 与 terminal `GapLockKey`）-> commit 释放 page latch/fix -> RC 对返回记录取 `REC_S/REC_X`，RR 取 `NEXT_KEY_S/X` + `GAP_S/X` -> 短 MTR 重扫 range 并校验；失败尝试释放已授予锁 | Implemented；批量 range 结果，不实现长期 cursor；terminal gap 仍是页级简化；SQL/session/executor range DML 尚未接 |
 | Bounded scan | `SplitCapableBTreeIndexService.scan` -> `descendSharedCrab(lowerKey)` **S-crab** 定位起始 leaf -> sibling loop via `fileHeader().nextPageNo()`（`FIL_NULL` 终止，**hand-over-hand**：先 latch 后继 leaf 再 `releaseHandle` 前驱）-> `scanLeafPage` per page | Implemented；任意高度；读路径 S-crab + sibling hand-over-hand（0.13c），任一时刻只持「父+子」/「≤2 leaf」|
 | Insert (no split) | SplitCapable `insert` -> **乐观** `tryOptimisticInsert`：`descendOptimistic`（内部层 S-crab、leaf X）-> unique check -> `inserter.insert`（放得下即成，仅 leaf 持 X）；溢出=unsafe 释放 leaf X 回退 `pessimisticInsert`。**悲观 insert 走 safe-node 下降（0.13d）**：`descendPathInsertSafeNode` 全 X 下降但每 latch 到内部 child 若 safe（`freeSpace ≥ maxSeparatorSize`=该索引 node pointer 编码严格上界）即释放其以上全部祖先 X（含 root）→ split 不传播到 root 时 **root X 不再持到 commit**；只判内部页（leaf 恒保留），既有 split 传播引擎在截断后的保留链上零改动正确。LeafOnly 仍 `descendPath` X-latch root→leaf | Implemented；overflow → `BTreeSplitRequiredException`（LeafOnly）或悲观 split 传播（SplitCapable，写路径 latch coupling 0.13a + safe-node 0.13d）；诊断计数 `safeNodeAncestorReleaseCount()`。insert/delete/purge 的 safe-node 下降共用 `descendPathSafeNode`（谓词参数化）。**0.13d SX+restart（§10.3 ROOT_LATCHED_SX）**：快照树高 ≥2 的悲观 SMO 首遍 root 取 **SX**（与读者/乐观写者 root S 并存、排它其它 SMO），safe 节点吸收 → 全程不 X root；首遍链顶仍是 root（SMO 可能写 root，SX 禁升级）→ 零写整链释放、root X 重启第二遍（至多一次，重启即全新导航天然正确）；level 0/1 树必写 root 故跳过 SX 首遍直取 X；计数 `rootSxDescentCount()`/`rootXRestartCount()` |
@@ -259,16 +264,17 @@ flowchart TD
 | Clustered purge (T1.3d；0.12 merge；0.13b latch coupling) | `SplitCapableBTreeIndexService.purgeDeleteMarkedClustered(...)` -> **乐观** `tryOptimisticPurge`：`descendOptimistic`（内部 S、leaf X）-> `findEqual` 严格校验（命中 + 仍 delete-marked + 隐藏列匹配，任一不符=stale no-op）-> `deleteWouldUnderflow` 预判：不欠载则 `purger.purge` **跳过 `reclaimAfterRemoval`**（仅 leaf 持 X）；欠载=unsafe 写页前释放 leaf X 回退悲观 `descendPathDeleteSafeNode`（0.13d safe-node，与 delete 同）+`purgeInLeaf`（带 merge）-> `BTreeDeleteResult(removed, indexAfter, freedPages)` | Implemented (StorageEngine service root + `PurgeCoordinator` + tests)；stale=no-op；与 delete 共用 0.12 欠载回收 + 0.13b 乐观预判 + 0.13d safe-node 下降/计数 |
 | Clustered replace (T1.3e；0.13b latch coupling) | `SplitCapableBTreeIndexService.replaceClustered(...)` -> **乐观** `tryOptimisticReplace`：`descendOptimistic`（内部 S、leaf X）-> `replaceInLeaf`：`findEqual` -> 所有权校验 -> `updater.update` 整记录替换；root 即 leaf 交悲观 `findLeaf(X)`。**恒 safe**（原地/页内搬迁，永不 split/merge）；REQUIRES_REINSERT(改 PK)→`BTreeUnsupportedStructureException`、搬迁溢出→`RecordPageOverflowException`（leaf 未改，与路径无关直接上抛）-> `BTreeUpdateResult(replaced)` | Implemented; 前向 UPDATE 与 rollback 恢复共用；幂等；不 import trx/undo；**0.13b 乐观 leaf-only，无 unsafe 回退** |
 | Clustered delete-mark (T1.3f；0.13b latch coupling) | `SplitCapableBTreeIndexService.setClusteredDeleteMark(...)` -> **乐观** `tryOptimisticMark`：`descendOptimistic`（内部 S、leaf X）-> `markInLeaf` plan-then-execute：`findEqual`(含已标记)→所有权校验→翻转合法校验→`setDeleted`+`writeHiddenColumns`(等长两步纯写)；root 即 leaf 交悲观。**恒 safe**（等长纯写、无 size 变化/无结构变更）-> `BTreeDeleteMarkResult(changed)`；`lookupIncludingDeleted` 不过滤 delete-marked | Implemented; 前向删除与 rollback 取消标记共用；幂等、非法翻转抛；不 import trx/undo；**0.13b 乐观 leaf-only，无 unsafe 回退** |
+| Secondary entry operations | `SplitCapableBTreeIndexService.insertSecondary` (`:222`) / `deletePublishedSecondary` (`:564`) / `purgeDeleteMarkedSecondary` (`:580`) / `setSecondaryDeleteMark` (`:927`) / `scanSecondaryPrefixIncludingDeleted` (`:1142`) -> 完整 physical key（logical parts + 完整聚簇主键后缀）定位；物理删除复用同一 underflow merge/redistribute/root-shrink | Implemented；DML、rollback、purge、unique check 与 secondary MVCC 均生产调用；`ABSENT` 是 crash 重试完成证据，live/marked 状态冲突显式返回 |
 | Underflow reclaim (0.12 merge+shrink / 0.12b redistribute，delete+purge 共用) | `deleteInLeaf`/`purgeInLeaf` 物理删除成功 -> `reclaimAfterRemoval` -> `considerMerge(path, depth)`：`isUnderfull`(可回收空闲 `freeSpace+garbage` > 页半) -> `chooseMergePair`（parent pointer 顺序，survivor=左/victim=右）-> `mergeFits`(reclaimable)？**fit** → `reorganize` survivor 压实 + 并入 victim（leaf 修 FIL 链）-> `removePointerFromParent`(deleteMark+purge) -> `freeSmoPage(victim)` -> 传播 `considerMerge(depth-1)` / parent 是 root 剩 1 pointer 则 `shrinkRoot`（吸收唯一 child、树高-1、级联）；**fit 不下** → `redistribute`：合并相邻对对半重分到两页（`splitRows`/`splitPointers`）+ 只更新 parent 中 right 成员 lowKey（删旧插新）| Implemented (StorageEngine service root + tests)；min-key-pointer 约定下 survivor/left 父 pointer key 不变（merge 无 separator 更新、redistribute 仅改 right lowKey）；**redistribute 不删页/不传播/不改树高**（leaf+internal 统一，0.12b）；root 页号稳定；额外 sibling/远兄弟/child latch 入 MTR memo；**0.13d 起 path 可为 safe-node 截断保留链**：`considerMerge` 的 root 判定改按 `parentHandle.pageId()==rootPageId`（页号跨 split/shrink 稳定）而非链下标——防止对非 root 的 safe 链顶误做 `shrinkRoot`；safe 链顶保证摘一指针后不欠载 → merge 传播必停在链顶；0.23a 起回收页触碰 FSP 元页经 `freeSmoPage` 使用带理由的 MTR ordering 例外（FSP 不反向等待 index latch）|
 
 ### Package Status
 
 | Package area | Representative classes | Current state | Notes |
 | --- | --- | --- | --- |
-| `storage.btree` facade | `BTreeIndexService` (interface), `BTreeIndex` (descriptor record), `BTreeLookupResult`, `BTreeInsertResult`, `BTreeScanRange` | Implemented (partially production-wired) | `StorageEngine` 构造并暴露 `SplitCapableBTreeIndexService`；2.1 起 `ClusteredDmlService` 调用 clustered insert/replace/delete-mark；descriptor/result 值对象随该 service 进入生产根。`BTreeIndexService` interface 与 leaf-only 旧实现仍主要是测试/遗留抽象；SQL executor/DD 尚未接入 |
-| `storage.btree` current-read | `BTreeCurrentReadService`, `BTreeCurrentReadRequest`, `BTreeCurrentReadMode`, `BTreeCurrentReadPosition`, `BTreeCurrentReadRangePosition`, `BTreeUniqueCheckResult` | Implemented; production-held by `StorageEngine` | 2.7a 点查/unique-check + 2.7b range：短 MTR 定位 -> 释放 latch/fix -> `LockManager.acquire` -> 重定位校验；2.1 起单聚簇 DML insert/update/delete 使用 unique/point current-read；RC range 只锁记录，RR range 锁 next-key + terminal gap；成功锁由 `ClusteredDmlService.commit/rollback` 调 `releaseAll` 释放 |
+| `storage.btree` facade | `BTreeIndexService` (interface), `BTreeIndex`, table/secondary metadata, clustered/secondary result types | Implemented (split-capable production-wired) | `StorageEngine` 暴露 concrete `SplitCapableBTreeIndexService`；TableDml/rollback/purge/MVCC 生产调用 clustered 与 secondary 原语。旧 `BTreeIndexService` interface 与 leaf-only 实现仍主要是教学/回归抽象 |
+| `storage.btree` current-read | `BTreeCurrentReadService` point/physical-unique/range + `SecondaryUniqueCheckService` logical unique | Implemented; production-held by `StorageEngine` | 聚簇 current-read 仍按短 MTR 定位→事务锁→重定位；secondary unique 另以规范化 logical-key X 锁串行检查并扫描含 marked 候选。全部事务锁由统一 DML terminal `releaseAll` 释放；SQL locking/range SELECT 仍未接 |
 | `storage.btree` leaf-only | `LeafOnlyBTreeIndexService` | Implemented (test-wired) | B1/B2 rootLevel=0 only; point lookup + in-page scan + insert-no-split; retained for regression/teaching tests while production root uses split-capable service |
-| `storage.btree` split-capable | `SplitCapableBTreeIndexService`, node pointer types, `BTreeRedoDeltas`, `RecordPageStructureSnapshot` | Implemented (StorageEngine + DML facade + tests) | 任意高度 split、merge/root shrink、redistribute、全部读写 latch coupling、safe-node/SX restart 与 MTR ordering 均生产接线。0.21d 起统一 existing-page helper 在实际 level 驱动 leaf/internal schema-aware key 顺序校验，早于 child 选择、search 与写页。B+Tree redo：sibling link；internal/root 最终 after-image；恢复只 patch 页面，不重跑 SMO。仍缺 B-link/OLC、MVCC/segment 辅助页头、SQL/DD 多索引 |
+| `storage.btree` split-capable | `SplitCapableBTreeIndexService`, `BTreeRootSnapshotService`, node pointer/redo snapshot types | Implemented (StorageEngine + table DML/rollback/purge/MVCC) | 任意高度 clustered/secondary split、merge/root shrink、redistribute、latch coupling、safe-node/SX restart 与 MTR ordering 均生产接线；结构写前从稳定 root 页头刷新 level，redo 只 patch 页面不重跑 SMO。仍缺 B-link/OLC 与 `PAGE_MAX_TRX_ID`/segment 辅助页头 |
 | `storage.btree` exceptions | `BTreeException` + 6 subclasses | Implemented | `BTreeCurrentReadRelocationException`（授锁后多次重定位失败）, `BTreeDuplicateKeyException` (physical unique check), `BTreeSplitRequiredException`, `BTreeStructureCorruptedException`, `BTreeUnsupportedStructureException`；`BTreeRootChangedException` 自 0.12 起**不再由 `openRoot` 的 level guard 抛出**（导航按实际 root level；reserved 供 0.13/2.7 并发重定位协议）|
 
 ## Redo Log Layer Slice
@@ -393,14 +399,19 @@ flowchart TD
 flowchart TD
   Tests["tests only"] --> Mgr["TransactionManager"]
   Tests --> UndoMgr["UndoLogManager"]
-  Engine["StorageEngine"] --> DML["storage.api.dml ClusteredDmlService (2.1)"]
+  Engine["StorageEngine"] --> DML["storage.api.dml TableDmlService"]
+  Engine --> ClusteredDML["ClusteredDmlService"]
+  DML --> ClusteredDML
   DML --> Mgr
   DML --> UndoMgr
   DML --> RollbackSvc["RollbackService"]
   Engine --> Purge["PurgeCoordinator"]
+  Engine --> SecondaryMvcc["SecondaryMvccReader"]
   DML --> Guard["DmlStatementGuard"]
   Guard --> RollbackSvc
   DML --> LockMgr
+  DML --> RowGuard["PurgeDmlRowGuardManager"]
+  Purge --> RowGuard
   DML --> RedoMgr["RedoLogManager + DurabilityPolicy"]
   Mgr -->|begin| Txn["Transaction"]
   Mgr -->|assignWriteId / commit / rollback| Sys["TransactionSystem"]
@@ -424,6 +435,7 @@ flowchart TD
   UndoMgr -->|begin append lease| History["HistoryList persistent-chain projection"]
   Purge -->|peek + begin head-removal lease| History
   Finalizer -->|MTR 后 publish| History
+  History --> Barrier["HistoryTablePurgeBarrier -> storage.api TablePurgeBarrier"]
   Finalizer -->|reserve push / commit 后 publish| Cache
   Finalizer -->|begin lease / commit 后 complete| Slots
   Tests --> LockMgr["LockManager (0.17)"]
@@ -446,28 +458,29 @@ flowchart TD
 | Flow | Current production chain | Current state |
 | --- | --- | --- |
 | Begin | `SessionTransactionPolicy.ensureTransaction` -> `SqlStorageGateway.begin` -> `DefaultSqlStorageGateway.begin` -> `TransactionManager.begin(options)` -> `new Transaction(options, now)` state `ACTIVE`; **no id allocation** (lazy) | Implemented；Session 持 opaque handle，不越层接触 storage transaction；低层调用方仍可显式持事务调用 DML facade |
-| Assign write id | `ClusteredDmlService.insert/update/delete` -> `TransactionManager.assignWriteId(txn)` (`:45`) -> requires `ACTIVE`, rejects read-only -> `system.allocateWriteId()` (`:53`) -> `txn.setTransactionId` (`:54`); idempotent if already set | Implemented; 2.1 production DML caller wired；`allocateWriteId` -> `active.register(id)` (`TransactionSystem.java:33`) |
-| Commit | `ClusteredDmlService.commit` -> `prepareCommit` 分配 no -> `UndoLogManager.onCommit`：有 UPDATE 时先 `HistoryList.beginAppend` 冻结 base -> `UndoSegmentFinalizer.finalizeCommit` 预检 page3/history/free evidence -> 一个 MTR 处理 INSERT cache/free/drop owner、history base、UPDATE history links+COMMITTED 与唯一 terminal delta，并按全局页序写全部普通首页 -> commit 后发布 slot/reuse directory/history -> `TransactionManager.commit` -> durability -> release locks | Implemented for storage DML facade；纯 INSERT 不进 history；mixed 所有 owner/link/terminal 同批；transition lock 不跨 IO，物理前失败可释放，物理后失败保留 fail-stop fence；若 `onCommit` 失败事务保持 ACTIVE 且锁不释放 |
-| Rollback (consume undo, T1.3d/1.4b/1.4c/1.6) | `ClusteredDmlService.rollback` -> `RollbackService.rollback` 预检 INSERT/UPDATE 两个 persistent logical head -> 按全局 `undoNo` 归并逆序执行短 MTR inverse -> INSERT ownership 的 LOB free 与 logical-head CAS 同属 marker MTR -> marker commit 后发布所属 binding -> 双链 EMPTY 后 batch finalization 在同一 MTR 按段 active→cache、active→free 或 drop，并写一条 terminal delta | Implemented for live 与 recovery；recovery 按 creator 聚合最多一条 INSERT + 一条 UPDATE ACTIVE evidence 后走同一归并/批终结；marker 永不领先 inverse。精确故障测试覆盖 `AFTER_INVERSE_COMMIT`（LOB 仍可读、head 未动、重试幂等 inverse 后 free）与 `AFTER_PROGRESS_COMMIT`（LOB 已释放、head EMPTY、重试只终结） |
-| Statement/savepoint rollback (1.4/1.4b/1.6) | SQL INSERT -> `DefaultSqlStorageGateway.insert` -> `ClusteredDmlService.beginStatement` -> `RollbackService.createSavepoint` 快照 INSERT/UPDATE 双 head；失败 rollback 先分别预检两条局部链，再按全局 `undoNo` 归并执行 inverse -> 一个按 `PageId` 排序的 marker MTR 对变化的 first pages 做 CAS -> commit 后一次发布双 binding head | Implemented for SQL v1 INSERT and explicit storage DML；局部链物理高水位不回退且允许跨 kind 序号间隙；marker/CAS 失败不移动内存 head，Guard 标记 rollback-only；命名 SAVEPOINT 与 savepoint 后锁精细释放未接 |
-| Undo write (INSERT/UPDATE/DELETE) | `ClusteredDmlService.insert/update/delete` -> `UndoLogManager.planX`：已有 binding 冻结 append snapshot；首写依次冻结同 kind cache LIFO、跨 kind free FIFO，否则 ALLOCATE_NEW -> `UndoLogSegmentAccess.planRecord/plannedNewPages` 冻结编码、页数、reservation 与 redo workload -> facade begin 业务 MTR -> `appendPlanned` 重新校验；REUSE_CACHED/REUSE_FREE 同 MTR page3 owner→active slot、首页激活、append，ALLOCATE_NEW 才建 FSP segment，已有 binding 直接 append -> 发布局部 head/全局 high-water -> 聚簇写 | Implemented；`UndoSegmentAcquisition` 精确区分四路；可复用 segment 激活后允许 grow/external，后续多页终结直接 drop；stale cache/free plan 在物理前拒绝 |
+| Assign write id | `TableDmlService.insert/update/delete` (`TableDmlService.java:130/193/266`) -> `ClusteredDmlService` anchor -> `TransactionManager.assignWriteId(txn)` -> requires `ACTIVE`, rejects read-only -> `system.allocateWriteId()` -> `txn.setTransactionId`; idempotent if already set | Implemented；表级和低层单聚簇入口共享同一 active transaction table |
+| Commit | `TableDmlService/ClusteredDmlService.commit` -> `prepareCommit` 分配 no -> `UndoLogManager.onCommit`：有 UPDATE 时冻结 history base，并把当前 reachable logical chain 的 `affectedTableIds` 写入 `HistoryEntry` -> finalizer 单 MTR 处理 owner/history/free/terminal -> commit 后发布 slot/reuse/history table counters -> transaction commit -> durability -> release locks | Implemented；同一 history entry 对同一 table 只计一次；纯 INSERT 不进 history；transition lock 不跨 IO，失败边界保持原有 fail-stop 语义 |
+| Rollback (multi-index) | production terminal -> `ResolvedDmlRollbackCommand` -> `TableDmlService.rollback` (`TableDmlService.java:338`) -> `RollbackService` 预检双 persistent head -> 每条 undo 解析 exact-version `TableIndexMetadata` (`DictionaryIndexMetadataResolver.java:37`) -> 共用 row guard，secondary inverse 按 index id 各自短 MTR、clustered inverse 最后、logical-head marker 再后 -> 双链 EMPTY 后 batch finalization/terminal | Implemented for statement/full/recovery；INSERT/UPDATE/DELETE secondary inverse、clustered inverse 与 marker-lag 均幂等；`RollbackService.java:842` 的 stable hook 验证首棵 secondary commit 后 persistent head 不提前移动 |
+| Statement/savepoint rollback | SQL INSERT -> `DefaultSqlStorageGateway.insert` -> `DmlStatementGuard` -> `RollbackService.createSavepoint` 快照双 head；TableDml secondary MTR 前/后失败由 guard 调同一 multi-index inverse，再用单 marker MTR CAS 变化的 first-page heads | Implemented；局部链高水位不回退，事务保持 ACTIVE；命名 SAVEPOINT 与 savepoint 后锁精细释放未接 |
+| Undo write (INSERT/UPDATE/DELETE) | `TableDmlService` (`TableDmlService.java:130/193/266`) 在聚簇首 MTR 前冻结按 index id 排序的 `SecondaryUndoMutation`（INSERT_ENTRY / CHANGE_KEY / DELETE_MARK_ENTRY）-> `ClusteredDmlService` 调 `UndoLogManager.planX/appendPlanned` 写同一行级 undo anchor -> 聚簇写成功后各 secondary 独立短 MTR 发布 (`TableDmlService.java:370/420`) | Implemented；codec secondary tail 与 LOB tail 可组合，旧记录解码为空 mutation 列表；失败由 statement/full/recovery rollback 从同一 tail 收敛 |
 | Slot claim | `RollbackSegmentSlotManager.reserveClaim` 短锁 `FREE -> RESERVED` -> 当前业务 MTR `RollbackSegmentHeaderRepository.requireSlotFree` 以 S latch 预检 page3 并在返回前释放 -> `access.create` -> claim lease `bind(firstPageId)` 变 ACTIVE -> 同一业务 MTR 在局部 latch-order 例外内 `claimSlot(slot,firstPageId)` X-latch CAS -> append/publish context | Implemented；RESERVED 计入占用但无 owner，未 bind lease close 才可退回 FREE；持久 claim 再次 CAS 防异常漂移；page3 header/slot 写有 `UndoMetadataDeltaRecord(RSEG_HEADER_FIELD/RSEG_SLOT)` |
 | Atomic slot release / segment finalization | `RollbackSegmentSlotManager.beginBatchFinalization` all-or-none 取 FINALIZING leases -> `UndoSegmentFinalizer` 短读 owner/kind/drop plan/history/free evidence -> 精确单 fragment 先尝试同 kind cache，未接纳则进入 free FIFO，其余 drop -> 动态预算 MTR 固定 FSP page0/page2→page3→全部普通 first pages 全局排序，原子修改 owner、history/free base/link 与 terminal delta -> commit 后发布 slot/reuse directory/history | Implemented for INSERT/mixed commit、live/recovery 双段 rollback、committed UPDATE purge；cache 容量满/0/transition busy 可降级 free，只有不合格 segment 才 drop；history/reuse lease 不持锁跨 IO；物理前失败恢复运行时 transition，物理后失败保留 fail-stop fence |
 | ReadView 创建 (T1.4) | `ReadViewManager.openReadView(txn)` -> 按隔离级别 RR 缓存到 `Transaction.readView` / RC 新建 / RU·SERIALIZABLE 抛 -> `TransactionSystem.openReadViewSnapshot(txn)`（锁内：可写事务分配 creator id + 原子捕获 {activeIds, nextId, **nextTransactionNo→ReadView.lowLimitNo**} 建 `ReadView` 并登记 live 集合，purge 用） | Implemented and SQL point-read production-wired；commit/finishRollback 调 `release` 清 RR 缓存并注销 live view；`DefaultSqlStorageGateway.selectPoint` 在 finally 注销 RC view，且 view 生命周期覆盖 MVCC 版本选择、external LOB hydration 与公开行投影 |
-| Purge boundary + 单线程聚簇 purge (T-purge/1.4b) | 取 persistent-chain runtime head -> `TransactionSystem.isPurgeEligible(no,creator)` 在短锁内要求 creator 已离开 active table、no 低于 low water 且对所有 live ReadView 可见 -> 短 MTR 读 logical head/沿 UPDATE 局部 predecessor 收集 DELETE_MARK tasks -> 独立 index MTR purge -> `HistoryList.beginHeadRemoval` -> finalizer 原子 page3 unlink + first-page links + UPDATE cache/free/drop owner -> commit 后发布 slot/reuse directory/history | Implemented；物理链可局部 TransactionNo 倒序，blocked head 不越过；task/预检失败保留 COMMITTED owner 与持久 head；finalization 后 crash 由持久链恢复 |
-| Consistent read (MVCC, T1.4) | SQL point SELECT -> `DefaultSqlStorageGateway.selectPoint` -> RR/RC `ReadViewManager` -> `MvccReader.read(readView, index, key)` -> MTR-1 `btree.lookup` 物化当前版本并提交（释放 index latch）-> 不可见时沿 undo 版本链 -> **同一存活 ReadView 内**由 gateway 用短只读 MTR hydration external LOB -> 完整投影为 public `SqlRow` -> RC finally close view | Implemented for clustered primary-key equality；RC 不会在解引用外置值前提前释放 purge low-water，任一时刻不同持 index+undo latch，结果不暴露 hidden columns/LobReference；range/locking SELECT 未接 |
+| Version-safe secondary purge | `PurgeCoordinator.runBatch` (`PurgeCoordinator.java:181`) -> persistent history head eligible -> 按 logical chain 收集 UPDATE/DELETE secondary tasks -> 取得 table+cluster-key row guard（busy zero-wait deferred）-> `SecondaryPurgeSafetyChecker.evaluate` (`SecondaryPurgeSafetyChecker.java:97`) 从当前聚簇版本沿 undo 到 target，较新 live 版本仍映射旧 identity 则 RETAIN、链不到 target fail-closed -> secondary 先于 clustered 各自短 MTR -> 所有 task 完成后 finalizer/unlink | Implemented；A→B→A 不误删，DELETE 固定 secondary-first，task commit 后 crash 由 `ABSENT` 幂等重试；history/table barrier 只在 finalization 后推进 |
+| Consistent read (primary + unique secondary) | SQL point SELECT -> RR/RC ReadView -> 主键走 `MvccReader`；unique secondary 走 `SecondaryMvccReader.readUnique` (`SecondaryMvccReader.java:82`)：含 marked prefix scan 的 secondary MTR 先提交，再逐候选回表聚簇 MVCC、从可见完整行重算 logical key并去重 -> 同一 view 内 LOB hydration/投影 -> RC finally close | Implemented；binder 主键优先，否则选完整无 prefix 的最小 index-id unique secondary；NULL equality 直接空；secondary/clustered/undo latch 不重叠，不同可见主键同时命中时 fail-closed |
+| Table purge barrier / DROP | commit/recovery publish `HistoryEntry.affectedTableIds` -> `HistoryList.awaitTableUnreferenced` (`HistoryList.java:156`) 在同一显式锁下维护 per-table 引用计数/Condition -> `HistoryTablePurgeBarrier.awaitUnreferenced` (`HistoryTablePurgeBarrier.java:36`) -> DD `DictionaryDdlService.dropTable` (`DictionaryDdlService.java:259`) 在 table MDL X 下、发布 DROP_PENDING 前等待；pending recovery (`DictionaryDdlRecoveryService.java:143`) 在物理删除前再次等待 | Implemented；timeout 保持 ACTIVE 或 DROP_PENDING+文件；purge finalization 原子摘 history 后唤醒；无独立持久计数，page3/first-page history 始终是重启真相 |
 | Row-lock diagnostics (2.8a) | `LockManager.acquire/release/releaseAll` -> `RowLockEventSink` 事件端口（端口与事件载荷 `RowLockObservation`/`RowLockBlocker`/`ThreadEventId` 定义在 `storage.trx.lock`，server.lockobs 向下实现，无反向依赖）；`StorageEngine.lockDiagnosticSnapshot` -> `lockManager.snapshot()` -> `DefaultLockObservationService.captureSnapshot` -> `data_locks` / `data_lock_waits` rows | Implemented; row-lock only；不授锁、不 release、不 rollback；session/statement id 为 0，DD 未接所以 schema/table 为空、index 名为 `index#<indexId>` |
 
 ### Package Status
 
 | Package area | Representative classes | Current state | Notes |
 | --- | --- | --- | --- |
-| `storage.trx` facade | `TransactionManager`, `UndoLogManager`, `UndoWritePlan`, `UndoSegmentReuseDirectory`, `RollbackService`, `UndoSegmentFinalizer`, `ReadViewManager`, `MvccReader`, `PurgeCoordinator`, `HistoryList`, `PurgeSummary` | Implemented; production-held by `StorageEngine`; DML/gateway-wired | 生命周期门面 + immutable undo plan/精确 reservation/redo workload + rollback progress + ReadView/MVCC + purge；Session 已接 autocommit/显式事务/close rollback，仍无命名 SAVEPOINT、RU/SERIALIZABLE、XA/PREPARED |
+| `storage.trx` facade | transaction/undo/finalizer/rollback, `MvccReader`, `SecondaryMvccReader`, `PurgeCoordinator`, `HistoryList`, `HistoryTablePurgeBarrier` | Implemented; production-held by `StorageEngine`; DML/gateway/DD-wired | 多索引 undo/rollback、primary/secondary MVCC、version-safe secondary purge、persistent-history DROP barrier 均接入；仍无命名 SAVEPOINT、RU/SERIALIZABLE、XA/PREPARED、多 worker purge |
 | `storage.trx` system | `TransactionSystem`, `ActiveTransactionTable`, `TransactionCounterSnapshot` | Implemented; production-held by `StorageEngine` | `ReentrantLock` 短锁保护 id/no/active/read views；checkpoint 用 `snapshotCounters()` 原子读取两个 next-counter（不消费号码），recovery 用 `restoreCounters` 只前进不回退 |
 | `storage.trx` aggregate | `Transaction`, `TransactionState`, `TransactionOptions`, `IsolationLevel`, `UndoContext`, `TransactionSavepoint`, `EmptyUndoBoundary`, `ReadView` | Implemented; DML facade consumes explicit transaction | 5-state FSM + ACTIVE rollback-only 提交资格；T1.3c 惰性 `UndoContext`；1.4 增 `TransactionSavepoint`、一次性空 undo statement boundary 与失败事务 rollback-only 防提交；T1.4 增 `Transaction.readView` 字段 + `ReadView` 五规则；`IsolationLevel` 驱动 RR/RC ReadView 生命周期（RU/SERIALIZABLE 拒绝） |
-| `storage.trx.lock` lock core | `LockManager`, `LockHandle`, `RecordLockKey`, `GapLockKey`, `NextKeyLockKey`, `InsertIntentionLockKey`, `TransactionLockMode`, `TransactionLockState`, `LockSnapshot`, `WaitForEdgeSnapshot`, `RowLockEventSink`(+`NoopRowLockEventSink`), `RowLockObservation`, `RowLockBlocker`, `ThreadEventId`, `LockWaitTimeoutException`, `DeadlockDetectedException` | Implemented; production-held by `StorageEngine`; DML-wired | 0.17 内存锁内核：按 indexId 分片的 `ReentrantLock` 锁表、record/gap/next-key/insert-intention 兼容判断、Condition wait queue、timeout 清理、`releaseAll(TransactionId)`、row-lock wait-for graph + bounded deadlock detector；2.7a/2.7b 已被 `BTreeCurrentReadService` 用于 point/unique/range current-read；2.1 `ClusteredDmlService.commit/rollback` 调 `releaseAll`；2.8a 通过 storage 侧 `RowLockEventSink` 事件端口发布观测事件，LockManager 不反向依赖 server.lockobs |
+| `storage.trx.lock` lock core | existing record/gap/next-key/insert-intention keys + `SecondaryUniqueKeyLockKey`, snapshots/events/exceptions | Implemented; production-held by `StorageEngine`; DML-wired | 按 indexId 分片显式锁表、Condition 有界等待、wait-for/deadlock 与 `releaseAll` 不变；TableDml 的 normalized secondary unique X 锁也进入同一事务持锁集合，终态前不释放；LockManager 不反向依赖 DD/SQL |
 | `server.lockobs` row-lock diagnostics | `LockObservationService`(extends `storage.trx.lock.RowLockEventSink`), `DefaultLockObservationService`, `SnapshotRequest`, `DataLockRow`, `DataLockWaitRow`, `LockDiagnosticSnapshot`, `WaitSlotSnapshot`, `DeadlockReport` | Implemented; production-wired by `StorageEngine` | 第一阶段只**向下依赖** `storage.trx.lock` 的事件端口与只读快照类型：实现 `RowLockEventSink` 消费 row-lock 事件，并追加 `captureSnapshot`/`latestDeadlocks` 生成 Java API 级 `data_locks` / `data_lock_waits` 当前快照与最近 deadlock report；不实现 SQL 视图、MDL、物理 latch/mutex/condition 采集或跨域 victim |
-| `storage.trx` undo context | `UndoContext`, `UndoLogBinding`, `TransactionSavepoint`, `EmptyUndoBoundary` | Implemented; DML facade writes through `UndoLogManager` and drives boundaries through `DmlStatementGuard` | `lastUndoNo` 是事务全局且不回退的 append 高水位；INSERT/UPDATE binding 各持 slot/firstPage/local logical head/persistent snapshot；首写可从同 kind cache 或跨 kind free FIFO 生成新 binding；savepoint 快照双 head；modifiedTables 仍 deferred |
+| `storage.trx` undo context | `UndoContext`, `UndoLogBinding`, `TransactionSavepoint`, `EmptyUndoBoundary` | Implemented; table DML/rollback/history-wired | `lastUndoNo` 为全局 append 高水位；双 binding/savepoint 语义不变；UPDATE reachable logical head 同步维护 `undoNo -> tableId` 投影，savepoint/full rollback 剪枝后 `affectedTableIds()` 精确生成 commit history 表集合 |
 | `storage.trx` rseg slot | `RollbackSegmentSlotManager`, `UndoSlotExhaustedException` | Implemented | 固定单一默认 rseg 的内存投影；显式 `FREE/RESERVED/ACTIVE/FINALIZING`，claim/finalization RAII lease 与 restore 都由 `ReentrantLock` 短临界区保护，锁内无 IO；RESERVED/FINALIZING 均计占用，恢复按 page3 下标重建 ACTIVE |
 | `storage.trx` exception | `TransactionStateException`, `UndoSlotExhaustedException`, `UndoWriteStalePlanException`, `UndoWriteFatalException`, `UndoClaimPublicationException`, `UndoFinalizationException`, lock exceptions；`storage.undo.UndoSlotOwnershipConflictException` | Implemented; production-reachable | All extend project exception hierarchy；stale plan/reservation 前错误可重试；page3 预检 owner 冲突在物理分配前可恢复；external/root 物理写开始后、segment bind 后 owner/context 发布失败与 finalization 物理边界后的不确定失败均抛 fatal，调用方不得同进程重试 |
 
@@ -493,11 +506,13 @@ flowchart TD
   Svc -->|"5. resumeAfterRedo (if undo participant)"| UndoResume["UNDO_TABLESPACE_RESUME"]
   Svc -->|"6. reconcileSpaceFiles (if spacesToReconcile)"| Reconcile["SPACE_FILE_RECONCILE: validate+page0 size -> PageStore.ensureCapacity"]
   Reconcile --> Codec["SpaceHeaderRawCodec.readPhysical"]
-  Svc -->|"7. recoverAfterRedo(recoveredToLsn, immutable trx snapshot)"| TrxUndo["UNDO_ROLLBACK + RESUME_PURGE"]
-  TrxUndo --> TrxWork["page3 v4 -> validate cache/free/FSP + reconcile slots + traverse persistent history -> ACTIVE rollback / RESUME_PURGE"]
-  Svc -->|"8. flush recovered redo (if rollback appended redo)"| RedoFlush["RedoLogManager.flush"]
-  Svc -->|"9. forceAll (durability barrier)"| Force["PageStore.forceAll"]
-  Svc -->|10. openForUserTraffic| Gate
+  Svc -->|"7. recoverAfterRedo"| TrxUndo["UNDO_ROLLBACK + rebuild persistent history/table refs"]
+  TrxUndo --> TrxWork["page3 v4 -> validate cache/free/FSP -> ACTIVE multi-index rollback"]
+  Svc -->|"8. resumePurgeAfterRedo"| ResumePurge["RESUME_PURGE real batches"]
+  ResumePurge --> TrxWork
+  Svc -->|"9. flush recovered redo"| RedoFlush["RedoLogManager.flush"]
+  Svc -->|"10. forceAll (durability barrier)"| Force["PageStore.forceAll"]
+  Svc -->|11. openForUserTraffic| Gate
   Svc -->|fail| Fail["failClosed -> RecoveryStartupException"]
   Gate --> States["RecoveryState: CLOSED/RECOVERING/OPEN/READ_ONLY/FAILED"]
 ```
@@ -506,7 +521,7 @@ flowchart TD
 
 | Flow | Current production chain | Current state |
 | --- | --- | --- |
-| Recovery orchestration | `DatabaseEngine.open(existing)` -> catalog/control recovery + high-water reconcile -> DD discovery -> `StorageEngine.open(existing)` gate/doublewrite/redo/undo truncate/space reconcile/page3 recovery -> ACTIVE rollback 逐 undo identity 经 DD resolver 定位索引 -> RESUME_PURGE -> storage force/open -> DD resume DROP_PENDING + DROPPED/orphan cleanup -> public OPEN | Implemented production path；cache/free owner、history、transaction evidence 均保持原有 fail-closed 校验；public engine 已接 DD discovery、lifecycle DDL recovery 与 table/index resolver；仍缺独立 DDL_LOG 阶段恢复、XA/PREPARED 决议、对象级 force-skip |
+| Recovery orchestration | `DatabaseEngine.open(existing)` -> DD discovery -> `StorageEngine.open(existing)` doublewrite/redo/undo resume/reconcile -> `PersistentHistoryRecovery.rebuild` (`PersistentHistoryRecovery.java:95`) 调用 `HistoryList.restore` (`HistoryList.java:222`) 重建 affected-table history，并按 exact table metadata 执行 ACTIVE multi-index rollback -> `StorageEngine.resumePurgeAfterRedo` (`StorageEngine.java:648`) 独立运行真实 `RESUME_PURGE` 安全 batch -> redo flush/force/open -> DDL recovery 续作 DROP_PENDING（再次过 barrier）/orphan cleanup -> public OPEN | Implemented production path；background purge 禁用时恢复阶段仍会消费当前安全 history；任一 resolver、版本链证明、barrier 或 finalization 失败均阻止 OPEN；仍缺 DDL_LOG、XA/PREPARED 与对象级 force recovery |
 | Space file reconcile (autoextend crash-safety) | undo resume 后若 `spacesToReconcile()` 非空：`reconcileSpaceFiles` 逐空间 `PageStore.readPage(page0)` -> `SpaceHeaderRawCodec.readPhysical` -> `validateReconcileHeader`（spaceId/pageSize 一致、size>0、偏移不溢出，否则 `TablespaceCorruptedException`）-> 幂等 `PageStore.ensureCapacity`；replay 期 `PageRedoApplyHandler` 仅对 PAGE_INIT extend-on-demand，首触越界 PAGE_BYTES 判 `RedoLogCorruptedException` | Implemented; `StorageEngine` E2 对系统 UNDO + 显式配置数据表空间执行；只恢复物理文件长度，不重建 FSP bitmap；弥补 autoExtend 不 fsync 在崩溃后留下的"物理短于 page0 逻辑"背离 |
 | Failure path | any `DatabaseRuntimeException` / `RuntimeException` inside an active stage -> `RecoveryProgressJournal.stageFailed`（memory + JSONL sink）-> `failClosed(mode, e)` -> `gate.failClosed(error)` -> state `FAILED` -> FAILED `RecoveryReport` with zeroed LSNs/counts -> throw `RecoveryStartupException` | Implemented; gate stays closed on failure; failed stage is visible through `StorageEngine.recoveryDiagnostics()` and `EngineConfig.recoveryProgressFile()`；若 failure progress 本身写文件失败，会作为 suppressed cause 保留但仍继续 fail-closed；`RecoveryStartupException` extends `DatabaseFatalException` |
 
@@ -524,16 +539,16 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-  Engine["StorageEngine production composition"] --> Dml["ClusteredDmlService"]
+  Engine["StorageEngine production composition"] --> Dml["TableDmlService + ClusteredDmlService"]
   Engine --> Recovery["TransactionUndoRecoveryParticipant"]
   Engine --> Purge["PurgeCoordinator"]
   Dml -->|planInsert / planUpdate / planDelete / appendPlanned / onCommit| UndoMgr["UndoLogManager (trx)"]
   Dml -->|full / statement rollback| Rollback["RollbackService (trx)"]
-  Engine --> Mvcc["MvccReader"]
+  Engine --> Mvcc["MvccReader + SecondaryMvccReader"]
   UndoMgr -->|snapshot / plan / reserve / create / open / append| Access
   Rollback -->|current/predecessor short read / per-record logical-head CAS| Access
   Recovery -->|ACTIVE rollback via RollbackService| Rollback
-  Purge -->|logicalHead / readRecord| Access
+  Purge -->|logicalHead / readRecord + secondary mutation tasks| Access
   Mvcc -->|readRecordByRollPointer| Access
   Tests["tests"] -.-> Access
   Access -->|create / open| Segment["UndoLogSegment (multi-page handle)"]
@@ -582,7 +597,7 @@ flowchart TD
 | `storage.undo` access | `UndoLogSegmentAccess`, `UndoLogSegment`, `UndoAppendSnapshot`, `UndoHistoryNodeSnapshot`, `UndoFreeListNodeSnapshot`, `UndoRecordWritePlan`, `UndoStoredRecordResolver`, `UndoPayloadStorage`, `UndoLogicalHead`, `UndoLog`, `UndoSegmentHandle`, allocation ports | Implemented; production-held by `StorageEngine` | create/open/plan/append、external chain、commit header、logical-head CAS、history/free node inspect/link/unlink/activate、按 pointer 直读均生产可达；rollback/recovery/purge/MVCC 共用 resolver；`UndoLog` 单页 predecessor 与 `forEachRecord*` 仅测试/诊断 |
 | `storage.undo` page | `UndoPageAccess`, `UndoPage`, `UndoPageLayout`, `UndoLogState`, `UndoPayloadPage`, `UndoPayloadPageLayout`, `UndoRedoDeltas` | Implemented | 普通 UNDO v3 flags gate + first-page 15-byte logical pair + state-discriminated history/free prev/next + record area=136 + every-page kind；external 页仍使用 `UNDO_PAYLOAD=9` 与 `UEP1/v1` body header；普通 v1/v2/未知版本 fail-closed |
 | `storage.undo` rseg header | `RollbackSegmentHeaderRepository`, `RollbackSegmentHeaderLayout`, `RollbackSegmentHeaderSnapshot`, `RollbackSegmentHeaderCapacity`, `RollbackSegmentHistoryBase`, `RollbackSegmentFreeListBase` | Implemented; production-wired by `StorageEngine` | 固定 **page3 v4**：history base/high-water + free head/tail/length + active slots + INSERT/UPDATE cache arrays；fresh/rebuild、slot/cache/free owner CAS、history append/remove、truncate/recovery 共用；active/cache/free owner 唯一，history 是 occupied UPDATE 关系而非额外 owner；expected base/owner/count/top fail-closed；v1-v3/未知版本拒绝；多 rseg 未实现 |
-| `storage.undo` record | `UndoRecord`, `UndoRecordCodec`, `UndoRecordType`, `UndoLogKind`, `UndoPayloadDescriptor` | Partial | 三类 record 全部编解码；INSERT log 仅允许 `INSERT_ROW`，UPDATE log 仅允许 `UPDATE_ROW/DELETE_MARK`，append/direct read/segment read/traversal 一致守门；inline 与 `0x7F/v1` external descriptor 编码不变；partial 仅指目标 `UPDATE_EXTERN_REF/DDL_MARKER` 等类型尚未实现 |
+| `storage.undo` record | `UndoRecord`, codec/types, `SecondaryUndoMutation`, external payload descriptor | Partial | 三类行记录与按 index id 排序的 secondary tail 全部编解码；LOB+secondary 双尾、旧记录空 tail、损坏/截断守门已接。partial 仅指目标 `UPDATE_EXTERN_REF/DDL_MARKER` 等记录类型尚未实现 |
 | `storage.undo` exceptions | `UndoPageOverflowException`, `UndoPayloadTooLargeException`, `UndoLogFormatException`, `UndoLogicalHeadConflictException` | Implemented | ordinary root 槽异常、external 配置上限、descriptor/page/link/owner/CRC/codec 损坏和 logical-head stale 均使用领域异常；页数上限在 reservation 前拒绝，物理发布后的事务编排不确定性由 trx fatal 异常表达 |
 | `storage.api` undo adapter | `DiskSpaceUndoAllocator` | Implemented | Implements `UndoSpaceAllocator`; delegates to `DiskSpaceManager.createSegment(UNDO)`/`allocatePage` and maps exact planned reservation to `DiskSpaceManager.reserveSpace(UNDO)`；同时服务主 UNDO chain grow 与同 segment external payload 页分配 |
 
@@ -619,11 +634,13 @@ flowchart TD
   Cache --> Repo
   Ddl["DictionaryDdlService"] --> Mdl
   Ddl --> Repo
+  Ddl --> Barrier["storage.api TablePurgeBarrier"]
   Ddl --> Physical
   Resolver["DictionaryIndexMetadataResolver"] --> Repo
   Resolver --> Mapper["DictionaryStorageMetadataMapper"]
   Mapper --> Factory["BTreeIndexMetadataFactory"]
   Storage -->|rollback / purge identity| Resolver
+  Storage -->|persistent history table refs| Barrier
 ```
 
 ### Current Data Chains
@@ -633,8 +650,8 @@ flowchart TD
 | Public bootstrap | `DatabaseEngine.open` -> open/rebuild control+catalog repository -> catalog high-water reconciliation -> DD tablespace discovery 返回稳定 API binding -> engine 组合根转换 recovery config/index resolver -> `StorageEngine.open` -> resume DROP_PENDING + remove DROPPED residue/controlled-name orphan -> publish OPEN | Implemented；ACTIVE binding 缺文件、binding 越出 `tables/` 或 catalog/control 损坏均 fail-closed；`mysql.ibd` 是 append catalog sidecar，不伪装成 StorageEngine tablespace |
 | Statement metadata lease | `DataDictionaryService.openTable(owner,name,TableAccessIntent,timeout)` -> schema MDL(SR) -> READ/table SR 或 WRITE/table SW -> cache single-flight load + pin -> `TableMetadataLease`；close 逆序 pin→table→schema | Implemented；访问意图无隐式默认值；DDL publish 后旧 pinned 版本可保持 stale，DROP_PENDING/DROPPED 不再由普通 lookup 打开 |
 | CREATE TABLE | schema IX -> table X -> reserve object/space/ddl/version high-water -> `TableDdlStorageService.createTable` schema 预检/LOB-capability 派生/redo admission -> 单 MTR 创建 GENERAL/FSP、每索引 leaf/non-leaf segment+root，并为含任一 TEXT/BLOB/JSON 列的表创建唯一 `SegmentPurpose.LOB` -> redo flush/force -> repository ACTIVE commit -> cache publish | Implemented for file-per-table + exactly one clustered primary index；非 LOB 表不分配 LOB inode，DROP 仍整体删除 space；DD publish 报错时提交结果不确定，保留物理文件；startup 对已提交 ACTIVE 继续使用、对未提交受控命名 orphan 清理 |
-| DROP TABLE | schema IX -> table X -> cache versioned admission barrier -> repository `DROP_PENDING` commit -> await pins -> 复核 binding path==opened path -> physical X lease -> durable DISCARDED page0 -> flush/invalidate/close/delete -> repository `DROPPED` commit | Implemented；DROP_PENDING publish 结果不确定时本地屏障阻止旧 ACTIVE snapshot 重载，重启裁决；durable marker 后故障注入证明重试幂等续作；尚缺 table-level persistent purge-history barrier |
-| Index/LOB metadata mapping | binder transaction scope pins exact `TableDefinition` -> SQL gateway `DictionaryStorageMetadataMapper.map`；rollback/purge -> `UndoStoredRecordResolver.identity` -> `IndexMetadataResolver.resolve(tableId,indexId)` -> DD repository identity lookup -> same mapper -> `BTreeIndexMetadataFactory` + binding `Optional<SegmentRef>` | Implemented；mapper 无 repository 依赖并严格消费调用方版本/root/binding；SQL INSERT/SELECT 与 undo rollback 共用权威 LOB capability；旧 catalog empty binding 保留而不猜测/偷建 segment |
+| DROP TABLE | `DictionaryDdlService.dropTable` (`DictionaryDdlService.java:259`) 在 schema IX/table X 下 resolve ACTIVE/binding -> `TablePurgeBarrier.awaitUnreferenced` (`:278`) -> cache version barrier -> repository `DROP_PENDING` -> await pins -> physical DISCARDED/flush/invalidate/delete -> `DROPPED`；启动时 `DictionaryDdlRecoveryService.recover` (`DictionaryDdlRecoveryService.java:105`) 对 pending DROP 再次执行 barrier (`:143`) | Implemented；barrier timeout 发生在版本预留/cache 失效/catalog 修改前，表保持 ACTIVE；DROP_PENDING recovery 在物理删除前再次等待恢复出的 history 引用，purge finalization 唤醒；publish 结果不确定与 durable marker 重试语义保持不变 |
+| Index/LOB metadata mapping | binder scope pins exact `TableDefinition` -> gateway mapper 生成 `TableIndexMetadata`（clustered + 按 id 排序 secondary）/LOB binding；rollback/purge -> undo identity -> `UndoTargetMetadataResolver` -> same mapper/factory | Implemented；SQL table INSERT、primary/unique-secondary SELECT、multi-index rollback/purge 共用 exact-version layout/root/binding；旧 catalog empty binding 保留而不猜测能力 |
 
 ### Package Status
 
@@ -642,12 +659,12 @@ flowchart TD
 | --- | --- | --- | --- |
 | `dd.domain/repo/tx` | immutable schema/table/index definitions, `DictionaryControlStore`, `PersistentDictionaryRepository`, `DictionaryTransaction` | Implemented v1 + compatible LOB tail | control 双槽 CRC；catalog page-aligned append frame + batch manifest；table payload 在 index bindings 后追加严格 `0/1 + SegmentRef` 尾部，EOF 兼容旧 binding，未知/截断/尾随 fail-closed；version 严格单调但允许 crash reservation gap；control 回退由 catalog high-water 校正 |
 | `dd.cache/mdl/service` | `DictionaryObjectCache`, `MetadataLockManager`, `DataDictionaryService`, `TableAccessIntent`, `TableMetadataLease` | Implemented | cache single-flight/pin/stale + DROP version barrier；显式 READ→table SR、WRITE→table SW，schema 恒 SR；MDL 六模式矩阵、FIFO、upgrade、timeout、deadlock wait graph；schema→table 锁序 |
-| `dd.ddl/recovery` | `DictionaryDdlService`, `DictionaryTablespaceDiscovery`, `DictionaryDdlRecoveryService` | Partial production-wired | CREATE/DROP 与 lifecycle recovery 已接；ALTER/CREATE INDEX statement/SDI/binlog/独立 DDL_LOG 未接 |
+| `dd.ddl/recovery` | `DictionaryDdlService`, `DictionaryTablespaceDiscovery`, `DictionaryDdlRecoveryService` | Partial production-wired | CREATE/DROP、purge-aware barrier 与 lifecycle recovery 已接；ALTER/CREATE INDEX statement、SDI/binlog/独立 DDL_LOG 未接 |
 | `storage.api.catalog` / `storage.fil.catalog` | `InternalCatalogStore`, catalog records/exceptions, `FileInternalCatalogStore` | Implemented v1 | 稳定 storage API 与 file backend；物理实现只依赖 common + storage API，不反向 import DD 异常或 repository |
 | `storage.api.ddl` | storage schema DTO/binding/mapper, `TableDdlStorageService`, `BTreeIndexMetadataFactory` | Implemented v1 + table LOB binding | physical create/drop、redo durability、DISCARDED marker；`TableStorageBinding` 校验 LOB segment 同 space 且不与 index segment alias，CREATE 的 LOB segment 与 indexes 同 MTR 创建；公开 DTO 隔离 DD domain，factory 供 engine adapter 使用 |
-| `engine` | `DatabaseEngine`, `EngineSessionExecutionGate`, `DictionaryIndexMetadataResolver`, `DictionaryStorageMetadataMapper`, `MappedTableStorage`, `DefaultSqlStorageGateway` | Implemented public composition root | DD 先于 storage discovery，storage recovery 先于 DDL cleanup，全部成功后构造 SQL 组件与 Session registry；adapter 把 pinned exact-version DD metadata 映射到 storage；每条 execute 持共享 gate permit，fatal 回调发布 FAILED，close 取得独占 quiescence 后才关闭 Session/storage/DD |
+| `engine` | `DatabaseEngine`, execution gate, DD metadata resolver/mapper, `MappedTableStorage`, `DefaultSqlStorageGateway` | Implemented public composition root | DD resolver 同时实现 index 与 table target；StorageEngine 的 table purge barrier 注入普通 DDL 和 DDL recovery；adapter 把 pinned exact-version metadata 映射为表级 DML/secondary MVCC 输入，生命周期 gate/关闭顺序不变 |
 
-## SQL Primary-Point + Session Slice
+## SQL Point Access + Session Slice
 
 ### Current Flow
 
@@ -669,8 +686,8 @@ flowchart TD
   Port --> Adapter["engine.adapter.DefaultSqlStorageGateway"]
   Deadline --> Adapter
   Adapter --> Mapper["DictionaryStorageMetadataMapper"]
-  Adapter --> DML["ClusteredDmlService INSERT/commit/rollback"]
-  Adapter --> MVCC["ReadViewManager + MvccReader"]
+  Adapter --> DML["TableDmlService INSERT + clustered terminal"]
+  Adapter --> MVCC["ReadViewManager + primary/secondary MVCC"]
   Adapter --> LOB["LobStorage hydration"]
   Engine --> Close["Session snapshot/close before StorageEngine.close"]
   Close -->|"write quiescence"| Gate
@@ -682,9 +699,9 @@ flowchart TD
 | --- | --- | --- |
 | Session admission | `DatabaseEngine.openSession` under lifecycle lock -> `SessionRegistry.register` -> `DefaultSqlSession`；每次 `execute` 先 `EngineSessionExecutionGate.enter` 取 read permit、再取 Session operation lock | Implemented；只允许 Engine OPEN；close 在 snapshot 同一 lifecycle 临界区切 CLOSING，gate 复核拒绝既有 Session 的新语句；锁序固定 gate→Session，避免 shutdown write gate 反向等待 |
 | Parse / bind | `DefaultSqlSession.execute` -> 单一 `SqlStatementDeadline` -> parser -> transaction policy -> `DefaultSqlBinder.bind` -> `TransactionMetadataScope.beginStatement` -> `DataDictionaryService.openTable` READ/WRITE | Implemented v1；绝对 deadline 从 Engine admission/Session lock 贯穿 MDL、executor、gateway/row lock、LOB/durability；Session MDL owner 使用保留高半区，普通 DDL owner 同数字不能重入；transaction-duration MDL/pin 不被 statement scope 提前释放 |
-| INSERT | `DefaultSqlExecutor.execute` -> `SqlStorageGateway.insert(transaction,bound,deadline)` -> `DefaultSqlStorageGateway.insert` -> deadline-capped handle/row-lock wait -> DD exact mapping -> `DmlStatementGuard` -> `ClusteredDmlService.insert` | Implemented；28 类型、复合 PK、external TEXT/BLOB/JSON、LOB+INSERT undo ownership+row 同 MTR；失败 guard rollback，rollback-only 保留终态资源；宽松 JSON 对象键/单引号/尾逗号/前导零在 binder 与 record 双层拒绝 |
-| Point SELECT | executor -> `DefaultSqlStorageGateway.selectPoint(transaction,bound,deadline)` -> isolation-specific ReadView -> `MvccReader.read` -> view 内 external LOB hydration/完整投影 -> RC finally close -> public `QueryResult` | Implemented；RR transaction snapshot 稳定、RC statement snapshot 刷新且覆盖 LOB 解引用；deadline 限制 handle 与每个 LOB 阶段，只返回投影列完整值，不泄露 storage reference |
-| Transaction terminal | `SessionTransactionPolicy` -> gateway `commit` (`DefaultSqlStorageGateway.java:146`) / `rollback` (`:176`) -> DML facade terminal + durability/row-lock release -> close transaction metadata scope | Implemented；storage 终态先于 MDL/pin 释放；outcome unknown 进入 FAILED；close rollback；rollback-only 只允许 rollback/close |
+| INSERT | `DefaultSqlExecutor.execute` (`DefaultSqlExecutor.java:30`) -> `DefaultSqlStorageGateway.insert` (`DefaultSqlStorageGateway.java:89`) -> exact DD `TableIndexMetadata`/LOB mapping -> `DmlStatementGuard` -> `TableDmlService.insert` (`TableDmlService.java:130`) -> 聚簇 undo/row anchor + 全部 secondary 按 id 独立发布 | Implemented；28 类型、复合 PK、external LOB、logical unique/NULL 与多索引 statement rollback 均走生产链；SQL grammar 仍只含 INSERT，不含 UPDATE/DELETE |
+| Point SELECT | `DefaultSqlBinder.bindSelect` (`DefaultSqlBinder.java:78`) 完整主键优先，否则选择完整无 prefix 的最小 id logical-unique secondary -> `DefaultSqlExecutor.execute` (`DefaultSqlExecutor.java:35`) -> `DefaultSqlStorageGateway.selectPoint` (`DefaultSqlStorageGateway.java:136`) 创建 ReadView -> primary `MvccReader` 或 `SecondaryMvccReader.readUnique` (`SecondaryMvccReader.java:82`) 回表复核 -> view 内 LOB hydration/投影 -> RC finally close | Implemented；RR/RC、未提交版本、A→B/A→B→A、marked candidate 与唯一可见性损坏均覆盖；NULL equality 返回空；不泄露 storage reference |
+| Transaction terminal | `SessionTransactionPolicy` -> gateway `commit` (`DefaultSqlStorageGateway.java:192`) / `rollback` (`:222`) -> DML facade terminal + durability/row-lock release -> close transaction metadata scope | Implemented；storage 终态先于 MDL/pin 释放；outcome unknown 进入 FAILED；close rollback；rollback-only 只允许 rollback/close |
 | Fatal propagation | storage fatal（即使位于 cause/suppressed）-> `DefaultSqlStorageGateway.adapt` / `DatabaseFailureClassifier` 保持 fatal -> `DefaultSqlSession` 进入 FAILED并 `SessionExecutionAdmission.failClosed` -> `DatabaseEngine` 发布 FAILED | Implemented；fatal 不再降级为可重试 `SqlStorageException`，组合根立即拒绝新 Session/statement；活动线程不递归 close，显式 close 再按 quiescence 顺序收敛 |
 | Engine close | `DatabaseEngine.close` -> lifecycle 发布 CLOSING/snapshot -> `EngineSessionExecutionGate.awaitQuiescence` write permit -> `closeSessions` virtual-thread bounded convergence -> `StorageEngine.close` -> DD resources | Implemented；write permit 证明全部 execute 已退出并覆盖 Session rollback + resource close；timeout 保持 CLOSING 且不关闭 storage；失败用 suppressed 聚合 |
 
@@ -694,10 +711,10 @@ flowchart TD
 | --- | --- | --- | --- |
 | `sql.parser` | lexer/token/source position/AST/`DefaultSqlParser` | Implemented v1 | 单语句 INSERT、primary-point SELECT、BEGIN/COMMIT/ROLLBACK、SET autocommit；错误含位置；无 UPDATE/DELETE/DDL/prepared grammar |
 | `common.json` | `StrictJsonValidator` | Implemented and production-wired | binder 与 record LOB codec 共享 RFC 8259 严格文本校验；零对象树、保留原始文本/数字精度；拒绝宽松扩展并限制嵌套深度；不实现 MySQL binary JSON |
-| `sql.binder` | `DefaultSqlBinder`, `SqlTypeCoercion`, bound statements, metadata scopes | Implemented v1 | DD 28 类型转换、严格 JSON、schema/name/shape 校验、transaction-duration metadata；无 optimizer/secondary access path |
+| `sql.binder` | `DefaultSqlBinder`, `BoundPointSelect`, `PointAccessKind`, coercion/metadata scopes | Implemented v1 | DD 28 类型转换、严格 JSON、transaction metadata；point access 支持 primary 与完整 non-prefix unique secondary，多个 secondary 候选取最小 index id；无 cost optimizer/range path |
 | `sql.executor` + `.storage` | public values/results, `DefaultSqlExecutor`, `SqlStatementDeadline`, outbound gateway/opaque handle | Implemented v1 | SQL/session 对 storage 零 import；INSERT/point SELECT 分派并传递单一绝对 deadline，transaction control 由 Session policy 执行 |
 | `session` | `DefaultSqlSession`, `SessionExecutionAdmission`, `SessionTransactionPolicy`, `SessionRegistry`, state/options/snapshot | Implemented in-process v1 | Engine permit→fair Session lock 固定顺序；autocommit 0/1、implicit/explicit transaction、rollback-only/FAILED/fatal fail-close/close；无 network connection/prepared statement/plan cache |
-| `engine.adapter` | `DefaultSqlStorageGateway`, `EngineSqlTransactionHandle` | Implemented v1 | 唯一 SQL→storage 映射层；handle 校验 ownership/terminal 并受 deadline 限制，精确 DD version 映射，RC view 覆盖 LOB hydrate，fatal 严重度保持；只支持 clustered INSERT/point SELECT |
+| `engine.adapter` | `DefaultSqlStorageGateway`, `EngineSqlTransactionHandle` | Implemented v1 | 唯一 SQL→storage 映射层；INSERT 走表级多索引 DML，point SELECT 按 bound access kind 分派 primary/unique-secondary MVCC；handle/deadline/LOB/fatal 语义不变 |
 
 ## Reserved / Unwired Production Types
 
@@ -729,16 +746,16 @@ flowchart TD
 | --- | --- | --- | --- |
 | `RecordDecoder` | Tests only (3 test classes) | Standalone decoder; production decode path goes through `RecordFieldResolver` via `RecordCursor` | Wire into a read/scan path, or fold into `RecordFieldResolver` if redundant |
 | `RecordPageDeleter` | `SplitCapableBTreeIndexService.deleteClustered` (StorageEngine service root + rollback tests) + tests | In-page delete-mark operator | rollback 已用；SQL v1 不含 DELETE，executor delete facade 仍待 |
-| `RecordPagePurger` | `SplitCapableBTreeIndexService.deleteClustered` / `purgeDeleteMarkedClustered` (StorageEngine service root + rollback/purge tests) + tests | In-page purge: physically remove delete-marked record + dir/group fixup | rollback/purge 已用；后台 purge 可由 DD resolver 逐 undo 定位聚簇索引，二级索引协调未接 |
+| `RecordPagePurger` | clustered delete/purge 与 secondary rollback/purge physical remove 共用，经 `SplitCapableBTreeIndexService` 生产调用 | In-page physical unlink + directory/garbage fixup | 已生产接线到 multi-index rollback/purge；后续只需其它 page-compaction/admin 消费者 |
 | `RecordPageReorganizer` | `SplitCapableBTreeIndexService` merge（`mergeLeaf`/`mergeInternal` 压实 survivor，0.12，StorageEngine service root + tests）+ tests | In-page dense rewrite + GarbageList reclaim + dir/n_owned rebuild | merge 已用；其余 page-compaction admin op 仍待 |
 | `RecordPageUpdater` | `SplitCapableBTreeIndexService.replaceClustered` (StorageEngine service root + `RollbackService`) + tests | In-page update: in-place / move / reinsert-required | UPDATE 写 + rollback 恢复已用；SQL v1 不含 UPDATE，executor update facade 仍待；改聚簇 PK(REQUIRES_REINSERT) 抛 unsupported |
 | `UpdateResult` / `UpdateOutcome` | `RecordPageUpdater` (via `replaceClustered`, T1.3e) + tests | Update result value objects | live；REQUIRES_REINSERT → `BTreeUnsupportedStructureException` |
 
-### btree 层仍未上接 SQL/DD 的类型
+### btree 层保留的 legacy / teaching 类型
 
 | Type | Current caller | Why it exists | Next action |
 | --- | --- | --- | --- |
-| `BTreeIndexService` (interface) | Tests/legacy abstraction only; production root exposes concrete `SplitCapableBTreeIndexService` from `StorageEngine` | Old BTree facade contract kept for teaching/regression while split-capable API grew more operations | Either expose the interface through storage API after SQL DML lands, or remove/fold it |
+| `BTreeIndexService` (interface) | Tests/legacy abstraction only; production SQL DML 已经由稳定 gateway 间接使用 `StorageEngine` 暴露的 concrete `SplitCapableBTreeIndexService` | Old BTree facade contract kept for teaching/regression while split-capable API grew more operations | 明确选择保留为教学接口，或在回归覆盖证明无独立价值后删除；不得为迁就旧接口削弱 concrete secondary API |
 | `LeafOnlyBTreeIndexService` | Tests only | Root-level-only B1/B2 implementation retained as small reference path and regression target | Remove after split-capable tests fully cover the same cases, or keep explicitly as teaching fixture |
 | `BTreeRootChangedException` | None（0.12 起 `openRoot` 不再抛）| 旧 root snapshot-lag guard；导航改按 root 页实际 level 后 level 相等断言去除（root shrink 使批量 rollback/purge 的快照合法陈旧）| 0.13/2.7 并发下以 latch coupling + 版本校验重定位时复用，否则移除 |
 
@@ -765,9 +782,10 @@ flowchart TD
 | Type | Current caller | Why it exists | Next action |
 | --- | --- | --- | --- |
 | `TransactionManager` / `TransactionSystem` / transaction value/state types | `StorageEngine` production-held; gateway/session + DML + checkpoint/recovery | In-memory lifecycle + active table；opaque SQL handle 隔离上层；`snapshotCounters` 给 sidecar，`restoreCounters` 消费 recovery high water | XA/PREPARED、RU/SERIALIZABLE 仍是后续 |
-| undo/rollback/finalizer types | `StorageEngine` + `ClusteredDmlService` + SQL gateway + formal recovery | 双 log append、双 head savepoint、live/recovery rollback、batch slot lease 与多 segment atomic finalization；SQL INSERT statement/full/close rollback 已接 | Named SAVEPOINT、DD 二级索引 inverse 与 LOB UPDATE/DELETE purge |
+| undo/rollback/finalizer types | `StorageEngine` + table/clustered DML + SQL gateway + formal recovery | 双 log、secondary undo tail、statement/full/recovery multi-index inverse、batch finalization；SQL INSERT statement/full/close rollback 已接 | Named SAVEPOINT、savepoint lock scope 与 LOB UPDATE/DELETE replacement purge |
 | `LockManager` / `LockHandle` / `RecordLockKey` / `GapLockKey` / `NextKeyLockKey` / `InsertIntentionLockKey` / lock snapshot types / lock exceptions | `StorageEngine` production-held；SQL INSERT 经 DML unique current-read 调用；BTree point/range 服务；DML terminal releaseAll；tests | SQL INSERT 已真实消费 row-lock timeout/cleanup；普通 SELECT 走 MVCC，不是 locking read；row-lock observer/snapshot 已接 | 接 SQL locking SELECT/range UPDATE/DELETE 与 SERIALIZABLE；global gap 精确化另列后续 |
-| `PurgeCoordinator`(impl `PurgeTarget`) / `PurgeDriverWorker` / `HistoryList` / transition exceptions / history value types | `StorageEngine` production-wired（DD resolver 或 legacy `clusteredIndex`）；formal RESUME_PURGE 按持久链重建 | `HistoryList` 是 page3/first-page 双向链投影；有界 append/remove lease 不持锁跨 IO；purge 复核 creator 非 active、no boundary 与 live-view visibility，每条 DELETE_MARK 用 undo identity 经 DD resolver 定位索引，成功后 finalizer 原子 unlink+cache/free/drop | 多 worker、二级索引协调与 table-level DROP/purge barrier；当前单 rseg blocked head 不越过 |
+| `PurgeCoordinator` / `PurgeDriverWorker` / `HistoryList` / `HistoryTablePurgeBarrier` / purge safety/guard types | `StorageEngine` production-wired；recovery、DD DROP 与 DML 共用 | persistent history runtime projection、affected-table counters、version-safe secondary-first purge、real RESUME_PURGE 与 DROP barrier 已闭环 | 多 worker、多 rseg、blocked-head 调度优化与 purge→truncate 自动调度 |
+| `TableDmlProgressFaultInjector` / `TableDmlProgressPhase` / `TableDmlSecondaryOperation` / `PurgeProgressFaultInjector` / `PurgeProgressPhase` | 生产 `TableDmlService`/`PurgeCoordinator` 固定调用 package-private `NO_OP` seam；同包故障测试临时安装 injector | 在不公开测试 API 的前提下钉住“短 MTR 已 durable、logical marker/history 尚未推进”等 crash 边界，验证重试幂等与恢复收敛 | 保持 package-private 与生产默认 no-op；只有新增真实持久化阶段时才扩展 phase，禁止作为业务回调使用 |
 
 ### recovery 层已由 Engine E2 接入
 
@@ -779,10 +797,10 @@ flowchart TD
 
 | Type | Current caller | Why it exists | Next action |
 | --- | --- | --- | --- |
-| `DiskSpaceUndoAllocator` | `UndoLogManager` / `UndoLogSegment` main grow + external payload path + tests | Adapter implementing `UndoSpaceAllocator` port; bridges undo -> `DiskSpaceManager` including exact UNDO reservation | 已被 `UndoLogManager` 经端口调用；单聚簇 DML 的 plan/append 路径在页写前精确预留 root grow + payload 总页数 |
-| `UndoLogSegmentAccess` / `UndoLogSegment` / `UndoRecordWritePlan` / `UndoStoredRecordResolver` / `UndoPayloadStorage` / `UndoLogicalHead` / history/free snapshot / page/record/codec/handle/allocation ports | `UndoLogManager` + `RollbackService` + `MvccReader` + recovery/purge production paths + tests | Multi-page root + external payload、v3 every-page kind/state-discriminated history/free links、cache/free reset/activation、persistent local head/history/free CAS、统一 resolver | 已生产接线；后续只需 DD 多索引、多 rseg/undo space、多页 shrink 与未来格式迁移方案 |
+| `DiskSpaceUndoAllocator` | `UndoLogManager` / `UndoLogSegment` main grow + external payload path + tests | Adapter implementing `UndoSpaceAllocator` port; bridges undo -> `DiskSpaceManager` including exact UNDO reservation | 已被 `UndoLogManager` 经端口调用；表级及低层 DML 的 plan/append 路径在页写前精确预留 root grow + payload 总页数 |
+| `UndoLogSegmentAccess` / `UndoLogSegment` / `UndoRecordWritePlan` / `UndoStoredRecordResolver` / `UndoPayloadStorage` / `UndoLogicalHead` / history/free snapshot / page/record/codec/handle/allocation ports | `UndoLogManager` + `RollbackService` + `MvccReader` + recovery/purge production paths + tests | Multi-page root + external payload、v3 every-page kind/state-discriminated history/free links、cache/free reset/activation、persistent local head/history/free CAS、统一 resolver | 已生产接线；后续只需多 rseg/undo space、多页 shrink 与未来格式迁移方案 |
 | `UndoLog` | `UndoLogStoreTest` only | 早期单页 undo predecessor，保留用于教学对照和单页 codec 测试；生产已由 `UndoLogSegment` 取代 | 若教学对照价值消失则删除；不得重新接入生产 rollback/recovery/purge |
-| `UndoRecordType.DELETE_MARK` | `ClusteredDmlService.delete` -> `UndoLogManager.planDelete/appendPlanned`; plus codec/rollback/MVCC/purge | Undo record type for delete-mark | 已实现：只写 UPDATE log；物理移除归 purge |
+| `UndoRecordType.DELETE_MARK` | `TableDmlService.delete` -> clustered anchor + `DELETE_MARK_ENTRY` secondary tail；rollback/MVCC/purge/recovery 消费 | 行删除逻辑证据 | 已实现：secondary 与 clustered 都先标记，purge 安全边界满足后按 secondary-first 物理移除 |
 | `UndoLogKind.TEMPORARY` | None (reserved enum constant) | Temporary-object undo kind | 普通 undo create/binding/recovery 明确拒绝；待临时表模块接独立临时 undo tablespace |
 
 ## Known Implementation Gaps
@@ -791,7 +809,7 @@ flowchart TD
 
 | Gap | Current consequence | Preferred resolution |
 | --- | --- | --- |
-| 公共 DD+storage+SQL Session 组合根已接 | `DatabaseEngine` 先打开 control/catalog，从 DD 发现 recovery spaces 并注入 `StorageEngine`；storage recovery 与 DDL cleanup 全成功后构造 parser/binder/Session registry，`openSession` 才可用；close 先收敛 Session | SQL v1 只含 INSERT/clustered point SELECT；完整 DDL 仍需独立 DDL_LOG、SDI、ALTER/CREATE INDEX statement、purge-aware DROP 和 XA/PREPARED 决议 |
+| 公共 DD+storage+SQL Session 组合根已接 | `DatabaseEngine` 先打开 control/catalog，从 DD 发现 recovery spaces 并注入表级 resolver；storage rollback/RESUME_PURGE 与 DDL barrier cleanup 全成功后才开放 Session | SQL v1 含表级 INSERT、primary/unique-secondary point SELECT；仍缺 SQL UPDATE/DELETE、range/locking read、DDL_LOG/SDI、ALTER/CREATE INDEX statement 与 XA/PREPARED |
 | 后台 redo flush + recent tracker/closedLsn + DurabilityPolicy 已接；Session commit 已消费 | `SessionTransactionPolicy` 把 durability mode 经 gateway 传入 `ClusteredDmlService.commit`，在 `UndoLogManager.onCommit` 后按 FLUSH/WRITE/BACKGROUND 等待；`MiniTransaction.commit`/`TransactionManager.commit` 本身仍不携带上层 durability 语义 | 后续协议层只映射 Session option，不绕过该 gateway/DML 终态链 |
 | public recovery 已从 DD 发现表空间，低层入口仍接受显式列表 | `DatabaseEngine` 用字典 binding 生成 `EngineConfig.recoveryTablespaces`；`StorageEngine` 保留显式列表作为稳定低层 API。doublewrite 页仍来自 doublewrite repository 枚举并过滤到已打开空间，不是全 data-dir checksum scan | 保持该分层；如需离线损坏扫描，单独实现全空间 checksum discovery，不让 fil 反向读 DD |
 | Recovery/closing gate 已覆盖 Session admission 与 DML | `DatabaseEngine` 仅在 recovery + DDL recovery 后发布 OPEN；`openSession` 要求 OPEN，CLOSING 先拒绝新流量；普通 storage accessor 和 DML facade 仍要求 recovery gate OPEN（含拒绝 READ_ONLY diagnostic） | 补 worker resume 结果、恢复锁/等待快照和更丰富 Session diagnostics |
@@ -802,7 +820,7 @@ flowchart TD
 | --- | --- | --- |
 | Global `architecture.mmd` shows `PageStore --> TablespaceRegistry` | Misleading if read as current wiring | Treat global graph as target architecture; current implementation uses `PageStore` registry-free |
 | SpaceReservation 三类生产消费者已接 | B+Tree split/root split 消费 NORMAL、Undo grow 消费 UNDO、0.21h `LobStorage.write` 按精确 chain page count 消费 BLOB；reservation 仍按页/extent 保底而非动态 reserveFactor | 后续按 IO capacity/extent locality 引入动态 reserveFactor 与观测，不再需要新增占位消费者 |
-| DROP lifecycle 已接，独立 DISCARD 语义未接 | `TableDdlStorageService.dropTable` 持 X lease，等 drain，持久 GENERAL DISCARDED page0 marker 并等 redo durable，再 flush/invalidate/close/delete；启动可幂等续作 | 后续若实现 DISCARD/IMPORT TABLESPACE，复用 marker 但增加字典状态与 import 验证；DROP 需补 purge-history barrier |
+| DROP lifecycle + purge-history barrier 已接，独立 DISCARD 语义未接 | DD 在 DROP_PENDING 前等待 table history 引用归零；physical DROP 继续持 X lease、durable DISCARDED、flush/invalidate/close/delete，启动续作再次过 barrier | 后续 DISCARD/IMPORT 复用 marker，但需独立字典状态与 file identity/import 验证 |
 | Registry type for existing 4-arg create defaults to GENERAL | Existing undo test harnesses that call 4-arg `createTablespace` register as GENERAL even when segment purpose is UNDO | Switch undo harnesses or undo allocator setup to typed `TablespaceType.UNDO` when that semantic distinction becomes required |
 | 平台 native preallocation adapter 尚未接 | `DataFileGateway` seam 已接入 `DataFileHandle.create/extend/ensureCapacity`，默认 `ZeroFillDataFileGateway` 保持原零填充语义；当前 `PreallocationStrategy` 仅有 no-op/测试替身，没有 `posix_fallocate` 或 Windows 平台适配 | 后续按平台能力补 native preallocation strategy；仍保持 PageStore registry-free 和现有 Lifecycle/FileSize/Fsync 锁顺序 |
 
@@ -825,10 +843,10 @@ flowchart TD
 | 28 类型 SQL binder 已接，物理简化仍保留 | `SqlTypeCoercion` 已补 TIME/YEAR 范围、Session 时区 TIMESTAMP、ENUM/SET 名称、BIT declared-width canonical；JSON 仍是严格 UTF-8 text，非 MySQL binary JSON | 未来 binary JSON/partial-update 必须追加明确格式版本，不得改变既有 Record stable encoding |
 | charset/collation v1 已接（0.21c/0.21g） | UTF8/LATIN1 + BINARY/charset-specific ASCII_CI + UTF8 Unicode weight v1 已生产接线；Unicode v1 固定 case/accent 子集与 code-point fallback，不含完整 UCA normalization/locale tailoring | 新增 weight 行为必须追加 stable collation id；不能静默改变已建索引顺序 |
 | INSERT external LOB ownership 已接，replacement/purge 未接 | 新 LOB 表由 DDL 暴露唯一 segment；SQL INSERT 自动 externalize，undo 记录 ordinal/type/reference ownership；statement/full/recovery rollback 经权威 DD resolver 回收，point SELECT hydration 完整值；旧 catalog empty binding 的大值 fail-closed | SQL UPDATE/DELETE 引入 replacement ownership 后再设计 purge 回收；不得从引用猜 segment 或给旧表偷建 segment |
-| Delete/Purge/Reorganize/Update 算子已有服务根与 DD resolver，但 SQL/二级索引驱动有限 | SQL v1 只驱动单聚簇 INSERT；storage facade 已有 UPDATE/DELETE，rollback/purge 可按 undo identity + DD resolver 定位聚簇 index；二级索引维护未接 | 先做二级索引同步写+undo producer，再扩 SQL UPDATE/DELETE 与 secondary purge/回表 MVCC |
-| `DB_ROLL_PTR` 版本链已被 MVCC 消费 | INSERT/UPDATE/DELETE 写真 roll pointer；`MvccReader` 沿 undo 构造旧版本并校验每跳 transaction ownership，SQL point SELECT 已消费 RR/RC ReadView | 二级索引回表 MVCC、locking/range SELECT 与 `PAGE_MAX_TRX_ID` 仍待 |
+| Delete/Purge/Reorganize/Update 算子已被多索引 DML/rollback/purge 消费 | SQL INSERT 同步维护全部 secondary；storage UPDATE/DELETE 也写 secondary undo tail 并可 statement/full/recovery rollback；secondary purge 已接 | SQL UPDATE/DELETE grammar/executor、LOB replacement ownership 与 admin compaction 仍待 |
+| `DB_ROLL_PTR` 版本链已被 primary/secondary MVCC 与 purge safety 消费 | `MvccReader` 构造可见旧版本；`SecondaryMvccReader` 回表复核；`SecondaryPurgeSafetyChecker` 到 target 前判断较新 live identity | locking/range SELECT、`PAGE_MAX_TRX_ID` 与更强 object-level corruption diagnostics 仍待 |
 | 索引页头缺 `PAGE_MAX_TRX_ID` / `PAGE_BTR_SEG_LEAF` / `PAGE_BTR_TOP` | MVCC 可见性 / B+Tree segment 指针不支持 | 在 MVCC / B+Tree segment 切片补充 |
-| prefix index 比较已接（0.13d/0.21c/0.21g/0.21h） | leaf/node-pointer 共用 `TypeCodec.compareKeyPart`；Unicode UTF-8 budget 会退到完整 code point；TEXT/BLOB external 只允许不超过记录中 32B inline prefix，JSON/full LOB 拒绝。**简化**：schema 的 prefix 仍以字节计，不是 MySQL 字符数 | 二级索引真正物化截断 key 与回表复核随 DD/secondary-index 接线；完整 UCA 字符权重另用新 stable id |
+| prefix index 比较与 secondary 紧凑物化已接 | leaf/node-pointer/unique-lock/layout 共用 codec/collation；`SecondaryIndexLayout` 按 byte prefix 截断且回退完整 UTF-8 code point，补齐缺失聚簇主键后缀。**简化**：prefix 仍按字节而非 MySQL 字符数 | 完整 UCA/更多 charset 另用新 stable id；SQL unique-secondary point access 当前只选择无 prefix 索引 |
 
 ### B+Tree 缺口
 
@@ -836,8 +854,8 @@ flowchart TD
 | --- | --- | --- |
 | 0.13d 主体已完成，仍缺 B-link/OLC 通用版本重定位 | **写：全部聚簇写算子乐观 S-crab 下降 + 悲观回退（0.13a/0.13b）**；**读：`lookup`/`scan`/current-read 定位经 `descendSharedCrab` 全 S hand-over-hand 下降 + scan sibling hand-over-hand（0.13c）**；**0.13d 已接 SX latch、safe-node 早释放祖先、root SX 下降 + restart-in-X**。当前仍无 B-link/OLC 版本页重定位，2.7a/2.7b current-read 只有授锁后重定位 | B-link/OLC 版本重启长期 deferred；除非并发性能目标明确，否则优先做 DD/session/redo/MVCC 辅助字段 |
 | B+Tree sibling/internal node/root page-local redo 已接 | 结构动作完成后 snapshot header/used heap/directory；root leaf 只 snapshot identity；固定 kind 布局校验，恢复只 patch；同值 physical bytes 过滤 | leaf row semantic redo、PAGE_MAX_TRX_ID/segment header 未做；当前物理 redo仍安全覆盖 |
-| B+Tree current-read 已接 point/unique/range；SQL 仅消费 INSERT unique-check | `BTreeCurrentReadService` 支持 point/range locking read；SQL INSERT 经 DML 消费 unique `INSERT_INTENTION`，普通 point SELECT 明确走 MVCC；terminal gap 仍是页级简化，非长期 cursor | 接 SQL locking SELECT 与 range UPDATE/DELETE；后续 global gap ref 精确化和 cursor 化 |
-| 唯一检查仍是物理语义 | 2.7a unique check 会等待 record/gap 锁，但 delete-marked key 仍被视为重复；不沿 undo 判断逻辑可见性 | 接入 MVCC 逻辑唯一检查后区分 delete-marked 可见性 |
+| B+Tree current-read 已接 point/physical-unique/range；TableDml 另接 secondary logical unique | 聚簇唯一继续用 record/gap/insert-intention；secondary logical key 用 normalized X lock + including-deleted prefix scan；普通 SELECT 走 primary/secondary MVCC | 接 SQL locking SELECT 与 range UPDATE/DELETE；global gap ref/cursor 化仍待 |
+| Secondary logical unique v1 已接但采用保守 marked 语义 | 其它主键的 delete-marked candidate 仍判 duplicate；同一主键 marked 可 revive，NULL parts 不冲突。它不沿候选 undo 判断“删除是否对当前事务可见” | 若需更贴近 InnoDB，可在保持 logical-key 锁的前提下引入事务可见性判定与等待策略 |
 | `nonLeafSegment` 已用于分配（0.11） | 内部页/root-split 子页经 `index.nonLeafSegment()` 分配（`requireNonLeafSegment` 校验）；root 仍页号稳定原地重建 | — |
 
 ### Redo 缺口
@@ -861,11 +879,11 @@ flowchart TD
 
 | Gap | Current consequence | Preferred resolution |
 | --- | --- | --- |
-| MVCC ReadView + 一致性读已接（T1.4 + T1.3f delete 可见性） | `ReadView`（五规则可见性）+ `ReadViewManager`（RR/RC）+ `openReadViewSnapshot`（锁内原子建快照）+ `MvccReader`（沿版本链构造旧版本，独立 MTR、不同持 index+undo latch）；T1.3f 加 delete-mark 可见性（`lookupIncludingDeleted` + 可见删除→消失/不可见→删除前版本）、**版本链所有权校验**（undo.transactionId==当前版本 trxId）、**MTR 异常清理**（修 T1.4 泄漏） | locking/current read、RU/SERIALIZABLE、二级索引 MVCC 留后续片 |
-| LockManager 已接 SQL INSERT、B+Tree current-read、DML 释放与诊断快照 | SQL INSERT unique-check 会等待/timeout，commit/rollback/close 经 DML `releaseAll`；普通 SELECT 是 MVCC，未调用 locking current-read；`TransactionManager` 仍不自动释放 DML row locks | 接 SQL locking SELECT/range DML、SERIALIZABLE 和 Performance Schema 视图 |
-| rollback 消费 undo 已接（含 atomic finalization + recovery terminal delta） | live/recovery 共用 per-record progress；EMPTY 后 cache/free/drop owner 转移、page3/history/free links 与 terminal delta 同批，recovery 使用独立 reason 与 creator id | crash 边界已闭合；剩余 DD 多索引与 XA/PREPARED 决议 |
-| SQL INSERT 自动 statement guard 已接，命名 SAVEPOINT 未接 | gateway 每个 INSERT 创建 `DmlStatementGuard`；执行失败 rollback 到 statement head，失败则 Session rollback-only；autocommit 失败再做 full rollback，显式事务可继续或要求 rollback | 命名 SAVEPOINT 与 savepoint 后 row-lock 精细释放；未来 UPDATE/DELETE 复用相同边界 |
-| SQL gateway 已接单聚簇 INSERT/point SELECT | DD exact-version mapper 提供 BTree/schema/LOB binding；opaque handle 持 storage transaction；Session 编排 autocommit/explicit terminal | 二级索引维护、SQL UPDATE/DELETE、range/locking SELECT、optimizer/prepared statement 未接 |
+| MVCC ReadView + primary/secondary 一致性读已接 | `MvccReader` 保持 delete/ownership/短 MTR 语义；`SecondaryMvccReader` 先物化含 marked 候选，再逐候选回表并用可见完整行复核 logical key，ReadView 覆盖 LOB hydration | locking/current read、RU/SERIALIZABLE 与非唯一 secondary/range scan 留后续 |
+| LockManager 已接 SQL INSERT、聚簇 current-read、secondary logical unique、DML 释放与诊断 | logical unique X 锁与 record/gap 锁同属事务，commit/rollback/close 才 `releaseAll`；purge/DML 行 guard 是独立短物理协调，不进入事务 wait-for graph | 接 SQL locking SELECT/range DML、SERIALIZABLE 与更完整 Performance Schema 语义 |
+| rollback 消费 multi-index undo 已接 | live/statement/recovery 共用 per-record progress；secondary inverse→clustered inverse→marker 顺序，EMPTY 后 atomic finalization/terminal | crash 边界已闭合；剩余 XA/PREPARED 与 LOB UPDATE/DELETE replacement 决议 |
+| SQL INSERT 自动 multi-index statement guard 已接，命名 SAVEPOINT 未接 | secondary MTR 前/后失败均回到 statement head；autocommit/显式事务终态复用 resolved rollback | 命名 SAVEPOINT 与 savepoint 后 row-lock 精细释放；未来 SQL UPDATE/DELETE 复用相同边界 |
+| SQL gateway 已接表级 INSERT 与 primary/unique-secondary point SELECT | DD exact-version table metadata、opaque transaction、RR/RC 与 LOB hydration 均生产接线 | SQL UPDATE/DELETE、non-unique/range/locking SELECT、optimizer/prepared statement 未接 |
 | `PREPARED` 只有稳定 redo code，无 XA 决议 | recovery table 识别 PREPARED 并 fail-closed；`RECOVERED_ACTIVE` 已作为恢复内存态驱动 rollback，但不发布为普通运行事务 | 后续接 XA coordinator 与 prepared commit/rollback 决议 |
 | 正式 trx recovery table v1 已接，尚无逐事务持久系统页 | sidecar 保存 counter baseline，redo 保存 terminal evidence，page3 保存仍占用 undo 的事务；三者交叉校验后恢复 counter/recovered-active/history | 若未来需要 XA/长 prepared，再设计持久 transaction system page/完整事务明细，不在 v1 扩张 |
 
@@ -873,7 +891,7 @@ flowchart TD
 
 | Gap | Current consequence | Preferred resolution |
 | --- | --- | --- |
-| lifecycle DDL_RECOVERY/discovery/多索引定位已接，独立 DDL log 与 prepared 决议仍缺 | public engine 已从 DD 发现 ACTIVE/DROP_PENDING space，续作 pending drop/orphan cleanup，ACTIVE rollback/purge 逐 undo tableId/indexId 解析索引；PREPARED 仍 fail-closed | 补持久 DDL_LOG 阶段证据、XA coordinator、SDI 与 object-level force recovery |
+| lifecycle DDL_RECOVERY/discovery/multi-index rollback+purge+DROP barrier 已接 | public engine 恢复 ACTIVE/DROP_PENDING space，重建 history table refs，先 rollback/RESUME_PURGE，再让 pending DROP 通过 barrier 后删文件；PREPARED 仍 fail-closed | 补 DDL_LOG、XA coordinator、SDI 与 object-level force recovery |
 | `RecoveryMode.FORCE_SKIP_CORRUPT_TABLESPACE` 仍只支持显式 SpaceId 集合 | DD 发现已接，但 public engine 尚未把 skipped space 发布为字典对象不可用状态；`CrashRecoveryService` 仍按 per-space 过滤 doublewrite/redo/reconcile，且系统 undo 不可 skip | 补 object-level unavailable lifecycle、DDL recovery 与多索引 transaction undo skip 语义 |
 | DD tablespace discovery 已接，doublewrite 仍不做全 data-dir checksum discovery | public engine 用 catalog binding 填充 recovery spaces；doublewrite repair 仍从 `dwRepo.pageIds()` 枚举候选并过滤到已打开空间，不主动扫描所有数据页 | 若需离线全库校验，新建明确的 scrubber，不把高成本扫描混入每次 startup |
 | Recovery control-plane/observability 不完整 | gate/status/report/progress events 已可诊断；Session 只在 public engine OPEN 后创建，CLOSING 拒绝新请求，active Session 先 rollback；仍无恢复后 worker resume 诊断、恢复期锁/等待快照 | 补 worker resume 结果、恢复锁快照与 Session/statement 关联诊断 |
@@ -882,19 +900,31 @@ flowchart TD
 
 | Gap | Current consequence | Preferred resolution |
 | --- | --- | --- |
-| 双链 rollback 消费者与 SQL INSERT lifecycle 已接 | full/recovery 每步选择 INSERT/UPDATE 较大 head undoNo；SQL gateway 自动 statement guard，Session full/close rollback；多表事务逐 undo identity 用 DD resolver，非空 predecessor 只做 schema-free identity 校验 | 命名 SAVEPOINT、savepoint row-lock scope、二级索引 inverse 与 LOB replacement purge 仍缺 |
+| 双链 + secondary tail rollback 消费者与 SQL INSERT lifecycle 已接 | full/recovery 每步选择较大 head undoNo；每条记录 exact-version 解析全部索引并按 secondary→clustered→marker 收敛；Session full/close rollback 复用 | 命名 SAVEPOINT、savepoint row-lock scope 与 LOB replacement purge 仍缺 |
 | page3 v4 owner/history/free 目录、恢复分组与多段 atomic finalization 已接 | mixed transaction 占两个 active slots；终结同批处理 owner、history/free base 与全部首页；recovery 分开校验 active/cache/free 证据，再严格遍历 committed UPDATE history 与 free FIFO；truncate drain/rebuild 覆盖 page3 且非空 history 拒绝 | 多页 free shrink、多 rseg/tablespace 选择另列后续 |
-| btree 回收与 DD 聚簇索引定位已接；仍缺二级索引 purge 协调 | `PurgeCoordinator` 从每条 undo 取 tableId/indexId 并经 DD resolver 定位目标聚簇 BTree，物理删除后可 merge/redistribute/root shrink/free page；undo v1 尚未表达二级索引维护任务 | 扩展 DML/undo 以记录二级索引变更，协调 secondary delete-mark/purge 与 clustered 回收 |
-| 多表/多索引 rollback 定位已接 | `RollbackService` 先用 `UndoStoredRecordResolver.identity` 校验 inline/external record identity，再经 `IndexMetadataResolver` 获取目标 index 的 schema/key；legacy 单索引构造保留给低层测试 | 仍需 DML 真正同时维护二级索引，并为其定义 undo inverse |
-| 单线程聚簇 purge + **后台 driver + persistent recovery resume 已接** | purge 只接受物理 head 的 committed UPDATE；task 失败保留 owner，成功后原子 unlink+cache/free/drop；slot/reuse directory/history 都在 MTR 后发布；no/visibility 任一不安全即停止，不越过 head | 多 worker / 二级索引 purge；blocked-head 调度优化需多 rseg |
+| Secondary purge 协调已接 | undo tail 重建 exact physical key；UPDATE 用聚簇版本链证明 REMOVE/RETAIN，DELETE secondary-first；每棵树独立 MTR，结构删除可 merge/root-shrink | 多 worker、跨 rseg blocked-head 调度与更细 purge diagnostics 仍待 |
+| 多表/多索引 rollback 定位与 inverse 已接 | `UndoTargetMetadataResolver` 返回表级 metadata；legacy 单索引构造只供低层测试，无 secondary tail 时走兼容分支 | 改聚簇 PK、LOB replacement 与 XA/PREPARED 仍需新的 ownership/决议语义 |
+| 单线程 table-aware purge + 后台 driver + real recovery resume 已接 | task 失败保留 COMMITTED owner/history/table barrier；task commit 后 crash 由状态/ABSENT 幂等；finalization 后才摘 history并唤醒 DROP | 多 worker / blocked-head 调度优化需多 rseg；purge→truncate 自动调度未接 |
 | Undo page v3 与旧教学文件不兼容 | v3 record area=136，first/chain 每页持久 kind，first page 增 history prev/next；v1/v2/未知版本在任意普通 UNDO page open 时 fail-closed | 当前测试/教学数据重建；未来若保留用户数据需单独迁移，不在 open 路径猜测布局 |
 | truncate 机制已实现但无 purge→truncate 调度 | `UndoTablespaceTruncationService` 可恢复收缩并由 recovery 续作；后台 purge driver 已接（0.4）但**未驱动 undo tablespace truncate**（purge 只 dropUndoSegment 回收段页，不判 tablespace 死亡触发物理收缩）；活动 inode 会拒绝 | purge→undo tablespace truncate 调度（判 undo 死亡 → truncate）留后续片 |
-| 版本链已被 MVCC 读消费（T1.3e/f 建 + T1.4/f 读） | UPDATE/DELETE undo 存全量旧 image 建记录版本链；`MvccReader` 跨事务直读 undo、沿 `oldHidden.dbRollPtr` 遍历构造旧版本，遍历接受 UPDATE_ROW+DELETE_MARK + **每跳所有权校验 `undo.transactionId()==当前版本 DB_TRX_ID`**（T1.3f 加固）；delete-mark 可见性：可见删除→行消失、不可见→见删除前版本 | 二级索引回表 MVCC；purge 物理移除 delete-marked |
+| 版本链已被 primary/secondary MVCC 与 secondary purge safety 消费 | UPDATE/DELETE 全量 old image + ownership 校验；secondary reader 回表，purge checker 在 target 前检测较新 live identity；链脱节/环/上限均 fail-closed | 非唯一 secondary range MVCC 与更复杂 purge 调度仍待 |
 | cache + persistent free undo segment reuse 已接 | INSERT/UPDATE cache 各自固定容量 LIFO；cache 满/0/忙时，合格单页段进入无配置上限的持久 FIFO 并可跨 kind 复用；page3 v4 是 owner/history/free 恢复权威，重启校验首页/链/FSP 后一次恢复统一目录；truncate 非阻塞 drain 并重建 page3 | 多页 segment shrink、多 rseg/tablespace 需要分区 reuse directory 与选择策略；不在当前 `RollPointer` 中猜测 space/rseg |
 | Extern undo record payload 已接；仍无改聚簇 PK | 1.6 起过大完整 `UndoRecordCodec` 字节由普通 root 槽中的 `0x7F/v1` descriptor 指向同 segment `UNDO_PAYLOAD=9` 页链；统一 resolver 校验 link/owner/identity/count/length/CRC，MVCC/rollback/purge/recovery 无旁路；DML begin 前冻结计划并精确 admission。Record LOB reference 与该链仍是两套 ownership | 改聚簇 PK update 仍需 delete+insert、多索引与锁语义；不要把业务 LOB chain 和 undo payload chain 合并 |
 | 单 writer 假设 | `UndoLogSegment` 假设同一事务/同 kind 单 EXCLUSIVE append 会话 | 实现并发 multi-writer 锁序 / rseg slot 选择 |
 | 单 undo 表空间假设 | `RollPointer` 只编 pageNo+offset；T1.3c 固定单一默认 rseg，rseg/slot 存 `UndoContext` + 内存目录不进指针 | 扩展多 rseg/多 undo 表空间编码 |
-| recovery 已接 DD discovery / table-index resolver / lifecycle DDL，仍缺 DDL_LOG / XA prepared | public engine 可恢复字典发现的多表空间，rollback/purge 按 undo identity 定位索引，DROP_PENDING/orphan 可续作；PREPARED 仍 fail-closed | 接独立 DDL_LOG 阶段机、XA coordinator、object-level force recovery 与 purge-aware DROP barrier |
+| recovery 已接 DD discovery / table target resolver / lifecycle DDL / purge-aware DROP | public engine 恢复多表空间、多索引 rollback、affected-table history、real RESUME_PURGE 与 pending DROP barrier；PREPARED 仍 fail-closed | 接 DDL_LOG、XA coordinator 与 object-level force recovery |
+
+## 2026-07-17 Secondary Index MVCC / Purge Closure 5-Pass Review Log
+
+本轮按最终源码、测试与恢复接线独立复核五遍；所有调用链均直接由本仓库源码、`rg`、Git diff 和固定 Gradle 报告核对，未使用 GitNexus。
+
+| Pass | Result | Evidence |
+| --- | --- | --- |
+| 1. 生产调用链与分层 | PASS | 从源码重核 `DefaultSqlExecutor → DefaultSqlStorageGateway → TableDmlService/SecondaryMvccReader`、`CrashRecoveryService → PersistentHistoryRecovery/RESUME_PURGE`、`DictionaryDdlService/RecoveryService → TablePurgeBarrier`；SQL/session 无 storage internal import，storage 无 SQL/session/engine/DD 反向 import，未把 SQL UPDATE/DELETE、non-unique range MVCC 或多 worker purge 画成实线 |
+| 2. 物理格式、metadata 与兼容 | PASS | `SecondaryIndexLayout` 固定 logical parts + 去重后的完整 clustered-key suffix；`BTreeIndex.physicalUnique` 与 logical unique 分离；root level 每次从稳定 root 页头刷新；undo secondary v1 tail 保留旧 EOF、LOB+secondary 双尾，并对未知/截断/尾随格式 fail-closed；A→B→A 与 marked identity 均有回归 |
+| 3. 并发、锁序与资源释放 | PASS | logical unique 使用统一 `LockManager` 事务级 X 锁，NULL 不冲突；1024 fair stripe 只协调 DML/purge 同行物理操作；所有等待有 timeout/zero-wait，锁序为 current-read/unique lock → row guard → 单树短 MTR，secondary/clustered/undo latch 不重叠；生产源码无 executable Java monitor |
+| 4. rollback、purge 与恢复 | PASS | statement/full/recovery rollback 按 secondary → clustered → logical marker 收敛；故障测试覆盖 secondary/cluster/marker durable 边界；purge 用聚簇版本链证明旧 secondary 可删，DELETE secondary-first，task commit 后崩溃不提前推进 history；affected-table projection 可由 persistent history 重建，DROP 与 DROP_PENDING recovery 都等待 barrier |
+| 5. 注释、文档、静态与全量 | PASS | 完整 design/implementation plan 已持久化；current map/backlog/相关厚设计按真实接线同步，fault seam 进入 Reserved/Unwired 表；新增/修改核心类、字段、方法和复杂测试补齐中文契约与阶段化数据流；无裸 `IllegalArgumentException/RuntimeException`、越层 import 或 feature 占位；固定 JDK 25.0.2 + Gradle 9.5.1 `test --rerun-tasks --no-daemon`：275 suites / **1476 tests**，0 failure/error/skip；`git diff --check` 通过 |
 
 ## 2026-07-16 Primary-Point SQL / Session v1 Corrective 5-Pass Review Log
 

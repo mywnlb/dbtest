@@ -125,9 +125,10 @@ public final class DatabaseEngine implements AutoCloseable {
                 metadataLocks = new MetadataLockManager();
                 dictionary = new DataDictionaryService(repository, cache, metadataLocks);
                 ddl = new DictionaryDdlService(controlStore, repository, cache, metadataLocks,
-                        storage.tableDdlStorageService(), tablesDirectory);
+                        storage.tableDdlStorageService(), tablesDirectory, storage.tablePurgeBarrier());
                 new DictionaryDdlRecoveryService(controlStore, repository, cache,
-                        storage.tableDdlStorageService(), tablesDirectory).recover(baseConfig.flushTimeout());
+                        storage.tableDdlStorageService(), tablesDirectory, storage.tablePurgeBarrier())
+                        .recover(baseConfig.flushTimeout());
                 // SQL/session 只能在 storage recovery 与 DDL recovery 都成功后发布，避免半恢复实例接受用户语句。
                 sqlMetadataMapper = new DictionaryStorageMetadataMapper();
                 sqlParser = new DefaultSqlParser();

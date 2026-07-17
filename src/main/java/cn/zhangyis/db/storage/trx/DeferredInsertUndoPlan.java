@@ -74,7 +74,7 @@ public final class DeferredInsertUndoPlan {
         UndoRecord placeholder = placeholderPlan.recordPlan().record();
         return UndoRecord.insert(placeholder.undoNo(), placeholder.transactionId(), placeholder.tableId(),
                 placeholder.indexId(), placeholder.clusterKey(), List.copyOf(actualOwnerships),
-                placeholder.prevRollPointer());
+                placeholder.secondaryMutations(), placeholder.prevRollPointer());
     }
 
     /** 实际编码必须与 placeholder 走相同 inline/external 分支并占用完全相同的字节数和页数。 */

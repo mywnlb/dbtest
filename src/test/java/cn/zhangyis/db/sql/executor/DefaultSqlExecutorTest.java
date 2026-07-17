@@ -3,7 +3,8 @@ package cn.zhangyis.db.sql.executor;
 import cn.zhangyis.db.dd.domain.*;
 import cn.zhangyis.db.domain.*;
 import cn.zhangyis.db.sql.binder.bound.BoundClusteredInsert;
-import cn.zhangyis.db.sql.binder.bound.BoundPrimaryPointSelect;
+import cn.zhangyis.db.sql.binder.bound.BoundPointSelect;
+import cn.zhangyis.db.sql.binder.bound.PointAccessKind;
 import cn.zhangyis.db.sql.executor.storage.*;
 import cn.zhangyis.db.storage.api.SegmentRef;
 import cn.zhangyis.db.storage.api.ddl.IndexStorageBinding;
@@ -35,7 +36,7 @@ class DefaultSqlExecutorTest {
         assertEquals(1, update.affectedRows());
 
         QueryResult query = assertInstanceOf(QueryResult.class, executor.execute(handle,
-                new BoundPrimaryPointSelect(table, List.of(0),
+                new BoundPointSelect(table, List.of(0), 3, PointAccessKind.CLUSTERED_PRIMARY,
                         List.of(new SqlValue.IntegerValue(BigInteger.ONE))), status,
                 SqlStatementDeadline.after(Duration.ofSeconds(1))));
         assertEquals("id", query.columns().getFirst().name());
@@ -68,7 +69,7 @@ class DefaultSqlExecutorTest {
             calls++; return new SqlWriteOutcome(1, false);
         }
         @Override public Optional<SqlRow> selectPoint(SqlTransactionHandle transaction,
-                                                     BoundPrimaryPointSelect statement,
+                                                     BoundPointSelect statement,
                                                      SqlStatementDeadline deadline) {
             calls++; return Optional.of(new SqlRow(List.of(new SqlValue.IntegerValue(BigInteger.ONE))));
         }

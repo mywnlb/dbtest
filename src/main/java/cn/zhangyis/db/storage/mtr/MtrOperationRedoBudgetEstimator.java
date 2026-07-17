@@ -39,7 +39,7 @@ final class MtrOperationRedoBudgetEstimator {
             case UNDO_TRUNCATE_LIFECYCLE -> 4;
             case UNDO_TRUNCATE_REBUILD -> 25;
             case DDL_TABLE_DROP -> 4;
-            case CLUSTERED_INSERT, CLUSTERED_UPDATE, CLUSTERED_DELETE, PURGE_INDEX,
+            case CLUSTERED_INSERT, CLUSTERED_UPDATE, CLUSTERED_DELETE, SECONDARY_INDEX, PURGE_INDEX,
                     ROLLBACK_INVERSE, UNDO_COMMIT, UNDO_FINALIZATION, LOB_WRITE, LOB_FREE,
                     DDL_TABLE_CREATE -> throw new DatabaseValidationException(
                     "dynamic redo budget purpose requires a domain workload: " + purpose);
@@ -58,7 +58,7 @@ final class MtrOperationRedoBudgetEstimator {
             throw new DatabaseValidationException("dynamic redo budget purpose/workload is invalid");
         }
         switch (purpose) {
-            case CLUSTERED_INSERT, CLUSTERED_UPDATE, CLUSTERED_DELETE, PURGE_INDEX,
+            case CLUSTERED_INSERT, CLUSTERED_UPDATE, CLUSTERED_DELETE, SECONDARY_INDEX, PURGE_INDEX,
                     ROLLBACK_INVERSE, ROLLBACK_MARKER, UNDO_COMMIT, UNDO_FINALIZATION, LOB_WRITE, LOB_FREE,
                     DDL_TABLE_CREATE -> {
                 // ROLLBACK_MARKER 无 LOB 时仍可走固定 6-page profile；ownership free 时使用动态合并上界。

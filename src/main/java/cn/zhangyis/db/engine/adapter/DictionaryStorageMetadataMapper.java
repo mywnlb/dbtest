@@ -52,11 +52,8 @@ public final class DictionaryStorageMetadataMapper {
             StorageTableDefinition storageTable = new StorageTableDefinition(table.id().value(), binding.spaceId(),
                     binding.path(), table.version().value(), RUNTIME_MAPPING_INITIAL_SIZE,
                     columns(table), indexes(table));
-            List<BTreeIndex> mappedIndexes = table.indexes().stream()
-                    .map(index -> factory.create(storageTable, storageIndex(storageTable, index.id().value()),
-                            indexBinding(binding, index.id().value())))
-                    .toList();
-            return new MappedTableStorage(table, storageTable, binding, binding.lobSegment(), mappedIndexes);
+            var tableIndexes = factory.createTable(storageTable, binding);
+            return new MappedTableStorage(table, storageTable, binding, binding.lobSegment(), tableIndexes);
         } catch (DictionaryStorageMappingException mappingFailure) {
             throw mappingFailure;
         } catch (DatabaseRuntimeException invalidMetadata) {

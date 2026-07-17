@@ -8,6 +8,7 @@ import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.domain.TransactionId;
 import cn.zhangyis.db.domain.TransactionNo;
 import cn.zhangyis.db.domain.UndoSlotId;
+import cn.zhangyis.db.storage.api.TablePurgeBarrierTimeoutException;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
@@ -31,6 +32,12 @@ class HistoryListTest {
     private static HistoryEntry entry(long no, long trx, long pageNo, int slot) {
         return new HistoryEntry(TransactionNo.of(no), TransactionId.of(trx), SpaceId.of(1),
                 PageId.of(SpaceId.of(1), PageNo.of(pageNo)), UndoSlotId.of(slot));
+    }
+
+    private static HistoryEntry entry(long no, long trx, long pageNo, int slot, long... tableIds) {
+        return new HistoryEntry(TransactionNo.of(no), TransactionId.of(trx), SpaceId.of(1),
+                PageId.of(SpaceId.of(1), PageNo.of(pageNo)), UndoSlotId.of(slot),
+                java.util.Arrays.stream(tableIds).boxed().collect(java.util.stream.Collectors.toSet()));
     }
 
     @Test
@@ -156,5 +163,33 @@ class HistoryListTest {
         }
 
         assertEquals(List.of(newCommit), history.snapshot());
+    }
+
+    /** commit 发布增加表引用，purge finalization 发布减少引用并唤醒等待中的 DROP barrier。 */
+    @Test
+    void tableBarrierTracksPublishedHistoryAndWakesAfterPurge() throws Exception {
+        HistoryList history = new HistoryList(Duration.ofSeconds(1));
+        HistoryTablePurgeBarrier barrier = new HistoryTablePurgeBarrier(history);
+        HistoryEntry entry = entry(1, 100, 65, 0, 11L, 12L);
+        try (HistoryList.AppendLease append = history.beginAppend(entry)) {
+            append.physicalMutationStarted();
+            append.complete();
+        }
+
+        assertEquals(1, barrier.referenceCount(11L));
+        assertThrows(TablePurgeBarrierTimeoutException.class,
+                () -> barrier.awaitUnreferenced(11L, Duration.ofMillis(20)));
+
+        try (var executor = Executors.newSingleThreadExecutor()) {
+            var waiter = executor.submit(() -> barrier.awaitUnreferenced(11L, Duration.ofSeconds(1)));
+            try (HistoryList.HeadRemovalLease removal = history.beginHeadRemoval(entry)) {
+                removal.physicalMutationStarted();
+                removal.complete();
+            }
+            waiter.get(1, TimeUnit.SECONDS);
+        }
+
+        assertEquals(0, barrier.referenceCount(11L));
+        assertEquals(0, barrier.referenceCount(12L));
     }
 }

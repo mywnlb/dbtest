@@ -2,7 +2,7 @@ package cn.zhangyis.db.session;
 
 import cn.zhangyis.db.dd.domain.MdlOwnerId;
 import cn.zhangyis.db.sql.binder.bound.BoundClusteredInsert;
-import cn.zhangyis.db.sql.binder.bound.BoundPrimaryPointSelect;
+import cn.zhangyis.db.sql.binder.bound.BoundPointSelect;
 import cn.zhangyis.db.sql.executor.SqlRow;
 import cn.zhangyis.db.sql.executor.storage.*;
 import org.junit.jupiter.api.Test;
@@ -84,7 +84,7 @@ class SessionTransactionPolicyTest {
             events.add("insert"); return new SqlWriteOutcome(1, false);
         }
         @Override public Optional<SqlRow> selectPoint(SqlTransactionHandle transaction,
-                                                     BoundPrimaryPointSelect statement,
+                                                     BoundPointSelect statement,
                                                      SqlStatementDeadline deadline) {
             events.add("select"); return Optional.empty();
         }

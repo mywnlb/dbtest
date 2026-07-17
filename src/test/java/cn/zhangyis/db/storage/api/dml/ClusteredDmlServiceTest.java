@@ -14,6 +14,7 @@ import cn.zhangyis.db.storage.api.SegmentRef;
 import cn.zhangyis.db.storage.btree.BTreeIndex;
 import cn.zhangyis.db.storage.btree.BTreeLookupResult;
 import cn.zhangyis.db.storage.btree.IndexMetadataResolver;
+import cn.zhangyis.db.storage.btree.TableIndexMetadata;
 import cn.zhangyis.db.storage.engine.EngineConfig;
 import cn.zhangyis.db.storage.engine.StorageEngine;
 import cn.zhangyis.db.storage.fsp.segment.SegmentPurpose;
@@ -190,7 +191,9 @@ class ClusteredDmlServiceTest {
         engine.open();
         try {
             LobIndexSetup setup = createLobClusteredIndex(engine, dir.resolve("dml-lob-rollback.ibd"));
-            resolver.install(new UndoTargetMetadata(setup.index(), Optional.of(setup.lobSegment())));
+            resolver.install(new UndoTargetMetadata(new TableIndexMetadata(TABLE_ID,
+                    setup.index().schema().schemaVersion(), setup.index(), List.of()),
+                    Optional.of(setup.lobSegment())));
             String text = "回滚".repeat(160);
             LogicalRecord record = new LogicalRecord(1, List.of(new ColumnValue.IntValue(3),
                     new ColumnValue.StringValue(text), new ColumnValue.BinaryValue(new byte[]{1})),
@@ -224,7 +227,9 @@ class ClusteredDmlServiceTest {
         engine.open();
         try {
             LobIndexSetup setup = createLobClusteredIndex(engine, dir.resolve("dml-lob-statement.ibd"));
-            resolver.install(new UndoTargetMetadata(setup.index(), Optional.of(setup.lobSegment())));
+            resolver.install(new UndoTargetMetadata(new TableIndexMetadata(TABLE_ID,
+                    setup.index().schema().schemaVersion(), setup.index(), List.of()),
+                    Optional.of(setup.lobSegment())));
             Transaction txn = engine.transactionManager().begin(TransactionOptions.defaults());
             LogicalRecord record = new LogicalRecord(1, List.of(new ColumnValue.IntValue(4),
                     new ColumnValue.StringValue("语句".repeat(160)), new ColumnValue.BinaryValue(new byte[]{1})),
@@ -425,7 +430,7 @@ class ClusteredDmlServiceTest {
 
             IndexKeyDef wrongKey = new IndexKeyDef(INDEX_ID + 1, index.keyDef().parts());
             BTreeIndex wrongIndex = new BTreeIndex(INDEX_ID + 1, index.rootPageId(), index.rootLevel(),
-                    wrongKey, index.schema(), index.unique(), index.leafSegment(), index.nonLeafSegment());
+                    wrongKey, index.schema(), index.physicalUnique(), index.leafSegment(), index.nonLeafSegment());
 
             assertThrows(DatabaseRuntimeException.class,
                     () -> engine.dmlService().rollback(new DmlRollbackCommand(txn, wrongIndex)));

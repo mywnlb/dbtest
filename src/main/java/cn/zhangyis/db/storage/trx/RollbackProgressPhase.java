@@ -6,6 +6,9 @@ package cn.zhangyis.db.storage.trx;
  */
 enum RollbackProgressPhase {
 
+    /** 单个二级索引物理 inverse 的短 MTR 已提交；其它二级树、聚簇树与 logical-head marker 可能尚未处理。 */
+    AFTER_SECONDARY_INVERSE_COMMIT,
+
     /** 当前 undo 的聚簇 inverse 已提交，但 first-page logical-head marker 尚未开始。 */
     AFTER_INVERSE_COMMIT,
 

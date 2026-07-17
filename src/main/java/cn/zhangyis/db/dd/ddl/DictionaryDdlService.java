@@ -36,6 +36,7 @@ import cn.zhangyis.db.storage.api.ddl.StorageIndexKeyPart;
 import cn.zhangyis.db.storage.api.ddl.StorageIndexOrder;
 import cn.zhangyis.db.storage.api.ddl.StorageTableDefinition;
 import cn.zhangyis.db.storage.api.ddl.TableDdlStorageService;
+import cn.zhangyis.db.storage.api.TablePurgeBarrier;
 import cn.zhangyis.db.storage.api.ddl.TableStorageBinding;
 import lombok.extern.slf4j.Slf4j;
 
@@ -60,22 +61,89 @@ public final class DictionaryDdlService {
     private final DictionaryObjectCache cache;
     private final MetadataLockManager locks;
     private final TableDdlStorageService physical;
+    /** DROP_PENDING 发布前等待 committed history 清零的稳定 storage API。 */
+    private final TablePurgeBarrier purgeBarrier;
     private final Path tablesDirectory;
     private final DictionaryDdlFaultInjector faultInjector;
 
+    /**
+     * 构造不接 persistent history barrier、也不注入故障的低层 DDL 服务；仅供孤立组件测试使用。
+     *
+     * @param control         字典 id/version/DDL id 的 durable 单调分配器。
+     * @param repository      committed catalog 事务仓储。
+     * @param cache           table metadata pin/invalidation cache。
+     * @param locks           schema/table MDL 锁入口。
+     * @param physical        物理 tablespace CREATE/DROP facade。
+     * @param tablesDirectory 受控表空间文件目录。
+     * @throws DatabaseValidationException 任一协作者或目录为空时抛出。
+     */
     public DictionaryDdlService(DictionaryControlStore control, PersistentDictionaryRepository repository,
                                 DictionaryObjectCache cache, MetadataLockManager locks,
                                 TableDdlStorageService physical, Path tablesDirectory) {
-        this(control, repository, cache, locks, physical, tablesDirectory, DictionaryDdlFaultInjector.NO_OP);
+        this(control, repository, cache, locks, physical, tablesDirectory,
+                TablePurgeBarrier.NONE, DictionaryDdlFaultInjector.NO_OP);
     }
 
-    /** 测试构造器：允许在已持久化状态边界注入进程中断，生产调用应使用六参构造。 */
+    /**
+     * 构造生产 DDL 服务，DROP 在发布 DROP_PENDING 前使用 StorageEngine 的真实 persistent history barrier。
+     *
+     * @param control         字典 id/version/DDL id 的 durable 单调分配器。
+     * @param repository      committed catalog 事务仓储。
+     * @param cache           table metadata pin/invalidation cache。
+     * @param locks           schema/table MDL 锁入口。
+     * @param physical        物理 tablespace CREATE/DROP facade。
+     * @param tablesDirectory 受控表空间文件目录。
+     * @param purgeBarrier    与 storage commit/purge/recovery 共享 history owner 的表级等待 API。
+     * @throws DatabaseValidationException 任一协作者、目录或 barrier 为空时抛出。
+     */
+    public DictionaryDdlService(DictionaryControlStore control, PersistentDictionaryRepository repository,
+                                DictionaryObjectCache cache, MetadataLockManager locks,
+                                TableDdlStorageService physical, Path tablesDirectory,
+                                TablePurgeBarrier purgeBarrier) {
+        this(control, repository, cache, locks, physical, tablesDirectory,
+                purgeBarrier, DictionaryDdlFaultInjector.NO_OP);
+    }
+
+    /**
+     * 构造不接 history barrier、但允许在 durable DDL 状态边界注入故障的测试服务。
+     *
+     * @param control         字典 id/version 分配器。
+     * @param repository      committed catalog 仓储。
+     * @param cache           metadata cache。
+     * @param locks           MDL 管理器。
+     * @param physical        物理 DDL facade。
+     * @param tablesDirectory 受控 tablespace 目录。
+     * @param faultInjector   CREATE/DROP durable 边界故障接缝，不能为 {@code null}。
+     * @throws DatabaseValidationException 任一依赖为空时抛出。
+     */
     public DictionaryDdlService(DictionaryControlStore control, PersistentDictionaryRepository repository,
                                 DictionaryObjectCache cache, MetadataLockManager locks,
                                 TableDdlStorageService physical, Path tablesDirectory,
                                 DictionaryDdlFaultInjector faultInjector) {
+        this(control, repository, cache, locks, physical, tablesDirectory,
+                TablePurgeBarrier.NONE, faultInjector);
+    }
+
+    /**
+     * 构造同时注入真实/测试 purge barrier 与 durable 状态边界故障点的完整服务。
+     *
+     * @param control         字典 id/version 分配器。
+     * @param repository      committed catalog 仓储。
+     * @param cache           metadata cache。
+     * @param locks           MDL 管理器。
+     * @param physical        物理 DDL facade。
+     * @param tablesDirectory 受控 tablespace 目录，构造时转为绝对规范路径。
+     * @param purgeBarrier    DROP_PENDING 前等待 affected-table history 清零的稳定 storage API。
+     * @param faultInjector   durable 状态发布后的测试故障接缝。
+     * @throws DatabaseValidationException 任一依赖为空时抛出，服务不会进入可执行状态。
+     */
+    public DictionaryDdlService(DictionaryControlStore control, PersistentDictionaryRepository repository,
+                                DictionaryObjectCache cache, MetadataLockManager locks,
+                                TableDdlStorageService physical, Path tablesDirectory,
+                                TablePurgeBarrier purgeBarrier,
+                                DictionaryDdlFaultInjector faultInjector) {
         if (control == null || repository == null || cache == null || locks == null || physical == null
-                || tablesDirectory == null || faultInjector == null) {
+                || tablesDirectory == null || purgeBarrier == null || faultInjector == null) {
             throw new DatabaseValidationException("dictionary DDL collaborators/path must not be null");
         }
         this.control = control;
@@ -83,6 +151,7 @@ public final class DictionaryDdlService {
         this.cache = cache;
         this.locks = locks;
         this.physical = physical;
+        this.purgeBarrier = purgeBarrier;
         this.tablesDirectory = tablesDirectory.toAbsolutePath().normalize();
         this.faultInjector = faultInjector;
     }
@@ -166,9 +235,26 @@ public final class DictionaryDdlService {
     }
 
     /**
-     * DROP 两版本状态机：先在 cache 建立不可回退的本地准入屏障，再提交 DROP_PENDING，随后确认历史 pin 归零
-     * 并执行物理删除，最后提交 DROPPED。catalog publish 结果不确定时屏障保留到重启，避免旧内存快照复活表；
+     * DROP 两版本状态机：持 table MDL X 时先等待 persistent history 表引用归零，再在 cache 建立不可回退的本地
+     * 准入屏障并提交 DROP_PENDING；随后等待旧 cache pin、执行物理删除，最后提交 DROPPED。catalog publish 结果不确定时
+     * 屏障保留到重启，避免旧内存快照复活表；
      * 若物理/最终 publish 失败，DROP_PENDING+binding 是启动恢复的权威续作输入。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>取得 schema IX 与 table X MDL，解析唯一 ACTIVE 表及其 durable storage binding。</li>
+     *     <li>在尚未发布 DROP_PENDING、未持有 MTR/page/file 资源时等待 persistent history 表引用归零；超时保持 ACTIVE。</li>
+     *     <li>预留单调版本，先失效 cache 准入，再持久发布 DROP_PENDING；发布结果不确定时保留屏障等待重启裁决。</li>
+     *     <li>等待旧 dictionary pin 排空后执行物理 DROP；失败保留 DROP_PENDING+binding 供 recovery 续作。</li>
+     *     <li>物理文件删除成功后发布 DROPPED 新版本，完成逻辑生命周期。</li>
+     * </ol>
+     *
+     * @param owner   本次 DDL 的 MDL owner；schema/table ticket 都归该 owner 生命周期。
+     * @param name    待删除表的完整 schema/table 名称，不能为 {@code null}。
+     * @param timeout MDL、history barrier、cache pin 与物理 DROP 共用的正有界等待时间。
+     * @throws DatabaseValidationException owner/name/timeout 无效时抛出，且不改变 catalog/cache/文件。
+     * @throws cn.zhangyis.db.storage.api.TablePurgeBarrierTimeoutException history 在 timeout 内仍引用表时抛出，表保持 ACTIVE。
+     * @throws DictionaryDdlException metadata/binding 不完整、cache pin 排空或物理 DROP 失败时抛出；DROP_PENDING durable 后由恢复续作。
      */
     public void dropTable(MdlOwnerId owner, QualifiedTableName name, Duration timeout) {
         validateOwnerTimeout(owner, timeout);
@@ -180,12 +266,18 @@ public final class DictionaryDdlService {
                 MdlDuration.TRANSACTION), timeout);
              MdlTicket tableTicket = locks.acquire(new MdlRequest(owner, MdlKey.table(name.canonicalKey()),
                      MdlMode.EXCLUSIVE, MdlDuration.TRANSACTION), timeout)) {
+            // 1、MDL 阻断新表访问后读取 ACTIVE metadata；此时还未改 cache/catalog/物理文件。
             SchemaDefinition schema = repository.findSchema(name.schema()).orElseThrow(() ->
                     new DictionaryObjectNotFoundException("schema does not exist: " + name.schema().displayName()));
             TableDefinition active = repository.findTable(schema.id(), name.table()).orElseThrow(() ->
                     new DictionaryObjectNotFoundException("table does not exist: " + name.canonicalKey()));
             TableStorageBinding binding = active.storageBinding().orElseThrow(() ->
                     new DictionaryDdlException("ACTIVE table has no physical binding: " + active.id().value()));
+
+            // 2、history 仍引用表 metadata 时不能发布 DROP_PENDING；等待只持 Java Condition，不持存储资源。
+            purgeBarrier.awaitUnreferenced(active.id().value(), timeout);
+
+            // 3、barrier 清零后才建立不可回退 cache 屏障并持久发布 DROP_PENDING。
             DictionaryIdAllocation ids = control.reserve(new DictionaryIdRequest(0, 0, 0, 0, 1, 2));
             DictionaryVersion pendingVersion = DictionaryVersion.of(ids.dictionaryVersion());
             DictionaryVersion droppedVersion = DictionaryVersion.of(ids.dictionaryVersion() + 1);
@@ -201,11 +293,15 @@ public final class DictionaryDdlService {
                 throw publishFailure;
             }
             faultInjector.afterDropPendingPublished(pending);
+
+            // 4、DROP_PENDING 已 durable；排空旧 pin 后删除表空间，失败由同一 pending binding 恢复。
             if (!cache.awaitUnpinned(active.id(), timeout)) {
                 throw new DictionaryDdlException("timed out waiting dictionary pins before DROP: "
                         + active.id().value());
             }
             physical.dropTable(binding, timeout);
+
+            // 5、物理删除完成后发布 DROPPED，普通 lookup 从此永久不可见。
             commitUpdate(droppedVersion, lifecycle(pending, droppedVersion, TableState.DROPPED));
             log.info("dropped table: name={} tableId={} ddlId={} version={}", name.canonicalKey(),
                     active.id().value(), ids.firstDdlId(), droppedVersion.value());

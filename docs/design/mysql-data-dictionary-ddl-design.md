@@ -3,7 +3,7 @@
 版本：2026-06-05  
 实现语言：Java  
 参考基线：MySQL 8.0.46 Data Dictionary、Atomic DDL、Metadata Locking  
-关联设计：[mysql-parser-binder-design.md](mysql-parser-binder-design.md)、[mysql-statistics-analyze-design.md](mysql-statistics-analyze-design.md)、[innodb-crash-recovery-design.md](innodb-crash-recovery-design.md)、[innodb-storage-engine-overview.md](innodb-storage-engine-overview.md)、[innodb-btree-design.md](innodb-btree-design.md)、[innodb-record-design.md](innodb-record-design.md)、[innodb-transaction-mvcc-design.md](innodb-transaction-mvcc-design.md)、[innodb-redo-log-design.md](innodb-redo-log-design.md)、[innodb-disk-manager-design.md](innodb-disk-manager-design.md)、[innodb-buffer-pool-design.md](innodb-buffer-pool-design.md)、[mysql-session-connection-protocol-design.md](mysql-session-connection-protocol-design.md)、[mysql-lock-observability-deadlock-design.md](mysql-lock-observability-deadlock-design.md)
+关联设计：[mysql-parser-binder-design.md](mysql-parser-binder-design.md)、[mysql-statistics-analyze-design.md](mysql-statistics-analyze-design.md)、[innodb-crash-recovery-design.md](innodb-crash-recovery-design.md)、[innodb-storage-engine-overview.md](innodb-storage-engine-overview.md)、[innodb-btree-design.md](innodb-btree-design.md)、[innodb-record-design.md](innodb-record-design.md)、[innodb-transaction-mvcc-design.md](innodb-transaction-mvcc-design.md)、[innodb-secondary-index-mvcc-purge-design.md](innodb-secondary-index-mvcc-purge-design.md)、[innodb-redo-log-design.md](innodb-redo-log-design.md)、[innodb-disk-manager-design.md](innodb-disk-manager-design.md)、[innodb-buffer-pool-design.md](innodb-buffer-pool-design.md)、[mysql-session-connection-protocol-design.md](mysql-session-connection-protocol-design.md)、[mysql-lock-observability-deadlock-design.md](mysql-lock-observability-deadlock-design.md)
 
 ## 1. 目标与边界
 
@@ -585,7 +585,7 @@ Atomic DDL recovery 流程见 [atomic-ddl-recovery-flow.mmd](diagrams/atomic-ddl
 - `DataDictionaryService.openTable` 按 schema→table 获取 MDL，再持有 cache pin；`TableMetadataLease.close` 统一逆序释放。
 - CREATE 先用单个 MTR 创建 GENERAL tablespace、每索引 leaf/non-leaf segment 和 root，等 redo durable 后发布 ACTIVE 字典版本。
 - CREATE 的 catalog append 若向调用方报错，v1 无法判定 header force 是否已经成功，因此不得立即补偿删除物理文件；启动时已提交 ACTIVE 继续使用，未提交的受控命名文件才按 orphan 清理。
-- DROP 在 table X 下先建立带版本的 cache 准入屏障，再发布 `DROP_PENDING` 并等待旧 pin；publish 结果不确定时屏障保持 fail-closed 到重启，防止旧 repository snapshot 复活 ACTIVE。物理阶段先复核 binding/opened path 一致，再写 durable `DISCARDED` page0 marker、flush/invalidate/close/delete，最后发布 `DROPPED`。
+- DROP 在 table X 下解析 ACTIVE/binding 后，先通过 storage `TablePurgeBarrier` 有界等待 persistent history 不再引用该表；归零后才建立带版本的 cache 准入屏障、发布 `DROP_PENDING` 并等待旧 pin。publish 结果不确定时屏障保持 fail-closed 到重启；物理阶段写 durable `DISCARDED`、flush/invalidate/close/delete，最后发布 `DROPPED`。恢复续作在删文件前再次等待同一 barrier。
 - DD discovery 从 ACTIVE/DROP_PENDING table 只返回稳定 storage API binding；公共 `cn.zhangyis.db.engine.DatabaseEngine` 再转换 recovery tablespace 配置，在 storage recovery 后续作 pending drop 与受控命名 orphan cleanup，全部完成后才发布 OPEN。
 - `UndoRecordCodec.peekIdentity`、`IndexMetadataResolver` 和 `engine.adapter.DictionaryIndexMetadataResolver` 已让 rollback/purge 按 tableId/indexId 解析目标 B+Tree，legacy 单索引构造仅供低层兼容。
 
@@ -593,7 +593,7 @@ Atomic DDL recovery 流程见 [atomic-ddl-recovery-flow.mmd](diagrams/atomic-ddl
 
 - `DdlId` 当前只作日志诊断，v1 没有独立 `dd_ddl_log` 实体；最新 control 槽损坏时其 high-water 可能回退复用，恢复只依据 table lifecycle、storage binding 和 orphan discovery，不得依赖 DdlId 唯一性。
 - SDI、binlog participant、online DDL、ALTER TABLE、独立 CREATE INDEX 和 foreign key 未实现。
-- DROP 已与 statement metadata pin 协调，但尚无表级持久 purge-history barrier；在该屏障落地前，不应将长运行多表 purge 与并发 DROP 宣称为生产完整语义。
+- DROP barrier 不持久化独立计数；恢复从 page3/undo first-page persistent history 重建 affected-table 引用。该简化保持单一恢复真相，但当前仍是单 rseg、单线程 purge。
 - orphan cleanup 只处理 `tables/` 下符合受控命名规则且未被 catalog 引用的文件，不扫描或删除任意路径。
 
 ## 20. 参考链接

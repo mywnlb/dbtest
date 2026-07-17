@@ -3,7 +3,7 @@
 版本：2026-06-04  
 实现语言：Java  
 参考基线：MySQL 8.0.46 InnoDB 官方手册与源码文档  
-关联设计：[innodb-crash-recovery-design.md](innodb-crash-recovery-design.md)，[innodb-disk-manager-design.md](innodb-disk-manager-design.md)，[innodb-buffer-pool-design.md](innodb-buffer-pool-design.md)，[innodb-undo-log-purge-design.md](innodb-undo-log-purge-design.md)，[mysql-lock-observability-deadlock-design.md](mysql-lock-observability-deadlock-design.md)，[mysql-session-connection-protocol-design.md](mysql-session-connection-protocol-design.md)
+关联设计：[innodb-crash-recovery-design.md](innodb-crash-recovery-design.md)，[innodb-disk-manager-design.md](innodb-disk-manager-design.md)，[innodb-buffer-pool-design.md](innodb-buffer-pool-design.md)，[innodb-undo-log-purge-design.md](innodb-undo-log-purge-design.md)，[innodb-secondary-index-mvcc-purge-design.md](innodb-secondary-index-mvcc-purge-design.md)，[mysql-lock-observability-deadlock-design.md](mysql-lock-observability-deadlock-design.md)，[mysql-session-connection-protocol-design.md](mysql-session-connection-protocol-design.md)
 
 ## 1. 目标与边界
 

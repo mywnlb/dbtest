@@ -8,6 +8,14 @@ import cn.zhangyis.db.domain.TransactionId;
 import cn.zhangyis.db.domain.UndoNo;
 import cn.zhangyis.db.domain.UndoSlotId;
 import cn.zhangyis.db.storage.btree.BTreeIndex;
+import cn.zhangyis.db.storage.btree.BTreeLookupResult;
+import cn.zhangyis.db.storage.btree.BTreeRootSnapshotService;
+import cn.zhangyis.db.storage.btree.BTreeSecondaryDeleteMarkResult;
+import cn.zhangyis.db.storage.btree.BTreeSecondaryRemovalResult;
+import cn.zhangyis.db.storage.btree.SecondaryDeleteMarkStatus;
+import cn.zhangyis.db.storage.btree.SecondaryEntryRemovalStatus;
+import cn.zhangyis.db.storage.btree.SecondaryIndexMetadata;
+import cn.zhangyis.db.storage.btree.TableIndexMetadata;
 import cn.zhangyis.db.storage.btree.SplitCapableBTreeIndexService;
 import cn.zhangyis.db.storage.btree.IndexMetadataResolver;
 import cn.zhangyis.db.storage.api.lob.LobStorage;
@@ -27,13 +35,17 @@ import cn.zhangyis.db.storage.undo.UndoLogFormatException;
 import cn.zhangyis.db.storage.undo.UndoLogicalHead;
 import cn.zhangyis.db.storage.undo.UndoLogKind;
 import cn.zhangyis.db.storage.undo.UndoRecord;
+import cn.zhangyis.db.storage.undo.SecondaryEntryBeforeState;
+import cn.zhangyis.db.storage.undo.SecondaryUndoMutation;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Collection;
+import java.util.Optional;
 
 /**
  * 事务 rollback 执行器（设计 §7.6/§11.2/§14.4）。从 INSERT/UPDATE 两个局部 logical head 中反复选择较大
@@ -58,11 +70,16 @@ import java.util.Collection;
  * （已写 undo 但无对应聚簇行）由本走链幂等清理；1.4 起 statement/savepoint 边界可由 storage DML Guard
  * 显式回退。
  *
- * <p><b>索引解析</b>：legacy 调用继续显式传单聚簇索引；DatabaseEngine 注入 {@link IndexMetadataResolver} 后，
- * 每条 undo 先读取固定前缀 tableId/indexId，再解析对应 keyDef/schema/root。二级索引 undo 尚未生成；SQL/session
- * 自动 statement 生命周期与 savepoint lock scope 留后续。
+ * <p><b>索引解析</b>：legacy 调用继续显式传单聚簇索引；DatabaseEngine 注入表级
+ * {@link UndoTargetMetadataResolver} 后，每条 undo 先读取固定前缀 tableId/indexId，再解析 exact-version
+ * 聚簇/secondary layout 与可选 LOB owner。带 secondary tail 的记录按 index id 逐棵树使用独立短 MTR 反向执行，
+ * secondary 全部收敛后才修改聚簇版本，最后另用 marker MTR 推进持久 logical head。命名 SAVEPOINT 与
+ * savepoint 后 row-lock 精细释放仍留后续。
  */
 public final class RollbackService {
+
+    /** rollback 等待短物理行 guard 的上界；等待发生时不持有 MTR、page latch 或 buffer fix。 */
+    private static final Duration ROW_GUARD_TIMEOUT = Duration.ofSeconds(30);
 
     /** 聚簇删除入口；{@code applyUndoRecord} 对 INSERT_ROW undo 调 {@code deleteClustered} 物理删除。 */
     private final SplitCapableBTreeIndexService btree;
@@ -82,6 +99,10 @@ public final class RollbackService {
     private final UndoTargetMetadataResolver targetResolver;
     /** INSERT ownership marker MTR 的 LOB 校验/free 入口；只有 target resolver 模式允许非空 ownership。 */
     private final LobStorage lobStorage;
+    /** 结构型二级 inverse 在 redo admission 前刷新 root level；legacy 单索引模式允许为空。 */
+    private final BTreeRootSnapshotService rootSnapshots;
+    /** 与表级 DML/purge 共享的短物理行协调器；legacy 单索引模式允许为空。 */
+    private final PurgeDmlRowGuardManager rowGuards;
 
     /**
      * 构造生产 rollback 执行器；逐记录 progress hook 固定为 no-op，完整终结必须使用共享 finalizer。
@@ -96,7 +117,7 @@ public final class RollbackService {
                            TransactionManager txnMgr, MiniTransactionManager mtrMgr,
                            UndoSegmentFinalizer finalizer) {
         this(btree, undoAccess, txnMgr, mtrMgr, finalizer, RollbackProgressFaultInjector.none(),
-                null, null, null);
+                null, null, null, null, null);
     }
 
     /** DD 模式构造器：rollback/recovery 逐条解析 undo 的 tableId/indexId。 */
@@ -104,7 +125,7 @@ public final class RollbackService {
                            TransactionManager txnMgr, MiniTransactionManager mtrMgr,
                            UndoSegmentFinalizer finalizer, IndexMetadataResolver indexResolver) {
         this(btree, undoAccess, txnMgr, mtrMgr, finalizer, RollbackProgressFaultInjector.none(),
-                indexResolver, null, null);
+                indexResolver, null, null, null, null);
     }
 
     /** DD 生产模式：full/recovery rollback 同时解析精确聚簇索引与权威 LOB segment。 */
@@ -113,7 +134,30 @@ public final class RollbackService {
                            UndoSegmentFinalizer finalizer, LobStorage lobStorage,
                            UndoTargetMetadataResolver targetResolver) {
         this(btree, undoAccess, txnMgr, mtrMgr, finalizer, RollbackProgressFaultInjector.none(),
-                null, targetResolver, lobStorage);
+                null, targetResolver, lobStorage, null, null);
+    }
+
+    /**
+     * DD 表级生产模式：full/statement/recovery rollback 使用 exact-version 全索引聚合，并与前台 DML 共用行 guard。
+     *
+     * @param btree          聚簇与二级 inverse 的页结构入口。
+     * @param undoAccess     undo logical chain 读取入口。
+     * @param txnMgr         live transaction 状态机。
+     * @param mtrMgr         每棵索引独立短 MTR 的来源。
+     * @param finalizer      完整回滚后终结 undo segment 的协作者。
+     * @param lobStorage     INSERT ownership marker 的 LOB 释放入口。
+     * @param targetResolver 按 undo table/index identity 解析 exact-version 表级目标。
+     * @param rootSnapshots  从 root 页头刷新结构 level 的服务。
+     * @param rowGuards      与表级 DML/purge 共享的聚簇行短物理协调器。
+     */
+    public RollbackService(SplitCapableBTreeIndexService btree, UndoLogSegmentAccess undoAccess,
+                           TransactionManager txnMgr, MiniTransactionManager mtrMgr,
+                           UndoSegmentFinalizer finalizer, LobStorage lobStorage,
+                           UndoTargetMetadataResolver targetResolver,
+                           BTreeRootSnapshotService rootSnapshots,
+                           PurgeDmlRowGuardManager rowGuards) {
+        this(btree, undoAccess, txnMgr, mtrMgr, finalizer, RollbackProgressFaultInjector.none(),
+                null, targetResolver, lobStorage, rootSnapshots, rowGuards);
     }
 
     /**
@@ -123,7 +167,7 @@ public final class RollbackService {
                     TransactionManager txnMgr, MiniTransactionManager mtrMgr,
                     UndoSegmentFinalizer finalizer, RollbackProgressFaultInjector progressFaultInjector) {
         this(btree, undoAccess, txnMgr, mtrMgr, finalizer, progressFaultInjector,
-                null, null, null);
+                null, null, null, null, null);
     }
 
     /**
@@ -138,14 +182,15 @@ public final class RollbackService {
             throw new DatabaseValidationException("rollback progress fault injector must not be null");
         }
         return new RollbackService(btree, undoAccess, txnMgr, mtrMgr, finalizer, injector,
-                indexResolver, targetResolver, lobStorage);
+                indexResolver, targetResolver, lobStorage, rootSnapshots, rowGuards);
     }
 
     private RollbackService(SplitCapableBTreeIndexService btree, UndoLogSegmentAccess undoAccess,
                     TransactionManager txnMgr, MiniTransactionManager mtrMgr,
-                    UndoSegmentFinalizer finalizer, RollbackProgressFaultInjector progressFaultInjector,
-                    IndexMetadataResolver indexResolver, UndoTargetMetadataResolver targetResolver,
-                    LobStorage lobStorage) {
+                     UndoSegmentFinalizer finalizer, RollbackProgressFaultInjector progressFaultInjector,
+                     IndexMetadataResolver indexResolver, UndoTargetMetadataResolver targetResolver,
+                     LobStorage lobStorage, BTreeRootSnapshotService rootSnapshots,
+                     PurgeDmlRowGuardManager rowGuards) {
         if (btree == null || undoAccess == null || txnMgr == null || mtrMgr == null
                 || finalizer == null || progressFaultInjector == null) {
             throw new DatabaseValidationException("rollback service collaborators must not be null");
@@ -159,6 +204,8 @@ public final class RollbackService {
         this.indexResolver = indexResolver;
         this.targetResolver = targetResolver;
         this.lobStorage = lobStorage;
+        this.rootSnapshots = rootSnapshots;
+        this.rowGuards = rowGuards;
     }
 
     /**
@@ -628,8 +675,56 @@ public final class RollbackService {
         return new UndoLogicalHead(predecessor.record().undoNo(), predecessorPointer);
     }
 
-    /** 单条 inverse 的独立 index MTR；异常时只释放当前物理资源，已提交的前序 record 保持可恢复。 */
+    /**
+     * 撤销一条逻辑 undo 对聚簇树和全部二级树的影响；每棵树使用独立短 MTR，聚簇 inverse 固定最后执行。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>无 secondary tail 时沿用单聚簇兼容路径；表级 tail 则先校验共享 root/guard wiring。</li>
+     *     <li>不持任何 MTR/page latch 时取得 table+cluster-key 行 guard，再用短读 MTR物化当前聚簇版本。</li>
+     *     <li>若聚簇 inverse 已完成，利用“聚簇最后提交”不变量把整条数据 inverse 判为完成；否则校验当前版本仍由本 undo 拥有。</li>
+     *     <li>按 undo 中稳定 index-id 顺序逐棵恢复二级 entry；每个状态转换单独提交，失败后 marker 保持原位供重试。</li>
+     *     <li>全部二级树收敛后才提交聚簇 inverse；调用方随后另用 marker MTR 后退 logical head。</li>
+     * </ol>
+     *
+     * @param at             已从 undo 页完整物化的 record、pointer 与 exact-version 表级目标。
+     * @param clusteredIndex legacy 显式聚簇索引；表级 resolver 模式使用 {@code at.target()}，该参数仅作兼容。
+     * @throws UndoLogFormatException 当前聚簇版本所有权、二级前态或 exact-version metadata 与 undo 证据冲突时抛出。
+     */
     private void applyUndoRecordInOwnMtr(RecordAt at, BTreeIndex clusteredIndex) {
+        // 1. 旧 undo 没有二级 tail，保持已有单树行为，也让低层测试不必伪造表级 wiring。
+        if (at.record().secondaryMutations().isEmpty()) {
+            applyClusteredInverseInOwnMtr(at);
+            return;
+        }
+        requireMultiIndexRollbackWiring();
+
+        UndoRecord record = at.record();
+        SearchKey clusterKey = new SearchKey(record.clusterKey());
+
+        // 2. guard 等待发生在所有短 MTR 之外；拿到 guard 后，各次页访问仍严格一次只进入一棵树。
+        try (PurgeDmlRowGuard ignored = rowGuards.acquireForDml(
+                record.tableId(), clusterKey, ROW_GUARD_TIMEOUT)) {
+            Optional<LogicalRecord> current = readClusteredRecord(at.index(), clusterKey);
+
+            // 3. 聚簇 inverse 固定最后提交，因此它的完成态也是全部 secondary inverse 已完成的重试证明。
+            if (clusteredInverseAlreadyComplete(record, at.index(), current)) {
+                return;
+            }
+            LogicalRecord ownedCurrent = requireUndoOwnedCurrentRecord(record, at.pointer(), current);
+
+            // 4. mutation 在 UndoRecord 构造/解码时已按 index id 严格递增；每个动作内部也不跨 MTR 持页资源。
+            for (SecondaryUndoMutation mutation : record.secondaryMutations()) {
+                applySecondaryInverse(at, mutation, ownedCurrent);
+            }
+
+            // 5. 最后恢复/删除聚簇版本；若后续 marker 失败，重试会由第 3 阶段直接跳过已完成的数据 inverse。
+            applyClusteredInverseInOwnMtr(at);
+        }
+    }
+
+    /** 在独立短 MTR 内执行聚簇 inverse；异常时释放当前 MTR 资源且不移动 undo logical head。 */
+    private void applyClusteredInverseInOwnMtr(RecordAt at) {
         BTreeIndex resolved = at.index();
         MiniTransaction inverseMtr = mtrMgr.begin(mtrMgr.budgetFor(
                 RedoBudgetPurpose.ROLLBACK_INVERSE,
@@ -641,6 +736,190 @@ public final class RollbackService {
             rollbackActiveStateMtr(inverseMtr, e);
             throw e;
         }
+    }
+
+    /**
+     * 短读当前聚簇物理版本并在返回前释放页资源；delete-marked 版本也必须返回，以便 DELETE rollback 校验 owner。
+     *
+     * @param index      exact-version 聚簇 descriptor。
+     * @param clusterKey 完整物化聚簇主键。
+     * @return 当前物理记录快照；聚簇 INSERT inverse 已完成时为空。
+     */
+    private Optional<LogicalRecord> readClusteredRecord(BTreeIndex index, SearchKey clusterKey) {
+        MiniTransaction read = mtrMgr.beginReadOnly();
+        try {
+            Optional<LogicalRecord> result = btree.lookupIncludingDeleted(read, index, clusterKey)
+                    .map(BTreeLookupResult::record);
+            mtrMgr.commit(read);
+            return result;
+        } catch (RuntimeException error) {
+            rollbackActiveStateMtr(read, error);
+            throw error;
+        }
+    }
+
+    /**
+     * 判断 marker 落后时当前聚簇行是否已经处于 undo 的目标旧状态。聚簇 inverse 最后提交，所以命中该状态时，
+     * earlier secondary inverse 必然都已提交；这里不能再次从旧聚簇 image 猜测 INSERT 的新二级 entry。
+     */
+    private static boolean clusteredInverseAlreadyComplete(UndoRecord record, BTreeIndex index,
+                                                            Optional<LogicalRecord> current) {
+        if (record.type() == cn.zhangyis.db.storage.undo.UndoRecordType.INSERT_ROW) {
+            return current.isEmpty();
+        }
+        return current.filter(expectedOldRecord(record, index)::equals).isPresent();
+    }
+
+    /**
+     * 校验当前聚簇版本仍是本 undo 要撤销的前向版本。所有权由 DB_TRX_ID+DB_ROLL_PTR 双重确定，delete 位还需与
+     * undo 类型一致；任一错配都 fail-closed，避免用旧 history 覆盖较新已提交版本。
+     */
+    private static LogicalRecord requireUndoOwnedCurrentRecord(UndoRecord record, RollPointer pointer,
+                                                                Optional<LogicalRecord> current) {
+        LogicalRecord row = current.orElseThrow(() -> new UndoLogFormatException(
+                "rollback current clustered record is absent before inverse: table=" + record.tableId()
+                        + " index=" + record.indexId() + " key=" + record.clusterKey()));
+        boolean expectedDeleted = record.type() == cn.zhangyis.db.storage.undo.UndoRecordType.DELETE_MARK;
+        if (row.hiddenColumns() == null
+                || !record.transactionId().equals(row.hiddenColumns().dbTrxId())
+                || !pointer.equals(row.hiddenColumns().dbRollPtr())
+                || row.deleted() != expectedDeleted) {
+            throw new UndoLogFormatException("rollback clustered owner/state mismatch: table="
+                    + record.tableId() + " index=" + record.indexId() + " key=" + record.clusterKey()
+                    + " expectedTrx=" + record.transactionId() + " expectedRollPtr=" + pointer
+                    + " expectedDeleted=" + expectedDeleted);
+        }
+        return row;
+    }
+
+    /** 从 UPDATE/DELETE undo 的全量旧 image 重建聚簇目标版本；INSERT 没有旧版本，不得调用。 */
+    private static LogicalRecord expectedOldRecord(UndoRecord record, BTreeIndex index) {
+        if (record.oldColumnValues() == null || record.oldHiddenColumns() == null) {
+            throw new UndoLogFormatException(record.type() + " undo has no old clustered image");
+        }
+        return new LogicalRecord(index.schema().schemaVersion(), record.oldColumnValues(), false,
+                RecordType.CONVENTIONAL, record.oldHiddenColumns());
+    }
+
+    /**
+     * 对一个 exact-version 二级索引应用反向动作。UPDATE 先 revive 旧 identity，再按落盘前态 remove/re-mark 新 identity；
+     * 即使阶段间 crash，重试也可依赖显式 CHANGED/ALREADY/ABSENT 状态收敛。
+     */
+    private void applySecondaryInverse(RecordAt at, SecondaryUndoMutation mutation,
+                                       LogicalRecord currentRow) {
+        SecondaryIndexMetadata secondary = at.target().tableIndexes().requireSecondary(mutation.indexId());
+        LogicalRecord currentEntry = secondary.layout().toEntry(currentRow, false);
+        switch (mutation.action()) {
+            case INSERT_ENTRY -> {
+                removePublishedSecondary(secondary, secondary.layout().physicalKey(currentEntry), true);
+                notifySecondaryInverseCommitted(at);
+            }
+            case CHANGE_KEY -> {
+                LogicalRecord oldRow = expectedOldRecord(at.record(), at.index());
+                LogicalRecord oldEntry = secondary.layout().toEntry(oldRow, false);
+                reviveSecondary(secondary, secondary.layout().physicalKey(oldEntry));
+                notifySecondaryInverseCommitted(at);
+                SearchKey currentKey = secondary.layout().physicalKey(currentEntry);
+                if (mutation.newEntryBeforeState() == SecondaryEntryBeforeState.ABSENT) {
+                    removePublishedSecondary(secondary, currentKey, true);
+                } else if (mutation.newEntryBeforeState() == SecondaryEntryBeforeState.DELETE_MARKED) {
+                    markSecondaryDeleted(secondary, currentKey);
+                } else {
+                    throw secondaryInverseMismatch(at.record(), mutation,
+                            "CHANGE_KEY has no recoverable new-entry before-state");
+                }
+                notifySecondaryInverseCommitted(at);
+            }
+            case DELETE_MARK_ENTRY -> {
+                reviveSecondary(secondary, secondary.layout().physicalKey(currentEntry));
+                notifySecondaryInverseCommitted(at);
+            }
+        }
+    }
+
+    /** 在单个 secondary MTR durable 后触发包内故障接缝；logical head 仍保持当前 undo，生产实例为 no-op。 */
+    private void notifySecondaryInverseCommitted(RecordAt at) {
+        progressFaultInjector.after(RollbackProgressPhase.AFTER_SECONDARY_INVERSE_COMMIT,
+                new UndoLogicalHead(at.record().undoNo(), at.pointer()));
+    }
+
+    /** 物理删除 rollback 新发布的 live entry；ABSENT 是 marker-lag/阶段重试的幂等完成态，状态冲突必须失败。 */
+    private void removePublishedSecondary(SecondaryIndexMetadata secondary, SearchKey key,
+                                          boolean absentIsComplete) {
+        BTreeIndex index = refreshRootSnapshot(secondary.index());
+        MiniTransaction inverse = mtrMgr.begin(mtrMgr.budgetFor(RedoBudgetPurpose.ROLLBACK_INVERSE,
+                BTreeRedoBudgetEstimator.structuralDelete(index.rootLevel())));
+        try {
+            BTreeSecondaryRemovalResult result = btree.deletePublishedSecondary(inverse, index, key);
+            if (result.status() == SecondaryEntryRemovalStatus.STATE_CONFLICT
+                    || (result.status() == SecondaryEntryRemovalStatus.ABSENT && !absentIsComplete)) {
+                throw new UndoLogFormatException("rollback secondary remove state mismatch: index="
+                        + index.indexId() + " key=" + key + " status=" + result.status());
+            }
+            mtrMgr.commit(inverse);
+        } catch (RuntimeException error) {
+            rollbackActiveStateMtr(inverse, error);
+            throw error;
+        }
+    }
+
+    /** revive 旧二级 identity；缺失不是幂等完成态，因为目标旧 entry 在 purge barrier 下必须仍可恢复。 */
+    private void reviveSecondary(SecondaryIndexMetadata secondary, SearchKey key) {
+        applySecondaryDeleteState(secondary, key, false, false);
+    }
+
+    /** 把 UPDATE 前被 revive 的新 identity 恢复为 delete-marked；缺失表示 undo 前态无法再重建。 */
+    private void markSecondaryDeleted(SecondaryIndexMetadata secondary, SearchKey key) {
+        applySecondaryDeleteState(secondary, key, true, false);
+    }
+
+    /** 在独立 point-rewrite MTR 中翻转二级 delete 位，并按调用方语义分类 ABSENT。 */
+    private void applySecondaryDeleteState(SecondaryIndexMetadata secondary, SearchKey key,
+                                           boolean deleted, boolean absentIsComplete) {
+        BTreeIndex index = refreshRootSnapshot(secondary.index());
+        MiniTransaction inverse = mtrMgr.begin(mtrMgr.budgetFor(RedoBudgetPurpose.ROLLBACK_INVERSE,
+                BTreeRedoBudgetEstimator.pointRewrite()));
+        try {
+            BTreeSecondaryDeleteMarkResult result = btree.setSecondaryDeleteMark(inverse, index, key, deleted);
+            if (result.status() == SecondaryDeleteMarkStatus.ABSENT && !absentIsComplete) {
+                throw new UndoLogFormatException("rollback secondary mark state mismatch: index="
+                        + index.indexId() + " key=" + key + " targetDeleted=" + deleted);
+            }
+            mtrMgr.commit(inverse);
+        } catch (RuntimeException error) {
+            rollbackActiveStateMtr(inverse, error);
+            throw error;
+        }
+    }
+
+    /** 使用独立只读 MTR 刷新 root level，提交释放 root S latch 后才允许开启二级写 MTR。 */
+    private BTreeIndex refreshRootSnapshot(BTreeIndex index) {
+        MiniTransaction read = mtrMgr.beginReadOnly();
+        try {
+            BTreeIndex refreshed = rootSnapshots.refresh(read, index);
+            mtrMgr.commit(read);
+            return refreshed;
+        } catch (RuntimeException error) {
+            rollbackActiveStateMtr(read, error);
+            throw error;
+        }
+    }
+
+    /** secondary tail 只能由完整表级生产 wiring 消费，legacy 单索引实例不得静默忽略二级恢复证据。 */
+    private void requireMultiIndexRollbackWiring() {
+        if (targetResolver == null || rootSnapshots == null || rowGuards == null) {
+            throw new DatabaseValidationException(
+                    "secondary rollback requires target resolver, root snapshots and shared row guards");
+        }
+    }
+
+    /** 构造包含 undo 与 mutation identity 的 fail-closed 二级恢复异常。 */
+    private static UndoLogFormatException secondaryInverseMismatch(UndoRecord record,
+                                                                   SecondaryUndoMutation mutation,
+                                                                   String detail) {
+        return new UndoLogFormatException("secondary inverse mismatch: table=" + record.tableId()
+                + " clusteredIndex=" + record.indexId() + " secondaryIndex=" + mutation.indexId()
+                + " action=" + mutation.action() + ": " + detail);
     }
 
     /**
@@ -955,7 +1234,7 @@ public final class RollbackService {
     /** 优先使用权威 DD target resolver；legacy 显式索引路径只产生 empty LOB binding。 */
     private UndoTargetMetadata resolveTarget(long tableId, long indexId, BTreeIndex fallback) {
         UndoTargetMetadata target = targetResolver == null
-                ? new UndoTargetMetadata(resolveIndex(tableId, indexId, fallback), java.util.Optional.empty())
+                ? legacyTarget(tableId, resolveIndex(tableId, indexId, fallback))
                 : targetResolver.resolveTarget(tableId, indexId);
         BTreeIndex index = target.clusteredIndex();
         if (index.indexId() != indexId || !index.clustered()) {
@@ -963,6 +1242,12 @@ public final class RollbackService {
                     + tableId + " index=" + indexId + " resolved=" + index.indexId());
         }
         return target;
+    }
+
+    /** legacy 单聚簇入口只为现有低层测试/显式 API 构造无二级、无 LOB 的表级包装。 */
+    private static UndoTargetMetadata legacyTarget(long tableId, BTreeIndex clusteredIndex) {
+        return new UndoTargetMetadata(new TableIndexMetadata(tableId, clusteredIndex.schema().schemaVersion(),
+                clusteredIndex, List.of()), java.util.Optional.empty());
     }
 
     private static BTreeIndex requireFallbackIndex(BTreeIndex fallback) {

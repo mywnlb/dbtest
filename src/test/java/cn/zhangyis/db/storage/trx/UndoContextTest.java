@@ -92,6 +92,24 @@ class UndoContextTest {
         assertEquals(UndoNo.of(1), context.lastUndoNo());
     }
 
+    /** UPDATE affected-table 投影只描述当前 logical head 可达记录，savepoint/full rollback 后不得保留假引用。 */
+    @Test
+    void affectedTablesFollowReachableUpdateLogicalHead() {
+        UndoContext context = freshUpdate();
+        RollPointer first = new RollPointer(false, PageNo.of(65), 120);
+        RollPointer second = new RollPointer(false, PageNo.of(65), 180);
+        context.publishAppend(UndoLogKind.UPDATE, UndoNo.of(1), first, 11L);
+        context.publishAppend(UndoLogKind.UPDATE, UndoNo.of(2), second, 12L);
+
+        assertEquals(java.util.Set.of(11L, 12L), context.affectedTableIds());
+
+        context.publishRollbackProgress(UndoLogKind.UPDATE, new UndoLogicalHead(UndoNo.of(1), first));
+        assertEquals(java.util.Set.of(11L), context.affectedTableIds());
+
+        context.completeRollbackToEmptyBoundary();
+        assertTrue(context.affectedTableIds().isEmpty());
+    }
+
     @Test void releaseSavepointRemovesNestedRange() {
         Transaction txn = new Transaction(TransactionOptions.defaults(), 1L);
         UndoContext context = freshInsert();
@@ -124,6 +142,12 @@ class UndoContextTest {
     private static UndoContext freshInsert() {
         UndoContext context = new UndoContext(RSEG);
         context.attach(new UndoLogBinding(UndoLogKind.INSERT, SLOT, FIRST, UndoLogicalHead.EMPTY));
+        return context;
+    }
+
+    private static UndoContext freshUpdate() {
+        UndoContext context = new UndoContext(RSEG);
+        context.attach(new UndoLogBinding(UndoLogKind.UPDATE, SLOT, FIRST, UndoLogicalHead.EMPTY));
         return context;
     }
 }

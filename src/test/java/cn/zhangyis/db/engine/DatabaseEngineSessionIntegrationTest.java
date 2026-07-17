@@ -34,7 +34,8 @@ class DatabaseEngineSessionIntegrationTest {
         database.open();
         createTable(database);
         var session = database.openSession(options(false));
-        session.execute("INSERT INTO docs (id, body) VALUES (1, '" + "长".repeat(300) + "')");
+        session.execute("INSERT INTO docs (id, email, body) VALUES (1, 'pending@example.test', '"
+                + "长".repeat(300) + "')");
         assertTrue(session.snapshot().transactionActive());
         database.close();
         assertEquals(SessionState.CLOSED, session.snapshot().state());
@@ -43,8 +44,30 @@ class DatabaseEngineSessionIntegrationTest {
             reopened.open();
             try (var reader = reopened.openSession(options(true))) {
                 QueryResult result = assertInstanceOf(QueryResult.class,
-                        reader.execute("SELECT * FROM docs WHERE id=1"));
+                        reader.execute("SELECT * FROM docs WHERE email='PENDING@example.test'"));
                 assertTrue(result.rows().isEmpty());
+            }
+        }
+    }
+
+    /** 公开 Session INSERT 必须维护 unique secondary；SELECT 由 Binder 选该索引并回表返回完整 LOB 投影。 */
+    @Test
+    void sessionSelectsCommittedRowThroughUniqueSecondaryAndHydratesLob() {
+        try (DatabaseEngine database = new DatabaseEngine(config())) {
+            database.open();
+            createTable(database);
+            String body = "回表".repeat(220);
+            try (var session = database.openSession(options(true))) {
+                session.execute("INSERT INTO docs (id, email, body) VALUES (7, 'Reader@example.test', '"
+                        + body + "')");
+                QueryResult result = assertInstanceOf(QueryResult.class,
+                        session.execute("SELECT body, id FROM docs WHERE email='READER@example.test'"));
+                assertEquals(1, result.rows().size());
+                assertEquals(body, ((cn.zhangyis.db.sql.executor.SqlValue.StringValue)
+                        result.rows().getFirst().values().get(0)).value());
+                assertEquals(java.math.BigInteger.valueOf(7),
+                        ((cn.zhangyis.db.sql.executor.SqlValue.IntegerValue)
+                                result.rows().getFirst().values().get(1)).value());
             }
         }
     }
@@ -54,10 +77,14 @@ class DatabaseEngineSessionIntegrationTest {
         database.ddl().createTable(MdlOwnerId.of(900), new CreateTableCommand(
                 QualifiedTableName.of("app", "docs"), PageNo.of(128),
                 List.of(new CreateColumnSpec(ObjectName.of("id"), ColumnTypeDefinition.bigint(false, false)),
+                        new CreateColumnSpec(ObjectName.of("email"), new ColumnTypeDefinition(
+                                DictionaryTypeId.VARCHAR, false, false, 160, 0, 1, 2, List.of())),
                         new CreateColumnSpec(ObjectName.of("body"), new ColumnTypeDefinition(DictionaryTypeId.TEXT,
                                 false, false, 65_535, 0, 1, 1, List.of()))),
                 List.of(new CreateIndexSpec(ObjectName.of("PRIMARY"), true, true,
-                        List.of(new CreateIndexKeyPartSpec(ObjectName.of("id"), IndexOrder.ASC, 0))))),
+                                List.of(new CreateIndexKeyPartSpec(ObjectName.of("id"), IndexOrder.ASC, 0))),
+                        new CreateIndexSpec(ObjectName.of("uq_email"), true, false,
+                                List.of(new CreateIndexKeyPartSpec(ObjectName.of("email"), IndexOrder.ASC, 0))))),
                 Duration.ofSeconds(5));
     }
 

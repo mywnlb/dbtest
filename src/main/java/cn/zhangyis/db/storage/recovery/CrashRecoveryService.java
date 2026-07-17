@@ -62,6 +62,17 @@ public final class CrashRecoveryService {
     /**
      * 执行 R2 最小恢复链。任何阶段失败都会 fail closed 并抛出 {@link RecoveryStartupException}，避免带未完成恢复的存储层开放流量。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验请求并独占恢复门面，关闭用户流量后读取 checkpoint；失败时 gate 保持关闭。</li>
+     *     <li>先修复 doublewrite，再从 checkpoint 连续重放 redo，并把事务 delta 汇入不可变恢复快照。</li>
+     *     <li>安装 redo 续写边界，续作 UNDO tablespace truncate，并按恢复后的 page0 对齐物理文件长度。</li>
+     *     <li>调用事务参与者回滚 ACTIVE undo、恢复 committed history；该阶段不得持有 redo reader 或数据页 latch。</li>
+     *     <li>在独立 RESUME_PURGE 阶段推进 persistent history，并 flush 恢复期间新产生的 rollback/purge redo。</li>
+     *     <li>force 所有恢复写，保证后续 checkpoint 越过恢复边界时数据页已经 durable。</li>
+     *     <li>仅在全部阶段成功后开放流量并发布报告；任一项目异常或意外运行时异常都 fail-closed。</li>
+     * </ol>
+     *
      * @param request 恢复请求。
      * @return 恢复报告。
      */
@@ -74,6 +85,7 @@ public final class CrashRecoveryService {
             List<RecoveryStageName> stages = new ArrayList<>();
             RecoveryStageTracker tracker = new RecoveryStageTracker(request.mode(), progressJournal, stages);
             try {
+                // 1、先关闭流量并固定 checkpoint 输入，后续任何失败都不能越过 gate。
                 tracker.begin(RecoveryStageName.TRAFFIC_CLOSED);
                 state = RecoveryState.RECOVERING;
                 gate.closeForRecovery();
@@ -86,6 +98,7 @@ public final class CrashRecoveryService {
                     return recoverReadOnlyValidate(request, tracker, checkpoint);
                 }
 
+                // 2、doublewrite 修复先于 redo；事务 delta 与 redo replay 使用同一连续边界。
                 tracker.begin(RecoveryStageName.DOUBLEWRITE_REPAIR);
                 DoublewriteRepairSummary doublewriteSummary = repairDoublewritePages(request);
                 tracker.complete(state, Lsn.of(0), skipDetail("skippedDoublewritePages",
@@ -107,7 +120,7 @@ public final class CrashRecoveryService {
                 tracker.complete(state, reader.recoveredToLsn(), skipDetail("skippedRedoRecords",
                         redoSummary.skippedRecordCount(), request.skipPolicy()));
 
-                // 先安装恢复边界，使后续 undo 续作（会 append marker/rebuild redo）从 recoveredToLsn 连续追加。
+                // 3、先安装恢复边界，使后续 undo 续作（会 append marker/rebuild redo）从 recoveredToLsn 连续追加。
                 // 与 undo 参与者内部对同一 recoveredToLsn 的安装幂等共存（RedoLogManager 同值再装为 no-op）。
                 if (request.recoveredRedoManager() != null) {
                     tracker.begin(RecoveryStageName.REDO_BOUNDARY_INSTALL);
@@ -131,6 +144,7 @@ public final class CrashRecoveryService {
                 }
 
                 if (request.transactionUndoRecovery() != null) {
+                    // 4、先回滚 ACTIVE 并恢复 committed history；返回时所有 undo/page latch 已释放。
                     tracker.begin(RecoveryStageName.UNDO_ROLLBACK);
                     RecoveredTransactionSnapshot transactionSnapshot =
                             request.transactionRecoveryContext().snapshot();
@@ -141,18 +155,22 @@ public final class CrashRecoveryService {
                         throw new DatabaseValidationException("transaction undo recovery result must not be null");
                     }
                     tracker.complete(state, reader.recoveredToLsn());
+
+                    // 5、在独立阶段真实推进恢复出的 history；异常直接阻止 OPEN_TRAFFIC。
                     tracker.begin(RecoveryStageName.RESUME_PURGE);
+                    request.transactionUndoRecovery().resumePurgeAfterRedo();
                     tracker.complete(state, reader.recoveredToLsn());
                     if (request.recoveredRedoManager() != null) {
                         request.recoveredRedoManager().flush();
                     }
                 }
 
-                // durability 屏障：开放流量前 force 全部恢复写。replay/repair/reconcile 都绕过 Buffer Pool dirty 跟踪、
+                // 6、durability 屏障：开放流量前 force 全部恢复写。replay/repair/reconcile 都绕过 Buffer Pool dirty 跟踪、
                 // 自身不 fsync；若不在此落盘，一旦后续 checkpoint 越过 recoveredToLsn 并回收 redo，再次崩溃将既无 redo
                 // 也无 durable 页，丢失恢复结果。force 后任何越过 recoveredToLsn 的 checkpoint 都是安全的。
                 request.applyContext().pageStore().forceAll();
 
+                // 7、只有前六阶段全部成功才开放流量；catch 分支统一记录失败并关闭 gate。
                 tracker.begin(RecoveryStageName.OPEN_TRAFFIC);
                 gate.openForUserTraffic();
                 state = RecoveryState.OPEN;

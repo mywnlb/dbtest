@@ -6,7 +6,8 @@ import cn.zhangyis.db.common.exception.DatabaseFatalException;
 import cn.zhangyis.db.dd.domain.ColumnTypeDefinition;
 import cn.zhangyis.db.dd.domain.DictionaryTypeId;
 import cn.zhangyis.db.sql.binder.bound.BoundClusteredInsert;
-import cn.zhangyis.db.sql.binder.bound.BoundPrimaryPointSelect;
+import cn.zhangyis.db.sql.binder.bound.BoundPointSelect;
+import cn.zhangyis.db.sql.binder.bound.PointAccessKind;
 import cn.zhangyis.db.sql.executor.SqlRow;
 import cn.zhangyis.db.sql.executor.SqlValue;
 import cn.zhangyis.db.sql.executor.storage.*;
@@ -96,14 +97,13 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
             BTreeIndex index = mapped.clusteredIndex();
             // 2. record/schema 校验仍在实际业务 MTR 前完成，key 顺序由 index definition 权威决定。
             List<ColumnValue> values = toColumnValues(statement.values(), index);
-            SearchKey key = keyFromRow(values, index);
             LogicalRecord record = new LogicalRecord(index.schema().schemaVersion(), values, false,
                     RecordType.CONVENTIONAL);
             // 3. guard 快照双 undo head；DML 成功前不发布 statement terminal。
             DmlStatementGuard guard = engine.dmlService().beginStatement(handle.transaction, index);
             try {
-                DmlWriteResult result = engine.dmlService().insert(new ClusteredInsertCommand(handle.transaction,
-                        index, key, record, statement.table().id().value(), mapped.lobSegment(),
+                DmlWriteResult result = engine.tableDmlService().insert(new TableInsertCommand(handle.transaction,
+                        mapped.tableIndexes(), record, mapped.lobSegment(),
                         deadline.cap(operationTimeout, "clustered INSERT row-lock wait")));
                 // 4. guard.close 成功才允许 handle 记为已写；失败路径由 catch 汇总 partial rollback 结果。
                 guard.close();
@@ -133,7 +133,7 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
      * </ol>
      */
     @Override
-    public Optional<SqlRow> selectPoint(SqlTransactionHandle transaction, BoundPrimaryPointSelect statement,
+    public Optional<SqlRow> selectPoint(SqlTransactionHandle transaction, BoundPointSelect statement,
                                         SqlStatementDeadline deadline) {
         if (statement == null || deadline == null) {
             throw new DatabaseValidationException("bound SELECT/deadline must not be null");
@@ -141,21 +141,28 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
         return withActive(transaction, deadline, handle -> {
             // 1. handle wait 已由 withActive 截断，下面所有 LOB 阶段继续消费同一绝对 deadline。
             MappedTableStorage mapped = mapper.map(statement.table());
-            BTreeIndex index = mapped.clusteredIndex();
-            SearchKey key = new SearchKey(toKeyValues(statement.keyValues(), index));
+            BTreeIndex clusteredIndex = mapped.clusteredIndex();
+            BTreeIndex accessIndex = mapped.index(statement.accessIndexId());
+            SearchKey key = new SearchKey(toKeyValues(statement.keyValues(), accessIndex));
+            if (statement.keyValues().stream().anyMatch(SqlValue.NullValue.class::isInstance)) {
+                return Optional.empty();
+            }
             ReadViewManager views = engine.transactionManager().readViewManager();
-            deadline.remaining("primary-point ReadView creation");
+            deadline.remaining("point-select ReadView creation");
             // 2. TransactionSystem 在此登记 live view，purge 在 closeReadView 前不能越过它。
             ReadView view = views.openReadView(handle.transaction);
             RuntimeException failure = null;
             try {
                 // 3. view 覆盖版本选择与外置引用解引用，避免 RC 提前注销后 purge 回收旧 LOB ownership。
-                Optional<LogicalRecord> record = engine.mvccReader().read(view, index, key);
+                Optional<LogicalRecord> record = statement.accessKind() == PointAccessKind.CLUSTERED_PRIMARY
+                        ? engine.mvccReader().read(view, clusteredIndex, key)
+                        : engine.secondaryMvccReader().readUnique(view, mapped.tableIndexes(),
+                                mapped.tableIndexes().requireSecondary(statement.accessIndexId()), key);
                 if (record.isEmpty()) return Optional.empty();
 
                 // RC view 必须覆盖 external chain hydration；否则 purge low water 可能在引用解引用前越过该版本。
                 List<ColumnValue> hydrated = hydrateExternalValues(
-                        record.orElseThrow().columnValues(), index, deadline);
+                        record.orElseThrow().columnValues(), clusteredIndex, deadline);
                 // 4. hydration 全部成功后才构造公开结果，storage LobReference 永不越过 gateway。
                 List<SqlValue> projected = new ArrayList<>(statement.projectionOrdinals().size());
                 for (int ordinal : statement.projectionOrdinals()) {
@@ -163,7 +170,7 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
                 }
                 return Optional.of(new SqlRow(projected));
             } catch (RuntimeException readFailure) {
-                failure = adapt("primary-point MVCC/LOB read failed", readFailure);
+                failure = adapt("point-select MVCC/LOB read failed", readFailure);
                 throw failure;
             } finally {
                 // 5. RR 由事务终态 release；RC 必须在全部读取工作结束后恰好注销，且不能覆盖主失败。
@@ -293,8 +300,8 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
     }
 
     private List<ColumnValue> toKeyValues(List<SqlValue> keys, BTreeIndex index) {
-        if (keys.size() != index.keyDef().parts().size()) {
-            throw new SqlStorageException("bound key width differs from mapped primary key");
+        if (keys.isEmpty() || keys.size() > index.keyDef().parts().size()) {
+            throw new SqlStorageException("bound key width exceeds mapped access index key");
         }
         ArrayList<ColumnValue> result = new ArrayList<>(keys.size());
         for (int i = 0; i < keys.size(); i++) {

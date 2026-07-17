@@ -2,7 +2,7 @@ package cn.zhangyis.db.sql.executor;
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.sql.binder.bound.BoundClusteredInsert;
-import cn.zhangyis.db.sql.binder.bound.BoundPrimaryPointSelect;
+import cn.zhangyis.db.sql.binder.bound.BoundPointSelect;
 import cn.zhangyis.db.sql.binder.bound.BoundStatement;
 import cn.zhangyis.db.sql.executor.storage.SqlStorageGateway;
 import cn.zhangyis.db.sql.executor.storage.SqlStatementDeadline;
@@ -32,7 +32,7 @@ public final class DefaultSqlExecutor {
                         new TransactionStatus(status.autocommit(), status.transactionActive(),
                                 outcome.rollbackOnly()));
             }
-            case BoundPrimaryPointSelect select -> {
+            case BoundPointSelect select -> {
                 List<ResultColumn> columns = select.projectionOrdinals().stream().map(ordinal -> {
                     var column = select.table().columns().get(ordinal);
                     return new ResultColumn(column.name().displayName(), column.type());

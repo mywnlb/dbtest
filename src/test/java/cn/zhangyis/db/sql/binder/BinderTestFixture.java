@@ -51,7 +51,9 @@ final class BinderTestFixture implements AutoCloseable {
                         false, true, 128, 0, 1, 1, List.of()), 2));
         IndexDefinition primary = new IndexDefinition(IndexId.of(3), ObjectName.of("PRIMARY"), true, true,
                 List.of(new IndexKeyPart(1, IndexOrder.ASC, 0), new IndexKeyPart(2, IndexOrder.ASC, 0)));
-        return table(2, 3, "orders", columns, primary, directory, Optional.of(segment(5, 3, 3)));
+        IndexDefinition note = new IndexDefinition(IndexId.of(4), ObjectName.of("uq_note"), true, false,
+                List.of(new IndexKeyPart(3, IndexOrder.ASC, 0)));
+        return table(2, "orders", columns, List.of(primary, note), directory, Optional.of(segment(5, 30, 30)));
     }
 
     private static TableDefinition prefixPrimary(Path directory) {
@@ -59,7 +61,7 @@ final class BinderTestFixture implements AutoCloseable {
                 new ColumnTypeDefinition(DictionaryTypeId.VARCHAR, false, false, 64, 0, 1, 1, List.of()), 0);
         IndexDefinition primary = new IndexDefinition(IndexId.of(13), ObjectName.of("PRIMARY"), true, true,
                 List.of(new IndexKeyPart(11, IndexOrder.ASC, 4)));
-        return table(12, 13, "prefix_key", List.of(code), primary, directory, Optional.empty());
+        return table(12, "prefix_key", List.of(code), List.of(primary), directory, Optional.empty());
     }
 
     private static TableDefinition lobPrimary(Path directory) {
@@ -67,7 +69,7 @@ final class BinderTestFixture implements AutoCloseable {
                 new ColumnTypeDefinition(DictionaryTypeId.TEXT, false, false, 65535, 0, 1, 1, List.of()), 0);
         IndexDefinition primary = new IndexDefinition(IndexId.of(23), ObjectName.of("PRIMARY"), true, true,
                 List.of(new IndexKeyPart(21, IndexOrder.ASC, 0)));
-        return table(22, 23, "lob_key", List.of(body), primary, directory, Optional.of(segment(25, 3, 3)));
+        return table(22, "lob_key", List.of(body), List.of(primary), directory, Optional.of(segment(25, 30, 30)));
     }
 
     private static TableDefinition unbound() {
@@ -79,16 +81,21 @@ final class BinderTestFixture implements AutoCloseable {
                 DictionaryVersion.of(2), TableState.ACTIVE, List.of(id), List.of(primary));
     }
 
-    private static TableDefinition table(long tableId, long indexId, String name, List<ColumnDefinition> columns,
-                                         IndexDefinition primary, Path directory, Optional<SegmentRef> lob) {
+    private static TableDefinition table(long tableId, String name, List<ColumnDefinition> columns,
+                                         List<IndexDefinition> indexes, Path directory, Optional<SegmentRef> lob) {
         int spaceValue = Math.toIntExact(tableId + 3);
         SpaceId spaceId = SpaceId.of(spaceValue);
-        IndexStorageBinding index = new IndexStorageBinding(indexId, PageId.of(spaceId, PageNo.of(10)), 0,
-                segment(spaceValue, 1, 1), segment(spaceValue, 2, 2));
+        List<IndexStorageBinding> bindings = new java.util.ArrayList<>();
+        for (int i = 0; i < indexes.size(); i++) {
+            IndexDefinition index = indexes.get(i);
+            bindings.add(new IndexStorageBinding(index.id().value(), PageId.of(spaceId, PageNo.of(10 + i)), 0,
+                    segment(spaceValue, 10 + i * 2, 100 + i * 2L),
+                    segment(spaceValue, 11 + i * 2, 101 + i * 2L)));
+        }
         TableStorageBinding binding = new TableStorageBinding(tableId, spaceId,
-                directory.resolve(name + ".ibd"), List.of(index), lob);
+                directory.resolve(name + ".ibd"), bindings, lob);
         return new TableDefinition(TableId.of(tableId), SchemaId.of(1), ObjectName.of(name),
-                DictionaryVersion.of(2), TableState.ACTIVE, columns, List.of(primary), Optional.of(binding));
+                DictionaryVersion.of(2), TableState.ACTIVE, columns, indexes, Optional.of(binding));
     }
 
     private static SegmentRef segment(int spaceId, int slot, long segmentId) {

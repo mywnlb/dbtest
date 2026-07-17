@@ -38,16 +38,45 @@ import java.util.List;
  * @param oldColumnValues UPDATE_ROW 的更新前全列值（按 schema 列序）；INSERT_ROW 必为 null。
  * @param oldHiddenColumns UPDATE_ROW 的更新前隐藏列；INSERT_ROW 必为 null。
  * @param insertedLobs    INSERT_ROW 新分配并随记录发布的 LOB ownership，按列 ordinal 严格递增；其它类型必为空。
+ * @param secondaryMutations 本次逻辑行操作涉及的二级索引反向证据，按 index id 严格递增；旧记录解码为空列表。
  * @param prevRollPointer 同 kind undo log 的事务回滚局部链前驱；记录版本链前驱保存在 oldHiddenColumns.dbRollPtr。
  */
 public record UndoRecord(UndoRecordType type, UndoNo undoNo, TransactionId transactionId,
                          long tableId, long indexId, List<ColumnValue> clusterKey,
                          List<ColumnValue> oldColumnValues, HiddenColumns oldHiddenColumns,
-                         List<InsertedLobOwnership> insertedLobs, RollPointer prevRollPointer) {
+                         List<InsertedLobOwnership> insertedLobs,
+                         List<SecondaryUndoMutation> secondaryMutations,
+                         RollPointer prevRollPointer) {
 
+    /**
+     * 校验并冻结一条可编码、可重放且反向动作无歧义的逻辑 undo record。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 type、undo/transaction identity、聚簇键、两个可选 tail 容器和局部链前驱完整，拒绝 NONE undoNo 与空主键。</li>
+     *     <li>防御性复制聚簇键、LOB ownership 和 secondary mutation，校验 LOB column ordinal 严格递增。</li>
+     *     <li>校验 secondary index id 严格递增，并强制 mutation action 与 INSERT/UPDATE/DELETE record type 一致。</li>
+     *     <li>按 undo type 校验旧 image、旧隐藏列与 LOB ownership 的互斥关系，并冻结 UPDATE/DELETE 全量旧列。</li>
+     * </ol>
+     *
+     * @param type                 决定 rollback inverse 与类型专用尾部的逻辑 undo 类型。
+     * @param undoNo               事务内严格递增且非 NONE 的序号。
+     * @param transactionId        写入并拥有该记录的事务 id。
+     * @param tableId              rollback/recovery 定位 exact-version 表 metadata 的稳定 id。
+     * @param indexId              聚簇索引稳定 id；不指向任一二级索引。
+     * @param clusterKey           按聚簇 key definition 顺序物化的完整主键值。
+     * @param oldColumnValues      UPDATE/DELETE 的全量旧用户列；INSERT 必须为 {@code null}。
+     * @param oldHiddenColumns     UPDATE/DELETE 的旧 DB_TRX_ID/DB_ROLL_PTR；INSERT 必须为 {@code null}。
+     * @param insertedLobs         INSERT 新分配 LOB ownership；其它类型必须为空。
+     * @param secondaryMutations   按二级 index id 递增的反向证据；action 必须与 {@code type} 一致。
+     * @param prevRollPointer      同 kind undo log 中该事务前一条逻辑记录的 roll pointer。
+     * @throws DatabaseValidationException 字段缺失、identity/排序/action/type 或旧 image/tail 组合不满足恢复不变量时抛出。
+     */
     public UndoRecord {
+        // 1. 基础 identity 与链字段必须在复制集合前完整，失败不会发布半有效 record。
         if (type == null || undoNo == null || transactionId == null
-                || clusterKey == null || insertedLobs == null || prevRollPointer == null) {
+                || clusterKey == null || insertedLobs == null || secondaryMutations == null
+                || prevRollPointer == null) {
             throw new DatabaseValidationException("undo record fields must not be null");
         }
         if (undoNo.isNone()) {
@@ -56,8 +85,11 @@ public record UndoRecord(UndoRecordType type, UndoNo undoNo, TransactionId trans
         if (clusterKey.isEmpty()) {
             throw new DatabaseValidationException("undo record clusterKey must not be empty");
         }
+
+        // 2. 冻结调用方集合，并确保 LOB ownership 顺序可作为稳定磁盘协议与释放顺序。
         clusterKey = List.copyOf(clusterKey);
         insertedLobs = List.copyOf(insertedLobs);
+        secondaryMutations = List.copyOf(secondaryMutations);
         int previousOrdinal = -1;
         for (InsertedLobOwnership ownership : insertedLobs) {
             if (ownership.columnOrdinal() <= previousOrdinal) {
@@ -66,6 +98,27 @@ public record UndoRecord(UndoRecordType type, UndoNo undoNo, TransactionId trans
             }
             previousOrdinal = ownership.columnOrdinal();
         }
+
+        // 3. 二级 inverse 的稳定顺序同时约束跨树 rollback 顺序；action 必须能由主 undo type 唯一解释。
+        long previousIndexId = -1;
+        for (SecondaryUndoMutation mutation : secondaryMutations) {
+            if (mutation.indexId() <= previousIndexId) {
+                throw new DatabaseValidationException(
+                        "secondary undo mutation index ids must be strictly increasing and unique");
+            }
+            previousIndexId = mutation.indexId();
+            SecondaryUndoAction expectedAction = switch (type) {
+                case INSERT_ROW -> SecondaryUndoAction.INSERT_ENTRY;
+                case UPDATE_ROW -> SecondaryUndoAction.CHANGE_KEY;
+                case DELETE_MARK -> SecondaryUndoAction.DELETE_MARK_ENTRY;
+            };
+            if (mutation.action() != expectedAction) {
+                throw new DatabaseValidationException(type + " undo cannot carry secondary action "
+                        + mutation.action() + "; expected " + expectedAction);
+            }
+        }
+
+        // 4. INSERT 与 UPDATE/DELETE 的旧 image、LOB ownership 互斥；旧全列在通过形状检查后再冻结。
         switch (type) {
             case INSERT_ROW -> {
                 // insert 无旧版本：携带旧 image 是构造错误
@@ -90,37 +143,179 @@ public record UndoRecord(UndoRecordType type, UndoNo undoNo, TransactionId trans
         }
     }
 
-    /** 构造 INSERT_ROW undo（不带旧 image）。 */
+    /**
+     * 兼容 secondary tail 引入前的直接构造调用。旧调用明确映射为空 mutation 列表，保证源码和磁盘语义不漂移；
+     * 新生产写路径应使用带 {@code secondaryMutations} 的工厂方法冻结完整反向证据。
+     *
+     * @param type             逻辑 undo 类型。
+     * @param undoNo           事务内非 NONE 序号。
+     * @param transactionId    undo owner 事务 id。
+     * @param tableId          稳定表 id。
+     * @param indexId          聚簇索引稳定 id。
+     * @param clusterKey       完整物化聚簇主键。
+     * @param oldColumnValues  UPDATE/DELETE 的全量旧用户列；INSERT 为 {@code null}。
+     * @param oldHiddenColumns UPDATE/DELETE 的旧隐藏列；INSERT 为 {@code null}。
+     * @param insertedLobs     INSERT 新 LOB ownership；其它类型为空。
+     * @param prevRollPointer  同 kind undo 局部链前驱。
+     * @throws DatabaseValidationException 任一领域不变量无效时由主构造器抛出。
+     */
+    public UndoRecord(UndoRecordType type, UndoNo undoNo, TransactionId transactionId,
+                      long tableId, long indexId, List<ColumnValue> clusterKey,
+                      List<ColumnValue> oldColumnValues, HiddenColumns oldHiddenColumns,
+                      List<InsertedLobOwnership> insertedLobs, RollPointer prevRollPointer) {
+        this(type, undoNo, transactionId, tableId, indexId, clusterKey, oldColumnValues, oldHiddenColumns,
+                insertedLobs, List.of(), prevRollPointer);
+    }
+
+    /**
+     * 构造不带 LOB ownership 和 secondary tail 的兼容 INSERT_ROW undo。
+     *
+     * @param undoNo          事务内非 NONE 序号。
+     * @param transactionId   写事务 owner id。
+     * @param tableId         稳定表 id。
+     * @param indexId         聚簇索引稳定 id。
+     * @param clusterKey      完整物化聚簇主键。
+     * @param prevRollPointer INSERT undo 局部链前驱。
+     * @return 可按旧 EOF 格式编码的 INSERT_ROW record。
+     * @throws DatabaseValidationException identity、主键或链前驱无效时抛出。
+     */
     public static UndoRecord insert(UndoNo undoNo, TransactionId transactionId, long tableId, long indexId,
                                     List<ColumnValue> clusterKey, RollPointer prevRollPointer) {
         return new UndoRecord(UndoRecordType.INSERT_ROW, undoNo, transactionId, tableId, indexId, clusterKey,
-                null, null, List.of(), prevRollPointer);
+                null, null, List.of(), List.of(), prevRollPointer);
     }
 
-    /** 构造携带新 LOB 页链 ownership 的 INSERT_ROW undo；列表必须按 column ordinal 严格递增。 */
+    /**
+     * 构造携带新 LOB 页链 ownership、但不带 secondary tail 的 INSERT_ROW undo。
+     *
+     * @param undoNo          事务内非 NONE 序号。
+     * @param transactionId   写事务 owner id。
+     * @param tableId         稳定表 id。
+     * @param indexId         聚簇索引稳定 id。
+     * @param clusterKey      完整物化聚簇主键。
+     * @param insertedLobs    新分配 LOB ownership，必须按 column ordinal 严格递增。
+     * @param prevRollPointer INSERT undo 局部链前驱。
+     * @return 带 LOB ownership tail 的 INSERT_ROW record。
+     * @throws DatabaseValidationException ownership 排序或其它 record 不变量无效时抛出。
+     */
     public static UndoRecord insert(UndoNo undoNo, TransactionId transactionId, long tableId, long indexId,
                                     List<ColumnValue> clusterKey, List<InsertedLobOwnership> insertedLobs,
                                     RollPointer prevRollPointer) {
         return new UndoRecord(UndoRecordType.INSERT_ROW, undoNo, transactionId, tableId, indexId, clusterKey,
-                null, null, insertedLobs, prevRollPointer);
+                null, null, insertedLobs, List.of(), prevRollPointer);
     }
 
-    /** 构造 UPDATE_ROW undo（带全量旧 image：旧全列值 + 旧隐藏列）。 */
+    /**
+     * 构造同时携带 INSERT LOB ownership 与二级发布证据的 INSERT_ROW undo；两份列表都在 record 构造时冻结，
+     * codec 固定按 LOB tail -> secondary tail 排列。
+     *
+     * @param undoNo                事务内非 NONE 序号。
+     * @param transactionId         写事务 owner id。
+     * @param tableId               稳定表 id。
+     * @param indexId               聚簇索引稳定 id。
+     * @param clusterKey            完整物化聚簇主键。
+     * @param insertedLobs          按 column ordinal 递增的新 LOB ownership。
+     * @param secondaryMutations    按 index id 递增的 INSERT_ENTRY 反向证据。
+     * @param prevRollPointer       INSERT undo 局部链前驱。
+     * @return 同时携带 LOB 与 secondary 可选尾部的 INSERT_ROW record。
+     * @throws DatabaseValidationException ownership/mutation 排序、action 或其它 record 不变量无效时抛出。
+     */
+    public static UndoRecord insert(UndoNo undoNo, TransactionId transactionId, long tableId, long indexId,
+                                    List<ColumnValue> clusterKey, List<InsertedLobOwnership> insertedLobs,
+                                    List<SecondaryUndoMutation> secondaryMutations,
+                                    RollPointer prevRollPointer) {
+        return new UndoRecord(UndoRecordType.INSERT_ROW, undoNo, transactionId, tableId, indexId, clusterKey,
+                null, null, insertedLobs, secondaryMutations, prevRollPointer);
+    }
+
+    /**
+     * 构造不带 secondary tail 的兼容 UPDATE_ROW undo。
+     *
+     * @param undoNo           事务内非 NONE 序号。
+     * @param transactionId    写事务 owner id。
+     * @param tableId          稳定表 id。
+     * @param indexId          聚簇索引稳定 id。
+     * @param clusterKey       被更新行的完整物化聚簇主键。
+     * @param oldColumnValues  更新前按 schema 列序排列的全量用户列。
+     * @param oldHiddenColumns 更新前 DB_TRX_ID/DB_ROLL_PTR。
+     * @param prevRollPointer  UPDATE-kind undo 局部链前驱。
+     * @return 带全量旧版本、secondary tail 为空的 UPDATE_ROW record。
+     * @throws DatabaseValidationException 旧 image 或其它 record 不变量无效时抛出。
+     */
     public static UndoRecord update(UndoNo undoNo, TransactionId transactionId, long tableId, long indexId,
                                     List<ColumnValue> clusterKey, List<ColumnValue> oldColumnValues,
                                     HiddenColumns oldHiddenColumns, RollPointer prevRollPointer) {
         return new UndoRecord(UndoRecordType.UPDATE_ROW, undoNo, transactionId, tableId, indexId, clusterKey,
-                oldColumnValues, oldHiddenColumns, List.of(), prevRollPointer);
+                oldColumnValues, oldHiddenColumns, List.of(), List.of(), prevRollPointer);
+    }
+
+    /**
+     * 构造携带二级 key-change 反向证据的 UPDATE_ROW undo。
+     *
+     * @param undoNo                事务内非 NONE 序号。
+     * @param transactionId         写事务 owner id。
+     * @param tableId               稳定表 id。
+     * @param indexId               聚簇索引稳定 id。
+     * @param clusterKey            被更新行的完整物化聚簇主键。
+     * @param oldColumnValues       更新前按 schema 列序排列的全量用户列。
+     * @param oldHiddenColumns      更新前 DB_TRX_ID/DB_ROLL_PTR。
+     * @param secondaryMutations    按 index id 递增的 CHANGE_KEY 反向证据。
+     * @param prevRollPointer       UPDATE-kind undo 局部链前驱。
+     * @return rollback 可同时恢复聚簇旧版本和变键二级 entry 的 UPDATE_ROW record。
+     * @throws DatabaseValidationException mutation action/排序、旧 image 或其它 record 不变量无效时抛出。
+     */
+    public static UndoRecord update(UndoNo undoNo, TransactionId transactionId, long tableId, long indexId,
+                                    List<ColumnValue> clusterKey, List<ColumnValue> oldColumnValues,
+                                    HiddenColumns oldHiddenColumns,
+                                    List<SecondaryUndoMutation> secondaryMutations,
+                                    RollPointer prevRollPointer) {
+        return new UndoRecord(UndoRecordType.UPDATE_ROW, undoNo, transactionId, tableId, indexId, clusterKey,
+                oldColumnValues, oldHiddenColumns, List.of(), secondaryMutations, prevRollPointer);
     }
 
     /**
      * 构造 DELETE_MARK undo（带删除前**存活**版本的全量旧 image：列不变 + 旧隐藏列）。rollback 用它取消删除标记并
      * 还原旧隐藏列；MVCC 旧版本遍历与 UPDATE 同路。本片不存 old delete flag（旧状态隐含 false，见 slice 决策 1）。
+     *
+     * @param undoNo           事务内非 NONE 序号。
+     * @param transactionId    写事务 owner id。
+     * @param tableId          稳定表 id。
+     * @param indexId          聚簇索引稳定 id。
+     * @param clusterKey       被逻辑删除行的完整物化聚簇主键。
+     * @param oldColumnValues  删除前存活版本的全量用户列。
+     * @param oldHiddenColumns 删除前 DB_TRX_ID/DB_ROLL_PTR。
+     * @param prevRollPointer  UPDATE-kind undo 局部链前驱。
+     * @return secondary tail 为空的 DELETE_MARK record。
+     * @throws DatabaseValidationException 旧 image 或其它 record 不变量无效时抛出。
      */
     public static UndoRecord deleteMark(UndoNo undoNo, TransactionId transactionId, long tableId, long indexId,
                                         List<ColumnValue> clusterKey, List<ColumnValue> oldColumnValues,
                                         HiddenColumns oldHiddenColumns, RollPointer prevRollPointer) {
         return new UndoRecord(UndoRecordType.DELETE_MARK, undoNo, transactionId, tableId, indexId, clusterKey,
-                oldColumnValues, oldHiddenColumns, List.of(), prevRollPointer);
+                oldColumnValues, oldHiddenColumns, List.of(), List.of(), prevRollPointer);
+    }
+
+    /**
+     * 构造携带全部二级 delete-mark 反向证据的 DELETE_MARK undo。
+     *
+     * @param undoNo                事务内非 NONE 序号。
+     * @param transactionId         写事务 owner id。
+     * @param tableId               稳定表 id。
+     * @param indexId               聚簇索引稳定 id。
+     * @param clusterKey            被逻辑删除行的完整物化聚簇主键。
+     * @param oldColumnValues       删除前存活版本的全量用户列。
+     * @param oldHiddenColumns      删除前 DB_TRX_ID/DB_ROLL_PTR。
+     * @param secondaryMutations    按 index id 递增的 DELETE_MARK_ENTRY 反向证据。
+     * @param prevRollPointer       UPDATE-kind undo 局部链前驱。
+     * @return rollback 可 revive 聚簇及全部二级 entry 的 DELETE_MARK record。
+     * @throws DatabaseValidationException mutation action/排序、旧 image 或其它 record 不变量无效时抛出。
+     */
+    public static UndoRecord deleteMark(UndoNo undoNo, TransactionId transactionId, long tableId, long indexId,
+                                        List<ColumnValue> clusterKey, List<ColumnValue> oldColumnValues,
+                                        HiddenColumns oldHiddenColumns,
+                                        List<SecondaryUndoMutation> secondaryMutations,
+                                        RollPointer prevRollPointer) {
+        return new UndoRecord(UndoRecordType.DELETE_MARK, undoNo, transactionId, tableId, indexId, clusterKey,
+                oldColumnValues, oldHiddenColumns, List.of(), secondaryMutations, prevRollPointer);
     }
 }

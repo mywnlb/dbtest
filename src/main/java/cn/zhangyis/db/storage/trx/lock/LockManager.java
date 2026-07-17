@@ -30,7 +30,7 @@ import java.util.concurrent.locks.ReentrantLock;
  */
 public final class LockManager {
 
-    /** 默认分片数；当前单聚簇 DML 已接入，16 个索引级分片足以表达教学版锁表并发边界。 */
+    /** 默认锁表分片数；聚簇 record/range 与规范化 secondary logical-unique key 都按 index id 路由到这些分片。 */
     private static final int DEFAULT_SHARD_COUNT = 16;
 
     /** 默认死锁搜索步数上限，避免异常长链在持 graph mutex 时无界遍历。 */
@@ -274,6 +274,13 @@ public final class LockManager {
         }
     }
 
+    /**
+     * 校验锁模式是否属于资源键允许的语义集合。
+     *
+     * @param key  record/gap/next-key/insert-intention 或 logical-secondary-unique 资源键。
+     * @param mode 调用方请求的锁模式。
+     * @return 模式与 key 类型匹配时返回 {@code true}；logical secondary unique 只允许 REC_X。
+     */
     private static boolean modeMatchesKey(TransactionLockKey key, TransactionLockMode mode) {
         if (key instanceof RecordLockKey) {
             return mode == TransactionLockMode.REC_S || mode == TransactionLockMode.REC_X;
@@ -286,6 +293,9 @@ public final class LockManager {
         }
         if (key instanceof InsertIntentionLockKey) {
             return mode == TransactionLockMode.INSERT_INTENTION;
+        }
+        if (key instanceof SecondaryUniqueKeyLockKey) {
+            return mode == TransactionLockMode.REC_X;
         }
         return false;
     }
@@ -331,8 +341,31 @@ public final class LockManager {
         return List.copyOf(summaries);
     }
 
+    /**
+     * 判断同一 shard 内已授予资源与新请求是否冲突。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>logical secondary unique 使用完整归一化 key 相等判定；同一资源始终 X/X 冲突。</li>
+     *     <li>record/next-key 的 record 部分按既有 S/X 兼容矩阵判断。</li>
+     *     <li>gap/next-key/insert-intention 的 gap 部分保持“意向之间兼容、意向与 gap 锁冲突”语义。</li>
+     * </ol>
+     *
+     * @param heldKey       已授予请求的逻辑资源键。
+     * @param heldMode      已授予锁模式。
+     * @param requestedKey  等待授予的新请求资源键。
+     * @param requestedMode 新请求锁模式。
+     * @return 任一资源部分相同且模式不兼容时返回 {@code true}。
+     */
     private static boolean conflicts(TransactionLockKey heldKey, TransactionLockMode heldMode,
                                      TransactionLockKey requestedKey, TransactionLockMode requestedMode) {
+        // 1. logical secondary unique token 已吸收 type/prefix/collation 等价语义，同 identity 只能串行化检查+发布。
+        if (heldKey instanceof SecondaryUniqueKeyLockKey heldUnique
+                && requestedKey instanceof SecondaryUniqueKeyLockKey requestedUnique
+                && heldUnique.equals(requestedUnique)) {
+            return true;
+        }
+        // 2. 普通 record 与 next-key 的 record 部分继续使用既有 S/X 兼容矩阵。
         RecordLockKey heldRecord = recordPart(heldKey);
         RecordLockKey requestedRecord = recordPart(requestedKey);
         if (heldRecord != null && requestedRecord != null && heldRecord.equals(requestedRecord)
@@ -340,6 +373,7 @@ public final class LockManager {
             return true;
         }
 
+        // 3. gap 部分仅 insert-intention 与 gap/next-key 冲突，两个 insert-intention 彼此兼容。
         GapLockKey heldGap = gapPart(heldKey);
         GapLockKey requestedGap = gapPart(requestedKey);
         if (heldGap != null && requestedGap != null && heldGap.equals(requestedGap)) {

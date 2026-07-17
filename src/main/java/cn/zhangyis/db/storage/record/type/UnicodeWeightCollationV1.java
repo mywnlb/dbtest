@@ -37,6 +37,39 @@ public final class UnicodeWeightCollationV1 implements CollationStrategy {
         return Integer.compare(left.length, right.length);
     }
 
+    /**
+     * 把固定 V1 主权重序列编码为 big-endian int 数组。compare 相等当且仅当该序列逐项相等，
+     * 因而 accent/case/combining-mark 等价值会竞争同一 unique-key 事务锁。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>用 REPORT 模式严格解码指定 UTF-8 slice，并按版本固定规则生成主权重序列。</li>
+     *     <li>把每个权重编码为 big-endian 四字节，保持权重边界和 compare 相等关系。</li>
+     * </ol>
+     *
+     * @param bytes  包含 UTF-8 字段 slice 的底层字节。
+     * @param offset 字段 slice 起始偏移。
+     * @param length 字段 slice 字节长度。
+     * @return 每个 V1 主权重占四字节的新数组；compare==0 的输入得到相同数组。
+     * @throws DatabaseValidationException slice 不是合法 UTF-8 时由严格 decoder 包装抛出。
+     */
+    @Override
+    public byte[] equalityKey(byte[] bytes, int offset, int length) {
+        // 1. 严格 UTF-8 解码与固定 V1 权重生成必须复用 compare 路径，避免锁判等分叉。
+        int[] weights = weights(decode(bytes, offset, length));
+
+        // 2. 定长 big-endian framing 防止不同权重序列产生字节边界歧义。
+        byte[] key = new byte[weights.length * Integer.BYTES];
+        int cursor = 0;
+        for (int value : weights) {
+            key[cursor++] = (byte) (value >>> 24);
+            key[cursor++] = (byte) (value >>> 16);
+            key[cursor++] = (byte) (value >>> 8);
+            key[cursor++] = (byte) value;
+        }
+        return key;
+    }
+
     /** 每次创建独立 decoder，避免共享 CharsetDecoder 的可变状态进入并发索引比较。 */
     private static String decode(byte[] bytes, int offset, int length) {
         try {

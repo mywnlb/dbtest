@@ -7,6 +7,7 @@ import cn.zhangyis.db.storage.api.SegmentRef;
 import cn.zhangyis.db.storage.api.ddl.StorageTableDefinition;
 import cn.zhangyis.db.storage.api.ddl.TableStorageBinding;
 import cn.zhangyis.db.storage.btree.BTreeIndex;
+import cn.zhangyis.db.storage.btree.TableIndexMetadata;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -34,16 +35,28 @@ public final class MappedTableStorage {
     /** 按逻辑 index 顺序保存的不可变运行期 descriptor。 */
     private final List<BTreeIndex> indexes;
 
+    /** 同一 DD aggregate 派生的表级索引布局，供多索引 DML/MVCC/rollback 使用。 */
+    private final TableIndexMetadata tableIndexes;
+
     /** indexId 到 descriptor 的只读定位表；构造后不再变化。 */
     private final Map<Long, BTreeIndex> indexesById;
 
     /**
      * 组装精确版本快照；这里只校验跨对象 identity，字段/索引物理细节由各自构造器和 mapper 保证。
+     *
+     * @param table        调用方通过 catalog lease 固定的 DD table aggregate。
+     * @param storageTable 从同一 aggregate 映射的 storage schema DTO。
+     * @param binding      与该表 id、版本和 space 对应的持久物理绑定。
+     * @param lobSegment   binding 中属于该 exact table version 的可选 LOB segment。
+     * @param tableIndexes 从同一 storage DTO/binding 构造的聚簇与全部二级运行期元数据。
+     * @throws DatabaseValidationException 字段缺失、table/version/space/LOB identity 不一致，或运行期索引数量/id
+     *                                     无法与 DD aggregate 一一对应时抛出。
      */
     MappedTableStorage(TableDefinition table, StorageTableDefinition storageTable,
-                       TableStorageBinding binding, Optional<SegmentRef> lobSegment, List<BTreeIndex> indexes) {
+                       TableStorageBinding binding, Optional<SegmentRef> lobSegment,
+                       TableIndexMetadata tableIndexes) {
         if (table == null || storageTable == null || binding == null || lobSegment == null
-                || indexes == null || indexes.isEmpty()) {
+                || tableIndexes == null) {
             throw new DatabaseValidationException("mapped table storage fields/indexes must not be null or empty");
         }
         if (table.id().value() != storageTable.tableId() || table.id().value() != binding.tableId()
@@ -56,7 +69,8 @@ public final class MappedTableStorage {
         this.storageTable = storageTable;
         this.binding = binding;
         this.lobSegment = lobSegment;
-        this.indexes = List.copyOf(indexes);
+        this.tableIndexes = tableIndexes;
+        this.indexes = tableIndexes.allIndexes();
         Map<Long, BTreeIndex> mapped = new LinkedHashMap<>();
         for (BTreeIndex index : this.indexes) {
             if (mapped.put(index.indexId(), index) != null) {
@@ -95,6 +109,16 @@ public final class MappedTableStorage {
     }
 
     /**
+     * 返回精确 DD 版本的表级聚簇/二级运行期 metadata。
+     *
+     * @return 与 {@link #table()}、{@link #storageTable()} 和 {@link #binding()} 同源的不可变索引聚合；
+     *         多索引 DML/rollback/MVCC 不得按 table id 回查并替换它。
+     */
+    public TableIndexMetadata tableIndexes() {
+        return tableIndexes;
+    }
+
+    /**
      * 按稳定 indexId 返回 descriptor；未知 id 表示调用方使用了错误的 bound index，禁止回退聚簇索引。
      */
     public BTreeIndex index(long indexId) {
@@ -108,6 +132,6 @@ public final class MappedTableStorage {
 
     /** 返回 DD 构造器保证唯一的聚簇 B+Tree descriptor。 */
     public BTreeIndex clusteredIndex() {
-        return index(table.primaryIndex().id().value());
+        return tableIndexes.clusteredIndex();
     }
 }

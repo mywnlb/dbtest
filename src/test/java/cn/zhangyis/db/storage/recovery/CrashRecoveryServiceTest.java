@@ -424,14 +424,24 @@ class CrashRecoveryServiceTest {
              RedoCheckpointStore checkpointStore = RedoCheckpointStore.open(dir.resolve("trx-recovery-control"))) {
             store.create(SPACE, dir.resolve("trx-recovery.ibd"), PS, PageNo.of(4));
             RecoveryTrafficGate gate = new RecoveryTrafficGate();
-            AtomicReference<RecoveryState> gateStateDuringStage = new AtomicReference<>();
+            AtomicReference<RecoveryState> gateStateDuringRollback = new AtomicReference<>();
+            AtomicReference<RecoveryState> gateStateDuringPurge = new AtomicReference<>();
             AtomicReference<Lsn> recoveredBoundarySeen = new AtomicReference<>();
             AtomicReference<RecoveredTransactionSnapshot> transactionSnapshotSeen = new AtomicReference<>();
-            TransactionUndoRecoveryParticipant participant = (recoveredToLsn, transactionSnapshot) -> {
-                gateStateDuringStage.set(gate.state());
-                recoveredBoundarySeen.set(recoveredToLsn);
-                transactionSnapshotSeen.set(transactionSnapshot);
-                return new TransactionUndoRecoveryResult(3, 1, 0, 2);
+            TransactionUndoRecoveryParticipant participant = new TransactionUndoRecoveryParticipant() {
+                @Override
+                public TransactionUndoRecoveryResult recoverAfterRedo(
+                        Lsn recoveredToLsn, RecoveredTransactionSnapshot transactionSnapshot) {
+                    gateStateDuringRollback.set(gate.state());
+                    recoveredBoundarySeen.set(recoveredToLsn);
+                    transactionSnapshotSeen.set(transactionSnapshot);
+                    return new TransactionUndoRecoveryResult(3, 1, 0, 2);
+                }
+
+                @Override
+                public void resumePurgeAfterRedo() {
+                    gateStateDuringPurge.set(gate.state());
+                }
             };
             RecoveryRequest request = RecoveryRequest.normal(checkpointStore, redoRepo,
                             RedoApplyDispatcher.pageDispatcher(), new RedoApplyContext(store, PS))
@@ -441,8 +451,10 @@ class CrashRecoveryServiceTest {
 
             RecoveryReport report = new CrashRecoveryService(gate).recover(request);
 
-            assertEquals(RecoveryState.RECOVERING, gateStateDuringStage.get(),
+            assertEquals(RecoveryState.RECOVERING, gateStateDuringRollback.get(),
                     "transaction undo recovery must run before user traffic opens");
+            assertEquals(RecoveryState.RECOVERING, gateStateDuringPurge.get(),
+                    "purge resume must run before user traffic opens");
             assertEquals(range.end(), recoveredBoundarySeen.get());
             assertEquals(TransactionId.of(1), transactionSnapshotSeen.get().nextTransactionId());
             assertEquals(List.of(RecoveryStageName.TRAFFIC_CLOSED,
@@ -452,6 +464,45 @@ class CrashRecoveryServiceTest {
                             RecoveryStageName.RESUME_PURGE,
                             RecoveryStageName.OPEN_TRAFFIC),
                     report.completedStages());
+        }
+    }
+
+    /** RESUME_PURGE 的持久 history 清理失败必须阻止 OPEN_TRAFFIC，不能降级为后台稍后重试。 */
+    @Test
+    void recoverFailsClosedWhenPurgeResumeFails() {
+        Path redoPath = dir.resolve("purge-resume-fail-redo.log");
+        try (RedoLogFileRepository redoRepo = RedoLogFileRepository.open(redoPath)) {
+            RedoLogManager redo = RedoLogManager.durable(redoRepo);
+            redo.append(List.of(new PageInitRecord(PAGE, PageType.INDEX)));
+            redo.flush();
+        }
+        try (PageStore store = new FileChannelPageStore();
+             RedoLogFileRepository redoRepo = RedoLogFileRepository.open(redoPath);
+             RedoCheckpointStore checkpointStore = RedoCheckpointStore.open(
+                     dir.resolve("purge-resume-fail-control"))) {
+            store.create(SPACE, dir.resolve("purge-resume-fail.ibd"), PS, PageNo.of(4));
+            RecoveryTrafficGate gate = new RecoveryTrafficGate();
+            TransactionUndoRecoveryParticipant participant = new TransactionUndoRecoveryParticipant() {
+                @Override
+                public TransactionUndoRecoveryResult recoverAfterRedo(
+                        Lsn recoveredToLsn, RecoveredTransactionSnapshot transactionSnapshot) {
+                    return new TransactionUndoRecoveryResult(0, 0, 0, 0);
+                }
+
+                @Override
+                public void resumePurgeAfterRedo() {
+                    throw new DatabaseRuntimeException("synthetic purge resume failure");
+                }
+            };
+            RecoveryRequest request = RecoveryRequest.normal(checkpointStore, redoRepo,
+                            RedoApplyDispatcher.pageDispatcher(), new RedoApplyContext(store, PS))
+                    .withTransactionRecovery(
+                            TransactionRecoveryContext.using(TransactionRecoveryCheckpointSource.empty()),
+                            participant);
+
+            assertThrows(RecoveryStartupException.class,
+                    () -> new CrashRecoveryService(gate).recover(request));
+            assertEquals(RecoveryState.FAILED, gate.state());
         }
     }
 

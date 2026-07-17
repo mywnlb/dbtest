@@ -350,7 +350,8 @@ public final class UndoSegmentFinalizer {
             throw new DatabaseValidationException("history append preparation requires UPDATE binding/lease");
         }
         HistoryEntry expectedEntry = new HistoryEntry(transaction.transactionNo(), transaction.transactionId(),
-                update.firstPageId().spaceId(), update.firstPageId(), update.slotId());
+                update.firstPageId().spaceId(), update.firstPageId(), update.slotId(),
+                transaction.undoContext().affectedTableIds());
         if (!expectedEntry.equals(lease.entry())) {
             throw new TransactionStateException("history append lease identity differs from UPDATE binding");
         }

@@ -15,6 +15,8 @@ public enum RedoBudgetPurpose {
     CLUSTERED_UPDATE,
     /** 聚簇索引 delete-mark 及同批 undo 写。 */
     CLUSTERED_DELETE,
+    /** 二级索引单树 publish/revive/delete-mark/purge 物理 MTR。 */
+    SECONDARY_INDEX,
     /** purge 对聚簇索引执行物理删除。 */
     PURGE_INDEX,
     /** rollback 应用一条 inverse record。 */

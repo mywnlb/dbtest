@@ -105,7 +105,7 @@ class PurgeCoordinatorTest {
             PurgeSummary summary = ctx.purge.runBatch(10);
 
             assertEquals(1, summary.purgedLogs());
-            assertEquals(1, summary.removedRecords(), "delete-marked row physically removed");
+            assertEquals(1, summary.removedClusteredRecords(), "delete-marked row physically removed");
             assertEquals(0, ctx.history.committedSize(), "history drained");
             MiniTransaction r = ctx.mgr.begin();
             assertTrue(ctx.svc.lookupIncludingDeleted(r, index, search(1)).isEmpty(), "row gone after purge");
@@ -136,7 +136,7 @@ class PurgeCoordinatorTest {
 
             PurgeSummary summary = ctx.purge.runBatch(10);
 
-            assertEquals(1, summary.removedRecords());
+            assertEquals(1, summary.removedClusteredRecords());
             assertEquals(TABLE_ID, resolvedTable.get());
             assertEquals(INDEX_ID, resolvedIndex.get());
         });
@@ -170,7 +170,7 @@ class PurgeCoordinatorTest {
 
             PurgeSummary after = ctx.purge.runBatch(10);
             assertEquals(1, after.purgedLogs());
-            assertEquals(1, after.removedRecords());
+            assertEquals(1, after.removedClusteredRecords());
             MiniTransaction r = ctx.mgr.begin();
             assertTrue(ctx.svc.lookupIncludingDeleted(r, index, search(1)).isEmpty(), "purged after reader released");
             ctx.mgr.commit(r);
@@ -192,7 +192,7 @@ class PurgeCoordinatorTest {
             PurgeSummary summary = ctx.purge.runBatch(10);
 
             assertEquals(1, summary.purgedLogs(), "update undo log reclaimed");
-            assertEquals(0, summary.removedRecords(), "UPDATE-only purge does not remove any clustered record");
+            assertEquals(0, summary.removedClusteredRecords(), "UPDATE-only purge does not remove any clustered record");
             assertEquals(0, ctx.history.committedSize());
             MiniTransaction r = ctx.mgr.begin();
             BTreeLookupResult found = ctx.svc.lookup(r, index, search(1)).orElseThrow();
@@ -225,7 +225,7 @@ class PurgeCoordinatorTest {
             PurgeSummary summary = ctx.purge.runBatch(10);
 
             assertEquals(1, summary.purgedLogs());
-            assertEquals(0, summary.removedRecords(),
+            assertEquals(0, summary.removedClusteredRecords(),
                     "rolled-back DELETE_MARK branch must not become a purge task");
             MiniTransaction read = ctx.mgr.begin();
             BTreeLookupResult row = ctx.svc.lookup(read, index, search(1)).orElseThrow();
@@ -265,7 +265,7 @@ class PurgeCoordinatorTest {
             PurgeSummary summary = purge.runBatch(1);
 
             assertEquals(1, summary.purgedLogs());
-            assertEquals(0, summary.removedRecords());
+            assertEquals(0, summary.removedClusteredRecords());
             assertEquals(0, history.committedSize());
             assertTrue(mgr.redoLogManager().bufferedBatches().getLast().records().stream()
                             .anyMatch(record -> record instanceof FspMetadataDeltaRecord delta
@@ -288,7 +288,7 @@ class PurgeCoordinatorTest {
             PurgeSummary summary = ctx.purge.runBatch(10);
 
             assertEquals(0, summary.purgedLogs(), "insert-only undo never enters purge history");
-            assertEquals(0, summary.removedRecords());
+            assertEquals(0, summary.removedClusteredRecords());
             MiniTransaction r = ctx.mgr.begin();
             assertTrue(ctx.svc.lookup(r, index, search(1)).isPresent(), "committed inserted row stays (only undo reclaimed)");
             ctx.mgr.commit(r);

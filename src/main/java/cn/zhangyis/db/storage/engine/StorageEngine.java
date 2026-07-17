@@ -4,6 +4,7 @@ import cn.zhangyis.db.common.exception.DatabaseRuntimeException;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.Lsn;
 import cn.zhangyis.db.domain.PageId;
+import cn.zhangyis.db.domain.RollPointer;
 import cn.zhangyis.db.domain.RollbackSegmentId;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.domain.TransactionId;
@@ -15,11 +16,13 @@ import cn.zhangyis.db.server.lockobs.api.SnapshotRequest;
 import cn.zhangyis.db.server.lockobs.snapshot.LockDiagnosticSnapshot;
 import cn.zhangyis.db.storage.api.DiskSpaceManager;
 import cn.zhangyis.db.storage.api.DiskSpaceUndoAllocator;
+import cn.zhangyis.db.storage.api.TablePurgeBarrier;
 import cn.zhangyis.db.storage.api.ddl.TableDdlStorageService;
 import cn.zhangyis.db.storage.api.index.IndexPageAccess;
 import cn.zhangyis.db.storage.btree.IndexMetadataResolver;
 import cn.zhangyis.db.storage.api.lob.LobStorage;
 import cn.zhangyis.db.storage.api.dml.ClusteredDmlService;
+import cn.zhangyis.db.storage.api.dml.TableDmlService;
 import cn.zhangyis.db.storage.api.tablespace.PageZeroTablespaceMetadataLoader;
 import cn.zhangyis.db.storage.api.undotruncate.UndoTablespaceTruncationRecovery;
 import cn.zhangyis.db.storage.api.undotruncate.UndoTablespaceTruncationService;
@@ -27,6 +30,7 @@ import cn.zhangyis.db.storage.api.undotruncate.UndoTruncationFaultInjector;
 import cn.zhangyis.db.storage.api.undotruncate.UndoReusableSegmentTruncationCoordinator;
 import cn.zhangyis.db.storage.btree.BTreeIndex;
 import cn.zhangyis.db.storage.btree.BTreeCurrentReadService;
+import cn.zhangyis.db.storage.btree.BTreeRootSnapshotService;
 import cn.zhangyis.db.storage.btree.SplitCapableBTreeIndexService;
 import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.LruBufferPool;
@@ -69,6 +73,7 @@ import cn.zhangyis.db.storage.recovery.RecoveryRequest;
 import cn.zhangyis.db.storage.recovery.RecoveryState;
 import cn.zhangyis.db.storage.recovery.RecoveryTrafficGate;
 import cn.zhangyis.db.storage.recovery.TransactionUndoRecoveryResult;
+import cn.zhangyis.db.storage.recovery.TransactionUndoRecoveryParticipant;
 import cn.zhangyis.db.storage.recovery.TransactionRecoveryCheckpoint;
 import cn.zhangyis.db.storage.recovery.TransactionRecoveryCheckpointStore;
 import cn.zhangyis.db.storage.recovery.TransactionRecoveryCheckpointSource;
@@ -89,9 +94,13 @@ import cn.zhangyis.db.storage.redo.RotatingRedoLogRepository;
 import cn.zhangyis.db.storage.redo.RedoLogManagerFlushTarget;
 import cn.zhangyis.db.storage.trx.HistoryEntry;
 import cn.zhangyis.db.storage.trx.HistoryList;
+import cn.zhangyis.db.storage.trx.HistoryTablePurgeBarrier;
 import cn.zhangyis.db.storage.trx.PurgeCoordinator;
 import cn.zhangyis.db.storage.trx.PurgeDriverWorker;
+import cn.zhangyis.db.storage.trx.PurgeSummary;
+import cn.zhangyis.db.storage.trx.SecondaryPurgeSafetyChecker;
 import cn.zhangyis.db.storage.trx.MvccReader;
+import cn.zhangyis.db.storage.trx.SecondaryMvccReader;
 import cn.zhangyis.db.storage.trx.RollbackSegmentSlotManager;
 import cn.zhangyis.db.storage.trx.RollbackService;
 import cn.zhangyis.db.storage.trx.RecoveredUndoLogIdentity;
@@ -103,6 +112,7 @@ import cn.zhangyis.db.storage.trx.UndoLogManager;
 import cn.zhangyis.db.storage.trx.UndoSegmentFinalizer;
 import cn.zhangyis.db.storage.trx.UndoSegmentReuseDirectory;
 import cn.zhangyis.db.storage.trx.lock.LockManager;
+import cn.zhangyis.db.storage.trx.PurgeDmlRowGuardManager;
 import cn.zhangyis.db.storage.undo.RollbackSegmentHeaderRepository;
 import cn.zhangyis.db.storage.undo.RollbackSegmentHeaderSnapshot;
 import cn.zhangyis.db.storage.undo.RollbackSegmentHistoryBase;
@@ -115,6 +125,10 @@ import cn.zhangyis.db.storage.undo.UndoLogKind;
 import cn.zhangyis.db.storage.undo.UndoLogSegment;
 import cn.zhangyis.db.storage.undo.UndoLogSegmentAccess;
 import cn.zhangyis.db.storage.undo.UndoHistoryNodeSnapshot;
+import cn.zhangyis.db.storage.undo.UndoLogicalHead;
+import cn.zhangyis.db.storage.undo.UndoRecord;
+import cn.zhangyis.db.storage.undo.UndoRecordIdentity;
+import cn.zhangyis.db.storage.undo.UndoRecordType;
 import cn.zhangyis.db.storage.undo.UndoSegmentDropPlan;
 
 import java.io.IOException;
@@ -141,13 +155,13 @@ import java.util.Set;
  * AutoCloseable 句柄。
  *
  * <p><b>当前限制</b>：启动后已有后台 redo flusher、单线程 page cleaner；配置 legacy 单聚簇索引或 DD resolver 时会启动
- * {@code PurgeCoordinator} + purge driver。后台 worker 失败仍无 supervisor 重启；事务 UNDO_ROLLBACK / RESUME_PURGE
- * 已作为正式 recovery stage 接入并支持逐 undo table/index 解析，prepared transaction 尚未实现；DDL 收敛由上层
+ * {@code PurgeCoordinator} + purge driver。事务 UNDO_ROLLBACK / RESUME_PURGE 已作为正式 recovery stage 接入；
+ * DD 表级 resolver 模式支持多索引 rollback、secondary purge 与 affected-table barrier，prepared transaction 尚未实现；DDL 收敛由上层
  * DatabaseEngine 在本存储恢复成功后执行。doublewrite 已常开为 {@link RecoverableDoublewriteStrategy}，但恢复页列表来自 doublewrite 文件有效 slot 并
  * 过滤到 recovery 已打开空间，仍没有全空间 checksum discovery。
  *
  * <p>访问器暴露已接线的事务/disk/btree/undo/mvcc/rollback/DML facade 服务；本类只负责组合根与生命周期，
- * 普通 DML 语义由 {@link ClusteredDmlService} 编排。
+ * 单聚簇物理 anchor 由 {@link ClusteredDmlService} 编排，表级多索引顺序由 {@link TableDmlService} 编排。
  */
 public final class StorageEngine {
 
@@ -183,18 +197,28 @@ public final class StorageEngine {
     private TransactionManager transactionManager;
     private UndoLogManager undoLogManager;
     private SplitCapableBTreeIndexService btreeService;
-    /** 0.17 事务锁内核；current-read 与单聚簇 DML 共享这一实例。 */
+    /** 0.17 事务锁内核；聚簇 current-read、secondary logical unique 与事务终态共享这一实例。 */
     private LockManager lockManager;
     /** server.lockobs row-lock 观测服务；只读消费 LockManager 事实，不参与授锁或 rollback。 */
     private LockObservationService lockObservationService;
     /** B+Tree current-read 点查/unique-check 协调器；授予的锁由 DML/上层事务结束入口释放。 */
     private BTreeCurrentReadService btreeCurrentReadService;
-    /** 单聚簇索引 DML facade；只做 storage 内事务/undo/B+Tree/redo 编排，不包含 SQL/DD/session 语义。 */
+    /** 聚簇 DML 内核兼容 facade；表级服务复用其 undo anchor、事务终态、LOB 与锁释放。 */
     private ClusteredDmlService dmlService;
+    /** 表级多索引 DML facade；与聚簇 facade 共享事务、锁、redo 和 undo 组合根。 */
+    private TableDmlService tableDmlService;
+    /** 结构写前读取 root 页头 level 的共享服务；DML、rollback 与 purge 不得各自相信过期 DD level。 */
+    private BTreeRootSnapshotService btreeRootSnapshots;
+    /** 表级 DML、rollback 与 purge 共用的短物理行协调器，保证同一主键的跨树变更不会互相穿插。 */
+    private PurgeDmlRowGuardManager purgeDmlRowGuards;
+    /** 组合根共享的类型/排序 registry，保证 DD、record 与 secondary comparator 使用同一语义。 */
+    private TypeCodecRegistry typeRegistry;
     private IndexPageAccess indexPageAccess;
     /** DD/DDL 上层唯一可调用的物理 CREATE/DROP TABLE facade。 */
     private TableDdlStorageService tableDdlStorageService;
     private MvccReader mvccReader;
+    /** logical unique secondary 候选回表并复核聚簇可见版本的读服务。 */
+    private SecondaryMvccReader secondaryMvccReader;
     private RollbackService rollbackService;
     /** 内存 rseg slot 目录；0.3 起 claim/release 持久化到 page3，恢复期扫描重建。 */
     private RollbackSegmentSlotManager rollbackSlots;
@@ -219,10 +243,14 @@ public final class StorageEngine {
     private TransactionSystem txnSystem;
     /** 已提交 undo 的 history list；undoLogManager 写入、purge 读出，须同一实例。 */
     private HistoryList history;
+    /** DD DROP 只依赖的稳定表级 barrier；计数权威态仍由 history 在同一锁内维护。 */
+    private TablePurgeBarrier tablePurgeBarrier;
     /** undo 段分配/回收端口；purge dropUndoSegment 用。 */
     private DiskSpaceUndoAllocator undoAllocator;
     /** E3a 后台 purge driver（0.4）；配置聚簇索引时启动，周期驱动 PurgeCoordinator.runBatch。 */
     private PurgeDriverWorker purgeDriverWorker;
+    /** 前台测试、后台 driver 与 recovery RESUME_PURGE 共用的单线程协调器；无索引 metadata 时为空。 */
+    private PurgeCoordinator purgeCoordinator;
     private FlushService flushService;
     /** E3a 后台 page cleaner；只由 engine 生命周期启动/停止，所有刷脏仍走 {@link FlushService}。 */
     private PageCleanerSupervisor pageCleanerSupervisor;
@@ -373,13 +401,14 @@ public final class StorageEngine {
         this.miniTransactionManager = new MiniTransactionManager(
                 accessController, redo, redoCapacityThrottle, config.pageSize());
 
-        TypeCodecRegistry typeRegistry = new TypeCodecRegistry();
+        this.typeRegistry = new TypeCodecRegistry();
         this.lobStorage = new LobStorage(diskSpaceManager, pool, config.pageSize(), typeRegistry);
         this.transactionManager = new TransactionManager(txnSystem);
         this.rollbackSlots = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), config.slotCapacity());
         this.undoSegmentReuse = new UndoSegmentReuseDirectory(config.undoCachedSegmentsPerKind());
         this.rsegHeaderRepo = new RollbackSegmentHeaderRepository(pool, config.pageSize());
         this.history = new HistoryList(config.undoHistoryTransitionTimeout());
+        this.tablePurgeBarrier = new HistoryTablePurgeBarrier(history);
         this.undoAllocator = new DiskSpaceUndoAllocator(diskSpaceManager);
         this.undoAccess = new UndoLogSegmentAccess(pool, config.pageSize(), undoAllocator, typeRegistry, registry,
                 config.maxExternalUndoPayloadPages());
@@ -389,6 +418,8 @@ public final class StorageEngine {
                 rsegHeaderRepo, undoSegmentFinalizer, undoSegmentReuse);
         this.indexPageAccess = new IndexPageAccess(pool, config.pageSize(), registry);
         this.btreeService = new SplitCapableBTreeIndexService(indexPageAccess, diskSpaceManager, typeRegistry);
+        this.btreeRootSnapshots = new BTreeRootSnapshotService(indexPageAccess);
+        this.purgeDmlRowGuards = new PurgeDmlRowGuardManager();
         this.tableDdlStorageService = new TableDdlStorageService(miniTransactionManager, diskSpaceManager,
                 indexPageAccess, pool, store, flushService, accessController);
         this.lockObservationService = new DefaultLockObservationService();
@@ -397,9 +428,12 @@ public final class StorageEngine {
                 new BTreeCurrentReadService(miniTransactionManager, btreeService, lockManager);
         this.mvccReader = new MvccReader(miniTransactionManager, btreeService, undoAccess,
                 config.undoSpaceId(), config.maxVersionHops());
+        this.secondaryMvccReader = new SecondaryMvccReader(
+                miniTransactionManager, btreeService, mvccReader, typeRegistry);
         this.rollbackService = indexMetadataResolver instanceof UndoTargetMetadataResolver targetResolver
                 ? new RollbackService(btreeService, undoAccess, transactionManager,
-                        miniTransactionManager, undoSegmentFinalizer, lobStorage, targetResolver)
+                        miniTransactionManager, undoSegmentFinalizer, lobStorage, targetResolver,
+                        btreeRootSnapshots, purgeDmlRowGuards)
                 : indexMetadataResolver == null
                         ? new RollbackService(btreeService, undoAccess, transactionManager,
                                 miniTransactionManager, undoSegmentFinalizer)
@@ -408,6 +442,22 @@ public final class StorageEngine {
         this.dmlService = new ClusteredDmlService(transactionManager, undoLogManager, miniTransactionManager,
                 btreeService, btreeCurrentReadService, rollbackService, lockManager, redo, recoveryGate,
                 lobStorage);
+        this.tableDmlService = new TableDmlService(dmlService, transactionManager, miniTransactionManager,
+                btreeService, btreeCurrentReadService, lockManager,
+                btreeRootSnapshots, typeRegistry, purgeDmlRowGuards, redo);
+        this.purgeCoordinator = indexMetadataResolver instanceof UndoTargetMetadataResolver targetResolver
+                ? new PurgeCoordinator(miniTransactionManager, txnSystem, history, undoAccess,
+                        undoSegmentFinalizer, btreeService, targetResolver, btreeRootSnapshots,
+                        purgeDmlRowGuards, new SecondaryPurgeSafetyChecker(miniTransactionManager,
+                                btreeService, undoAccess, config.undoSpaceId(),
+                                config.maxVersionHops(), typeRegistry))
+                : indexMetadataResolver != null
+                        ? new PurgeCoordinator(miniTransactionManager, txnSystem, history, undoAccess,
+                                undoSegmentFinalizer, btreeService, indexMetadataResolver)
+                        : clusteredIndex != null
+                                ? new PurgeCoordinator(miniTransactionManager, txnSystem, history, undoAccess,
+                                        undoSegmentFinalizer, btreeService, clusteredIndex)
+                                : null;
 
         // WAL 安全淘汰：注入淘汰刷盘端口，使脏页淘汰复用 FlushCoordinator 的 WAL gate + checksum + doublewrite
         // 管线。必须在 FlushCoordinator 就绪后、任何可能触发淘汰的 page access（fresh 建系统 undo / recover）之前注入。
@@ -466,7 +516,7 @@ public final class StorageEngine {
      *   <li>普通模式不能携带 skipped set，避免配置残留导致静默跳过数据；</li>
      *   <li>force-skip 必须显式非空，不能由引擎猜测损坏空间；</li>
      *   <li>系统 undo 不能跳过，否则 UNDO_ROLLBACK/RESUME_PURGE 没有安全语义；</li>
-     *   <li>当前单聚簇索引所在空间不能跳过，否则恢复期 rollback 会访问被隔离对象。</li>
+     *   <li>显式配置的 legacy 聚簇索引所在空间不能跳过；DD resolver 模式若解析到被跳过表空间，会在恢复访问时 fail-closed。</li>
      * </ul>
      */
     private void validateRecoverySkipConfiguration() {
@@ -498,8 +548,17 @@ public final class StorageEngine {
      * {@link DoublewriteRecoveryScanner}/page 列表，但 page 列表只来自 doublewrite 文件中的有效 slot，且仅覆盖启动恢复
      * 已打开的系统 undo 与显式配置数据表空间；没有全空间 checksum discovery。事务 UNDO_ROLLBACK
      * / RESUME_PURGE 已进入恢复服务阶段链，索引可由 legacy 单索引或 DD resolver 提供；DDL 收敛属于 DatabaseEngine 上层阶段。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>以 recovery 模式打开系统 undo 和允许参与恢复的数据表空间；force-skip 空间不创建物理句柄。</li>
+     *     <li>从已打开空间筛选 doublewrite 候选页，并构造 checkpoint/redo 事务恢复上下文。</li>
+     *     <li>按恢复模式组装不可变请求；NORMAL/FORCE 注入 rollback 与真实 purge 两阶段参与者，READ_ONLY 只校验证据。</li>
+     *     <li>交给恢复总控执行并保存报告；总控返回前已经 force 恢复写且开放 traffic gate。</li>
+     * </ol>
      */
     private void recoverExisting() {
+        // 1、只打开恢复准入范围内的物理空间，避免 redo/doublewrite 访问未发现文件。
         diskSpaceManager.openTablespaceForRecovery(config.undoSpaceId(), config.undoFile());
         for (EngineTablespaceConfig tablespace : config.recoveryTablespaces()) {
             if (config.forceSkippedSpaces().contains(tablespace.spaceId())) {
@@ -508,7 +567,7 @@ public final class StorageEngine {
             diskSpaceManager.openTablespaceForRecovery(tablespace.spaceId(), tablespace.path());
         }
 
-        // doublewrite repair：scanner 用同一 dwRepo（含上一进程整页副本）。待检查页**只取恢复期已打开的空间**
+        // 2、doublewrite repair：scanner 用同一 dwRepo（含上一进程整页副本）。待检查页**只取恢复期已打开的空间**
         // （系统 undo + 配置的 recoveryTablespaces）——没有 DD discovery 前恢复只能触达这些空间，对未打开空间的页
         // 调 scanner 会触发 TablespaceNotOpenException；其它空间的 torn 页留待该空间被显式打开/未来 discovery 时修复。
         List<SpaceId> recoverySpaces = recoverySpaceIds();
@@ -525,6 +584,9 @@ public final class StorageEngine {
                         ? TransactionRecoveryCheckpointSource.empty()
                         : transactionRecoveryCheckpointStore;
         TransactionRecoveryContext transactionRecovery = TransactionRecoveryContext.using(transactionRecoverySource);
+
+        // 3、写恢复模式注入 rollback+purge 参与者；只读诊断模式禁止任何 undo/history 写入。
+        TransactionUndoRecoveryParticipant undoRecovery = transactionUndoRecoveryParticipant();
         RecoveryRequest request = switch (config.recoveryMode()) {
             case NORMAL -> RecoveryRequest.normal(checkpointStore, redoRepo,
                             RedoApplyDispatcher.pageDispatcher(),
@@ -533,7 +595,7 @@ public final class StorageEngine {
                     .withRedoBoundaryInstall(redo)
                     .withUndoTablespaceRecovery(buildUndoTablespaceRecovery())
                     .withSpaceFileReconcile(recoverySpaces)
-                    .withTransactionRecovery(transactionRecovery, this::recoverTransactionUndoAfterRedo);
+                    .withTransactionRecovery(transactionRecovery, undoRecovery);
             case READ_ONLY_VALIDATE -> RecoveryRequest.readOnlyValidate(checkpointStore, redoRepo,
                             RedoApplyDispatcher.pageDispatcher(), new RedoApplyContext(store, config.pageSize()))
                     .withDoublewriteRepair(doublewriteScanner, doublewritePages)
@@ -546,9 +608,71 @@ public final class StorageEngine {
                     .withRedoBoundaryInstall(redo)
                     .withUndoTablespaceRecovery(buildUndoTablespaceRecovery())
                     .withSpaceFileReconcile(recoverySpaces)
-                    .withTransactionRecovery(transactionRecovery, this::recoverTransactionUndoAfterRedo);
+                    .withTransactionRecovery(transactionRecovery, undoRecovery);
         };
+
+        // 4、恢复总控负责阶段顺序、redo flush/page force 与 traffic gate；失败不会发布半恢复引擎。
         lastRecoveryReport = crashRecoveryService.recover(request);
+    }
+
+    /**
+     * 构造绑定当前引擎生命周期的事务恢复参与者，使恢复总控能把 UNDO_ROLLBACK 与 RESUME_PURGE 分成两个可诊断阶段。
+     *
+     * @return 同时委托恢复扫描/回滚和 persistent history purge 的阶段端口。
+     */
+    private TransactionUndoRecoveryParticipant transactionUndoRecoveryParticipant() {
+        return new TransactionUndoRecoveryParticipant() {
+            @Override
+            public TransactionUndoRecoveryResult recoverAfterRedo(
+                    Lsn recoveredToLsn, RecoveredTransactionSnapshot transactionSnapshot) {
+                return recoverTransactionUndoAfterRedo(recoveredToLsn, transactionSnapshot);
+            }
+
+            @Override
+            public void resumePurgeAfterRedo() {
+                StorageEngine.this.resumePurgeAfterRedo();
+            }
+        };
+    }
+
+    /**
+     * 在用户流量开放前推进恢复出的 committed history，复用前台测试和后台 driver 的同一个 purge coordinator。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取恢复后的 history 长度；空链直接返回，非空链若缺索引 resolver/coordinator 则 fail-closed。</li>
+     *     <li>按 rollback slot 容量循环执行 purge batch；每个 batch 内部只持单个短 undo/index MTR，不跨批保留 latch。</li>
+     *     <li>每次正进展后校验运行时 history 恰好减少已完成日志数；无进展表示到达 purge boundary 或 guard 延后，保留 head 后返回。</li>
+     * </ol>
+     */
+    private void resumePurgeAfterRedo() {
+        // 1、persistent history 非空却没有 metadata 定位能力时，不能假装 RESUME_PURGE 已完成后开放流量。
+        int historyBefore = history.committedSize();
+        if (historyBefore == 0) {
+            return;
+        }
+        if (purgeCoordinator == null) {
+            throw new TransactionRecoveryException(
+                    "recovered committed history requires an index resolver before RESUME_PURGE: entries="
+                            + historyBefore);
+        }
+
+        // 2、恢复期没有用户事务和后台 purge worker；循环只推进当前安全 boundary，单批上限沿用 slot 容量。
+        while (historyBefore > 0) {
+            PurgeSummary summary = purgeCoordinator.runBatch(config.slotCapacity());
+            int historyAfter = history.committedSize();
+
+            // 3、零进展保留不安全 head；正进展必须和 history 摘除数完全一致，否则拒绝潜在无限循环/投影漂移。
+            if (summary.purgedLogs() == 0) {
+                return;
+            }
+            if (historyAfter != historyBefore - summary.purgedLogs()) {
+                throw new TransactionRecoveryException(
+                        "RESUME_PURGE history projection changed inconsistently: before=" + historyBefore
+                                + ", purged=" + summary.purgedLogs() + ", after=" + historyAfter);
+            }
+            historyBefore = historyAfter;
+        }
     }
 
     /**
@@ -626,7 +750,8 @@ public final class StorageEngine {
                 .reconcile(transactionSnapshot, recoveredToLsn, recoveredSlots);
         PersistentHistoryRecovery historyRecovery = new PersistentHistoryRecovery();
         List<HistoryEntry> committed = historyRecovery.rebuild(
-                historyBase, occupiedSlots, recoveredSlots, this::readRecoveredHistoryNode);
+                historyBase, occupiedSlots, recoveredSlots, this::readRecoveredHistoryNode,
+                this::readRecoveredHistoryAffectedTables);
         if (!reconciliation.activeSlots().isEmpty() && clusteredIndex == null && indexMetadataResolver == null) {
             throw new TransactionRecoveryException(
                     "recovered ACTIVE transactions require the configured clustered index; "
@@ -670,6 +795,108 @@ public final class StorageEngine {
             rollbackRecoveryScanMtr(read, error);
             throw error;
         }
+    }
+
+    /**
+     * 从一条恢复出的 UPDATE history logical head 投影稳定表集合，不读取独立 sidecar/count。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>用 first-page recordCount 冻结最大遍历步数，并校验传入 logical head 未超过物理高水位。</li>
+     *     <li>每个 roll pointer 在独立短 MTR 中先读 schema-free identity，再经 legacy/DD resolver 取得 exact schema 完整解码。</li>
+     *     <li>校验 creator、undoNo 严格下降和 UPDATE/DELETE 类型，收集 table id 后沿 prevRollPointer 继续。</li>
+     *     <li>NULL 前驱前未超界则返回去重集合；超步数、断链或 metadata 不可解析均 fail-closed。</li>
+     * </ol>
+     *
+     * @param firstPageId 当前 committed UPDATE undo log 首页。
+     * @param logicalHead first-page header 中恢复出的权威逻辑链头。
+     * @return 当前 logical chain 实际涉及的稳定 table id 集合。
+     */
+    private Set<Long> readRecoveredHistoryAffectedTables(PageId firstPageId, UndoLogicalHead logicalHead) {
+        if (firstPageId == null || logicalHead == null) {
+            throw new DatabaseValidationException("recovered history projection inputs must not be null");
+        }
+        if (logicalHead.isEmpty()) {
+            return Set.of();
+        }
+
+        // 1、先短读物理 recordCount 作为损坏链上限；不把 first-page latch 带入逐条 metadata 解析。
+        long maxRecords;
+        MiniTransaction headerRead = miniTransactionManager.beginReadOnly();
+        try {
+            UndoLogSegment segment = undoAccess.open(headerRead, firstPageId, PageLatchMode.SHARED);
+            maxRecords = segment.logRecordCount();
+            if (logicalHead.undoNo().value() > segment.logLastUndoNo().value()) {
+                throw new UndoLogFormatException("recovered history logical head exceeds physical high-water: "
+                        + firstPageId);
+            }
+            miniTransactionManager.commit(headerRead);
+        } catch (RuntimeException error) {
+            rollbackRecoveryScanMtr(headerRead, error);
+            throw error;
+        }
+
+        Set<Long> affected = new LinkedHashSet<>();
+        RollPointer pointer = logicalHead.rollPointer();
+        long previousUndoNo = Long.MAX_VALUE;
+        long visited = 0L;
+        boolean first = true;
+        while (!pointer.isNull()) {
+            if (visited++ >= maxRecords) {
+                throw new TransactionRecoveryException(
+                        "recovered history logical chain exceeds physical record count: " + firstPageId);
+            }
+
+            // 2、单 pointer 短读：identity 只选 metadata，完整 record 才提供版本链 predecessor。
+            UndoRecord record;
+            MiniTransaction recordRead = miniTransactionManager.beginReadOnly();
+            try {
+                UndoLogSegment segment = undoAccess.open(recordRead, firstPageId, PageLatchMode.SHARED);
+                UndoRecordIdentity identity = segment.readRecordIdentity(pointer);
+                BTreeIndex index = resolveRecoveryHistoryIndex(identity);
+                record = segment.readRecord(pointer, index.keyDef(), index.schema());
+                miniTransactionManager.commit(recordRead);
+            } catch (RuntimeException error) {
+                rollbackRecoveryScanMtr(recordRead, error);
+                throw error;
+            }
+
+            // 3、history 只允许 UPDATE_ROW/DELETE_MARK，且同一 creator 的 undoNo 必须严格下降。
+            if (record.type() != UndoRecordType.UPDATE_ROW && record.type() != UndoRecordType.DELETE_MARK) {
+                throw new TransactionRecoveryException(
+                        "recovered UPDATE history contains non-update record: " + record.type());
+            }
+            if (first && !record.undoNo().equals(logicalHead.undoNo())) {
+                throw new TransactionRecoveryException(
+                        "recovered history logical head pointer resolves to undoNo "
+                                + record.undoNo().value() + " instead of " + logicalHead.undoNo().value());
+            }
+            if (record.undoNo().value() >= previousUndoNo) {
+                throw new TransactionRecoveryException(
+                        "recovered history logical undo numbers are not strictly descending: "
+                                + record.undoNo().value() + " after " + previousUndoNo);
+            }
+            affected.add(record.tableId());
+            first = false;
+            previousUndoNo = record.undoNo().value();
+            pointer = record.prevRollPointer();
+        }
+
+        // 4、HistoryEntry 构造器会排序并防御性冻结；此处集合只表达当前可达链，不包含 detached rollback 分支。
+        return Set.copyOf(affected);
+    }
+
+    /** recovery affected-table 投影按 undo identity 选择 exact-version 聚簇 metadata。 */
+    private BTreeIndex resolveRecoveryHistoryIndex(UndoRecordIdentity identity) {
+        if (indexMetadataResolver != null) {
+            return indexMetadataResolver.resolve(identity.tableId(), identity.indexId());
+        }
+        if (clusteredIndex != null && clusteredIndex.indexId() == identity.indexId()) {
+            return clusteredIndex;
+        }
+        throw new TransactionRecoveryException(
+                "recovered history requires index metadata: table=" + identity.tableId()
+                        + ", index=" + identity.indexId());
     }
 
     /**
@@ -890,12 +1117,8 @@ public final class StorageEngine {
         if (!config.backgroundFlushEnabled() || clusteredIndex == null && indexMetadataResolver == null) {
             return;
         }
-        PurgeCoordinator coordinator = indexMetadataResolver == null
-                ? new PurgeCoordinator(miniTransactionManager, txnSystem, history,
-                        undoAccess, undoSegmentFinalizer, btreeService, clusteredIndex)
-                : new PurgeCoordinator(miniTransactionManager, txnSystem, history,
-                        undoAccess, undoSegmentFinalizer, btreeService, indexMetadataResolver);
-        purgeDriverWorker = new PurgeDriverWorker(coordinator, config.slotCapacity(), config.backgroundFlushInterval());
+        purgeDriverWorker = new PurgeDriverWorker(
+                purgeCoordinator, config.slotCapacity(), config.backgroundFlushInterval());
         purgeDriverWorker.start();
     }
 
@@ -1085,12 +1308,23 @@ public final class StorageEngine {
     }
 
     /**
-     * 单聚簇索引 DML facade。当前无 SQL executor/DD/session，调用方必须显式传入事务、索引快照和行值；
-     * 本入口保证生产代码通过同一套 transaction/undo/current-read/B+Tree/redo/lock 实例完成编排。
+     * 返回聚簇 DML 内核 facade。SQL gateway 通过它创建 statement guard 和执行事务终态；普通 INSERT 写入由
+     * {@link #tableDmlService()} 先编排全部 secondary，再复用本入口的聚簇 undo anchor。低层单聚簇测试仍可显式调用。
      */
     public ClusteredDmlService dmlService() {
         requireOpen();
         return dmlService;
+    }
+
+    /**
+     * 返回生产组合根接线的表级多索引 DML facade。
+     *
+     * @return 与 {@link #dmlService()} 共享 transaction、undo、lock、B+Tree、redo 和类型 registry 的表级入口。
+     * @throws EngineStateException 引擎尚未打开、已经关闭或 recovery gate 尚未开放时抛出。
+     */
+    public TableDmlService tableDmlService() {
+        requireOpen();
+        return tableDmlService;
     }
 
     /**
@@ -1119,6 +1353,14 @@ public final class StorageEngine {
     public TableDdlStorageService tableDdlStorageService() {
         requireOpen();
         return tableDdlStorageService;
+    }
+
+    /**
+     * 返回 DD DROP 使用的 persistent history barrier。该 API 不暴露 HistoryEntry、undo page 或内部 Condition。
+     */
+    public TablePurgeBarrier tablePurgeBarrier() {
+        requireOpen();
+        return tablePurgeBarrier;
     }
 
     public UndoLogManager undoLogManager() {
@@ -1163,9 +1405,28 @@ public final class StorageEngine {
         return mvccReader;
     }
 
+    /**
+     * 返回组合根持有的 logical unique 二级回表 MVCC 服务；调用方必须保持 ReadView 覆盖结果 hydration/投影。
+     *
+     * @return 与本引擎 B+Tree、MvccReader 和 type registry 共用协作者的读服务。
+     */
+    public SecondaryMvccReader secondaryMvccReader() {
+        requireOpen();
+        return secondaryMvccReader;
+    }
+
     public RollbackService rollbackService() {
         requireOpen();
         return rollbackService;
+    }
+
+    /** 返回与后台 driver/recovery 共用的 purge 协调器；只有配置可解析索引 metadata 时可用。 */
+    public PurgeCoordinator purgeCoordinator() {
+        requireOpen();
+        if (purgeCoordinator == null) {
+            throw new EngineStateException("purge coordinator requires configured index metadata");
+        }
+        return purgeCoordinator;
     }
 
     /** 当前生命周期状态。 */

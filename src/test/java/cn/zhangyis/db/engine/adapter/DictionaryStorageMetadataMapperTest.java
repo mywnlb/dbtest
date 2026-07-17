@@ -72,6 +72,25 @@ class DictionaryStorageMetadataMapperTest {
         assertThrows(DictionaryStorageMappingException.class, () -> mapped.index(999));
     }
 
+    /** secondary descriptor 必须使用紧凑 entry schema和完整主键后缀，logical unique 不得覆盖物理唯一语义。 */
+    @Test
+    void mapsSecondaryIndexToCompactPhysicalMetadata() {
+        DictionaryStorageMetadataMapper mapper = new DictionaryStorageMetadataMapper();
+
+        MappedTableStorage mapped = mapper.map(tableWithSecondary());
+
+        var tableIndexes = mapped.tableIndexes();
+        assertEquals(1, tableIndexes.secondaryIndexes().size());
+        var secondary = tableIndexes.secondaryIndexes().getFirst();
+        assertEquals(4, secondary.index().indexId());
+        assertTrue(secondary.index().physicalUnique(), "完整 secondary key 必须按二级 key + PK 做物理唯一");
+        assertTrue(secondary.logicalUnique(), "DD logical unique 必须独立保留");
+        assertEquals(List.of(1, 0), secondary.layout().sourceOrdinals());
+        assertEquals(2, secondary.index().schema().columnCount());
+        assertEquals(2, secondary.index().keyDef().parts().size());
+        assertEquals(1, secondary.layout().logicalKeyPartCount());
+    }
+
     private TableDefinition table(DictionaryVersion version, TableState state, long rootPageNo) {
         TableDefinition logical = logicalTable(state);
         SegmentRef leaf = new SegmentRef(SpaceId.of(1024), 1, SegmentId.of(11));
@@ -90,5 +109,30 @@ class DictionaryStorageMetadataMapperTest {
                 List.of(new IndexKeyPart(1, IndexOrder.ASC, 0)));
         return new TableDefinition(TableId.of(2), SchemaId.of(1), ObjectName.of("orders"),
                 DictionaryVersion.of(2), state, List.of(id), List.of(primary));
+    }
+
+    private TableDefinition tableWithSecondary() {
+        ColumnDefinition id = new ColumnDefinition(1, ObjectName.of("id"),
+                ColumnTypeDefinition.bigint(false, false), 0);
+        ColumnDefinition email = new ColumnDefinition(2, ObjectName.of("email"),
+                new ColumnTypeDefinition(cn.zhangyis.db.dd.domain.DictionaryTypeId.VARCHAR,
+                        false, false, 128, 0, 1, 2, List.of()), 1);
+        IndexDefinition primary = new IndexDefinition(IndexId.of(3), ObjectName.of("PRIMARY"), true, true,
+                List.of(new IndexKeyPart(1, IndexOrder.ASC, 0)));
+        IndexDefinition secondary = new IndexDefinition(IndexId.of(4), ObjectName.of("uk_email"), true, false,
+                List.of(new IndexKeyPart(2, IndexOrder.ASC, 0)));
+        SegmentRef primaryLeaf = new SegmentRef(SpaceId.of(1024), 1, SegmentId.of(11));
+        SegmentRef primaryNonLeaf = new SegmentRef(SpaceId.of(1024), 2, SegmentId.of(12));
+        SegmentRef secondaryLeaf = new SegmentRef(SpaceId.of(1024), 3, SegmentId.of(13));
+        SegmentRef secondaryNonLeaf = new SegmentRef(SpaceId.of(1024), 4, SegmentId.of(14));
+        TableStorageBinding binding = new TableStorageBinding(2, SpaceId.of(1024),
+                directory.resolve("tables/table_2_space_1024.ibd"), List.of(
+                new IndexStorageBinding(3, PageId.of(SpaceId.of(1024), PageNo.of(64)), 0,
+                        primaryLeaf, primaryNonLeaf),
+                new IndexStorageBinding(4, PageId.of(SpaceId.of(1024), PageNo.of(65)), 0,
+                        secondaryLeaf, secondaryNonLeaf)), Optional.empty());
+        return new TableDefinition(TableId.of(2), SchemaId.of(1), ObjectName.of("accounts"),
+                DictionaryVersion.of(5), TableState.ACTIVE, List.of(id, email),
+                List.of(primary, secondary), Optional.of(binding));
     }
 }

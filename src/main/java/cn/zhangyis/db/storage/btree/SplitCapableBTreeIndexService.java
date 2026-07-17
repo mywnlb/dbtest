@@ -1,5 +1,6 @@
 package cn.zhangyis.db.storage.btree;
 
+import cn.zhangyis.db.common.exception.DatabaseRuntimeException;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageNo;
@@ -37,6 +38,7 @@ import cn.zhangyis.db.storage.record.page.SearchKey;
 import cn.zhangyis.db.storage.record.page.UpdateOutcome;
 import cn.zhangyis.db.storage.record.page.UpdateResult;
 import cn.zhangyis.db.storage.record.schema.ColumnType;
+import cn.zhangyis.db.storage.record.schema.IndexKeyDef;
 import cn.zhangyis.db.storage.record.type.ColumnValue;
 import cn.zhangyis.db.storage.record.type.LobCodec;
 import cn.zhangyis.db.storage.record.type.TemporalKind;
@@ -194,6 +196,40 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
                 record.deleted(), record.recordType(),
                 new HiddenColumns(transactionId, rollPointer));
         return insert(mtr, index, stamped);
+    }
+
+    /**
+     * 发布一条紧凑二级索引 entry。二级 entry 必须由 {@link SecondaryIndexMetadata#layout()} 投影得到，
+     * 不携带聚簇记录的 DB_TRX_ID/DB_ROLL_PTR；完整物理 key 已包含聚簇主键后缀，因而继续复用通用
+     * {@link #insert} 的 duplicate 检查、split 和 root grow 逻辑。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 descriptor 确为非聚簇索引，并拒绝隐藏列或预置 delete-mark，防止把聚簇版本信息复制进二级页。</li>
+     *     <li>委托通用插入路径按完整物理 key 检查冲突；delete-marked entry 仍会被视为占用 identity。</li>
+     *     <li>复用既有 leaf insert/split/root grow，所有页修改和 redo/dirty 副作用仍归调用方当前 MTR。</li>
+     * </ol>
+     *
+     * @param mtr    当前短物理事务；其提交/失败处理由上层表级 DML 编排负责。
+     * @param index  二级索引物理描述符；必须为 physical unique 且非聚簇。
+     * @param entry  layout 投影后的紧凑 entry；不得带隐藏列或 delete-mark。
+     * @return 通用插入结果；root grow 后调用方必须继续使用 {@code indexAfterInsert}。
+     * @throws DatabaseValidationException MTR/descriptor/entry 缺失，索引不是物理唯一二级树，或 entry 携带
+     *                                     delete mark/聚簇隐藏列时抛出。
+     * @throws BTreeDuplicateKeyException 完整 physical key 已被 live 或 delete-marked entry 占用时抛出。
+     * @throws DatabaseRuntimeException 页导航、split/root-grow、FSP 分配或 MTR redo 记录失败时抛出。
+     */
+    public BTreeInsertResult insertSecondary(MiniTransaction mtr, BTreeIndex index, LogicalRecord entry) {
+        // 1. 在获取任何 index page latch 前验证二级记录边界，非法输入不会留下页修改或 MTR memo。
+        requireSecondaryIndex(index, "insertSecondary");
+        if (entry == null || entry.hiddenColumns() != null || entry.deleted()) {
+            throw new DatabaseValidationException(
+                    "insertSecondary entry must be live, non-null and carry no clustered hidden columns");
+        }
+
+        // 2. 完整物理 key 的唯一检查由通用 insert 在目标 leaf X latch 内执行，marked entry 同样阻止重复发布。
+        // 3. 页内插入、split、root grow 与 redo/dirty 发布完全复用成熟路径，不另建一套二级结构算法。
+        return insert(mtr, index, entry);
     }
 
     /**
@@ -515,6 +551,182 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
     }
 
     /**
+     * rollback 物理删除本次 statement 刚发布的 live 二级 entry。该入口要求命中 entry 仍为 live；若已被
+     * delete-mark，说明 inverse 顺序、undo mutation state 或并发协调出现错误，返回 STATE_CONFLICT 而不改页。
+     *
+     * @param mtr   当前 rollback 短物理事务；方法不提交该 MTR。
+     * @param index 非聚簇二级索引描述符。
+     * @param key   待撤销 entry 的完整物理 key。
+     * @return 物理删除状态以及 merge/root shrink 后的 index 快照。
+     * @throws DatabaseValidationException MTR/key 缺失或 descriptor 不是物理唯一二级索引时抛出。
+     * @throws DatabaseRuntimeException 页导航、物理摘链、merge/root-shrink、FSP 回收或 redo 记录失败时抛出。
+     */
+    public BTreeSecondaryRemovalResult deletePublishedSecondary(MiniTransaction mtr, BTreeIndex index,
+                                                                 SearchKey key) {
+        return removeSecondaryByState(mtr, index, key, false, "deletePublishedSecondary");
+    }
+
+    /**
+     * purge 物理删除已 delete-marked 的二级 entry。live 命中属于 fail-closed 状态冲突：purge 不能像普通删除那样
+     * 主动标记当前 entry，否则可能回收仍被较新聚簇版本需要的物理 identity；ABSENT 则是幂等成功证据。
+     *
+     * @param mtr   当前 purge 短物理事务；方法不提交该 MTR。
+     * @param index 非聚簇二级索引描述符。
+     * @param key   经版本链安全检查后允许回收的完整物理 key。
+     * @return 物理删除状态以及 merge/root shrink 后的 index 快照。
+     * @throws DatabaseValidationException MTR/key 缺失或 descriptor 不是物理唯一二级索引时抛出。
+     * @throws DatabaseRuntimeException 页导航、物理摘链、merge/root-shrink、FSP 回收或 redo 记录失败时抛出。
+     */
+    public BTreeSecondaryRemovalResult purgeDeleteMarkedSecondary(MiniTransaction mtr, BTreeIndex index,
+                                                                   SearchKey key) {
+        return removeSecondaryByState(mtr, index, key, true, "purgeDeleteMarkedSecondary");
+    }
+
+    /**
+     * 按预期 delete 状态物理摘除二级 entry，并复用聚簇删除已验证的乐观 leaf-only 与悲观 merge 路径。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>页导航前校验二级 descriptor、MTR 与完整物理 key，错误输入不会获取 latch 或产生 redo。</li>
+     *     <li>多层树先 S-crab 到 leaf X，定位并检查 delete 状态；ABSENT/STATE_CONFLICT 立即只读返回。</li>
+     *     <li>若删除后不欠载，在当前 leaf X 内直接 purge；若可能欠载，写页前释放 leaf 并重启悲观 safe-node X 下降。</li>
+     *     <li>悲观路径物理摘链后复用 merge/root shrink/FSP 回收，返回新 level 快照与 freed pages。</li>
+     * </ol>
+     *
+     * @param mtr             调用方拥有的单次 rollback/purge 物理事务；方法不提交或关闭它。
+     * @param index           exact-version 物理唯一二级 descriptor；root level 应在调用前刷新。
+     * @param key             覆盖 logical key 与完整聚簇主键后缀的 physical identity。
+     * @param expectedDeleted true 表示 purge 只接收 marked entry；false 表示 rollback 只接收 live entry。
+     * @param operation       仅用于领域校验消息，帮助恢复日志定位错误调用入口。
+     * @return ABSENT/STATE_CONFLICT no-op，或携带结构后置快照和释放页的 REMOVED 结果。
+     * @throws DatabaseValidationException 参数缺失或 descriptor 不满足二级物理唯一约束时抛出。
+     * @throws DatabaseRuntimeException 页导航、摘链、结构回收或 redo 记录失败时抛出。
+     */
+    private BTreeSecondaryRemovalResult removeSecondaryByState(MiniTransaction mtr, BTreeIndex index,
+                                                                SearchKey key, boolean expectedDeleted,
+                                                                String operation) {
+        // 1. 在任何页资源进入 MTR memo 前完成边界校验。
+        requireSecondaryIndex(index, operation);
+        if (mtr == null || key == null) {
+            throw new DatabaseValidationException(operation + " mtr/key must not be null");
+        }
+
+        // 2. 乐观路径仅持 leaf X；明确 no-op 状态可直接返回，不需要悲观结构锁。
+        BTreeSecondaryRemovalResult optimistic = tryOptimisticSecondaryRemoval(
+                mtr, index, key, expectedDeleted);
+        if (optimistic != null) {
+            return optimistic;
+        }
+
+        // 3. null 表示 root 即 leaf，或删除可能造成欠载；两种情况都在写页前进入悲观 safe-node 下降。
+        List<IndexPageHandle> path = descendPathDeleteSafeNode(mtr, index, key);
+
+        // 4. 悲观 leaf 删除成功后复用既有 merge/root shrink 与 FSP 回收，不复制结构维护算法。
+        return removeSecondaryInLeaf(mtr, index, path, key, expectedDeleted);
+    }
+
+    /**
+     * 多层树的二级 entry 乐观物理删除。返回 null 仅表示必须在零页修改状态下改走悲观路径；
+     * 非 null 结果均是完整终态，包括 ABSENT、STATE_CONFLICT 和不欠载的 REMOVED。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>S-crab 到目标 leaf 并只保留 leaf X；root 即 leaf 时返回 null 交给悲观路径。</li>
+     *     <li>定位完整 physical key 并核对 delete 位；缺失/状态冲突不写页直接返回。</li>
+     *     <li>预测删除后欠载；unsafe 时释放尚未修改的 leaf handle 并返回 null。</li>
+     *     <li>safe 时在同一 leaf X 内满足 purger 前置条件并物理摘链，返回无结构变化的 REMOVED。</li>
+     * </ol>
+     *
+     * @param mtr             调用方 rollback/purge 短物理事务。
+     * @param index           多层物理唯一二级 descriptor。
+     * @param key             待删除 entry 的完整 physical identity。
+     * @param expectedDeleted purge 传 true 只删 marked；rollback 传 false 只删 live。
+     * @return 完整 no-op/removed 结果；必须悲观重启时返回 {@code null}。
+     * @throws DatabaseRuntimeException 页导航、记录解析或页内摘链失败时抛出。
+     */
+    private BTreeSecondaryRemovalResult tryOptimisticSecondaryRemoval(MiniTransaction mtr, BTreeIndex index,
+                                                                       SearchKey key,
+                                                                       boolean expectedDeleted) {
+        // 1. 乐观下降释放祖先，只保留目标 leaf X；单 root leaf 没有 crab 收益，交悲观路径统一处理。
+        IndexPageHandle leafHandle = descendOptimistic(mtr, index, key);
+        if (leafHandle == null) {
+            return null;
+        }
+        // 2. 完整 physical key 与 delete 位都在写页前检查，no-op 分支不产生 redo/dirty。
+        RecordPage leaf = leafHandle.recordPage();
+        PageId leafId = leafHandle.pageId();
+        validateLeafPage(leaf, index, leafId);
+        OptionalInt found = search.findEqual(leaf, key, index.keyDef(), index.schema());
+        if (found.isEmpty()) {
+            return BTreeSecondaryRemovalResult.noChange(SecondaryEntryRemovalStatus.ABSENT, index);
+        }
+        RecordCursor cursor = new RecordCursor(leaf, found.getAsInt(), index.schema(), registry);
+        if (cursor.isDeleted() != expectedDeleted) {
+            return BTreeSecondaryRemovalResult.noChange(SecondaryEntryRemovalStatus.STATE_CONFLICT, index);
+        }
+        // 3. 欠载预测发生在任何 setDeleted/purge 前；unsafe 时显式提前释放 leaf 后再重启。
+        if (deleteWouldUnderflow(leaf, cursor, index)) {
+            pageAccess.releaseHandle(mtr, leafHandle);
+            return null;
+        }
+        // 4. rollback live entry 在同一 leaf X 内临时标记后立即摘链，不向其它 MTR 暴露中间状态。
+        if (!expectedDeleted) {
+            // RecordPagePurger 的页内契约只接受 marked 记录；rollback 已在同一 leaf X 下确认目标仍为 live，
+            // 因此先置位再立即摘链，不向其它 MTR 暴露中间状态，也不改变“错误 marked entry 不得删除”的外部语义。
+            leaf.setDeleted(found.getAsInt(), true);
+        }
+        purger.purge(leaf, found.getAsInt());
+        return BTreeSecondaryRemovalResult.removed(index, List.of());
+    }
+
+    /**
+     * 在悲观 safe-node X 路径末端检查二级 entry 状态并物理摘除。状态检查先于任何页写；成功后才允许
+     * merge/root shrink 向保留链传播，确保错误 inverse 不会产生半完成结构修改。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>取得悲观路径末端 leaf 并校验页归属/层级。</li>
+     *     <li>按完整 physical key 定位并检查 delete 位；缺失或状态冲突不修改路径中任何页。</li>
+     *     <li>满足状态前提后物理摘链；rollback live entry 的临时 mark 与摘链位于同一 leaf X 临界区。</li>
+     *     <li>复用结构回收算法执行 merge/root-shrink/FSP 归还，返回新索引快照与释放页。</li>
+     * </ol>
+     *
+     * @param mtr             调用方短物理事务，已持 safe-node 悲观路径 latch。
+     * @param index           exact-version 物理唯一二级 descriptor。
+     * @param path            从保留 safe node 到目标 leaf 的 X-latched handle 列表，末项必须是 leaf。
+     * @param key             待删除 entry 的完整 physical identity。
+     * @param expectedDeleted purge 传 true，rollback 传 false。
+     * @return no-op 状态，或含 merge/root-shrink 后置快照的 REMOVED 结果。
+     * @throws DatabaseRuntimeException 页校验、记录解析、摘链、结构回收或 redo 记录失败时抛出。
+     */
+    private BTreeSecondaryRemovalResult removeSecondaryInLeaf(MiniTransaction mtr, BTreeIndex index,
+                                                               List<IndexPageHandle> path, SearchKey key,
+                                                               boolean expectedDeleted) {
+        // 1. 悲观路径末项必须是目标 leaf；页头归属错误按结构损坏 fail-closed。
+        IndexPageHandle leafHandle = path.getLast();
+        RecordPage leaf = leafHandle.recordPage();
+        validateLeafPage(leaf, index, leafHandle.pageId());
+        // 2. 完整 identity 与状态检查先于任何写，错误 inverse 不得触发 merge 或 dirty publish。
+        OptionalInt found = search.findEqual(leaf, key, index.keyDef(), index.schema());
+        if (found.isEmpty()) {
+            return BTreeSecondaryRemovalResult.noChange(SecondaryEntryRemovalStatus.ABSENT, index);
+        }
+        RecordCursor cursor = new RecordCursor(leaf, found.getAsInt(), index.schema(), registry);
+        if (cursor.isDeleted() != expectedDeleted) {
+            return BTreeSecondaryRemovalResult.noChange(SecondaryEntryRemovalStatus.STATE_CONFLICT, index);
+        }
+        // 3. rollback live entry 在同一 leaf X 中完成临时 mark + 摘链，满足 RecordPagePurger 前置条件。
+        if (!expectedDeleted) {
+            // 与乐观路径相同：在同一 leaf X 下把 live rollback target 临时标记后立即物理摘链，满足 purger 前置条件。
+            leaf.setDeleted(found.getAsInt(), true);
+        }
+        purger.purge(leaf, found.getAsInt());
+        // 4. 只有物理摘链成功后才传播结构回收；结果携带调用方后续必须使用的新 root level。
+        MergeOutcome outcome = reclaimAfterRemoval(mtr, index, path);
+        return BTreeSecondaryRemovalResult.removed(outcome.indexAfter(), outcome.freedPages());
+    }
+
+    /**
      * 聚簇记录整记录替换（T1.3e，前向 UPDATE 与 rollback 恢复共用）。数据流：导航到目标 leaf（level 0/1，X）→
      * {@code findEqual} 定位 → **所有权校验**（当前记录 {@code DB_TRX_ID}/{@code DB_ROLL_PTR} 必须同时等于
      * {@code expectedTrxId}/{@code expectedRollPtr}）→ {@code RecordPageUpdater.update} 整记录替换为
@@ -693,6 +905,87 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
     }
 
     /**
+     * 翻转紧凑二级 entry 的 delete 位。二级记录没有隐藏列，完整物理 key 自身就是稳定 identity；
+     * 方法只在目标 leaf X latch 内执行等长 header 写，不触发 split/merge，也不等待事务锁。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>在进入页导航前校验非聚簇 descriptor 与完整物理 key，非法输入不产生 latch/redo 副作用。</li>
+     *     <li>多层树使用 S-crab 到 leaf X，单 root leaf 使用普通 X 定位；父页在写 leaf 前已经释放或由 MTR 管理。</li>
+     *     <li>命中后先比较当前 delete 位；缺失和已处于目标状态均返回显式 no-op，不写页。</li>
+     *     <li>仅在状态确需翻转时写 record header；页字节 redo、pageLSN 与 dirty publish 归当前 MTR。</li>
+     * </ol>
+     *
+     * @param mtr     当前短物理事务；方法不提交该 MTR。
+     * @param index   非聚簇二级索引描述符。
+     * @param key     logical key + 完整聚簇主键后缀组成的物理 key。
+     * @param deleted 目标 delete 状态；true 用于 DML，false 用于 revive/rollback。
+     * @return CHANGED、ALREADY_IN_STATE 或 ABSENT；结果不暴露页内资源。
+     * @throws DatabaseValidationException MTR/key 缺失或 descriptor 不是物理唯一二级索引时抛出。
+     * @throws DatabaseRuntimeException 页导航、记录解析或页头改写/redo 记录失败时抛出。
+     */
+    public BTreeSecondaryDeleteMarkResult setSecondaryDeleteMark(MiniTransaction mtr, BTreeIndex index,
+                                                                  SearchKey key, boolean deleted) {
+        // 1. 页 latch 获取前完成模块边界和参数校验，失败时不污染 MTR memo。
+        requireSecondaryIndex(index, "setSecondaryDeleteMark");
+        if (mtr == null || key == null) {
+            throw new DatabaseValidationException("setSecondaryDeleteMark mtr/key must not be null");
+        }
+
+        // 2. 多层树用 crab 只保留 leaf X；root 即 leaf 时由 findLeaf 获取唯一目标页 X。
+        IndexPageHandle optimisticLeaf = descendOptimistic(mtr, index, key);
+        if (optimisticLeaf != null) {
+            // 3、4. leaf 内先分类再按需写 delete 位，no-op 分支不产生 redo/dirty 修改。
+            return markSecondaryInLeaf(optimisticLeaf.recordPage(), optimisticLeaf.pageId(), index, key, deleted);
+        }
+        LeafLocation leaf = findLeaf(mtr, index, key, PageLatchMode.EXCLUSIVE);
+        // 3、4. 单 root leaf 与多层树共享同一 plan-then-execute 实现。
+        return markSecondaryInLeaf(leaf.page(), leaf.pageId(), index, key, deleted);
+    }
+
+    /**
+     * 在已持 X latch 的二级 leaf 内执行 delete 位 plan-then-execute。先完整定位并分类，只有 CHANGED 分支才写页，
+     * 因而 ABSENT/ALREADY_IN_STATE 可安全用于 statement/full/recovery rollback 重试。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 leaf 页头层级、index id 与 descriptor 归属。</li>
+     *     <li>按完整 physical key 定位记录；缺失返回 ABSENT，不写页。</li>
+     *     <li>比较当前 delete 位；已处于目标状态返回 ALREADY_IN_STATE，不写页。</li>
+     *     <li>仅 CHANGED 分支翻转等长记录头位，redo/pageLSN/dirty 副作用归调用方 MTR。</li>
+     * </ol>
+     *
+     * @param leaf    已由调用方以 X latch 打开的二级 leaf record page。
+     * @param leafId  用于页归属校验和结构损坏诊断的物理 page id。
+     * @param index   exact-version 物理唯一二级 descriptor。
+     * @param key     待标记/复活 entry 的完整 physical identity。
+     * @param deleted 目标 delete 位。
+     * @return 显式 CHANGED、ALREADY_IN_STATE 或 ABSENT 结果。
+     * @throws DatabaseRuntimeException 页结构校验、记录解析或页改写失败时抛出。
+     */
+    private BTreeSecondaryDeleteMarkResult markSecondaryInLeaf(RecordPage leaf, PageId leafId,
+                                                                 BTreeIndex index, SearchKey key,
+                                                                 boolean deleted) {
+        // 1. 页头必须属于目标索引且 level=0，错配时不能继续解释记录格式。
+        validateLeafPage(leaf, index, leafId);
+
+        // 2. physical key 包含完整主键后缀，findEqual 至多定位一个二级 identity。
+        OptionalInt found = search.findEqual(leaf, key, index.keyDef(), index.schema());
+        if (found.isEmpty()) {
+            return new BTreeSecondaryDeleteMarkResult(SecondaryDeleteMarkStatus.ABSENT);
+        }
+        // 3. 已在目标状态是 crash/rollback 重试的幂等完成证明，不重复写相同页字节。
+        int offset = found.getAsInt();
+        RecordCursor cursor = new RecordCursor(leaf, offset, index.schema(), registry);
+        if (cursor.isDeleted() == deleted) {
+            return new BTreeSecondaryDeleteMarkResult(SecondaryDeleteMarkStatus.ALREADY_IN_STATE);
+        }
+        // 4. 状态确需变化时才执行等长 header 改写。
+        leaf.setDeleted(offset, deleted);
+        return new BTreeSecondaryDeleteMarkResult(SecondaryDeleteMarkStatus.CHANGED);
+    }
+
+    /**
      * 点查索引。数据流：打开 root 并校验 header → level=0 直接查 leaf；
      * level=1 用 root node pointer 选择 leaf，再在 leaf 内执行页内等值查找。
      */
@@ -805,6 +1098,129 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
      */
     @Override
     public List<BTreeLookupResult> scan(MiniTransaction mtr, BTreeIndex index, BTreeScanRange range) {
+        return doScan(mtr, index, range, false);
+    }
+
+    /**
+     * 扫描二级索引物理视图，保留 delete-marked entry。该入口供唯一前缀检查、rollback 和 purge 使用；
+     * 返回值已完全物化，不携带 secondary page latch、Buffer fix 或 cursor。
+     *
+     * @param mtr   当前只读短 MTR；调用方必须先结束它，再进入可能阻塞的事务锁等待或聚簇回表。
+     * @param index 非聚簇二级索引描述符。
+     * @param range 完整物理 key 范围与结果上限。
+     * @return 包含 live 与 delete-marked entry 的有序不可变物化结果。
+     * @throws DatabaseValidationException range 缺失或 descriptor 不是物理唯一二级索引时抛出。
+     * @throws DatabaseRuntimeException 页导航、sibling hand-over-hand 或记录物化失败时抛出。
+     */
+    public List<BTreeLookupResult> scanIncludingDeleted(MiniTransaction mtr, BTreeIndex index,
+                                                        BTreeScanRange range) {
+        requireSecondaryIndex(index, "scanIncludingDeleted");
+        return doScan(mtr, index, range, true);
+    }
+
+    /**
+     * 扫描与 logical secondary key 等价的物理 entry，并保留 delete-marked 候选。因为二级物理 key 追加了
+     * 完整聚簇主键，logical prefix 不是一个可直接传给普通 point lookup 的完整 key；本方法从最左 leaf 起按
+     * B+Tree 顺序比较，命中段结束后立即停止。v1 优先保证 collation/prefix 正确性，后续可增加 prefix-aware root descent。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 metadata/layout/key/limit，构造只覆盖声明 logical parts 的比较定义。</li>
+     *     <li>从 root S-crab 到最左 leaf，每次取得 child S 后立即释放 parent，避免全路径 pin。</li>
+     *     <li>沿 sibling hand-over-hand 物化 entry，用与 B+Tree 相同的类型、prefix、collation、方向比较 logical key。</li>
+     *     <li>收集 live/marked 候选至 limit；越过目标有序段或链尾时返回，不泄露 page handle/cursor。</li>
+     * </ol>
+     *
+     * @param mtr        当前短只读 MTR；结束后再进入事务锁等待或聚簇回表。
+     * @param metadata   exact-version 二级 descriptor 与 layout。
+     * @param logicalKey 声明 logical key parts 的完整值。
+     * @param limit      最大候选数；唯一检查通常取 2 以发现非法多主键状态。
+     * @return 按完整物理 key 排序的物化候选，包含 delete-marked entry。
+     * @throws DatabaseValidationException 参数缺失、limit 为负、descriptor/layout 或 logical part 数错配时抛出。
+     * @throws DatabaseRuntimeException 页导航、sibling hand-over-hand、记录物化或 comparator 失败时抛出。
+     */
+    public List<BTreeLookupResult> scanSecondaryPrefixIncludingDeleted(MiniTransaction mtr,
+                                                                        SecondaryIndexMetadata metadata,
+                                                                        SearchKey logicalKey,
+                                                                        int limit) {
+        // 1. 构造 logical-prefix 比较定义；它引用 compact schema 的前 N 个连续字段。
+        if (mtr == null || metadata == null || logicalKey == null || limit < 0) {
+            throw new DatabaseValidationException("secondary prefix scan args are invalid");
+        }
+        BTreeIndex index = metadata.index();
+        requireSecondaryIndex(index, "scanSecondaryPrefixIncludingDeleted");
+        int logicalParts = metadata.layout().logicalKeyPartCount();
+        if (logicalKey.size() != logicalParts) {
+            throw new DatabaseValidationException("secondary logical key size " + logicalKey.size()
+                    + " != declared parts " + logicalParts);
+        }
+        if (limit == 0) {
+            return List.of();
+        }
+        IndexKeyDef logicalKeyDef = new IndexKeyDef(index.indexId(),
+                index.keyDef().parts().subList(0, logicalParts));
+
+        // 2. S-crab 到最左 leaf；祖先在 child 到手后立即释放，避免全树扫描持 root 到 MTR 结束。
+        IndexPageHandle leafHandle = descendLeftmostSharedCrab(mtr, index);
+        List<BTreeLookupResult> results = new ArrayList<>(Math.min(limit, 2));
+        while (true) {
+            // 3. 当前 leaf 内按完整物理顺序遍历，marked 与 live 都参与唯一/purge 的物理视图。
+            RecordPage leaf = leafHandle.recordPage();
+            validateLeafPage(leaf, index, leafHandle.pageId());
+            for (int offset : leaf.recordOffsetsInOrder()) {
+                RecordCursor cursor = new RecordCursor(leaf, offset, index.schema(), registry);
+                LogicalRecord entry = cursor.materialize();
+                SearchKey candidate = metadata.layout().logicalKey(entry);
+                int compared = keyComparator.compare(candidate, logicalKey, logicalKeyDef, index.schema());
+                if (compared < 0) {
+                    continue;
+                }
+                if (compared > 0) {
+                    // 4. B+Tree logical prefix 已越过目标；后续 sibling 只会更大，可立即收敛。
+                    return List.copyOf(results);
+                }
+                results.add(materialize(index, leafHandle.pageId(), cursor));
+                if (results.size() >= limit) {
+                    return List.copyOf(results);
+                }
+            }
+
+            // 4. 匹配段若在当前 leaf 结束，下一 sibling 仍需看首项才能确认越界；链尾则直接返回。
+            long next = leafHandle.fileHeader().nextPageNo();
+            if (next == FilePageHeader.FIL_NULL) {
+                return List.copyOf(results);
+            }
+            PageId nextId = PageId.of(index.rootPageId().spaceId(), PageNo.of(next));
+            IndexPageHandle nextHandle = openBTreePageOutOfOrder(mtr, nextId, index, PageLatchMode.SHARED,
+                    "secondary logical-prefix scan sibling hand-over-hand");
+            pageAccess.releaseHandle(mtr, leafHandle);
+            leafHandle = nextHandle;
+        }
+    }
+
+    /**
+     * scan 共用实现。沿 leaf sibling hand-over-hand 读取，每次只同时持当前与后继 leaf 的 S latch；
+     * {@code includeDeleted} 只控制结果过滤，不改变页导航、比较器或范围终止语义。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验范围；limit=0 在页访问前返回空结果。</li>
+     *     <li>按 lower bound S-crab 到起始 leaf，只保留 leaf S latch。</li>
+     *     <li>逐页物化范围内记录，并按 includeDeleted 过滤；达到 upper bound/limit 时停止。</li>
+     *     <li>未结束时先取得 next leaf S 再释放当前 leaf，链尾返回不可变结果。</li>
+     * </ol>
+     *
+     * @param mtr            调用方短只读 MTR；方法不提交它。
+     * @param index          目标索引 exact-version descriptor。
+     * @param range          完整 lower/upper bound、开闭属性与结果上限。
+     * @param includeDeleted {@code true} 保留 marked 物理记录；{@code false} 执行普通可见物理过滤。
+     * @return 按完整索引 key 排序的不可变物化结果。
+     * @throws DatabaseValidationException range 缺失时抛出。
+     * @throws DatabaseRuntimeException 页导航、sibling latch 或记录物化失败时抛出。
+     */
+    private List<BTreeLookupResult> doScan(MiniTransaction mtr, BTreeIndex index, BTreeScanRange range,
+                                           boolean includeDeleted) {
+        // 1. 空上限在任何 root/leaf fix 前返回，避免无意义占用 Buffer Pool。
         if (range == null) {
             throw new DatabaseValidationException("btree scan range must not be null");
         }
@@ -813,13 +1229,15 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         }
         // 任意树高（0.13c 读 crab）：S-crab 下降到 lowerKey 起始 leaf（祖先早释放），再沿 FIL sibling next 链
         // hand-over-hand 顺序扫（level 0 时起始 leaf 即 root，无 next）。
+        // 2. lower bound 决定起始 leaf；S-crab 释放全部祖先，仅保留 leaf handle。
         IndexPageHandle leafHandle = descendSharedCrab(mtr, index, range.lowerKey());
         ScanAccumulator acc = new ScanAccumulator(range.limit());
         while (true) {
+            // 3. 当前 leaf 内统一执行边界比较、delete 过滤和 limit 累积。
             RecordPage leaf = leafHandle.recordPage();
             PageId leafId = leafHandle.pageId();
             validateLeafPage(leaf, index, leafId);
-            boolean stop = scanLeafPage(leaf, leafId, index, range, acc);
+            boolean stop = scanLeafPage(leaf, leafId, index, range, acc, includeDeleted);
             if (stop || acc.full()) {
                 break;
             }
@@ -827,13 +1245,14 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
             if (next == FilePageHeader.FIL_NULL) {
                 break;
             }
-            // hand-over-hand：读出 next 时仍持当前 leaf S；先 latch 后继 leaf，再释放当前 leaf（后继到手前不放手）。
+            // 4. hand-over-hand：读出 next 时仍持当前 leaf S；先 latch 后继 leaf，再释放当前 leaf。
             PageId nextId = PageId.of(index.rootPageId().spaceId(), PageNo.of(next));
             IndexPageHandle nextHandle = openBTreePageOutOfOrder(mtr, nextId, index, PageLatchMode.SHARED,
                     "btree scan sibling hand-over-hand: next leaf is latched before predecessor release");
             pageAccess.releaseHandle(mtr, leafHandle);
             leafHandle = nextHandle;
         }
+        // 4. ScanAccumulator 返回不可变物化结果，不携带 cursor、page handle 或 Buffer fix。
         return acc.results();
     }
 
@@ -1927,6 +2346,54 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
     }
 
     /**
+     * S-crab 到整棵树最左 leaf。每个内部页取第一条 node pointer 作为最小子树；空内部页或错误 index id
+     * 表示结构损坏。该入口只供无完整 lower physical key 的 logical-prefix 扫描使用。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>以 S latch 打开稳定 root，并读取当前页头 level。</li>
+     *     <li>每层选择第一条 node pointer，先取得 child S 再释放 parent S。</li>
+     *     <li>逐层校验 child index id，避免跨索引 sibling/指针损坏被当作正常导航。</li>
+     *     <li>到达 level-0 后校验 leaf 页头并返回唯一仍由 MTR 持有的 handle。</li>
+     * </ol>
+     *
+     * @param mtr   调用方短只读 MTR；所有 fix/latch memo 归它管理。
+     * @param index 目标索引 descriptor；root page id 是稳定导航起点。
+     * @return 整棵树最左 leaf 的 S-latched handle；调用方必须经 pageAccess/MTR 释放。
+     * @throws BTreeStructureCorruptedException 内部页无 node pointer、child index id 错配或目标页不是合法 leaf 时抛出。
+     */
+    private IndexPageHandle descendLeftmostSharedCrab(MiniTransaction mtr, BTreeIndex index) {
+        // 1. root 页头 level 是当前结构权威，不能使用 descriptor 的创建时层级猜测循环次数。
+        IndexPageHandle node = openRoot(mtr, index, PageLatchMode.SHARED);
+        RecordPage page = node.recordPage();
+        while (page.header().level() > 0) {
+            // 2. 最左子树由第一条 node pointer 定义；child S 到手后才释放 parent，防止导航窗口断裂。
+            List<Integer> offsets = page.recordOffsetsInOrder();
+            if (offsets.isEmpty()) {
+                throw new BTreeStructureCorruptedException(
+                        "secondary prefix scan found empty internal page " + node.pageId());
+            }
+            BTreeNodePointerSchema pointerSchema = BTreeNodePointerSchema.from(index);
+            RecordCursor first = new RecordCursor(page, offsets.getFirst(), pointerSchema.schema(), registry);
+            PageId childId = pointerCodec.fromRecord(first.materialize(), pointerSchema).childPageId();
+            IndexPageHandle child = openBTreePageOutOfOrder(mtr, childId, index, PageLatchMode.SHARED,
+                    "btree leftmost shared crab: child S is latched before parent S release");
+            pageAccess.releaseHandle(mtr, node);
+            page = child.recordPage();
+            // 3. 每个 child 必须仍属于同一 index；错配说明页指针/恢复状态损坏。
+            if (page.header().indexId() != index.indexId()) {
+                throw new BTreeStructureCorruptedException("leftmost child page index id mismatch at "
+                        + child.pageId() + ": page=" + page.header().indexId()
+                        + " expected=" + index.indexId());
+            }
+            node = child;
+        }
+        // 4. 返回前确认 level=0 与页归属；此时祖先 handle 均已提前释放。
+        validateLeafPage(page, index, node.pageId());
+        return node;
+    }
+
+    /**
      * 读路径 crab 定位（0.13c）：{@link #descendSharedCrab} S-crab 下降到 leaf(S) 并包成 {@link LeafLocation}；
      * 返回时 root/内部祖先均已早释放，仅 leaf S 仍在 MTR memo 中（读毕随 commit 释放）。
      */
@@ -1978,7 +2445,7 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
     }
 
     private void ensureUniqueAbsent(RecordPage leaf, PageId leafId, BTreeIndex index, SearchKey key) {
-        if (!index.unique()) {
+        if (!index.physicalUnique()) {
             return;
         }
         if (search.findEqual(leaf, key, index.keyDef(), index.schema()).isPresent()) {
@@ -1987,11 +2454,15 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         }
     }
 
+    /**
+     * 扫描单个已持 S latch 的 leaf。delete-mark 过滤在范围比较前执行，但 including-deleted 模式会保留标记项；
+     * 两种模式均复用同一 key comparator，保证普通查询与物理检查的边界排序一致。
+     */
     private boolean scanLeafPage(RecordPage leaf, PageId leafId, BTreeIndex index, BTreeScanRange range,
-                                 ScanAccumulator acc) {
+                                 ScanAccumulator acc, boolean includeDeleted) {
         for (int off : leaf.recordOffsetsInOrder()) {
             RecordCursor cursor = new RecordCursor(leaf, off, index.schema(), registry);
-            if (cursor.isDeleted()) {
+            if (!includeDeleted && cursor.isDeleted()) {
                 continue;
             }
             if (belowLower(cursor, index, range)) {
@@ -2006,6 +2477,24 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
             }
         }
         return false;
+    }
+
+    /**
+     * 校验调用入口确实面向紧凑二级索引。完整物理 key 必须唯一，否则 rollback/purge 无法凭 key 精确定位一条 entry；
+     * 聚簇 descriptor 则携带隐藏列，不能走没有版本所有权校验的二级原语。
+     *
+     * @param index     调用方提供的 exact-version B+Tree descriptor。
+     * @param operation 进入该校验的二级原语名，仅用于领域错误诊断。
+     * @throws DatabaseValidationException descriptor 缺失、属于聚簇索引或未声明完整 physical key 唯一时抛出。
+     */
+    private void requireSecondaryIndex(BTreeIndex index, String operation) {
+        if (index == null) {
+            throw new DatabaseValidationException(operation + " index must not be null");
+        }
+        if (index.clustered() || !index.physicalUnique()) {
+            throw new DatabaseValidationException(operation
+                    + " requires a non-clustered physically unique index: " + index.indexId());
+        }
     }
 
     private boolean locateRangeLeaf(RecordPage leaf, PageId leafId, BTreeIndex index, BTreeScanRange range,

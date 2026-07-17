@@ -8,7 +8,8 @@ import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.engine.DatabaseEngine;
 import cn.zhangyis.db.sql.binder.bound.BoundClusteredInsert;
-import cn.zhangyis.db.sql.binder.bound.BoundPrimaryPointSelect;
+import cn.zhangyis.db.sql.binder.bound.BoundPointSelect;
+import cn.zhangyis.db.sql.binder.bound.PointAccessKind;
 import cn.zhangyis.db.sql.executor.SqlRow;
 import cn.zhangyis.db.sql.executor.SqlValue;
 import cn.zhangyis.db.sql.executor.storage.*;
@@ -31,7 +32,7 @@ import static org.junit.jupiter.api.Assertions.*;
 class DefaultSqlStorageGatewayTest {
     @TempDir Path directory;
 
-    /** exact bound INSERT 真实进入 storage，提交后点查按投影顺序返回并 hydrate external TEXT。 */
+    /** exact bound INSERT 真实维护全部索引，提交后唯一二级点查回表并按投影顺序 hydrate external TEXT。 */
     @Test
     void insertsCommitsAndReadsHydratedLobThroughOpaqueHandle() {
         try (DatabaseEngine database = openDatabase()) {
@@ -40,7 +41,8 @@ class DefaultSqlStorageGatewayTest {
                     new DictionaryStorageMetadataMapper(), Duration.ofSeconds(2));
             String text = "长".repeat(300);
             BoundClusteredInsert insert = new BoundClusteredInsert(table, List.of(
-                    new SqlValue.IntegerValue(BigInteger.ONE), new SqlValue.StringValue(text)));
+                    new SqlValue.IntegerValue(BigInteger.ONE), new SqlValue.StringValue("reader@example.test"),
+                    new SqlValue.StringValue(text)));
             SqlTransactionHandle write = gateway.begin(new SqlTransactionRequest(
                     SqlIsolationLevel.REPEATABLE_READ, false, false));
             assertEquals(1, gateway.insert(write, insert,
@@ -51,8 +53,11 @@ class DefaultSqlStorageGatewayTest {
 
             SqlTransactionHandle read = gateway.begin(new SqlTransactionRequest(
                     SqlIsolationLevel.READ_COMMITTED, true, true));
-            BoundPrimaryPointSelect select = new BoundPrimaryPointSelect(table, List.of(1, 0),
-                    List.of(new SqlValue.IntegerValue(BigInteger.ONE)));
+            IndexDefinition email = table.indexes().stream().filter(index -> !index.clustered())
+                    .findFirst().orElseThrow();
+            BoundPointSelect select = new BoundPointSelect(table, List.of(2, 0), email.id().value(),
+                    PointAccessKind.UNIQUE_SECONDARY,
+                    List.of(new SqlValue.StringValue("READER@example.test")));
             SqlRow row = gateway.selectPoint(read, select,
                     SqlStatementDeadline.after(Duration.ofSeconds(2))).orElseThrow();
             assertEquals(List.of(new SqlValue.StringValue(text),
@@ -103,7 +108,8 @@ class DefaultSqlStorageGatewayTest {
                 return null;
             });
             assertTrue(locked.await(1, TimeUnit.SECONDS));
-            BoundPrimaryPointSelect select = new BoundPrimaryPointSelect(table, List.of(0),
+            BoundPointSelect select = new BoundPointSelect(table, List.of(0),
+                    table.primaryIndex().id().value(), PointAccessKind.CLUSTERED_PRIMARY,
                     List.of(new SqlValue.IntegerValue(BigInteger.ONE)));
             long started = System.nanoTime();
             assertThrows(SqlTransactionStateException.class, () -> gateway.selectPoint(handle, select,
@@ -129,10 +135,14 @@ class DefaultSqlStorageGatewayTest {
         TableDefinition created = database.ddl().createTable(MdlOwnerId.of(300), new CreateTableCommand(
                 QualifiedTableName.of("app", "docs"), PageNo.of(128),
                 List.of(new CreateColumnSpec(ObjectName.of("id"), ColumnTypeDefinition.bigint(false, false)),
+                        new CreateColumnSpec(ObjectName.of("email"), new ColumnTypeDefinition(
+                                DictionaryTypeId.VARCHAR, false, false, 160, 0, 1, 2, List.of())),
                         new CreateColumnSpec(ObjectName.of("body"), new ColumnTypeDefinition(DictionaryTypeId.TEXT,
                                 false, false, 65_535, 0, 1, 1, List.of()))),
                 List.of(new CreateIndexSpec(ObjectName.of("PRIMARY"), true, true,
-                        List.of(new CreateIndexKeyPartSpec(ObjectName.of("id"), IndexOrder.ASC, 0))))),
+                                List.of(new CreateIndexKeyPartSpec(ObjectName.of("id"), IndexOrder.ASC, 0))),
+                        new CreateIndexSpec(ObjectName.of("uq_email"), true, false,
+                                List.of(new CreateIndexKeyPartSpec(ObjectName.of("email"), IndexOrder.ASC, 0))))),
                 Duration.ofSeconds(5));
         try (var lease = database.dictionary().openTable(MdlOwnerId.of(301), QualifiedTableName.of("app", "docs"),
                 TableAccessIntent.WRITE, Duration.ofSeconds(2))) {

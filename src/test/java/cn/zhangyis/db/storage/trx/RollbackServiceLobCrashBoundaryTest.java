@@ -9,9 +9,21 @@ import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.api.DiskSpaceManager;
 import cn.zhangyis.db.storage.api.SegmentRef;
 import cn.zhangyis.db.storage.api.dml.ClusteredInsertCommand;
+import cn.zhangyis.db.storage.api.ddl.BTreeIndexMetadataFactory;
+import cn.zhangyis.db.storage.api.ddl.StorageColumnDefinition;
+import cn.zhangyis.db.storage.api.ddl.StorageColumnType;
+import cn.zhangyis.db.storage.api.ddl.StorageColumnTypeId;
+import cn.zhangyis.db.storage.api.ddl.StorageIndexDefinition;
+import cn.zhangyis.db.storage.api.ddl.StorageIndexKeyPart;
+import cn.zhangyis.db.storage.api.ddl.StorageIndexOrder;
+import cn.zhangyis.db.storage.api.ddl.StorageTableDefinition;
+import cn.zhangyis.db.storage.api.ddl.TableStorageBinding;
+import cn.zhangyis.db.storage.api.dml.TableInsertCommand;
 import cn.zhangyis.db.storage.btree.BTreeIndex;
 import cn.zhangyis.db.storage.btree.BTreeLookupResult;
 import cn.zhangyis.db.storage.btree.IndexMetadataResolver;
+import cn.zhangyis.db.storage.btree.SecondaryIndexMetadata;
+import cn.zhangyis.db.storage.btree.TableIndexMetadata;
 import cn.zhangyis.db.storage.engine.EngineConfig;
 import cn.zhangyis.db.storage.engine.StorageEngine;
 import cn.zhangyis.db.storage.fsp.segment.SegmentPurpose;
@@ -37,6 +49,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -114,6 +127,112 @@ class RollbackServiceLobCrashBoundaryTest {
         }
     }
 
+    /**
+     * 第一棵 secondary inverse 提交后中断时，聚簇行仍作为当前完整行 image；重试必须接受第一棵 entry 已 ABSENT，
+     * 继续撤销第二棵 secondary，最后删除聚簇行并推进 marker。
+     */
+    @Test
+    void retryAfterOneSecondaryInverseCommitConvergesAllIndexes() {
+        StorageEngine engine = new StorageEngine(new EngineConfig(directory, PAGE_SIZE, 256,
+                SpaceId.of(5), PageNo.of(64), 64, 100, Duration.ofSeconds(10), 64L * 1024 * 1024));
+        MutableTargetResolver resolver = new MutableTargetResolver();
+        engine.configureIndexMetadataResolver(resolver);
+        engine.open();
+        try {
+            TableIndexMetadata table = createSecondaryTable(engine, directory.resolve("secondary-crash.ibd"));
+            resolver.install(new UndoTargetMetadata(table, Optional.empty()));
+            LogicalRecord row = secondaryRow(1, "secondary-crash@example.test", 7);
+            Transaction transaction = engine.transactionManager().begin(TransactionOptions.defaults());
+            engine.tableDmlService().insert(new TableInsertCommand(transaction, table, row,
+                    Optional.empty(), Duration.ofSeconds(1)));
+
+            AtomicInteger secondaryCommits = new AtomicInteger();
+            RollbackService crashable = engine.rollbackService().withProgressFaultInjectorForTest((phase, head) -> {
+                if (phase == RollbackProgressPhase.AFTER_SECONDARY_INVERSE_COMMIT
+                        && secondaryCommits.incrementAndGet() == 1) {
+                    throw new DatabaseRuntimeException("simulated crash after first secondary inverse");
+                }
+            });
+
+            assertThrows(DatabaseRuntimeException.class, () -> crashable.rollback(transaction));
+            assertEquals(TransactionState.ROLLING_BACK, transaction.state());
+            assertTrue(clusteredIncludingDeleted(engine, table, 1).isPresent(),
+                    "cluster inverse must remain last");
+            assertTrue(secondaryIncludingDeleted(engine, table.secondaryIndexes().get(0), row).isEmpty());
+            assertTrue(secondaryIncludingDeleted(engine, table.secondaryIndexes().get(1), row).isPresent());
+
+            assertEquals(1, crashable.rollback(transaction).undoRecordsApplied());
+            assertEquals(TransactionState.ROLLED_BACK, transaction.state());
+            assertTrue(clusteredIncludingDeleted(engine, table, 1).isEmpty());
+            assertTrue(secondaryIncludingDeleted(engine, table.secondaryIndexes().get(0), row).isEmpty());
+            assertTrue(secondaryIncludingDeleted(engine, table.secondaryIndexes().get(1), row).isEmpty());
+            engine.lockManager().releaseAll(transaction.transactionId());
+        } finally {
+            engine.close();
+        }
+    }
+
+    /** 创建一棵聚簇树与两棵二级树，供跨树 rollback crash 边界测试使用。 */
+    private static TableIndexMetadata createSecondaryTable(StorageEngine engine, Path dataPath) {
+        StorageTableDefinition definition = new StorageTableDefinition(TABLE_ID, SPACE, dataPath,
+                1, PageNo.of(128),
+                List.of(new StorageColumnDefinition(1, "id", 0,
+                                StorageColumnType.bigint(false, false)),
+                        new StorageColumnDefinition(2, "email", 1,
+                                new StorageColumnType(StorageColumnTypeId.VARCHAR, true,
+                                        160, 0, false, 1, 2, List.of())),
+                        new StorageColumnDefinition(3, "tenant_id", 2,
+                                StorageColumnType.bigint(false, false))),
+                List.of(new StorageIndexDefinition(201, "PRIMARY", true, true,
+                                List.of(new StorageIndexKeyPart(1, StorageIndexOrder.ASC, 0))),
+                        new StorageIndexDefinition(202, "uq_email", true, false,
+                                List.of(new StorageIndexKeyPart(2, StorageIndexOrder.ASC, 0))),
+                        new StorageIndexDefinition(203, "idx_tenant", false, false,
+                                List.of(new StorageIndexKeyPart(3, StorageIndexOrder.ASC, 0)))));
+        TableStorageBinding binding = engine.tableDdlStorageService().createTable(definition);
+        return new BTreeIndexMetadataFactory().createTable(definition, binding);
+    }
+
+    /** 构造 secondary crash 测试使用的完整聚簇行。 */
+    private static LogicalRecord secondaryRow(long id, String email, long tenantId) {
+        return new LogicalRecord(1, List.of(new ColumnValue.IntValue(id),
+                new ColumnValue.StringValue(email), new ColumnValue.IntValue(tenantId)),
+                false, RecordType.CONVENTIONAL);
+    }
+
+    /** 读取包含 delete-marked 状态的聚簇物理记录，并在返回前释放短读 MTR。 */
+    private static Optional<BTreeLookupResult> clusteredIncludingDeleted(StorageEngine engine,
+                                                                          TableIndexMetadata table,
+                                                                          long id) {
+        MiniTransaction read = engine.miniTransactionManager().beginReadOnly();
+        try {
+            Optional<BTreeLookupResult> result = engine.btreeService().lookupIncludingDeleted(
+                    read, table.clusteredIndex(), key(id));
+            engine.miniTransactionManager().commit(read);
+            return result;
+        } catch (RuntimeException failure) {
+            engine.miniTransactionManager().rollbackUncommitted(read);
+            throw failure;
+        }
+    }
+
+    /** 精确读取一条 secondary physical identity，保留其 delete 位。 */
+    private static Optional<BTreeLookupResult> secondaryIncludingDeleted(StorageEngine engine,
+                                                                          SecondaryIndexMetadata secondary,
+                                                                          LogicalRecord row) {
+        LogicalRecord entry = secondary.layout().toEntry(row, false);
+        MiniTransaction read = engine.miniTransactionManager().beginReadOnly();
+        try {
+            Optional<BTreeLookupResult> result = engine.btreeService().lookupIncludingDeleted(
+                    read, secondary.index(), secondary.layout().physicalKey(entry));
+            engine.miniTransactionManager().commit(read);
+            return result;
+        } catch (RuntimeException failure) {
+            engine.miniTransactionManager().rollbackUncommitted(read);
+            throw failure;
+        }
+    }
+
     private Fixture openFixture(String fileName) {
         StorageEngine engine = new StorageEngine(new EngineConfig(directory, PAGE_SIZE, 256,
                 SpaceId.of(5), PageNo.of(64), 64, 100, Duration.ofSeconds(10), 64L * 1024 * 1024));
@@ -121,7 +240,9 @@ class RollbackServiceLobCrashBoundaryTest {
         engine.configureIndexMetadataResolver(resolver);
         engine.open();
         LobIndexSetup setup = createLobClusteredIndex(engine, directory.resolve(fileName));
-        resolver.install(new UndoTargetMetadata(setup.index(), Optional.of(setup.lobSegment())));
+        resolver.install(new UndoTargetMetadata(new TableIndexMetadata(TABLE_ID,
+                setup.index().schema().schemaVersion(), setup.index(), List.of()),
+                Optional.of(setup.lobSegment())));
         return new Fixture(engine, setup);
     }
 

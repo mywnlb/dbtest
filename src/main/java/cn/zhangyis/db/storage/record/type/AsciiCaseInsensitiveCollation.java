@@ -27,7 +27,30 @@ public final class AsciiCaseInsensitiveCollation implements CollationStrategy {
         return Integer.compare(aLength, bLength);
     }
 
-    /** 只折叠 ASCII 大写范围；高位字节与标点不变。 */
+    /**
+     * 把 ASCII A-Z 折叠后的字节作为 equality key，使大小写等价值竞争同一个 unique-key 事务锁。
+     *
+     * @param bytes  包含 ASCII-CI 字段 slice 的底层字节。
+     * @param offset 字段 slice 起始偏移。
+     * @param length 字段 slice 字节长度。
+     * @return 长度与输入相同的新数组；ASCII 大写转为小写，其它字节保持不变。
+     * @throws IndexOutOfBoundsException offset/length 越过数组边界时抛出。
+     */
+    @Override
+    public byte[] equalityKey(byte[] bytes, int offset, int length) {
+        byte[] key = new byte[length];
+        for (int i = 0; i < length; i++) {
+            key[i] = (byte) fold(bytes[offset + i] & 0xFF);
+        }
+        return key;
+    }
+
+    /**
+     * 折叠单个无符号字节的 ASCII 大写范围；高位字节、数字与标点保持不变。
+     *
+     * @param value 0..255 的无符号字节值。
+     * @return A-Z 对应的小写值，其它输入原样返回。
+     */
     private static int fold(int value) {
         return value >= 'A' && value <= 'Z' ? value + ('a' - 'A') : value;
     }

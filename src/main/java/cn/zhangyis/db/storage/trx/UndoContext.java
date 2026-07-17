@@ -12,6 +12,10 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.EnumMap;
 import java.util.List;
+import java.util.NavigableMap;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
 
 /**
  * 事务聚合内部的 undo 子状态。INSERT/UPDATE 各有独立 slot、segment 和局部逻辑链；事务只共享全局单调
@@ -29,6 +33,8 @@ public final class UndoContext {
     private final List<TransactionSavepoint> savepointStack = new ArrayList<>();
     /** 同一 context 内保存点创建序号，只用于诊断与稳定归属。 */
     private long nextSavepointSequence;
+    /** 当前 UPDATE logical head 可达记录的 undoNo→tableId；marker 发布后按新 head 裁剪，供 commit history 投影。 */
+    private final NavigableMap<Long, Long> updateAffectedTables = new TreeMap<>();
 
     /** 构造尚未创建任何物理 log 的事务 undo 上下文。 */
     public UndoContext(RollbackSegmentId rollbackSegmentId) {
@@ -86,12 +92,69 @@ public final class UndoContext {
 
     /** append MTR 成功后原子发布全局高水位和目标局部头。 */
     void publishAppend(UndoLogKind kind, UndoNo undoNo, RollPointer pointer) {
-        publishAppend(kind, undoNo, pointer, null);
+        publishAppendInternal(kind, undoNo, pointer, null, null);
+    }
+
+    /**
+     * UPDATE append MTR 成功后同时发布 logical head 与 record 所属表；INSERT table id 不进入 committed history 投影。
+     *
+     * @param kind    已提交 append 所属 INSERT/UPDATE undo log kind。
+     * @param undoNo  本事务全局严格递增的 undo number。
+     * @param pointer 新 record 的稳定 roll pointer。
+     * @param tableId UPDATE/DELETE record 所属的正稳定表 id。
+     * @throws DatabaseValidationException 表 id、head identity 或目标 undo binding 无效时抛出。
+     */
+    void publishAppend(UndoLogKind kind, UndoNo undoNo, RollPointer pointer, long tableId) {
+        if (tableId <= 0L) {
+            throw new DatabaseValidationException("undo append affected table id must be positive");
+        }
+        publishAppendInternal(kind, undoNo, pointer, null, tableId);
     }
 
     /** 生产 append 同时发布供下一次无 IO 规划使用的权威物理快照。 */
     void publishAppend(UndoLogKind kind, UndoNo undoNo, RollPointer pointer,
                        UndoAppendSnapshot appendSnapshot) {
+        publishAppendInternal(kind, undoNo, pointer, appendSnapshot, null);
+    }
+
+    /**
+     * 生产 UPDATE append 在 MTR commit 后同时发布 logical head、物理 append 快照和精确 table id。
+     *
+     * @param kind           已提交 append 所属 undo log kind；记录表投影时必须为 UPDATE。
+     * @param undoNo         本事务全局严格递增的 undo number。
+     * @param pointer        新 record 的稳定 roll pointer。
+     * @param appendSnapshot 供下一次规划复用的已提交 first/record-page 物理快照。
+     * @param tableId        本条 UPDATE/DELETE record 所属的正稳定表 id。
+     * @throws DatabaseValidationException identity、binding、单调性或表 id 无效时抛出。
+     */
+    void publishAppend(UndoLogKind kind, UndoNo undoNo, RollPointer pointer,
+                       UndoAppendSnapshot appendSnapshot, long tableId) {
+        if (tableId <= 0L) {
+            throw new DatabaseValidationException("undo append affected table id must be positive");
+        }
+        publishAppendInternal(kind, undoNo, pointer, appendSnapshot, tableId);
+    }
+
+    /**
+     * 原子发布一次已经 durable/committed 的 undo append 结果到事务内存上下文；本方法不写页、不产生 redo。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 head identity、目标 binding 与全局 undoNo 单调性，拒绝重复/乱序发布。</li>
+     *     <li>按是否携带物理快照更新对应 INSERT/UPDATE binding 的局部 logical head。</li>
+     *     <li>推进事务全局 undoNo；UPDATE 且带 table id 时记录 undoNo→table，用于 commit history 投影。</li>
+     * </ol>
+     *
+     * @param kind           目标 INSERT 或 UPDATE undo binding 种类。
+     * @param undoNo         已提交 record 的全局单调 undo number。
+     * @param pointer        已提交 record 的稳定 roll pointer。
+     * @param appendSnapshot 可选已提交物理尾快照；低层兼容路径可为 {@code null}。
+     * @param tableId        可选 UPDATE record 表 id；INSERT 或兼容路径可为 {@code null}。
+     * @throws DatabaseValidationException 字段缺失、binding 不存在、undoNo 不前进或表投影非法时抛出。
+     */
+    private void publishAppendInternal(UndoLogKind kind, UndoNo undoNo, RollPointer pointer,
+                                       UndoAppendSnapshot appendSnapshot, Long tableId) {
+        // 1. 内存发布只能消费已提交结果，identity/单调性错误表示调用顺序损坏。
         if (undoNo == null || pointer == null) {
             throw new DatabaseValidationException("undo append publication fields must not be null");
         }
@@ -103,13 +166,27 @@ public final class UndoContext {
             throw new DatabaseValidationException("global undo number must advance: current="
                     + lastUndoNo.value() + ", next=" + undoNo.value());
         }
+        // 2. binding 局部 head 与可选物理快照一起更新，供下一次 append 无 IO 规划。
         UndoLogicalHead head = new UndoLogicalHead(undoNo, pointer);
         if (appendSnapshot == null) {
             binding.publishHead(head);
         } else {
             binding.publishAppend(head, appendSnapshot);
         }
+        // 3. 全局高水位与 affected-table side projection 在同一事务线程内顺序发布。
         lastUndoNo = undoNo;
+        if (kind == UndoLogKind.UPDATE && tableId != null) {
+            updateAffectedTables.put(undoNo.value(), tableId);
+        }
+    }
+
+    /**
+     * 返回当前仍位于 UPDATE logical chain 中的 affected-table 去重排序快照。
+     *
+     * @return 按 table id 升序的不可变集合；statement/full rollback marker 已剪除的记录不再贡献表引用。
+     */
+    public Set<Long> affectedTableIds() {
+        return Set.copyOf(new TreeSet<>(updateAffectedTables.values()));
     }
 
     /** full/recovery marker 已提交后，只发布所属 kind 的新局部头；全局物理高水位保持不变。 */
@@ -118,6 +195,7 @@ public final class UndoContext {
             throw new DatabaseValidationException("rollback progress requires an existing binding and head");
         }
         binding(kind).publishHead(persistedHead);
+        pruneAffectedTables(kind, persistedHead);
         savepointStack.clear();
     }
 
@@ -149,6 +227,7 @@ public final class UndoContext {
         for (UndoLogBinding binding : bindings.values()) {
             binding.publishHead(UndoLogicalHead.EMPTY);
         }
+        updateAffectedTables.clear();
         savepointStack.clear();
     }
 
@@ -181,6 +260,18 @@ public final class UndoContext {
             return;
         }
         binding.publishHead(head);
+        pruneAffectedTables(kind, head);
+    }
+
+    private void pruneAffectedTables(UndoLogKind kind, UndoLogicalHead head) {
+        if (kind != UndoLogKind.UPDATE) {
+            return;
+        }
+        if (head.isEmpty()) {
+            updateAffectedTables.clear();
+            return;
+        }
+        updateAffectedTables.tailMap(head.undoNo().value(), false).clear();
     }
 
     private static void requireOrdinaryKind(UndoLogKind kind) {

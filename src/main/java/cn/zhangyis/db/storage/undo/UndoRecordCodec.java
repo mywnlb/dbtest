@@ -27,8 +27,10 @@ import java.util.List;
  * 公共：[type u8][undoNo u64][transactionId u64][tableId u64][indexId u64][prevRollPointer 7B][keyColCount u8]
  *       后跟每个 key 列：[nullFlag u8]（非 null 再 [len u16][bytes]）
  * UPDATE_ROW 追加尾部：[oldDbTrxId u64][oldDbRollPtr 7B][rowColCount u8] 后跟每个 row 列（同 framing，按 schema 全列序）
+ * 可选 secondary 尾部：[magic "SI" u16][version u8][count u16]，每项 [indexId u64][action u8][beforeState u8]
  * </pre>
- * INSERT_ROW 无尾部。{@code type} 首字节与 v2 普通 UNDO 页复制的 {@link UndoLogKind} 共同守门：INSERT log 仅容纳
+ * INSERT_ROW 可先带既有 LOB ownership 尾部，再带 secondary 尾部；两者都为空时编码与旧版本逐字节一致。
+ * {@code type} 首字节与 v2 普通 UNDO 页复制的 {@link UndoLogKind} 共同守门：INSERT log 仅容纳
  * INSERT_ROW，UPDATE log 仅容纳 UPDATE_ROW/DELETE_MARK。
  *
  * <p><b>为什么自带 framing</b>：undo record 无 record 页的 NullBitmap/变长目录，而 {@link TypeCodec} 约定 NULL 不由
@@ -44,8 +46,21 @@ public final class UndoRecordCodec {
     /** ownership 尾部首版；未来扩展必须追加版本并保留 v1 decoder，不能静默重解释。 */
     private static final int INSERT_LOB_TAIL_VERSION = 1;
 
+    /** secondary mutation 尾部 magic：ASCII "SI"；与 INSERT 的 "LO" 区分，便于旧 EOF 与双尾顺序判定。 */
+    private static final int SECONDARY_TAIL_MAGIC = 0x5349;
+
+    /** secondary mutation 尾部首版；未知版本必须 fail-closed，不能按 v1 猜测恢复动作。 */
+    private static final int SECONDARY_TAIL_VERSION = 1;
+
+    /** key/旧 image 列值编码使用的稳定类型 codec 注册表；构造后只读，可跨线程共享。 */
     private final TypeCodecRegistry registry;
 
+    /**
+     * 创建 undo record codec。
+     *
+     * @param registry 必须与 record/B+Tree 使用相同稳定类型定义的 codec 注册表。
+     * @throws DatabaseValidationException 注册表为空时抛出，防止编码/解码类型协议无法确定。
+     */
     public UndoRecordCodec(TypeCodecRegistry registry) {
         if (registry == null) {
             throw new DatabaseValidationException("undo record codec registry must not be null");
@@ -54,10 +69,24 @@ public final class UndoRecordCodec {
     }
 
     /**
-     * 编码一条 INSERT undo record。数据流：写定长前缀（type/undoNo/事务/表/索引/prev 指针）→ 写 keyColCount →
-     * 逐列按 schema 类型自带 framing 编码。非 INSERT_ROW 或 key 列数与 keyDef 不符抛 {@link DatabaseValidationException}。
+     * 按稳定 big-endian 协议编码一条 INSERT/UPDATE/DELETE undo record；空可选 tail 保持旧编码逐字节兼容。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 record、key definition、schema 和聚簇 key part 数，任何错误在创建输出前失败。</li>
+     *     <li>写固定 identity/链前缀，再按 key part 对应列类型写带 null/length framing 的完整聚簇键。</li>
+     *     <li>INSERT 先写可选 LOB ownership；UPDATE/DELETE 写旧隐藏列与全量旧 image。</li>
+     *     <li>最后写可选 secondary mutation tail，并返回独立字节数组；尾部顺序固定，不能按调用方列表动态互换。</li>
+     * </ol>
+     *
+     * @param rec    领域约束已由 {@link UndoRecord} 校验的逻辑 undo record。
+     * @param keyDef exact-version 聚簇主键定义，用于解释 {@code clusterKey} 每个 part 的 source column。
+     * @param schema exact-version 完整聚簇表 schema，用于类型编码主键和旧 image。
+     * @return 从 offset 0 开始、无额外尾随空间的稳定磁盘协议字节。
+     * @throws DatabaseValidationException 参数缺失、key part 数/类型、LOB column 或可选 tail count 无效时抛出。
      */
     public byte[] encode(UndoRecord rec, IndexKeyDef keyDef, TableSchema schema) {
+        // 1. 形状校验先于 ByteArrayOutputStream 创建，失败不会产生可被误写盘的部分编码。
         if (rec == null || keyDef == null || schema == null) {
             throw new DatabaseValidationException("undo encode args must not be null");
         }
@@ -66,6 +95,7 @@ public final class UndoRecordCodec {
             throw new DatabaseValidationException("clusterKey size " + rec.clusterKey().size()
                     + " != key parts " + parts.size());
         }
+        // 2. 公共前缀和聚簇键是 identity/peek 的稳定基础，所有类型共享完全相同的 framing。
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         out.write(rec.type().code());
         writeU64(out, rec.undoNo().value());
@@ -79,6 +109,7 @@ public final class UndoRecordCodec {
             ColumnType ct = schema.column(parts.get(i).columnId().value()).type();
             writeFramedColumn(out, v, ct);
         }
+        // 3. 类型专用 payload：INSERT 的 LOB tail 必须先于 secondary；UPDATE/DELETE 固定保存旧版本。
         if (rec.type() == UndoRecordType.INSERT_ROW && !rec.insertedLobs().isEmpty()) {
             writeInsertedLobTail(out, rec.insertedLobs(), schema);
         }
@@ -91,6 +122,10 @@ public final class UndoRecordCodec {
             for (int i = 0; i < row.size(); i++) {
                 writeFramedColumn(out, row.get(i), schema.column(i).type());
             }
+        }
+        // 4. secondary tail 始终位于记录末尾；空列表不写 magic，旧 decoder/旧记录都以 EOF 保持兼容。
+        if (!rec.secondaryMutations().isEmpty()) {
+            writeSecondaryTail(out, rec.secondaryMutations());
         }
         return out.toByteArray();
     }
@@ -111,10 +146,29 @@ public final class UndoRecordCodec {
     }
 
     /**
-     * 解码一条 INSERT undo record（从 {@code off} 起）。任何越界/字段不符/落盘类型非 INSERT_ROW 抛
-     * {@link UndoLogFormatException}（物理损坏，不静默跳过）。
+     * 从指定偏移解码完整 INSERT/UPDATE/DELETE undo record。任何截断、未知类型/tail 或 schema 形状错配都按
+     * 物理格式损坏 fail-closed，禁止跳过未知字节继续 recovery。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验容器参数，从固定前缀读取 type、undo/transaction/table/index identity 与局部链前驱。</li>
+     *     <li>按 exact key definition/schema 解码带 framing 的完整聚簇键，并核对落盘 key part 数。</li>
+     *     <li>INSERT 按固定顺序识别可选 LOB tail 与 secondary tail，要求消费到 EOF 后构造 INSERT_ROW record。</li>
+     *     <li>UPDATE/DELETE 解码旧隐藏列和全量旧 image，列数必须等于 exact-version schema。</li>
+     *     <li>解码可选 secondary tail，要求 action 与主 type 一致且消费到 EOF，再构造对应领域 record。</li>
+     * </ol>
+     *
+     * @param buf    包含一条完整 undo record 的字节数组。
+     * @param off    record 固定前缀起始偏移；必须位于数组有效范围。
+     * @param keyDef exact-version 聚簇主键定义。
+     * @param schema exact-version 完整聚簇表 schema。
+     * @return 字段集合已防御性冻结、可直接供 rollback/MVCC 使用的 UndoRecord。
+     * @throws DatabaseValidationException 参数容器缺失时抛出。
+     * @throws UndoLogFormatException offset 越界、记录截断、type/magic/version/code 未知、字段数/类型/排序/action
+     *                                不满足磁盘协议或存在尾随垃圾时抛出。
      */
     public UndoRecord decode(byte[] buf, int off, IndexKeyDef keyDef, TableSchema schema) {
+        // 1. 先校验调用容器，再读取所有类型共享的固定 identity 与局部链前驱。
         if (buf == null || keyDef == null || schema == null) {
             throw new DatabaseValidationException("undo decode args must not be null");
         }
@@ -133,7 +187,7 @@ public final class UndoRecordCodec {
         }
         RollPointer prev = RollPointer.decode(buf, c[0]);
         c[0] += RollPointer.BYTES;
-        // 公共 key 段（INSERT/UPDATE 一致）：keyColCount + 每列 framing（按 keyDef part 的列类型）。
+        // 2. 公共 key 段按 keyDef part 的 source column 类型解码，落盘 part 数必须精确一致。
         int keyColCount = readU8(buf, c);
         List<KeyPartDef> parts = keyDef.parts();
         if (keyColCount != parts.size()) {
@@ -143,14 +197,21 @@ public final class UndoRecordCodec {
         for (int i = 0; i < keyColCount; i++) {
             key.add(readFramedColumn(buf, c, schema.column(parts.get(i).columnId().value()).type(), "key col " + i));
         }
+        // 3. INSERT 兼容三种尾部形状：EOF、仅 LOB/secondary，以及固定 LOB -> secondary 双尾。
         if (typeCode == UndoRecordType.INSERT_ROW.code()) {
-            List<InsertedLobOwnership> ownerships = c[0] == buf.length
-                    ? List.of() : readInsertedLobTail(buf, c, schema);
+            List<InsertedLobOwnership> ownerships = List.of();
+            List<SecondaryUndoMutation> mutations = List.of();
+            if (c[0] < buf.length && peekU16(buf, c[0]) == INSERT_LOB_TAIL_MAGIC) {
+                ownerships = readInsertedLobTail(buf, c, schema);
+            }
+            if (c[0] < buf.length) {
+                mutations = readSecondaryTail(buf, c, UndoRecordType.INSERT_ROW);
+            }
             requireFullyConsumed(buf, c[0]);
             return UndoRecord.insert(UndoNo.of(undoNo), TransactionId.of(txn), tableId, indexId, key,
-                    ownerships, prev);
+                    ownerships, mutations, prev);
         }
-        // UPDATE_ROW / DELETE_MARK 尾部：旧隐藏列 + 全量旧 image（按 schema 全列序）。
+        // 4. UPDATE/DELETE 必须携带旧隐藏列和 exact schema 全列旧 image，缺列/多列均为恢复歧义。
         long oldTrx = readU64(buf, c);
         if (c[0] + RollPointer.BYTES > buf.length) {
             throw new UndoLogFormatException("undo record truncated (old roll pointer)");
@@ -167,13 +228,17 @@ public final class UndoRecordCodec {
         for (int i = 0; i < rowColCount; i++) {
             oldRow.add(readFramedColumn(buf, c, schema.column(i).type(), "old row col " + i));
         }
+        // 5. secondary tail 位于 UPDATE/DELETE 旧 image 后；action 必须由主 record type 唯一决定。
+        UndoRecordType recordType = UndoRecordType.fromCode(typeCode);
+        List<SecondaryUndoMutation> mutations = c[0] == buf.length
+                ? List.of() : readSecondaryTail(buf, c, recordType);
         requireFullyConsumed(buf, c[0]);
         if (typeCode == UndoRecordType.UPDATE_ROW.code()) {
             return UndoRecord.update(UndoNo.of(undoNo), TransactionId.of(txn), tableId, indexId, key,
-                    oldRow, oldHidden, prev);
+                    oldRow, oldHidden, mutations, prev);
         }
         return UndoRecord.deleteMark(UndoNo.of(undoNo), TransactionId.of(txn), tableId, indexId, key,
-                oldRow, oldHidden, prev);
+                oldRow, oldHidden, mutations, prev);
     }
 
     /**
@@ -305,6 +370,121 @@ public final class UndoRecordCodec {
         if (columnType.storageKind() != StorageKind.OVERFLOW_CAPABLE) {
             throw new DatabaseValidationException("inserted LOB ownership targets non-LOB column: " + ordinal);
         }
+    }
+
+    /**
+     * 写 secondary mutation 可选尾部。领域对象已保证 index id 严格递增、action/type 与 state 组合合法；
+     * codec 仍冻结 count 与稳定 enum code，避免 write plan 之后出现集合迭代顺序漂移。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 tail 非空且 count 可由 u16 表示，失败不写 magic，避免留下可误判的部分尾部。</li>
+     *     <li>写稳定 magic、version 与 count framing。</li>
+     *     <li>按领域对象既定 index id 顺序写 identity/action/before-state，不重排或猜测默认值。</li>
+     * </ol>
+     *
+     * @param out       已写完公共和类型专用 payload 的目标输出；方法不关闭它。
+     * @param mutations 按 index id 严格递增、action/type 已由 UndoRecord 校验的非空列表。
+     * @throws DatabaseValidationException 列表为空或数量超过 u16 上限时抛出。
+     */
+    private static void writeSecondaryTail(ByteArrayOutputStream out,
+                                           List<SecondaryUndoMutation> mutations) {
+        // 1. 在写 magic 前验证 count，失败不会产生无法回退的半个 tail。
+        if (mutations.isEmpty() || mutations.size() > 0xFFFF) {
+            throw new DatabaseValidationException(
+                    "secondary undo tail count must be between 1 and 65535: " + mutations.size());
+        }
+        // 2. magic/version/count 是未来协议演进与 fail-closed 解码的边界。
+        writeU16(out, SECONDARY_TAIL_MAGIC);
+        out.write(SECONDARY_TAIL_VERSION);
+        writeU16(out, mutations.size());
+        // 3. 保持领域列表的稳定顺序，恢复阶段据此获得确定的跨树 inverse 顺序。
+        for (SecondaryUndoMutation mutation : mutations) {
+            writeU64(out, mutation.indexId());
+            out.write(mutation.action().code());
+            out.write(mutation.newEntryBeforeState().code());
+        }
+    }
+
+    /**
+     * 解码并验证 secondary mutation 尾部。任何未知 magic/version/code、空列表、倒序/重复 index 或与 undo type
+     * 不兼容的 action/state 都是物理恢复歧义，统一转为 {@link UndoLogFormatException}，禁止泄漏普通参数异常。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取并校验 magic/version/count，未知协议和显式空 tail 立即按格式损坏失败。</li>
+     *     <li>由主 undo type 计算唯一合法 action，防止 tail 自行重解释聚簇操作。</li>
+     *     <li>逐项读取 index id/action/before-state，校验 identity 递增和动作组合；普通领域异常包装为格式损坏并保留 cause。</li>
+     *     <li>返回不可变列表；cursor 精确指向 tail 末尾，由调用方统一检查 EOF/尾随垃圾。</li>
+     * </ol>
+     *
+     * @param buf        包含 secondary tail 的完整 undo record 字节。
+     * @param cursor     单元素可变偏移；输入指向 tail magic，成功后推进到 tail 末尾。
+     * @param recordType 已由公共前缀验证的主 undo type，决定唯一合法 secondary action。
+     * @return 按 index id 严格递增的不可变 secondary mutation 列表。
+     * @throws UndoLogFormatException tail 截断、协议字段未知、count/identity/action/state 无效时抛出。
+     */
+    private static List<SecondaryUndoMutation> readSecondaryTail(byte[] buf, int[] cursor,
+                                                                  UndoRecordType recordType) {
+        // 1. 先守住协议 framing，未知版本不能按当前布局猜测字段边界。
+        int magic = readU16(buf, cursor);
+        if (magic != SECONDARY_TAIL_MAGIC) {
+            throw new UndoLogFormatException("unknown secondary undo tail magic: " + magic);
+        }
+        int version = readU8(buf, cursor);
+        if (version != SECONDARY_TAIL_VERSION) {
+            throw new UndoLogFormatException("unknown secondary undo tail version: " + version);
+        }
+        int count = readU16(buf, cursor);
+        if (count == 0) {
+            throw new UndoLogFormatException("secondary undo tail must not encode an empty list");
+        }
+        // 2. 主 record type 是 action 的唯一权威，tail 中每项都必须与之相同。
+        List<SecondaryUndoMutation> mutations = new ArrayList<>(count);
+        long previousIndexId = -1;
+        SecondaryUndoAction expectedAction = switch (recordType) {
+            case INSERT_ROW -> SecondaryUndoAction.INSERT_ENTRY;
+            case UPDATE_ROW -> SecondaryUndoAction.CHANGE_KEY;
+            case DELETE_MARK -> SecondaryUndoAction.DELETE_MARK_ENTRY;
+        };
+        // 3. 逐项验证稳定顺序与 action/state；任何领域校验失败都升级为磁盘格式异常。
+        for (int i = 0; i < count; i++) {
+            long indexId = readU64(buf, cursor);
+            if (indexId < 0 || indexId <= previousIndexId) {
+                throw new UndoLogFormatException(
+                        "secondary undo index id is negative/duplicate/out-of-order: " + indexId);
+            }
+            previousIndexId = indexId;
+            try {
+                SecondaryUndoAction action = SecondaryUndoAction.fromCode(readU8(buf, cursor));
+                SecondaryEntryBeforeState beforeState = SecondaryEntryBeforeState.fromCode(readU8(buf, cursor));
+                if (action != expectedAction) {
+                    throw new UndoLogFormatException(recordType + " secondary tail contains action " + action
+                            + " instead of " + expectedAction);
+                }
+                mutations.add(new SecondaryUndoMutation(indexId, action, beforeState));
+            } catch (UndoLogFormatException formatFailure) {
+                throw formatFailure;
+            } catch (DatabaseRuntimeException invalidValue) {
+                throw new UndoLogFormatException(
+                        "invalid secondary undo mutation at position " + i, invalidValue);
+            }
+        }
+        // 4. 防御性冻结后返回；EOF/尾随垃圾由 decode 的 requireFullyConsumed 统一判断。
+        return List.copyOf(mutations);
+    }
+
+    /**
+     * 查看指定偏移的下一个 u16 magic 而不推进调用方 cursor。
+     *
+     * @param buf    完整 undo record 字节。
+     * @param offset 待探测 tail 的起始偏移。
+     * @return big-endian 无符号 u16 magic。
+     * @throws UndoLogFormatException 剩余字节不足两个时抛出，表示截断 tail。
+     */
+    private static int peekU16(byte[] buf, int offset) {
+        int[] cursor = {offset};
+        return readU16(buf, cursor);
     }
 
     private static void writeU16(ByteArrayOutputStream out, int v) {

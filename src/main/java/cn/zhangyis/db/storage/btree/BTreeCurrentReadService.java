@@ -180,7 +180,7 @@ public final class BTreeCurrentReadService {
         if (index == null || key == null || request == null) {
             throw new DatabaseValidationException("unique current-read args must not be null");
         }
-        if (!index.unique()) {
+        if (!index.physicalUnique()) {
             throw new DatabaseValidationException("unique current-read requires unique index: " + index.indexId());
         }
     }

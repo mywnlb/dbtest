@@ -15,11 +15,24 @@ import cn.zhangyis.db.dd.recovery.DictionaryDdlRecoveryService;
 import cn.zhangyis.db.dd.service.DataDictionaryService;
 import cn.zhangyis.db.dd.service.TableAccessIntent;
 import cn.zhangyis.db.engine.DatabaseEngine;
+import cn.zhangyis.db.engine.adapter.DictionaryIndexMetadataResolver;
+import cn.zhangyis.db.engine.adapter.DictionaryStorageMetadataMapper;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.engine.EngineConfig;
 import cn.zhangyis.db.storage.engine.StorageEngine;
+import cn.zhangyis.db.storage.api.TablePurgeBarrier;
+import cn.zhangyis.db.storage.api.TablePurgeBarrierTimeoutException;
+import cn.zhangyis.db.storage.api.dml.DmlCommitCommand;
+import cn.zhangyis.db.storage.api.dml.TableInsertCommand;
+import cn.zhangyis.db.storage.api.dml.TableUpdateCommand;
+import cn.zhangyis.db.storage.record.format.LogicalRecord;
+import cn.zhangyis.db.storage.record.format.RecordType;
+import cn.zhangyis.db.storage.record.page.SearchKey;
+import cn.zhangyis.db.storage.record.type.ColumnValue;
+import cn.zhangyis.db.storage.redo.DurabilityPolicy;
+import cn.zhangyis.db.storage.trx.TransactionOptions;
 import cn.zhangyis.db.storage.api.catalog.CatalogBatch;
 import cn.zhangyis.db.storage.api.catalog.CatalogRecord;
 import cn.zhangyis.db.storage.api.catalog.InternalCatalogPersistenceException;
@@ -32,6 +45,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -89,6 +106,129 @@ class DictionaryDdlServiceTest {
         }
     }
 
+    /** DROP 必须在发布 DROP_PENDING 前等待 purge barrier；超时后 catalog/cache/文件仍保持 ACTIVE 可用状态。 */
+    @Test
+    void dropTimeoutAtPurgeBarrierKeepsTableActive() {
+        StorageEngine storage = new StorageEngine(config());
+        storage.open();
+        try (FileInternalCatalogStore catalog = FileInternalCatalogStore.openOrCreate(
+                directory.resolve("barrier-mysql.ibd"));
+             DictionaryControlStore control = DictionaryControlStore.openOrCreate(
+                     directory.resolve("barrier-mysql.dd.ctrl"), SpaceId.of(1), 1024)) {
+            PersistentDictionaryRepository repository = new PersistentDictionaryRepository(catalog);
+            DictionaryObjectCache cache = new DictionaryObjectCache(16);
+            MetadataLockManager locks = new MetadataLockManager(8, 128);
+            Path tables = directory.resolve("barrier-tables");
+            DictionaryDdlService creator = new DictionaryDdlService(control, repository, cache, locks,
+                    storage.tableDdlStorageService(), tables);
+            creator.createSchema(MdlOwnerId.of(40), ObjectName.of("app"), 1, 1, Duration.ofSeconds(5));
+            var table = creator.createTable(MdlOwnerId.of(40), command(), Duration.ofSeconds(5));
+            Path tableFile = table.storageBinding().orElseThrow().path();
+            TablePurgeBarrier blocking = new TablePurgeBarrier() {
+                @Override
+                public void awaitUnreferenced(long tableId, Duration timeout) {
+                    throw new TablePurgeBarrierTimeoutException(
+                            "synthetic table history reference: " + tableId);
+                }
+
+                @Override
+                public int referenceCount(long tableId) {
+                    return 1;
+                }
+            };
+            DictionaryDdlService blocked = new DictionaryDdlService(control, repository, cache, locks,
+                    storage.tableDdlStorageService(), tables, blocking);
+
+            assertThrows(TablePurgeBarrierTimeoutException.class, () -> blocked.dropTable(
+                    MdlOwnerId.of(40), QualifiedTableName.of("app", "orders"), Duration.ofMillis(20)));
+
+            assertEquals(TableState.ACTIVE, repository.findTableForRecovery(table.id()).orElseThrow().state());
+            assertTrue(Files.exists(tableFile));
+            try (var lease = new DataDictionaryService(repository, cache, locks).openTable(
+                    MdlOwnerId.of(41), QualifiedTableName.of("app", "orders"), TableAccessIntent.READ,
+                    Duration.ofSeconds(1))) {
+                assertEquals(table.id(), lease.table().id());
+            }
+        } finally {
+            storage.close();
+        }
+    }
+
+    /** DROP 在真实 history 引用上等待；purge finalization 发布引用减少后唤醒同一 Condition 并继续物理删除。 */
+    @Test
+    void purgeFinalizationWakesWaitingDrop() throws Exception {
+        Path tables = directory.resolve("purge-wake-tables");
+        try (FileInternalCatalogStore catalog = FileInternalCatalogStore.openOrCreate(
+                directory.resolve("purge-wake-mysql.ibd"));
+             DictionaryControlStore control = DictionaryControlStore.openOrCreate(
+                     directory.resolve("purge-wake-mysql.dd.ctrl"), SpaceId.of(1), 1024)) {
+            PersistentDictionaryRepository repository = new PersistentDictionaryRepository(catalog);
+            StorageEngine storage = new StorageEngine(config());
+            storage.configureIndexMetadataResolver(new DictionaryIndexMetadataResolver(repository));
+            storage.open();
+            try {
+                DictionaryObjectCache cache = new DictionaryObjectCache(16);
+                MetadataLockManager locks = new MetadataLockManager(8, 128);
+                CountDownLatch barrierEntered = new CountDownLatch(1);
+                TablePurgeBarrier observedBarrier = new TablePurgeBarrier() {
+                    private final TablePurgeBarrier delegate = storage.tablePurgeBarrier();
+
+                    @Override
+                    public void awaitUnreferenced(long tableId, Duration timeout) {
+                        barrierEntered.countDown();
+                        delegate.awaitUnreferenced(tableId, timeout);
+                    }
+
+                    @Override
+                    public int referenceCount(long tableId) {
+                        return delegate.referenceCount(tableId);
+                    }
+                };
+                DictionaryDdlService ddl = new DictionaryDdlService(control, repository, cache, locks,
+                        storage.tableDdlStorageService(), tables, observedBarrier);
+                ddl.createSchema(MdlOwnerId.of(60), ObjectName.of("app"), 1, 1, Duration.ofSeconds(5));
+                var table = ddl.createTable(MdlOwnerId.of(60), updateCommand(), Duration.ofSeconds(5));
+                var mapped = new DictionaryStorageMetadataMapper().map(table);
+                long schemaVersion = mapped.tableIndexes().schemaVersion();
+                LogicalRecord before = new LogicalRecord(schemaVersion,
+                        List.of(new ColumnValue.IntValue(1), new ColumnValue.IntValue(10)),
+                        false, RecordType.CONVENTIONAL);
+                LogicalRecord after = new LogicalRecord(schemaVersion,
+                        List.of(new ColumnValue.IntValue(1), new ColumnValue.IntValue(20)),
+                        false, RecordType.CONVENTIONAL);
+                var insert = storage.transactionManager().begin(TransactionOptions.defaults());
+                storage.tableDmlService().insert(new TableInsertCommand(insert, mapped.tableIndexes(), before,
+                        Optional.empty(), Duration.ofSeconds(5)));
+                storage.tableDmlService().commit(new DmlCommitCommand(
+                        insert, DurabilityPolicy.FLUSH_ON_COMMIT, Duration.ofSeconds(5)));
+                var update = storage.transactionManager().begin(TransactionOptions.defaults());
+                storage.tableDmlService().update(new TableUpdateCommand(update, mapped.tableIndexes(),
+                        new SearchKey(List.of(new ColumnValue.IntValue(1))), after, Duration.ofSeconds(5)));
+                storage.tableDmlService().commit(new DmlCommitCommand(
+                        update, DurabilityPolicy.FLUSH_ON_COMMIT, Duration.ofSeconds(5)));
+                assertEquals(1, storage.tablePurgeBarrier().referenceCount(table.id().value()));
+                Path tableFile = table.storageBinding().orElseThrow().path();
+
+                try (var executor = Executors.newSingleThreadExecutor()) {
+                    var drop = executor.submit(() -> ddl.dropTable(MdlOwnerId.of(60),
+                            QualifiedTableName.of("app", "orders"), Duration.ofSeconds(2)));
+                    assertTrue(barrierEntered.await(1, TimeUnit.SECONDS));
+                    assertFalse(drop.isDone(), "DROP must remain blocked while committed history references table");
+
+                    assertEquals(1, storage.purgeCoordinator().runBatch(1).purgedLogs());
+                    drop.get(2, TimeUnit.SECONDS);
+                }
+
+                assertEquals(0, storage.tablePurgeBarrier().referenceCount(table.id().value()));
+                assertFalse(Files.exists(tableFile));
+                assertEquals(TableState.DROPPED,
+                        repository.findTableForRecovery(table.id()).orElseThrow().state());
+            } finally {
+                storage.close();
+            }
+        }
+    }
+
     /** DROP_PENDING durable 后崩溃时，恢复使用持久 binding 删除文件并以新的单调版本收敛 DROPPED。 */
     @Test
     void recoversCrashAfterDropPendingPublish() {
@@ -133,6 +273,53 @@ class DictionaryDdlServiceTest {
                     repository.findTableForRecovery(table.id()).orElseThrow().state());
             assertTrue(repository.snapshot().publishedVersion().value() > 5,
                     "recovery version must remain monotonic even when reserved version 5 was never published");
+        } finally {
+            storage.close();
+        }
+    }
+
+    /** DROP_PENDING recovery 物理删除前必须再次检查 barrier；超时保持 pending 和文件，阻止上层 OPEN。 */
+    @Test
+    void pendingDropRecoveryDoesNotCrossPurgeBarrier() {
+        StorageEngine storage = new StorageEngine(config());
+        storage.open();
+        Path tables = directory.resolve("pending-barrier-tables");
+        try (FileInternalCatalogStore catalog = FileInternalCatalogStore.openOrCreate(
+                directory.resolve("pending-barrier-mysql.ibd"));
+             DictionaryControlStore control = DictionaryControlStore.openOrCreate(
+                     directory.resolve("pending-barrier-mysql.dd.ctrl"), SpaceId.of(1), 1024)) {
+            PersistentDictionaryRepository repository = new PersistentDictionaryRepository(catalog);
+            DictionaryObjectCache cache = new DictionaryObjectCache(16);
+            MetadataLockManager locks = new MetadataLockManager(8, 128);
+            DictionaryDdlService ddl = new DictionaryDdlService(control, repository, cache, locks,
+                    storage.tableDdlStorageService(), tables);
+            ddl.createSchema(MdlOwnerId.of(50), ObjectName.of("app"), 1, 1, Duration.ofSeconds(5));
+            var table = ddl.createTable(MdlOwnerId.of(50), command(), Duration.ofSeconds(5));
+            DictionaryDdlService crashing = new DictionaryDdlService(control, repository, cache, locks,
+                    storage.tableDdlStorageService(), tables,
+                    pending -> { throw new DictionaryDdlException("injected crash after DROP_PENDING"); });
+            assertThrows(DictionaryDdlException.class, () -> crashing.dropTable(MdlOwnerId.of(50),
+                    QualifiedTableName.of("app", "orders"), Duration.ofSeconds(5)));
+            Path tableFile = table.storageBinding().orElseThrow().path();
+            TablePurgeBarrier blocking = new TablePurgeBarrier() {
+                @Override
+                public void awaitUnreferenced(long tableId, Duration timeout) {
+                    throw new TablePurgeBarrierTimeoutException(
+                            "synthetic recovered table history reference: " + tableId);
+                }
+
+                @Override
+                public int referenceCount(long tableId) {
+                    return 1;
+                }
+            };
+
+            assertThrows(TablePurgeBarrierTimeoutException.class,
+                    () -> new DictionaryDdlRecoveryService(control, repository, cache,
+                            storage.tableDdlStorageService(), tables, blocking).recover(Duration.ofMillis(20)));
+            assertEquals(TableState.DROP_PENDING,
+                    repository.findTableForRecovery(table.id()).orElseThrow().state());
+            assertTrue(Files.exists(tableFile));
         } finally {
             storage.close();
         }
@@ -258,6 +445,16 @@ class DictionaryDdlServiceTest {
     private static CreateTableCommand command() {
         return new CreateTableCommand(QualifiedTableName.of("app", "orders"), PageNo.of(128),
                 List.of(new CreateColumnSpec(ObjectName.of("id"), ColumnTypeDefinition.bigint(false, false))),
+                List.of(new CreateIndexSpec(ObjectName.of("PRIMARY"), true, true,
+                        List.of(new CreateIndexKeyPartSpec(ObjectName.of("id"), IndexOrder.ASC, 0)))));
+    }
+
+    private static CreateTableCommand updateCommand() {
+        return new CreateTableCommand(QualifiedTableName.of("app", "orders"), PageNo.of(128),
+                List.of(new CreateColumnSpec(ObjectName.of("id"),
+                                ColumnTypeDefinition.bigint(false, false)),
+                        new CreateColumnSpec(ObjectName.of("value"),
+                                ColumnTypeDefinition.integer(false, false))),
                 List.of(new CreateIndexSpec(ObjectName.of("PRIMARY"), true, true,
                         List.of(new CreateIndexKeyPartSpec(ObjectName.of("id"), IndexOrder.ASC, 0)))));
     }

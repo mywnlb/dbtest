@@ -122,7 +122,7 @@ public final class LeafOnlyBTreeIndexService implements BTreeIndexService {
         }
         RecordPage page = openRootLeaf(mtr, index, PageLatchMode.EXCLUSIVE);
         SearchKey key = keyOf(record, index);
-        if (index.unique() && search.findEqual(page, key, index.keyDef(), index.schema()).isPresent()) {
+        if (index.physicalUnique() && search.findEqual(page, key, index.keyDef(), index.schema()).isPresent()) {
             throw new BTreeDuplicateKeyException("duplicate key in unique btree index " + index.indexId());
         }
         try {

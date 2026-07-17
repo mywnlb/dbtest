@@ -45,6 +45,23 @@ class PersistentHistoryRecoveryTest {
                 .map(item -> item.transactionNo().value()).toList());
     }
 
+    /** recovery 不读取独立计数，而是逐 history node 的 persistent logical chain 重建 affected-table 集合。 */
+    @Test
+    void rebuildProjectsAffectedTablesFromPersistentLogicalChains() {
+        var fixture = twoCommitted(20, 10,
+                node(P1, UndoLogState.COMMITTED, UndoLogKind.UPDATE, 101, 20,
+                        Optional.empty(), Optional.of(P2)),
+                node(P2, UndoLogState.COMMITTED, UndoLogKind.UPDATE, 102, 10,
+                        Optional.of(P1), Optional.empty()), TransactionNo.of(20));
+
+        var rebuilt = new PersistentHistoryRecovery().rebuild(
+                fixture.base(), fixture.owners(), fixture.evidence(), fixture.nodes()::get,
+                (pageId, logicalHead) -> pageId.equals(P1) ? java.util.Set.of(11L, 12L) : java.util.Set.of(12L));
+
+        assertEquals(java.util.Set.of(11L, 12L), rebuilt.getFirst().affectedTableIds());
+        assertEquals(java.util.Set.of(12L), rebuilt.getLast().affectedTableIds());
+    }
+
     @Test
     void rejectsCyclePrevMismatchAndDeclaredTailMismatch() {
         PersistentHistoryRecovery recovery = new PersistentHistoryRecovery();

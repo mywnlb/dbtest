@@ -3,7 +3,8 @@ package cn.zhangyis.db.sql.binder;
 import cn.zhangyis.db.dd.domain.MdlOwnerId;
 import cn.zhangyis.db.dd.domain.ObjectName;
 import cn.zhangyis.db.sql.binder.bound.BoundClusteredInsert;
-import cn.zhangyis.db.sql.binder.bound.BoundPrimaryPointSelect;
+import cn.zhangyis.db.sql.binder.bound.BoundPointSelect;
+import cn.zhangyis.db.sql.binder.bound.PointAccessKind;
 import cn.zhangyis.db.sql.binder.exception.SqlBindingException;
 import cn.zhangyis.db.sql.executor.SqlValue;
 import cn.zhangyis.db.sql.parser.DefaultSqlParser;
@@ -50,12 +51,30 @@ class DefaultSqlBinderTest {
              TransactionMetadataScope transaction = new TransactionMetadataScope(fixture.dictionary,
                      MdlOwnerId.of(201));
              StatementBindingScope statement = transaction.beginStatement(Duration.ofSeconds(1))) {
-            BoundPrimaryPointSelect bound = assertInstanceOf(BoundPrimaryPointSelect.class, binder.bind(
+            BoundPointSelect bound = assertInstanceOf(BoundPointSelect.class, binder.bind(
                     parser.parse("SELECT Note, ID FROM def.APP.ORDERS WHERE TENANT=2 AND ID=7"),
                     context(statement, Optional.empty())));
             assertEquals(List.of(2, 0), bound.projectionOrdinals());
+            assertEquals(PointAccessKind.CLUSTERED_PRIMARY, bound.accessKind());
+            assertEquals(3, bound.accessIndexId());
             assertEquals(List.of(new SqlValue.IntegerValue(BigInteger.valueOf(7)),
                     new SqlValue.IntegerValue(BigInteger.valueOf(2))), bound.keyValues());
+        }
+    }
+
+    /** 完整 unique secondary 谓词可绑定为回表点查；Binder 只携带稳定 index id，不泄漏 storage metadata。 */
+    @Test
+    void bindsCompleteUniqueSecondaryPointSelect() {
+        try (BinderTestFixture fixture = new BinderTestFixture(directory);
+             TransactionMetadataScope transaction = new TransactionMetadataScope(fixture.dictionary,
+                     MdlOwnerId.of(204));
+             StatementBindingScope statement = transaction.beginStatement(Duration.ofSeconds(1))) {
+            BoundPointSelect bound = assertInstanceOf(BoundPointSelect.class, binder.bind(
+                    parser.parse("SELECT ID, NOTE FROM orders WHERE NOTE='Hello'"),
+                    context(statement, Optional.of(ObjectName.of("app")))));
+            assertEquals(PointAccessKind.UNIQUE_SECONDARY, bound.accessKind());
+            assertEquals(4, bound.accessIndexId());
+            assertEquals(List.of(new SqlValue.StringValue("Hello")), bound.keyValues());
         }
     }
 

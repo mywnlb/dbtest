@@ -4,7 +4,8 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.dd.domain.*;
 import cn.zhangyis.db.dd.service.TableAccessIntent;
 import cn.zhangyis.db.sql.binder.bound.BoundClusteredInsert;
-import cn.zhangyis.db.sql.binder.bound.BoundPrimaryPointSelect;
+import cn.zhangyis.db.sql.binder.bound.BoundPointSelect;
+import cn.zhangyis.db.sql.binder.bound.PointAccessKind;
 import cn.zhangyis.db.sql.binder.bound.BoundStatement;
 import cn.zhangyis.db.sql.binder.exception.SqlBindingException;
 import cn.zhangyis.db.sql.binder.exception.UnknownColumnException;
@@ -74,17 +75,10 @@ public final class DefaultSqlBinder {
         return new BoundClusteredInsert(table, values);
     }
 
-    private BoundPrimaryPointSelect bindSelect(SelectStatementNode select, SqlBindingContext context) {
+    private BoundPointSelect bindSelect(SelectStatementNode select, SqlBindingContext context) {
         TableDefinition table = openActiveBoundTable(select.table(), context, TableAccessIntent.READ);
         Map<ObjectName, ColumnDefinition> columns = columns(table);
         List<Integer> projections = projectionOrdinals(select, table, columns);
-        IndexDefinition primary = table.primaryIndex();
-        if (primary.keyParts().stream().anyMatch(part -> part.prefixBytes() != 0)) {
-            throw new UnsupportedSqlShapeException("primary-point SELECT does not support prefix primary keys");
-        }
-        if (select.predicates().size() != primary.keyParts().size()) {
-            throw new UnsupportedSqlShapeException("SELECT predicates must equal the complete primary key");
-        }
         Map<ObjectName, LiteralNode> predicates = new LinkedHashMap<>();
         for (EqualityPredicateNode predicate : select.predicates()) {
             ObjectName name = ObjectName.of(predicate.column().value());
@@ -93,24 +87,56 @@ public final class DefaultSqlBinder {
                 throw new UnsupportedSqlShapeException("duplicate SELECT predicate: " + name);
             }
         }
-        List<SqlValue> keys = new ArrayList<>(primary.keyParts().size());
-        for (IndexKeyPart part : primary.keyParts()) {
+        IndexDefinition access = choosePointAccess(table, predicates.keySet());
+        List<SqlValue> keys = new ArrayList<>(access.keyParts().size());
+        for (IndexKeyPart part : access.keyParts()) {
             ColumnDefinition column = table.columns().stream()
                     .filter(candidate -> candidate.columnId() == part.columnId()).findFirst()
-                    .orElseThrow(() -> new SqlBindingException("primary key references missing DD column"));
+                    .orElseThrow(() -> new SqlBindingException("point access index references missing DD column"));
             if (isLobKey(column.type().typeId())) {
-                throw new UnsupportedSqlShapeException("primary-point SELECT does not support LOB/JSON primary key");
+                throw new UnsupportedSqlShapeException("point SELECT does not support LOB/JSON index key");
             }
             LiteralNode literal = predicates.remove(column.name());
             if (literal == null) {
-                throw new UnsupportedSqlShapeException("SELECT must constrain every primary key column");
+                throw new UnsupportedSqlShapeException("SELECT must constrain every selected index key column");
             }
-            keys.add(coercion.coerce(literal, column.type(), context.zoneId(), true));
+            keys.add(coercion.coerce(literal, column.type(), context.zoneId(), access.clustered()));
         }
         if (!predicates.isEmpty()) {
-            throw new UnsupportedSqlShapeException("SELECT contains non-primary-key predicate");
+            throw new UnsupportedSqlShapeException("SELECT contains predicate outside selected point index");
         }
-        return new BoundPrimaryPointSelect(table, projections, keys);
+        return new BoundPointSelect(table, projections, access.id().value(),
+                access.clustered() ? PointAccessKind.CLUSTERED_PRIMARY : PointAccessKind.UNIQUE_SECONDARY,
+                keys);
+    }
+
+    /** 完整主键优先；否则选择完整、无 prefix 的 logical unique secondary，多个候选取稳定最小 index id。 */
+    private static IndexDefinition choosePointAccess(TableDefinition table, java.util.Set<ObjectName> predicates) {
+        IndexDefinition primary = table.primaryIndex();
+        if (matchesExactKey(table, primary, predicates)
+                && primary.keyParts().stream().allMatch(part -> part.prefixBytes() == 0)) {
+            return primary;
+        }
+        return table.indexes().stream()
+                .filter(index -> !index.clustered() && index.unique())
+                .filter(index -> index.keyParts().stream().allMatch(part -> part.prefixBytes() == 0))
+                .filter(index -> matchesExactKey(table, index, predicates))
+                .min(java.util.Comparator.comparingLong(index -> index.id().value()))
+                .orElseThrow(() -> new UnsupportedSqlShapeException(
+                        "SELECT predicates must exactly cover the primary key or one non-prefix unique secondary"));
+    }
+
+    /** 判断谓词列集合是否与索引 key column 集合完全一致；part 顺序只影响后续 keyValues 排列。 */
+    private static boolean matchesExactKey(TableDefinition table, IndexDefinition index,
+                                           java.util.Set<ObjectName> predicates) {
+        if (predicates.size() != index.keyParts().size()) {
+            return false;
+        }
+        java.util.Set<ObjectName> keyColumns = index.keyParts().stream().map(part -> table.columns().stream()
+                .filter(column -> column.columnId() == part.columnId()).findFirst()
+                .orElseThrow(() -> new SqlBindingException("index references missing DD column")).name())
+                .collect(java.util.stream.Collectors.toSet());
+        return keyColumns.equals(predicates);
     }
 
     private static TableDefinition openActiveBoundTable(QualifiedNameNode syntax, SqlBindingContext context,

@@ -27,6 +27,9 @@ class LockManagerCoreTest {
 
     private static final Duration TEST_TIMEOUT = Duration.ofMillis(800);
 
+    /**
+     * 验证 {@code recordSharedLocksCoexistButExclusiveWaitsUntilConflictingOwnerReleases} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void recordSharedLocksCoexistButExclusiveWaitsUntilConflictingOwnerReleases() {
         LockManager manager = new LockManager(4, 16);
@@ -54,6 +57,9 @@ class LockManagerCoreTest {
         assertEquals(1, manager.releaseAll(t3));
     }
 
+    /**
+     * 验证 {@code gapLocksAllowRecordReadButBlockInsertIntentionUntilReleased} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void gapLocksAllowRecordReadButBlockInsertIntentionUntilReleased() {
         assertGapLockAllowsRecordReadButBlocksInsert(TransactionLockMode.GAP_S, 110);
@@ -82,6 +88,9 @@ class LockManagerCoreTest {
         assertEquals(1, manager.releaseAll(t3));
     }
 
+    /**
+     * 验证 {@code insertIntentionsOnSameGapAreCompatibleWithEachOther} 对应的事务、MVCC 与锁行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void insertIntentionsOnSameGapAreCompatibleWithEachOther() {
         LockManager manager = new LockManager(4, 16);
@@ -99,6 +108,9 @@ class LockManagerCoreTest {
         assertEquals(1, manager.releaseAll(t2));
     }
 
+    /**
+     * 验证 {@code nextKeyExclusiveBlocksBothCoveredRecordAndPrecedingGapInsert} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void nextKeyExclusiveBlocksBothCoveredRecordAndPrecedingGapInsert() {
         LockManager manager = new LockManager(4, 16);
@@ -147,6 +159,9 @@ class LockManagerCoreTest {
         assertEquals(1, manager.releaseAll(writer));
     }
 
+    /**
+     * 验证 {@code lockWaitTimeoutRemovesWaitingRequestAndWaitForEdge} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void lockWaitTimeoutRemovesWaitingRequestAndWaitForEdge() {
         LockManager manager = new LockManager(4, 16);
@@ -165,6 +180,9 @@ class LockManagerCoreTest {
         assertEquals(1, manager.releaseAll(t1));
     }
 
+    /**
+     * 验证 {@code twoTransactionDeadlockThrowsForCurrentWaiterAndKeepsOtherWaiterObservable} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void twoTransactionDeadlockThrowsForCurrentWaiterAndKeepsOtherWaiterObservable() {
         LockManager manager = new LockManager(4, 16);
@@ -188,6 +206,9 @@ class LockManagerCoreTest {
         assertEquals(2, manager.releaseAll(t1));
     }
 
+    /**
+     * 验证 {@code threeTransactionDeadlockIsDetectedWithinBoundedSearch} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void threeTransactionDeadlockIsDetectedWithinBoundedSearch() {
         LockManager manager = new LockManager(4, 16);

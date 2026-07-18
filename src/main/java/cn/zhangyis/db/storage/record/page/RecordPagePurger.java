@@ -19,11 +19,22 @@ public final class RecordPagePurger {
     /**
      * 物理 purge {@code recordOffset} 处记录（要求 X）。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
      * @throws DatabaseValidationException 目标为系统记录或未 delete-marked。
      * @throws PageDirectoryCorruptedException 前驱/owner 槽定位失败（页损坏）。
+     * @param page 已固定的页面、frame 或页头视图；不得为 {@code null}，必须指向目标 PageId，并在访问期间持有契约要求的 fix/latch
+     * @param recordOffset 目标结构内的零基偏移；必须落在当前页、记录或持久槽位的合法范围
      */
     public void purge(RecordPage page, int recordOffset) {
         // ---------- plan：只读 + 校验 ----------
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         RecordHeader target = page.recordHeaderAt(recordOffset);
         RecordType type = target.recordType();
         if (type == RecordType.INFIMUM || type == RecordType.SUPREMUM) {
@@ -35,6 +46,7 @@ public final class RecordPagePurger {
         int prev = page.findPredecessor(recordOffset);
         int targetNext = page.nextRecord(recordOffset);
         // owner = 沿链首个 n_owned>0 的记录（supremum 恒 n_owned≥1，必终止）。
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         int owner = recordOffset;
         while (page.recordHeaderAt(owner).nOwned() == 0) {
             owner = page.nextRecord(owner);
@@ -45,6 +57,7 @@ public final class RecordPagePurger {
         if (ownerSlot < 1) {
             throw new PageDirectoryCorruptedException("owner slot not found for offset " + owner);
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         int cnt = page.recordHeaderAt(owner).nOwned();
 
         // ---------- execute：连续写 ----------
@@ -86,6 +99,7 @@ public final class RecordPagePurger {
         }
 
         new HeapSpaceManager(page).free(recordOffset); // 空间挂回 GarbageList、GARBAGE+=len
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         page.writeHeader(page.header().withNRecs(page.header().nRecs() - 1));
     }
 }

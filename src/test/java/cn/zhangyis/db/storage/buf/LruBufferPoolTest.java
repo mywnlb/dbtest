@@ -54,6 +54,9 @@ class LruBufferPoolTest {
         return PageId.of(SPACE, PageNo.of(no));
     }
 
+    /**
+     * 验证 {@code shouldRoundTripPageThroughBufferPool} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void shouldRoundTripPageThroughBufferPool() {
         try (PageStore store = openStore(8)) {
@@ -68,6 +71,9 @@ class LruBufferPoolTest {
         }
     }
 
+    /**
+     * 验证 {@code residentCountInRangeCountsResidentPagesOnly} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void residentCountInRangeCountsResidentPagesOnly() {
         try (PageStore store = openStore(16)) {
@@ -90,6 +96,9 @@ class LruBufferPoolTest {
         }
     }
 
+    /**
+     * 验证 {@code shouldEvictLruWriteBackDirtyAndReReadFromDisk} 所描述的刷脏与持久化协作，并断言 redo durable 边界先覆盖 page LSN、失败后仍保留脏状态。
+     */
     @Test
     void shouldEvictLruWriteBackDirtyAndReReadFromDisk() {
         try (PageStore store = openStore(8)) {
@@ -112,6 +121,9 @@ class LruBufferPoolTest {
         }
     }
 
+    /**
+     * 验证 {@code attachVictimFlusherRejectsNullAndRepeat} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void attachVictimFlusherRejectsNullAndRepeat() {
         try (PageStore store = openStore(8)) {
@@ -201,6 +213,9 @@ class LruBufferPoolTest {
         }
     }
 
+    /**
+     * 验证 {@code shouldThrowWhenAllFramesFixed} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void shouldThrowWhenAllFramesFixed() {
         try (PageStore store = openStore(8)) {
@@ -213,6 +228,9 @@ class LruBufferPoolTest {
         }
     }
 
+    /**
+     * 验证 {@code newPageShouldNotReadDiskAndPersistThroughFlushCoordinator} 所描述的刷脏与持久化协作，并断言 redo durable 边界先覆盖 page LSN、失败后仍保留脏状态。
+     */
     @Test
     void newPageShouldNotReadDiskAndPersistThroughFlushCoordinator() {
         try (PageStore store = openStore(8)) {
@@ -231,6 +249,9 @@ class LruBufferPoolTest {
         }
     }
 
+    /**
+     * 验证 {@code newPageReinitializesResidentPage} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void newPageReinitializesResidentPage() {
         try (PageStore store = openStore(8)) {
@@ -247,6 +268,9 @@ class LruBufferPoolTest {
         }
     }
 
+    /**
+     * 验证 {@code newPageRejectsSharedMode} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void newPageRejectsSharedMode() {
         try (PageStore store = openStore(8)) {
@@ -257,6 +281,11 @@ class LruBufferPoolTest {
         }
     }
 
+    /**
+     * 验证 {@code newPageOnResidentBlocksUntilSharedReleasedThenZeroes} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void newPageOnResidentBlocksUntilSharedReleasedThenZeroes() throws Exception {
         try (PageStore store = openStore(8)) {
@@ -288,6 +317,9 @@ class LruBufferPoolTest {
         }
     }
 
+    /**
+     * 验证 {@code fixCountShouldPreventEvictionUntilAllGuardsClosed} 所描述的组件生命周期，并断言状态转换、后台线程停止和资源恰好释放一次。
+     */
     @Test
     void fixCountShouldPreventEvictionUntilAllGuardsClosed() {
         try (PageStore store = openStore(8)) {
@@ -305,6 +337,9 @@ class LruBufferPoolTest {
         }
     }
 
+    /**
+     * 验证 {@code flushCoordinatorShouldSkipFixedPageAndPersistAfterRelease} 所描述的刷脏与持久化协作，并断言 redo durable 边界先覆盖 page LSN、失败后仍保留脏状态。
+     */
     @Test
     void flushCoordinatorShouldSkipFixedPageAndPersistAfterRelease() {
         try (PageStore store = openStore(8)) {
@@ -333,6 +368,9 @@ class LruBufferPoolTest {
         }
     }
 
+    /**
+     * 验证 {@code shouldRejectInvalidConstruction} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void shouldRejectInvalidConstruction() {
         try (PageStore store = openStore(2)) {

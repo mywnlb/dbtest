@@ -14,6 +14,9 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
  */
 class DataFileDescriptorTest {
 
+    /**
+     * 验证 {@code shouldDescribeCoveredPageRange} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void shouldDescribeCoveredPageRange() {
         DataFileDescriptor descriptor = DataFileDescriptor.single(Path.of("t1.ibd"), PageNo.of(64), PageNo.of(32));
@@ -23,6 +26,9 @@ class DataFileDescriptorTest {
         assertEquals(PageNo.of(96), descriptor.endExclusivePageNo());
     }
 
+    /**
+     * 验证 {@code shouldRejectEmptyFileRange} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void shouldRejectEmptyFileRange() {
         assertThrows(DatabaseRuntimeException.class, () -> DataFileDescriptor.single(Path.of("t1.ibd"), PageNo.of(0), PageNo.of(0)));

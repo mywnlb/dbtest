@@ -13,7 +13,11 @@ public final class DatabaseFailureClassifier {
     private DatabaseFailureClassifier() {
     }
 
-    /** 返回异常图中的首个 fatal；不存在时返回 null。 */
+    /** 返回异常图中的首个 fatal；不存在时返回 null。
+     *
+     * @param failure 需要分类或包装的原始失败；允许为 {@code null} 表示没有底层 cause，存在时必须保留 cause 与 suppressed 异常图
+     * @return {@code findFatal} 未找到或条件不满足时返回 {@code null}；否则返回满足构造不变量的 {@code DatabaseFatalException} 结果
+     */
     public static DatabaseFatalException findFatal(Throwable failure) {
         if (failure == null) {
             return null;
@@ -26,6 +30,8 @@ public final class DatabaseFailureClassifier {
      * 若 failure 内含 fatal，则保持直接 fatal，或用新的 fatal 包住外层上下文；没有 fatal 时返回 null。
      *
      * @param message 跨层边界诊断，包装时保留原异常及其 suppressed 图。
+     * @param failure 需要分类或包装的原始失败；不得为 {@code null}，包装时必须保留 cause 与 suppressed 异常图
+     * @return {@code preserveFatal} 未找到或条件不满足时返回 {@code null}；否则返回满足构造不变量的 {@code DatabaseFatalException} 结果
      */
     public static DatabaseFatalException preserveFatal(String message, RuntimeException failure) {
         DatabaseFatalException fatal = findFatal(failure);

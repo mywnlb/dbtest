@@ -12,6 +12,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class TablespaceStateTest {
 
+    /**
+     * 验证 {@code shouldAllowNormalLifecycleTransitions} 所描述的组件生命周期，并断言状态转换、后台线程停止和资源恰好释放一次。
+     */
     @Test
     void shouldAllowNormalLifecycleTransitions() {
         assertTrue(TablespaceState.EMPTY.canTransitTo(TablespaceState.NORMAL));
@@ -22,6 +25,9 @@ class TablespaceStateTest {
         assertTrue(TablespaceState.ACTIVE.canTransitTo(TablespaceState.CORRUPTED));
     }
 
+    /**
+     * 验证 {@code shouldRejectUnsafeLifecycleTransitions} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void shouldRejectUnsafeLifecycleTransitions() {
         assertFalse(TablespaceState.CORRUPTED.canTransitTo(TablespaceState.ACTIVE));

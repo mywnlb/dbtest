@@ -24,6 +24,9 @@ import java.util.concurrent.locks.ReentrantLock;
  */
 public final class RedoFlushWorker implements AutoCloseable {
 
+    /**
+     * 类级不可变配置常量；所有实例共享该边界，非法调整会破坏Redo/WAL的不变量。
+     */
     private static final long NANOS_PER_SECOND = 1_000_000_000L;
 
     /** redo durable 驱动端口。 */
@@ -53,6 +56,13 @@ public final class RedoFlushWorker implements AutoCloseable {
     /** worker 失败根因。 */
     private DatabaseRuntimeException failure;
 
+    /**
+     * 创建 {@code RedoFlushWorker}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param target redo 收集、定位或重放所需的日志对象；不得为 {@code null}，其 LSN 范围和记录格式必须连续且属于当前恢复或 MTR 上下文
+     * @param idleWait 本次等待或操作的最大时长；不得为 {@code null} 且必须为正，超时不得留下未释放资源
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public RedoFlushWorker(RedoFlushTarget target, Duration idleWait) {
         if (target == null || idleWait == null) {
             throw new DatabaseValidationException("redo flush worker target/idle wait must not be null");
@@ -64,7 +74,10 @@ public final class RedoFlushWorker implements AutoCloseable {
         this.idleWaitNanos = timeoutNanos(idleWait);
     }
 
-    /** 启动后台 worker。只能从 NEW 启动一次。 */
+    /** 启动后台 worker。只能从 NEW 启动一次。
+     *
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public void start() {
         lock.lock();
         try {
@@ -83,6 +96,8 @@ public final class RedoFlushWorker implements AutoCloseable {
     /**
      * 请求一次 on-demand flush（合并式）。只置位并唤醒 worker，不在调用线程做 IO；worker 已停止/失败时静默丢弃，
      * 不抛异常——nudge 不应因 worker 生命周期而让调用方（如淘汰路径）失败。
+     *
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public void requestFlush() {
         lock.lock();
@@ -138,7 +153,10 @@ public final class RedoFlushWorker implements AutoCloseable {
         }
     }
 
-    /** 当前 worker 状态。 */
+    /** 当前 worker 状态。
+     *
+     * @return {@code state} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     */
     public RedoFlushWorkerState state() {
         lock.lock();
         try {
@@ -148,7 +166,10 @@ public final class RedoFlushWorker implements AutoCloseable {
         }
     }
 
-    /** 最近一次成功 flush 后的 durable LSN（诊断用）。 */
+    /** 最近一次成功 flush 后的 durable LSN（诊断用）。
+     *
+     * @return 当前可见的最近快照或持久边界；尚未产生对应状态时为空 {@code Optional}，从不返回 Java {@code null}
+     */
     public Optional<Lsn> lastFlushedLsn() {
         lock.lock();
         try {
@@ -158,7 +179,10 @@ public final class RedoFlushWorker implements AutoCloseable {
         }
     }
 
-    /** worker 失败根因。 */
+    /** worker 失败根因。
+     *
+     * @return 最近一次受控操作记录的失败；尚无失败时为空 {@code Optional}，参数容器与返回值均不使用 Java {@code null}
+     */
     public Optional<DatabaseRuntimeException> failure() {
         lock.lock();
         try {
@@ -245,6 +269,9 @@ public final class RedoFlushWorker implements AutoCloseable {
         return target.currentLsn().value() > target.flushedToDiskLsn().value();
     }
 
+    /**
+     * 推进Redo/WAL刷盘或检查点边界；写数据前遵守 WAL，失败时不得清除尚未安全持久化的状态。
+     */
     private void flushIfPending() {
         // 空转保护：无待刷 redo 时不触发 fsync（on-demand 请求落到无待刷时同样跳过）。flush 在锁外执行。
         if (target.currentLsn().value() <= target.flushedToDiskLsn().value()) {

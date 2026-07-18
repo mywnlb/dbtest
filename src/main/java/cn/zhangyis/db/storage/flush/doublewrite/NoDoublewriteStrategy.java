@@ -13,6 +13,12 @@ public final class NoDoublewriteStrategy implements DoublewriteStrategy {
         return DoublewriteMode.OFF;
     }
 
+    /**
+     * 校验输入与当前状态后修改脏页刷盘与 checkpoint领域数据；成功发布完整结果，异常路径保留既有持久化与并发不变量。
+     *
+     * @param snapshot 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     @Override
     public void beforeDataFileWrite(FlushPageSnapshot snapshot) {
         if (snapshot == null) {

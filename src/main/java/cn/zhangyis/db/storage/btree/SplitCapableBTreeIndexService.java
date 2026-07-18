@@ -137,6 +137,14 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
      */
     private final LongAdder rootXRestarts = new LongAdder();
 
+    /**
+     * 创建 {@code SplitCapableBTreeIndexService}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param pageAccess 由组合根提供的 {@code IndexPageAccess} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param disk 由组合根提供的 {@code DiskSpaceManager} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param registry 由组合根提供的 {@code TypeCodecRegistry} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public SplitCapableBTreeIndexService(IndexPageAccess pageAccess, DiskSpaceManager disk,
                                          TypeCodecRegistry registry) {
         if (pageAccess == null || disk == null || registry == null) {
@@ -176,25 +184,43 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
      * <p>事务 id 来源：调用方须先 {@code TransactionManager.assignWriteId(txn)}，此处只验非 NONE，
      * 不依赖 TransactionManager，保持 B+Tree 与事务管理解耦。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取并校验调用参数与当前领域状态，确保失败发生在本方法创建共享或持久副作用之前。</li>
+     *     <li>按类级并发协议取得本阶段所需协作者与 Guard，竞争后重新校验资源身份和生命周期。</li>
+     *     <li>执行核心状态转换或数据变换，并只通过本包稳定协作者发布可观察副作用。</li>
+     *     <li>汇总稳定结果并沿现有 finally/Guard 释放资源；异常不得伪造成功或清除未完成状态。</li>
+     * </ol>
+     *
      * @param rollPointer 本事务 INSERT undo record 的 roll pointer；可为 {@link RollPointer#NULL}，不能为 Java null。
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param record 参与本次操作的记录或记录集合；不得为 {@code null}，顺序、身份与编码必须满足当前索引或日志格式
+     * @param transactionId 事务的稳定标识；不得为 {@code null}，{@code NONE} 只表示尚未绑定事务，不能代替活跃事务身份
+     * @return {@code insertClustered} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public BTreeInsertResult insertClustered(MiniTransaction mtr, BTreeIndex index,
                                              LogicalRecord record, TransactionId transactionId,
                                              RollPointer rollPointer) {
+        // 1、读取并校验调用参数与当前领域状态，在共享或持久副作用前拒绝非法状态。
         if (record == null || transactionId == null || rollPointer == null) {
             throw new DatabaseValidationException(
                     "clustered insert record/transactionId/rollPointer must not be null");
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按类级并发协议取得本阶段所需协作者与 Guard，保持处理顺序与资源边界。
         if (!index.clustered()) {
             throw new DatabaseValidationException(
                     "insertClustered requires a clustered index: " + index.indexId());
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，执行核心状态转换或数据变换，并维持领域不变量。
         if (transactionId.isNone()) {
             throw new DatabaseValidationException("clustered insert requires a non-NONE transaction id");
         }
         LogicalRecord stamped = new LogicalRecord(record.schemaVersion(), record.columnValues(),
                 record.deleted(), record.recordType(),
                 new HiddenColumns(transactionId, rollPointer));
+        // 4、汇总稳定结果并沿现有 finally/Guard 释放资源，以稳定返回或领域异常完成收口。
         return insert(mtr, index, stamped);
     }
 
@@ -240,10 +266,25 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
      * <p>index→FSP/LOB 的无环证明：所有 LOB-aware writer 都先取得 index prepare guard，普通 SMO 也只沿
      * index→FSP 分配；LOB/FSP 代码不反向获取任何 B+Tree latch，读者只持 index latch 且不等待 FSP，故不存在
      * FSP→index 的反向等待边。
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取并校验调用参数与当前领域状态，确保失败发生在本方法创建共享或持久副作用之前。</li>
+     *     <li>按类级并发协议取得本阶段所需协作者与 Guard，竞争后重新校验资源身份和生命周期。</li>
+     *     <li>执行核心状态转换或数据变换，并只通过本包稳定协作者发布可观察副作用。</li>
+     *     <li>汇总稳定结果并沿现有 finally/Guard 释放资源；异常不得伪造成功或清除未完成状态。</li>
+     * </ol>
+     *
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param placeholder 参与记录编解码或索引比较的字段值；不得为 {@code null}，其类型、字节边界和 SQL NULL 语义必须与当前 schema 一致
+     * @param transactionId 事务的稳定标识；不得为 {@code null}，{@code NONE} 只表示尚未绑定事务，不能代替活跃事务身份
+     * @return {@code prepareClusteredInsert} 准备或解码出的中间领域对象；成功时不为 {@code null}，其边界、资源归属和后续发布阶段已明确
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public PreparedClusteredInsert prepareClusteredInsert(MiniTransaction mtr, BTreeIndex index,
                                                           LogicalRecord placeholder,
                                                           TransactionId transactionId) {
+        // 1、读取并校验调用参数与当前领域状态，在共享或持久副作用前拒绝非法状态。
         if (mtr == null || index == null || placeholder == null || transactionId == null) {
             throw new DatabaseValidationException("prepare clustered insert args must not be null");
         }
@@ -254,16 +295,19 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
                 placeholder.deleted(), placeholder.recordType(),
                 new HiddenColumns(transactionId, RollPointer.NULL));
         SearchKey expectedKey = keyOf(stampedPlaceholder, index);
+        // 2、继续完成范围、身份与候选校验；通过后，按类级并发协议取得本阶段所需协作者与 Guard，保持处理顺序与资源边界。
         int expectedLength = recordEncoder.encode(stampedPlaceholder, index.schema()).length;
         List<IndexPageHandle> path = descendPathInsertSafeNode(mtr, index, expectedKey);
         IndexPageHandle leafHandle = path.getLast();
         RecordPage leaf = leafHandle.recordPage();
+        // 3、在中间分支复核阶段性结果；满足条件后，执行核心状态转换或数据变换，并维持领域不变量。
         ensureUniqueAbsent(leaf, leafHandle.pageId(), index, expectedKey);
         boolean requiresSplit = expectedLength > leaf.freeSpace();
 
         var scope = mtr.allowOutOfOrderPageLatch(
                 "prepared clustered insert: all writers acquire index before FSP/LOB; FSP/LOB never wait for index");
         SpaceReservation reservation = null;
+        // 4、汇总稳定结果并沿现有 finally/Guard 释放资源，以稳定返回或领域异常完成收口。
         try {
             if (requiresSplit) {
                 reservation = reserveSplitSpace(mtr, index, splitReservationBudget(index, path));
@@ -314,6 +358,7 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
      * @return 固定目标 leaf 和形状、等待 actual undo/row 发布的 guard。
      * @throws DatabaseValidationException 参数、descriptor、write id 或 placeholder 形状无效时抛出。
      * @throws PreparedUpdateStateException 目标记录在 prepare 前已消失、版本不匹配或 actual 形状漂移时抛出。
+     * @throws BTreeUnsupportedStructureException 请求的语法形状、类型或运行模式超出当前实现范围时抛出；调用方应改写请求或选择受支持配置
      */
     public PreparedClusteredUpdate prepareClusteredUpdate(MiniTransaction mtr, BTreeIndex index,
                                                           SearchKey key, LogicalRecord placeholder,
@@ -389,17 +434,30 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
      * 保持 B+Tree 与事务/undo 模块解耦（与 {@code insertClustered} 对称）。不做 merge / node-pointer 维护 / 空页回收：
      * 删后空 leaf 留页、root node pointer 的 lowKey 作为保守下界仍能正确路由（misroute 只会落到 findEqual 空）。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取并校验调用参数与当前领域状态，确保失败发生在本方法创建共享或持久副作用之前。</li>
+     *     <li>按类级并发协议取得本阶段所需协作者与 Guard，竞争后重新校验资源身份和生命周期。</li>
+     *     <li>执行核心状态转换或数据变换，并只通过本包稳定协作者发布可观察副作用。</li>
+     *     <li>汇总稳定结果并沿现有 finally/Guard 释放资源；异常不得伪造成功或清除未完成状态。</li>
+     * </ol>
+     *
      * @param key             目标聚簇 key。
      * @param expectedTrxId   期望的 DB_TRX_ID（本 undo 的写事务 id），不能为 null。
      * @param expectedRollPtr 期望的 DB_ROLL_PTR（正在应用的 undo roll pointer），不能为 Java null（可为 NULL 指针）。
      * @return {@link BTreeDeleteResult#removed()} 表示是否真正摘除了一条匹配记录。
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public BTreeDeleteResult deleteClustered(MiniTransaction mtr, BTreeIndex index, SearchKey key,
                                              TransactionId expectedTrxId, RollPointer expectedRollPtr) {
+        // 1、读取并校验调用参数与当前领域状态，在共享或持久副作用前拒绝非法状态。
         if (key == null || expectedTrxId == null || expectedRollPtr == null) {
             throw new DatabaseValidationException(
                     "deleteClustered key/expectedTrxId/expectedRollPtr must not be null");
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按类级并发协议取得本阶段所需协作者与 Guard，保持处理顺序与资源边界。
         if (!index.clustered()) {
             throw new DatabaseValidationException(
                     "deleteClustered requires a clustered index: " + index.indexId());
@@ -408,10 +466,12 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         // 未命中/所有权不符=幂等 no-op（纯读，safe）。删后欠载需 merge（unsafe）或单 root leaf 时返回 null，
         // 回退悲观 X 下降 + safe-node 早释放祖先（0.13d，merge 只在保留链内传播、root X 不必持到 commit）。
         BTreeDeleteResult optimistic = tryOptimisticDelete(mtr, index, key, expectedTrxId, expectedRollPtr);
+        // 3、在中间分支复核阶段性结果；满足条件后，执行核心状态转换或数据变换，并维持领域不变量。
         if (optimistic != null) {
             return optimistic;
         }
         List<IndexPageHandle> path = descendPathDeleteSafeNode(mtr, index, key);
+        // 4、汇总稳定结果并沿现有 finally/Guard 释放资源，以稳定返回或领域异常完成收口。
         return deleteInLeaf(mtr, index, path, key, expectedTrxId, expectedRollPtr);
     }
 
@@ -426,15 +486,31 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
      *   <li><b>欠载（unsafe）</b>：**写页前**提前释放 leaf X（零页修改，可干净重启），返回 null 交悲观全 X 重启（带 merge）。</li>
      * </ul>
      * root 即 leaf（单页树）时 {@code descendOptimistic} 返回 null，本方法同样返回 null 交悲观。
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取并校验调用参数与当前领域状态，确保失败发生在本方法创建共享或持久副作用之前。</li>
+     *     <li>按类级并发协议取得本阶段所需协作者与 Guard，竞争后重新校验资源身份和生命周期。</li>
+     *     <li>执行核心状态转换或数据变换，并只通过本包稳定协作者发布可观察副作用。</li>
+     *     <li>汇总稳定结果并沿现有 finally/Guard 释放资源；异常不得伪造成功或清除未完成状态。</li>
+     * </ol>
+     *
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param key 参与 {@code tryOptimisticDelete} 的稳定领域标识 {@code SearchKey}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param expectedTrxId 参与 {@code tryOptimisticDelete} 的稳定领域标识 {@code TransactionId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param expectedRollPtr 参与 {@code tryOptimisticDelete} 的稳定领域标识 {@code RollPointer}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @return {@code tryOptimisticDelete} 未找到或条件不满足时返回 {@code null}；否则返回满足构造不变量的 {@code BTreeDeleteResult} 结果
      */
     private BTreeDeleteResult tryOptimisticDelete(MiniTransaction mtr, BTreeIndex index, SearchKey key,
                                                   TransactionId expectedTrxId, RollPointer expectedRollPtr) {
+        // 1、读取并校验调用参数与当前领域状态，在共享或持久副作用前拒绝非法状态。
         IndexPageHandle leafHandle = descendOptimistic(mtr, index, key);
         if (leafHandle == null) {
             return null; // root 即 leaf：交悲观
         }
         RecordPage leaf = leafHandle.recordPage();
         PageId leafId = leafHandle.pageId();
+        // 2、继续完成范围、身份与候选校验；通过后，按类级并发协议取得本阶段所需协作者与 Guard，保持处理顺序与资源边界。
         validateLeafPage(leaf, index, leafId);
         OptionalInt found = search.findEqual(leaf, key, index.keyDef(), index.schema());
         if (found.isEmpty()) {
@@ -443,6 +519,7 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         }
         int offset = found.getAsInt();
         RecordCursor cursor = new RecordCursor(leaf, offset, index.schema(), registry);
+        // 3、在中间分支复核阶段性结果；满足条件后，执行核心状态转换或数据变换，并维持领域不变量。
         if (!expectedTrxId.equals(cursor.dbTrxId()) || !expectedRollPtr.equals(cursor.dbRollPtr())) {
             optimisticDeleteHits.increment();
             return BTreeDeleteResult.noChange(index); // 幂等：所有权不符，纯读（safe）
@@ -459,6 +536,7 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         }
         purger.purge(leaf, offset);
         optimisticDeleteHits.increment();
+        // 4、汇总稳定结果并沿现有 finally/Guard 释放资源，以稳定返回或领域异常完成收口。
         return BTreeDeleteResult.removed(index, List.of());
     }
 
@@ -491,13 +569,30 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
      * 在已定位的 leaf（path 末项）上执行所有权校验 + delete-mark + purge，物理删除成功后触发欠载回收
      * （merge + 原地 root shrink，见 {@link #reclaimAfterRemoval}）。{@code findEqual} 返回的是物理命中（含 delete-marked），
      * 因此这里要先按隐藏列确认归属、再判断是否已标记，避免对非本 undo 的行或已标记的行误操作。
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取并校验调用参数与当前领域状态，确保失败发生在本方法创建共享或持久副作用之前。</li>
+     *     <li>按类级并发协议取得本阶段所需协作者与 Guard，竞争后重新校验资源身份和生命周期。</li>
+     *     <li>执行核心状态转换或数据变换，并只通过本包稳定协作者发布可观察副作用。</li>
+     *     <li>汇总稳定结果并沿现有 finally/Guard 释放资源；异常不得伪造成功或清除未完成状态。</li>
+     * </ol>
+     *
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param path 受控目录内的规范化文件路径；不得为 {@code null}，也不得逃逸所属表空间或日志目录
+     * @param key 参与 {@code deleteInLeaf} 的稳定领域标识 {@code SearchKey}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param expectedTrxId 参与 {@code deleteInLeaf} 的稳定领域标识 {@code TransactionId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param expectedRollPtr 参与 {@code deleteInLeaf} 的稳定领域标识 {@code RollPointer}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @return {@code deleteInLeaf} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
      */
     private BTreeDeleteResult deleteInLeaf(MiniTransaction mtr, BTreeIndex index, List<IndexPageHandle> path,
                                           SearchKey key, TransactionId expectedTrxId, RollPointer expectedRollPtr) {
+        // 1、读取并校验调用参数与当前领域状态，在共享或持久副作用前拒绝非法状态。
         IndexPageHandle leafHandle = path.get(path.size() - 1);
         RecordPage leaf = leafHandle.recordPage();
         PageId leafId = leafHandle.pageId();
         validateLeafPage(leaf, index, leafId);
+        // 2、继续完成范围、身份与候选校验；通过后，按类级并发协议取得本阶段所需协作者与 Guard，保持处理顺序与资源边界。
         OptionalInt found = search.findEqual(leaf, key, index.keyDef(), index.schema());
         if (found.isEmpty()) {
             return BTreeDeleteResult.noChange(index);
@@ -505,6 +600,7 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         int offset = found.getAsInt();
         RecordCursor cursor = new RecordCursor(leaf, offset, index.schema(), registry);
         // 所有权校验：dbTrxId+dbRollPtr 同时匹配才是本 undo 插入的行；否则不删（幂等收敛）
+        // 3、在中间分支复核阶段性结果；满足条件后，执行核心状态转换或数据变换，并维持领域不变量。
         if (!expectedTrxId.equals(cursor.dbTrxId()) || !expectedRollPtr.equals(cursor.dbRollPtr())) {
             return BTreeDeleteResult.noChange(index);
         }
@@ -514,6 +610,7 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         }
         purger.purge(leaf, offset);
         MergeOutcome outcome = reclaimAfterRemoval(mtr, index, path);
+        // 4、汇总稳定结果并沿现有 finally/Guard 释放资源，以稳定返回或领域异常完成收口。
         return BTreeDeleteResult.removed(outcome.indexAfter(), outcome.freedPages());
     }
 
@@ -527,17 +624,30 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
      * <p>为什么必须严格：purge 在 boundary 之外异步运行，若像 {@code deleteClustered} 那样对未标记行也先 deleteMark，
      * 会把一行**存活**记录误删（例如该 key 已被新事务重新插入为 live 行）。purge 只能回收确属本 undo 删除的死行。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
      * @param key             目标聚簇 key。
      * @param expectedTrxId   删除该行的事务 id（undo 的 DB_TRX_ID），不能为 null。
      * @param expectedRollPtr 该 DELETE_MARK undo record 自身的 roll pointer（= 记录应有的 DB_ROLL_PTR），不能为 Java null。
      * @return {@link BTreeDeleteResult#removed()} 是否物理移除；false 表示确认 stale、未改任何内容。
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public BTreeDeleteResult purgeDeleteMarkedClustered(MiniTransaction mtr, BTreeIndex index, SearchKey key,
                                                         TransactionId expectedTrxId, RollPointer expectedRollPtr) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         if (key == null || expectedTrxId == null || expectedRollPtr == null) {
             throw new DatabaseValidationException(
                     "purgeDeleteMarkedClustered key/expectedTrxId/expectedRollPtr must not be null");
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         if (!index.clustered()) {
             throw new DatabaseValidationException(
                     "purgeDeleteMarkedClustered requires a clustered index: " + index.indexId());
@@ -545,10 +655,12 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         // 0.13b：乐观优先，与 deleteClustered 同构（唯一区别：purge 不主动 deleteMark，严格校验未标记即 stale no-op）。
         // 悲观回退同样走 safe-node X 下降（0.13d）。
         BTreeDeleteResult optimistic = tryOptimisticPurge(mtr, index, key, expectedTrxId, expectedRollPtr);
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         if (optimistic != null) {
             return optimistic;
         }
         List<IndexPageHandle> path = descendPathDeleteSafeNode(mtr, index, key);
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         return purgeInLeaf(mtr, index, path, key, expectedTrxId, expectedRollPtr);
     }
 
@@ -559,15 +671,31 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
      * <p>命中且严格校验通过 → {@link #deleteWouldUnderflow} 预判：不欠载则 {@link RecordPagePurger#purge} **跳过**
      * {@link #reclaimAfterRemoval}（仅 leaf 持 X）；欠载=unsafe **写页前**释放 leaf X → 返回 null 交悲观全 X（带 merge）。
      * root 即 leaf 返回 null 交悲观。
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param key 参与 {@code tryOptimisticPurge} 的稳定领域标识 {@code SearchKey}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param expectedTrxId 参与 {@code tryOptimisticPurge} 的稳定领域标识 {@code TransactionId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param expectedRollPtr 参与 {@code tryOptimisticPurge} 的稳定领域标识 {@code RollPointer}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @return {@code tryOptimisticPurge} 未找到或条件不满足时返回 {@code null}；否则返回满足构造不变量的 {@code BTreeDeleteResult} 结果
      */
     private BTreeDeleteResult tryOptimisticPurge(MiniTransaction mtr, BTreeIndex index, SearchKey key,
                                                  TransactionId expectedTrxId, RollPointer expectedRollPtr) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         IndexPageHandle leafHandle = descendOptimistic(mtr, index, key);
         if (leafHandle == null) {
             return null; // root 即 leaf：交悲观
         }
         RecordPage leaf = leafHandle.recordPage();
         PageId leafId = leafHandle.pageId();
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         validateLeafPage(leaf, index, leafId);
         OptionalInt found = search.findEqual(leaf, key, index.keyDef(), index.schema());
         if (found.isEmpty()) {
@@ -575,6 +703,7 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
             return BTreeDeleteResult.noChange(index); // 未命中，纯读（safe）
         }
         int offset = found.getAsInt();
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         RecordCursor cursor = new RecordCursor(leaf, offset, index.schema(), registry);
         // purge 严格校验：仍 delete-marked 且隐藏列匹配才移除；未标记/不符=确认 stale，绝不主动 deleteMark。
         if (!cursor.isDeleted()
@@ -590,6 +719,7 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         }
         purger.purge(leaf, offset);
         optimisticPurgeHits.increment();
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         return BTreeDeleteResult.removed(index, List.of());
     }
 
@@ -607,18 +737,36 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
      * 在已定位 leaf（path 末项）上执行 purge 严格校验：命中 + 已 delete-marked + 隐藏列(DB_TRX_ID/DB_ROLL_PTR)匹配才物理摘除；
      * 否则不改任何内容（stale 收敛）。与 {@link #deleteInLeaf} 的差别：未标记记录在此**不**会被 deleteMark。
      * 物理摘除成功后同样触发欠载回收（{@link #reclaimAfterRemoval}）。
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param path 受控目录内的规范化文件路径；不得为 {@code null}，也不得逃逸所属表空间或日志目录
+     * @param key 参与 {@code purgeInLeaf} 的稳定领域标识 {@code SearchKey}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param expectedTrxId 参与 {@code purgeInLeaf} 的稳定领域标识 {@code TransactionId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param expectedRollPtr 参与 {@code purgeInLeaf} 的稳定领域标识 {@code RollPointer}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @return {@code purgeInLeaf} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
      */
     private BTreeDeleteResult purgeInLeaf(MiniTransaction mtr, BTreeIndex index, List<IndexPageHandle> path,
                                           SearchKey key, TransactionId expectedTrxId, RollPointer expectedRollPtr) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         IndexPageHandle leafHandle = path.get(path.size() - 1);
         RecordPage leaf = leafHandle.recordPage();
         PageId leafId = leafHandle.pageId();
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         validateLeafPage(leaf, index, leafId);
         OptionalInt found = search.findEqual(leaf, key, index.keyDef(), index.schema());
         if (found.isEmpty()) {
             return BTreeDeleteResult.noChange(index);
         }
         int offset = found.getAsInt();
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         RecordCursor cursor = new RecordCursor(leaf, offset, index.schema(), registry);
         if (!cursor.isDeleted()
                 || !expectedTrxId.equals(cursor.dbTrxId())
@@ -627,6 +775,7 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         }
         purger.purge(leaf, offset);
         MergeOutcome outcome = reclaimAfterRemoval(mtr, index, path);
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         return BTreeDeleteResult.removed(outcome.indexAfter(), outcome.freedPages());
     }
 
@@ -824,6 +973,10 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
      * @param expectedTrxId   期望的当前 DB_TRX_ID，不能为 null。
      * @param expectedRollPtr 期望的当前 DB_ROLL_PTR，不能为 Java null。
      * @return {@link BTreeUpdateResult#replaced()} 表示是否真正替换了一条匹配记录。
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param key 参与 {@code replaceClustered} 的稳定领域标识 {@code SearchKey}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public BTreeUpdateResult replaceClustered(MiniTransaction mtr, BTreeIndex index, SearchKey key,
                                               LogicalRecord newRecord, TransactionId expectedTrxId,
@@ -907,18 +1060,33 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
      * 回滚取消标记：{@code deleted=false}、{@code newHidden}=删除前旧隐藏列、{@code expected}=(删除事务 id, delMarkRollPtr)。
      * 物理移除归 purge（本片不做）。不 import trx/undo。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取并校验调用参数与当前领域状态，确保失败发生在本方法创建共享或持久副作用之前。</li>
+     *     <li>按类级并发协议取得本阶段所需协作者与 Guard，竞争后重新校验资源身份和生命周期。</li>
+     *     <li>执行核心状态转换或数据变换，并只通过本包稳定协作者发布可观察副作用。</li>
+     *     <li>汇总稳定结果并沿现有 finally/Guard 释放资源；异常不得伪造成功或清除未完成状态。</li>
+     * </ol>
+     *
      * @param deleted         目标 delete 位。
      * @param newHidden       目标隐藏列（DB_TRX_ID/DB_ROLL_PTR），不能为 null。
      * @param expectedTrxId   期望的当前 DB_TRX_ID，不能为 null。
      * @param expectedRollPtr 期望的当前 DB_ROLL_PTR，不能为 Java null。
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param key 参与 {@code setClusteredDeleteMark} 的稳定领域标识 {@code SearchKey}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @return {@code setClusteredDeleteMark} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public BTreeDeleteMarkResult setClusteredDeleteMark(MiniTransaction mtr, BTreeIndex index, SearchKey key,
                                                         boolean deleted, HiddenColumns newHidden,
                                                         TransactionId expectedTrxId, RollPointer expectedRollPtr) {
+        // 1、读取并校验调用参数与当前领域状态，在共享或持久副作用前拒绝非法状态。
         if (key == null || newHidden == null || expectedTrxId == null || expectedRollPtr == null) {
             throw new DatabaseValidationException(
                     "setClusteredDeleteMark key/newHidden/expectedTrxId/expectedRollPtr must not be null");
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按类级并发协议取得本阶段所需协作者与 Guard，保持处理顺序与资源边界。
         if (!index.clustered()) {
             throw new DatabaseValidationException("setClusteredDeleteMark requires a clustered index: " + index.indexId());
         }
@@ -926,10 +1094,12 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         // 只有 root 即 leaf 交悲观 findLeaf(X)；非法翻转与路径无关，抛出即上抛。
         BTreeDeleteMarkResult optimistic = tryOptimisticMark(mtr, index, key, deleted, newHidden,
                 expectedTrxId, expectedRollPtr);
+        // 3、在中间分支复核阶段性结果；满足条件后，执行核心状态转换或数据变换，并维持领域不变量。
         if (optimistic != null) {
             return optimistic;
         }
         LeafLocation leaf = findLeaf(mtr, index, key, PageLatchMode.EXCLUSIVE);
+        // 4、汇总稳定结果并沿现有 finally/Guard 释放资源，以稳定返回或领域异常完成收口。
         return markInLeaf(leaf.page(), leaf.pageId(), index, key, deleted, newHidden, expectedTrxId, expectedRollPtr);
     }
 
@@ -1020,6 +1190,7 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         }
         LeafLocation leaf = findLeaf(mtr, index, key, PageLatchMode.EXCLUSIVE);
         // 3、4. 单 root leaf 与多层树共享同一 plan-then-execute 实现。
+        // 4、汇总稳定结果并沿现有 finally/Guard 释放资源，以稳定返回或领域异常完成收口。
         return markSecondaryInLeaf(leaf.page(), leaf.pageId(), index, key, deleted);
     }
 
@@ -1068,6 +1239,11 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
     /**
      * 点查索引。数据流：打开 root 并校验 header → level=0 直接查 leaf；
      * level=1 用 root node pointer 选择 leaf，再在 leaf 内执行页内等值查找。
+     *
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param key 参与 {@code lookup} 的稳定领域标识 {@code SearchKey}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @return {@code lookup} 按身份或键定位到的对象；未找到、不可见或尚未持久化时为空 {@code Optional}，从不返回 Java {@code null}
      */
     @Override
     public Optional<BTreeLookupResult> lookup(MiniTransaction mtr, BTreeIndex index, SearchKey key) {
@@ -1078,6 +1254,10 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
      * 点查但**不过滤** delete-marked 当前版本（T1.3f，供 MVCC）。普通 {@link #lookup} 把 delete-marked 当作"消失"
      * 返回空；一致性读必须看到 delete-marked 当前版本（其 {@code DB_TRX_ID}/{@code DB_ROLL_PTR}）才能按 ReadView
      * 判可见性（可见删除→行消失；不可见删除→沿版本链取删除前版本）。返回的 {@code LogicalRecord.deleted()} 携带删除位。
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param key 参与 {@code lookupIncludingDeleted} 的稳定领域标识 {@code SearchKey}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @return {@code lookupIncludingDeleted} 按身份或键定位到的对象；未找到、不可见或尚未持久化时为空 {@code Optional}，从不返回 Java {@code null}
      */
     public Optional<BTreeLookupResult> lookupIncludingDeleted(MiniTransaction mtr, BTreeIndex index, SearchKey key) {
         return doLookup(mtr, index, key, true);
@@ -1101,15 +1281,31 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
      * current-read 专用点定位。调用方必须在本方法返回后提交/回滚 MTR 释放 page latch/fix，再用返回的
      * record/gap/next-key 值对象进入 LockManager；返回值不包含任何 cursor 或 page handle。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取并校验调用参数与当前领域状态，确保失败发生在本方法创建共享或持久副作用之前。</li>
+     *     <li>按类级并发协议取得本阶段所需协作者与 Guard，竞争后重新校验资源身份和生命周期。</li>
+     *     <li>执行核心状态转换或数据变换，并只通过本包稳定协作者发布可观察副作用。</li>
+     *     <li>汇总稳定结果并沿现有 finally/Guard 释放资源；异常不得伪造成功或清除未完成状态。</li>
+     * </ol>
+     *
      * @param includeDeleted true 时 delete-marked 同 key 也算命中（unique 物理检查）；false 时按普通当前读视为缺失。
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param key 参与 {@code locatePointForCurrentRead} 的稳定领域标识 {@code SearchKey}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @return {@code locatePointForCurrentRead} 准备或解码出的中间领域对象；成功时不为 {@code null}，其边界、资源归属和后续发布阶段已明确
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     BTreeCurrentReadPosition locatePointForCurrentRead(MiniTransaction mtr, BTreeIndex index, SearchKey key,
                                                        boolean includeDeleted) {
+        // 1、读取并校验调用参数与当前领域状态，在共享或持久副作用前拒绝非法状态。
         if (index == null || key == null) {
             throw new DatabaseValidationException("current-read locate index/key must not be null");
         }
         // 0.13c 读路径 crab：S-crab 下降定位 record/gap，祖先早释放。
+        // 2、继续完成范围、身份与候选校验；通过后，按类级并发协议取得本阶段所需协作者与 Guard，保持处理顺序与资源边界。
         LeafLocation leaf = findLeafSharedCrab(mtr, index, key);
+        // 3、在中间分支复核阶段性结果；满足条件后，执行核心状态转换或数据变换，并维持领域不变量。
         OptionalInt found = search.findEqual(leaf.page(), key, index.keyDef(), index.schema());
         if (found.isPresent()) {
             RecordCursor cursor = new RecordCursor(leaf.page(), found.getAsInt(), index.schema(), registry);
@@ -1121,6 +1317,7 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
                         Optional.of(new NextKeyLockKey(recordKey, gapKey)));
             }
         }
+        // 4、汇总稳定结果并沿现有 finally/Guard 释放资源，以稳定返回或领域异常完成收口。
         return new BTreeCurrentReadPosition(Optional.empty(), Optional.empty(),
                 gapForSearchKey(leaf.page(), index, key), Optional.empty());
     }
@@ -1131,18 +1328,36 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
      * 终止 gap。调用方必须在返回后结束 MTR，再进入可能阻塞的事务锁等待。
      *
      * <p>简化点：终止 gap 仍使用当前页级 gap 表达，可能比 SQL 谓词略宽；后续 global gap ref 可进一步收窄。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取并校验调用参数与当前领域状态，确保失败发生在本方法创建共享或持久副作用之前。</li>
+     *     <li>按类级并发协议取得本阶段所需协作者与 Guard，竞争后重新校验资源身份和生命周期。</li>
+     *     <li>执行核心状态转换与受控 IO，把必要的 redo、dirty 或诊断副作用交给既有下游。</li>
+     *     <li>汇总稳定结果并沿现有 finally/Guard 释放资源；异常不得伪造成功或清除未完成状态。</li>
+     * </ol>
+     *
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param range 调用方已校验的执行计划、批次、范围或候选对象；不得为 {@code null}，边界必须有序且不得跨越所属事务、表或日志批次
+     * @return {@code locateRangeForCurrentRead} 准备或解码出的中间领域对象；成功时不为 {@code null}，其边界、资源归属和后续发布阶段已明确
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     BTreeCurrentReadRangePosition locateRangeForCurrentRead(MiniTransaction mtr, BTreeIndex index,
                                                             BTreeScanRange range) {
+        // 1、读取并校验调用参数与当前领域状态，在共享或持久副作用前拒绝非法状态。
         if (index == null || range == null) {
             throw new DatabaseValidationException("current-read range index/range must not be null");
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按类级并发协议取得本阶段所需协作者与 Guard，保持处理顺序与资源边界。
         if (range.limit() == 0) {
             return new BTreeCurrentReadRangePosition(List.of(), Optional.empty());
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，执行核心状态转换与受控 IO，并维持领域不变量。
         List<BTreeCurrentReadPosition> positions = new ArrayList<>();
         // 0.13c 读 crab：S-crab 下降到起始 leaf，沿 sibling 链 hand-over-hand 扫；祖先与前驱 leaf 均早释放。
         IndexPageHandle leafHandle = descendSharedCrab(mtr, index, range.lowerKey());
+        // 4、汇总稳定结果并沿现有 finally/Guard 释放资源，以稳定返回或领域异常完成收口。
         while (true) {
             RecordPage leaf = leafHandle.recordPage();
             PageId leafId = leafHandle.pageId();
@@ -1167,6 +1382,11 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
 
     /**
      * 历史 scanLeaf 方法在 B3 后委托为真正 scan。leaf-only 语义仍由 LeafOnlyBTreeIndexService 保持。
+     *
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param range 调用方已校验的执行计划、批次、范围或候选对象；不得为 {@code null}，边界必须有序且不得跨越所属事务、表或日志批次
+     * @return 按物理页、日志或 SQL 源顺序扫描并物化的元素；无匹配内容时返回空集合，不用 {@code null} 表示缺失
      */
     @Override
     public List<BTreeLookupResult> scanLeaf(MiniTransaction mtr, BTreeIndex index, BTreeScanRange range) {
@@ -1175,6 +1395,11 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
 
     /**
      * 有界范围扫描。level=0 扫 root leaf；level=1 从 lowerKey 对应 leaf 开始，沿 FIL sibling next 链顺序扫。
+     *
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param range 调用方已校验的执行计划、批次、范围或候选对象；不得为 {@code null}，边界必须有序且不得跨越所属事务、表或日志批次
+     * @return 按物理页、日志或 SQL 源顺序扫描并物化的元素；无匹配内容时返回空集合，不用 {@code null} 表示缺失
      */
     @Override
     public List<BTreeLookupResult> scan(MiniTransaction mtr, BTreeIndex index, BTreeScanRange range) {
@@ -1397,6 +1622,11 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
      * 插入逻辑记录（0.13a：写路径 latch coupling）。<b>乐观优先</b>：多层树先 {@link #tryOptimisticInsert} 走
      * S-crab 下降 + leaf X，放得下即成（仅 leaf 持 X，放开 root 处写并发）；leaf 溢出需 split（unsafe）或树只有单 root leaf
      * 时返回 null，回退 {@link #pessimisticInsert} 悲观全路径 X（现有 split 引擎不变）。
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param record 参与本次操作的记录或记录集合；不得为 {@code null}，顺序、身份与编码必须满足当前索引或日志格式
+     * @return {@code insert} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     @Override
     public BTreeInsertResult insert(MiniTransaction mtr, BTreeIndex index, LogicalRecord record) {
@@ -1419,16 +1649,33 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
      * **提前释放 leaf X**（零页修改，可干净重启）后返回 null，交悲观全 X 处理 split。root 即 leaf（单页树）无 crab 收益，
      * {@code descendOptimistic} 返回 null，本方法同样返回 null 交悲观。唯一性冲突（{@link #ensureUniqueAbsent} 抛
      * {@link BTreeDuplicateKeyException}）与路径无关，直接上抛（悲观也会抛，语义一致）。
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取并校验调用参数与当前领域状态，确保失败发生在本方法创建共享或持久副作用之前。</li>
+     *     <li>按类级并发协议取得本阶段所需协作者与 Guard，竞争后重新校验资源身份和生命周期。</li>
+     *     <li>执行核心状态转换或数据变换，并只通过本包稳定协作者发布可观察副作用。</li>
+     *     <li>汇总稳定结果并沿现有 finally/Guard 释放资源；异常不得伪造成功或清除未完成状态。</li>
+     * </ol>
+     *
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param record 参与本次操作的记录或记录集合；不得为 {@code null}，顺序、身份与编码必须满足当前索引或日志格式
+     * @param key 参与 {@code tryOptimisticInsert} 的稳定领域标识 {@code SearchKey}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @return {@code tryOptimisticInsert} 未找到或条件不满足时返回 {@code null}；否则返回满足构造不变量的 {@code BTreeInsertResult} 结果
      */
     private BTreeInsertResult tryOptimisticInsert(MiniTransaction mtr, BTreeIndex index, LogicalRecord record,
                                                   SearchKey key) {
+        // 1、读取并校验调用参数与当前领域状态，在共享或持久副作用前拒绝非法状态。
         IndexPageHandle leafHandle = descendOptimistic(mtr, index, key);
+        // 2、继续完成范围、身份与候选校验；通过后，按类级并发协议取得本阶段所需协作者与 Guard，保持处理顺序与资源边界。
         if (leafHandle == null) {
             return null; // root 即 leaf：交悲观（单页无并发收益）
         }
         RecordPage leaf = leafHandle.recordPage();
+        // 3、在中间分支复核阶段性结果；满足条件后，执行核心状态转换或数据变换，并维持领域不变量。
         PageId leafId = leafHandle.pageId();
         ensureUniqueAbsent(leaf, leafId, index, key);
+        // 4、汇总稳定结果并沿现有 finally/Guard 释放资源，以稳定返回或领域异常完成收口。
         try {
             RecordRef ref = inserter.insert(leaf, leafId, record, index.keyDef(), index.schema());
             optimisticInsertHits.increment();
@@ -1445,14 +1692,31 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
      * 悲观插入：X 下降 + <b>safe-node 早释放祖先</b>（0.13d，{@link #descendPathInsertSafeNode}）——遇到 safe 祖先即释放其
      * 以上全部 X latch（含 root），保留链收缩为「safe 祖先 … leaf」；放得下直接插、溢出自底向上 split 传播（只在保留链内）。
      * 既是单 root leaf 树的基础路径，也是乐观 unsafe（split）后的重启路径；split 引擎与本次改动无关，行为不变。
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取并校验调用参数与当前领域状态，确保失败发生在本方法创建共享或持久副作用之前。</li>
+     *     <li>按类级并发协议取得本阶段所需协作者与 Guard，竞争后重新校验资源身份和生命周期。</li>
+     *     <li>执行核心状态转换或数据变换，并只通过本包稳定协作者发布可观察副作用。</li>
+     *     <li>汇总稳定结果并沿现有 finally/Guard 释放资源；异常不得伪造成功或清除未完成状态。</li>
+     * </ol>
+     *
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param record 参与本次操作的记录或记录集合；不得为 {@code null}，顺序、身份与编码必须满足当前索引或日志格式
+     * @param key 参与 {@code pessimisticInsert} 的稳定领域标识 {@code SearchKey}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @return {@code pessimisticInsert} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
      */
     private BTreeInsertResult pessimisticInsert(MiniTransaction mtr, BTreeIndex index, LogicalRecord record,
                                                 SearchKey key) {
+        // 1、读取并校验调用参数与当前领域状态，在共享或持久副作用前拒绝非法状态。
         List<IndexPageHandle> path = descendPathInsertSafeNode(mtr, index, key);
+        // 2、继续完成范围、身份与候选校验；通过后，按类级并发协议取得本阶段所需协作者与 Guard，保持处理顺序与资源边界。
         IndexPageHandle leafHandle = path.get(path.size() - 1);
         RecordPage leaf = leafHandle.recordPage();
+        // 3、在中间分支复核阶段性结果；满足条件后，执行核心状态转换或数据变换，并维持领域不变量。
         PageId leafId = leafHandle.pageId();
         ensureUniqueAbsent(leaf, leafId, index, key);
+        // 4、汇总稳定结果并沿现有 finally/Guard 释放资源，以稳定返回或领域异常完成收口。
         try {
             RecordRef ref = inserter.insert(leaf, leafId, record, index.keyDef(), index.schema());
             return new BTreeInsertResult(index, ref);
@@ -1646,6 +1910,13 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
     /**
      * B+Tree 导航/兄弟页维护的 page-latch-order 例外入口。B+Tree 的正确性依赖 hand-over-hand：释放父页或前驱页之前，
      * 必须先 latch 到即将使用的子页/后继页；物理页号与 key 顺序无关，不能用 PageId 升序替代 B+Tree 的局部无环证明。
+     *
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param pageId 目标页的稳定物理标识；必须属于当前已准入表空间，且不得为 {@code null}
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param mode 调用方请求的目标状态、阶段或模式；不得为 {@code null}，且必须是当前状态机允许的后继值
+     * @param reason 传给 {@code openBTreePageOutOfOrder} 的文本值；不得为 {@code null} 或空白，并保持调用方提供的字符顺序
+     * @return {@code openBTreePageOutOfOrder} 取得或创建的受控存储资源；成功时不为 {@code null}，调用方必须按其 Guard/lease 契约释放
      */
     private IndexPageHandle openBTreePageOutOfOrder(MiniTransaction mtr, PageId pageId, BTreeIndex index,
                                                     PageLatchMode mode, String reason) {
@@ -1663,28 +1934,47 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
      * <p>数据流：{@link IndexPageAccess} 已先完成物理结构校验；本方法随后核对 indexId，并按页面实际 level 选择
      * leaf schema 或派生 node-pointer schema。校验早于 child 选择、record search 和任何写页/redo 收集。
      * 页实际 level 是树高权威，不能使用可能因 root shrink 而陈旧的 index.rootLevel 快照。
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验表空间生命周期、页号、区段身份与容量边界，非法或损坏元数据在分配/IO 前拒绝。</li>
+     *     <li>按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，避免锁序反转。</li>
+     *     <li>执行空间元数据或物理文件变化，并把需要的 allocation intent、redo、dirty 或 force 副作用交给既有下游。</li>
+     *     <li>发布稳定结果并逆序释放 lease、latch 与 fix；失败保留可由恢复流程识别的权威状态。</li>
+     * </ol>
+     *
+     * @param handle 调用方持有的 {@code IndexPageHandle} 资源句柄；不得为 {@code null} 且必须处于有效期，方法返回前所有权仍归调用方
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws BTreeStructureCorruptedException 检测到不能安全解释的持久数据损坏时抛出；调用方不得继续发布普通服务或覆盖原始证据
      */
     private void validateExistingBTreePage(IndexPageHandle handle, BTreeIndex index) {
+        // 1、校验表空间生命周期、页号、区段身份与容量边界，在共享或持久副作用前拒绝非法状态。
         if (handle == null || index == null) {
             throw new DatabaseValidationException("btree existing page handle/index must not be null");
         }
         RecordPage page = handle.recordPage();
+        // 2、继续完成范围、身份与候选校验；通过后，按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，保持处理顺序与资源边界。
         IndexPageHeader header = page.header();
         if (header.indexId() != index.indexId()) {
             throw new BTreeStructureCorruptedException("index page id mismatch at " + handle.pageId()
                     + ": page=" + header.indexId() + " expected=" + index.indexId());
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，执行空间元数据或物理文件变化，并维持领域不变量。
         if (header.level() == 0) {
             keyOrderValidator.validate(handle.pageId(), page, index.schema(), index.keyDef(),
                     RecordType.CONVENTIONAL);
             return;
         }
         BTreeNodePointerSchema pointerSchema = BTreeNodePointerSchema.from(index);
+        // 4、发布稳定结果并逆序释放 lease、latch 与 fix，以稳定返回或领域异常完成收口。
         keyOrderValidator.validate(handle.pageId(), page, pointerSchema.schema(), pointerSchema.keyDef(),
                 RecordType.NODE_POINTER);
     }
 
-    /** split/root split 预留预算。 */
+    /** split/root split 预留预算。
+     *
+     * @param pages 参与 {@code 构造} 的上界或规格值 {@code pages}；必须非负且不能使容量、页数或编码长度计算溢出
+     */
     private record SplitReservationBudget(long pages) {
     }
 
@@ -1731,9 +2021,25 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
      * 把 separator 插入 {@code path[depth]}（非叶页）。放得下直接插（树高不变）；放不下则对该非叶页做内部 split：
      * 它若是 root 则原地长高（level L→L+1），否则改写为左半 + 新右兄弟存右半，新 separator 继续向上递归。
      * 返回插入后调用方应使用的索引快照（仅原地长高会改 rootLevel）。
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取并校验调用参数与当前领域状态，确保失败发生在本方法创建共享或持久副作用之前。</li>
+     *     <li>按类级并发协议取得本阶段所需协作者与 Guard，竞争后重新校验资源身份和生命周期。</li>
+     *     <li>执行核心状态转换或数据变换，并只通过本包稳定协作者发布可观察副作用。</li>
+     *     <li>汇总稳定结果并沿现有 finally/Guard 释放资源；异常不得伪造成功或清除未完成状态。</li>
+     * </ol>
+     *
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param path 受控目录内的规范化文件路径；不得为 {@code null}，也不得逃逸所属表空间或日志目录
+     * @param depth 参与 {@code insertSeparator} 的树层级或递归深度 {@code depth}；必须非负且不得超过当前页结构、MTR memo 或解析器声明的最大深度
+     * @param separator 参与 {@code insertSeparator} 的稳定领域标识 {@code BTreeNodePointer}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param allocated 参与 {@code insertSeparator} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @return {@code insertSeparator} 取得或创建的受控存储资源；成功时不为 {@code null}，调用方必须按其 Guard/lease 契约释放
      */
     private BTreeIndex insertSeparator(MiniTransaction mtr, BTreeIndex index, List<IndexPageHandle> path,
                                        int depth, BTreeNodePointer separator, List<PageId> allocated) {
+        // 1、读取并校验调用参数与当前领域状态，在共享或持久副作用前拒绝非法状态。
         IndexPageHandle parentHandle = path.get(depth);
         RecordPage parent = parentHandle.recordPage();
         if (pointerFits(parent, index, separator)) {
@@ -1743,16 +2049,19 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
                     "btree separator insertion final parent image");
             return index;
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按类级并发协议取得本阶段所需协作者与 Guard，保持处理顺序与资源边界。
         requireNonLeafSegment(index);
         List<BTreeNodePointer> combined = materializePointers(parent, index);
         combined.add(separator);
         combined.sort((a, b) -> keyComparator.compare(a.lowKey(), b.lowKey(), index.keyDef(), index.schema()));
+        // 3、在中间分支复核阶段性结果；满足条件后，执行核心状态转换或数据变换，并维持领域不变量。
         SplitPointers split = splitPointers(combined);
         if (depth == 0) {
             return growRootWithInternal(mtr, index, parentHandle, split, allocated);
         }
         PageId newSiblingId = splitNonRootInternal(mtr, index, parentHandle, split, allocated);
         BTreeNodePointer upSeparator = new BTreeNodePointer(split.right().get(0).lowKey(), newSiblingId);
+        // 4、汇总稳定结果并沿现有 finally/Guard 释放资源，以稳定返回或领域异常完成收口。
         return insertSeparator(mtr, index, path, depth - 1, upSeparator, allocated);
     }
 
@@ -2128,11 +2437,21 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         return after;
     }
 
-    /** 欠载回收结果：操作后索引快照（root shrink 会降 rootLevel）+ 回收页集合。 */
+    /** 欠载回收结果：操作后索引快照（root shrink 会降 rootLevel）+ 回收页集合。
+     *
+     * @param indexAfter 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param freedPages 参与 {@code 构造} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     */
     private record MergeOutcome(BTreeIndex indexAfter, List<PageId> freedPages) {
     }
 
-    /** merge 的相邻同父页对：survivor 恒为左者（保留、父 pointer key 不变），victim 为右者（并入 survivor 后被摘 pointer + free）。 */
+    /** merge 的相邻同父页对：survivor 恒为左者（保留、父 pointer key 不变），victim 为右者（并入 survivor 后被摘 pointer + free）。
+     *
+     * @param survivor 调用方持有的 {@code IndexPageHandle} 资源句柄；不得为 {@code null} 且必须处于有效期，方法返回前所有权仍归调用方
+     * @param victim 调用方持有的 {@code IndexPageHandle} 资源句柄；不得为 {@code null} 且必须处于有效期，方法返回前所有权仍归调用方
+     * @param survivorId 参与 {@code 构造} 的稳定领域标识 {@code PageId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param victimId 参与 {@code 构造} 的稳定领域标识 {@code PageId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     */
     private record MergePair(IndexPageHandle survivor, IndexPageHandle victim, PageId survivorId, PageId victimId) {
     }
 
@@ -2144,6 +2463,12 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
      * （每条独立 MTR）调用，shrink 后快照 {@code rootLevel} 必然陈旧——严格相等断言会把合法的 shrink 误判为
      * 「root changed」。页才是树高的权威；快照 level 仅作 {@code indexAfter} 观测/回填用。并发场景下的真正
      * 重定位/重启协议留 0.13/2.7，届时再以 latch coupling + 版本校验替代（{@code BTreeRootChangedException} 保留备用）。
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param mode 调用方请求的目标状态、阶段或模式；不得为 {@code null}，且必须是当前状态机允许的后继值
+     * @return {@code openRoot} 取得或创建的受控存储资源；成功时不为 {@code null}，调用方必须按其 Guard/lease 契约释放
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws BTreeStructureCorruptedException 检测到不能安全解释的持久数据损坏时抛出；调用方不得继续发布普通服务或覆盖原始证据
      */
     private IndexPageHandle openRoot(MiniTransaction mtr, BTreeIndex index, PageLatchMode mode) {
         if (mtr == null || index == null || mode == null) {
@@ -2324,6 +2649,9 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
      * 释放并清空当前保留链中的全部 latch（已找到 safe 内部 child，其全部祖先与本次 SMO 无关）；按早释放的祖先数累加
      * {@code releaseCounter}（insert 与 delete/purge 分开计数，便于测试定向断言）。释放的祖先在下降阶段未写入（非 touched），
      * {@link MiniTransaction#releaseLatch} 放行。
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param retained 参与 {@code releaseRetainedAncestors} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @param releaseCounter 调用方提供的长度或容量值对象；不得为 {@code null}，且必须已通过其构造范围校验
      */
     private void releaseRetainedAncestors(MiniTransaction mtr, List<IndexPageHandle> retained,
                                           LongAdder releaseCounter) {
@@ -2539,10 +2867,22 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         return new LeafLocation(leaf, leaf.recordPage(), leaf.pageId());
     }
 
-    /** {@link #findLeaf} 定位结果：leaf 句柄（scan 取 sibling 链/header）、leaf 页视图、leaf 物理页号。 */
+    /** {@link #findLeaf} 定位结果：leaf 句柄（scan 取 sibling 链/header）、leaf 页视图、leaf 物理页号。
+     * @param handle 调用方持有的 {@code IndexPageHandle} 资源句柄；不得为 {@code null} 且必须处于有效期，方法返回前所有权仍归调用方
+     * @param page 已固定的页面、frame 或页头视图；不得为 {@code null}，必须指向目标 PageId，并在访问期间持有契约要求的 fix/latch
+     * @param pageId 目标页的稳定物理标识；必须属于当前已准入表空间，且不得为 {@code null}
+     */
     private record LeafLocation(IndexPageHandle handle, RecordPage page, PageId pageId) {
     }
 
+    /**
+     * 校验 {@code validateLeafPage} 涉及的B+Tree 索引结构、范围与交叉字段；合法输入不修改状态，非法输入在副作用前抛出领域异常。
+     *
+     * @param page 已固定的页面、frame 或页头视图；不得为 {@code null}，必须指向目标 PageId，并在访问期间持有契约要求的 fix/latch
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param pageId 目标页的稳定物理标识；必须属于当前已准入表空间，且不得为 {@code null}
+     * @throws BTreeStructureCorruptedException 检测到不能安全解释的持久数据损坏时抛出；调用方不得继续发布普通服务或覆盖原始证据
+     */
     private void validateLeafPage(RecordPage page, BTreeIndex index, PageId pageId) {
         IndexPageHeader header = page.header();
         if (header.indexId() != index.indexId()) {
@@ -2594,6 +2934,14 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
     /**
      * 扫描单个已持 S latch 的 leaf。delete-mark 过滤在范围比较前执行，但 including-deleted 模式会保留标记项；
      * 两种模式均复用同一 key comparator，保证普通查询与物理检查的边界排序一致。
+     *
+     * @param leaf 已固定的页面、frame 或页头视图；不得为 {@code null}，必须指向目标 PageId，并在访问期间持有契约要求的 fix/latch
+     * @param leafId 参与 {@code scanLeafPage} 的稳定领域标识 {@code PageId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param range 调用方已校验的执行计划、批次、范围或候选对象；不得为 {@code null}，边界必须有序且不得跨越所属事务、表或日志批次
+     * @param acc 当前算法已准备的中间状态；不得为 {@code null}，必须由本次扫描、日志组装或事务终结流程创建且尚未发布
+     * @param includeDeleted 资源是否处于删除、空闲、静默、持久化或终态；必须与权威状态机一致，不能由调用方猜测
+     * @return {@code scanLeafPage} 成功完成其命名的受控动作并发布结果时为 {@code true}；未命中、未执行或状态竞争失败时为 {@code false}
      */
     private boolean scanLeafPage(RecordPage leaf, PageId leafId, BTreeIndex index, BTreeScanRange range,
                                  ScanAccumulator acc, boolean includeDeleted) {
@@ -2659,6 +3007,13 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         return false;
     }
 
+    /**
+     * 把输入转换为 {@code materializeLeafRecords} 对应的B+Tree 索引结果；转换保持稳定顺序与身份映射，不修改调用方持有的输入对象。
+     *
+     * @param page 已固定的页面、frame 或页头视图；不得为 {@code null}，必须指向目标 PageId，并在访问期间持有契约要求的 fix/latch
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @return 按物理页、日志或 SQL 源顺序扫描并物化的元素；无匹配内容时返回空集合，不用 {@code null} 表示缺失
+     */
     private List<LogicalRecord> materializeLeafRecords(RecordPage page, BTreeIndex index) {
         List<LogicalRecord> records = new ArrayList<>();
         for (int off : page.recordOffsetsInOrder()) {
@@ -2667,13 +3022,33 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         return records;
     }
 
+    /**
+     * 校验输入与当前状态后修改B+Tree 索引领域数据；成功发布完整结果，异常路径保留既有持久化与并发不变量。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取并校验调用参数与当前领域状态，确保失败发生在本方法创建共享或持久副作用之前。</li>
+     *     <li>按类级并发协议取得本阶段所需协作者与 Guard，竞争后重新校验资源身份和生命周期。</li>
+     *     <li>执行核心状态转换或数据变换，并只通过本包稳定协作者发布可观察副作用。</li>
+     *     <li>汇总稳定结果并沿现有 finally/Guard 释放资源；异常不得伪造成功或清除未完成状态。</li>
+     * </ol>
+     *
+     * @param records 参与本次操作的记录或记录集合；不得为 {@code null}，顺序、身份与编码必须满足当前索引或日志格式
+     * @param inserted 参与记录编解码或索引比较的字段值；不得为 {@code null}，其类型、字节边界和 SQL NULL 语义必须与当前 schema 一致
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @return {@code sortedWithInserted} 产生的非空集合容器；元素身份与顺序遵循当前模块契约，无元素时返回空集合而非 {@code null}
+     */
     private List<LogicalRecord> sortedWithInserted(List<LogicalRecord> records, LogicalRecord inserted,
                                                    BTreeIndex index) {
+        // 1、读取并校验调用参数与当前领域状态，在共享或持久副作用前拒绝非法状态。
         List<LogicalRecord> all = new ArrayList<>(records.size() + 1);
+        // 2、继续完成范围、身份与候选校验；通过后，按类级并发协议取得本阶段所需协作者与 Guard，保持处理顺序与资源边界。
         all.addAll(records);
+        // 3、在中间分支复核阶段性结果；满足条件后，执行核心状态转换或数据变换，并维持领域不变量。
         all.add(inserted);
         all.sort(Comparator.comparing(rec -> keyOf(rec, index),
                 (a, b) -> keyComparator.compare(a, b, index.keyDef(), index.schema())));
+        // 4、汇总稳定结果并沿现有 finally/Guard 释放资源，以稳定返回或领域异常完成收口。
         return all;
     }
 
@@ -2685,6 +3060,16 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         return new SplitRows(List.copyOf(records.subList(0, mid)), List.copyOf(records.subList(mid, records.size())));
     }
 
+    /**
+     * 校验输入与当前状态后修改B+Tree 索引领域数据；成功发布完整结果，异常路径保留既有持久化与并发不变量。
+     *
+     * @param page 已固定的页面、frame 或页头视图；不得为 {@code null}，必须指向目标 PageId，并在访问期间持有契约要求的 fix/latch
+     * @param pageId 目标页的稳定物理标识；必须属于当前已准入表空间，且不得为 {@code null}
+     * @param rows 参与 {@code insertAll} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param inserted 参与记录编解码或索引比较的字段值；不得为 {@code null}，其类型、字节边界和 SQL NULL 语义必须与当前 schema 一致
+     * @return {@code insertAll} 定位或分配的稳定值对象；成功时不为 {@code null}，其身份、范围和特殊值已由构造校验保证
+     */
     private RecordRef insertAll(RecordPage page, PageId pageId, List<LogicalRecord> rows, BTreeIndex index,
                                 LogicalRecord inserted) {
         RecordRef insertedRef = null;
@@ -2783,6 +3168,15 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         return new BTreeLookupResult(index, cursor.recordRef(pageId, index.indexId()), cursor.materialize());
     }
 
+    /**
+     * 按 leaf 的物理记录顺序定位目标 offset，并用前驱 key 与目标 key 构造其左侧 gap lock 身份；offset 不存在视为页结构损坏。
+     *
+     * @param leaf 已固定的页面、frame 或页头视图；不得为 {@code null}，必须指向目标 PageId，并在访问期间持有契约要求的 fix/latch
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param recordOffset 目标结构内的零基偏移；必须落在当前页、记录或持久槽位的合法范围
+     * @return {@code gapBeforeRecord} 定位或分配的稳定值对象；成功时不为 {@code null}，其身份、范围和特殊值已由构造校验保证
+     * @throws BTreeStructureCorruptedException 检测到不能安全解释的持久数据损坏时抛出；调用方不得继续发布普通服务或覆盖原始证据
+     */
     private GapLockKey gapBeforeRecord(RecordPage leaf, BTreeIndex index, int recordOffset) {
         SearchKey leftKey = null;
         for (int off : leaf.recordOffsetsInOrder()) {
@@ -2840,21 +3234,40 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         }
     }
 
-    /** 分裂后的左右记录集；两侧都必须非空。 */
+    /** 分裂后的左右记录集；两侧都必须非空。
+     *
+     * @param left 参与 {@code 构造} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @param right 参与 {@code 构造} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     */
     private record SplitRows(List<LogicalRecord> left, List<LogicalRecord> right) {
     }
 
-    /** 非叶页内部 split 的左右 pointer 集；两侧都必须非空。 */
+    /** 非叶页内部 split 的左右 pointer 集；两侧都必须非空。
+     *
+     * @param left 参与 {@code 构造} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @param right 参与 {@code 构造} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     */
     private record SplitPointers(List<BTreeNodePointer> left, List<BTreeNodePointer> right) {
     }
 
-    /** 非 root leaf split 结果：新插入记录页内短期 ref、右半最小 key（separator）、新右兄弟页号。 */
+    /** 非 root leaf split 结果：新插入记录页内短期 ref、右半最小 key（separator）、新右兄弟页号。
+     *
+     * @param insertedRef 参与 {@code 构造} 的稳定领域标识 {@code RecordRef}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param rightLowKey 参与 {@code 构造} 的稳定领域标识 {@code SearchKey}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param newRightId 参与 {@code 构造} 的稳定领域标识 {@code PageId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     */
     private record LeafSplitResult(RecordRef insertedRef, SearchKey rightLowKey, PageId newRightId) {
     }
 
     /** scan 结果累积器，集中管理 limit 与不可变输出。 */
     private static final class ScanAccumulator {
+        /**
+         * 记录 {@code limit} 的非负位置、容量或计数；写入前必须校验所属页/集合上界，溢出会破坏布局或资源记账。
+         */
         private final int limit;
+        /**
+         * 本对象拥有的 {@code rows} 受控集合；元素生命周期与外层对象一致，仅由本类方法更新，对外暴露时必须返回副本或不可变视图。
+         */
         private final List<BTreeLookupResult> rows = new ArrayList<>();
 
         private ScanAccumulator(int limit) {

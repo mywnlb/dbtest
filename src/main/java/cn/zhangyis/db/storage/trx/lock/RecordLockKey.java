@@ -32,6 +32,7 @@ public record RecordLockKey(long indexId, PageId pageId, int heapNo) implements 
      *
      * @param ref record 模块返回的记录定位。
      * @return record 事务锁 key。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public static RecordLockKey from(RecordRef ref) {
         if (ref == null) {

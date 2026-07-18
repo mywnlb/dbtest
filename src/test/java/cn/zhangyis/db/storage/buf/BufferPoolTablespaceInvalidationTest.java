@@ -39,6 +39,11 @@ class BufferPoolTablespaceInvalidationTest {
         return PageId.of(SPACE, PageNo.of(pageNo));
     }
 
+    /**
+     * 验证 {@code waitsForFixedFrameThenEvictsAllSpaceFrames} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void waitsForFixedFrameThenEvictsAllSpaceFrames() throws Exception {
         try (PageStore store = new FileChannelPageStore(); BufferPool pool = new LruBufferPool(store, PS, 4)) {
@@ -55,6 +60,11 @@ class BufferPoolTablespaceInvalidationTest {
         }
     }
 
+    /**
+     * 验证 {@code rejectsForegroundAdmissionWhileInvalidationWaitsForFixedFrame} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void rejectsForegroundAdmissionWhileInvalidationWaitsForFixedFrame() throws Exception {
         try (PageStore store = new FileChannelPageStore(); BufferPool pool = new LruBufferPool(store, PS, 4)) {
@@ -74,6 +84,11 @@ class BufferPoolTablespaceInvalidationTest {
         }
     }
 
+    /**
+     * 验证 {@code prefetchSkipsDuringInvalidationWindow} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void prefetchSkipsDuringInvalidationWindow() throws Exception {
         try (CountingPageStore store = openCountingStore("prefetch.ibu", 3);
@@ -92,6 +107,11 @@ class BufferPoolTablespaceInvalidationTest {
         }
     }
 
+    /**
+     * 验证 {@code loadingOwnerDropsPlaceholderWhenInvalidationBeginsBeforePublish} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void loadingOwnerDropsPlaceholderWhenInvalidationBeginsBeforePublish() throws Exception {
         try (BlockingPageStore store = openBlockingStore("loading.ibu", 3);
@@ -122,6 +142,9 @@ class BufferPoolTablespaceInvalidationTest {
         }
     }
 
+    /**
+     * 验证 {@code rejectsDirtyFrameInsteadOfSilentlyDroppingIt} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void rejectsDirtyFrameInsteadOfSilentlyDroppingIt() {
         try (PageStore store = new FileChannelPageStore(); BufferPool pool = new LruBufferPool(store, PS, 4)) {
@@ -139,6 +162,9 @@ class BufferPoolTablespaceInvalidationTest {
         }
     }
 
+    /**
+     * 验证 {@code fixedFrameWaitHasTimeout} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void fixedFrameWaitHasTimeout() {
         try (PageStore store = new FileChannelPageStore(); BufferPool pool = new LruBufferPool(store, PS, 4)) {

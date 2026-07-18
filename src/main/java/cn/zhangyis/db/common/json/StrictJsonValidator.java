@@ -51,7 +51,10 @@ public final class StrictJsonValidator {
             }
         }
 
-        /** 根据首字符分派 value；容器递归显式携带深度上界。 */
+        /** 根据首字符分派 value；容器递归显式携带深度上界。
+         *
+         * @param depth 参与 {@code parseValue} 的树层级或递归深度 {@code depth}；必须非负且不得超过当前页结构、MTR memo 或解析器声明的最大深度
+         */
         private void parseValue(int depth) {
             if (offset >= source.length()) {
                 fail("JSON value expected");
@@ -74,14 +77,29 @@ public final class StrictJsonValidator {
             }
         }
 
-        /** object key 必须是双引号字符串；逗号后必须紧跟下一成员，因而尾逗号自然失败。 */
+        /** object key 必须是双引号字符串；逗号后必须紧跟下一成员，因而尾逗号自然失败。
+         *
+         * <p>数据流：</p>
+         * <ol>
+         *     <li>读取输入长度、游标边界与必要标识，损坏、截断或超限数据在创建结果前失败。</li>
+         *     <li>按稳定字段或 token 顺序推进游标并调用对应编解码分支，任何分支都不得越过输入边界。</li>
+         *     <li>交叉校验聚合计数、类型、校验值和剩余输入，防止截断或多余内容形成半解析对象。</li>
+         *     <li>完成剩余字段写入或稳定领域结果构造；失败只保留领域异常与根因，不修改调用方输入或其他持久状态。</li>
+         * </ol>
+         *
+         * @param depth 参与 {@code parseObject} 的树层级或递归深度 {@code depth}；必须非负且不得超过当前页结构、MTR memo 或解析器声明的最大深度
+         */
         private void parseObject(int depth) {
+            // 1、读取输入长度、游标边界与必要标识，在共享或持久副作用前拒绝非法状态。
             requireContainerDepth(depth);
+            // 2、继续完成范围、身份与候选校验；通过后，按稳定字段或 token 顺序推进游标并调用对应编解码分支，保持处理顺序与资源边界。
             offset++;
+            // 3、在中间分支复核阶段性结果；满足条件后，交叉校验聚合计数、类型、校验值和剩余输入，并维持领域不变量。
             skipWhitespace();
             if (consume('}')) {
                 return;
             }
+            // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
             while (true) {
                 if (!peek('"')) {
                     fail("JSON object key must be a double-quoted string");
@@ -100,14 +118,29 @@ public final class StrictJsonValidator {
             }
         }
 
-        /** array 元素必须由单个逗号分隔；空数组只允许直接闭合。 */
+        /** array 元素必须由单个逗号分隔；空数组只允许直接闭合。
+         *
+         * <p>数据流：</p>
+         * <ol>
+         *     <li>读取输入长度、游标边界与必要标识，损坏、截断或超限数据在创建结果前失败。</li>
+         *     <li>按稳定字段或 token 顺序推进游标并调用对应编解码分支，任何分支都不得越过输入边界。</li>
+         *     <li>交叉校验聚合计数、类型、校验值和剩余输入，防止截断或多余内容形成半解析对象。</li>
+         *     <li>完成剩余字段写入或稳定领域结果构造；失败只保留领域异常与根因，不修改调用方输入或其他持久状态。</li>
+         * </ol>
+         *
+         * @param depth 参与 {@code parseArray} 的树层级或递归深度 {@code depth}；必须非负且不得超过当前页结构、MTR memo 或解析器声明的最大深度
+         */
         private void parseArray(int depth) {
+            // 1、读取输入长度、游标边界与必要标识，在共享或持久副作用前拒绝非法状态。
             requireContainerDepth(depth);
+            // 2、继续完成范围、身份与候选校验；通过后，按稳定字段或 token 顺序推进游标并调用对应编解码分支，保持处理顺序与资源边界。
             offset++;
+            // 3、在中间分支复核阶段性结果；满足条件后，交叉校验聚合计数、类型、校验值和剩余输入，并维持领域不变量。
             skipWhitespace();
             if (consume(']')) {
                 return;
             }
+            // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
             while (true) {
                 parseValue(depth + 1);
                 skipWhitespace();
@@ -147,8 +180,18 @@ public final class StrictJsonValidator {
             fail("unterminated JSON string");
         }
 
-        /** 解析一个反斜杠 escape，并完整验证 unicode surrogate pair。 */
+        /** 解析一个反斜杠 escape，并完整验证 unicode surrogate pair。
+         * <p>数据流：</p>
+         * <ol>
+         *     <li>读取输入长度、游标边界与必要标识，损坏、截断或超限数据在创建结果前失败。</li>
+         *     <li>按稳定字段或 token 顺序推进游标并调用对应编解码分支，任何分支都不得越过输入边界。</li>
+         *     <li>交叉校验聚合计数、类型、校验值和剩余输入，防止截断或多余内容形成半解析对象。</li>
+         *     <li>完成剩余字段写入或稳定领域结果构造；失败只保留领域异常与根因，不修改调用方输入或其他持久状态。</li>
+         * </ol>
+         *
+         */
         private void parseEscape() {
+            // 1、读取输入长度、游标边界与必要标识，在共享或持久副作用前拒绝非法状态。
             if (offset >= source.length()) {
                 fail("unterminated JSON escape");
             }
@@ -157,6 +200,7 @@ public final class StrictJsonValidator {
                     || escaped == 'f' || escaped == 'n' || escaped == 'r' || escaped == 't') {
                 return;
             }
+            // 2、继续完成范围、身份与候选校验；通过后，按稳定字段或 token 顺序推进游标并调用对应编解码分支，保持处理顺序与资源边界。
             if (escaped != 'u') {
                 fail("unsupported JSON escape");
             }
@@ -164,6 +208,7 @@ public final class StrictJsonValidator {
             if (Character.isLowSurrogate(decoded)) {
                 fail("unicode escape contains an unpaired low surrogate");
             }
+            // 3、在中间分支复核阶段性结果；满足条件后，交叉校验聚合计数、类型、校验值和剩余输入，并维持领域不变量。
             if (!Character.isHighSurrogate(decoded)) {
                 return;
             }
@@ -173,17 +218,32 @@ public final class StrictJsonValidator {
             }
             offset += 2;
             char low = parseHexCodeUnit();
+            // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
             if (!Character.isLowSurrogate(low)) {
                 fail("unicode high surrogate escape is followed by a non-low surrogate");
             }
         }
 
-        /** 恰好读取四个十六进制字符，不接受 Java/Hutool 扩展格式。 */
+        /** 恰好读取四个十六进制字符，不接受 Java/Hutool 扩展格式。
+         *
+         * <p>数据流：</p>
+         * <ol>
+         *     <li>读取输入长度、游标边界与必要标识，损坏、截断或超限数据在创建结果前失败。</li>
+         *     <li>按稳定字段或 token 顺序推进游标并调用对应编解码分支，任何分支都不得越过输入边界。</li>
+         *     <li>交叉校验聚合计数、类型、校验值和剩余输入，防止截断或多余内容形成半解析对象。</li>
+         *     <li>完成剩余字段写入或稳定领域结果构造；失败只保留领域异常与根因，不修改调用方输入或其他持久状态。</li>
+         * </ol>
+         *
+         * @return {@code parseHexCodeUnit} 从受校验输入或持久字节中得到的 {@code char} 结果；位宽、符号和特殊值语义遵循当前格式，无法表示时抛出领域异常
+         */
         private char parseHexCodeUnit() {
+            // 1、读取输入长度、游标边界与必要标识，在共享或持久副作用前拒绝非法状态。
             if (offset + 4 > source.length()) {
                 fail("incomplete unicode escape");
             }
+            // 2、继续完成范围、身份与候选校验；通过后，按稳定字段或 token 顺序推进游标并调用对应编解码分支，保持处理顺序与资源边界。
             int value = 0;
+            // 3、在中间分支复核阶段性结果；满足条件后，交叉校验聚合计数、类型、校验值和剩余输入，并维持领域不变量。
             for (int i = 0; i < 4; i++) {
                 int digit = Character.digit(source.charAt(offset++), 16);
                 if (digit < 0) {
@@ -191,12 +251,24 @@ public final class StrictJsonValidator {
                 }
                 value = (value << 4) | digit;
             }
+            // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
             return (char) value;
         }
 
-        /** RFC 8259 number：整数零不可带前导数字，小数与指数标记后都必须至少有一位。 */
+        /** RFC 8259 number：整数零不可带前导数字，小数与指数标记后都必须至少有一位。
+         * <p>数据流：</p>
+         * <ol>
+         *     <li>读取输入长度、游标边界与必要标识，损坏、截断或超限数据在创建结果前失败。</li>
+         *     <li>按稳定字段或 token 顺序推进游标并调用对应编解码分支，任何分支都不得越过输入边界。</li>
+         *     <li>交叉校验聚合计数、类型、校验值和剩余输入，防止截断或多余内容形成半解析对象。</li>
+         *     <li>完成剩余字段写入或稳定领域结果构造；失败只保留领域异常与根因，不修改调用方输入或其他持久状态。</li>
+         * </ol>
+         *
+         */
         private void parseNumber() {
+            // 1、读取输入长度、游标边界与必要标识，在共享或持久副作用前拒绝非法状态。
             consume('-');
+            // 2、继续完成范围、身份与候选校验；通过后，按稳定字段或 token 顺序推进游标并调用对应编解码分支，保持处理顺序与资源边界。
             if (consume('0')) {
                 if (offset < source.length() && isDigit(source.charAt(offset))) {
                     fail("leading zero in JSON number");
@@ -207,12 +279,14 @@ public final class StrictJsonValidator {
                     offset++;
                 }
             }
+            // 3、在中间分支复核阶段性结果；满足条件后，交叉校验聚合计数、类型、校验值和剩余输入，并维持领域不变量。
             if (consume('.')) {
                 requireDigit("JSON fraction digits expected");
                 while (offset < source.length() && isDigit(source.charAt(offset))) {
                     offset++;
                 }
             }
+            // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
             if (consume('e') || consume('E')) {
                 if (!consume('+')) {
                     consume('-');
@@ -245,6 +319,9 @@ public final class StrictJsonValidator {
             offset++;
         }
 
+        /**
+         * 从当前输入 token 与局部游标解析 {@code skipWhitespace} 对应的格式结构；成功推进到确定边界，失败报告位置且不发布半解析对象。
+         */
         private void skipWhitespace() {
             while (offset < source.length()) {
                 char current = source.charAt(offset);

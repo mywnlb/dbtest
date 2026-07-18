@@ -27,11 +27,30 @@ import cn.zhangyis.db.storage.page.PageType;
  */
 public final class UndoTablespaceFspRebuilder {
 
+    /**
+     * 本对象持有的 {@code pool} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private final BufferPool pool;
+    /**
+     * 本对象持有的 {@code pageSize} 页面、记录或布局状态；身份与 schema 必须匹配，访问期间遵守 fix/latch 和字节边界，不能泄漏未发布修改。
+     */
     private final PageSize pageSize;
+    /**
+     * 本对象持有的 {@code headerRepository} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private final SpaceHeaderRepository headerRepository;
+    /**
+     * 本对象持有的 {@code extentRepository} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private final ExtentDescriptorRepository extentRepository;
 
+    /**
+     * 创建 {@code UndoTablespaceFspRebuilder}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param pool 由组合根提供的 {@code BufferPool} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param pageSize 调用方提供的长度或容量值对象；不得为 {@code null}，且必须已通过其构造范围校验
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public UndoTablespaceFspRebuilder(BufferPool pool, PageSize pageSize) {
         if (pool == null || pageSize == null) {
             throw new DatabaseValidationException("undo FSP rebuilder pool/pageSize must not be null");
@@ -48,6 +67,7 @@ public final class UndoTablespaceFspRebuilder {
      * @param mtr 维护 MTR。
      * @param previous 截断前/恢复时可读的 FSP 头，用于保留 flags/serverVersion 并推进 spaceVersion。
      * @param marker 同 epoch 的 TRUNCATING marker。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public void rebuild(MiniTransaction mtr, SpaceHeaderSnapshot previous, TablespaceLifecycleHeader marker) {
         if (mtr == null || previous == null || marker == null) {

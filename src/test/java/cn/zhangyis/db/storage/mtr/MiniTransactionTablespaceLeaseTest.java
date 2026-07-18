@@ -27,6 +27,11 @@ class MiniTransactionTablespaceLeaseTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code pageFixHoldsSharedTablespaceLeaseUntilCommit} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void pageFixHoldsSharedTablespaceLeaseUntilCommit() throws Exception {
         SpaceId spaceId = SpaceId.of(79);

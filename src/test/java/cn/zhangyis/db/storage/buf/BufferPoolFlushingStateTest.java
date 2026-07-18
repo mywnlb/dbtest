@@ -46,6 +46,9 @@ class BufferPoolFlushingStateTest {
         }
     }
 
+    /**
+     * 验证 {@code flushingPageExcludedFromCandidatesAndNotDoubleSnapshotted} 所描述的刷脏与持久化协作，并断言 redo durable 边界先覆盖 page LSN、失败后仍保留脏状态。
+     */
     @Test
     void flushingPageExcludedFromCandidatesAndNotDoubleSnapshotted() {
         try (PageStore store = openStore(8); BufferPool pool = new LruBufferPool(store, PS, 4)) {
@@ -61,6 +64,9 @@ class BufferPoolFlushingStateTest {
         }
     }
 
+    /**
+     * 验证 {@code failFlushReturnsFlushingPageToDirty} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void failFlushReturnsFlushingPageToDirty() {
         try (PageStore store = openStore(8); BufferPool pool = new LruBufferPool(store, PS, 4)) {
@@ -77,6 +83,9 @@ class BufferPoolFlushingStateTest {
         }
     }
 
+    /**
+     * 验证 {@code flushingFrameIsNotEvictedAsVictim} 所描述的刷脏与持久化协作，并断言 redo durable 边界先覆盖 page LSN、失败后仍保留脏状态。
+     */
     @Test
     void flushingFrameIsNotEvictedAsVictim() {
         try (PageStore store = openStore(8); BufferPool pool = new LruBufferPool(store, PS, 1)) {

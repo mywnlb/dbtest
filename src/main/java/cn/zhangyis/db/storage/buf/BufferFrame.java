@@ -36,6 +36,9 @@ final class BufferFrame {
      */
     TablespaceVersion spaceVersion;
 
+    /** 每次重新绑定 page 时递增；flush completion 用它拒绝旧 snapshot 污染复用帧。 */
+    long generation;
+
     /** 页内容字节，帧创建时按 pageSize 分配一次、跨驻留复用。内容由 pageLatch 保护。 */
     final byte[] data;
 
@@ -79,6 +82,11 @@ final class BufferFrame {
      */
     final ReentrantLock pageIntentLatch = new ReentrantLock();
 
+    /**
+     * 创建 {@code BufferFrame}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param pageSize 调用方提供的长度或容量值对象；不得为 {@code null}，且必须已通过其构造范围校验
+     */
     BufferFrame(PageSize pageSize) {
         this.data = new byte[pageSize.bytes()];
         this.buffer = ByteBuffer.wrap(data);

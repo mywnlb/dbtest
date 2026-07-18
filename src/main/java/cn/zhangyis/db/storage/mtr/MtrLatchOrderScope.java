@@ -18,6 +18,12 @@ public final class MtrLatchOrderScope implements AutoCloseable {
     /** 幂等关闭标志。 */
     private boolean closed;
 
+    /**
+     * 创建 {@code MtrLatchOrderScope}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param owner 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
+     * @param reason 传给 {@code 构造} 的文本值；不得为 {@code null} 或空白，并保持调用方提供的字符顺序
+     */
     MtrLatchOrderScope(MiniTransaction owner, String reason) {
         this.owner = owner;
         this.reason = reason;

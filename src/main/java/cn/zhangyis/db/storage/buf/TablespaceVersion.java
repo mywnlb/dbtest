@@ -25,6 +25,7 @@ record TablespaceVersion(long value) {
      * 返回下一代版本。只由 {@link SpaceLifecycleClock} 在 invalidate 全部分片 drain+clean 后调用。
      *
      * @return 当前版本的下一代。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     TablespaceVersion next() {
         if (value == Long.MAX_VALUE) {

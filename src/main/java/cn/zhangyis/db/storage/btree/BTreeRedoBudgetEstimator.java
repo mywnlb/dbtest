@@ -12,12 +12,20 @@ public final class BTreeRedoBudgetEstimator {
     private BTreeRedoBudgetEstimator() {
     }
 
-    /** insert/split：4 个固定叶/root 余量，加每层 6 个 page-image 等价量。 */
+    /** insert/split：4 个固定叶/root 余量，加每层 6 个 page-image 等价量。
+     *
+     * @param rootLevel 参与 {@code insert} 的树层级或递归深度 {@code rootLevel}；必须非负且不得超过当前页结构、MTR memo 或解析器声明的最大深度
+     * @return {@code insert} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     */
     public static RedoBudgetWorkload insert(int rootLevel) {
         return scaled(rootLevel, 4, 6);
     }
 
-    /** physical delete/merge：6 个固定 sibling/FSP 余量，加每层 6 个结构传播等价量。 */
+    /** physical delete/merge：6 个固定 sibling/FSP 余量，加每层 6 个结构传播等价量。
+     *
+     * @param rootLevel 参与 {@code structuralDelete} 的树层级或递归深度 {@code rootLevel}；必须非负且不得超过当前页结构、MTR memo 或解析器声明的最大深度
+     * @return {@code structuralDelete} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     */
     public static RedoBudgetWorkload structuralDelete(int rootLevel) {
         return scaled(rootLevel, 6, 6);
     }

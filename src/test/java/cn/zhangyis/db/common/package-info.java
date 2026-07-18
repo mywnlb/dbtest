@@ -1,4 +1,7 @@
 /**
- * Tests for common utilities and shared infrastructure contracts.
+ * {@code cn.zhangyis.db.common} 包的自动化测试。
+ *
+ * <p>测试围绕以下生产职责建立可重复断言：通用基础设施包，提供项目异常、校验、时钟、配置与无数据库业务规则的工具接口。
+ * 同时覆盖正常路径、边界条件与领域异常，避免用控制台输出代替行为验证。
  */
 package cn.zhangyis.db.common;

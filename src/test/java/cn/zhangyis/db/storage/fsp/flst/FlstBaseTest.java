@@ -32,6 +32,9 @@ class FlstBaseTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code constructorValidates} 对应的表空间、区与段分配行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void constructorValidates() {
         assertThrows(DatabaseValidationException.class, () -> new FlstBase(-1, FileAddress.NULL, FileAddress.NULL));
@@ -40,6 +43,9 @@ class FlstBaseTest {
         assertEquals(new FlstBase(0, FileAddress.NULL, FileAddress.NULL), FlstBase.EMPTY);
     }
 
+    /**
+     * 验证 {@code roundTripAndZeroDecodesEmpty} 所描述的稳定格式转换，并断言往返值、字节布局、版本与损坏输入处理。
+     */
     @Test
     void roundTripAndZeroDecodesEmpty() {
         PageStore store = new FileChannelPageStore();
@@ -56,6 +62,9 @@ class FlstBaseTest {
         }
     }
 
+    /**
+     * 验证 {@code decodeRejectsLengthEndpointInconsistency} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void decodeRejectsLengthEndpointInconsistency() {
         PageStore store = new FileChannelPageStore();

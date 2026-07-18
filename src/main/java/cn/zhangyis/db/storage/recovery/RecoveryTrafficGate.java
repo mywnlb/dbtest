@@ -66,7 +66,10 @@ public final class RecoveryTrafficGate {
         }
     }
 
-    /** 当前 gate 状态。 */
+    /** 当前 gate 状态。
+     *
+     * @return {@code state} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     */
     public RecoveryState state() {
         lock.lock();
         try {
@@ -76,7 +79,10 @@ public final class RecoveryTrafficGate {
         }
     }
 
-    /** 最近一次 fail closed 根因。 */
+    /** 最近一次 fail closed 根因。
+     *
+     * @return 最近一次受控操作记录的失败；尚无失败时为空 {@code Optional}，参数容器与返回值均不使用 Java {@code null}
+     */
     public Optional<Throwable> lastFailure() {
         lock.lock();
         try {

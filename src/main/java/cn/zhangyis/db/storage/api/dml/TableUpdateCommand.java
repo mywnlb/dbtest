@@ -18,6 +18,7 @@ import java.util.Optional;
  * @param clusterKey      定位旧聚簇行的完整物化主键，也是事务行锁和 row guard identity。
  * @param newRecord       更新后的完整用户行；必须与目标 schema 匹配且不能携带隐藏列。
  * @param lockWaitTimeout 聚簇行锁、二级唯一锁及短物理 row guard 的最大等待时长；必须为正值。
+ * @param lobSegment 可选的 {@code lobSegment}；参数本身不得为 {@code null}，空 {@code Optional} 明确表示调用方未提供该领域值
  */
 public record TableUpdateCommand(Transaction transaction, TableIndexMetadata metadata,
                                  SearchKey clusterKey, LogicalRecord newRecord,

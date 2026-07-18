@@ -31,6 +31,9 @@ class DiskSpaceUndoAllocatorTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code createUndoSegmentReturnsHandleWithFirstPage} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void createUndoSegmentReturnsHandleWithFirstPage() {
         onPool((mgr, allocator) -> {
@@ -45,6 +48,9 @@ class DiskSpaceUndoAllocatorTest {
         });
     }
 
+    /**
+     * 验证 {@code allocatePageGivesDistinctPageInSameSegment} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void allocatePageGivesDistinctPageInSameSegment() {
         onPool((mgr, allocator) -> {

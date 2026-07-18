@@ -108,6 +108,7 @@ public final class PersistentDdlLogRepository {
      *
      * @param ddlId control 分配且可能出现在 marker history 中的正 identity。
      * @return 最新不可变 marker；identity 尚未 prepare 时为空。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public Optional<DdlLogRecord> find(DdlId ddlId) {
         if (ddlId == null) {
@@ -166,7 +167,9 @@ public final class PersistentDdlLogRepository {
 
     private static void requireSameIdentity(DdlLogRecord before, DdlLogRecord after) {
         if (!before.marker().equals(after.marker()) || before.operation() != after.operation()
-                || !before.spaceId().equals(after.spaceId()) || !before.path().equals(after.path())) {
+                || !before.spaceId().equals(after.spaceId()) || !before.path().equals(after.path())
+                || !before.auxiliaryPath().equals(after.auxiliaryPath())
+                || !before.fileIdentity().equals(after.fileIdentity())) {
             throw new DictionaryCatalogCorruptionException(
                     "DDL log identity changed across phases: " + before.marker().ddlOperationId());
         }
@@ -182,7 +185,7 @@ public final class PersistentDdlLogRepository {
                     || (from == DdlLogPhase.ENGINE_DONE
                     && (to == DdlLogPhase.DICTIONARY_COMMITTED || to == DdlLogPhase.ROLLED_BACK))
                     || (from == DdlLogPhase.DICTIONARY_COMMITTED && to == DdlLogPhase.COMMITTED);
-            case DROP_TABLE -> (from == DdlLogPhase.PREPARED
+            case DROP_TABLE, DISCARD_TABLESPACE, IMPORT_TABLESPACE -> (from == DdlLogPhase.PREPARED
                     && (to == DdlLogPhase.DICTIONARY_COMMITTED || to == DdlLogPhase.ROLLED_BACK))
                     || (from == DdlLogPhase.DICTIONARY_COMMITTED && to == DdlLogPhase.ENGINE_DONE)
                     || (from == DdlLogPhase.ENGINE_DONE && to == DdlLogPhase.COMMITTED);

@@ -137,6 +137,8 @@ class TableDmlServiceTest {
     /**
      * 两个事务以不同主键写入 collation 等价的 logical unique key 时，第二个必须等待第一个事务终态；锁释放后
      * including-deleted prefix 复核发现其它主键并返回 duplicate，不能双双越过检查。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
      */
     @Test
     @DisplayName("logical unique key lock serializes concurrent inserts")

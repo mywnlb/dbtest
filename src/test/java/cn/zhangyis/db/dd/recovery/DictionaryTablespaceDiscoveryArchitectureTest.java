@@ -15,7 +15,10 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
  */
 class DictionaryTablespaceDiscoveryArchitectureTest {
 
-    /** 防止 DD discovery 再次把 storage.engine 具体配置泄漏进模块签名。 */
+    /** 防止 DD discovery 再次把 storage.engine 具体配置泄漏进模块签名。
+     *
+     * @throws NoSuchMethodException 测试或适配层无法定位所需反射入口时抛出；调用方应停止该兼容路径并保留反射失败原因
+     */
     @Test
     void discoveryReturnsStableStorageApiBindings() throws NoSuchMethodException {
         Method discover = DictionaryTablespaceDiscovery.class.getMethod("discover");

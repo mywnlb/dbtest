@@ -74,6 +74,9 @@ class HeapSpaceManagerTest {
         }
     }
 
+    /**
+     * 验证 {@code freeThenAllocateReusesFragment} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void freeThenAllocateReusesFragment() {
         onPage((rp, schema) -> {
@@ -95,6 +98,9 @@ class HeapSpaceManagerTest {
         });
     }
 
+    /**
+     * 验证 {@code allocateFallsBackToFreeSpaceWhenFragmentTooSmall} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void allocateFallsBackToFreeSpaceWhenFragmentTooSmall() {
         onPage((rp, schema) -> {
@@ -112,6 +118,9 @@ class HeapSpaceManagerTest {
         });
     }
 
+    /**
+     * 验证 {@code firstFitPicksFirstFittingFragment} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void firstFitPicksFirstFittingFragment() {
         onPage((rp, schema) -> {

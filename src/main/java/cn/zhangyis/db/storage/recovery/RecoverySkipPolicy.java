@@ -61,6 +61,7 @@ public record RecoverySkipPolicy(Set<SpaceId> skippedSpaces) {
      *
      * @param spaceId 待判断表空间。
      * @return true 表示该空间不应进入物理 IO。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public boolean shouldSkip(SpaceId spaceId) {
         if (spaceId == null) {
@@ -74,6 +75,7 @@ public record RecoverySkipPolicy(Set<SpaceId> skippedSpaces) {
      *
      * @param pageId 待判断物理页。
      * @return true 表示该页不应进入 doublewrite/redo/reconcile 物理 IO。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public boolean shouldSkip(PageId pageId) {
         if (pageId == null) {

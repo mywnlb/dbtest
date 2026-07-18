@@ -13,6 +13,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /** ColumnType 工厂与校验：storageKind 一致、DECIMAL/CHAR 参数边界。 */
 class ColumnTypeTest {
 
+    /**
+     * 验证 {@code integerFactories} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void integerFactories() {
         ColumnType t = ColumnType.intType(false, true);
@@ -22,6 +25,9 @@ class ColumnTypeTest {
         assertEquals(StorageKind.FIXED, t.storageKind());
     }
 
+    /**
+     * 验证 {@code varcharIsVariableCharIsFixed} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void varcharIsVariableCharIsFixed() {
         assertEquals(StorageKind.VARIABLE, ColumnType.varchar(20, false).storageKind());
@@ -42,6 +48,9 @@ class ColumnTypeTest {
         assertEquals(CharsetId.UTF8, ColumnType.json(false).charset());
     }
 
+    /**
+     * 验证 {@code characterFactoriesKeepBinaryDefaultAndAcceptExplicitPair} 所描述的返回值或状态会按契约保留，并断言原始信息与领域不变量未丢失。
+     */
     @Test
     void characterFactoriesKeepBinaryDefaultAndAcceptExplicitPair() {
         ColumnType defaultType = ColumnType.varchar(20, false);
@@ -54,6 +63,9 @@ class ColumnTypeTest {
         assertEquals(CollationId.LATIN1_ASCII_CI, latin1.collation());
     }
 
+    /**
+     * 验证 {@code decimalValidatesPrecisionScale} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void decimalValidatesPrecisionScale() {
         ColumnType d = ColumnType.decimal(10, 2, false);
@@ -64,12 +76,18 @@ class ColumnTypeTest {
         assertThrows(DatabaseValidationException.class, () -> ColumnType.decimal(5, 6, false));
     }
 
+    /**
+     * 验证 {@code charLengthMustBePositive} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void charLengthMustBePositive() {
         assertThrows(DatabaseValidationException.class, () -> ColumnType.charType(0, false));
         assertThrows(DatabaseValidationException.class, () -> ColumnType.varchar(-1, false));
     }
 
+    /**
+     * 验证 {@code temporalAndFloating} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void temporalAndFloating() {
         assertEquals(TypeId.DATE, ColumnType.date(true).typeId());

@@ -41,6 +41,9 @@ class LockObservationServiceTest {
 
     private static final Duration TEST_TIMEOUT = Duration.ofMillis(800);
 
+    /**
+     * 验证 {@code dataLocksAndWaitsExposeGrantedAndWaitingRecordRowsWithThreadEvents} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void dataLocksAndWaitsExposeGrantedAndWaitingRecordRowsWithThreadEvents() {
         DefaultLockObservationService observation = new DefaultLockObservationService();
@@ -78,6 +81,9 @@ class LockObservationServiceTest {
         assertEquals(1, manager.releaseAll(waiter));
     }
 
+    /**
+     * 验证 {@code dataLockWaitsExposeAllBlockingTransactionsForOneWaitingRequest} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void dataLockWaitsExposeAllBlockingTransactionsForOneWaitingRequest() {
         DefaultLockObservationService observation = new DefaultLockObservationService();
@@ -107,6 +113,9 @@ class LockObservationServiceTest {
         assertEquals(1, manager.releaseAll(waiter));
     }
 
+    /**
+     * 验证 {@code deadlockVictimIsRecordedAsLatestDeadlockReport} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void deadlockVictimIsRecordedAsLatestDeadlockReport() {
         DefaultLockObservationService observation = new DefaultLockObservationService();
@@ -139,6 +148,9 @@ class LockObservationServiceTest {
         assertEquals(2, manager.releaseAll(first));
     }
 
+    /**
+     * 验证 {@code timeoutCleansWaitSlotAndWaitingRows} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void timeoutCleansWaitSlotAndWaitingRows() {
         DefaultLockObservationService observation = new DefaultLockObservationService();

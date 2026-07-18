@@ -44,20 +44,33 @@ public final class RollbackSegmentSlotManager {
     /**
      * 构造一个空的 slot 目录。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝 null、越界和相互矛盾的组合。</li>
+     *     <li>完成跨参数校验并推导不可变配置；若构造过程创建自有资源，后续失败必须在异常路径关闭。</li>
+     *     <li>把已校验协作者与配置绑定到字段，并初始化本对象拥有的状态、显式锁、队列或缓存，不允许 this 提前逃逸。</li>
+     *     <li>构造完成后对象处于类契约声明的初始状态；任一步失败都抛出领域异常且不发布半初始化实例。</li>
+     * </ol>
+     *
      * @param rollbackSegmentId 所属 rollback segment，不能为 null。
      * @param slotCapacity      slot 容量，必须 &gt; 0。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public RollbackSegmentSlotManager(RollbackSegmentId rollbackSegmentId, int slotCapacity) {
+        // 1、校验必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝非法组合。
         if (rollbackSegmentId == null) {
             throw new DatabaseValidationException("rollback segment id must not be null");
         }
         if (slotCapacity <= 0) {
             throw new DatabaseValidationException("slot capacity must be positive: " + slotCapacity);
         }
+        // 2、完成跨参数校验并推导不可变配置；后续失败仍由当前构造路径收口已创建资源。
         this.rollbackSegmentId = rollbackSegmentId;
         this.slotCapacity = slotCapacity;
+        // 3、绑定已校验协作者并初始化本对象拥有的状态、显式锁、队列或缓存，不允许半初始化实例逃逸。
         this.slots = new PageId[slotCapacity];
         this.states = new SlotLifecycleState[slotCapacity];
+        // 4、完成初始状态发布；失败以领域异常终止构造，成功对象满足类级生命周期不变量。
         java.util.Arrays.fill(this.states, SlotLifecycleState.FREE);
     }
 
@@ -73,6 +86,7 @@ public final class RollbackSegmentSlotManager {
      *
      * @param undoFirstPageId 已由 {@code UndoLogSegmentAccess.create} 分配的 undo segment 首页。
      * @return 认领到的 slot id。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     UndoSlotId claim(PageId undoFirstPageId) {
         if (undoFirstPageId == null) {
@@ -108,7 +122,12 @@ public final class RollbackSegmentSlotManager {
         }
     }
 
-    /** 将 RESERVED 槽绑定到已创建的 undo 首页并发布为 ACTIVE。 */
+    /** 将 RESERVED 槽绑定到已创建的 undo 首页并发布为 ACTIVE。
+     *
+     * @param slot 参与 {@code bindClaim} 的稳定领域标识 {@code UndoSlotId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param firstPageId 目标页的稳定物理标识；必须属于当前已准入表空间，且不得为 {@code null}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     private void bindClaim(UndoSlotId slot, PageId firstPageId) {
         if (firstPageId == null) {
             throw new DatabaseValidationException("claim first page id must not be null");
@@ -150,6 +169,7 @@ public final class RollbackSegmentSlotManager {
      * @param slot              要终结的运行期槽。
      * @param expectedFirstPage 预期物理 owner，用于拒绝 stale terminal command。
      * @return 独占该 slot 终结资格的 RAII lease。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     FinalizationLease beginFinalization(UndoSlotId slot, PageId expectedFirstPage) {
         if (expectedFirstPage == null) {
@@ -173,6 +193,10 @@ public final class RollbackSegmentSlotManager {
     /**
      * 以全有或全无方式独占同一事务的多个 ACTIVE slot。全部 owner 在一段短锁临界区内校验后才一起进入
      * FINALIZING；任一冲突都不会改变任何 slot。调用方随后在锁外完成双 segment MTR。
+     *
+     * @param bindings 参与 {@code beginBatchFinalization} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @return {@code beginBatchFinalization} 取得或创建的受控存储资源；成功时不为 {@code null}，调用方必须按其 Guard/lease 契约释放
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     BatchFinalizationLease beginBatchFinalization(Collection<UndoLogBinding> bindings) {
         if (bindings == null || bindings.isEmpty() || bindings.stream().anyMatch(java.util.Objects::isNull)) {
@@ -214,6 +238,7 @@ public final class RollbackSegmentSlotManager {
      *
      * @param slot 要查询的 slot。
      * @return 该 slot 登记的 undo 首页。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public PageId undoFirstPageId(UndoSlotId slot) {
         if (slot == null) {
@@ -241,6 +266,7 @@ public final class RollbackSegmentSlotManager {
      *
      * @param slot                 磁盘记录的 slot 下标。
      * @param undoFirstPageId 该 slot 登记的 undo segment 首页。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public void restore(UndoSlotId slot, PageId undoFirstPageId) {
         if (slot == null || undoFirstPageId == null) {
@@ -263,7 +289,11 @@ public final class RollbackSegmentSlotManager {
         }
     }
 
-    /** slot 是否已占用；越界 slot 返回 false（只读查询，不抛异常）。 */
+    /** slot 是否已占用；越界 slot 返回 false（只读查询，不抛异常）。
+     *
+     * @param slot 参与 {@code isOccupied} 的稳定领域标识 {@code UndoSlotId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @return {@code isOccupied} 命名的领域事实成立时为 {@code true}，否则为 {@code false}；查询本身不改变权威状态
+     */
     public boolean isOccupied(UndoSlotId slot) {
         if (slot == null) {
             return false;
@@ -280,7 +310,10 @@ public final class RollbackSegmentSlotManager {
         }
     }
 
-    /** 已占用 slot 数量。 */
+    /** 已占用 slot 数量。
+     *
+     * @return {@code activeSlotCount} 计算出的非负长度、位置或数量；结果必须落在所属页、集合或持久格式容量内，溢出通过领域异常报告
+     */
     public int activeSlotCount() {
         lock.lock();
         try {
@@ -332,7 +365,11 @@ public final class RollbackSegmentSlotManager {
             return slotId;
         }
 
-        /** 段创建成功后把首页 owner 绑定到 reservation；成功后 close 不再回退状态。 */
+        /** 段创建成功后把首页 owner 绑定到 reservation；成功后 close 不再回退状态。
+         *
+         * @param firstPageId 目标页的稳定物理标识；必须属于当前已准入表空间，且不得为 {@code null}
+         * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+         */
         void bind(PageId firstPageId) {
             requireOpen("bind");
             if (bound) {
@@ -342,7 +379,10 @@ public final class RollbackSegmentSlotManager {
             bound = true;
         }
 
-        /** 在空间预留或 segment 创建之前标记 fail-stop 边界；标记后未 bind 的 close 也不得取消 slot。 */
+        /** 在空间预留或 segment 创建之前标记 fail-stop 边界；标记后未 bind 的 close 也不得取消 slot。
+         *
+         * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+         */
         void physicalMutationStarted() {
             requireOpen("mark physical mutation");
             if (physicalMutationStarted) {
@@ -395,7 +435,10 @@ public final class RollbackSegmentSlotManager {
             this.expectedFirstPage = expectedFirstPage;
         }
 
-        /** 在首个 FSP/undo/page3 写之前标记 fail-stop 边界。 */
+        /** 在首个 FSP/undo/page3 写之前标记 fail-stop 边界。
+         *
+         * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+         */
         void physicalMutationStarted() {
             requireOpen("mark physical mutation");
             if (physicalMutationStarted) {
@@ -406,7 +449,10 @@ public final class RollbackSegmentSlotManager {
             physicalMutationStarted = true;
         }
 
-        /** 持久 MTR 已成功提交后发布内存 FREE；未越过物理边界不得伪造完成。 */
+        /** 持久 MTR 已成功提交后发布内存 FREE；未越过物理边界不得伪造完成。
+         *
+         * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+         */
         void complete() {
             requireOpen("complete finalization");
             if (!physicalMutationStarted) {
@@ -439,10 +485,25 @@ public final class RollbackSegmentSlotManager {
 
     /** 多 slot 终结租约；物理边界与完成发布都对整批 slot 同步执行。 */
     static final class BatchFinalizationLease implements AutoCloseable {
+        /**
+         * 本对象持有的 {@code owner} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+         */
         private final RollbackSegmentSlotManager owner;
+        /**
+         * 本对象拥有的 {@code targets} 受控集合；元素生命周期与外层对象一致，仅由本类方法更新，对外暴露时必须返回副本或不可变视图。
+         */
         private final List<FinalizationTarget> targets;
+        /**
+         * 记录 {@code physicalMutationStarted} 生命周期事实是否成立；只由本类状态转换更新，共享访问受所属显式锁、原子发布或单一 owner 线程保护。
+         */
         private boolean physicalMutationStarted;
+        /**
+         * 记录 {@code completed} 生命周期事实是否成立；只由本类状态转换更新，共享访问受所属显式锁、原子发布或单一 owner 线程保护。
+         */
         private boolean completed;
+        /**
+         * 记录 {@code closed} 生命周期事实是否成立；只由本类状态转换更新，共享访问受所属显式锁、原子发布或单一 owner 线程保护。
+         */
         private boolean closed;
 
         private BatchFinalizationLease(RollbackSegmentSlotManager owner, List<FinalizationTarget> targets) {
@@ -450,6 +511,11 @@ public final class RollbackSegmentSlotManager {
             this.targets = List.copyOf(targets);
         }
 
+        /**
+         * 在 lease 仍开放时复核转移对象的权威状态，并标记物理修改已经开始；重复标记或关闭后的调用必须拒绝。
+         *
+         * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+         */
         void physicalMutationStarted() {
             requireOpen("mark batch physical mutation");
             if (physicalMutationStarted) {
@@ -459,6 +525,11 @@ public final class RollbackSegmentSlotManager {
             physicalMutationStarted = true;
         }
 
+        /**
+         * 推进 {@code complete} 对应的事务、MVCC 与锁阶段转换；成功只发布一次目标状态，失败路径保留可取消或可诊断的原状态。
+         *
+         * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+         */
         void complete() {
             requireOpen("complete batch finalization");
             if (completed) {
@@ -471,6 +542,9 @@ public final class RollbackSegmentSlotManager {
             completed = true;
         }
 
+        /**
+         * 释放本方法拥有的事务、MVCC 与锁资源；遵守既定释放顺序，重复或失败调用不得掩盖原始状态。
+         */
         @Override
         public void close() {
             if (closed) {
@@ -515,6 +589,12 @@ public final class RollbackSegmentSlotManager {
         }
     }
 
+    /**
+     * 释放本方法拥有的事务、MVCC 与锁资源；遵守既定释放顺序，重复或失败调用不得掩盖原始状态。
+     *
+     * @param targets 参与 {@code closeBatchFinalization} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @param physicalMutationStarted 既有物理或缓存步骤是否已经发生；该事实用于避免重复修改、重复补偿或错误发布中间状态
+     */
     private void closeBatchFinalization(List<FinalizationTarget> targets, boolean physicalMutationStarted) {
         lock.lock();
         try {
@@ -528,6 +608,12 @@ public final class RollbackSegmentSlotManager {
         }
     }
 
+    /**
+     * 封装事务、MVCC 与锁中 {@code FinalizationTarget} 已校验但尚待发布的事务阶段状态；字段共同固定 owner、物理证据和补偿边界，防止提交/回滚重复执行。
+     *
+     * @param slotId 参与 {@code 构造} 的稳定领域标识 {@code UndoSlotId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param firstPageId 目标页的稳定物理标识；必须属于当前已准入表空间，且不得为 {@code null}
+     */
     private record FinalizationTarget(UndoSlotId slotId, PageId firstPageId) {
         private FinalizationTarget {
             if (slotId == null || firstPageId == null) {
@@ -561,7 +647,12 @@ public final class RollbackSegmentSlotManager {
         }
     }
 
-    /** 异常关闭终结租约：物理边界前恢复 ACTIVE，之后只校验并保留 fail-stop 状态。 */
+    /** 异常关闭终结租约：物理边界前恢复 ACTIVE，之后只校验并保留 fail-stop 状态。
+     *
+     * @param slot 参与 {@code closeFinalization} 的稳定领域标识 {@code UndoSlotId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param expectedFirstPage 参与 {@code closeFinalization} 的稳定领域标识 {@code PageId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param physicalMutationStarted 既有物理或缓存步骤是否已经发生；该事实用于避免重复修改、重复补偿或错误发布中间状态
+     */
     private void closeFinalization(UndoSlotId slot, PageId expectedFirstPage, boolean physicalMutationStarted) {
         lock.lock();
         try {

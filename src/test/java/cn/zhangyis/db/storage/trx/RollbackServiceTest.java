@@ -92,6 +92,9 @@ class RollbackServiceTest {
 
     private final TypeCodecRegistry registry = new TypeCodecRegistry();
 
+    /**
+     * 验证 {@code singleRowInsertRollbackRemovesRowAndReleasesSlot} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void singleRowInsertRollbackRemovesRowAndReleasesSlot() {
         onPool(ctx -> {
@@ -242,6 +245,9 @@ class RollbackServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code multipleRowsRollbackReverseWalkRemovesAll} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void multipleRowsRollbackReverseWalkRemovesAll() {
         onPool(ctx -> {
@@ -436,6 +442,9 @@ class RollbackServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code rollbackToSavepointRemovesOnlyLaterInsertAndKeepsTransactionActive} 所描述的返回值或状态会按契约保留，并断言原始信息与领域不变量未丢失。
+     */
     @Test
     void rollbackToSavepointRemovesOnlyLaterInsertAndKeepsTransactionActive() {
         onPool(ctx -> {
@@ -600,6 +609,9 @@ class RollbackServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code rollbackToSavepointRejectsForeignSavepointBeforeApplyingUndo} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void rollbackToSavepointRejectsForeignSavepointBeforeApplyingUndo() {
         onPool(ctx -> {
@@ -627,6 +639,9 @@ class RollbackServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code rollbackToSavepointRejectsDetachedBoundaryInsteadOfResurrectingItsPointer} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void rollbackToSavepointRejectsDetachedBoundaryInsteadOfResurrectingItsPointer() {
         onPool(ctx -> {
@@ -781,6 +796,9 @@ class RollbackServiceTest {
         }
     }
 
+    /**
+     * 验证 {@code emptyStatementBoundaryIsAnOwnedOneShotCapability} 对应的事务、MVCC 与锁行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void emptyStatementBoundaryIsAnOwnedOneShotCapability() {
         onPool(ctx -> {
@@ -817,6 +835,9 @@ class RollbackServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code rollbackToLatestSavepointIsNoopAndDoesNotWriteTransactionStateRedo} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void rollbackToLatestSavepointIsNoopAndDoesNotWriteTransactionStateRedo() {
         onPool(ctx -> {
@@ -845,6 +866,9 @@ class RollbackServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code rollbackToSavepointRestoresUpdatedRowAndNextUndoNoDoesNotReuseRolledBackRecord} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void rollbackToSavepointRestoresUpdatedRowAndNextUndoNoDoesNotReuseRolledBackRecord() {
         onPool(ctx -> {
@@ -880,6 +904,9 @@ class RollbackServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code rollbackToSavepointRestoresDeleteMarkedRow} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void rollbackToSavepointRestoresDeleteMarkedRow() {
         onPool(ctx -> {
@@ -909,6 +936,9 @@ class RollbackServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code fullRollbackAfterPartialRollbackWalksOnlyCurrentLogicalChain} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void fullRollbackAfterPartialRollbackWalksOnlyCurrentLogicalChain() {
         onPool(ctx -> {
@@ -1008,6 +1038,9 @@ class RollbackServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code orphanUndoRollbackIsIdempotent} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void orphanUndoRollbackIsIdempotent() {
         onPool(ctx -> {
@@ -1032,6 +1065,9 @@ class RollbackServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code readOnlyOrUnwrittenTxnRollbackJustFlipsState} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void readOnlyOrUnwrittenTxnRollbackJustFlipsState() {
         onPool(ctx -> {
@@ -1048,6 +1084,9 @@ class RollbackServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code insertThenUpdateRollbackRemovesRowReversingBoth} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void insertThenUpdateRollbackRemovesRowReversingBoth() {
         onPool(ctx -> {
@@ -1075,6 +1114,9 @@ class RollbackServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code sameRowDoubleUpdateRollbackChainRestoresThenDeletes} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void sameRowDoubleUpdateRollbackChainRestoresThenDeletes() {
         onPool(ctx -> {
@@ -1103,6 +1145,9 @@ class RollbackServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code deleteMarkThenRollbackRestoresLiveRow} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void deleteMarkThenRollbackRestoresLiveRow() {
         onPool(ctx -> {
@@ -1139,6 +1184,9 @@ class RollbackServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code insertThenDeleteMarkRollbackRemovesRow} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void insertThenDeleteMarkRollbackRemovesRow() {
         onPool(ctx -> {

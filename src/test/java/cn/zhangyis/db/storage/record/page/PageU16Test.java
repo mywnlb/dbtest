@@ -28,6 +28,9 @@ class PageU16Test {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code roundTripAndRangeCheck} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void roundTripAndRangeCheck() {
         PageStore store = new FileChannelPageStore();

@@ -1,4 +1,7 @@
 /**
- * Common exceptions, validation, clocks, configuration, and utility interfaces.
+ * 通用基础设施包，提供项目异常、校验、时钟、配置与无数据库业务规则的工具接口。
+ *
+ * <p>本包只通过显式接口与相邻模块协作；调用方不得绕过稳定 API 读取内部可变状态，
+ * 包内实现也不得反向依赖 SQL、会话或其他上层语义。
  */
 package cn.zhangyis.db.common;

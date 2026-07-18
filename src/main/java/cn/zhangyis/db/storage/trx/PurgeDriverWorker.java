@@ -24,6 +24,9 @@ import java.util.concurrent.locks.ReentrantLock;
  */
 public final class PurgeDriverWorker implements AutoCloseable {
 
+    /**
+     * 类级不可变配置常量；所有实例共享该边界，非法调整会破坏事务、MVCC 与锁的不变量。
+     */
     private static final long NANOS_PER_SECOND = 1_000_000_000L;
 
     /** purge 驱动端口。 */
@@ -42,29 +45,70 @@ public final class PurgeDriverWorker implements AutoCloseable {
     /** worker 线程终止信号。 */
     private CountDownLatch terminated = new CountDownLatch(1);
 
+    /**
+     * 本对象的权威状态机字段 {@code state}；只有合法转换方法可以更新，更新受显式锁、原子发布或单一 owner 线程保护，下游据此决定可执行阶段。
+     */
     private PurgeDriverWorkerState state = PurgeDriverWorkerState.NEW;
+    /**
+     * 记录 {@code purgeRequested} 生命周期事实是否成立；只由本类状态转换更新，共享访问受所属显式锁、原子发布或单一 owner 线程保护。
+     */
     private boolean purgeRequested;
+    /**
+     * 记录 {@code inFlight} 生命周期事实是否成立；只由本类状态转换更新，共享访问受所属显式锁、原子发布或单一 owner 线程保护。
+     */
     private boolean inFlight;
+    /**
+     * 本对象拥有的后台工作线程；启动、停止与引用清理必须由生命周期锁协调，关闭后不得残留存活线程。
+     */
     private Thread thread;
+    /**
+     * 最近一次后台周期或恢复步骤的可观测结果 {@code lastSummary}；由执行线程发布，诊断读取不得清除原始失败或覆盖更新顺序。
+     */
     private PurgeSummary lastSummary;
+    /**
+     * 最近一次后台周期或恢复步骤的可观测结果 {@code failure}；由执行线程发布，诊断读取不得清除原始失败或覆盖更新顺序。
+     */
     private DatabaseRuntimeException failure;
 
+    /**
+     * 创建 {@code PurgeDriverWorker}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝 null、越界和相互矛盾的组合。</li>
+     *     <li>完成跨参数校验并推导不可变配置；若构造过程创建自有资源，后续失败必须在异常路径关闭。</li>
+     *     <li>把已校验协作者与配置绑定到字段，并初始化本对象拥有的状态、显式锁、队列或缓存，不允许 this 提前逃逸。</li>
+     *     <li>构造完成后对象处于类契约声明的初始状态；任一步失败都抛出领域异常且不发布半初始化实例。</li>
+     * </ol>
+     *
+     * @param target 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param maxPerBatch 参与 {@code 构造} 的上界或规格值 {@code maxPerBatch}；必须非负且不能使容量、页数或编码长度计算溢出
+     * @param idleWait 本次等待或操作的最大时长；不得为 {@code null} 且必须为正，超时不得留下未释放资源
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public PurgeDriverWorker(PurgeTarget target, int maxPerBatch, Duration idleWait) {
+        // 1、校验必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝非法组合。
         if (target == null || idleWait == null) {
             throw new DatabaseValidationException("purge driver target/idle wait must not be null");
         }
+        // 2、完成跨参数校验并推导不可变配置；后续失败仍由当前构造路径收口已创建资源。
         if (maxPerBatch <= 0) {
             throw new DatabaseValidationException("purge driver maxPerBatch must be positive: " + maxPerBatch);
         }
         if (idleWait.isNegative() || idleWait.isZero()) {
             throw new DatabaseValidationException("purge driver idle wait must be positive: " + idleWait);
         }
+        // 3、绑定已校验协作者并初始化本对象拥有的状态、显式锁、队列或缓存，不允许半初始化实例逃逸。
         this.target = target;
         this.maxPerBatch = maxPerBatch;
+        // 4、完成初始状态发布；失败以领域异常终止构造，成功对象满足类级生命周期不变量。
         this.idleWaitNanos = timeoutNanos(idleWait);
     }
 
-    /** 启动后台 worker。只能从 NEW 启动一次。 */
+    /** 启动后台 worker。只能从 NEW 启动一次。
+     *
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public void start() {
         lock.lock();
         try {
@@ -80,7 +124,10 @@ public final class PurgeDriverWorker implements AutoCloseable {
         }
     }
 
-    /** 请求一次 on-demand purge（合并式）；worker 已停止/失败时静默丢弃。 */
+    /** 请求一次 on-demand purge（合并式）；worker 已停止/失败时静默丢弃。
+     *
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public void requestPurge() {
         lock.lock();
         try {
@@ -135,7 +182,10 @@ public final class PurgeDriverWorker implements AutoCloseable {
         }
     }
 
-    /** 当前 worker 状态。 */
+    /** 当前 worker 状态。
+     *
+     * @return {@code state} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     */
     public PurgeDriverWorkerState state() {
         lock.lock();
         try {
@@ -145,7 +195,10 @@ public final class PurgeDriverWorker implements AutoCloseable {
         }
     }
 
-    /** 最近一批 purge 统计（诊断用）。 */
+    /** 最近一批 purge 统计（诊断用）。
+     *
+     * @return 当前可见的最近快照或持久边界；尚未产生对应状态时为空 {@code Optional}，从不返回 Java {@code null}
+     */
     public Optional<PurgeSummary> lastSummary() {
         lock.lock();
         try {
@@ -155,7 +208,10 @@ public final class PurgeDriverWorker implements AutoCloseable {
         }
     }
 
-    /** worker 失败根因。 */
+    /** worker 失败根因。
+     *
+     * @return 最近一次受控操作记录的失败；尚无失败时为空 {@code Optional}，参数容器与返回值均不使用 Java {@code null}
+     */
     public Optional<DatabaseRuntimeException> failure() {
         lock.lock();
         try {
@@ -165,6 +221,9 @@ public final class PurgeDriverWorker implements AutoCloseable {
         }
     }
 
+    /**
+     * 释放本方法拥有的事务、MVCC 与锁资源；遵守既定释放顺序，重复或失败调用不得掩盖原始状态。
+     */
     @Override
     public void close() {
         stop(Duration.ofSeconds(5));

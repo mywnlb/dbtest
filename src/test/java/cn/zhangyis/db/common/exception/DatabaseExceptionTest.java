@@ -10,6 +10,9 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
  */
 class DatabaseExceptionTest {
 
+    /**
+     * 验证 {@code runtimeExceptionShouldKeepMessageAndCause} 所描述的返回值或状态会按契约保留，并断言原始信息与领域不变量未丢失。
+     */
     @Test
     void runtimeExceptionShouldKeepMessageAndCause() {
         Throwable cause = new IllegalStateException("raw cause");
@@ -21,6 +24,9 @@ class DatabaseExceptionTest {
         assertInstanceOf(RuntimeException.class, exception);
     }
 
+    /**
+     * 验证 {@code fatalExceptionShouldKeepMessageAndCause} 所描述的返回值或状态会按契约保留，并断言原始信息与领域不变量未丢失。
+     */
     @Test
     void fatalExceptionShouldKeepMessageAndCause() {
         Throwable cause = new IllegalStateException("raw cause");

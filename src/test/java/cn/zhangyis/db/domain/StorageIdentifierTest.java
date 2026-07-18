@@ -11,6 +11,9 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
  */
 class StorageIdentifierTest {
 
+    /**
+     * 验证 {@code shouldRejectNegativeIdentifiers} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void shouldRejectNegativeIdentifiers() {
         assertThrows(DatabaseRuntimeException.class, () -> SpaceId.of(-1));
@@ -19,6 +22,9 @@ class StorageIdentifierTest {
         assertThrows(DatabaseRuntimeException.class, () -> Lsn.of(-1));
     }
 
+    /**
+     * 验证 {@code shouldCalculateExtentFromPageNo} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void shouldCalculateExtentFromPageNo() {
         PageSize pageSize = PageSize.ofBytes(16 * 1024);
@@ -27,6 +33,9 @@ class StorageIdentifierTest {
         assertEquals(ExtentId.of(SpaceId.of(3), 1), ExtentId.from(PageId.of(SpaceId.of(3), PageNo.of(64)), pageSize));
     }
 
+    /**
+     * 验证 {@code shouldCalculateFirstPageNoInExtent} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void shouldCalculateFirstPageNoInExtent() {
         ExtentId extentId = ExtentId.of(SpaceId.of(9), 2);

@@ -32,6 +32,9 @@ class LinearReadAheadTrackerTest {
         return result;
     }
 
+    /**
+     * 验证 {@code emitsNextExtentAfterThreshold} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void emitsNextExtentAfterThreshold() {
         LinearReadAheadTracker tracker = new LinearReadAheadTracker(4);
@@ -46,6 +49,9 @@ class LinearReadAheadTrackerTest {
                 "extent 0 连续达阈值 → 预取 extent 1（起始页 64）");
     }
 
+    /**
+     * 验证 {@code resetsRunOnNonSequentialAccess} 对应的Buffer Pool行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void resetsRunOnNonSequentialAccess() {
         LinearReadAheadTracker tracker = new LinearReadAheadTracker(4);
@@ -60,6 +66,9 @@ class LinearReadAheadTrackerTest {
         assertTrue(tracker.record(page(8)).isPresent(), "重置后重新累计达阈值再触发");
     }
 
+    /**
+     * 验证 {@code doesNotResubmitSameNextExtent} 所描述的边界场景保持既有领域不变量，不产生方法名明确禁止的副作用。
+     */
     @Test
     void doesNotResubmitSameNextExtent() {
         LinearReadAheadTracker tracker = new LinearReadAheadTracker(4);
@@ -69,6 +78,9 @@ class LinearReadAheadTrackerTest {
         assertTrue(tracker.record(page(5)).isEmpty());
     }
 
+    /**
+     * 验证 {@code sequentialCrossExtentReemitsForFurtherExtent} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void sequentialCrossExtentReemitsForFurtherExtent() {
         LinearReadAheadTracker tracker = new LinearReadAheadTracker(4);
@@ -79,6 +91,9 @@ class LinearReadAheadTrackerTest {
         assertEquals(128, req.get().firstPageNo(), "跨入 extent 1 后顺序达阈值 → 预取 extent 2（起始页 128）");
     }
 
+    /**
+     * 验证 {@code rejectsInvalidThreshold} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void rejectsInvalidThreshold() {
         assertThrows(DatabaseValidationException.class, () -> new LinearReadAheadTracker(0));

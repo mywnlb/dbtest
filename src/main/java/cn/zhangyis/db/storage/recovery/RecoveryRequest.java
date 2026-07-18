@@ -89,6 +89,12 @@ public record RecoveryRequest(RecoveryMode mode,
 
     /**
      * 创建 NORMAL 模式请求。默认不检查 doublewrite 页，适合纯 redo replay 测试或后续 discovery 之前的空扫描。
+     *
+     * @param checkpointStore 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param redoRepository 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param dispatcher 由组合根提供的 {@code RedoApplyDispatcher} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code normal} 调用
+     * @param applyContext redo 收集、定位或重放所需的日志对象；不得为 {@code null}，其 LSN 范围和记录格式必须连续且属于当前恢复或 MTR 上下文
+     * @return {@code normal} 产生的恢复或持久化阶段对象；成功时不为 {@code null}，其中的 durable 边界不超过已安全完成的工作
      */
     public static RecoveryRequest normal(RedoCheckpointStore checkpointStore,
                                          RedoLogFileRepository redoRepository,
@@ -102,6 +108,12 @@ public record RecoveryRequest(RecoveryMode mode,
     /**
      * 创建 READ_ONLY_VALIDATE 模式请求。该模式复用 redo reader 和 doublewrite scanner 输入，但恢复服务只能扫描并报告，
      * 不能执行 page apply、redo 边界安装、undo 续作、空间 reconcile 或事务 rollback。
+     *
+     * @param checkpointStore 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param redoRepository 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param dispatcher 由组合根提供的 {@code RedoApplyDispatcher} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code readOnlyValidate} 调用
+     * @param applyContext redo 收集、定位或重放所需的日志对象；不得为 {@code null}，其 LSN 范围和记录格式必须连续且属于当前恢复或 MTR 上下文
+     * @return {@code readOnlyValidate} 产生的恢复或持久化阶段对象；成功时不为 {@code null}，其中的 durable 边界不超过已安全完成的工作
      */
     public static RecoveryRequest readOnlyValidate(RedoCheckpointStore checkpointStore,
                                                    RedoLogFileRepository redoRepository,
@@ -136,6 +148,11 @@ public record RecoveryRequest(RecoveryMode mode,
 
     /**
      * 返回带 doublewrite repair 阶段输入的新请求。保持请求不可变，避免启动恢复过程中外部修改页列表。
+     *
+     * @param scanner 恢复、checkpoint、doublewrite 或刷脏阶段的协作状态；不得为 {@code null}，阶段和持久化边界必须与当前实例的恢复状态机一致
+     * @param pages 参与 {@code withDoublewriteRepair} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @return {@code withDoublewriteRepair} 产生的恢复或持久化阶段对象；成功时不为 {@code null}，其中的 durable 边界不超过已安全完成的工作
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public RecoveryRequest withDoublewriteRepair(DoublewriteRecoveryScanner scanner, List<PageId> pages) {
         if (scanner == null) {
@@ -148,6 +165,10 @@ public record RecoveryRequest(RecoveryMode mode,
 
     /**
      * 接入 undo TRUNCATING 启动恢复。参与者持有显式配置空间集及生命周期服务，request 本身保持不可变。
+     *
+     * @param participant 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @return {@code withUndoTablespaceRecovery} 产生的恢复或持久化阶段对象；成功时不为 {@code null}，其中的 durable 边界不超过已安全完成的工作
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public RecoveryRequest withUndoTablespaceRecovery(UndoTablespaceRecoveryParticipant participant) {
         if (participant == null) {
@@ -164,6 +185,7 @@ public record RecoveryRequest(RecoveryMode mode,
      *
      * @param spaces 待重对齐的表空间集（不可变快照）。
      * @return 携带空间集的新请求。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public RecoveryRequest withSpaceFileReconcile(List<SpaceId> spaces) {
         if (spaces == null) {
@@ -180,6 +202,7 @@ public record RecoveryRequest(RecoveryMode mode,
      *
      * @param redoManager 恢复后继续使用的 redo 管理器（须尚未 append）。
      * @return 携带 redo 管理器的新请求。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public RecoveryRequest withRedoBoundaryInstall(RedoLogManager redoManager) {
         if (redoManager == null) {
@@ -197,6 +220,7 @@ public record RecoveryRequest(RecoveryMode mode,
      * @param context 事务恢复上下文。
      * @param participant page3/undo 恢复参与者。
      * @return 携带正式事务恢复链的新请求。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public RecoveryRequest withTransactionRecovery(
             TransactionRecoveryContext context, TransactionUndoRecoveryParticipant participant) {
@@ -211,6 +235,10 @@ public record RecoveryRequest(RecoveryMode mode,
 
     /**
      * READ_ONLY_VALIDATE 只接事务 sidecar 覆盖校验，不注入 redo sink 或 undo participant，保证诊断路径不写页/redo。
+     *
+     * @param context 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
+     * @return {@code withTransactionRecoveryValidation} 产生的恢复或持久化阶段对象；成功时不为 {@code null}，其中的 durable 边界不超过已安全完成的工作
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public RecoveryRequest withTransactionRecoveryValidation(TransactionRecoveryContext context) {
         if (context == null) {

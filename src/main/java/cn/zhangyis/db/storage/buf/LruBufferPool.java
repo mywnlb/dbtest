@@ -62,7 +62,11 @@ public final class LruBufferPool implements BufferPool {
      */
     private final AtomicReference<ReadAheadHook> readAheadHook = new AtomicReference<>();
 
-    /** 单实例池，默认 midpoint LRU（Phase A）。等价 {@code instanceCount=1}。 */
+    /** 单实例池，默认 midpoint LRU（Phase A）。等价 {@code instanceCount=1}。
+     * @param pageStore 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param pageSize 调用方提供的长度或容量值对象；不得为 {@code null}，且必须已通过其构造范围校验
+     * @param capacity 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     */
     public LruBufferPool(PageStore pageStore, PageSize pageSize, int capacity) {
         this(pageStore, pageSize, capacity, 1);
     }
@@ -70,6 +74,10 @@ public final class LruBufferPool implements BufferPool {
     /**
      * 多实例池：把容量分到 {@code instanceCount} 个分片，各用独立默认 midpoint 策略 + 默认 load 超时。
      * 生产由 {@code StorageEngine} 经 {@code EngineConfig.bufferPoolInstanceCount()} 构造（默认 1）。
+     * @param pageStore 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param pageSize 调用方提供的长度或容量值对象；不得为 {@code null}，且必须已通过其构造范围校验
+     * @param capacity 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @param instanceCount 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
      */
     public LruBufferPool(PageStore pageStore, PageSize pageSize, int capacity, int instanceCount) {
         this.lifecycleClock = new SpaceLifecycleClock();
@@ -78,12 +86,25 @@ public final class LruBufferPool implements BufferPool {
         this.router = new BufferPoolRouter(instanceCount);
     }
 
-    /** 单实例池 + 注入替换策略（测试注入可控时钟）。 */
+    /** 单实例池 + 注入替换策略（测试注入可控时钟）。
+     *
+     * @param pageStore 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param pageSize 调用方提供的长度或容量值对象；不得为 {@code null}，且必须已通过其构造范围校验
+     * @param capacity 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @param policy 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     */
     LruBufferPool(PageStore pageStore, PageSize pageSize, int capacity, ReplacementPolicy policy) {
         this(pageStore, pageSize, capacity, policy, DEFAULT_LOAD_TIMEOUT);
     }
 
-    /** 单实例池 + 注入替换策略 + load 超时（测试注入短超时验证 LOADING 等待有界）。 */
+    /** 单实例池 + 注入替换策略 + load 超时（测试注入短超时验证 LOADING 等待有界）。
+     *
+     * @param pageStore 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param pageSize 调用方提供的长度或容量值对象；不得为 {@code null}，且必须已通过其构造范围校验
+     * @param capacity 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @param policy 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param loadTimeout 本次等待或操作的最大时长；不得为 {@code null} 且必须为正，超时不得留下未释放资源
+     */
     LruBufferPool(PageStore pageStore, PageSize pageSize, int capacity, ReplacementPolicy policy,
                   Duration loadTimeout) {
         this.lifecycleClock = new SpaceLifecycleClock();
@@ -118,7 +139,11 @@ public final class LruBufferPool implements BufferPool {
         return arr;
     }
 
-    /** 注入淘汰脏页的 WAL 安全刷盘端口（set-once）并传播给每个分片。 */
+    /** 注入淘汰脏页的 WAL 安全刷盘端口（set-once）并传播给每个分片。
+     *
+     * @param flusher 由组合根提供的 {@code DirtyVictimFlusher} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code attachVictimFlusher} 调用
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public void attachVictimFlusher(DirtyVictimFlusher flusher) {
         if (flusher == null) {
             throw new DatabaseValidationException("victim flusher must not be null");
@@ -131,7 +156,10 @@ public final class LruBufferPool implements BufferPool {
         }
     }
 
-    /** 注入 read-ahead 钩子（set-once）；留在 facade，由 {@link #getPage} 调用。 */
+    /** 注入 read-ahead 钩子（set-once）；留在 facade，由 {@link #getPage} 调用。
+     * @param hook 由组合根提供的 {@code ReadAheadHook} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code attachReadAheadHook} 调用
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public void attachReadAheadHook(ReadAheadHook hook) {
         if (hook == null) {
             throw new DatabaseValidationException("read-ahead hook must not be null");
@@ -145,6 +173,13 @@ public final class LruBufferPool implements BufferPool {
         return instances[router.route(pageId)];
     }
 
+    /**
+     * 返回 {@code getPage} 对应的Buffer Pool受控对象；调用方获得使用权但不接管组合根或 owner 的生命周期。
+     *
+     * @param pageId 目标页的稳定物理标识；必须属于当前已准入表空间，且不得为 {@code null}
+     * @param mode 调用方请求的目标状态、阶段或模式；不得为 {@code null}，且必须是当前状态机允许的后继值
+     * @return {@code getPage} 取得或创建的受控存储资源；成功时不为 {@code null}，调用方必须按其 Guard/lease 契约释放
+     */
     @Override
     public PageGuard getPage(PageId pageId, PageLatchMode mode) {
         PageGuard guard = instanceFor(pageId).getPage(pageId, mode);
@@ -157,18 +192,47 @@ public final class LruBufferPool implements BufferPool {
         return guard;
     }
 
+    /**
+     * 根据调用参数构造 {@code newPage} 对应的Buffer Pool领域对象；构造前完成范围与组合校验，成功结果不为 {@code null}。
+     *
+     * @param pageId 目标页的稳定物理标识；必须属于当前已准入表空间，且不得为 {@code null}
+     * @param mode 调用方请求的目标状态、阶段或模式；不得为 {@code null}，且必须是当前状态机允许的后继值
+     * @return {@code newPage} 取得或创建的受控存储资源；成功时不为 {@code null}，调用方必须按其 Guard/lease 契约释放
+     */
     @Override
     public PageGuard newPage(PageId pageId, PageLatchMode mode) {
         return instanceFor(pageId).newPage(pageId, mode);
     }
 
+    /**
+     * 将预取请求路由到 PageId 所属分片；预取只填充可淘汰 frame，不向调用方返回或遗留 page fix。
+     *
+     * @param pageId 目标页的稳定物理标识；必须属于当前已准入表空间，且不得为 {@code null}
+     */
     @Override
     public void prefetch(PageId pageId) {
         instanceFor(pageId).prefetch(pageId);
     }
 
+    /**
+     * 汇总各分片 oldest modification LSN 不晚于目标 LSN 的脏页候选，全局排序后最多返回 maxPages 个不可变快照。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>按 PageId 路由分片并读取 page hash、frame 代际与生命周期状态，过期映射在返回前拒绝。</li>
+     *     <li>遵守 pageHashLock、frameMutex、列表锁与 page latch 顺序固定 frame，慢 IO 或条件等待移到内部锁外。</li>
+     *     <li>完成页载入、替换、dirty snapshot 或状态转换，并向等待者发布唯一完成或失败信号。</li>
+     *     <li>返回受控 Guard/快照或释放 fix；失败回收占位且不错误清除并发产生的 dirty 状态。</li>
+     * </ol>
+     *
+     * @param targetLsn redo 日志边界；不得为 {@code null}，必须单调且与调用方已发布的页或事务状态一致
+     * @param maxPages 参与 {@code dirtyPageCandidates} 的上界或规格值 {@code maxPages}；必须非负且不能使容量、页数或编码长度计算溢出
+     * @return 按当前快照筛出的候选页、脏页或阻塞关系；保持方法声明的稳定顺序，无候选时返回空集合而非 {@code null}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     @Override
     public List<DirtyPageCandidate> dirtyPageCandidates(Lsn targetLsn, int maxPages) {
+        // 1、按 PageId 路由分片并读取 page hash、frame 代际与生命周期状态，在共享或持久副作用前拒绝非法状态。
         if (targetLsn == null) {
             throw new DatabaseValidationException("target LSN must not be null");
         }
@@ -177,17 +241,74 @@ public final class LruBufferPool implements BufferPool {
         }
         // 各分片各取本地 ≤maxPages 候选（已按 oldest 升序裁剪），并集再全局按 oldest 升序排序取前 maxPages：
         // 全局 top-maxPages ⊆ 各分片 top-maxPages 的并集，故合并结果正确。
+        // 2、继续完成范围、身份与候选校验；通过后，遵守 pageHashLock、frameMutex、列表锁与 page latch 顺序固定 frame，保持处理顺序与资源边界。
         List<DirtyPageCandidate> merged = new ArrayList<>();
         for (BufferPoolInstance instance : instances) {
             merged.addAll(instance.localDirtyPageCandidates(targetLsn, maxPages));
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，完成页载入、替换、dirty snapshot 或状态转换，并维持领域不变量。
         merged.sort(Comparator.comparingLong(candidate -> candidate.oldestModificationLsn().value()));
         if (merged.size() > maxPages) {
             merged = merged.subList(0, maxPages);
         }
+        // 4、返回受控 Guard/快照或释放 fix，以稳定返回或领域异常完成收口。
         return List.copyOf(merged);
     }
 
+    /**
+     * 按各分片 LRU 淘汰顺序汇总脏页候选，并在不固定 frame 的情况下最多返回 maxPages 个不可变候选。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>按 PageId 路由分片并读取 page hash、frame 代际与生命周期状态，过期映射在返回前拒绝。</li>
+     *     <li>遵守 pageHashLock、frameMutex、列表锁与 page latch 顺序固定 frame，慢 IO 或条件等待移到内部锁外。</li>
+     *     <li>完成页载入、替换、dirty snapshot 或状态转换，并向等待者发布唯一完成或失败信号。</li>
+     *     <li>返回受控 Guard/快照或释放 fix；失败回收占位且不错误清除并发产生的 dirty 状态。</li>
+     * </ol>
+     *
+     * @param maxPages 参与 {@code lruDirtyPageCandidates} 的上界或规格值 {@code maxPages}；必须非负且不能使容量、页数或编码长度计算溢出
+     * @return 按当前快照筛出的候选页、脏页或阻塞关系；保持方法声明的稳定顺序，无候选时返回空集合而非 {@code null}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
+    @Override
+    public List<DirtyPageCandidate> lruDirtyPageCandidates(int maxPages) {
+        // 1、按 PageId 路由分片并读取 page hash、frame 代际与生命周期状态，在共享或持久副作用前拒绝非法状态。
+        if (maxPages < 0) {
+            throw new DatabaseValidationException("lru dirty max pages must not be negative: " + maxPages);
+        }
+        // 2、继续完成范围、身份与候选校验；通过后，遵守 pageHashLock、frameMutex、列表锁与 page latch 顺序固定 frame，保持处理顺序与资源边界。
+        List<DirtyPageCandidate> merged = new ArrayList<>();
+        // 3、在中间分支复核阶段性结果；满足条件后，完成页载入、替换、dirty snapshot 或状态转换，并维持领域不变量。
+        for (BufferPoolInstance instance : instances) {
+            merged.addAll(instance.localLruDirtyPageCandidates(maxPages));
+        }
+        if (merged.size() > maxPages) {
+            merged = merged.subList(0, maxPages);
+        }
+        // 4、返回受控 Guard/快照或释放 fix，以稳定返回或领域异常完成收口。
+        return List.copyOf(merged);
+    }
+
+    /**
+     * 计算 {@code freeFrameCount} 所表达的Buffer Pool数量、容量或物理位置；计算只读取输入，溢出或越界以领域异常报告。
+     *
+     * @return {@code freeFrameCount} 计算出的非负长度、位置或数量；结果必须落在所属页、集合或持久格式容量内，溢出通过领域异常报告
+     */
+    @Override
+    public int freeFrameCount() {
+        int total = 0;
+        for (BufferPoolInstance instance : instances) {
+            total += instance.freeFrameCount();
+        }
+        return total;
+    }
+
+    /**
+     * 推进Buffer Pool刷盘或检查点边界；写数据前遵守 WAL，失败时不得清除尚未安全持久化的状态。
+     *
+     * @param pageId 目标页的稳定物理标识；必须属于当前已准入表空间，且不得为 {@code null}
+     * @return 当前可见的最近快照或持久边界；尚未产生对应状态时为空 {@code Optional}，从不返回 Java {@code null}
+     */
     @Override
     public Optional<FlushPageSnapshot> snapshotForFlush(PageId pageId) {
         return instanceFor(pageId).snapshotForFlush(pageId);
@@ -195,6 +316,10 @@ public final class LruBufferPool implements BufferPool {
 
     /**
      * 等待任一分片的 dirty 状态变化通知。Condition 不保护 dirty 谓词，调用方必须在返回后重新查询 dirty view。
+     *
+     * @param timeout 本次等待或操作的最大时长；不得为 {@code null} 或负值，零表示只做一次立即检查而不阻塞
+     * @return 在超时或取消前观察到 {@code awaitDirtyStateChange} 的目标状态时为 {@code true}；等待期限届满且状态仍未满足时为 {@code false}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     @Override
     public boolean awaitDirtyStateChange(Duration timeout) {
@@ -224,6 +349,13 @@ public final class LruBufferPool implements BufferPool {
         }
     }
 
+    /**
+     * 推进Buffer Pool刷盘或检查点边界；写数据前遵守 WAL，失败时不得清除尚未安全持久化的状态。
+     *
+     * @param snapshot 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @return {@code completeFlush} 成功完成其命名的受控动作并发布结果时为 {@code true}；未命中、未执行或状态竞争失败时为 {@code false}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     @Override
     public boolean completeFlush(FlushPageSnapshot snapshot) {
         if (snapshot == null) {
@@ -232,6 +364,11 @@ public final class LruBufferPool implements BufferPool {
         return instanceFor(snapshot.pageId()).completeFlush(snapshot);
     }
 
+    /**
+     * 推进Buffer Pool刷盘或检查点边界；写数据前遵守 WAL，失败时不得清除尚未安全持久化的状态。
+     *
+     * @param pageId 目标页的稳定物理标识；必须属于当前已准入表空间，且不得为 {@code null}
+     */
     @Override
     public void failFlush(PageId pageId) {
         instanceFor(pageId).failFlush(pageId);
@@ -247,6 +384,13 @@ public final class LruBufferPool implements BufferPool {
         }
     }
 
+    /**
+     * 读取所有分片的最早脏页 LSN 并返回全局最小值；没有脏页时返回调用方提供的 cleanBoundary。
+     *
+     * @param cleanBoundary redo 日志边界；不得为 {@code null}，必须单调且与调用方已发布的页或事务状态一致
+     * @return {@code oldestDirtyLsnOr} 定位或分配的稳定值对象；成功时不为 {@code null}，其身份、范围和特殊值已由构造校验保证
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     @Override
     public Lsn oldestDirtyLsnOr(Lsn cleanBoundary) {
         if (cleanBoundary == null) {
@@ -262,6 +406,11 @@ public final class LruBufferPool implements BufferPool {
         return min == null ? cleanBoundary : min;
     }
 
+    /**
+     * 判断 {@code hasDirtyPages} 所表达的Buffer Pool条件；方法只读取稳定状态，并用返回值报告是否满足条件。
+     *
+     * @return {@code hasDirtyPages} 命名的领域事实成立时为 {@code true}，否则为 {@code false}；查询本身不改变权威状态
+     */
     @Override
     public boolean hasDirtyPages() {
         for (BufferPoolInstance instance : instances) {
@@ -277,24 +426,39 @@ public final class LruBufferPool implements BufferPool {
      * 先逐分片 {@link BufferPoolInstance#awaitDrainedAndCheckClean}（共享 deadline 等 fix=0 + 校验无脏，任一脏帧/超时即抛、
      * 尚未移除任何帧），全部通过后再逐分片 {@link BufferPoolInstance#removeTablespaceFrames}。调用方须已持该表空间独占
      * operation lease，阻止新 page fix 与并发 flush，使两阶段之间确认的 fix=0/clean 不变。
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>按 PageId 路由分片并读取 page hash、frame 代际与生命周期状态，过期映射在返回前拒绝。</li>
+     *     <li>遵守 pageHashLock、frameMutex、列表锁与 page latch 顺序固定 frame，慢 IO 或条件等待移到内部锁外。</li>
+     *     <li>完成页载入、替换、dirty snapshot 或状态转换，并向等待者发布唯一完成或失败信号。</li>
+     *     <li>返回受控 Guard/快照或释放 fix；失败回收占位且不错误清除并发产生的 dirty 状态。</li>
+     * </ol>
+     *
+     * @param spaceId 目标表空间的稳定标识；不得为 {@code null}，且必须已注册并满足当前生命周期准入条件
+     * @param timeout 本次等待或操作的最大时长；不得为 {@code null} 且必须为正，超时不得留下未释放资源
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     @Override
     public void invalidateTablespace(SpaceId spaceId, Duration timeout) {
+        // 1、按 PageId 路由分片并读取 page hash、frame 代际与生命周期状态，在共享或持久副作用前拒绝非法状态。
         if (spaceId == null) {
             throw new DatabaseValidationException("invalidate tablespace space id must not be null");
         }
         if (timeout == null || timeout.isZero() || timeout.isNegative()) {
             throw new DatabaseValidationException("invalidate tablespace timeout must be positive");
         }
+        // 2、继续完成范围、身份与候选校验；通过后，遵守 pageHashLock、frameMutex、列表锁与 page latch 顺序固定 frame，保持处理顺序与资源边界。
         long timeoutNanos;
         try {
             timeoutNanos = timeout.toNanos();
         } catch (ArithmeticException overflow) {
             throw new DatabaseValidationException("invalidate tablespace timeout is too large", overflow);
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，完成页载入、替换、dirty snapshot 或状态转换，并维持领域不变量。
         long deadlineNanos = System.nanoTime() + timeoutNanos;
         lifecycleClock.beginInvalidation(spaceId);
         boolean advanced = false;
+        // 4、返回受控 Guard/快照或释放 fix，以稳定返回或领域异常完成收口。
         try {
             // 阶段 1：维护窗口已打开，新 admission 被拒绝；全部分片 drain+check 通过前不推进版本。
             for (BufferPoolInstance instance : instances) {
@@ -317,6 +481,14 @@ public final class LruBufferPool implements BufferPool {
         }
     }
 
+    /**
+     * 计算 {@code residentCountInRange} 所表达的Buffer Pool数量、容量或物理位置；计算只读取输入，溢出或越界以领域异常报告。
+     *
+     * @param spaceId 目标表空间的稳定标识；不得为 {@code null}，且必须已注册并满足当前生命周期准入条件
+     * @param firstPageNo 参与 {@code residentCountInRange} 的原始数值身份 {@code firstPageNo}；必须非负，零值仅用于对应格式明确声明的系统或空身份
+     * @param pageCount 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @return {@code residentCountInRange} 计算出的非负长度、位置或数量；结果必须落在所属页、集合或持久格式容量内，溢出通过领域异常报告
+     */
     @Override
     public int residentCountInRange(SpaceId spaceId, long firstPageNo, int pageCount) {
         // 各分片本地区间计数求和：每个 PageId 只在其归属分片，故求和=区间内总驻留数。
@@ -328,6 +500,11 @@ public final class LruBufferPool implements BufferPool {
         return total;
     }
 
+    /**
+     * 计算 {@code capacity} 所表达的Buffer Pool数量、容量或物理位置；计算只读取输入，溢出或越界以领域异常报告。
+     *
+     * @return {@code capacity} 计算出的非负长度、位置或数量；结果必须落在所属页、集合或持久格式容量内，溢出通过领域异常报告
+     */
     @Override
     public int capacity() {
         int total = 0;
@@ -337,6 +514,11 @@ public final class LruBufferPool implements BufferPool {
         return total;
     }
 
+    /**
+     * 计算 {@code residentCount} 所表达的Buffer Pool数量、容量或物理位置；计算只读取输入，溢出或越界以领域异常报告。
+     *
+     * @return {@code residentCount} 计算出的非负长度、位置或数量；结果必须落在所属页、集合或持久格式容量内，溢出通过领域异常报告
+     */
     @Override
     public int residentCount() {
         int total = 0;
@@ -346,6 +528,11 @@ public final class LruBufferPool implements BufferPool {
         return total;
     }
 
+    /**
+     * 合并各分片当前驻留页的稳定标识快照；返回列表不携带 frame、page latch 或 fix 所有权。
+     *
+     * @return 按当前快照筛出的候选页、脏页或阻塞关系；保持方法声明的稳定顺序，无候选时返回空集合而非 {@code null}
+     */
     @Override
     public List<PageId> residentPageIds() {
         List<PageId> all = new ArrayList<>();
@@ -355,6 +542,9 @@ public final class LruBufferPool implements BufferPool {
         return List.copyOf(all);
     }
 
+    /**
+     * 释放本方法拥有的Buffer Pool资源；遵守既定释放顺序，重复或失败调用不得掩盖原始状态。
+     */
     @Override
     public void close() {
         // BufferPool 不拥有 PageStore 生命周期，也不再提供 legacy flushAll 直写路径。

@@ -22,7 +22,16 @@ public final class UnicodeWeightCollationV1 implements CollationStrategy {
     private UnicodeWeightCollationV1() {
     }
 
-    /** 严格解码两侧 UTF-8、生成固定主权重序列，再做整数 lexicographic compare。 */
+    /** 严格解码两侧 UTF-8、生成固定主权重序列，再做整数 lexicographic compare。
+     *
+     * @param a 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @param aOffset 目标结构内的零基偏移；必须落在当前页、记录或持久槽位的合法范围
+     * @param aLength 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @param b 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @param bOffset 目标结构内的零基偏移；必须落在当前页、记录或持久槽位的合法范围
+     * @param bLength 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @return 左值小于、等于或大于右值时分别返回负数、零或正数；排序规则与对应索引或无符号格式一致
+     */
     @Override
     public int compare(byte[] a, int aOffset, int aLength, byte[] b, int bOffset, int bLength) {
         int[] left = weights(decode(a, aOffset, aLength));
@@ -70,7 +79,14 @@ public final class UnicodeWeightCollationV1 implements CollationStrategy {
         return key;
     }
 
-    /** 每次创建独立 decoder，避免共享 CharsetDecoder 的可变状态进入并发索引比较。 */
+    /** 每次创建独立 decoder，避免共享 CharsetDecoder 的可变状态进入并发索引比较。
+     *
+     * @param bytes 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @param offset 目标结构内的零基偏移；必须落在当前页、记录或持久槽位的合法范围
+     * @param length 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @return {@code decode} 生成的非空文本表示；字符顺序保持 SQL、标识符或诊断格式约定，无结果时返回空串而非 {@code null}
+     * @throws InvalidCharacterEncodingException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     private static String decode(byte[] bytes, int offset, int length) {
         try {
             CharBuffer decoded = StandardCharsets.UTF_8.newDecoder()

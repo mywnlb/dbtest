@@ -29,6 +29,9 @@ class PersistentHistoryRecoveryTest {
     private static final PageId P1 = page(64);
     private static final PageId P2 = page(65);
 
+    /**
+     * 验证 {@code rebuildPreservesPhysicalOrderWhenTransactionNumbersAreLocallyInverted} 所描述的返回值或状态会按契约保留，并断言原始信息与领域不变量未丢失。
+     */
     @Test
     void rebuildPreservesPhysicalOrderWhenTransactionNumbersAreLocallyInverted() {
         var fixture = twoCommitted(20, 10,
@@ -62,6 +65,9 @@ class PersistentHistoryRecoveryTest {
         assertEquals(java.util.Set.of(12L), rebuilt.getLast().affectedTableIds());
     }
 
+    /**
+     * 验证 {@code rejectsCyclePrevMismatchAndDeclaredTailMismatch} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void rejectsCyclePrevMismatchAndDeclaredTailMismatch() {
         PersistentHistoryRecovery recovery = new PersistentHistoryRecovery();
@@ -87,6 +93,9 @@ class PersistentHistoryRecoveryTest {
                 () -> recovery.rebuild(wrongTail, badPrev.owners(), badPrev.evidence(), cycle.nodes()::get));
     }
 
+    /**
+     * 验证 {@code rejectsOrphanCommittedLinkedActiveAndNonUpdateNode} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void rejectsOrphanCommittedLinkedActiveAndNonUpdateNode() {
         PersistentHistoryRecovery recovery = new PersistentHistoryRecovery();
@@ -160,6 +169,9 @@ class PersistentHistoryRecoveryTest {
                         101, 0, Optional.empty(), Optional.empty())));
     }
 
+    /**
+     * 验证 {@code rejectsDuplicateCreatorDuplicateCommitNumberAndLowHighWater} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void rejectsDuplicateCreatorDuplicateCommitNumberAndLowHighWater() {
         PersistentHistoryRecovery recovery = new PersistentHistoryRecovery();
@@ -191,6 +203,9 @@ class PersistentHistoryRecoveryTest {
                         lowHighWater.evidence(), lowHighWater.nodes()::get));
     }
 
+    /**
+     * 验证 {@code allPurgedHistoryStillAdvancesTransactionNumberAndOverflowFailsClosed} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void allPurgedHistoryStillAdvancesTransactionNumberAndOverflowFailsClosed() {
         PersistentHistoryRecovery recovery = new PersistentHistoryRecovery();

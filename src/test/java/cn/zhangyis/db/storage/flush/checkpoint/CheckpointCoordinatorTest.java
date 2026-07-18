@@ -42,6 +42,9 @@ class CheckpointCoordinatorTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code safeCheckpointDoesNotPassOldestDirtyOrRedoDurable} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void safeCheckpointDoesNotPassOldestDirtyOrRedoDurable() {
         try (PageStore store = new FileChannelPageStore();
@@ -63,6 +66,9 @@ class CheckpointCoordinatorTest {
         }
     }
 
+    /**
+     * 验证 {@code safeCheckpointUsesClosedLsnInsteadOfCurrentLsn} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void safeCheckpointUsesClosedLsnInsteadOfCurrentLsn() {
         try (PageStore store = new FileChannelPageStore();
@@ -82,6 +88,9 @@ class CheckpointCoordinatorTest {
         }
     }
 
+    /**
+     * 验证 {@code safeCheckpointDoesNotPassUnclosedRedoEvenWhenDirtyViewIsEmpty} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void safeCheckpointDoesNotPassUnclosedRedoEvenWhenDirtyViewIsEmpty() {
         try (PageStore store = new FileChannelPageStore();
@@ -99,6 +108,9 @@ class CheckpointCoordinatorTest {
         }
     }
 
+    /**
+     * 验证 {@code safeCheckpointUsesRedoFlushedWhenThereAreNoDirtyPages} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void safeCheckpointUsesRedoFlushedWhenThereAreNoDirtyPages() {
         try (PageStore store = new FileChannelPageStore();
@@ -116,6 +128,9 @@ class CheckpointCoordinatorTest {
         }
     }
 
+    /**
+     * 验证 {@code advanceCheckpointPushesRedoReclaimBoundaryWhenAdvanced} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void advanceCheckpointPushesRedoReclaimBoundaryWhenAdvanced() {
         try (PageStore store = new FileChannelPageStore();
@@ -141,6 +156,9 @@ class CheckpointCoordinatorTest {
         }
     }
 
+    /**
+     * 验证 {@code doesNotTouchReclaimBoundaryWhenCheckpointDoesNotAdvance} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void doesNotTouchReclaimBoundaryWhenCheckpointDoesNotAdvance() {
         try (PageStore store = new FileChannelPageStore();

@@ -59,6 +59,7 @@ public final class CharacterTypeRegistry {
      * @param charsetId schema 声明的字符集。
      * @return 精确编码字节。
      * @throws InvalidCharacterEncodingException 输入包含 malformed surrogate 或 charset 不可映射字符时抛出。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public byte[] encode(String value, CharsetId charsetId) {
         if (value == null || charsetId == null) {
@@ -86,6 +87,7 @@ public final class CharacterTypeRegistry {
      * @param charsetId schema 声明的字符集。
      * @return 解码字符串。
      * @throws InvalidCharacterEncodingException 字段不是该 charset 的合法字节序列时抛出。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public String decode(FieldSlice slice, CharsetId charsetId) {
         if (slice == null || charsetId == null) {
@@ -111,6 +113,7 @@ public final class CharacterTypeRegistry {
      * @param collationId 排序规则稳定标识。
      * @return 已注册的无状态比较策略。
      * @throws UnsupportedCollationException pair 未注册时抛出。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public CollationStrategy collationFor(CharsetId charsetId, CollationId collationId) {
         if (charsetId == null || collationId == null) {
@@ -133,7 +136,11 @@ public final class CharacterTypeRegistry {
         return charset;
     }
 
-    /** charset/collation 组合键；仅 registry 内使用，不暴露可变注册能力。 */
+    /** charset/collation 组合键；仅 registry 内使用，不暴露可变注册能力。
+     *
+     * @param charsetId 参与 {@code 构造} 的稳定领域标识 {@code CharsetId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param collationId 参与 {@code 构造} 的稳定领域标识 {@code CollationId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     */
     private record CharsetCollationKey(CharsetId charsetId, CollationId collationId) {
     }
 }

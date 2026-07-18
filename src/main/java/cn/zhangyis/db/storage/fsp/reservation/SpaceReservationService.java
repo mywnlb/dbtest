@@ -55,6 +55,15 @@ public final class SpaceReservationService {
     /** 按 MTR id 索引的活动 reservation；consume 路径无全局锁读取，避免持 data page latch 时阻塞在账本锁。 */
     private final Map<Long, CopyOnWriteArrayList<SpaceReservation>> reservationsByMtr = new ConcurrentHashMap<>();
 
+    /**
+     * 创建 {@code SpaceReservationService}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param pageStore 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param pageSize 调用方提供的长度或容量值对象；不得为 {@code null}，且必须已通过其构造范围校验
+     * @param headerRepo 由组合根提供的 {@code SpaceHeaderRepository} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param flst FSP 层的链表、空间预留或分配方向对象；不得为 {@code null}，必须属于当前表空间且保持 extent/segment 所有权不变量
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public SpaceReservationService(PageStore pageStore, PageSize pageSize,
                                    SpaceHeaderRepository headerRepo, Flst flst) {
         if (pageStore == null || pageSize == null || headerRepo == null || flst == null) {
@@ -114,17 +123,30 @@ public final class SpaceReservationService {
      * 如果当前 MTR 在该表空间存在活动 reservation，则消费一个 page quota；若 quota 已耗尽，在真正进入
      * SegmentPageAllocator 前抛出领域异常。没有活动 reservation 的兼容路径直接放行。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验表空间生命周期、页号、区段身份与容量边界，非法或损坏元数据在分配/IO 前拒绝。</li>
+     *     <li>按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，避免锁序反转。</li>
+     *     <li>执行空间元数据或物理文件变化，并把需要的 allocation intent、redo、dirty 或 force 副作用交给既有下游。</li>
+     *     <li>发布稳定结果并逆序释放 lease、latch 与 fix；失败保留可由恢复流程识别的权威状态。</li>
+     * </ol>
+     *
      * @param mtr 当前活动 MTR。
      * @param spaceId 待分配页所属表空间。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws SpaceReservationExceededException 输入值或资源需求超出编码、页面或容量上限时抛出；调用方应缩小请求、回滚或等待资源释放
      */
     public void consumePageIfReserved(MiniTransaction mtr, SpaceId spaceId) {
+        // 1、校验表空间生命周期、页号、区段身份与容量边界，在共享或持久副作用前拒绝非法状态。
         if (mtr == null || spaceId == null) {
             throw new DatabaseValidationException("reservation consume mtr/space id must not be null");
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，保持处理顺序与资源边界。
         List<SpaceReservation> reservations = reservationsByMtr.get(mtr.id());
         if (reservations == null) {
             return;
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，执行空间元数据或物理文件变化，并维持领域不变量。
         boolean exhaustedForSpace = false;
         for (SpaceReservation reservation : reservations) {
             SpaceReservation.ConsumeResult result = reservation.consumePageQuota(spaceId);
@@ -135,6 +157,7 @@ public final class SpaceReservationService {
                 exhaustedForSpace = true;
             }
         }
+        // 4、发布稳定结果并逆序释放 lease、latch 与 fix，以稳定返回或领域异常完成收口。
         if (exhaustedForSpace) {
             throw new SpaceReservationExceededException("space reservation page quota exhausted: mtr="
                     + mtr.id() + " space=" + spaceId.value());
@@ -144,16 +167,29 @@ public final class SpaceReservationService {
     /**
      * 释放 reservation 的剩余容量承诺。该方法只由 {@link SpaceReservation#close()} 调用，并在锁内做幂等保护。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验表空间生命周期、页号、区段身份与容量边界，非法或损坏元数据在分配/IO 前拒绝。</li>
+     *     <li>按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，避免锁序反转。</li>
+     *     <li>执行空间元数据或物理文件变化，并把需要的 allocation intent、redo、dirty 或 force 副作用交给既有下游。</li>
+     *     <li>发布稳定结果并逆序释放 lease、latch 与 fix；失败保留可由恢复流程识别的权威状态。</li>
+     * </ol>
+     *
      * @param reservation 待释放 reservation。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     void release(SpaceReservation reservation) {
+        // 1、校验表空间生命周期、页号、区段身份与容量边界，在共享或持久副作用前拒绝非法状态。
         if (reservation == null) {
             throw new DatabaseValidationException("space reservation must not be null");
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，保持处理顺序与资源边界。
         if (!reservation.markClosed()) {
             return;
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，执行空间元数据或物理文件变化，并维持领域不变量。
         lock.lock();
+        // 4、发布稳定结果并逆序释放 lease、latch 与 fix，以稳定返回或领域异常完成收口。
         try {
             ReservationCounter counter = countersBySpace.get(reservation.spaceId);
             if (counter != null) {
@@ -174,6 +210,12 @@ public final class SpaceReservationService {
         }
     }
 
+    /**
+     * 计算 {@code reservedCapacityExtents} 所表达的表空间、区与段分配数量、容量或物理位置；计算只读取输入，溢出或越界以领域异常报告。
+     *
+     * @param spaceId 目标表空间的稳定标识；不得为 {@code null}，且必须已注册并满足当前生命周期准入条件
+     * @return {@code reservedCapacityExtents} 计算出的非负长度、位置或数量；结果必须落在所属页、集合或持久格式容量内，溢出通过领域异常报告
+     */
     private long reservedCapacityExtents(SpaceId spaceId) {
         lock.lock();
         try {

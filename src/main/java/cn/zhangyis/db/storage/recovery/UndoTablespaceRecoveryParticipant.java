@@ -18,9 +18,16 @@ public interface UndoTablespaceRecoveryParticipant {
      */
     int prepareDoublewrite(DoublewriteRecoveryScanner scanner);
 
-    /** durable TRUNCATING target 之外的尾页必须返回 false，防止恢复已声明丢弃的旧字节。 */
+    /** durable TRUNCATING target 之外的尾页必须返回 false，防止恢复已声明丢弃的旧字节。
+     *
+     * @param pageId 目标页的稳定物理标识；必须属于当前已准入表空间，且不得为 {@code null}
+     * @return {@code shouldRepairDoublewritePage} 命名的领域事实成立时为 {@code true}，否则为 {@code false}；查询本身不改变权威状态
+     */
     boolean shouldRepairDoublewritePage(PageId pageId);
 
-    /** redo replay 到完整边界后续作所有已发现的 TRUNCATING 空间。 */
+    /** redo replay 到完整边界后续作所有已发现的 TRUNCATING 空间。
+     *
+     * @param recoveredToLsn redo 日志边界；不得为 {@code null}，必须单调且与调用方已发布的页或事务状态一致
+     */
     void resumeAfterRedo(Lsn recoveredToLsn);
 }

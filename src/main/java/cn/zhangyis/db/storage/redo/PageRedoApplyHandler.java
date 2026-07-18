@@ -24,6 +24,12 @@ import java.util.Set;
  */
 public final class PageRedoApplyHandler implements RedoApplyHandler {
 
+    /**
+     * 判断 {@code supports} 所表达的Redo/WAL条件；方法只读取稳定状态，并用返回值报告是否满足条件。
+     *
+     * @param record 参与本次操作的记录或记录集合；不得为 {@code null}，顺序、身份与编码必须满足当前索引或日志格式
+     * @return {@code supports} 命名的领域事实成立时为 {@code true}，否则为 {@code false}；查询本身不改变权威状态
+     */
     @Override
     public boolean supports(RedoRecord record) {
         return record instanceof PageInitRecord
@@ -34,11 +40,25 @@ public final class PageRedoApplyHandler implements RedoApplyHandler {
                 || record instanceof BTreePageDeltaRecord;
     }
 
+    /**
+     * 计算 {@code affectedPages} 所表达的Redo/WAL数量、容量或物理位置；计算只读取输入，溢出或越界以领域异常报告。
+     *
+     * @param record 参与本次操作的记录或记录集合；不得为 {@code null}，顺序、身份与编码必须满足当前索引或日志格式
+     * @return 按当前快照筛出的候选页、脏页或阻塞关系；保持方法声明的稳定顺序，无候选时返回空集合而非 {@code null}
+     */
     @Override
     public List<PageId> affectedPages(RedoRecord record) {
         return List.of(pageIdOf(record));
     }
 
+    /**
+     * 定位并读取Redo/WAL领域对象；先校验标识与准入状态，返回值只暴露稳定视图或受控句柄。
+     *
+     * @param range redo 收集、定位或重放所需的日志对象；不得为 {@code null}，其 LSN 范围和记录格式必须连续且属于当前恢复或 MTR 上下文
+     * @param context redo 收集、定位或重放所需的日志对象；不得为 {@code null}，其 LSN 范围和记录格式必须连续且属于当前恢复或 MTR 上下文
+     * @return {@code openBatch} 取得或创建的受控存储资源；成功时不为 {@code null}，调用方必须按其 Guard/lease 契约释放
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     @Override
     public RedoApplyBatchHandler openBatch(LogRange range, RedoApplyContext context) {
         if (range == null || context == null) {
@@ -47,7 +67,12 @@ public final class PageRedoApplyHandler implements RedoApplyHandler {
         return new Batch(range, context);
     }
 
-    /** 应用一个完整 redo 批次；每个页只在批次末尾写回一次。 */
+    /** 应用一个完整 redo 批次；每个页只在批次末尾写回一次。
+     *
+     * @param batch redo 收集、定位或重放所需的日志对象；不得为 {@code null}，其 LSN 范围和记录格式必须连续且属于当前恢复或 MTR 上下文
+     * @param context redo 收集、定位或重放所需的日志对象；不得为 {@code null}，其 LSN 范围和记录格式必须连续且属于当前恢复或 MTR 上下文
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public void apply(RedoLogBatch batch, RedoApplyContext context) {
         if (batch == null || context == null) {
             throw new DatabaseValidationException("page redo apply batch/context must not be null");
@@ -63,6 +88,7 @@ public final class PageRedoApplyHandler implements RedoApplyHandler {
      *
      * @param batch 原始 range 加过滤后记录的内部视图。
      * @param context 页重放上下文。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     void apply(RedoApplyBatchView batch, RedoApplyContext context) {
         if (batch == null || context == null) {
@@ -75,6 +101,9 @@ public final class PageRedoApplyHandler implements RedoApplyHandler {
         session.finish();
     }
 
+    /**
+     * Redo/WAL的 {@code Batch} 批处理上下文；它聚合同一批次的输入与阶段结果，批次结束后不得跨请求复用。
+     */
     private static final class Batch implements RedoApplyBatchHandler {
 
         /** 原始 batch range，finish 时作为所有 touched 页的 pageLSN 幂等边界。 */
@@ -94,12 +123,29 @@ public final class PageRedoApplyHandler implements RedoApplyHandler {
             this.context = context;
         }
 
+        /**
+         * 执行Redo/WAL恢复或重放步骤；按持久证据校验并幂等推进状态，不执行普通 SQL 业务语义。
+         *
+         * <p>数据流：</p>
+         * <ol>
+         *     <li>读取 checkpoint、redo、doublewrite 或事务持久证据，并校验阶段、范围与文件身份。</li>
+         *     <li>依据 page LSN、恢复进度和稳定标识判断跳过或续作，保证重复启动不会重复产生副作用。</li>
+         *     <li>按恢复阶段应用物理页或事务状态变化，并在每个可恢复边界记录已完成进度。</li>
+         *     <li>发布恢复结果并释放恢复专用资源；失败保持 fail-closed，不能提前开放普通 SQL 流量。</li>
+         * </ol>
+         *
+         * @param record 参与本次操作的记录或记录集合；不得为 {@code null}，顺序、身份与编码必须满足当前索引或日志格式
+         * @throws RedoLogCorruptedException 检测到不能安全解释的持久数据损坏时抛出；调用方不得继续发布普通服务或覆盖原始证据
+         */
         @Override
         public void apply(RedoRecord record) {
+            // 1、读取 checkpoint、redo、doublewrite 或事务持久证据，在共享或持久副作用前拒绝非法状态。
             PageId pageId = pageIdOf(record);
+            // 2、继续完成范围、身份与候选校验；通过后，依据 page LSN、恢复进度和稳定标识判断跳过或续作，保持处理顺序与资源边界。
             if (skippedPages.contains(pageId)) {
                 return;
             }
+            // 3、在中间分支复核阶段性结果；满足条件后，按恢复阶段应用物理页或事务状态变化，并维持领域不变量。
             ReplayPage page = pages.get(pageId);
             if (page == null) {
                 if (record instanceof PageInitRecord) {
@@ -120,6 +166,7 @@ public final class PageRedoApplyHandler implements RedoApplyHandler {
                 page = new ReplayPage(pageId, current);
                 pages.put(pageId, page);
             }
+            // 4、发布恢复结果并释放恢复专用资源，以稳定返回或领域异常完成收口。
             if (record instanceof PageInitRecord pir) {
                 page.bytes = initializedPage(context, pir);
                 page.touched = true;
@@ -138,6 +185,9 @@ public final class PageRedoApplyHandler implements RedoApplyHandler {
             }
         }
 
+        /**
+         * 推进 {@code finish} 对应的Redo/WAL阶段转换；成功只发布一次目标状态，失败路径保留可取消或可诊断的原状态。
+         */
         @Override
         public void finish() {
             for (ReplayPage page : pages.values()) {
@@ -182,6 +232,11 @@ public final class PageRedoApplyHandler implements RedoApplyHandler {
     /**
      * B+Tree 结构 delta 同样只做页内 after-image patch。恢复期不重新运行 split/merge/root shrink 算法，
      * 避免把 redo replay 变成普通运行时结构调整。
+     *
+     * @param context redo 收集、定位或重放所需的日志对象；不得为 {@code null}，其 LSN 范围和记录格式必须连续且属于当前恢复或 MTR 上下文
+     * @param page 已固定的页面、frame 或页头视图；不得为 {@code null}，必须指向目标 PageId，并在访问期间持有契约要求的 fix/latch
+     * @param record 参与本次操作的记录或记录集合；不得为 {@code null}，顺序、身份与编码必须满足当前索引或日志格式
+     * @throws RedoLogCorruptedException 检测到不能安全解释的持久数据损坏时抛出；调用方不得继续发布普通服务或覆盖原始证据
      */
     private static void applyBTreePageDelta(RedoApplyContext context, ReplayPage page,
                                             BTreePageDeltaRecord record) {
@@ -197,6 +252,16 @@ public final class PageRedoApplyHandler implements RedoApplyHandler {
         applyPatch(context, page, record.offset(), record.afterImage(), "redo B+Tree page delta");
     }
 
+    /**
+     * 执行Redo/WAL恢复或重放步骤；按持久证据校验并幂等推进状态，不执行普通 SQL 业务语义。
+     *
+     * @param context redo 收集、定位或重放所需的日志对象；不得为 {@code null}，其 LSN 范围和记录格式必须连续且属于当前恢复或 MTR 上下文
+     * @param page 已固定的页面、frame 或页头视图；不得为 {@code null}，必须指向目标 PageId，并在访问期间持有契约要求的 fix/latch
+     * @param offset 目标结构内的零基偏移；必须落在当前页、记录或持久槽位的合法范围
+     * @param patch 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @param what 传给 {@code applyPatch} 的文本值；不得为 {@code null} 或空白，并保持调用方提供的字符顺序
+     * @throws RedoLogCorruptedException 检测到不能安全解释的持久数据损坏时抛出；调用方不得继续发布普通服务或覆盖原始证据
+     */
     private static void applyPatch(RedoApplyContext context, ReplayPage page, int offset, byte[] patch, String what) {
         long end = (long) offset + patch.length;
         if (offset < 0 || end > context.pageSize().bytes()) {
@@ -227,15 +292,34 @@ public final class PageRedoApplyHandler implements RedoApplyHandler {
         return bytes;
     }
 
+    /**
+     * 根据调用参数构造 {@code initializedPage} 对应的Redo/WAL领域对象；构造前完成范围与组合校验，成功结果不为 {@code null}。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取 checkpoint、redo、doublewrite 或事务持久证据，并校验阶段、范围与文件身份。</li>
+     *     <li>依据 page LSN、恢复进度和稳定标识判断跳过或续作，保证重复启动不会重复产生副作用。</li>
+     *     <li>按恢复阶段应用物理页或事务状态变化，并在每个可恢复边界记录已完成进度。</li>
+     *     <li>发布恢复结果并释放恢复专用资源；失败保持 fail-closed，不能提前开放普通 SQL 流量。</li>
+     * </ol>
+     *
+     * @param context redo 收集、定位或重放所需的日志对象；不得为 {@code null}，其 LSN 范围和记录格式必须连续且属于当前恢复或 MTR 上下文
+     * @param record 参与本次操作的记录或记录集合；不得为 {@code null}，顺序、身份与编码必须满足当前索引或日志格式
+     * @return {@code initializedPage} 生成的非空字节表示；调用方获得独立结果或受控视图，格式失败通过领域异常报告
+     */
     private static byte[] initializedPage(RedoApplyContext context, PageInitRecord record) {
+        // 1、读取 checkpoint、redo、doublewrite 或事务持久证据，在共享或持久副作用前拒绝非法状态。
         byte[] bytes = new byte[context.pageSize().bytes()];
         ByteBuffer page = ByteBuffer.wrap(bytes);
+        // 2、继续完成范围、身份与候选校验；通过后，依据 page LSN、恢复进度和稳定标识判断跳过或续作，保持处理顺序与资源边界。
         page.putInt(PageEnvelopeLayout.SPACE_ID, record.pageId().spaceId().value());
         page.putInt(PageEnvelopeLayout.PAGE_NO, (int) record.pageId().pageNo().value());
         page.putInt(PageEnvelopeLayout.PREV_PAGE_NO, (int) FilePageHeader.FIL_NULL);
+        // 3、在中间分支复核阶段性结果；满足条件后，按恢复阶段应用物理页或事务状态变化，并维持领域不变量。
         page.putInt(PageEnvelopeLayout.NEXT_PAGE_NO, (int) FilePageHeader.FIL_NULL);
         page.putLong(PageEnvelopeLayout.PAGE_LSN, 0L);
         page.putInt(PageEnvelopeLayout.PAGE_TYPE, record.pageType().code());
+        // 4、发布恢复结果并释放恢复专用资源，以稳定返回或领域异常完成收口。
         return bytes;
     }
 
@@ -247,31 +331,62 @@ public final class PageRedoApplyHandler implements RedoApplyHandler {
         ByteBuffer.wrap(page).putLong(PageEnvelopeLayout.PAGE_LSN, lsn.value());
     }
 
+    /**
+     * 根据调用参数创建或转换 {@code pageIdOf} 返回的 {@code PageId}；输入先完成领域校验，成功结果不为 {@code null}。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取 checkpoint、redo、doublewrite 或事务持久证据，并校验阶段、范围与文件身份。</li>
+     *     <li>依据 page LSN、恢复进度和稳定标识判断跳过或续作，保证重复启动不会重复产生副作用。</li>
+     *     <li>按恢复阶段应用物理页或事务状态变化，并在每个可恢复边界记录已完成进度。</li>
+     *     <li>发布恢复结果并释放恢复专用资源；失败保持 fail-closed，不能提前开放普通 SQL 流量。</li>
+     * </ol>
+     *
+     * @param record 参与本次操作的记录或记录集合；不得为 {@code null}，顺序、身份与编码必须满足当前索引或日志格式
+     * @return {@code pageIdOf} 定位或分配的稳定值对象；成功时不为 {@code null}，其身份、范围和特殊值已由构造校验保证
+     * @throws RedoLogCorruptedException 检测到不能安全解释的持久数据损坏时抛出；调用方不得继续发布普通服务或覆盖原始证据
+     */
     static PageId pageIdOf(RedoRecord record) {
+        // 1、读取 checkpoint、redo、doublewrite 或事务持久证据，在共享或持久副作用前拒绝非法状态。
         if (record instanceof PageInitRecord pir) {
             return pir.pageId();
         }
         if (record instanceof PageBytesRecord pbr) {
             return pbr.pageId();
         }
+        // 2、继续完成范围、身份与候选校验；通过后，依据 page LSN、恢复进度和稳定标识判断跳过或续作，保持处理顺序与资源边界。
         if (record instanceof FspMetadataDeltaRecord fmd) {
             return fmd.pageId();
         }
         if (record instanceof UndoMetadataDeltaRecord umd) {
             return umd.pageId();
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，按恢复阶段应用物理页或事务状态变化，并维持领域不变量。
         if (record instanceof UndoRecordPayloadRecord urp) {
             return urp.pageId();
         }
         if (record instanceof BTreePageDeltaRecord btd) {
             return btd.pageId();
         }
+        // 4、发布恢复结果并释放恢复专用资源，以稳定返回或领域异常完成收口。
         throw new RedoLogCorruptedException("unsupported redo record type: " + record.getClass().getName());
     }
 
+    /**
+     * 单页 redo replay 的批内工作副本；pageId 固定，bytes 只由当前批次替换，touched 标识是否需要写回 PageStore。
+     */
     private static final class ReplayPage {
+        /**
+         * 构造时冻结的 {@code pageId} 稳定领域标识；必须属于本对象的表空间、事务或日志上下文，下游定位与恢复均依赖其身份不变。
+         */
         private final PageId pageId;
+        /**
+         * 本对象独占的 {@code bytes} 数据缓冲；构造和访问路径必须遵守防御性复制或受控视图约束，不能泄漏可变数组。
+         */
         private byte[] bytes;
+        /**
+         * 记录 {@code touched} 生命周期事实是否成立；只由本类状态转换更新，共享访问受所属显式锁、原子发布或单一 owner 线程保护。
+         */
         private boolean touched;
 
         private ReplayPage(PageId pageId, byte[] bytes) {

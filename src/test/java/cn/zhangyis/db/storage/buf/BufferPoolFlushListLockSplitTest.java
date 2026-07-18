@@ -33,6 +33,9 @@ class BufferPoolFlushListLockSplitTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code dirtyViewKeepsOldestAndRefreshesNewestForRepeatedWrites} 所描述的返回值或状态会按契约保留，并断言原始信息与领域不变量未丢失。
+     */
     @Test
     void dirtyViewKeepsOldestAndRefreshesNewestForRepeatedWrites() {
         try (PageStore store = openStore(); BufferPool pool = new LruBufferPool(store, PS, 4)) {
@@ -47,6 +50,9 @@ class BufferPoolFlushListLockSplitTest {
         }
     }
 
+    /**
+     * 验证 {@code flushingPageStaysInDirtyBoundaryButIsSkippedAsFlushCandidate} 所描述的刷脏与持久化协作，并断言 redo durable 边界先覆盖 page LSN、失败后仍保留脏状态。
+     */
     @Test
     void flushingPageStaysInDirtyBoundaryButIsSkippedAsFlushCandidate() {
         try (PageStore store = openStore(); BufferPool pool = new LruBufferPool(store, PS, 4)) {
@@ -60,6 +66,9 @@ class BufferPoolFlushListLockSplitTest {
         }
     }
 
+    /**
+     * 验证 {@code completeFlushAfterRewriteKeepsPageInDirtyView} 所描述的返回值或状态会按契约保留，并断言原始信息与领域不变量未丢失。
+     */
     @Test
     void completeFlushAfterRewriteKeepsPageInDirtyView() {
         try (PageStore store = openStore(); BufferPool pool = new LruBufferPool(store, PS, 4)) {
@@ -76,6 +85,9 @@ class BufferPoolFlushListLockSplitTest {
         }
     }
 
+    /**
+     * 验证 {@code latchSetRejectsIoWhileAnyListLockHeld} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void latchSetRejectsIoWhileAnyListLockHeld() {
         BufferPoolInstanceLatchSet latchSet = new BufferPoolInstanceLatchSet();

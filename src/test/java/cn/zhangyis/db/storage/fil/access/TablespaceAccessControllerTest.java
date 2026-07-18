@@ -14,6 +14,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /** 表空间 operation lease 测试：共享访问可并行，截断独占 lease 必须 drain 已进入的普通访问。 */
 class TablespaceAccessControllerTest {
 
+    /**
+     * 验证 {@code exclusiveLeaseWaitsUntilSharedLeaseCloses} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void exclusiveLeaseWaitsUntilSharedLeaseCloses() throws Exception {
         TablespaceAccessController controller = new TablespaceAccessController(Duration.ofSeconds(2));
@@ -33,6 +38,9 @@ class TablespaceAccessControllerTest {
         assertTrue(exclusive.isDone());
     }
 
+    /**
+     * 验证 {@code waitingLeaseHasBoundedTimeout} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void waitingLeaseHasBoundedTimeout() {
         TablespaceAccessController controller = new TablespaceAccessController(Duration.ofMillis(50));

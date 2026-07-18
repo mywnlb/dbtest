@@ -371,7 +371,7 @@ public final class CachingTablespaceRegistry implements TablespaceRegistry {
      * <ol>
      *     <li>按请求 SpaceId 调用 loader；空结果转换为明确 NotFound。</li>
      *     <li>比较 metadata 自带 SpaceId，拒绝把其它空间的 page0 快照缓存到当前 key。</li>
-     *     <li>转换为 Tablespace/Handle；成功仅返回候选值，是否写 cache 由调用方法决定。</li>
+     *     <li>转换为 Tablespace/Handle；成功仅返回候选值，是否写入 cache 由上层缓存装载流程决定。</li>
      * </ol>
      *
      * @param spaceId 已通过非空校验的请求标识

@@ -56,7 +56,10 @@ class TransactionMetadataScopeTest {
         }
     }
 
-    /** DDL X 必须等到 transaction scope 反序释放 table pin/MDL 后才能越过。 */
+    /** DDL X 必须等到 transaction scope 反序释放 table pin/MDL 后才能越过。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void holdsMetadataUntilTransactionEndAndCloseIsIdempotent() throws Exception {
         try (BinderTestFixture fixture = new BinderTestFixture(directory)) {

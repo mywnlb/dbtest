@@ -41,6 +41,14 @@ public final class UndoPage {
      */
     private final PageSize pageSize;
 
+    /**
+     * 创建 {@code UndoPage}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param guard 调用方持有的 {@code PageGuard} 资源句柄；不得为 {@code null} 且必须处于有效期，方法返回前所有权仍归调用方
+     * @param pageSize 调用方提供的长度或容量值对象；不得为 {@code null}，且必须已通过其构造范围校验
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     UndoPage(MiniTransaction mtr, PageGuard guard, PageSize pageSize) {
         if (mtr == null || guard == null || pageSize == null) {
             throw new DatabaseValidationException("undo page mtr/guard/pageSize must not be null");
@@ -57,6 +65,7 @@ public final class UndoPage {
      * @param kind   独立 undo log 类型；普通表空间只使用 INSERT/UPDATE。
      * @param txnId  所属事务 id；恢复用它把 ACTIVE/COMMITTED first page 与事务证据交叉校验。
      * @param handle segment 定位；first 页必须位于 handle 所属表空间。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     void formatFirstPage(UndoLogKind kind, TransactionId txnId, UndoSegmentHandle handle) {
         if (kind == null || txnId == null || handle == null) {
@@ -69,6 +78,11 @@ public final class UndoPage {
     /**
      * 把已结束且只有一个普通页的 segment 重置为 CACHED。record area 不全页清零：freeOffset 回到起点后旧槽
      * 不再可达，下一次激活/append 会从头覆盖；这是教学实现相对 InnoDB 更简单的缓存清理策略。
+     *
+     * @param kind 选择 {@code resetForCache} 分支的 {@code UndoLogKind} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     * @param handle 调用方持有的 {@code UndoSegmentHandle} 资源句柄；不得为 {@code null} 且必须处于有效期，方法返回前所有权仍归调用方
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws UndoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     void resetForCache(UndoLogKind kind, UndoSegmentHandle handle) {
         if (kind == null || handle == null || kind == UndoLogKind.TEMPORARY) {
@@ -86,7 +100,13 @@ public final class UndoPage {
                 "reset finalized undo first page for cache");
     }
 
-    /** 用新的事务 owner 激活 CACHED 首页；调用方随后在同一业务 MTR 追加首条 undo record。 */
+    /** 用新的事务 owner 激活 CACHED 首页；调用方随后在同一业务 MTR 追加首条 undo record。
+     *
+     * @param kind 选择 {@code activateCached} 分支的 {@code UndoLogKind} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     * @param txnId 参与 {@code activateCached} 的稳定领域标识 {@code TransactionId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param handle 调用方持有的 {@code UndoSegmentHandle} 资源句柄；不得为 {@code null} 且必须处于有效期，方法返回前所有权仍归调用方
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     void activateCached(UndoLogKind kind, TransactionId txnId, UndoSegmentHandle handle) {
         if (kind == null || txnId == null || handle == null || txnId.isNone()
                 || kind == UndoLogKind.TEMPORARY) {
@@ -100,13 +120,29 @@ public final class UndoPage {
     /**
      * 把已结束且物理上只有一个 ordinary page 的 segment 重置为 FREE，并写入 free FIFO 双向链接。
      * 最近一次 kind 只留作诊断；FREE owner 本身不按 kind 分区。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
+     * @param handle 调用方持有的 {@code UndoSegmentHandle} 资源句柄；不得为 {@code null} 且必须处于有效期，方法返回前所有权仍归调用方
+     * @param previousFreePageNo 参与 {@code resetForFree} 的原始数值身份 {@code previousFreePageNo}；必须非负，零值仅用于对应格式明确声明的系统或空身份
+     * @param nextFreePageNo 参与 {@code resetForFree} 的原始数值身份 {@code nextFreePageNo}；必须非负，零值仅用于对应格式明确声明的系统或空身份
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws UndoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     void resetForFree(UndoSegmentHandle handle, long previousFreePageNo, long nextFreePageNo) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         if (handle == null) {
             throw new DatabaseValidationException("undo free reset handle must not be null");
         }
         requireFirstPage();
         requireHandleSpace(handle);
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         validateFreePageNo(previousFreePageNo);
         validateFreePageNo(nextFreePageNo);
         if (!guard.pageId().equals(handle.firstPageId()) || !handle.firstPageId().equals(handle.lastPageId())
@@ -115,16 +151,24 @@ public final class UndoPage {
             throw new UndoLogFormatException("only a self-linked single-page undo segment can enter free list: "
                     + guard.pageId());
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         UndoLogKind retainedKind = undoKind();
         if (retainedKind == UndoLogKind.TEMPORARY) {
             throw new UndoLogFormatException("temporary undo cannot enter persistent free list: " + guard.pageId());
         }
         rewriteFirstPage(retainedKind, TransactionId.NONE, UndoPageLayout.STATE_FREE, handle,
                 "reset finalized undo first page for free list");
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         setFreeLinks(previousFreePageNo, nextFreePageNo);
     }
 
-    /** 用新事务和新 kind 激活 FREE 首页；调用方随后在同一业务 MTR 追加首条记录。 */
+    /** 用新事务和新 kind 激活 FREE 首页；调用方随后在同一业务 MTR 追加首条记录。
+     *
+     * @param kind 选择 {@code activateFree} 分支的 {@code UndoLogKind} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     * @param txnId 参与 {@code activateFree} 的稳定领域标识 {@code TransactionId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param handle 调用方持有的 {@code UndoSegmentHandle} 资源句柄；不得为 {@code null} 且必须处于有效期，方法返回前所有权仍归调用方
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     void activateFree(UndoLogKind kind, TransactionId txnId, UndoSegmentHandle handle) {
         if (kind == null || txnId == null || handle == null || txnId.isNone()
                 || kind == UndoLogKind.TEMPORARY) {
@@ -135,7 +179,11 @@ public final class UndoPage {
                 "activate free undo first page");
     }
 
-    /** 校验 FREE 首页的可复用物理边界；prev/next 可以指向同一持久 FIFO 中的相邻节点。 */
+    /** 校验 FREE 首页的可复用物理边界；prev/next 可以指向同一持久 FIFO 中的相邻节点。
+     *
+     * @param handle 调用方持有的 {@code UndoSegmentHandle} 资源句柄；不得为 {@code null} 且必须处于有效期，方法返回前所有权仍归调用方
+     * @throws UndoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     void requireFreeEmpty(UndoSegmentHandle handle) {
         requireFirstPage();
         requireHandleSpace(handle);
@@ -155,7 +203,12 @@ public final class UndoPage {
         validateFreePageNo(freeNextPageNo());
     }
 
-    /** 校验 CACHED 首页的全部可复用边界；恢复与运行期 pop 共用。 */
+    /** 校验 CACHED 首页的全部可复用边界；恢复与运行期 pop 共用。
+     *
+     * @param expectedKind 选择 {@code requireCachedEmpty} 分支的 {@code UndoLogKind} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     * @param handle 调用方持有的 {@code UndoSegmentHandle} 资源句柄；不得为 {@code null} 且必须处于有效期，方法返回前所有权仍归调用方
+     * @throws UndoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     void requireCachedEmpty(UndoLogKind expectedKind, UndoSegmentHandle handle) {
         requireFirstPage();
         requireHandleSpace(handle);
@@ -176,20 +229,41 @@ public final class UndoPage {
         }
     }
 
+    /**
+     * 校验输入与当前状态后修改Undo 日志领域数据；成功发布完整结果，异常路径保留既有持久化与并发不变量。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
+     * @param kind 选择 {@code rewriteFirstPage} 分支的 {@code UndoLogKind} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     * @param txnId 参与 {@code rewriteFirstPage} 的稳定领域标识 {@code TransactionId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param state 调用方请求的目标状态、阶段或模式；不得为 {@code null}，且必须是当前状态机允许的后继值
+     * @param handle 调用方持有的 {@code UndoSegmentHandle} 资源句柄；不得为 {@code null} 且必须处于有效期，方法返回前所有权仍归调用方
+     * @param reason 传给 {@code rewriteFirstPage} 的文本值；不得为 {@code null} 或空白，并保持调用方提供的字符顺序
+     */
     private void rewriteFirstPage(UndoLogKind kind, TransactionId txnId, int state,
                                   UndoSegmentHandle handle, String reason) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         writePageHeader(handle, true);
         PageEnvelope.writeSiblingLinks(guard, FilePageHeader.FIL_NULL, FilePageHeader.FIL_NULL);
         writeLogHeaderLong(handle, UndoPageLayout.TRANSACTION_ID, txnId.value(), reason + " transaction id");
         writeLogHeaderU8(handle, UndoPageLayout.UNDO_KIND, kind.ordinal(), reason + " kind");
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         writeLogHeaderU8(handle, UndoPageLayout.STATE, state, reason + " state");
         long self = guard.pageId().pageNo().value();
         writeLogHeaderU32(handle, UndoPageLayout.FIRST_PAGE_NO, self, reason + " first page no");
         writeLogHeaderU32(handle, UndoPageLayout.LAST_PAGE_NO, self, reason + " last page no");
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         writeLogHeaderLong(handle, UndoPageLayout.LOG_RECORD_COUNT, 0L, reason + " log record count");
         writeLogHeaderLong(handle, UndoPageLayout.LOG_LAST_UNDO_NO, 0L, reason + " log last undo no");
         writeLogHeaderLong(handle, UndoPageLayout.COMMIT_NO, 0L, reason + " commit no");
         setLogicalHead(UndoLogicalHead.EMPTY);
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         setHistoryLinks(FilePageHeader.FIL_NULL, FilePageHeader.FIL_NULL);
     }
 
@@ -198,6 +272,8 @@ public final class UndoPage {
      * 使 record area 起点与 first 页一致；其余 first-only 访问器仍通过 {@link #isFirstPage()} 拒绝。
      *
      * @param handle segment 定位；页必须与 handle 所属表空间一致。
+     * @param kind 选择 {@code formatChainPage} 分支的 {@code UndoLogKind} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     void formatChainPage(UndoLogKind kind, UndoSegmentHandle handle) {
         if (kind == null || handle == null) {
@@ -220,12 +296,23 @@ public final class UndoPage {
      * <p>本方法只维护 page header，不更新 first 页 log header；整链计数由 {@link UndoLogSegment} 在 append
      * 成功后统一更新，从而能覆盖单页与跨页两种路径。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
      * @param payload 已编码 undo record payload。
      * @param txnId   生成该 undo record 的事务写 id，用于 redo 诊断和后续恢复阶段关联。
      * @param undoNo  事务内 undo 序号，不能是 NONE。
      * @return record 槽起始 offset，供 RollPointer 编码。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws UndoPageOverflowException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
      */
     int appendRecord(byte[] payload, TransactionId txnId, UndoNo undoNo) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         if (payload == null || txnId == null || undoNo == null) {
             throw new DatabaseValidationException("undo append payload/txnId/undoNo must not be null");
         }
@@ -233,24 +320,30 @@ public final class UndoPage {
             throw new DatabaseValidationException("undo append undoNo must be > 0 (not NONE)");
         }
         int free = getU16(UndoPageLayout.FREE_OFFSET);
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         int need = 2 + payload.length;
         int limit = pageSize.bytes() - PageEnvelopeLayout.FIL_PAGE_TRAILER_BYTES;
         if (free + need > limit) {
             throw new UndoPageOverflowException("undo record (" + need + "B) does not fit at free="
                     + free + " limit=" + limit);
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         UndoRedoDeltas.writeRecordPayload(mtr, guard, guard.pageId(), txnId, undoNo, free, payload,
                 "append undo record payload");
         writePageHeaderU16(UndoPageLayout.FREE_OFFSET, free + need, "advance undo page free offset");
         writePageHeaderU16(UndoPageLayout.RECORD_COUNT, getU16(UndoPageLayout.RECORD_COUNT) + 1,
                 "advance undo page record count");
         writePageHeaderLong(UndoPageLayout.PAGE_LAST_UNDO_NO, undoNo.value(), "advance undo page last undo no");
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         return free;
     }
 
     /**
      * 读取指定 offset 的 undo record payload。offset 必须落在 {@link UndoPageLayout#RECORD_AREA_START}
      * 与当前 freeOffset 之间，且 len 前缀不能越过已写区域；越界表示 roll pointer 或页内容损坏。
+     * @param offset 目标结构内的零基偏移；必须落在当前页、记录或持久槽位的合法范围
+     * @return {@code recordAt} 生成的非空字节表示；调用方获得独立结果或受控视图，格式失败通过领域异常报告
+     * @throws UndoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     byte[] recordAt(int offset) {
         int free = getU16(UndoPageLayout.FREE_OFFSET);
@@ -269,6 +362,7 @@ public final class UndoPage {
      * 或 pageType 等信封字段。
      *
      * @param next 新后继页号。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     void linkNextTo(PageNo next) {
         if (next == null) {
@@ -282,6 +376,7 @@ public final class UndoPage {
      * 写 FIL PREV 链接并保留现有 NEXT。用于新 chain 页接入前驱页，NEXT 初始保持 FIL_NULL。
      *
      * @param prev 新前驱页号。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     void linkPrevTo(PageNo prev) {
         if (prev == null) {
@@ -294,6 +389,9 @@ public final class UndoPage {
     /**
      * 推进 first 页 log header 中的链尾页号。只能在 first 页调用；chain 页调用说明调用方把页角色弄错，
      * 属物理格式使用错误，按格式异常处理。
+     *
+     * @param last 参与 {@code setLastPageNo} 的稳定领域标识 {@code PageNo}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     void setLastPageNo(PageNo last) {
         requireFirstPage();
@@ -306,6 +404,8 @@ public final class UndoPage {
     /**
      * 更新 first 页整链 record 总数。该值是 reopen 和遍历诊断的权威整链计数，不等同于任一页的
      * {@link #recordCount()}。
+     * @param count 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     void setLogRecordCount(long count) {
         requireFirstPage();
@@ -317,6 +417,9 @@ public final class UndoPage {
 
     /**
      * 更新 first 页整链最后 undoNo。成功 append 后由 UndoLogSegment 调用；失败路径不应提前写此字段。
+     *
+     * @param undoNo 参与 {@code setLogLastUndoNo} 的原始数值身份 {@code undoNo}；必须非负，零值仅用于对应格式明确声明的系统或空身份
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     void setLogLastUndoNo(long undoNo) {
         requireFirstPage();
@@ -359,6 +462,8 @@ public final class UndoPage {
     /**
      * 打开既有页时统一执行版本守门。v1/v2 的 record area 分别从 105/120 开始，若按当前 136 偏移继续解析会把
      * 旧 record 误当 history header 或跳过，因此 legacy/未知版本都必须快速失败，不能猜测兼容。
+     *
+     * @throws UndoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     void requireCurrentFormat() {
         int version = formatVersion();
@@ -393,13 +498,20 @@ public final class UndoPage {
         return PageEnvelope.readHeader(guard).prevPageNo();
     }
 
-    /** first 页 log header 中的事务 id。 */
+    /** first 页 log header 中的事务 id。
+     *
+     * @return {@code transactionId} 定位或分配的稳定值对象；成功时不为 {@code null}，其身份、范围和特殊值已由构造校验保证
+     */
     TransactionId transactionId() {
         requireFirstPage();
         return TransactionId.of(guard.readLong(UndoPageLayout.TRANSACTION_ID));
     }
 
-    /** 当前普通 UNDO 页携带的 log 类型；v3 在 first/chain 页都必须可独立读取。 */
+    /** 当前普通 UNDO 页携带的 log 类型；v3 在 first/chain 页都必须可独立读取。
+     *
+     * @return {@code undoKind} 解析或选择出的已知领域类型；成功时不为 {@code null}，未知编码或非法状态通过领域异常报告
+     * @throws UndoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     UndoLogKind undoKind() {
         int idx = getU8(UndoPageLayout.UNDO_KIND);
         UndoLogKind[] all = UndoLogKind.values();
@@ -409,13 +521,20 @@ public final class UndoPage {
         return all[idx];
     }
 
-    /** first 页 log header 中的 undo log 状态（ACTIVE/PREPARED/COMMITTED/CACHED/FREE）。 */
+    /** first 页 log header 中的 undo log 状态（ACTIVE/PREPARED/COMMITTED/CACHED/FREE）。
+     *
+     * @return {@code state} 从受校验输入或持久字节中得到的 {@code int} 结果；位宽、符号和特殊值语义遵循当前格式，无法表示时抛出领域异常
+     */
     int state() {
         requireFirstPage();
         return getU8(UndoPageLayout.STATE);
     }
 
-    /** 写 first 页 log header 状态（X，R 1.2）。commit 时标 COMMITTED，使恢复期能据此跳过已提交事务回滚。 */
+    /** 写 first 页 log header 状态（X，R 1.2）。commit 时标 COMMITTED，使恢复期能据此跳过已提交事务回滚。
+     *
+     * @param state 调用方请求的目标状态、阶段或模式；不得为 {@code null}，且必须是当前状态机允许的后继值
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     void setLogState(int state) {
         requireFirstPage();
         if (state != UndoPageLayout.STATE_ACTIVE && state != UndoPageLayout.STATE_COMMITTED
@@ -426,25 +545,37 @@ public final class UndoPage {
         writeLogHeaderU8(UndoPageLayout.STATE, state, "write undo log state");
     }
 
-    /** first 页 log header 中的提交序号 TransactionNo（R 1.3）；0 表尚未提交。 */
+    /** first 页 log header 中的提交序号 TransactionNo（R 1.3）；0 表尚未提交。
+     *
+     * @return {@code commitNo} 返回的稳定数值身份或单调版本；零值仅按对应格式的系统/空身份约定解释，非法回退通过领域异常报告
+     */
     long commitNo() {
         requireFirstPage();
         return guard.readLong(UndoPageLayout.COMMIT_NO);
     }
 
-    /** 写 first 页 log header 提交序号（X，R 1.3）。commit 时与 STATE=COMMITTED 同 MTR 写，恢复重建 history 用。 */
+    /** 写 first 页 log header 提交序号（X，R 1.3）。commit 时与 STATE=COMMITTED 同 MTR 写，恢复重建 history 用。
+     *
+     * @param commitNo 参与 {@code setCommitNo} 的原始数值身份 {@code commitNo}；必须非负，零值仅用于对应格式明确声明的系统或空身份
+     */
     void setCommitNo(long commitNo) {
         requireFirstPage();
         writeLogHeaderLong(UndoPageLayout.COMMIT_NO, commitNo, "write undo commit no");
     }
 
-    /** first 页在 rollback-segment history 双向链中的前驱 pageNo；无前驱为 FIL_NULL。 */
+    /** first 页在 rollback-segment history 双向链中的前驱 pageNo；无前驱为 FIL_NULL。
+     *
+     * @return {@code historyPrevPageNo} 返回的稳定数值身份或单调版本；零值仅按对应格式的系统/空身份约定解释，非法回退通过领域异常报告
+     */
     long historyPrevPageNo() {
         requireFirstPage();
         return guard.readLong(UndoPageLayout.HISTORY_PREV_PAGE_NO);
     }
 
-    /** first 页在 rollback-segment history 双向链中的后继 pageNo；无后继为 FIL_NULL。 */
+    /** first 页在 rollback-segment history 双向链中的后继 pageNo；无后继为 FIL_NULL。
+     *
+     * @return {@code historyNextPageNo} 返回的稳定数值身份或单调版本；零值仅按对应格式的系统/空身份约定解释，非法回退通过领域异常报告
+     */
     long historyNextPageNo() {
         requireFirstPage();
         return guard.readLong(UndoPageLayout.HISTORY_NEXT_PAGE_NO);
@@ -453,6 +584,9 @@ public final class UndoPage {
     /**
      * 更新 first 页的 history prev/next。该链接与 FIL sibling links 无关：FIL 链连接同一 undo segment 的页，
      * history 链连接不同事务的 UPDATE undo first page；二者不能混用。
+     *
+     * @param prevPageNo 参与 {@code setHistoryLinks} 的原始数值身份 {@code prevPageNo}；必须非负，零值仅用于对应格式明确声明的系统或空身份
+     * @param nextPageNo 参与 {@code setHistoryLinks} 的原始数值身份 {@code nextPageNo}；必须非负，零值仅用于对应格式明确声明的系统或空身份
      */
     void setHistoryLinks(long prevPageNo, long nextPageNo) {
         requireFirstPage();
@@ -464,7 +598,10 @@ public final class UndoPage {
                 "write undo history next link");
     }
 
-    /** purge 摘头时把新 head.prev 清为 FIL_NULL。 */
+    /** purge 摘头时把新 head.prev 清为 FIL_NULL。
+     *
+     * @param prevPageNo 参与 {@code setHistoryPrevPageNo} 的原始数值身份 {@code prevPageNo}；必须非负，零值仅用于对应格式明确声明的系统或空身份
+     */
     void setHistoryPrevPageNo(long prevPageNo) {
         requireFirstPage();
         validateHistoryPageNo(prevPageNo);
@@ -472,7 +609,10 @@ public final class UndoPage {
                 "write undo history prev link");
     }
 
-    /** commit append 时把旧 tail.next 指向新节点。 */
+    /** commit append 时把旧 tail.next 指向新节点。
+     *
+     * @param nextPageNo 参与 {@code setHistoryNextPageNo} 的原始数值身份 {@code nextPageNo}；必须非负，零值仅用于对应格式明确声明的系统或空身份
+     */
     void setHistoryNextPageNo(long nextPageNo) {
         requireFirstPage();
         validateHistoryPageNo(nextPageNo);
@@ -480,19 +620,29 @@ public final class UndoPage {
                 "write undo history next link");
     }
 
-    /** FREE 状态下的前驱 pageNo；与 history prev 共用物理槽，但使用独立 redo 分类。 */
+    /** FREE 状态下的前驱 pageNo；与 history prev 共用物理槽，但使用独立 redo 分类。
+     *
+     * @return {@code freePrevPageNo} 返回的稳定数值身份或单调版本；零值仅按对应格式的系统/空身份约定解释，非法回退通过领域异常报告
+     */
     long freePrevPageNo() {
         requireFreeState();
         return guard.readLong(UndoPageLayout.HISTORY_PREV_PAGE_NO);
     }
 
-    /** FREE 状态下的后继 pageNo；与 history next 共用物理槽，但使用独立 redo 分类。 */
+    /** FREE 状态下的后继 pageNo；与 history next 共用物理槽，但使用独立 redo 分类。
+     *
+     * @return {@code freeNextPageNo} 返回的稳定数值身份或单调版本；零值仅按对应格式的系统/空身份约定解释，非法回退通过领域异常报告
+     */
     long freeNextPageNo() {
         requireFreeState();
         return guard.readLong(UndoPageLayout.HISTORY_NEXT_PAGE_NO);
     }
 
-    /** FREE 入队时一次写入 prev/next；调用方已按全局 PageId 顺序持有相关首页 X latch。 */
+    /** FREE 入队时一次写入 prev/next；调用方已按全局 PageId 顺序持有相关首页 X latch。
+     *
+     * @param previousPageNo 参与 {@code setFreeLinks} 的原始数值身份 {@code previousPageNo}；必须非负，零值仅用于对应格式明确声明的系统或空身份
+     * @param nextPageNo 参与 {@code setFreeLinks} 的原始数值身份 {@code nextPageNo}；必须非负，零值仅用于对应格式明确声明的系统或空身份
+     */
     void setFreeLinks(long previousPageNo, long nextPageNo) {
         requireFreeState();
         validateFreePageNo(previousPageNo);
@@ -503,7 +653,10 @@ public final class UndoPage {
                 "write undo free next link");
     }
 
-    /** 摘除 free head 后清空新 head.prev。 */
+    /** 摘除 free head 后清空新 head.prev。
+     *
+     * @param previousPageNo 参与 {@code setFreePrevPageNo} 的原始数值身份 {@code previousPageNo}；必须非负，零值仅用于对应格式明确声明的系统或空身份
+     */
     void setFreePrevPageNo(long previousPageNo) {
         requireFreeState();
         validateFreePageNo(previousPageNo);
@@ -511,7 +664,10 @@ public final class UndoPage {
                 "write undo free prev link");
     }
 
-    /** 尾插 free node 时把旧 tail.next 指向新节点。 */
+    /** 尾插 free node 时把旧 tail.next 指向新节点。
+     *
+     * @param nextPageNo 参与 {@code setFreeNextPageNo} 的原始数值身份 {@code nextPageNo}；必须非负，零值仅用于对应格式明确声明的系统或空身份
+     */
     void setFreeNextPageNo(long nextPageNo) {
         requireFreeState();
         validateFreePageNo(nextPageNo);
@@ -519,19 +675,29 @@ public final class UndoPage {
                 "write undo free next link");
     }
 
-    /** first 页 log header 中的链首页号。 */
+    /** first 页 log header 中的链首页号。
+     *
+     * @return {@code firstPageNo} 返回的稳定数值身份或单调版本；零值仅按对应格式的系统/空身份约定解释，非法回退通过领域异常报告
+     */
     long firstPageNo() {
         requireFirstPage();
         return getU32(UndoPageLayout.FIRST_PAGE_NO);
     }
 
-    /** first 页 log header 中的当前链尾页号。 */
+    /** first 页 log header 中的当前链尾页号。
+     *
+     * @return {@code lastPageNo} 返回的稳定数值身份或单调版本；零值仅按对应格式的系统/空身份约定解释，非法回退通过领域异常报告
+     */
     long lastPageNo() {
         requireFirstPage();
         return getU32(UndoPageLayout.LAST_PAGE_NO);
     }
 
-    /** first 页 log header 中的整链 record 总数。 */
+    /** first 页 log header 中的整链 record 总数。
+     *
+     * @return {@code logRecordCount} 计算出的非负长度、位置或数量；结果必须落在所属页、集合或持久格式容量内，溢出通过领域异常报告
+     * @throws UndoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     long logRecordCount() {
         requireFirstPage();
         long count = guard.readLong(UndoPageLayout.LOG_RECORD_COUNT);
@@ -541,7 +707,11 @@ public final class UndoPage {
         return count;
     }
 
-    /** first 页 log header 中的整链最近 undoNo。 */
+    /** first 页 log header 中的整链最近 undoNo。
+     *
+     * @return {@code logLastUndoNo} 定位或分配的稳定值对象；成功时不为 {@code null}，其身份、范围和特殊值已由构造校验保证
+     * @throws UndoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     UndoNo logLastUndoNo() {
         requireFirstPage();
         long value = guard.readLong(UndoPageLayout.LOG_LAST_UNDO_NO);
@@ -554,6 +724,8 @@ public final class UndoPage {
     /**
      * 读取 first-page header 中连续编码的持久逻辑头。磁盘负值、RollPointer 保留位或半空 pair 都属于
      * undo 格式损坏，统一包装成 {@link UndoLogFormatException}，避免 recovery 把它误判为普通调用参数错误。
+     * @return {@code logicalHead} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     * @throws UndoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     UndoLogicalHead logicalHead() {
         requireFirstPage();
@@ -570,6 +742,9 @@ public final class UndoPage {
     /**
      * 把 logical undo 头作为单个 15 字节 after-image 写入 first-page header。一次 metadata delta 使 undoNo 与
      * pointer 在同一 MTR redo batch 中不可拆分；调用方必须在写前完成目标 record/高水位校验。
+     *
+     * @param head 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     void setLogicalHead(UndoLogicalHead head) {
         requireFirstPage();
@@ -584,6 +759,12 @@ public final class UndoPage {
                 "write persistent logical undo head");
     }
 
+    /**
+     * 校验输入与当前状态后修改Undo 日志领域数据；成功发布完整结果，异常路径保留既有持久化与并发不变量。
+     *
+     * @param handle 调用方持有的 {@code UndoSegmentHandle} 资源句柄；不得为 {@code null} 且必须处于有效期，方法返回前所有权仍归调用方
+     * @param first 当前对象是否处于首次创建、首次写入或复用分支；该事实决定初始化、redo 和失败补偿路径
+     */
     private void writePageHeader(UndoSegmentHandle handle, boolean first) {
         writePageHeaderU16(handle, UndoPageLayout.FREE_OFFSET, UndoPageLayout.RECORD_AREA_START,
                 "format undo page free offset");

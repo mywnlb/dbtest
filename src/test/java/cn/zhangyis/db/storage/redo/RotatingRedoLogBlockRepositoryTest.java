@@ -28,7 +28,10 @@ class RotatingRedoLogBlockRepositoryTest {
     @TempDir
     Path dir;
 
-    /** 一个小 batch 占一个 block；容量恰好 512B 时每批轮转，并保持全局 blockNo 连续。 */
+    /** 一个小 batch 占一个 block；容量恰好 512B 时每批轮转，并保持全局 blockNo 连续。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void rotatesWholeBatchAndKeepsGlobalBlockNumbers() throws Exception {
         long l = length(8);
@@ -51,7 +54,10 @@ class RotatingRedoLogBlockRepositoryTest {
         }
     }
 
-    /** 物理容量必须按 block 对齐；大于单文件容量的 batch 在触碰文件前拒绝。 */
+    /** 物理容量必须按 block 对齐；大于单文件容量的 batch 在触碰文件前拒绝。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void validatesAlignedCapacityAndRejectsOversizedBatch() throws Exception {
         assertThrows(DatabaseValidationException.class,
@@ -78,7 +84,10 @@ class RotatingRedoLogBlockRepositoryTest {
                 () -> RotatingRedoLogRepository.open(ring, 2, 512));
     }
 
-    /** 逻辑最后文件的坏 checksum 是 torn tail；更早文件同类损坏后仍有后续 redo，必须致命。 */
+    /** 逻辑最后文件的坏 checksum 是 torn tail；更早文件同类损坏后仍有后续 redo，必须致命。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void toleratesTornOnlyInLogicalLastFile() throws Exception {
         long l = length(8);
@@ -96,7 +105,10 @@ class RotatingRedoLogBlockRepositoryTest {
                 () -> RotatingRedoLogRepository.open(middleRing, 3, 512));
     }
 
-    /** 已存在 ring 的预期文件不能缺失；只读打开空目录也不能自动创建文件。 */
+    /** 已存在 ring 的预期文件不能缺失；只读打开空目录也不能自动创建文件。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void rejectsPartialFileSetAndReadOnlyDoesNotCreate() throws Exception {
         Path ring = dir.resolve("partial");
@@ -113,7 +125,10 @@ class RotatingRedoLogBlockRepositoryTest {
         assertFalse(Files.exists(missing));
     }
 
-    /** v1 ring header 是已知旧格式，不能按 CRC 损坏或空闲文件自动重写。 */
+    /** v1 ring header 是已知旧格式，不能按 CRC 损坏或空闲文件自动重写。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void rejectsLegacyRingHeaderVersion() throws Exception {
         Path ring = dir.resolve("legacy");
@@ -125,7 +140,10 @@ class RotatingRedoLogBlockRepositoryTest {
                 () -> RotatingRedoLogRepository.open(ring, 2, 512));
     }
 
-    /** read-only ring 可扫描，但 append/force/reclaim 都不能改变文件或内存回收边界。 */
+    /** read-only ring 可扫描，但 append/force/reclaim 都不能改变文件或内存回收边界。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void readOnlyRingRejectsMutations() throws Exception {
         Path ring = dir.resolve("readonly");

@@ -803,6 +803,17 @@ InnoDB 风格删除分两阶段：
 8. flush、checkpoint、doublewrite。
 9. 并发和故障注入测试。
 
+## 22. GENERAL 表空间 DISCARD/IMPORT v1
+
+DISCARD/IMPORT 是 DD 与 storage API 共同编排的控制面操作。DDL log v3 持久化 canonical path、
+quarantine/source path 和 `TablespaceFileIdentity`；page0 继续使用 v1 `NORMAL/DISCARDED` marker，
+不扩张 page0 格式。DISCARD 在 WAL-safe marker、BufferPool drain/invalidate、PageStore close 后
+以 `ATOMIC_MOVE` 移入受控 discarded 目录；IMPORT 校验 page0 envelope/checksum、SpaceId、页大小、
+类型、lifecycle 和 spaceVersion，复制到临时目标后原子发布，写回 NORMAL 并递增 spaceVersion。
+DISCARDED/pending DD 状态不进入普通 discovery，启动由 DDL recovery 按双路径 identity 续作；
+quarantine 目录不参与普通 orphan cleanup。跨设备 rename 和目录 fsync 不作为 v1 强保证，
+文件 force、DDL phase durable 边界和 fail-closed 双路径裁决共同保证可重试恢复。
+
 ## 21. 十五轮自检记录
 
 本节记录参考本地 HTML 后的十五轮实际自检结果。

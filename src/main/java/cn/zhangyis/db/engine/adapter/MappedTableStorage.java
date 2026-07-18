@@ -120,6 +120,10 @@ public final class MappedTableStorage {
 
     /**
      * 按稳定 indexId 返回 descriptor；未知 id 表示调用方使用了错误的 bound index，禁止回退聚簇索引。
+     *
+     * @param indexId 参与 {@code index} 的零基位置 {@code indexId}；必须非负且小于所属页面、集合或持久结构的容量
+     * @return {@code index} 取得或创建的受控存储资源；成功时不为 {@code null}，调用方必须按其 Guard/lease 契约释放
+     * @throws DictionaryStorageMappingException 字典定义无法完整映射为当前存储 schema 或索引绑定时抛出；调用方不得发布半映射对象，应刷新元数据或回滚 DDL
      */
     public BTreeIndex index(long indexId) {
         BTreeIndex index = indexesById.get(indexId);

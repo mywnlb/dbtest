@@ -23,7 +23,11 @@ public enum RecoveredTransactionState {
     /** page3 ACTIVE 且没有终态冲突，启动期间必须完成 undo rollback。 */
     RECOVERED_ACTIVE;
 
-    /** 把 redo 稳定枚举映射为恢复期状态，不把运行时实现细节写回 redo 包。 */
+    /** 把 redo 稳定枚举映射为恢复期状态，不把运行时实现细节写回 redo 包。
+     *
+     * @param state 调用方请求的目标状态、阶段或模式；不得为 {@code null}，且必须是当前状态机允许的后继值
+     * @return {@code fromRedo} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     */
     static RecoveredTransactionState fromRedo(TransactionStateDeltaState state) {
         return switch (state) {
             case ACTIVE -> ACTIVE;

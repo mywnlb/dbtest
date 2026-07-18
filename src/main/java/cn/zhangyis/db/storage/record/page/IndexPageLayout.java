@@ -62,5 +62,8 @@ final class IndexPageLayout {
 
     /** 系统记录标签（教学：8 字节 ASCII，便于人工识别 + 固定 heapTop）。InnoDB 同样保留 "infimum\0"/"supremum"。 */
     static final byte[] INFIMUM_LABEL = "infimum\0".getBytes(StandardCharsets.UTF_8);
+    /**
+     * 类级不可变配置常量；所有实例共享该边界，非法调整会破坏记录格式与页内组织的不变量。
+     */
     static final byte[] SUPREMUM_LABEL = "supremum".getBytes(StandardCharsets.UTF_8);
 }

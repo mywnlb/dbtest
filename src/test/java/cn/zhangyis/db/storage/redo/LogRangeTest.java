@@ -10,6 +10,9 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 /** LogRange：end>=start，endLsn 取 end。 */
 class LogRangeTest {
 
+    /**
+     * 验证 {@code holdsRangeAndRejectsInverted} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void holdsRangeAndRejectsInverted() {
         LogRange r = new LogRange(Lsn.of(10), Lsn.of(27));

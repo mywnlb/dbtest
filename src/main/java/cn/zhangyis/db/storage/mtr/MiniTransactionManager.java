@@ -33,10 +33,18 @@ public final class MiniTransactionManager {
     private final RedoCapacityThrottle redoCapacityThrottle;
     /** 实例页大小感知的生产操作 profile；只估算，不读取或修改 MTR/redo 状态。 */
     private final MtrOperationRedoBudgetEstimator operationBudgetEstimator;
+    /**
+     * 创建 {@code MiniTransactionManager}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     */
     public MiniTransactionManager() {
         this(new TablespaceAccessController(), new RedoLogManager());
     }
 
+    /**
+     * 创建 {@code MiniTransactionManager}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param accessController 由组合根提供的 {@code TablespaceAccessController} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     */
     public MiniTransactionManager(TablespaceAccessController accessController) {
         this(accessController, new RedoLogManager());
     }
@@ -44,6 +52,9 @@ public final class MiniTransactionManager {
     /**
      * 创建共享 operation lease 与指定 redo manager 的 MTR 管理器。截断 marker 必须使用 durable redo manager，
      * 从而让 commit 返回的 end LSN 能在物理缩短前 fsync。
+     *
+     * @param accessController 由组合根提供的 {@code TablespaceAccessController} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param redoLogManager 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
      */
     public MiniTransactionManager(TablespaceAccessController accessController, RedoLogManager redoLogManager) {
         this(accessController, redoLogManager, RedoCapacityThrottle.NO_OP);
@@ -52,6 +63,10 @@ public final class MiniTransactionManager {
     /**
      * 创建带 redo capacity throttle 的 MTR 管理器。三参构造不申请额外预算，只保留 begin-time 当前压力检查；
      * 生产引擎应使用四参构造传入前台预算，避免多个 MTR 在低水位 begin 后集中 append。
+     *
+     * @param accessController 由组合根提供的 {@code TablespaceAccessController} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param redoLogManager 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param redoCapacityThrottle 调用方提供的长度或容量值对象；不得为 {@code null}，且必须已通过其构造范围校验
      */
     public MiniTransactionManager(TablespaceAccessController accessController,
                                   RedoLogManager redoLogManager,
@@ -59,7 +74,14 @@ public final class MiniTransactionManager {
         this(accessController, redoLogManager, redoCapacityThrottle, PageSize.ofBytes(16 * 1024));
     }
 
-    /** 创建使用实例真实页大小计算操作级 redo 上界的生产 MTR 管理器。 */
+    /** 创建使用实例真实页大小计算操作级 redo 上界的生产 MTR 管理器。
+     *
+     * @param accessController 由组合根提供的 {@code TablespaceAccessController} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param redoLogManager 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param redoCapacityThrottle 调用方提供的长度或容量值对象；不得为 {@code null}，且必须已通过其构造范围校验
+     * @param pageSize 调用方提供的长度或容量值对象；不得为 {@code null}，且必须已通过其构造范围校验
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public MiniTransactionManager(TablespaceAccessController accessController,
                                   RedoLogManager redoLogManager,
                                   RedoCapacityThrottle redoCapacityThrottle,
@@ -77,6 +99,7 @@ public final class MiniTransactionManager {
      * 开启并绑定一个 MTR。已有当前 MTR 则抛异常（禁静默嵌套，需嵌套应显式建 child）。
      *
      * @return 已 ACTIVE 的 MTR。
+     * @throws MtrStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
      */
     public MiniTransaction begin() {
         if (redoCapacityThrottle.requiresExplicitBudget()) {
@@ -92,6 +115,10 @@ public final class MiniTransactionManager {
 
     /**
      * 按操作级上界开启写 MTR。预算准入先于 MTR 暴露给调用方，因而调用方尚不可能持有本 MTR 的页/FSP 资源。
+     *
+     * @param budget redo 收集、定位或重放所需的日志对象；不得为 {@code null}，其 LSN 范围和记录格式必须连续且属于当前恢复或 MTR 上下文
+     * @return {@code begin} 创建或观察到的事务/锁状态；成功时不为 {@code null}，owner、可见性与生命周期来自当前会话
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public MiniTransaction begin(RedoAppendBudget budget) {
         if (budget == null) {
@@ -102,12 +129,19 @@ public final class MiniTransactionManager {
 
     /**
      * 返回实例页大小感知的写操作上界。调用方必须在取得 page/FSP 资源前计算并立即传给 {@link #begin(RedoAppendBudget)}。
+     * @param purpose 选择 {@code budgetFor} 分支的 {@code RedoBudgetPurpose} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     * @return {@code budgetFor} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
      */
     public RedoAppendBudget budgetFor(RedoBudgetPurpose purpose) {
         return operationBudgetEstimator.estimate(purpose);
     }
 
-    /** 把 begin 前由 BTree/Undo/DML 物化的领域 workload 转为实例级 redo admission 上界。 */
+    /** 把 begin 前由 BTree/Undo/DML 物化的领域 workload 转为实例级 redo admission 上界。
+     *
+     * @param purpose 选择 {@code budgetFor} 分支的 {@code RedoBudgetPurpose} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     * @param workload redo 收集、定位或重放所需的日志对象；不得为 {@code null}，其 LSN 范围和记录格式必须连续且属于当前恢复或 MTR 上下文
+     * @return {@code budgetFor} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     */
     public RedoAppendBudget budgetFor(RedoBudgetPurpose purpose, RedoBudgetWorkload workload) {
         return operationBudgetEstimator.estimate(purpose, workload);
     }
@@ -142,6 +176,7 @@ public final class MiniTransactionManager {
      * 返回当前线程绑定的 MTR；无则抛异常。
      *
      * @return 当前 MTR。
+     * @throws MtrStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
      */
     public MiniTransaction current() {
         MiniTransaction mtr = current.get();
@@ -155,6 +190,7 @@ public final class MiniTransactionManager {
      * 提交并解绑。mtr 必须是当前线程绑定的那个；释放资源后无论成败都解绑。
      *
      * @param mtr 待提交 MTR。
+     * @return {@code commit} 定位或分配的稳定值对象；成功时不为 {@code null}，其身份、范围和特殊值已由构造校验保证
      */
     public cn.zhangyis.db.domain.Lsn commit(MiniTransaction mtr) {
         requireBound(mtr);

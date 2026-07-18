@@ -28,6 +28,9 @@ class BTreePageDeltaRedoTest {
     private static final SpaceId SPACE = SpaceId.of(31);
     private static final PageId LEAF = PageId.of(SPACE, PageNo.of(11));
 
+    /**
+     * 验证 {@code btreePageDeltaRoundTripsThroughRedoFrameCodec} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void btreePageDeltaRoundTripsThroughRedoFrameCodec() {
         byte[] links = siblingBytes(10, 12);
@@ -45,6 +48,9 @@ class BTreePageDeltaRedoTest {
         assertEquals(1 + 12 + 8 + 1 + 8 + 4 + 4 + links.length, delta.byteLength());
     }
 
+    /**
+     * 验证 {@code btreePageDeltaReplaysSiblingLinksWithoutPageBytes} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void btreePageDeltaReplaysSiblingLinksWithoutPageBytes() {
         RecordingPageStore store = new RecordingPageStore();
@@ -63,6 +69,9 @@ class BTreePageDeltaRedoTest {
         assertEquals(batch.range().end().value(), ByteBuffer.wrap(page).getLong(PageEnvelopeLayout.PAGE_LSN));
     }
 
+    /**
+     * 验证 {@code nodeAndRootDeltaLayoutsRejectMalformedOffsetsOrLengths} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void nodeAndRootDeltaLayoutsRejectMalformedOffsetsOrLengths() {
         assertThrows(cn.zhangyis.db.common.exception.DatabaseValidationException.class,
@@ -76,6 +85,9 @@ class BTreePageDeltaRedoTest {
                         2L, 65, new byte[4]));
     }
 
+    /**
+     * 验证 {@code nodeAndRootDeltasReplayAsPageLocalAfterImages} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void nodeAndRootDeltasReplayAsPageLocalAfterImages() {
         RecordingPageStore store = new RecordingPageStore();
@@ -94,6 +106,9 @@ class BTreePageDeltaRedoTest {
         assertArrayEquals(pointerHeap, slice(store.page(LEAF), 66, pointerHeap.length));
     }
 
+    /**
+     * 验证 {@code nodePointerDeltaCannotPatchFileTrailer} 对应的Redo/WAL行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void nodePointerDeltaCannotPatchFileTrailer() {
         RecordingPageStore store = new RecordingPageStore();

@@ -36,6 +36,11 @@ class DoublewriteSlotReuseTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code reusesCompletedSlotsWithoutGrowingFileAndKeepsLatestCopy} 所描述的返回值或状态会按契约保留，并断言原始信息与领域不变量未丢失。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void reusesCompletedSlotsWithoutGrowingFileAndKeepsLatestCopy() throws Exception {
         Path path = dir.resolve("dw.dat");
@@ -56,6 +61,9 @@ class DoublewriteSlotReuseTest {
         }
     }
 
+    /**
+     * 验证 {@code doesNotOverwriteInFlightSlotBeforeDataFileWriteCompletes} 所描述的边界场景保持既有领域不变量，不产生方法名明确禁止的副作用。
+     */
     @Test
     void doesNotOverwriteInFlightSlotBeforeDataFileWriteCompletes() {
         try (DoublewriteFileRepository dw = DoublewriteFileRepository.open(dir.resolve("dw.dat"), PS, 1)) {
@@ -73,6 +81,11 @@ class DoublewriteSlotReuseTest {
         }
     }
 
+    /**
+     * 验证 {@code skipsCorruptSlotWhenEnumeratingAndChoosingLatestCopy} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void skipsCorruptSlotWhenEnumeratingAndChoosingLatestCopy() throws Exception {
         Path path = dir.resolve("dw.dat");

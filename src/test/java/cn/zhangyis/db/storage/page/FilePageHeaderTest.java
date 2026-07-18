@@ -28,6 +28,9 @@ class FilePageHeaderTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code roundTripWithNeighbors} 对应的物理页信封行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void roundTripWithNeighbors() {
         PageStore store = new FileChannelPageStore();
@@ -41,6 +44,9 @@ class FilePageHeaderTest {
         }
     }
 
+    /**
+     * 验证 {@code roundTripWithFilNullNeighbors} 对应的物理页信封行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void roundTripWithFilNullNeighbors() {
         PageStore store = new FileChannelPageStore();
@@ -58,6 +64,9 @@ class FilePageHeaderTest {
         }
     }
 
+    /**
+     * 验证 {@code constructorRejectsNulls} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void constructorRejectsNulls() {
         assertThrows(DatabaseValidationException.class, () -> new FilePageHeader(

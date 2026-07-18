@@ -37,6 +37,9 @@ class RedoRuntimeHardeningTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code batchRejectsRangeNotMatchingRecordLength} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void batchRejectsRangeNotMatchingRecordLength() {
         PageInitRecord init = new PageInitRecord(P, PageType.INDEX);
@@ -45,6 +48,9 @@ class RedoRuntimeHardeningTest {
         assertThrows(DatabaseValidationException.class, () -> new RedoLogBatch(wrong, List.of(init)));
     }
 
+    /**
+     * 验证 {@code waitFlushedDoesNotOverflowTimeoutWhenTargetAlreadyDurable} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void waitFlushedDoesNotOverflowTimeoutWhenTargetAlreadyDurable() {
         RedoLogManager mgr = new RedoLogManager();
@@ -52,6 +58,9 @@ class RedoRuntimeHardeningTest {
         assertTrue(mgr.waitFlushed(Lsn.of(0), Duration.ofSeconds(Long.MAX_VALUE)));
     }
 
+    /**
+     * 验证 {@code pageBytesOverflowIsReportedAsRedoCorruption} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void pageBytesOverflowIsReportedAsRedoCorruption() {
         PageBytesRecord overflow = new PageBytesRecord(P, Integer.MAX_VALUE, new byte[]{1});
@@ -64,6 +73,11 @@ class RedoRuntimeHardeningTest {
         }
     }
 
+    /**
+     * 验证 {@code repositoryRejectsChecksumValidBlockWithInvalidFramePayload} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void repositoryRejectsChecksumValidBlockWithInvalidFramePayload() throws Exception {
         Path redoPath = dir.resolve("redo.log");

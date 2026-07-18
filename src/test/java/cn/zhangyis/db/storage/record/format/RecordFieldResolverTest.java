@@ -36,6 +36,9 @@ class RecordFieldResolverTest {
                 col(2, "amt", ColumnType.decimal(10, 2, false))));
     }
 
+    /**
+     * 验证 {@code resolvesColumnsWithPresentNullable} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void resolvesColumnsWithPresentNullable() {
         TableSchema s = schema();
@@ -60,6 +63,9 @@ class RecordFieldResolverTest {
         assertEquals(new RecordDecoder(registry).decode(bytes, s), r.materialize());
     }
 
+    /**
+     * 验证 {@code nullColumnHasNoSlice} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void nullColumnHasNoSlice() {
         TableSchema s = schema();

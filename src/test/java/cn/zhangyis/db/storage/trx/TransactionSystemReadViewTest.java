@@ -22,6 +22,9 @@ class TransactionSystemReadViewTest {
         return mgr.begin(new TransactionOptions(IsolationLevel.REPEATABLE_READ, true, true));
     }
 
+    /**
+     * 验证 {@code emptyActiveSetUpEqualsLow} 所描述的值对象语义，并断言相等性、哈希、排序及非法构造边界一致。
+     */
     @Test
     void emptyActiveSetUpEqualsLow() {
         TransactionSystem sys = new TransactionSystem();
@@ -32,6 +35,9 @@ class TransactionSystemReadViewTest {
         assertEquals(1L, v.lowLimitId(), "fresh system nextTransactionId=1");
     }
 
+    /**
+     * 验证 {@code nonEmptyActiveSetBoundaries} 对应的事务、MVCC 与锁行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void nonEmptyActiveSetBoundaries() {
         TransactionSystem sys = new TransactionSystem();
@@ -55,6 +61,9 @@ class TransactionSystemReadViewTest {
         assertEquals(4L, v2.lowLimitId());
     }
 
+    /**
+     * 验证 {@code nonReadOnlyProbeAllocatesCreatorAtomically} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void nonReadOnlyProbeAllocatesCreatorAtomically() {
         TransactionSystem sys = new TransactionSystem();
@@ -67,6 +76,11 @@ class TransactionSystemReadViewTest {
         assertTrue(writer.transactionId().value() < v.lowLimitId());
     }
 
+    /**
+     * 验证 {@code concurrentAllocateCommitAndSnapshotStayConsistent} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     *
+     * @throws InterruptedException 等待被中断时抛出；调用方应恢复中断标志并终止当前资源获取流程
+     */
     @Test
     void concurrentAllocateCommitAndSnapshotStayConsistent() throws InterruptedException {
         TransactionSystem sys = new TransactionSystem();

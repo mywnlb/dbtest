@@ -44,7 +44,12 @@ public record TableSchema(long schemaVersion, List<ColumnDef> columns, boolean c
         return columns.size();
     }
 
-    /** 按 ordinal 取列；越界抛校验异常。 */
+    /** 按 ordinal 取列；越界抛校验异常。
+     *
+     * @param ordinal 参与 {@code column} 的零基位置 {@code ordinal}；必须非负且小于所属页面、集合或持久结构的容量
+     * @return {@code column} 形成的不可变定义、计划或元数据快照；成功时不为 {@code null}，内部身份、版本和范围已完成交叉校验
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public ColumnDef column(int ordinal) {
         if (ordinal < 0 || ordinal >= columns.size()) {
             throw new DatabaseValidationException("column ordinal out of range: " + ordinal);

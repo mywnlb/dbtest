@@ -7,6 +7,14 @@ package cn.zhangyis.db.storage.buf;
 interface FrameReleaser {
 
     /**
+     * 标记一次活跃页写入。默认空实现保持旧测试替身和 lambda 的二元 release 契约兼容。
+     *
+     * @param frame 被当前 PageGuard 修改的 frame。
+     */
+    default void markWritePending(BufferFrame frame) {
+    }
+
+    /**
      * 释放一帧。由 PageGuard.close() 在已释放 page latch 之后调用。
      *
      * @param frame 被释放的帧。

@@ -5,6 +5,7 @@ import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.recovery.RecoveryMode;
+import cn.zhangyis.db.storage.flush.doublewrite.DoublewriteMode;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -29,6 +30,9 @@ class EngineConfigTest {
                 PageNo.of(64), 64, 100, Duration.ofSeconds(5), 64L * 1024 * 1024);
     }
 
+    /**
+     * 验证 {@code fileLayoutUnderBaseDir} 对应的数据库引擎组合根行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void fileLayoutUnderBaseDir() {
         EngineConfig c = valid();
@@ -46,8 +50,14 @@ class EngineConfigTest {
                 "外置 undo 默认上限兼顾宽行教学场景与损坏链的读取边界");
         assertEquals(8, c.undoCachedSegmentsPerKind(), "INSERT/UPDATE 默认各保留八个 cached segment");
         assertEquals(Duration.ofSeconds(5), c.undoHistoryTransitionTimeout());
+        assertEquals(DoublewriteMode.DETECT_AND_RECOVER, c.doublewriteMode());
+        assertEquals(dir.resolve("doublewrite-flush-list.dwb"), c.flushListDoublewriteFile());
+        assertEquals(dir.resolve("doublewrite-lru.dwb"), c.lruDoublewriteFile());
     }
 
+    /**
+     * 验证 {@code historyTransitionTimeoutIsIndependentAndValidated} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void historyTransitionTimeoutIsIndependentAndValidated() {
         EngineConfig original = valid();
@@ -60,6 +70,9 @@ class EngineConfigTest {
                 () -> original.withUndoHistoryTransitionTimeout(null));
     }
 
+    /**
+     * 验证 {@code undoCacheCapacityCanBeDisabledAndMustFitRollbackHeaderPage} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void undoCacheCapacityCanBeDisabledAndMustFitRollbackHeaderPage() {
         EngineConfig config = valid();
@@ -73,6 +86,9 @@ class EngineConfigTest {
                 "slot array 与两个 cache array 的组合布局不能越过 FIL trailer");
     }
 
+    /**
+     * 验证 {@code defaultConfigEnablesRedoRotation} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void defaultConfigEnablesRedoRotation() {
         // 0.18 收口：默认 redo 后端改为有界文件环（不再单 append-only 文件）。
@@ -95,6 +111,9 @@ class EngineConfigTest {
         assertEquals(512, new RedoRotationConfig(2, 512).fileBytes());
     }
 
+    /**
+     * 验证 {@code bufferPoolInstanceCountDefaultsToOneAndIsConfigurable} 对应的数据库引擎组合根行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void bufferPoolInstanceCountDefaultsToOneAndIsConfigurable() {
         EngineConfig c = valid();
@@ -129,6 +148,9 @@ class EngineConfigTest {
                 () -> c.withMaxExternalUndoPayloadPages(0));
     }
 
+    /**
+     * 验证 {@code recoveryModeDefaultsToNormalAndIsConfigurable} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void recoveryModeDefaultsToNormalAndIsConfigurable() {
         EngineConfig c = valid();
@@ -145,6 +167,21 @@ class EngineConfigTest {
                 "recovery mode 必须显式非空，避免启动时落入未定义恢复语义");
     }
 
+    /**
+     * 验证 {@code doublewriteModeIsImmutableAndConfigurable} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
+    @Test
+    void doublewriteModeIsImmutableAndConfigurable() {
+        EngineConfig c = valid();
+        EngineConfig detectOnly = c.withDoublewriteMode(DoublewriteMode.DETECT_ONLY);
+        assertEquals(DoublewriteMode.DETECT_ONLY, detectOnly.doublewriteMode());
+        assertEquals(DoublewriteMode.DETECT_AND_RECOVER, c.doublewriteMode());
+        assertThrows(DatabaseValidationException.class, () -> c.withDoublewriteMode(null));
+    }
+
+    /**
+     * 验证 {@code forceSkippedSpacesAreSnapshottedAndCanEnableForceSkipMode} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void forceSkippedSpacesAreSnapshottedAndCanEnableForceSkipMode() {
         EngineConfig c = valid();
@@ -162,6 +199,9 @@ class EngineConfigTest {
                 new java.util.HashSet<>(java.util.Arrays.asList(SpaceId.of(10), null))));
     }
 
+    /**
+     * 验证 {@code recoveryTablespacesAreValidatedAndSnapshotted} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void recoveryTablespacesAreValidatedAndSnapshotted() {
         Path path = dir.resolve("data.ibd");
@@ -182,6 +222,9 @@ class EngineConfigTest {
                 List.of(tablespace, new EngineTablespaceConfig(SpaceId.of(10), dir.resolve("same.ibd")))));
     }
 
+    /**
+     * 验证 {@code backgroundFlushSettingsAreValidatedAndSnapshotted} 所描述的刷脏与持久化协作，并断言 redo durable 边界先覆盖 page LSN、失败后仍保留脏状态。
+     */
     @Test
     void backgroundFlushSettingsAreValidatedAndSnapshotted() {
         EngineConfig c = new EngineConfig(dir, PageSize.ofBytes(16 * 1024), 256, SpaceId.of(5),
@@ -214,6 +257,9 @@ class EngineConfigTest {
                 List.of(), true, 4, Duration.ofMillis(25), 1, null));
     }
 
+    /**
+     * 验证 {@code rejectsNullAndNonPositiveFields} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void rejectsNullAndNonPositiveFields() {
         assertThrows(DatabaseValidationException.class, () -> new EngineConfig(null, PageSize.ofBytes(16 * 1024),

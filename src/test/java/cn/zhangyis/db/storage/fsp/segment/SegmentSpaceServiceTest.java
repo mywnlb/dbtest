@@ -77,6 +77,9 @@ class SegmentSpaceServiceTest {
         }
     }
 
+    /**
+     * 验证 {@code allocateFragmentPageRecordsInInodeAndCounts} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void allocateFragmentPageRecordsInInodeAndCounts() {
         withCtx(128, (header, xdes, inode, flst, free, seg, mgr) -> {
@@ -93,6 +96,9 @@ class SegmentSpaceServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code assignExtentSetsFsegOwnerAndSegFreeList} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void assignExtentSetsFsegOwnerAndSegFreeList() {
         withCtx(128, (header, xdes, inode, flst, free, seg, mgr) -> {
@@ -110,6 +116,9 @@ class SegmentSpaceServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code allocatePageFromSegmentExtentMovesFreeToNotFullThenFull} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void allocatePageFromSegmentExtentMovesFreeToNotFullThenFull() {
         withCtx(128, (header, xdes, inode, flst, free, seg, mgr) -> {
@@ -134,6 +143,9 @@ class SegmentSpaceServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code freeFragmentPageClearsSlotAndRecyclesExtentWhenEmpty} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void freeFragmentPageClearsSlotAndRecyclesExtentWhenEmpty() {
         withCtx(128, (header, xdes, inode, flst, free, seg, mgr) -> {
@@ -154,6 +166,9 @@ class SegmentSpaceServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code freeFragmentPageMovesFullFragBackToFreeFrag} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void freeFragmentPageMovesFullFragBackToFreeFrag() {
         withCtx(128, (header, xdes, inode, flst, free, seg, mgr) -> {
@@ -180,6 +195,9 @@ class SegmentSpaceServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code freeSegmentExtentPageMovesFullToNotFullAndRecyclesWhenEmpty} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void freeSegmentExtentPageMovesFullToNotFullAndRecyclesWhenEmpty() {
         withCtx(128, (header, xdes, inode, flst, free, seg, mgr) -> {
@@ -208,6 +226,9 @@ class SegmentSpaceServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code freeRejectsSystemAndUnallocatedPages} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void freeRejectsSystemAndUnallocatedPages() {
         withCtx(128, (header, xdes, inode, flst, free, seg, mgr) -> {

@@ -32,6 +32,9 @@ class UndoMetadataRedoTest {
     /** undo first-page v3 中 logical pair 起点；history links 紧随其后。 */
     private static final int LOGICAL_HEAD_OFFSET = 105;
 
+    /**
+     * 验证 {@code undoMetadataDeltaRoundTripsThroughRedoFrameCodec} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void undoMetadataDeltaRoundTripsThroughRedoFrameCodec() {
         UndoMetadataDeltaRecord delta = new UndoMetadataDeltaRecord(RSEG_PAGE,
@@ -48,6 +51,9 @@ class UndoMetadataRedoTest {
         assertEquals(1 + 12 + 1 + 8 + 4 + 4 + 4 + Long.BYTES, delta.byteLength());
     }
 
+    /**
+     * 验证 {@code persistentHistoryRedoKindCodesAreAppendOnlyAndRoundTrip} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void persistentHistoryRedoKindCodesAreAppendOnlyAndRoundTrip() {
         assertEquals(8, UndoMetadataDeltaKind.RSEG_HISTORY_BASE.code());
@@ -66,6 +72,9 @@ class UndoMetadataRedoTest {
                 () -> UndoMetadataDeltaKind.fromCode((byte) 12));
     }
 
+    /**
+     * 验证 {@code undoMetadataDeltaReplaysWithoutPageBytesAndStampsBatchEndLsn} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void undoMetadataDeltaReplaysWithoutPageBytesAndStampsBatchEndLsn() {
         RecordingPageStore store = new RecordingPageStore();
@@ -85,6 +94,9 @@ class UndoMetadataRedoTest {
         assertEquals(1, store.writeCount);
     }
 
+    /**
+     * 验证 {@code historyBaseDeltaReplayIsIdempotentByPageLsn} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void historyBaseDeltaReplayIsIdempotentByPageLsn() {
         RecordingPageStore store = new RecordingPageStore();

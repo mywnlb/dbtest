@@ -37,6 +37,9 @@ class RedoDurabilityPolicyTest {
         return redo.append(List.of(new PageBytesRecord(P, 200, new byte[]{1, 2, 3})));
     }
 
+    /**
+     * 验证 {@code flushOnCommitMakesCommitLsnDurable} 所描述的刷脏与持久化协作，并断言 redo durable 边界先覆盖 page LSN、失败后仍保留脏状态。
+     */
     @Test
     void flushOnCommitMakesCommitLsnDurable() {
         RedoLogManager redo = durable("flush.log");
@@ -46,6 +49,9 @@ class RedoDurabilityPolicyTest {
         assertTrue(redo.flushedToDiskLsn().value() >= commitLsn.value(), "FLUSH_ON_COMMIT 等到 fsync durable");
     }
 
+    /**
+     * 验证 {@code writeOnCommitAdvancesWrittenButNotFlushed} 所描述的刷脏与持久化协作，并断言 redo durable 边界先覆盖 page LSN、失败后仍保留脏状态。
+     */
     @Test
     void writeOnCommitAdvancesWrittenButNotFlushed() {
         RedoLogManager redo = durable("write.log");
@@ -56,6 +62,9 @@ class RedoDurabilityPolicyTest {
         assertEquals(Lsn.of(0), redo.flushedToDiskLsn(), "WRITE_ON_COMMIT 不 fsync，flushedLsn 不前进");
     }
 
+    /**
+     * 验证 {@code backgroundFlushDoesNotWaitOnCommit} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void backgroundFlushDoesNotWaitOnCommit() {
         RedoLogManager redo = durable("bg.log");
@@ -70,6 +79,9 @@ class RedoDurabilityPolicyTest {
         assertTrue(redo.flushedToDiskLsn().value() >= commitLsn.value());
     }
 
+    /**
+     * 验证 {@code waitWrittenReturnsWhenWritten} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void waitWrittenReturnsWhenWritten() {
         RedoLogManager redo = durable("ww.log");
@@ -78,6 +90,9 @@ class RedoDurabilityPolicyTest {
         assertTrue(redo.waitWritten(commitLsn, Duration.ofMillis(100)));
     }
 
+    /**
+     * 验证 {@code waitWrittenTimesOutWhenNoWriter} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void waitWrittenTimesOutWhenNoWriter() {
         RedoLogManager redo = durable("ww-timeout.log");
@@ -87,6 +102,9 @@ class RedoDurabilityPolicyTest {
         assertEquals(Lsn.of(0), redo.writtenToDiskLsn());
     }
 
+    /**
+     * 验证 {@code writtenToDiskLsnMonotonicAcrossWriteThenFlush} 所描述的刷脏与持久化协作，并断言 redo durable 边界先覆盖 page LSN、失败后仍保留脏状态。
+     */
     @Test
     void writtenToDiskLsnMonotonicAcrossWriteThenFlush() {
         RedoLogManager redo = durable("mono.log");

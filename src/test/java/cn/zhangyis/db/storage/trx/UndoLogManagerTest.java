@@ -182,6 +182,9 @@ class UndoLogManagerTest {
         });
     }
 
+    /**
+     * 验证 {@code firstWriteBuildsSegmentClaimsSlotReturnsInsertRollPointer} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void firstWriteBuildsSegmentClaimsSlotReturnsInsertRollPointer() {
         onPool(h -> {
@@ -408,6 +411,9 @@ class UndoLogManagerTest {
         });
     }
 
+    /**
+     * 验证 {@code multipleInsertsIncrementUndoNoAndChainPrevRollPointer} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void multipleInsertsIncrementUndoNoAndChainPrevRollPointer() {
         onPool(h -> {
@@ -448,6 +454,9 @@ class UndoLogManagerTest {
         });
     }
 
+    /**
+     * 验证 {@code reloadReadsUndoRecordByRollPointerEqualToOriginalClusterKey} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void reloadReadsUndoRecordByRollPointerEqualToOriginalClusterKey() {
         Path path = dir.resolve("undo.ibu");
@@ -510,6 +519,9 @@ class UndoLogManagerTest {
         }
     }
 
+    /**
+     * 验证 {@code rejectsNoneTransactionId} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void rejectsNoneTransactionId() {
         onPool(h -> {
@@ -522,6 +534,9 @@ class UndoLogManagerTest {
         });
     }
 
+    /**
+     * 验证 {@code rejectsNonActiveTransaction} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void rejectsNonActiveTransaction() {
         onPool(h -> {
@@ -536,6 +551,9 @@ class UndoLogManagerTest {
         });
     }
 
+    /**
+     * 验证 {@code rejectsNullArgs} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void rejectsNullArgs() {
         onPool(h -> {
@@ -554,6 +572,9 @@ class UndoLogManagerTest {
 
     // ---- T1.3d：commit 回收 insert undo slot（对齐 trx_undo_insert_cleanup） ----
 
+    /**
+     * 验证 {@code onCommitReleasesSlotForReclaim} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void onCommitReleasesSlotForReclaim() {
         onPool(h -> {
@@ -683,6 +704,9 @@ class UndoLogManagerTest {
         });
     }
 
+    /**
+     * 验证 {@code onCommitWithoutWriteIsNoOp} 所描述的边界场景保持既有领域不变量，不产生方法名明确禁止的副作用。
+     */
     @Test
     void onCommitWithoutWriteIsNoOp() {
         onPool(h -> {
@@ -696,6 +720,9 @@ class UndoLogManagerTest {
 
     // ---- T1.3e：planUpdate/appendPlanned（UPDATE undo 写）+ onCommit 含 update 不回收 slot ----
 
+    /**
+     * 验证 {@code plannedUpdateWritesUpdateUndoChainsAndCarriesOldImage} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void plannedUpdateWritesUpdateUndoChainsAndCarriesOldImage() {
         onPool(h -> {
@@ -730,6 +757,9 @@ class UndoLogManagerTest {
         });
     }
 
+    /**
+     * 验证 {@code plannedDeleteWritesDeleteMarkUndoChainsAndKeepsSlotOnCommit} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void plannedDeleteWritesDeleteMarkUndoChainsAndKeepsSlotOnCommit() {
         onPool(h -> {
@@ -766,6 +796,9 @@ class UndoLogManagerTest {
         });
     }
 
+    /**
+     * 验证 {@code onCommitKeepsSlotWhenUpdateUndoPresent} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void onCommitKeepsSlotWhenUpdateUndoPresent() {
         onPool(h -> {
@@ -885,6 +918,9 @@ class UndoLogManagerTest {
         });
     }
 
+    /**
+     * 验证 {@code onCommitWritesTransactionStateRedoInCommitMtr} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void onCommitWritesTransactionStateRedoInCommitMtr() {
         onPool(h -> {
@@ -909,6 +945,9 @@ class UndoLogManagerTest {
         });
     }
 
+    /**
+     * 验证 {@code mixedInsertAndExternalUpdateSegmentReopenReadsBothByRollPointer} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void mixedInsertAndExternalUpdateSegmentReopenReadsBothByRollPointer() {
         Path path = dir.resolve("undo.ibu");
@@ -976,6 +1015,9 @@ class UndoLogManagerTest {
         }
     }
 
+    /**
+     * 验证 {@code plannedUpdateOversizedOldImageUsesExternalUndoPayload} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void plannedUpdateOversizedOldImageUsesExternalUndoPayload() {
         onPool(h -> {
@@ -1170,6 +1212,9 @@ class UndoLogManagerTest {
         });
     }
 
+    /**
+     * 验证 {@code secondUndoKindFailsSafelyWhenSingleSlotIsAlreadyOwned} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void secondUndoKindFailsSafelyWhenSingleSlotIsAlreadyOwned() {
         PageStore store = new FileChannelPageStore();

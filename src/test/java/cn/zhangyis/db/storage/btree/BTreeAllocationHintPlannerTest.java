@@ -35,6 +35,9 @@ class BTreeAllocationHintPlannerTest {
     private final SearchKeyComparator comparator = new SearchKeyComparator(registry);
     private final BTreeIndex index = new BTreeIndex(INDEX_ID, LEAF, 0, keyDef(), schema(), true);
 
+    /**
+     * 验证 {@code rightEdgeInsertWithoutRightSiblingProducesUpHint} 所描述的边界场景保持既有领域不变量，不产生方法名明确禁止的副作用。
+     */
     @Test
     void rightEdgeInsertWithoutRightSiblingProducesUpHint() {
         PageAllocationHint hint = BTreeAllocationHintPlanner.leafSplitHint(
@@ -45,6 +48,9 @@ class BTreeAllocationHintPlannerTest {
         assertEquals(3L, hint.pagesNeeded());
     }
 
+    /**
+     * 验证 {@code leftEdgeInsertWithoutLeftSiblingProducesDownHint} 所描述的边界场景保持既有领域不变量，不产生方法名明确禁止的副作用。
+     */
     @Test
     void leftEdgeInsertWithoutLeftSiblingProducesDownHint() {
         PageAllocationHint hint = BTreeAllocationHintPlanner.leafSplitHint(
@@ -55,6 +61,9 @@ class BTreeAllocationHintPlannerTest {
         assertEquals(2L, hint.pagesNeeded());
     }
 
+    /**
+     * 验证 {@code middleInsertOrExistingSiblingKeepsNoDirection} 所描述的返回值或状态会按契约保留，并断言原始信息与领域不变量未丢失。
+     */
     @Test
     void middleInsertOrExistingSiblingKeepsNoDirection() {
         assertTrue(BTreeAllocationHintPlanner.leafSplitHint(

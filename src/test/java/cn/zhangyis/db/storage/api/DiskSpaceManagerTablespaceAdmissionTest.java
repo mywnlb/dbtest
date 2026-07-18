@@ -41,6 +41,9 @@ class DiskSpaceManagerTablespaceAdmissionTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code createUndoTablespaceRegistersActiveAndAllowsSpaceManagement} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void createUndoTablespaceRegistersActiveAndAllowsSpaceManagement() {
         onPool((mgr, disk, store) -> {
@@ -58,6 +61,9 @@ class DiskSpaceManagerTablespaceAdmissionTest {
         });
     }
 
+    /**
+     * 验证 {@code defaultCreateTablespaceUsesGeneralType} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void defaultCreateTablespaceUsesGeneralType() {
         onPool((mgr, disk, store) -> {
@@ -70,6 +76,9 @@ class DiskSpaceManagerTablespaceAdmissionTest {
         });
     }
 
+    /**
+     * 验证 {@code openTablespaceForRecoveryReopensNormalFromDisk} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void openTablespaceForRecoveryReopensNormalFromDisk() {
         Path path = dir.resolve("rec.ibu");
@@ -93,6 +102,9 @@ class DiskSpaceManagerTablespaceAdmissionTest {
         }
     }
 
+    /**
+     * 验证 {@code markCorruptedBlocksCreateSegment} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void markCorruptedBlocksCreateSegment() {
         onPool((mgr, disk, store) -> {
@@ -111,6 +123,9 @@ class DiskSpaceManagerTablespaceAdmissionTest {
         });
     }
 
+    /**
+     * 验证 {@code markInactiveBlocksAllocatePage} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void markInactiveBlocksAllocatePage() {
         onPool((mgr, disk, store) -> {
@@ -128,6 +143,9 @@ class DiskSpaceManagerTablespaceAdmissionTest {
         });
     }
 
+    /**
+     * 验证 {@code discardBlocksUsage} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void discardBlocksUsage() {
         onPool((mgr, disk, store) -> {
@@ -144,6 +162,9 @@ class DiskSpaceManagerTablespaceAdmissionTest {
         });
     }
 
+    /**
+     * 验证 {@code reopenViaDirectStoreOpenLazyLoadsViaLoader} 对应的存储引擎稳定 API行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void reopenViaDirectStoreOpenLazyLoadsViaLoader() {
         Path path = dir.resolve("re.ibu");

@@ -48,22 +48,41 @@ public record IndexPageHeader(int nDirSlots, int heapTop, int nHeap, int free, i
         }
     }
 
-    /** 写全部字段到页 header 区（要求 X）。 */
+    /** 写全部字段到页 header 区（要求 X）。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验表空间生命周期、页号、区段身份与容量边界，非法或损坏元数据在分配/IO 前拒绝。</li>
+     *     <li>按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，避免锁序反转。</li>
+     *     <li>执行空间元数据或物理文件变化，并把需要的 allocation intent、redo、dirty 或 force 副作用交给既有下游。</li>
+     *     <li>发布稳定结果并逆序释放 lease、latch 与 fix；失败保留可由恢复流程识别的权威状态。</li>
+     * </ol>
+     *
+     * @param guard 调用方持有的 {@code PageGuard} 资源句柄；不得为 {@code null} 且必须处于有效期，方法返回前所有权仍归调用方
+     */
     public void writeTo(PageGuard guard) {
+        // 1、校验表空间生命周期、页号、区段身份与容量边界，在共享或持久副作用前拒绝非法状态。
         PageU16.put(guard, IndexPageHeaderLayout.N_DIR_SLOTS, nDirSlots);
         PageU16.put(guard, IndexPageHeaderLayout.HEAP_TOP, heapTop);
         PageU16.put(guard, IndexPageHeaderLayout.N_HEAP, nHeap);
+        // 2、继续完成范围、身份与候选校验；通过后，按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，保持处理顺序与资源边界。
         PageU16.put(guard, IndexPageHeaderLayout.FREE, free);
         PageU16.put(guard, IndexPageHeaderLayout.GARBAGE, garbage);
         PageU16.put(guard, IndexPageHeaderLayout.LAST_INSERT, lastInsert);
+        // 3、在中间分支复核阶段性结果；满足条件后，执行空间元数据或物理文件变化，并维持领域不变量。
         PageU16.put(guard, IndexPageHeaderLayout.DIRECTION, direction.code());
         PageU16.put(guard, IndexPageHeaderLayout.N_DIRECTION, nDirection);
         PageU16.put(guard, IndexPageHeaderLayout.N_RECS, nRecs);
         PageU16.put(guard, IndexPageHeaderLayout.LEVEL, level);
+        // 4、发布稳定结果并逆序释放 lease、latch 与 fix，以稳定返回或领域异常完成收口。
         guard.writeLong(IndexPageHeaderLayout.INDEX_ID, indexId);
     }
 
-    /** 从页 header 区读全部字段（S/X 均可）。 */
+    /** 从页 header 区读全部字段（S/X 均可）。
+     *
+     * @param guard 调用方持有的 {@code PageGuard} 资源句柄；不得为 {@code null} 且必须处于有效期，方法返回前所有权仍归调用方
+     * @return {@code readFrom} 编码、解码或重建的记录数据；成功时不为 {@code null}，字段顺序、隐藏列和字节边界满足当前 schema
+     */
     public static IndexPageHeader readFrom(PageGuard guard) {
         return new IndexPageHeader(
                 PageU16.get(guard, IndexPageHeaderLayout.N_DIR_SLOTS),
@@ -79,19 +98,28 @@ public record IndexPageHeader(int nDirSlots, int heapTop, int nHeap, int free, i
                 guard.readLong(IndexPageHeaderLayout.INDEX_ID));
     }
 
-    /** 返回仅 {@code free}（GarbageList 头）不同的副本（其余字段不变）。供 HeapSpaceManager 做 header RMW。 */
+    /** 返回仅 {@code free}（GarbageList 头）不同的副本（其余字段不变）。供 HeapSpaceManager 做 header RMW。
+     * @param newFree 写入页内记录链或空闲链的偏移 {@code newFree}；必须是当前页面中的合法记录边界，哨兵值只按页格式约定解释
+     * @return {@code withFree} 编码、解码或重建的记录数据；成功时不为 {@code null}，字段顺序、隐藏列和字节边界满足当前 schema
+     */
     public IndexPageHeader withFree(int newFree) {
         return new IndexPageHeader(nDirSlots, heapTop, nHeap, newFree, garbage, lastInsert, direction,
                 nDirection, nRecs, level, indexId);
     }
 
-    /** 返回仅 {@code garbage}（已跟踪垃圾字节数）不同的副本。 */
+    /** 返回仅 {@code garbage}（已跟踪垃圾字节数）不同的副本。
+     * @param newGarbage 待写入页头或目录的记录计数 {@code newGarbage}；必须非负并满足当前页容量及 page-directory 分组上界
+     * @return {@code withGarbage} 编码、解码或重建的记录数据；成功时不为 {@code null}，字段顺序、隐藏列和字节边界满足当前 schema
+     */
     public IndexPageHeader withGarbage(int newGarbage) {
         return new IndexPageHeader(nDirSlots, heapTop, nHeap, free, newGarbage, lastInsert, direction,
                 nDirection, nRecs, level, indexId);
     }
 
-    /** 返回仅 {@code nRecs}（用户记录数，含 delete-marked）不同的副本。供 purge/reorganize 维护计数。 */
+    /** 返回仅 {@code nRecs}（用户记录数，含 delete-marked）不同的副本。供 purge/reorganize 维护计数。
+     * @param newNRecs 待写入页头或目录的记录计数 {@code newNRecs}；必须非负并满足当前页容量及 page-directory 分组上界
+     * @return {@code withNRecs} 编码、解码或重建的记录数据；成功时不为 {@code null}，字段顺序、隐藏列和字节边界满足当前 schema
+     */
     public IndexPageHeader withNRecs(int newNRecs) {
         return new IndexPageHeader(nDirSlots, heapTop, nHeap, free, garbage, lastInsert, direction,
                 nDirection, newNRecs, level, indexId);

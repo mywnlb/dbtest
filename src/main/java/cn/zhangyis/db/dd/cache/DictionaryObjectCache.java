@@ -57,6 +57,12 @@ public final class DictionaryObjectCache {
     /** 只在 lock 内递增，用于近似 LRU。 */
     private long accessClock;
 
+    /**
+     * 创建 {@code DictionaryObjectCache}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param capacity 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public DictionaryObjectCache(int capacity) {
         if (capacity <= 0) {
             throw new DatabaseValidationException("dictionary cache capacity must be positive");
@@ -67,6 +73,12 @@ public final class DictionaryObjectCache {
     /**
      * pin 最新 table 版本。leader 在锁外 load，followers 对同一 future 做有界等待；load 成功后所有线程回到
      * lock 内重新 pin current，避免 publish/invalidate 竞态下返回已不再 current 的裸对象。
+     *
+     * @param tableId 目标表的稳定字典标识；不得为 {@code null}，且必须与当前元数据和物理绑定一致
+     * @param timeout 本次等待或操作的最大时长；不得为 {@code null} 且必须为正，超时不得留下未释放资源
+     * @param loader 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @return {@code pinTable} 形成的不可变定义、计划或元数据快照；成功时不为 {@code null}，内部身份、版本和范围已完成交叉校验
+     * @throws DictionaryObjectNotFoundException 按稳定身份无法定位所需领域对象时抛出；调用方应刷新元数据或终止当前操作
      */
     public DictionaryPin<TableDefinition> pinTable(TableId tableId, Duration timeout,
                                                     DictionaryLoader<TableDefinition> loader) {
@@ -104,7 +116,11 @@ public final class DictionaryObjectCache {
         }
     }
 
-    /** 发布新 current version；旧 current 只被标 stale，pin owner 仍可安全读完。 */
+    /** 发布新 current version；旧 current 只被标 stale，pin owner 仍可安全读完。
+     *
+     * @param table 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public void publishTable(TableDefinition table) {
         if (table == null) {
             throw new DatabaseValidationException("published table definition must not be null");
@@ -120,6 +136,11 @@ public final class DictionaryObjectCache {
     /**
      * 建立 DROP 本地准入屏障：移除 current 并把所有版本标 stale；已有 pin 仍持不可变对象直到 close。
      * 屏障可早于 catalog publish 建立，因为提交结果不确定时宁可要求重启裁决，也不能重载旧 ACTIVE 快照。
+     *
+     * @param tableId 目标表的稳定字典标识；不得为 {@code null}，且必须与当前元数据和物理绑定一致
+     * @param dropVersion 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws DictionaryVersionConflictException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
      */
     public void invalidateTable(TableId tableId, DictionaryVersion dropVersion) {
         if (tableId == null || dropVersion == null) {
@@ -150,7 +171,13 @@ public final class DictionaryObjectCache {
         }
     }
 
-    /** DROP 在持有 MDL X 后有界等待所有历史 pin 释放；timeout 返回 false，不吞掉资源泄漏。 */
+    /** DROP 在持有 MDL X 后有界等待所有历史 pin 释放；timeout 返回 false，不吞掉资源泄漏。
+     *
+     * @param tableId 目标表的稳定字典标识；不得为 {@code null}，且必须与当前元数据和物理绑定一致
+     * @param timeout 本次等待或操作的最大时长；不得为 {@code null} 或负值，零表示只做一次立即检查而不阻塞
+     * @return 在超时或取消前观察到 {@code awaitUnpinned} 的目标状态时为 {@code true}；等待期限届满且状态仍未满足时为 {@code false}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public boolean awaitUnpinned(TableId tableId, Duration timeout) {
         if (tableId == null || timeout == null || timeout.isZero() || timeout.isNegative()) {
             throw new DatabaseValidationException("await-unpinned table/positive timeout required");
@@ -175,6 +202,11 @@ public final class DictionaryObjectCache {
         }
     }
 
+    /**
+     * 采集 {@code snapshot} 对应的数据字典稳定快照；返回对象与后续内部修改隔离，不转移内部可变状态的所有权。
+     *
+     * @return {@code snapshot} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     */
     public DictionaryCacheSnapshot snapshot() {
         lock.lock();
         try {
@@ -187,10 +219,29 @@ public final class DictionaryObjectCache {
         }
     }
 
+    /**
+     * 推进 {@code completeLoad} 对应的数据字典阶段转换；成功只发布一次目标状态，失败路径保留可取消或可诊断的原状态。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验语法/命令、会话状态与元数据身份，构造统一 deadline，纯输入错误在事务或持久副作用前失败。</li>
+     *     <li>按 session、transaction、MDL 与 metadata scope 顺序取得受控资源，并在等待后复核版本与状态。</li>
+     *     <li>调用 binder、executor、字典或 storage 稳定接口完成领域动作，成功后才发布缓存、事务或结果状态。</li>
+     *     <li>关闭 scope 并返回不可变结果；异常保留 cause/suppressed 图，按 autocommit 或显式事务边界回滚。</li>
+     * </ol>
+     *
+     * @param tableId 目标表的稳定字典标识；不得为 {@code null}，且必须与当前元数据和物理绑定一致
+     * @param loader 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @param future 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @throws DictionaryCacheLoadException 字典对象装载失败、版本不匹配或并发装载异常完成时抛出；调用方应释放 pin，保留 cause，并按新版本重试
+     */
     private void completeLoad(TableId tableId, DictionaryLoader<TableDefinition> loader,
                               CompletableFuture<TableDefinition> future) {
+        // 1、校验语法/命令、会话状态与元数据身份，在共享或持久副作用前拒绝非法状态。
         TableDefinition loaded = null;
+        // 2、继续完成范围、身份与候选校验；通过后，按 session、transaction、MDL 与 metadata scope 顺序取得受控资源，保持处理顺序与资源边界。
         Throwable failure = null;
+        // 3、在中间分支复核阶段性结果；满足条件后，调用 binder、executor、字典或 storage 稳定接口完成领域动作，并维持领域不变量。
         try {
             loaded = loader.load().orElseThrow(() -> new DictionaryObjectNotFoundException(
                     "dictionary table not found: " + tableId.value()));
@@ -215,6 +266,7 @@ public final class DictionaryObjectCache {
             }
         }
         // complete 可能同步执行 dependent action，必须放在 cache lock 外。
+        // 4、关闭 scope 并返回不可变结果，以稳定返回或领域异常完成收口。
         if (failure == null) {
             future.complete(loaded);
         } else {
@@ -225,6 +277,14 @@ public final class DictionaryObjectCache {
         }
     }
 
+    /**
+     * 按数据字典并发协议获取或等待资源；等待必须有界，失败路径保持锁顺序并释放已取得资源。
+     *
+     * @param tableId 目标表的稳定字典标识；不得为 {@code null}，且必须与当前元数据和物理绑定一致
+     * @param future 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @param remainingNanos 参与 {@code awaitLoad} 的时间量 {@code remainingNanos}；必须非负，零表示立即检查或尚未累计等待
+     * @throws DictionaryCacheLoadException 字典对象装载失败、版本不匹配或并发装载异常完成时抛出；调用方应释放 pin，保留 cause，并按新版本重试
+     */
     private void awaitLoad(TableId tableId, CompletableFuture<TableDefinition> future, long remainingNanos) {
         if (remainingNanos <= 0) {
             throw new DictionaryCacheLoadException("dictionary cache load timeout: " + tableId.value());
@@ -248,7 +308,23 @@ public final class DictionaryObjectCache {
         }
     }
 
+    /**
+     * 按数据字典并发协议获取或等待资源；等待必须有界，失败路径保持锁顺序并释放已取得资源。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 owner、目标资源、锁模式与等待时限；非法请求在进入队列或建立等待边前拒绝。</li>
+     *     <li>按分片与队列锁顺序定位请求，在显式锁内重新检查兼容性，并用有界条件等待处理竞争。</li>
+     *     <li>授予、转换或释放锁所有权，同时维护等待队列、Wait-For Graph 与可观测状态的一致视图。</li>
+     *     <li>唤醒后再次验证结果并释放内部短锁；超时、中断或 victim 路径不得遗留锁请求或等待边。</li>
+     * </ol>
+     *
+     * @param table 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @throws DictionaryObjectNotFoundException 按稳定身份无法定位所需领域对象时抛出；调用方应刷新元数据或终止当前操作
+     * @throws DictionaryVersionConflictException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
+     */
     private void publishUnderLock(TableDefinition table) {
+        // 1、校验 owner、目标资源、锁模式与等待时限，在共享或持久副作用前拒绝非法状态。
         DictionaryVersion barrier = invalidatedAt.get(table.id());
         if (barrier != null) {
             if (table.version().compareTo(barrier) <= 0) {
@@ -258,6 +334,7 @@ public final class DictionaryObjectCache {
             }
         }
         Entry previous = current.get(table.id());
+        // 2、继续完成范围、身份与候选校验；通过后，按分片与队列锁顺序定位请求，保持处理顺序与资源边界。
         if (previous != null) {
             int comparison = table.version().compareTo(previous.value.version());
             if (comparison < 0) {
@@ -276,11 +353,13 @@ public final class DictionaryObjectCache {
         Entry entry = new Entry(table, ++accessClock);
         versions.computeIfAbsent(table.id(), ignored -> new TreeMap<>())
                 .put(table.version().value(), entry);
+        // 3、在中间分支复核阶段性结果；满足条件后，授予、转换或释放锁所有权，并维持领域不变量。
         current.put(table.id(), entry);
         invalidatedAt.remove(table.id());
         if (previous != null && previous.pinCount == 0) {
             removeEntry(table.id(), previous);
         }
+        // 4、唤醒后再次验证结果并释放内部短锁，以稳定返回或领域异常完成收口。
         evictToCapacity(entry);
     }
 
@@ -291,6 +370,12 @@ public final class DictionaryObjectCache {
                 () -> release(entry));
     }
 
+    /**
+     * 释放本方法拥有的数据字典资源；遵守既定释放顺序，重复或失败调用不得掩盖原始状态。
+     *
+     * @param entry 当前 cache 或 pin 所持有的已装载条目；不得为 {@code null}，引用计数和所有权必须归属当前 cache key
+     * @throws DictionaryCacheLoadException 字典对象装载失败、版本不匹配或并发装载异常完成时抛出；调用方应释放 pin，保留 cause，并按新版本重试
+     */
     private void release(Entry entry) {
         lock.lock();
         try {
@@ -321,6 +406,12 @@ public final class DictionaryObjectCache {
         }
     }
 
+    /**
+     * 更新 {@code removeReleasedStale} 指定的数据字典局部状态；写入前校验身份和范围，成功后由所属对象维护一致性。
+     *
+     * @param tableId 目标表的稳定字典标识；不得为 {@code null}，且必须与当前元数据和物理绑定一致
+     * @param tableVersions 参与 {@code removeReleasedStale} 的键值映射；不得为 {@code null}，空映射表示没有条目，键和值均不得包含 Java {@code null}
+     */
     private void removeReleasedStale(TableId tableId, NavigableMap<Long, Entry> tableVersions) {
         List<Entry> released = new ArrayList<>();
         for (Entry entry : tableVersions.values()) {
@@ -376,9 +467,21 @@ public final class DictionaryObjectCache {
 
     /** Entry 可变字段全部由 cache lock 保护；stale 额外 volatile 供 pin 的只读诊断。 */
     private static final class Entry {
+        /**
+         * 构造时冻结的 {@code value} 领域快照；其身份、版本与范围来自同一次权威读取，下游步骤依赖它检测并发变化和避免发布陈旧状态。
+         */
         private final TableDefinition value;
+        /**
+         * 记录 {@code pinCount} 的非负位置、容量或计数；写入前必须校验所属页/集合上界，溢出会破坏布局或资源记账。
+         */
         private int pinCount;
+        /**
+         * 跨线程发布的权威状态或计数；更新只允许通过本类定义的原子状态转换完成。
+         */
         private volatile boolean stale;
+        /**
+         * 记录 {@code lastAccess} 的权威数值状态；仅由本类受控路径更新，取值范围和特殊值遵循所属格式或状态机，溢出必须拒绝。
+         */
         private long lastAccess;
 
         private Entry(TableDefinition value, long lastAccess) {

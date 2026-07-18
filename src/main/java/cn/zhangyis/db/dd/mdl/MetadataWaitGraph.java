@@ -16,9 +16,21 @@ import java.util.concurrent.locks.ReentrantLock;
  */
 final class MetadataWaitGraph {
 
+    /**
+     * 保护本对象共享状态的显式并发闩；获取后必须在 {@code finally} 或 Guard 关闭路径释放。
+     */
     private final ReentrantLock lock = new ReentrantLock();
+    /**
+     * 本对象拥有的 {@code edges} 受控集合；元素生命周期与外层对象一致，仅由本类方法更新，对外暴露时必须返回副本或不可变视图。
+     */
     private final Map<MdlOwnerId, Set<MdlOwnerId>> edges = new HashMap<>();
 
+    /**
+     * 在 graph lock 内原子替换 waiter 的全部出边；空 blocker 集合删除该 waiter，非空集合以不可变副本发布。
+     *
+     * @param waiter 参与 {@code replace} 的稳定领域标识 {@code MdlOwnerId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param blockers 参与 {@code replace} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     */
     void replace(MdlOwnerId waiter, Set<MdlOwnerId> blockers) {
         lock.lock();
         try {
@@ -32,7 +44,10 @@ final class MetadataWaitGraph {
         }
     }
 
-    /** 请求离开等待态时只删 outgoing edges；owner 可能仍持 grant，不能误删其它 waiter 的 incoming edge。 */
+    /** 请求离开等待态时只删 outgoing edges；owner 可能仍持 grant，不能误删其它 waiter 的 incoming edge。
+     *
+     * @param owner 参与 {@code removeWaiter} 的稳定领域标识 {@code MdlOwnerId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     */
     void removeWaiter(MdlOwnerId owner) {
         lock.lock();
         try {
@@ -42,7 +57,10 @@ final class MetadataWaitGraph {
         }
     }
 
-    /** owner 的全部 granted/waiting 均已结束时，清理 outgoing 与 incoming edges。 */
+    /** owner 的全部 granted/waiting 均已结束时，清理 outgoing 与 incoming edges。
+     *
+     * @param owner 参与 {@code removeOwner} 的稳定领域标识 {@code MdlOwnerId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     */
     void removeOwner(MdlOwnerId owner) {
         lock.lock();
         try {
@@ -58,6 +76,13 @@ final class MetadataWaitGraph {
         }
     }
 
+    /**
+     * 在 graph lock 内从指定 owner 做有界深度优先遍历；搜索重新到达起点时报告环，达到上限或遍历结束时报告无环。
+     *
+     * @param start 参与 {@code introducesCycle} 的稳定领域标识 {@code MdlOwnerId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param searchLimit 参与 {@code introducesCycle} 的上界或规格值 {@code searchLimit}；必须非负且不能使容量、页数或编码长度计算溢出
+     * @return {@code introducesCycle} 命名的领域事实成立时为 {@code true}，否则为 {@code false}；查询本身不改变权威状态
+     */
     boolean introducesCycle(MdlOwnerId start, int searchLimit) {
         lock.lock();
         try {
@@ -82,6 +107,11 @@ final class MetadataWaitGraph {
         }
     }
 
+    /**
+     * 采集 {@code snapshot} 对应的数据字典稳定快照；返回对象与后续内部修改隔离，不转移内部可变状态的所有权。
+     *
+     * @return 调用时刻的不可变状态集合或映射；没有已发布条目时返回空集合，调用方修改不会影响权威状态
+     */
     List<MetadataWaitEdge> snapshot() {
         lock.lock();
         try {

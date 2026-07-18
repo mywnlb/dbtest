@@ -50,6 +50,9 @@ class SearchKeyComparatorTest {
         return new SearchKey(List.of(new ColumnValue.StringValue(s)));
     }
 
+    /**
+     * 验证 {@code prefixComparesOnlyLeadingBytes} 所描述的值对象语义，并断言相等性、哈希、排序及非法构造边界一致。
+     */
     @Test
     void prefixComparesOnlyLeadingBytes() {
         TableSchema schema = nameSchema();
@@ -60,6 +63,9 @@ class SearchKeyComparatorTest {
         assertTrue(comparator.compare(nameKey("apricot"), nameKey("apple"), kd, schema) > 0, "'apr' > 'app'");
     }
 
+    /**
+     * 验证 {@code fullColumnComparedWhenNoPrefix} 所描述的值对象语义，并断言相等性、哈希、排序及非法构造边界一致。
+     */
     @Test
     void fullColumnComparedWhenNoPrefix() {
         TableSchema schema = nameSchema();
@@ -68,6 +74,9 @@ class SearchKeyComparatorTest {
                 "no prefix → full lexicographic: 'application' > 'apple'");
     }
 
+    /**
+     * 验证 {@code prefixLengthRejectedOnNonByteColumn} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void prefixLengthRejectedOnNonByteColumn() {
         TableSchema idSchema = new TableSchema(1, List.of(
@@ -111,6 +120,9 @@ class SearchKeyComparatorTest {
                 new ColumnValue.SetValue(1), new ColumnValue.SetValue(4));
     }
 
+    /**
+     * 验证 {@code charsetCollationOrderingMatrixKeepsDirectionNullAndPrefixSemantics} 所描述的返回值或状态会按契约保留，并断言原始信息与领域不变量未丢失。
+     */
     @Test
     void charsetCollationOrderingMatrixKeepsDirectionNullAndPrefixSemantics() {
         ColumnType binary = ColumnType.varchar(20, true, CharsetId.UTF8, CollationId.BINARY);

@@ -1,4 +1,7 @@
 /**
- * SQL lexer, parser, and abstract syntax tree model.
+ * SQL 词法、语法与 AST 包，只把输入文本转换为语法结构，不访问数据字典或存储内部状态。
+ *
+ * <p>本包只通过显式接口与相邻模块协作；调用方不得绕过稳定 API 读取内部可变状态，
+ * 包内实现也不得反向依赖 SQL、会话或其他上层语义。
  */
 package cn.zhangyis.db.sql.parser;

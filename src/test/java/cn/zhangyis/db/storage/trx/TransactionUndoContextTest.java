@@ -19,12 +19,18 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
  */
 class TransactionUndoContextTest {
 
+    /**
+     * 验证 {@code freshTransactionHasNoUndoContext} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void freshTransactionHasNoUndoContext() {
         Transaction t = new Transaction(TransactionOptions.defaults(), 1L);
         assertNull(t.undoContext(), "undo context is lazy: null before first write");
     }
 
+    /**
+     * 验证 {@code setUndoContextBindsContext} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void setUndoContextBindsContext() {
         Transaction t = new Transaction(TransactionOptions.defaults(), 1L);
@@ -35,12 +41,18 @@ class TransactionUndoContextTest {
         assertEquals(ctx, t.undoContext());
     }
 
+    /**
+     * 验证 {@code setUndoContextRejectsNull} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void setUndoContextRejectsNull() {
         Transaction t = new Transaction(TransactionOptions.defaults(), 1L);
         assertThrows(DatabaseValidationException.class, () -> t.setUndoContext(null));
     }
 
+    /**
+     * 验证 {@code setUndoContextAllowsOverwriteByManager} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void setUndoContextAllowsOverwriteByManager() {
         // UndoLogManager 控制单次调用；mutator 本身不强制单次，避免把生命周期约束塞进 setter

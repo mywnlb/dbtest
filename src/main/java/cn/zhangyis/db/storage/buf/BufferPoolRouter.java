@@ -19,6 +19,12 @@ public final class BufferPoolRouter {
     /** 分片数量（≥1）。固定于构造期，路由结果对它取模。 */
     private final int instanceCount;
 
+    /**
+     * 创建 {@code BufferPoolRouter}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param instanceCount 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public BufferPoolRouter(int instanceCount) {
         if (instanceCount < 1) {
             throw new DatabaseValidationException("buffer pool instance count must be >= 1: " + instanceCount);
@@ -36,6 +42,7 @@ public final class BufferPoolRouter {
      *
      * @param pageId 目标页。
      * @return 归属 instance 下标，落在 {@code [0, instanceCount)}。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public int route(PageId pageId) {
         if (pageId == null) {

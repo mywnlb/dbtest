@@ -69,6 +69,9 @@ class UndoWritePathWiringTest {
 
     private final TypeCodecRegistry registry = new TypeCodecRegistry();
 
+    /**
+     * 验证 {@code successfulPathStampsRealRollPtrAndTrxId_orphanUndoOnFailureLeftToT13d} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void successfulPathStampsRealRollPtrAndTrxId_orphanUndoOnFailureLeftToT13d() {
         onPool(ctx -> {
@@ -101,6 +104,9 @@ class UndoWritePathWiringTest {
         });
     }
 
+    /**
+     * 验证 {@code multipleRowsEachGetDistinctRollPtrInSameTransaction} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void multipleRowsEachGetDistinctRollPtrInSameTransaction() {
         onPool(ctx -> {

@@ -73,22 +73,38 @@ public final class RecordPageStructureValidator {
         }
     }
 
-    /** 校验固定系统记录 identity/标签；supremum 的 nOwned 可随尾 group 变化，不能固定为 1。 */
+    /** 校验固定系统记录 identity/标签；supremum 的 nOwned 可随尾 group 变化，不能固定为 1。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验表空间生命周期、页号、区段身份与容量边界，非法或损坏元数据在分配/IO 前拒绝。</li>
+     *     <li>按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，避免锁序反转。</li>
+     *     <li>执行空间元数据或物理文件变化，并把需要的 allocation intent、redo、dirty 或 force 副作用交给既有下游。</li>
+     *     <li>发布稳定结果并逆序释放 lease、latch 与 fix；失败保留可由恢复流程识别的权威状态。</li>
+     * </ol>
+     *
+     * @param page 已固定的页面、frame 或页头视图；不得为 {@code null}，必须指向目标 PageId，并在访问期间持有契约要求的 fix/latch
+     * @return {@code validateSystemRecords} 编码、解码或重建的记录数据；成功时不为 {@code null}，字段顺序、隐藏列和字节边界满足当前 schema
+     */
     private static SystemRecords validateSystemRecords(RecordPage page) {
+        // 1、校验表空间生命周期、页号、区段身份与容量边界，在共享或持久副作用前拒绝非法状态。
         RecordHeader infimum = page.recordHeaderAt(page.infimumOffset());
         requireSystemHeader("infimum", infimum, RecordType.INFIMUM, 0);
+        // 2、继续完成范围、身份与候选校验；通过后，按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，保持处理顺序与资源边界。
         if (infimum.nOwned() != 1) {
             throw corrupted("infimum must own exactly itself: nOwned=" + infimum.nOwned());
         }
         requireLabel("infimum", IndexPageLayout.INFIMUM_LABEL, page.systemLabelAt(page.infimumOffset()));
 
         RecordHeader supremum = page.recordHeaderAt(page.supremumOffset());
+        // 3、在中间分支复核阶段性结果；满足条件后，执行空间元数据或物理文件变化，并维持领域不变量。
         requireSystemHeader("supremum", supremum, RecordType.SUPREMUM, 1);
         if (supremum.nextRecordOffset() != 0) {
             throw corrupted("supremum must terminate next_record chain: next="
                     + supremum.nextRecordOffset());
         }
         requireLabel("supremum", IndexPageLayout.SUPREMUM_LABEL, page.systemLabelAt(page.supremumOffset()));
+        // 4、发布稳定结果并逆序释放 lease、latch 与 fix，以稳定返回或领域异常完成收口。
         return new SystemRecords(infimum, supremum);
     }
 
@@ -320,11 +336,22 @@ public final class RecordPageStructureValidator {
         }
     }
 
-    /** 已校验的固定系统记录头。 */
+    /** 已校验的固定系统记录头。
+     *
+     * @param infimum 记录格式使用的 header、隐藏列或键布局；不得为 {@code null}，偏移、字段顺序和编码宽度必须与当前页格式一致
+     * @param supremum 记录格式使用的 header、隐藏列或键布局；不得为 {@code null}，偏移、字段顺序和编码宽度必须与当前页格式一致
+     */
     private record SystemRecords(RecordHeader infimum, RecordHeader supremum) {
     }
 
-    /** 已校验用户记录头、逻辑位置、heap identity、物理区间与 live 字节账本。 */
+    /** 已校验用户记录头、逻辑位置、heap identity、物理区间与 live 字节账本。
+     *
+     * @param headers 参与 {@code 构造} 的键值映射；不得为 {@code null}，空映射表示没有条目，键和值均不得包含 Java {@code null}
+     * @param positions 参与 {@code 构造} 的键值映射；不得为 {@code null}，空映射表示没有条目，键和值均不得包含 Java {@code null}
+     * @param heapNumbers 参与 {@code 构造} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @param ranges 参与 {@code 构造} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @param liveRecordBytes 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     */
     private record UserChain(Map<Integer, RecordHeader> headers,
                              Map<Integer, Integer> positions,
                              Set<Integer> heapNumbers,
@@ -332,7 +359,11 @@ public final class RecordPageStructureValidator {
                              long liveRecordBytes) {
     }
 
-    /** 一条 live 用户记录在物理 heap 中的半开区间。 */
+    /** 一条 live 用户记录在物理 heap 中的半开区间。
+     *
+     * @param start 参与 {@code 构造} 的零基位置 {@code start}；必须非负且小于所属页面、集合或持久结构的容量
+     * @param endExclusive 参与 {@code 构造} 的零基位置 {@code endExclusive}；必须非负且小于所属页面、集合或持久结构的容量
+     */
     private record RecordRange(int start, int endExclusive) {
     }
 }

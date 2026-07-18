@@ -58,6 +58,25 @@ public interface BufferPool extends AutoCloseable {
      */
     List<DirtyPageCandidate> dirtyPageCandidates(Lsn targetLsn, int maxPages);
 
+    /** 返回按 LRU 淘汰顺序排列的 dirty 候选；旧测试池默认不提供该视图。
+     *
+     * @param maxPages 参与 {@code lruDirtyPageCandidates} 的上界或规格值 {@code maxPages}；必须非负且不能使容量、页数或编码长度计算溢出
+     * @return 按当前快照筛出的候选页、脏页或阻塞关系；保持方法声明的稳定顺序，无候选时返回空集合而非 {@code null}
+     * @throws cn.zhangyis.db.common.exception.DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
+    default List<DirtyPageCandidate> lruDirtyPageCandidates(int maxPages) {
+        if (maxPages < 0) {
+            throw new cn.zhangyis.db.common.exception.DatabaseValidationException(
+                    "lru dirty max pages must not be negative: " + maxPages);
+        }
+        return List.of();
+    }
+
+    /** 返回当前 free frame 数；旧测试池返回 0，调用方必须结合候选是否为空决定是否走 LRU。 */
+    default int freeFrameCount() {
+        return 0;
+    }
+
     /**
      * 等待 dirty view 可能发生变化。该方法不承诺返回时已经没有脏页；调用方醒来后必须重新查询
      * {@link #dirtyPageCandidates(Lsn, int)} 或其它 dirty view 谓词。FlushService 的 tablespace drain 使用它避免
@@ -131,10 +150,16 @@ public interface BufferPool extends AutoCloseable {
      */
     int residentCountInRange(SpaceId spaceId, long firstPageNo, int pageCount);
 
-    /** 帧总容量。 */
+    /** 帧总容量。
+     *
+     * @return {@code capacity} 计算出的非负长度、位置或数量；结果必须落在所属页、集合或持久格式容量内，溢出通过领域异常报告
+     */
     int capacity();
 
-    /** 当前驻留帧数。 */
+    /** 当前驻留帧数。
+     *
+     * @return {@code residentCount} 计算出的非负长度、位置或数量；结果必须落在所属页、集合或持久格式容量内，溢出通过领域异常报告
+     */
     int residentCount();
 
     /**

@@ -36,7 +36,11 @@ public final class UndoContext {
     /** 当前 UPDATE logical head 可达记录的 undoNo→tableId；marker 发布后按新 head 裁剪，供 commit history 投影。 */
     private final NavigableMap<Long, Long> updateAffectedTables = new TreeMap<>();
 
-    /** 构造尚未创建任何物理 log 的事务 undo 上下文。 */
+    /** 构造尚未创建任何物理 log 的事务 undo 上下文。
+     *
+     * @param rollbackSegmentId 参与 {@code 构造} 的稳定领域标识 {@code RollbackSegmentId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public UndoContext(RollbackSegmentId rollbackSegmentId) {
         if (rollbackSegmentId == null) {
             throw new DatabaseValidationException("undo context rollback segment must not be null");
@@ -47,7 +51,11 @@ public final class UndoContext {
     public RollbackSegmentId rollbackSegmentId() { return rollbackSegmentId; }
     public UndoNo lastUndoNo() { return lastUndoNo; }
 
-    /** 在 segment + page3 claim 已完成后附加一条 binding；同 kind 只允许一次。 */
+    /** 在 segment + page3 claim 已完成后附加一条 binding；同 kind 只允许一次。
+     *
+     * @param binding 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     void attach(UndoLogBinding binding) {
         if (binding == null) {
             throw new DatabaseValidationException("undo binding must not be null");
@@ -57,7 +65,12 @@ public final class UndoContext {
         }
     }
 
-    /** recovery 根据已核对的持久 header 恢复 binding 与事务全局高水位。 */
+    /** recovery 根据已核对的持久 header 恢复 binding 与事务全局高水位。
+     *
+     * @param binding 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param globalHighWater 参与 {@code restoreBinding} 的稳定领域标识 {@code UndoNo}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     void restoreBinding(UndoLogBinding binding, UndoNo globalHighWater) {
         if (binding == null || globalHighWater == null
                 || globalHighWater.value() < binding.logicalHead().undoNo().value()) {
@@ -69,11 +82,23 @@ public final class UndoContext {
         }
     }
 
+    /**
+     * 把语法对象绑定到稳定元数据与类型；绑定期间保持版本一致，失败不发布半绑定结果。
+     *
+     * @param kind 选择 {@code binding} 分支的 {@code UndoLogKind} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     * @return {@code binding} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     */
     public UndoLogBinding binding(UndoLogKind kind) {
         requireOrdinaryKind(kind);
         return bindings.get(kind);
     }
 
+    /**
+     * 把语法对象绑定到稳定元数据与类型；绑定期间保持版本一致，失败不发布半绑定结果。
+     *
+     * @param kind 选择 {@code hasBinding} 分支的 {@code UndoLogKind} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     * @return {@code hasBinding} 命名的领域事实成立时为 {@code true}，否则为 {@code false}；查询本身不改变权威状态
+     */
     public boolean hasBinding(UndoLogKind kind) {
         if (kind == UndoLogKind.TEMPORARY) {
             return false;
@@ -84,13 +109,22 @@ public final class UndoContext {
     /** 返回不可变 binding 列表；物理调用方仍须按 PageId/slot 明确排序。 */
     public Collection<UndoLogBinding> bindings() { return List.copyOf(bindings.values()); }
 
-    /** 尚未创建指定 log 时返回 EMPTY，便于保存点把“当时不存在”表达为精确边界。 */
+    /** 尚未创建指定 log 时返回 EMPTY，便于保存点把“当时不存在”表达为精确边界。
+     *
+     * @param kind 选择 {@code head} 分支的 {@code UndoLogKind} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     * @return {@code head} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     */
     public UndoLogicalHead head(UndoLogKind kind) {
         UndoLogBinding binding = binding(kind);
         return binding == null ? UndoLogicalHead.EMPTY : binding.logicalHead();
     }
 
-    /** append MTR 成功后原子发布全局高水位和目标局部头。 */
+    /** append MTR 成功后原子发布全局高水位和目标局部头。
+     *
+     * @param kind 选择 {@code publishAppend} 分支的 {@code UndoLogKind} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     * @param undoNo 参与 {@code publishAppend} 的稳定领域标识 {@code UndoNo}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param pointer 参与 {@code publishAppend} 的稳定领域标识 {@code RollPointer}；不得为 {@code null}，并须由对应值对象构造校验产生
+     */
     void publishAppend(UndoLogKind kind, UndoNo undoNo, RollPointer pointer) {
         publishAppendInternal(kind, undoNo, pointer, null, null);
     }
@@ -111,7 +145,13 @@ public final class UndoContext {
         publishAppendInternal(kind, undoNo, pointer, null, tableId);
     }
 
-    /** 生产 append 同时发布供下一次无 IO 规划使用的权威物理快照。 */
+    /** 生产 append 同时发布供下一次无 IO 规划使用的权威物理快照。
+     *
+     * @param kind 选择 {@code publishAppend} 分支的 {@code UndoLogKind} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     * @param undoNo 参与 {@code publishAppend} 的稳定领域标识 {@code UndoNo}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param pointer 参与 {@code publishAppend} 的稳定领域标识 {@code RollPointer}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param appendSnapshot 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     */
     void publishAppend(UndoLogKind kind, UndoNo undoNo, RollPointer pointer,
                        UndoAppendSnapshot appendSnapshot) {
         publishAppendInternal(kind, undoNo, pointer, appendSnapshot, null);
@@ -189,7 +229,12 @@ public final class UndoContext {
         return Set.copyOf(new TreeSet<>(updateAffectedTables.values()));
     }
 
-    /** full/recovery marker 已提交后，只发布所属 kind 的新局部头；全局物理高水位保持不变。 */
+    /** full/recovery marker 已提交后，只发布所属 kind 的新局部头；全局物理高水位保持不变。
+     *
+     * @param kind 选择 {@code publishRollbackProgress} 分支的 {@code UndoLogKind} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     * @param persistedHead 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     void publishRollbackProgress(UndoLogKind kind, UndoLogicalHead persistedHead) {
         if (persistedHead == null || binding(kind) == null) {
             throw new DatabaseValidationException("rollback progress requires an existing binding and head");
@@ -199,6 +244,14 @@ public final class UndoContext {
         savepointStack.clear();
     }
 
+    /**
+     * 根据调用参数构造 {@code createSavepoint} 对应的事务、MVCC 与锁领域对象；构造前完成范围与组合校验，成功结果不为 {@code null}。
+     *
+     * @param txn 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
+     * @return {@code createSavepoint} 创建或观察到的事务/锁状态；成功时不为 {@code null}，owner、可见性与生命周期来自当前会话
+     * @throws TransactionStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     TransactionSavepoint createSavepoint(Transaction txn) {
         if (txn == null || txn.state() != TransactionState.ACTIVE) {
             throw new TransactionStateException("savepoint requires an ACTIVE transaction");
@@ -212,7 +265,10 @@ public final class UndoContext {
         return savepoint;
     }
 
-    /** partial rollback 的双 header marker 已同批提交后发布两个精确边界并修剪嵌套保存点。 */
+    /** partial rollback 的双 header marker 已同批提交后发布两个精确边界并修剪嵌套保存点。
+     *
+     * @param savepoint 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
+     */
     void completeRollbackToSavepoint(TransactionSavepoint savepoint) {
         int index = requireOwnedSavepoint(savepoint);
         publishExistingHead(UndoLogKind.INSERT, savepoint.insertHead());
@@ -231,6 +287,11 @@ public final class UndoContext {
         savepointStack.clear();
     }
 
+    /**
+     * 释放本方法拥有的事务、MVCC 与锁资源；遵守既定释放顺序，重复或失败调用不得掩盖原始状态。
+     *
+     * @param savepoint 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
+     */
     void releaseSavepoint(TransactionSavepoint savepoint) {
         int index = requireOwnedSavepoint(savepoint);
         for (int i = savepointStack.size() - 1; i >= index; i--) {
@@ -238,6 +299,13 @@ public final class UndoContext {
         }
     }
 
+    /**
+     * 校验 {@code requireOwnedSavepoint} 涉及的事务、MVCC 与锁结构、范围与交叉字段；合法输入不修改状态，非法输入在副作用前抛出领域异常。
+     *
+     * @param savepoint 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
+     * @return {@code requireOwnedSavepoint} 从受校验输入或持久字节中得到的 {@code int} 结果；位宽、符号和特殊值语义遵循当前格式，无法表示时抛出领域异常
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     int requireOwnedSavepoint(TransactionSavepoint savepoint) {
         if (savepoint == null) {
             throw new DatabaseValidationException("transaction savepoint must not be null");

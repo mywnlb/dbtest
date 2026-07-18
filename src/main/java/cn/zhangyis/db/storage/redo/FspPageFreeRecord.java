@@ -14,7 +14,10 @@ import cn.zhangyis.db.domain.SegmentId;
  */
 public record FspPageFreeRecord(PageId freedPageId, int inodeSlot, SegmentId segmentId) implements RedoRecord {
 
-    /** tag(1) + pageId(space 4 + pageNo 8) + inodeSlot(4) + segmentId(8)。 */
+    /** tag(1) + pageId(space 4 + pageNo 8) + inodeSlot(4) + segmentId(8)。
+     *
+     * 稳定布局常量，参与页内偏移、长度或位域计算；编解码两端必须保持完全一致。
+     */
     private static final int LENGTH = 25;
 
     public FspPageFreeRecord {

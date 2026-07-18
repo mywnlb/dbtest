@@ -89,6 +89,9 @@ class PurgeCoordinatorTest {
 
     private final TypeCodecRegistry registry = new TypeCodecRegistry();
 
+    /**
+     * 验证 {@code purgesCommittedDeleteWhenNoLiveReadView} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void purgesCommittedDeleteWhenNoLiveReadView() {
         onPool(false, ctx -> {
@@ -142,6 +145,9 @@ class PurgeCoordinatorTest {
         });
     }
 
+    /**
+     * 验证 {@code liveReadViewBlocksPurgeThenReleaseAllows} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void liveReadViewBlocksPurgeThenReleaseAllows() {
         onPool(false, ctx -> {
@@ -177,6 +183,9 @@ class PurgeCoordinatorTest {
         });
     }
 
+    /**
+     * 验证 {@code updateOnlyReclaimsSegmentWithoutTouchingRecord} 所描述的边界场景保持既有领域不变量，不产生方法名明确禁止的副作用。
+     */
     @Test
     void updateOnlyReclaimsSegmentWithoutTouchingRecord() {
         onPool(false, ctx -> {
@@ -274,6 +283,9 @@ class PurgeCoordinatorTest {
         }
     }
 
+    /**
+     * 验证 {@code insertOnlyUndoReclaimedImmediately} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void insertOnlyUndoReclaimedImmediately() {
         onPool(false, ctx -> {
@@ -313,6 +325,9 @@ class PurgeCoordinatorTest {
         });
     }
 
+    /**
+     * 验证 {@code perEntryAtomicityKeepsHistoryHeadOnDropFailure} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void perEntryAtomicityKeepsHistoryHeadOnDropFailure() {
         onPool(2, ctx -> { // mixed commit 的第 1 次 drop 成功，purge 的第 2 次 drop 注入失败

@@ -16,6 +16,7 @@ import java.util.Optional;
  * @param metadata        目标表 exact schema-version 的全部索引快照；聚簇与二级布局必须来自同一 DD binding。
  * @param clusterKey      经过聚簇类型系统物化的完整主键；用于 current-read、事务行锁和 DML/purge row guard。
  * @param lockWaitTimeout 聚簇行锁与短物理 row guard 的最大等待时长；必须为正值。
+ * @param lobSegment 可选的 {@code lobSegment}；参数本身不得为 {@code null}，空 {@code Optional} 明确表示调用方未提供该领域值
  */
 public record TableDeleteCommand(Transaction transaction, TableIndexMetadata metadata,
                                  SearchKey clusterKey, Optional<SegmentRef> lobSegment,

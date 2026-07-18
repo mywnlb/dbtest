@@ -60,6 +60,9 @@ class MtrRedoAppendTest {
         }
     }
 
+    /**
+     * 验证 {@code writeProducesPageBytesAndStampsPageLsn} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void writeProducesPageBytesAndStampsPageLsn() {
         onPool((pool, mgr) -> {
@@ -83,6 +86,9 @@ class MtrRedoAppendTest {
         });
     }
 
+    /**
+     * 验证 {@code commitClosesRedoRangeAfterDirtyPublish} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void commitClosesRedoRangeAfterDirtyPublish() {
         onPool((pool, mgr) -> {
@@ -96,6 +102,9 @@ class MtrRedoAppendTest {
         });
     }
 
+    /**
+     * 验证 {@code newPageProducesPageInitAndStamps} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void newPageProducesPageInitAndStamps() {
         onPool((pool, mgr) -> {
@@ -114,6 +123,9 @@ class MtrRedoAppendTest {
         });
     }
 
+    /**
+     * 验证 {@code sharedOnlyPageProducesNoRedoNorStamp} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void sharedOnlyPageProducesNoRedoNorStamp() {
         onPool((pool, mgr) -> {
@@ -134,6 +146,9 @@ class MtrRedoAppendTest {
         });
     }
 
+    /**
+     * 验证 {@code rollbackToSavepointRejectsTouchedPage} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void rollbackToSavepointRejectsTouchedPage() {
         onPool((pool, mgr) -> {
@@ -146,6 +161,9 @@ class MtrRedoAppendTest {
         });
     }
 
+    /**
+     * 验证 {@code touchedPageBeforeSavepointStillStampsBatchEndLsn} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void touchedPageBeforeSavepointStillStampsBatchEndLsn() {
         onPool((pool, mgr) -> {
@@ -166,6 +184,9 @@ class MtrRedoAppendTest {
         });
     }
 
+    /**
+     * 验证 {@code readOnlyMtrDoesNotCloseExternalUnpublishedRedoRange} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void readOnlyMtrDoesNotCloseExternalUnpublishedRedoRange() {
         onPool((pool, mgr) -> {
@@ -181,6 +202,9 @@ class MtrRedoAppendTest {
         });
     }
 
+    /**
+     * 验证 {@code multiPageCommitStampsSameBatchEndLsn} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void multiPageCommitStampsSameBatchEndLsn() {
         onPool((pool, mgr) -> {
@@ -200,6 +224,9 @@ class MtrRedoAppendTest {
         });
     }
 
+    /**
+     * 验证 {@code redoEntriesTrackDefaultAndPageInitCategoriesWithoutChangingRecords} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void redoEntriesTrackDefaultAndPageInitCategoriesWithoutChangingRecords() {
         onPool((pool, mgr) -> {
@@ -217,6 +244,9 @@ class MtrRedoAppendTest {
         });
     }
 
+    /**
+     * 验证 {@code fspMetadataDeltaSuppressesCoveredPageBytesButStillStampsPage} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void fspMetadataDeltaSuppressesCoveredPageBytesButStillStampsPage() {
         onPool((pool, mgr) -> {
@@ -241,6 +271,9 @@ class MtrRedoAppendTest {
         });
     }
 
+    /**
+     * 验证 {@code undoMetadataDeltaSuppressesOnlyCoveredUndoPageBytes} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void undoMetadataDeltaSuppressesOnlyCoveredUndoPageBytes() {
         onPool((pool, mgr) -> {
@@ -283,6 +316,9 @@ class MtrRedoAppendTest {
         });
     }
 
+    /**
+     * 验证 {@code undoRecordPayloadDeltaSuppressesCoveredUndoPageBytes} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void undoRecordPayloadDeltaSuppressesCoveredUndoPageBytes() {
         onPool((pool, mgr) -> {
@@ -311,6 +347,9 @@ class MtrRedoAppendTest {
         });
     }
 
+    /**
+     * 验证 {@code btreePageDeltaSuppressesCoveredStructureBytes} 所描述的 B+Tree 定位或结构变化，并断言键序、父子链接、页资源和唯一性不变量。
+     */
     @Test
     void btreePageDeltaSuppressesCoveredStructureBytes() {
         onPool((pool, mgr) -> {
@@ -338,6 +377,9 @@ class MtrRedoAppendTest {
         });
     }
 
+    /**
+     * 验证 {@code redoCategoryScopeIsNestedAndRestoredByLifo} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void redoCategoryScopeIsNestedAndRestoredByLifo() {
         onPool((pool, mgr) -> {
@@ -367,6 +409,9 @@ class MtrRedoAppendTest {
         });
     }
 
+    /**
+     * 验证 {@code redoCategoryScopeOutOfOrderCloseDoesNotPoisonLaterLifoRecovery} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void redoCategoryScopeOutOfOrderCloseDoesNotPoisonLaterLifoRecovery() {
         onPool((pool, mgr) -> {

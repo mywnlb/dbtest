@@ -119,6 +119,9 @@ class RecordPageInserterTest {
         }
     }
 
+    /**
+     * 验证 {@code sequentialInsertKeepsKeyOrder} 所描述的返回值或状态会按契约保留，并断言原始信息与领域不变量未丢失。
+     */
     @Test
     void sequentialInsertKeepsKeyOrder() {
         onPage(schema(), (rp, schema) -> {
@@ -132,6 +135,9 @@ class RecordPageInserterTest {
         });
     }
 
+    /**
+     * 验证 {@code randomInsertKeepsKeyOrder} 所描述的返回值或状态会按契约保留，并断言原始信息与领域不变量未丢失。
+     */
     @Test
     void randomInsertKeepsKeyOrder() {
         onPage(schema(), (rp, schema) -> {
@@ -158,6 +164,9 @@ class RecordPageInserterTest {
         });
     }
 
+    /**
+     * 验证 {@code groupSplitMaintainsOwnership} 所描述的 B+Tree 定位或结构变化，并断言键序、父子链接、页资源和唯一性不变量。
+     */
     @Test
     void groupSplitMaintainsOwnership() {
         onPage(schema(), (rp, schema) -> {
@@ -187,6 +196,9 @@ class RecordPageInserterTest {
         });
     }
 
+    /**
+     * 验证 {@code pageFullThrowsOverflow} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void pageFullThrowsOverflow() {
         onPage(bigSchema(), (rp, schema) -> {
@@ -200,6 +212,9 @@ class RecordPageInserterTest {
         });
     }
 
+    /**
+     * 验证 {@code nullKeyAndVarlenInsertAndLookup} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void nullKeyAndVarlenInsertAndLookup() {
         onPage(schema(), (rp, schema) -> {
@@ -220,6 +235,9 @@ class RecordPageInserterTest {
         });
     }
 
+    /**
+     * 验证 {@code insertReusesFreedGarbageFragment} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void insertReusesFreedGarbageFragment() {
         onPage(schema(), (rp, schema) -> {

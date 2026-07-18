@@ -27,7 +27,10 @@ public record BTreePageDeltaRecord(
         int offset,
         byte[] afterImage) implements RedoRecord {
 
-    /** tag(1)+pageId(12)+indexId(8)+kind(1)+subjectId(8)+offset(4)+payloadLen(4)。 */
+    /** tag(1)+pageId(12)+indexId(8)+kind(1)+subjectId(8)+offset(4)+payloadLen(4)。
+     *
+     * 稳定布局常量，参与页内偏移、长度或位域计算；编解码两端必须保持完全一致。
+     */
     private static final int HEADER_BYTES = 38;
     /** INDEX page header 固定布局 `[38,66)`。 */
     public static final int INDEX_HEADER_OFFSET = 38;
@@ -72,7 +75,11 @@ public record BTreePageDeltaRecord(
         return HEADER_BYTES + afterImage.length;
     }
 
-    /** redo payload 是值对象，数组字段按内容比较。 */
+    /** redo payload 是值对象，数组字段按内容比较。
+     *
+     * @param obj 待比较对象；允许为 {@code null} 或其他类型，此时按 {@code equals} 契约返回 {@code false}
+     * @return 比较对象类型与全部值语义相等时为 {@code true}；对象为 {@code null}、类型不同或任一组件不等时为 {@code false}
+     */
     @Override
     public boolean equals(Object obj) {
         if (this == obj) {
@@ -89,6 +96,11 @@ public record BTreePageDeltaRecord(
                 && Arrays.equals(afterImage, that.afterImage);
     }
 
+    /**
+     * 实现 {@code hashCode} 的稳定值语义；比较只读取输入与本对象，不改变Redo/WAL状态。
+     *
+     * @return 由参与值语义的全部组件计算出的稳定哈希值；与 {@code equals} 相等的对象必须返回相同结果
+     */
     @Override
     public int hashCode() {
         int result = pageId.hashCode();

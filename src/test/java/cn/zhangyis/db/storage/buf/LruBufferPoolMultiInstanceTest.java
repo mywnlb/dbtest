@@ -93,6 +93,9 @@ class LruBufferPoolMultiInstanceTest {
         }
     }
 
+    /**
+     * 验证 {@code routesAndRoundTripsAcrossInstances} 对应的Buffer Pool行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void routesAndRoundTripsAcrossInstances() {
         try (PageStore store = openStore(256)) {
@@ -114,6 +117,9 @@ class LruBufferPoolMultiInstanceTest {
         }
     }
 
+    /**
+     * 验证 {@code capacitySplitSumsToTotalWithRemainder} 所描述的 B+Tree 定位或结构变化，并断言键序、父子链接、页资源和唯一性不变量。
+     */
     @Test
     void capacitySplitSumsToTotalWithRemainder() {
         try (PageStore store = openStore(64)) {
@@ -125,6 +131,9 @@ class LruBufferPoolMultiInstanceTest {
         }
     }
 
+    /**
+     * 验证 {@code perInstanceEvictionDoesNotTouchOtherInstanceHotPage} 所描述的边界场景保持既有领域不变量，不产生方法名明确禁止的副作用。
+     */
     @Test
     void perInstanceEvictionDoesNotTouchOtherInstanceHotPage() {
         try (CountingPageStore store = openCountingStore(256)) {
@@ -144,6 +153,9 @@ class LruBufferPoolMultiInstanceTest {
         }
     }
 
+    /**
+     * 验证 {@code localShardExhaustionThrowsEvenWhenOtherShardFree} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void localShardExhaustionThrowsEvenWhenOtherShardFree() {
         try (PageStore store = openStore(256)) {
@@ -164,6 +176,9 @@ class LruBufferPoolMultiInstanceTest {
         }
     }
 
+    /**
+     * 验证 {@code dirtyCandidatesMergeAcrossInstancesSortedByLsn} 所描述的刷脏与持久化协作，并断言 redo durable 边界先覆盖 page LSN、失败后仍保留脏状态。
+     */
     @Test
     void dirtyCandidatesMergeAcrossInstancesSortedByLsn() {
         try (PageStore store = openStore(256)) {
@@ -187,6 +202,9 @@ class LruBufferPoolMultiInstanceTest {
         }
     }
 
+    /**
+     * 验证 {@code oldestDirtyLsnIsGlobalMinAcrossInstances} 所描述的刷脏与持久化协作，并断言 redo durable 边界先覆盖 page LSN、失败后仍保留脏状态。
+     */
     @Test
     void oldestDirtyLsnIsGlobalMinAcrossInstances() {
         try (PageStore store = openStore(256)) {
@@ -201,6 +219,9 @@ class LruBufferPoolMultiInstanceTest {
         }
     }
 
+    /**
+     * 验证 {@code invalidateRemovesSpaceAcrossInstancesAndIsAllOrNothing} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void invalidateRemovesSpaceAcrossInstancesAndIsAllOrNothing() {
         try (PageStore store = openStore(256)) {
@@ -233,6 +254,9 @@ class LruBufferPoolMultiInstanceTest {
         }
     }
 
+    /**
+     * 验证 {@code aggregatesResidentCountIdsAndRange} 对应的Buffer Pool行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void aggregatesResidentCountIdsAndRange() {
         try (PageStore store = openStore(256)) {
@@ -251,6 +275,9 @@ class LruBufferPoolMultiInstanceTest {
         }
     }
 
+    /**
+     * 验证 {@code readAheadPrefetchesThroughFacadeAtMultipleInstances} 对应的Buffer Pool行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void readAheadPrefetchesThroughFacadeAtMultipleInstances() {
         try (CountingPageStore store = openCountingStore(256)) {
@@ -273,6 +300,11 @@ class LruBufferPoolMultiInstanceTest {
         }
     }
 
+    /**
+     * 验证 {@code concurrentGetsOnDifferentInstancesSucceed} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     *
+     * @throws InterruptedException 等待被中断时抛出；调用方应恢复中断标志并终止当前资源获取流程
+     */
     @Test
     void concurrentGetsOnDifferentInstancesSucceed() throws InterruptedException {
         try (PageStore store = openStore(512)) {

@@ -22,18 +22,27 @@ class ReadViewTest {
         return new ReadView(TransactionId.of(creator), up, low, active, low);
     }
 
+    /**
+     * 验证 {@code recordByCreatorIsVisible} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void recordByCreatorIsVisible() {
         ReadView v = new ReadView(TransactionId.of(5), 10, 20, Set.of(12L, 15L), 20);
         assertTrue(v.isVisible(TransactionId.of(5)), "事务总能看见自己的修改（==creator）");
     }
 
+    /**
+     * 验证 {@code belowUpLimitVisible} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void belowUpLimitVisible() {
         ReadView v = rv(99, 10, 20, Set.of(12L, 15L));
         assertTrue(v.isVisible(TransactionId.of(5)), "recordTrxId < upLimit 必可见（提交早于本快照）");
     }
 
+    /**
+     * 验证 {@code atOrAboveLowLimitInvisible} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void atOrAboveLowLimitInvisible() {
         ReadView v = rv(99, 10, 20, Set.of(12L, 15L));
@@ -41,6 +50,9 @@ class ReadViewTest {
         assertFalse(v.isVisible(TransactionId.of(25)));
     }
 
+    /**
+     * 验证 {@code inActiveSetInvisibleOtherwiseVisible} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void inActiveSetInvisibleOtherwiseVisible() {
         ReadView v = rv(99, 10, 20, Set.of(12L, 15L));
@@ -48,6 +60,9 @@ class ReadViewTest {
         assertTrue(v.isVisible(TransactionId.of(13)), "[up,low) 内但不在活跃集合（已提交）可见");
     }
 
+    /**
+     * 验证 {@code readOnlyCreatorNoneNeverMatchesRule1} 对应的事务、MVCC 与锁行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void readOnlyCreatorNoneNeverMatchesRule1() {
         // 只读事务 creator=NONE：记录 writer 恒非 NONE，故规则1 永不命中
@@ -56,6 +71,9 @@ class ReadViewTest {
         assertFalse(v.isVisible(TransactionId.of(15)), ">=low 不可见");
     }
 
+    /**
+     * 验证 {@code isVisibleRejectsNoneRecordWriter} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void isVisibleRejectsNoneRecordWriter() {
         ReadView v = rv(99, 10, 20, Set.of(12L));
@@ -64,6 +82,9 @@ class ReadViewTest {
         assertThrows(DatabaseValidationException.class, () -> v.isVisible(null));
     }
 
+    /**
+     * 验证 {@code constructorEnforcesInvariants} 对应的事务、MVCC 与锁行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void constructorEnforcesInvariants() {
         // up > low 非法
@@ -77,6 +98,9 @@ class ReadViewTest {
         assertThrows(DatabaseValidationException.class, () -> new ReadView(TransactionId.of(1), 10, 20, null, 20));
     }
 
+    /**
+     * 验证 {@code activeIdsAreDefensivelyCopied} 对应的事务、MVCC 与锁行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void activeIdsAreDefensivelyCopied() {
         Set<Long> src = new HashSet<>(Set.of(12L, 15L));

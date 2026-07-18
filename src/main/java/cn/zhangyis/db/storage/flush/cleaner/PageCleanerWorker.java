@@ -60,6 +60,13 @@ public final class PageCleanerWorker implements PageCleanerWorkerHandle {
     /** worker 失败根因。 */
     private DatabaseRuntimeException failure;
 
+    /**
+     * 创建 {@code PageCleanerWorker}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param flushService 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param queueCapacity 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @param idleWait 本次等待或操作的最大时长；不得为 {@code null} 且必须为正，超时不得留下未释放资源
+     */
     public PageCleanerWorker(FlushService flushService, int queueCapacity, Duration idleWait) {
         this(flushService, queueCapacity, idleWait, PERIODIC_DISABLED, false);
     }
@@ -68,19 +75,43 @@ public final class PageCleanerWorker implements PageCleanerWorkerHandle {
      * 创建带周期 tick 的 page cleaner。周期 tick 只表达“检查 redo capacity 并推进 checkpoint”的后台节奏；
      * 真正刷哪些页仍由 {@link FlushService} 内部策略和 WAL gate 决定。{@code periodicMaxPages=0} 时允许只推进
      * checkpoint，不主动刷脏，便于 engine bootstrap 测试验证后台 checkpoint worker 语义。
+     * @param flushService 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param queueCapacity 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @param idleWait 本次等待或操作的最大时长；不得为 {@code null} 且必须为正，超时不得留下未释放资源
+     * @param periodicMaxPages 参与 {@code 构造} 的上界或规格值 {@code periodicMaxPages}；必须非负且不能使容量、页数或编码长度计算溢出
      */
     public PageCleanerWorker(FlushService flushService, int queueCapacity, Duration idleWait, int periodicMaxPages) {
         this(flushService, queueCapacity, idleWait, periodicMaxPages, true);
     }
 
+    /**
+     * 创建 {@code PageCleanerWorker}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝 null、越界和相互矛盾的组合。</li>
+     *     <li>完成跨参数校验并推导不可变配置；若构造过程创建自有资源，后续失败必须在异常路径关闭。</li>
+     *     <li>把已校验协作者与配置绑定到字段，并初始化本对象拥有的状态、显式锁、队列或缓存，不允许 this 提前逃逸。</li>
+     *     <li>构造完成后对象处于类契约声明的初始状态；任一步失败都抛出领域异常且不发布半初始化实例。</li>
+     * </ol>
+     *
+     * @param flushService 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param queueCapacity 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @param idleWait 本次等待或操作的最大时长；不得为 {@code null} 且必须为正，超时不得留下未释放资源
+     * @param periodicMaxPages 参与 {@code 构造} 的上界或规格值 {@code periodicMaxPages}；必须非负且不能使容量、页数或编码长度计算溢出
+     * @param validatePeriodicMaxPages 当前算法是否纳入终态增量、同步压力、磁盘来源、根节点或周期上界校验；用于选择对应的不变量检查分支
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     private PageCleanerWorker(FlushService flushService, int queueCapacity, Duration idleWait,
                               int periodicMaxPages, boolean validatePeriodicMaxPages) {
+        // 1、校验必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝非法组合。
         if (flushService == null || idleWait == null) {
             throw new DatabaseValidationException("page cleaner service/idle wait must not be null");
         }
         if (queueCapacity < 1) {
             throw new DatabaseValidationException("page cleaner queue capacity must be >= 1: " + queueCapacity);
         }
+        // 2、完成跨参数校验并推导不可变配置；后续失败仍由当前构造路径收口已创建资源。
         if (idleWait.isNegative() || idleWait.isZero()) {
             throw new DatabaseValidationException("page cleaner idle wait must be positive: " + idleWait);
         }
@@ -88,13 +119,18 @@ public final class PageCleanerWorker implements PageCleanerWorkerHandle {
             throw new DatabaseValidationException("page cleaner periodic max pages must not be negative: "
                     + periodicMaxPages);
         }
+        // 3、绑定已校验协作者并初始化本对象拥有的状态、显式锁、队列或缓存，不允许半初始化实例逃逸。
         this.flushService = flushService;
         this.queueCapacity = queueCapacity;
         this.idleWaitNanos = timeoutNanos(idleWait);
+        // 4、完成初始状态发布；失败以领域异常终止构造，成功对象满足类级生命周期不变量。
         this.periodicMaxPages = periodicMaxPages;
     }
 
-    /** 启动后台 worker。只能从 NEW 状态启动一次。 */
+    /** 启动后台 worker。只能从 NEW 状态启动一次。
+     *
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public void start() {
         lock.lock();
         try {
@@ -114,6 +150,9 @@ public final class PageCleanerWorker implements PageCleanerWorkerHandle {
      * 提交一次 capacity flush 请求。该方法只入队并唤醒 worker，不在调用线程执行 IO。
      *
      * @param maxPages 本轮最多刷页数。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws PageCleanerStoppedException 后台刷脏工作线程已经停止或无法继续服务时抛出；监督者应停止派发并关闭或重启对应 worker
+     * @throws FlushWriteException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
      */
     public void requestFlush(int maxPages) {
         if (maxPages < 0) {
@@ -202,7 +241,10 @@ public final class PageCleanerWorker implements PageCleanerWorkerHandle {
         }
     }
 
-    /** 当前 worker 状态。 */
+    /** 当前 worker 状态。
+     *
+     * @return {@code state} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     */
     public PageCleanerState state() {
         lock.lock();
         try {
@@ -212,7 +254,10 @@ public final class PageCleanerWorker implements PageCleanerWorkerHandle {
         }
     }
 
-    /** 最近一轮成功执行的 flush cycle。 */
+    /** 最近一轮成功执行的 flush cycle。
+     *
+     * @return 当前可见的最近快照或持久边界；尚未产生对应状态时为空 {@code Optional}，从不返回 Java {@code null}
+     */
     public Optional<FlushCycleResult> lastCycle() {
         lock.lock();
         try {
@@ -222,7 +267,10 @@ public final class PageCleanerWorker implements PageCleanerWorkerHandle {
         }
     }
 
-    /** worker 失败根因。 */
+    /** worker 失败根因。
+     *
+     * @return 最近一次受控操作记录的失败；尚无失败时为空 {@code Optional}，参数容器与返回值均不使用 Java {@code null}
+     */
     public Optional<DatabaseRuntimeException> failure() {
         lock.lock();
         try {

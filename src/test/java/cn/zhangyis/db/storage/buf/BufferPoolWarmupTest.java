@@ -41,6 +41,9 @@ class BufferPoolWarmupTest {
         return PageId.of(SPACE, PageNo.of(no));
     }
 
+    /**
+     * 验证 {@code dumpThenLoadWarmsPages} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void dumpThenLoadWarmsPages() {
         try (CountingPageStore store = openStore()) {
@@ -70,6 +73,9 @@ class BufferPoolWarmupTest {
         }
     }
 
+    /**
+     * 验证 {@code loadOnMissingDumpIsNoOp} 对应的Buffer Pool行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void loadOnMissingDumpIsNoOp() {
         try (CountingPageStore store = openStore()) {
@@ -81,6 +87,11 @@ class BufferPoolWarmupTest {
         }
     }
 
+    /**
+     * 验证 {@code loadOnCorruptDumpIsNoOp} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void loadOnCorruptDumpIsNoOp() throws Exception {
         try (CountingPageStore store = openStore()) {
@@ -93,6 +104,9 @@ class BufferPoolWarmupTest {
         }
     }
 
+    /**
+     * 验证 {@code residentPageIdsSnapshotsResidentPages} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void residentPageIdsSnapshotsResidentPages() {
         try (CountingPageStore store = openStore()) {

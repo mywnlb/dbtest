@@ -31,6 +31,9 @@ class PageHashTableTest {
         return new BufferFrame(PS);
     }
 
+    /**
+     * 验证 {@code putGetRemoveContainsSize} 对应的Buffer Pool行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void putGetRemoveContainsSize() {
         PageHashTable table = new PageHashTable();
@@ -51,6 +54,9 @@ class PageHashTableTest {
         assertEquals(0, table.size());
     }
 
+    /**
+     * 验证 {@code countInRangeCountsOnlyPresentKeys} 对应的Buffer Pool行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void countInRangeCountsOnlyPresentKeys() {
         PageHashTable table = new PageHashTable();
@@ -64,6 +70,9 @@ class PageHashTableTest {
         assertEquals(1, table.countInRange(SPACE, 8, 1), "单页区间命中计 1");
     }
 
+    /**
+     * 验证 {@code valuesAndKeysSnapshot} 对应的Buffer Pool行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void valuesAndKeysSnapshot() {
         PageHashTable table = new PageHashTable();
@@ -76,6 +85,9 @@ class PageHashTableTest {
         assertTrue(table.keySet().contains(page(1)) && table.keySet().contains(page(2)));
     }
 
+    /**
+     * 验证 {@code countInRangeRejectsInvalidArguments} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void countInRangeRejectsInvalidArguments() {
         PageHashTable table = new PageHashTable();

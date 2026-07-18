@@ -15,6 +15,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class PurgeDriverWorkerTest {
 
+    /**
+     * 验证 {@code drivesRunBatchPeriodically} 对应的事务、MVCC 与锁行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void drivesRunBatchPeriodically() {
         FakeTarget target = new FakeTarget();
@@ -28,6 +31,9 @@ class PurgeDriverWorkerTest {
         }
     }
 
+    /**
+     * 验证 {@code requestPurgeTriggersImmediateRun} 对应的事务、MVCC 与锁行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void requestPurgeTriggersImmediateRun() {
         FakeTarget target = new FakeTarget();
@@ -42,6 +48,9 @@ class PurgeDriverWorkerTest {
         }
     }
 
+    /**
+     * 验证 {@code stopHaltsWorkerAndIsIdempotent} 所描述的组件生命周期，并断言状态转换、后台线程停止和资源恰好释放一次。
+     */
     @Test
     void stopHaltsWorkerAndIsIdempotent() {
         PurgeDriverWorker worker = new PurgeDriverWorker(new FakeTarget(), 16, Duration.ofMillis(20));
@@ -51,6 +60,9 @@ class PurgeDriverWorkerTest {
         assertTrue(worker.stop(Duration.ofSeconds(2)), "second stop idempotent");
     }
 
+    /**
+     * 验证 {@code runBatchFailureMovesToFailedState} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void runBatchFailureMovesToFailedState() {
         FakeTarget target = new FakeTarget();

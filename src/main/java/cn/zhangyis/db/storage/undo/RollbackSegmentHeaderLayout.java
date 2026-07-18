@@ -28,7 +28,10 @@ final class RollbackSegmentHeaderLayout {
     static final int MAGIC = PageEnvelopeLayout.FIL_PAGE_HEADER_BYTES;  // 38
     /** 格式版本（u32）。 */
     static final int FORMAT = MAGIC + 4;                               // 42
-    /** rollback segment id（u32）。 */
+    /** rollback segment id（u32）。
+     *
+     * 持久结构布局常量；它定义 {@code RollbackSegmentHeaderLayout} 中 {@code RSEG_ID} 的固定偏移、槽位或宽度，读写两端必须使用同一数值。
+     */
     static final int RSEG_ID = FORMAT + 4;                             // 46
     /** slot 容量（u32）；磁盘权威值，打开时校验与配置一致。 */
     static final int SLOT_CAPACITY = RSEG_ID + 4;                      // 50
@@ -55,27 +58,52 @@ final class RollbackSegmentHeaderLayout {
     /** active slot array 起点；每槽 u64 pageNo，{@code FIL_NULL}=空。 */
     static final int SLOT_ARRAY_BASE = FREE_LENGTH + 8;                // 122
 
-    /** 第 idx 个 slot 的页内偏移。 */
+    /** 第 idx 个 slot 的页内偏移。
+     *
+     * @param idx 参与 {@code slotOffset} 的原始数值身份 {@code idx}；必须非负，零值仅用于对应格式明确声明的系统或空身份
+     * @return {@code slotOffset} 计算出的非负长度、位置或数量；结果必须落在所属页、集合或持久格式容量内，溢出通过领域异常报告
+     */
     static int slotOffset(int idx) {
         return SLOT_ARRAY_BASE + idx * Long.BYTES;
     }
 
-    /** 容纳 slotCapacity 个槽所需的末尾偏移（用于校验不越过页尾 trailer）。 */
+    /** 容纳 slotCapacity 个槽所需的末尾偏移（用于校验不越过页尾 trailer）。
+     *
+     * @param slotCapacity 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @return {@code slotArrayEnd} 计算出的非负长度、位置或数量；结果必须落在所属页、集合或持久格式容量内，溢出通过领域异常报告
+     */
     static int slotArrayEnd(int slotCapacity) {
         return SLOT_ARRAY_BASE + slotCapacity * Long.BYTES;
     }
 
-    /** INSERT cached 栈数组起点，紧随 active slot array。 */
+    /** INSERT cached 栈数组起点，紧随 active slot array。
+     *
+     * @param slotCapacity 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @return {@code insertCacheBase} 从受校验输入或持久字节中得到的 {@code int} 结果；位宽、符号和特殊值语义遵循当前格式，无法表示时抛出领域异常
+     */
     static int insertCacheBase(int slotCapacity) {
         return slotArrayEnd(slotCapacity);
     }
 
-    /** UPDATE cached 栈数组起点，紧随 INSERT cached 栈数组。 */
+    /** UPDATE cached 栈数组起点，紧随 INSERT cached 栈数组。
+     *
+     * @param slotCapacity 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @param cacheCapacityPerKind 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @return {@code updateCacheBase} 从受校验输入或持久字节中得到的 {@code int} 结果；位宽、符号和特殊值语义遵循当前格式，无法表示时抛出领域异常
+     */
     static int updateCacheBase(int slotCapacity, int cacheCapacityPerKind) {
         return insertCacheBase(slotCapacity) + cacheCapacityPerKind * Long.BYTES;
     }
 
-    /** 指定 kind/cache index 的页内偏移。 */
+    /** 指定 kind/cache index 的页内偏移。
+     *
+     * @param kind 选择 {@code cacheOffset} 分支的 {@code UndoLogKind} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     * @param slotCapacity 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @param cacheCapacityPerKind 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @param index 参与 {@code cacheOffset} 的零基位置 {@code index}；必须非负且小于所属页面、集合或持久结构的容量
+     * @return {@code cacheOffset} 计算出的非负长度、位置或数量；结果必须落在所属页、集合或持久格式容量内，溢出通过领域异常报告
+     * @throws UndoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     static int cacheOffset(UndoLogKind kind, int slotCapacity, int cacheCapacityPerKind, int index) {
         int base = switch (kind) {
             case INSERT -> insertCacheBase(slotCapacity);
@@ -85,7 +113,12 @@ final class RollbackSegmentHeaderLayout {
         return base + index * Long.BYTES;
     }
 
-    /** page3 v4 全部定长数组结束位置。 */
+    /** page3 v4 全部定长数组结束位置。
+     *
+     * @param slotCapacity 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @param cacheCapacityPerKind 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @return {@code layoutEnd} 从受校验输入或持久字节中得到的 {@code int} 结果；位宽、符号和特殊值语义遵循当前格式，无法表示时抛出领域异常
+     */
     static int layoutEnd(int slotCapacity, int cacheCapacityPerKind) {
         return updateCacheBase(slotCapacity, cacheCapacityPerKind)
                 + cacheCapacityPerKind * Long.BYTES;

@@ -93,6 +93,9 @@ class RecoveredTransactionReconcilerTest {
                         table.snapshot(), Lsn.of(120), List.of(committedSlot(0, 7, 4))));
     }
 
+    /**
+     * 验证 {@code activeTransactionMayOwnOneInsertAndOneUpdateSlot} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void activeTransactionMayOwnOneInsertAndOneUpdateSlot() {
         RecoveredUndoSlotEvidence insert = active(0, 7);
@@ -104,12 +107,18 @@ class RecoveredTransactionReconcilerTest {
         assertEquals(List.of(insert, update), result.activeSlots());
     }
 
+    /**
+     * 验证 {@code duplicateRecoveredKindForOneCreatorIsFatal} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void duplicateRecoveredKindForOneCreatorIsFatal() {
         assertThrows(TransactionRecoveryException.class, () -> new RecoveredTransactionReconciler()
                 .reconcile(baseline(0, 3, 2), Lsn.of(100), List.of(active(0, 7), active(1, 7))));
     }
 
+    /**
+     * 验证 {@code activeAndCommittedUndoForOneCreatorIsFatal} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void activeAndCommittedUndoForOneCreatorIsFatal() {
         RecoveredTransactionTable table = table(0, 8, 4);
@@ -117,6 +126,9 @@ class RecoveredTransactionReconcilerTest {
                 .reconcile(table.snapshot(), Lsn.of(100), List.of(active(0, 7), committedSlot(1, 7, 3))));
     }
 
+    /**
+     * 验证 {@code committedInsertUndoEvidenceIsFatal} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void committedInsertUndoEvidenceIsFatal() {
         assertThrows(TransactionRecoveryException.class, () -> RecoveredUndoSlotEvidence.committed(

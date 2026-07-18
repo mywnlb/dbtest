@@ -12,6 +12,14 @@ import java.util.Set;
 
 /**
  * 物理建表请求。它是 DD→storage.api 的稳定 DTO，不携带 DD cache/MDL 对象，也不暴露 BufferFrame/BTreeIndex。
+ *
+ * @param tableId 目标表的原始字典标识；必须为已分配的正数并与当前元数据和物理绑定一致
+ * @param spaceId 目标表空间的稳定标识；不得为 {@code null}，且必须已注册并满足当前生命周期准入条件
+ * @param path 受控目录内的规范化文件路径；不得为 {@code null}，也不得逃逸所属表空间或日志目录
+ * @param schemaVersion 参与 {@code 构造} 的单调版本值 {@code schemaVersion}；必须非负，回退或与权威快照冲突时拒绝
+ * @param initialSizeInPages 调用方提供的长度或容量值对象；不得为 {@code null}，且必须已通过其构造范围校验
+ * @param columns 参与 {@code 构造} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+ * @param indexes 参与 {@code 构造} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
  */
 public record StorageTableDefinition(long tableId, SpaceId spaceId, Path path, long schemaVersion,
                                      PageNo initialSizeInPages, List<StorageColumnDefinition> columns,

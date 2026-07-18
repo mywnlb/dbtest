@@ -35,6 +35,9 @@ class DoublewriteDetectOnlyTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code detectOnlyWritesMetadataWithoutFullPagePayload} 所描述的边界场景保持既有领域不变量，不产生方法名明确禁止的副作用。
+     */
     @Test
     void detectOnlyWritesMetadataWithoutFullPagePayload() {
         try (DoublewriteFileRepository dw = DoublewriteFileRepository.open(dir.resolve("dw.dat"), PS)) {
@@ -54,6 +57,9 @@ class DoublewriteDetectOnlyTest {
         }
     }
 
+    /**
+     * 验证 {@code detectOnlyRecoveryReportsTornPageButDoesNotRepair} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void detectOnlyRecoveryReportsTornPageButDoesNotRepair() {
         try (PageStore store = new FileChannelPageStore();
@@ -79,6 +85,11 @@ class DoublewriteDetectOnlyTest {
         }
     }
 
+    /**
+     * 验证 {@code fullCopyWritesV2TypedSlotAndStillExposesRepairCopy} 对应的脏页刷盘与 checkpoint行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void fullCopyWritesV2TypedSlotAndStillExposesRepairCopy() throws Exception {
         Path path = dir.resolve("dw-full-copy-v2.dat");

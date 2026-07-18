@@ -5,6 +5,7 @@ import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.recovery.RecoveryMode;
+import cn.zhangyis.db.storage.flush.doublewrite.DoublewriteMode;
 import cn.zhangyis.db.storage.undo.RollbackSegmentHeaderCapacity;
 
 import java.nio.file.Path;
@@ -44,6 +45,7 @@ import java.util.Set;
  * @param maxExternalUndoPayloadPages 单条 external undo payload 可占用的最大页数；同时作为读取期内存安全上限。
  * @param undoCachedSegmentsPerKind rollback segment 为 INSERT/UPDATE 各自保留的 cached segment 容量；0 禁用。
  * @param undoHistoryTransitionTimeout commit append 与 purge unlink 等待 history transition 的上限；超时发生在页修改前。
+ * @param doublewriteMode 调用方请求的目标状态、阶段或模式；不得为 {@code null}，且必须是当前状态机允许的后继值
  */
 public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapacityFrames,
                            SpaceId undoSpaceId, PageNo undoSpaceInitialPages, int slotCapacity,
@@ -54,7 +56,8 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                            Duration backgroundFlushStopTimeout, RedoRotationConfig redoRotation,
                            int bufferPoolInstanceCount, RecoveryMode recoveryMode,
                            Set<SpaceId> forceSkippedSpaces, int maxExternalUndoPayloadPages,
-                           int undoCachedSegmentsPerKind, Duration undoHistoryTransitionTimeout) {
+                           int undoCachedSegmentsPerKind, Duration undoHistoryTransitionTimeout,
+                           DoublewriteMode doublewriteMode) {
 
     /** 默认启动后台 page cleaner，使 engine open 后具备持续 checkpoint tick 能力。 */
     private static final boolean DEFAULT_BACKGROUND_FLUSH_ENABLED = true;
@@ -70,6 +73,8 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
     private static final int DEFAULT_UNDO_CACHED_SEGMENTS_PER_KIND = 8;
     /** history transition 默认等待上限；独立于 flush timeout，避免 IO 配置意外改变事务内存协调语义。 */
     private static final Duration DEFAULT_UNDO_HISTORY_TRANSITION_TIMEOUT = Duration.ofSeconds(5);
+    /** 默认保留完整页副本，保证现有 engine 的 torn-page 恢复语义不变。 */
+    private static final DoublewriteMode DEFAULT_DOUBLEWRITE_MODE = DoublewriteMode.DETECT_AND_RECOVER;
 
     public EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapacityFrames,
                         SpaceId undoSpaceId, PageNo undoSpaceInitialPages, int slotCapacity,
@@ -105,7 +110,8 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, RedoRotationConfig.defaults(),
                 DEFAULT_BUFFER_POOL_INSTANCE_COUNT, RecoveryMode.NORMAL, Set.of(),
                 defaultMaxExternalUndoPages(bufferPoolCapacityFrames, DEFAULT_BUFFER_POOL_INSTANCE_COUNT),
-                DEFAULT_UNDO_CACHED_SEGMENTS_PER_KIND, DEFAULT_UNDO_HISTORY_TRANSITION_TIMEOUT);
+                DEFAULT_UNDO_CACHED_SEGMENTS_PER_KIND, DEFAULT_UNDO_HISTORY_TRANSITION_TIMEOUT,
+                DEFAULT_DOUBLEWRITE_MODE);
     }
 
     /**
@@ -125,7 +131,8 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation,
                 bufferPoolInstanceCount, recoveryMode, Set.of(),
                 defaultMaxExternalUndoPages(bufferPoolCapacityFrames, bufferPoolInstanceCount),
-                DEFAULT_UNDO_CACHED_SEGMENTS_PER_KIND, DEFAULT_UNDO_HISTORY_TRANSITION_TIMEOUT);
+                DEFAULT_UNDO_CACHED_SEGMENTS_PER_KIND, DEFAULT_UNDO_HISTORY_TRANSITION_TIMEOUT,
+                DEFAULT_DOUBLEWRITE_MODE);
     }
 
     /** 兼容新增 external undo 配置前的完整 canonical 签名。 */
@@ -144,7 +151,8 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation,
                 bufferPoolInstanceCount, recoveryMode, forceSkippedSpaces,
                 defaultMaxExternalUndoPages(bufferPoolCapacityFrames, bufferPoolInstanceCount),
-                DEFAULT_UNDO_CACHED_SEGMENTS_PER_KIND, DEFAULT_UNDO_HISTORY_TRANSITION_TIMEOUT);
+                DEFAULT_UNDO_CACHED_SEGMENTS_PER_KIND, DEFAULT_UNDO_HISTORY_TRANSITION_TIMEOUT,
+                DEFAULT_DOUBLEWRITE_MODE);
     }
 
     /** 兼容新增 cached undo 配置前的完整 canonical 签名；新建实例默认每类缓存 8 个 segment。 */
@@ -162,7 +170,8 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation,
                 bufferPoolInstanceCount, recoveryMode, forceSkippedSpaces, maxExternalUndoPayloadPages,
-                DEFAULT_UNDO_CACHED_SEGMENTS_PER_KIND, DEFAULT_UNDO_HISTORY_TRANSITION_TIMEOUT);
+                DEFAULT_UNDO_CACHED_SEGMENTS_PER_KIND, DEFAULT_UNDO_HISTORY_TRANSITION_TIMEOUT,
+                DEFAULT_DOUBLEWRITE_MODE);
     }
 
     /** 兼容新增 history transition timeout 前的完整 canonical 签名。 */
@@ -181,14 +190,16 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation,
                 bufferPoolInstanceCount, recoveryMode, forceSkippedSpaces, maxExternalUndoPayloadPages,
-                undoCachedSegmentsPerKind, DEFAULT_UNDO_HISTORY_TRANSITION_TIMEOUT);
+                undoCachedSegmentsPerKind, DEFAULT_UNDO_HISTORY_TRANSITION_TIMEOUT,
+                DEFAULT_DOUBLEWRITE_MODE);
     }
 
     public EngineConfig {
         if (baseDir == null || pageSize == null || undoSpaceId == null
                 || undoSpaceInitialPages == null || flushTimeout == null || recoveryTablespaces == null
                 || backgroundFlushInterval == null || backgroundFlushStopTimeout == null
-                || recoveryMode == null || forceSkippedSpaces == null || undoHistoryTransitionTimeout == null) {
+                || recoveryMode == null || forceSkippedSpaces == null || undoHistoryTransitionTimeout == null
+                || doublewriteMode == null) {
             throw new DatabaseValidationException("engine config object fields must not be null");
         }
         if (bufferPoolCapacityFrames <= 0) {
@@ -291,7 +302,7 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, rotation, bufferPoolInstanceCount, recoveryMode,
                 forceSkippedSpaces, maxExternalUndoPayloadPages, undoCachedSegmentsPerKind,
-                undoHistoryTransitionTimeout);
+                undoHistoryTransitionTimeout, doublewriteMode);
     }
 
     /**
@@ -307,7 +318,7 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, instanceCount, recoveryMode,
                 forceSkippedSpaces, maxExternalUndoPayloadPages, undoCachedSegmentsPerKind,
-                undoHistoryTransitionTimeout);
+                undoHistoryTransitionTimeout, doublewriteMode);
     }
 
     /**
@@ -323,12 +334,14 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, bufferPoolInstanceCount, mode,
                 forceSkippedSpaces, maxExternalUndoPayloadPages, undoCachedSegmentsPerKind,
-                undoHistoryTransitionTimeout);
+                undoHistoryTransitionTimeout, doublewriteMode);
     }
 
     /**
      * 派生由 DD discovery 计算出的 existing-open 表空间集合；调用方无需重建二十余个无关配置字段。
      * fresh open 也允许携带空集合，真正的 fresh/existing 判定仍由 {@link StorageEngine} 根据 redo/undo 文件完成。
+     * @param tablespaces 参与 {@code withRecoveryTablespaces} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @return {@code withRecoveryTablespaces} 形成的不可变定义、计划或元数据快照；成功时不为 {@code null}，内部身份、版本和范围已完成交叉校验
      */
     public EngineConfig withRecoveryTablespaces(List<EngineTablespaceConfig> tablespaces) {
         return new EngineConfig(baseDir, pageSize, bufferPoolCapacityFrames, undoSpaceId, undoSpaceInitialPages,
@@ -336,7 +349,7 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, bufferPoolInstanceCount,
                 recoveryMode, forceSkippedSpaces, maxExternalUndoPayloadPages, undoCachedSegmentsPerKind,
-                undoHistoryTransitionTimeout);
+                undoHistoryTransitionTimeout, doublewriteMode);
     }
 
     /**
@@ -353,7 +366,7 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, bufferPoolInstanceCount,
                 recoveryMode, skippedSpaces, maxExternalUndoPayloadPages, undoCachedSegmentsPerKind,
-                undoHistoryTransitionTimeout);
+                undoHistoryTransitionTimeout, doublewriteMode);
     }
 
     /**
@@ -362,6 +375,7 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
      *
      * @param skippedSpaces 管理员明确要隔离的表空间集合，必须非空。
      * @return FORCE_SKIP_CORRUPT_TABLESPACE 模式的新配置。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public EngineConfig withForceSkipRecovery(Set<SpaceId> skippedSpaces) {
         validateForceSkippedSpaces(skippedSpaces);
@@ -373,17 +387,21 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, bufferPoolInstanceCount,
                 RecoveryMode.FORCE_SKIP_CORRUPT_TABLESPACE, skippedSpaces, maxExternalUndoPayloadPages,
-                undoCachedSegmentsPerKind, undoHistoryTransitionTimeout);
+                undoCachedSegmentsPerKind, undoHistoryTransitionTimeout, doublewriteMode);
     }
 
-    /** 派生单条 external undo payload 页数上限；降低该值前必须确认 active/history undo 不含更长页链。 */
+    /** 派生单条 external undo payload 页数上限；降低该值前必须确认 active/history undo 不含更长页链。
+     *
+     * @param maxPages 参与 {@code withMaxExternalUndoPayloadPages} 的上界或规格值 {@code maxPages}；必须非负且不能使容量、页数或编码长度计算溢出
+     * @return {@code withMaxExternalUndoPayloadPages} 形成的不可变定义、计划或元数据快照；成功时不为 {@code null}，内部身份、版本和范围已完成交叉校验
+     */
     public EngineConfig withMaxExternalUndoPayloadPages(int maxPages) {
         return new EngineConfig(baseDir, pageSize, bufferPoolCapacityFrames, undoSpaceId, undoSpaceInitialPages,
                 slotCapacity, maxVersionHops, flushTimeout, redoCapacityBytes, recoveryTablespaces,
                 backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, bufferPoolInstanceCount,
                 recoveryMode, forceSkippedSpaces, maxPages, undoCachedSegmentsPerKind,
-                undoHistoryTransitionTimeout);
+                undoHistoryTransitionTimeout, doublewriteMode);
     }
 
     /**
@@ -399,16 +417,39 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, bufferPoolInstanceCount,
                 recoveryMode, forceSkippedSpaces, maxExternalUndoPayloadPages, capacity,
-                undoHistoryTransitionTimeout);
+                undoHistoryTransitionTimeout, doublewriteMode);
     }
 
-    /** 派生独立的 history transition 等待上限；只影响内存串行化，不改变磁盘格式。 */
+    /** 派生独立的 history transition 等待上限；只影响内存串行化，不改变磁盘格式。
+     *
+     * @param timeout 本次等待或操作的最大时长；不得为 {@code null} 且必须为正，超时不得留下未释放资源
+     * @return {@code withUndoHistoryTransitionTimeout} 形成的不可变定义、计划或元数据快照；成功时不为 {@code null}，内部身份、版本和范围已完成交叉校验
+     */
     public EngineConfig withUndoHistoryTransitionTimeout(Duration timeout) {
         return new EngineConfig(baseDir, pageSize, bufferPoolCapacityFrames, undoSpaceId, undoSpaceInitialPages,
                 slotCapacity, maxVersionHops, flushTimeout, redoCapacityBytes, recoveryTablespaces,
                 backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, bufferPoolInstanceCount,
-                recoveryMode, forceSkippedSpaces, maxExternalUndoPayloadPages, undoCachedSegmentsPerKind, timeout);
+                recoveryMode, forceSkippedSpaces, maxExternalUndoPayloadPages, undoCachedSegmentsPerKind, timeout,
+                doublewriteMode);
+    }
+
+    /** 派生 doublewrite 保护模式；不会改变其它恢复与 flush 配置。
+     *
+     * @param mode 调用方请求的目标状态、阶段或模式；不得为 {@code null}，且必须是当前状态机允许的后继值
+     * @return {@code withDoublewriteMode} 形成的不可变定义、计划或元数据快照；成功时不为 {@code null}，内部身份、版本和范围已完成交叉校验
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
+    public EngineConfig withDoublewriteMode(DoublewriteMode mode) {
+        if (mode == null) {
+            throw new DatabaseValidationException("doublewrite mode must not be null");
+        }
+        return new EngineConfig(baseDir, pageSize, bufferPoolCapacityFrames, undoSpaceId, undoSpaceInitialPages,
+                slotCapacity, maxVersionHops, flushTimeout, redoCapacityBytes, recoveryTablespaces,
+                backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
+                backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, bufferPoolInstanceCount,
+                recoveryMode, forceSkippedSpaces, maxExternalUndoPayloadPages, undoCachedSegmentsPerKind,
+                undoHistoryTransitionTimeout, mode);
     }
 
     private static int defaultMaxExternalUndoPages(int capacityFrames, int instanceCount) {
@@ -441,6 +482,16 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
         return baseDir.resolve("doublewrite.dwb");
     }
 
+    /** FlushList 批次使用的独立 doublewrite 文件。 */
+    public Path flushListDoublewriteFile() {
+        return baseDir.resolve("doublewrite-flush-list.dwb");
+    }
+
+    /** LRU 与 single-page flush 使用的独立 doublewrite 文件。 */
+    public Path lruDoublewriteFile() {
+        return baseDir.resolve("doublewrite-lru.dwb");
+    }
+
     /** recovery progress JSONL 文件路径。它只记录启动恢复阶段诊断，不作为恢复输入或跳过阶段依据。 */
     public Path recoveryProgressFile() {
         return baseDir.resolve("recovery-progress.jsonl");
@@ -464,6 +515,9 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
      * 校验恢复期显式表空间集合。重复 SpaceId 会导致同一 {@code PageStore} 句柄被打开两次，破坏 registry
      * 中“一个 SpaceId 一个运行时状态”的不变量；系统 undo 由 {@link #undoFile()} 单独管理，也不能再作为
      * 普通数据表空间重复传入。
+     * @param undoSpaceId 目标表空间的稳定标识；不得为 {@code null}，且必须已注册并满足当前生命周期准入条件
+     * @param recoveryTablespaces 参与 {@code validateRecoveryTablespaces} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     private static void validateRecoveryTablespaces(
             SpaceId undoSpaceId,
@@ -487,6 +541,8 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
     /**
      * 校验 force-skip 表空间集合本身的结构完整性；模式与系统空间保护由 {@link StorageEngine} 在恢复前结合
      * existing/fresh、系统 undo 和单聚簇索引配置统一判断。
+     * @param forceSkippedSpaces 参与 {@code validateForceSkippedSpaces} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     private static void validateForceSkippedSpaces(Set<SpaceId> forceSkippedSpaces) {
         if (forceSkippedSpaces == null) {

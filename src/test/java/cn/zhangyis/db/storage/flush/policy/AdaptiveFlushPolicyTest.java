@@ -22,6 +22,9 @@ class AdaptiveFlushPolicyTest {
 
     // ---- fixed（离散）：忽略 backlog ----
 
+    /**
+     * 验证 {@code fixedPressureMapsToDeterministicBatchSizes} 对应的脏页刷盘与 checkpoint行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void fixedPressureMapsToDeterministicBatchSizes() {
         AdaptiveFlushPolicy policy = AdaptiveFlushPolicy.fixed(2, 10);
@@ -32,6 +35,9 @@ class AdaptiveFlushPolicyTest {
         assertAdvice(policy.plan(decision(RedoCapacityPressure.HARD_LIMIT), 7, 99), 10, true);
     }
 
+    /**
+     * 验证 {@code fixedRequestMaxClampsPlannedPages} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void fixedRequestMaxClampsPlannedPages() {
         AdaptiveFlushPolicy policy = AdaptiveFlushPolicy.fixed(2, 10);
@@ -45,6 +51,9 @@ class AdaptiveFlushPolicyTest {
 
     // ---- adaptive（§7.4 比例）：随 backlog ----
 
+    /**
+     * 验证 {@code adaptiveScalesBatchWithDirtyBacklog} 所描述的刷脏与持久化协作，并断言 redo durable 边界先覆盖 page LSN、失败后仍保留脏状态。
+     */
     @Test
     void adaptiveScalesBatchWithDirtyBacklog() {
         AdaptiveFlushPolicy policy = AdaptiveFlushPolicy.adaptive(2, 1, 20);
@@ -55,6 +64,9 @@ class AdaptiveFlushPolicyTest {
         assertAdvice(policy.plan(decision(RedoCapacityPressure.SYNC_FLUSH), 40, 99), 20, true);
     }
 
+    /**
+     * 验证 {@code adaptiveHardPressureScalesBacklogToMax} 对应的脏页刷盘与 checkpoint行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void adaptiveHardPressureScalesBacklogToMax() {
         AdaptiveFlushPolicy policy = AdaptiveFlushPolicy.adaptive(2, 1, 20);
@@ -64,6 +76,9 @@ class AdaptiveFlushPolicyTest {
         assertAdvice(policy.plan(decision(RedoCapacityPressure.HARD_LIMIT), 50, 99), 20, true);
     }
 
+    /**
+     * 验证 {@code adaptiveNonePressureFlushesNothing} 所描述的刷脏与持久化协作，并断言 redo durable 边界先覆盖 page LSN、失败后仍保留脏状态。
+     */
     @Test
     void adaptiveNonePressureFlushesNothing() {
         AdaptiveFlushPolicy policy = AdaptiveFlushPolicy.adaptive(2, 1, 20);
@@ -74,6 +89,9 @@ class AdaptiveFlushPolicyTest {
         assertFalse(advice.shouldFlush());
     }
 
+    /**
+     * 验证 {@code adaptiveFloorsToMinBatchAndClampsToRequestMax} 对应的脏页刷盘与 checkpoint行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void adaptiveFloorsToMinBatchAndClampsToRequestMax() {
         AdaptiveFlushPolicy policy = AdaptiveFlushPolicy.adaptive(1, 5, 20);
@@ -84,6 +102,9 @@ class AdaptiveFlushPolicyTest {
         assertEquals(3, policy.plan(decision(RedoCapacityPressure.HARD_LIMIT), 50, 3).maxPages());
     }
 
+    /**
+     * 验证 {@code invalidConfigurationOrRequestIsRejected} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void invalidConfigurationOrRequestIsRejected() {
         assertThrows(DatabaseValidationException.class, () -> AdaptiveFlushPolicy.fixed(0, 10));

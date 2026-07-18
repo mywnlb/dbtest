@@ -73,19 +73,31 @@ public final class DeferredUpdateUndoPlan implements DeferredUndoPlan<LobVersion
     /**
      * 用真实 rollback-new external envelope 构造 actual UPDATE undo，并逐项复核冻结 ownership 形状。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
      * @param actualOwnerships 实际新 LOB allocation 产生的 LV ownership；顺序和数量必须与 placeholder 相同。
      * @return 旧 image、secondary tail 和逻辑 identity 保持不变的 actual UPDATE_ROW。
      * @throws UndoWriteStalePlanException ownership 数量或除 firstPageNo 外的任一字段发生变化时抛出。
      */
     @Override
     public UndoRecord actualRecord(List<LobVersionOwnership> actualOwnerships) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         if (actualOwnerships == null || actualOwnerships.size() != placeholderOwnerships.size()) {
             throw new UndoWriteStalePlanException("deferred UPDATE LOB ownership count changed");
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         for (int i = 0; i < placeholderOwnerships.size(); i++) {
             requireSameShape(placeholderOwnerships.get(i), actualOwnerships.get(i));
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         UndoRecord placeholder = placeholderPlan.recordPlan().record();
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         return UndoRecord.update(placeholder.undoNo(), placeholder.transactionId(), placeholder.tableId(),
                 placeholder.indexId(), placeholder.clusterKey(), placeholder.oldColumnValues(),
                 placeholder.oldHiddenColumns(), List.copyOf(actualOwnerships),

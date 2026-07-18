@@ -24,7 +24,10 @@ public record TransactionStateDeltaRecord(
         TransactionNo transactionNo,
         TransactionStateDeltaReason reason) implements RedoRecord {
 
-    /** tag(1)+transactionId(8)+fromState(1)+toState(1)+transactionNo(8)+reason(1)。 */
+    /** tag(1)+transactionId(8)+fromState(1)+toState(1)+transactionNo(8)+reason(1)。
+     *
+     * 稳定布局常量，参与页内偏移、长度或位域计算；编解码两端必须保持完全一致。
+     */
     private static final int BYTES = 20;
 
     public TransactionStateDeltaRecord {

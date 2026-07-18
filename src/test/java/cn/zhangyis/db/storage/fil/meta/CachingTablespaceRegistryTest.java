@@ -30,6 +30,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class CachingTablespaceRegistryTest {
 
+    /**
+     * 验证 {@code shouldLoadTablespaceFromMetadataLoaderOnFirstRequire} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void shouldLoadTablespaceFromMetadataLoaderOnFirstRequire() {
         CountingLoader loader = new CountingLoader(metadata(TablespaceState.NORMAL));
@@ -41,6 +44,9 @@ class CachingTablespaceRegistryTest {
         assertEquals(1, loader.loadCount());
     }
 
+    /**
+     * 验证 {@code shouldOpenAndFindTablespace} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void shouldOpenAndFindTablespace() {
         CachingTablespaceRegistry registry = new CachingTablespaceRegistry(spaceId -> Optional.of(metadata(TablespaceState.NORMAL)));
@@ -51,6 +57,9 @@ class CachingTablespaceRegistryTest {
         assertTrue(registry.isOpen(SpaceId.of(10)));
     }
 
+    /**
+     * 验证 {@code shouldReuseRuntimeHandleAfterFirstLoad} 所描述的 B+Tree 定位或结构变化，并断言键序、父子链接、页资源和唯一性不变量。
+     */
     @Test
     void shouldReuseRuntimeHandleAfterFirstLoad() {
         CountingLoader loader = new CountingLoader(metadata(TablespaceState.NORMAL));
@@ -63,6 +72,9 @@ class CachingTablespaceRegistryTest {
         assertEquals(1, loader.loadCount());
     }
 
+    /**
+     * 验证 {@code shouldRejectMissingTablespace} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void shouldRejectMissingTablespace() {
         CachingTablespaceRegistry registry = new CachingTablespaceRegistry(spaceId -> Optional.empty());
@@ -70,6 +82,9 @@ class CachingTablespaceRegistryTest {
         assertThrows(TablespaceNotFoundException.class, () -> registry.require(SpaceId.of(404)));
     }
 
+    /**
+     * 验证 {@code shouldAllowActiveTablespaceForOrdinaryRequire} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void shouldAllowActiveTablespaceForOrdinaryRequire() {
         CachingTablespaceRegistry registry = new CachingTablespaceRegistry(spaceId -> Optional.of(metadata(TablespaceState.ACTIVE)));
@@ -79,6 +94,9 @@ class CachingTablespaceRegistryTest {
         assertEquals(TablespaceState.ACTIVE, handle.tablespace().state());
     }
 
+    /**
+     * 验证 {@code shouldRejectCorruptedTablespaceForOrdinaryRequire} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void shouldRejectCorruptedTablespaceForOrdinaryRequire() {
         CachingTablespaceRegistry registry = new CachingTablespaceRegistry(spaceId -> Optional.of(metadata(TablespaceState.CORRUPTED)));
@@ -86,6 +104,9 @@ class CachingTablespaceRegistryTest {
         assertThrows(TablespaceCorruptedException.class, () -> registry.require(SpaceId.of(10)));
     }
 
+    /**
+     * 验证 {@code shouldRejectInactiveTablespaceForOrdinaryRequire} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void shouldRejectInactiveTablespaceForOrdinaryRequire() {
         CachingTablespaceRegistry registry = new CachingTablespaceRegistry(spaceId -> Optional.of(metadata(TablespaceState.INACTIVE)));
@@ -93,6 +114,9 @@ class CachingTablespaceRegistryTest {
         assertThrows(TablespaceUnavailableException.class, () -> registry.require(SpaceId.of(10)));
     }
 
+    /**
+     * 验证 {@code shouldRejectEmptyTablespaceForOrdinaryRequire} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void shouldRejectEmptyTablespaceForOrdinaryRequire() {
         CachingTablespaceRegistry registry = new CachingTablespaceRegistry(spaceId -> Optional.of(metadata(TablespaceState.EMPTY)));
@@ -100,6 +124,9 @@ class CachingTablespaceRegistryTest {
         assertThrows(TablespaceUnavailableException.class, () -> registry.require(SpaceId.of(10)));
     }
 
+    /**
+     * 验证 {@code shouldAllowCorruptedTablespaceForRecoveryRequire} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void shouldAllowCorruptedTablespaceForRecoveryRequire() {
         CachingTablespaceRegistry registry = new CachingTablespaceRegistry(spaceId -> Optional.of(metadata(TablespaceState.CORRUPTED)));
@@ -109,6 +136,9 @@ class CachingTablespaceRegistryTest {
         assertEquals(TablespaceState.CORRUPTED, handle.tablespace().state());
     }
 
+    /**
+     * 验证 {@code shouldRefreshRuntimeHandleFromLoader} 对应的表空间物理文件行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void shouldRefreshRuntimeHandleFromLoader() {
         MutableLoader loader = new MutableLoader(metadata(TablespaceState.NORMAL));
@@ -121,6 +151,9 @@ class CachingTablespaceRegistryTest {
         assertEquals(TablespaceState.INACTIVE, refreshed.tablespace().state());
     }
 
+    /**
+     * 验证 {@code shouldReplaceRuntimeMetadata} 所描述的字典/DDL 协作，并断言版本、对象身份、缓存失效和物理绑定保持一致。
+     */
     @Test
     void shouldReplaceRuntimeMetadata() {
         CachingTablespaceRegistry registry = new CachingTablespaceRegistry(spaceId -> Optional.empty());
@@ -130,6 +163,9 @@ class CachingTablespaceRegistryTest {
         assertSame(replaced, registry.require(SpaceId.of(10)));
     }
 
+    /**
+     * 验证 {@code shouldMarkCorruptedAndDiscarded} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void shouldMarkCorruptedAndDiscarded() {
         CachingTablespaceRegistry registry = new CachingTablespaceRegistry(spaceId -> Optional.of(metadata(TablespaceState.NORMAL)));
@@ -146,6 +182,9 @@ class CachingTablespaceRegistryTest {
         assertThrows(TablespaceNotFoundException.class, () -> another.require(SpaceId.of(10)));
     }
 
+    /**
+     * 验证 {@code shouldMarkInactiveBlockingOrdinaryRequireButAllowingRecovery} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void shouldMarkInactiveBlockingOrdinaryRequireButAllowingRecovery() {
         CachingTablespaceRegistry registry = new CachingTablespaceRegistry(spaceId -> Optional.of(metadata(TablespaceState.NORMAL)));
@@ -159,6 +198,9 @@ class CachingTablespaceRegistryTest {
         assertEquals(TablespaceState.INACTIVE, registry.find(SpaceId.of(10)).orElseThrow().tablespace().state());
     }
 
+    /**
+     * 验证 {@code shouldCloseRemoveAndListRuntimeHandles} 所描述的组件生命周期，并断言状态转换、后台线程停止和资源恰好释放一次。
+     */
     @Test
     void shouldCloseRemoveAndListRuntimeHandles() {
         CachingTablespaceRegistry registry = new CachingTablespaceRegistry(spaceId -> Optional.of(metadata(TablespaceState.NORMAL)));

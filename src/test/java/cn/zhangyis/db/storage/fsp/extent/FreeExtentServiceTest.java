@@ -66,6 +66,9 @@ class FreeExtentServiceTest {
         }
     }
 
+    /**
+     * 验证 {@code fillSkipsSystemExtentAndAdvancesByExtent} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void fillSkipsSystemExtentAndAdvancesByExtent() {
         withSvc(192, (header, xdes, flst, svc, mgr, pool) -> {
@@ -82,6 +85,9 @@ class FreeExtentServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code acquireFillsThenPopsAndReturnsRecycle} 对应的表空间、区与段分配行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void acquireFillsThenPopsAndReturnsRecycle() {
         withSvc(192, (header, xdes, flst, svc, mgr, pool) -> {
@@ -99,6 +105,9 @@ class FreeExtentServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code acquireWithDirectionChoosesNearestFreeExtentAroundHint} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void acquireWithDirectionChoosesNearestFreeExtentAroundHint() {
         withSvc(320, (header, xdes, flst, svc, mgr, pool) -> {
@@ -117,6 +126,9 @@ class FreeExtentServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code upDirectionCanMaterializeHigherExtentBeforeFallingBack} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void upDirectionCanMaterializeHigherExtentBeforeFallingBack() {
         withSvc(256, (header, xdes, flst, svc, mgr, pool) -> {
@@ -128,6 +140,9 @@ class FreeExtentServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code allocateFragmentPagesFromFreeFragThenFull} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void allocateFragmentPagesFromFreeFragThenFull() {
         withSvc(128, (header, xdes, flst, svc, mgr, pool) -> {

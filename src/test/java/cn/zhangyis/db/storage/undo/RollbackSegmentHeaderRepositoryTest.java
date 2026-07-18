@@ -45,6 +45,9 @@ class RollbackSegmentHeaderRepositoryTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code formatThenReadEmptyDirectory} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void formatThenReadEmptyDirectory() {
         assertEquals(4, RollbackSegmentHeaderLayout.FORMAT_VERSION);
@@ -200,6 +203,9 @@ class RollbackSegmentHeaderRepositoryTest {
         });
     }
 
+    /**
+     * 验证 {@code truncateStyleTopRemovalValidatesExpectedCountAndOrder} 对应的Undo 日志行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void truncateStyleTopRemovalValidatesExpectedCountAndOrder() {
         withRepo((repo, mgr) -> {
@@ -234,6 +240,9 @@ class RollbackSegmentHeaderRepositoryTest {
         });
     }
 
+    /**
+     * 验证 {@code claimSlotThenReadRoundTrips} 对应的Undo 日志行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void claimSlotThenReadRoundTrips() {
         withRepo((repo, mgr) -> {
@@ -280,6 +289,9 @@ class RollbackSegmentHeaderRepositoryTest {
         });
     }
 
+    /**
+     * 验证 {@code claimSlotAppendsUndoMetadataDeltaRedo} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void claimSlotAppendsUndoMetadataDeltaRedo() {
         withRepo((repo, mgr) -> {
@@ -302,6 +314,9 @@ class RollbackSegmentHeaderRepositoryTest {
         });
     }
 
+    /**
+     * 验证 {@code clearSlotRequiresExpectedOwnerAndClearsSlot} 对应的Undo 日志行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void clearSlotRequiresExpectedOwnerAndClearsSlot() {
         withRepo((repo, mgr) -> {
@@ -318,6 +333,9 @@ class RollbackSegmentHeaderRepositoryTest {
         });
     }
 
+    /**
+     * 验证 {@code claimOccupiedAndClearStaleOwnerFailClosed} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void claimOccupiedAndClearStaleOwnerFailClosed() {
         withRepo((repo, mgr) -> {
@@ -343,6 +361,9 @@ class RollbackSegmentHeaderRepositoryTest {
         });
     }
 
+    /**
+     * 验证 {@code readRejectsRsegIdAndCapacityMismatch} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void readRejectsRsegIdAndCapacityMismatch() {
         withRepo((repo, mgr) -> {
@@ -428,6 +449,9 @@ class RollbackSegmentHeaderRepositoryTest {
         }
     }
 
+    /**
+     * 验证 {@code readRejectsUnformattedPage} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void readRejectsUnformattedPage() {
         withRepo((repo, mgr) -> {
@@ -437,6 +461,9 @@ class RollbackSegmentHeaderRepositoryTest {
         });
     }
 
+    /**
+     * 验证 {@code claimSlotRejectsOutOfRangeSlot} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void claimSlotRejectsOutOfRangeSlot() {
         withRepo((repo, mgr) -> {
@@ -448,6 +475,9 @@ class RollbackSegmentHeaderRepositoryTest {
         });
     }
 
+    /**
+     * 验证 {@code formatRejectsCapacityOverflowingPage} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void formatRejectsCapacityOverflowingPage() {
         withRepo((repo, mgr) -> {

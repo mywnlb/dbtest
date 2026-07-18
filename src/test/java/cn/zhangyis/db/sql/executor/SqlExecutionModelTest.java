@@ -13,6 +13,9 @@ import static org.junit.jupiter.api.Assertions.*;
 
 /** SQL 公开结果模型不变量。 */
 class SqlExecutionModelTest {
+    /**
+     * 验证 {@code bytesAndListsAreDefensivelyCopiedAndUnsignedBigintIsExact} 对应的SQL 计划执行行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void bytesAndListsAreDefensivelyCopiedAndUnsignedBigintIsExact() {
         byte[] source = {1, 2};
@@ -31,6 +34,9 @@ class SqlExecutionModelTest {
         assertEquals(1, row.values().size());
     }
 
+    /**
+     * 验证 {@code queryRejectsDuplicateColumnsAndWidthMismatch} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void queryRejectsDuplicateColumnsAndWidthMismatch() {
         ColumnTypeDefinition type = ColumnTypeDefinition.scalar(DictionaryTypeId.INT, false, false);

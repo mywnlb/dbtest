@@ -35,6 +35,9 @@ class UndoRecordTest {
             new HiddenColumns(TransactionId.of(3), new RollPointer(false, PageNo.of(66), 12));
     private static final RollPointer PREV = new RollPointer(false, PageNo.of(66), 40);
 
+    /**
+     * 验证 {@code insertFactoryHasNoOldImage} 对应的Undo 日志行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void insertFactoryHasNoOldImage() {
         UndoRecord rec = UndoRecord.insert(UndoNo.of(1), TXN, 1L, 9L, KEY, RollPointer.NULL);
@@ -44,6 +47,9 @@ class UndoRecordTest {
         assertNull(rec.oldHiddenColumns(), "INSERT undo carries no old hidden columns");
     }
 
+    /**
+     * 验证 {@code updateFactoryCarriesFullOldImage} 对应的Undo 日志行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void updateFactoryCarriesFullOldImage() {
         UndoRecord rec = UndoRecord.update(UndoNo.of(2), TXN, 1L, 9L, KEY, OLD_ROW, OLD_HIDDEN, PREV);
@@ -54,6 +60,9 @@ class UndoRecordTest {
         assertEquals(PREV, rec.prevRollPointer());
     }
 
+    /**
+     * 验证 {@code insertWithOldImageRejected} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void insertWithOldImageRejected() {
         // 直接走 canonical ctor 传 old image 给 INSERT_ROW → 拒绝
@@ -62,6 +71,9 @@ class UndoRecordTest {
                 List.of(), RollPointer.NULL));
     }
 
+    /**
+     * 验证 {@code updateWithoutOldImageRejected} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void updateWithoutOldImageRejected() {
         assertThrows(DatabaseValidationException.class, () -> new UndoRecord(
@@ -70,6 +82,9 @@ class UndoRecordTest {
                 UndoRecordType.UPDATE_ROW, UndoNo.of(2), TXN, 1L, 9L, KEY, OLD_ROW, null, List.of(), PREV));
     }
 
+    /**
+     * 验证 {@code deleteMarkFactoryCarriesFullOldImage} 对应的Undo 日志行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void deleteMarkFactoryCarriesFullOldImage() {
         // T1.3f：DELETE_MARK 放开，复用 UPDATE 旧 image 结构（删除前存活版本）
@@ -80,12 +95,18 @@ class UndoRecordTest {
         assertEquals(PREV, rec.prevRollPointer());
     }
 
+    /**
+     * 验证 {@code deleteMarkWithoutOldImageRejected} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void deleteMarkWithoutOldImageRejected() {
         assertThrows(DatabaseValidationException.class, () -> new UndoRecord(
                 UndoRecordType.DELETE_MARK, UndoNo.of(1), TXN, 1L, 9L, KEY, null, null, List.of(), PREV));
     }
 
+    /**
+     * 验证 {@code undoNoNoneAndEmptyKeyRejected} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void undoNoNoneAndEmptyKeyRejected() {
         assertThrows(DatabaseValidationException.class,

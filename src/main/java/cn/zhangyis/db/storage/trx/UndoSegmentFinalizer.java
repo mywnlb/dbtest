@@ -71,6 +71,7 @@ public final class UndoSegmentFinalizer {
      * @param undoAllocator    segment drop 端口。
      * @param headerRepository page3 owner CAS 仓储。
      * @param slotManager      运行期 slot 投影。
+     * @param reuseDirectory 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
      */
     public UndoSegmentFinalizer(MiniTransactionManager mtrManager, UndoLogSegmentAccess undoAccess,
                                  UndoSpaceAllocator undoAllocator,
@@ -81,23 +82,45 @@ public final class UndoSegmentFinalizer {
                 UndoFinalizationFaultInjector.none());
     }
 
-    /** 包内测试构造器，只允许在成功 commit 后注入模拟 crash。 */
+    /** 包内测试构造器，只允许在成功 commit 后注入模拟 crash。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝 null、越界和相互矛盾的组合。</li>
+     *     <li>完成跨参数校验并推导不可变配置；若构造过程创建自有资源，后续失败必须在异常路径关闭。</li>
+     *     <li>把已校验协作者与配置绑定到字段，并初始化本对象拥有的状态、显式锁、队列或缓存，不允许 this 提前逃逸。</li>
+     *     <li>构造完成后对象处于类契约声明的初始状态；任一步失败都抛出领域异常且不发布半初始化实例。</li>
+     * </ol>
+     *
+     * @param mtrManager 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param undoAccess 由组合根提供的 {@code UndoLogSegmentAccess} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param undoAllocator 由组合根提供的 {@code UndoSpaceAllocator} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param headerRepository 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param slotManager 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param reuseDirectory 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param faultInjector 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     UndoSegmentFinalizer(MiniTransactionManager mtrManager, UndoLogSegmentAccess undoAccess,
                           UndoSpaceAllocator undoAllocator,
                           RollbackSegmentHeaderRepository headerRepository,
                           RollbackSegmentSlotManager slotManager,
                           UndoSegmentReuseDirectory reuseDirectory,
                           UndoFinalizationFaultInjector faultInjector) {
+        // 1、校验必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝非法组合。
         if (mtrManager == null || undoAccess == null || undoAllocator == null || headerRepository == null
                 || slotManager == null || reuseDirectory == null || faultInjector == null) {
             throw new DatabaseValidationException("undo finalizer collaborators must not be null");
         }
         this.mtrManager = mtrManager;
+        // 2、完成跨参数校验并推导不可变配置；后续失败仍由当前构造路径收口已创建资源。
         this.undoAccess = undoAccess;
         this.undoAllocator = undoAllocator;
+        // 3、绑定已校验协作者并初始化本对象拥有的状态、显式锁、队列或缓存，不允许半初始化实例逃逸。
         this.headerRepository = headerRepository;
         this.slotManager = slotManager;
         this.reuseDirectory = reuseDirectory;
+        // 4、完成初始状态发布；失败以领域异常终止构造，成功对象满足类级生命周期不变量。
         this.faultInjector = faultInjector;
     }
 
@@ -159,17 +182,34 @@ public final class UndoSegmentFinalizer {
     /**
      * 原子提交事务拥有的独立 undo logs。INSERT-only 按 eligibility cache/free/drop；UPDATE-only 只写 COMMITTED
      * header；mixed 在同一 MTR 中先终结 INSERT owner，再写 UPDATE header，最后只追加一次事务 commit delta。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
+     * @param transaction 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
+     * @param context 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param historyLease 参与 {@code finalizeCommit} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @throws TransactionStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
+     * @throws UndoFinalizationException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
      */
     void finalizeCommit(Transaction transaction, UndoContext context, HistoryList.AppendLease historyLease) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         if (transaction == null || context == null || transaction.state() != TransactionState.ACTIVE
                 || transaction.transactionId().isNone() || transaction.transactionNo().isNone()) {
             throw new TransactionStateException("undo commit finalization requires ACTIVE write transaction and commitNo");
         }
         UndoLogBinding insert = context.binding(UndoLogKind.INSERT);
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         UndoLogBinding update = context.binding(UndoLogKind.UPDATE);
         if (insert == null && update == null) {
             throw new TransactionStateException("undo commit finalization requires at least one undo log");
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         if ((update == null) != (historyLease == null)) {
             throw new TransactionStateException("UPDATE undo commit requires exactly one history append lease");
         }
@@ -180,6 +220,7 @@ public final class UndoSegmentFinalizer {
             commitUpdateOnly(transaction, historyAppend, historyLease);
             return;
         }
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         try (RollbackSegmentSlotManager.BatchFinalizationLease lease =
                      slotManager.beginBatchFinalization(List.of(insert))) {
             PreparedActive insertPrepared = prepareActive(insert, transaction.transactionId(), false);
@@ -243,10 +284,28 @@ public final class UndoSegmentFinalizer {
         }
     }
 
+    /**
+     * 校验当前状态后推进事务、MVCC 与锁状态机；成功发布唯一终态，失败保留可回滚或可恢复的原始状态。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
+     * @param transaction 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
+     * @param prepared 当前算法已准备的中间状态；不得为 {@code null}，必须由本次扫描、日志组装或事务终结流程创建且尚未发布
+     * @param historyLease 参与 {@code commitUpdateOnly} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @throws UndoFinalizationException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
+     */
     private void commitUpdateOnly(Transaction transaction, PreparedHistoryAppend prepared,
                                   HistoryList.AppendLease historyLease) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         MiniTransaction mtr = mtrManager.begin(mtrManager.budgetFor(
                 RedoBudgetPurpose.UNDO_COMMIT, UndoRedoBudgetEstimator.commit(null)));
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         try {
             historyLease.physicalMutationStarted();
             UndoLogBinding update = prepared.update().binding();
@@ -261,8 +320,10 @@ public final class UndoSegmentFinalizer {
             rollbackActiveMtr(mtr, error);
             throw new UndoFinalizationException("UPDATE undo commit finalization failed", error);
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         UndoLogBinding update = prepared.update().binding();
         faultInjector.afterCommit(UndoFinalizationKind.UPDATE_COMMIT, update.slotId(), update.firstPageId());
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         try {
             historyLease.complete();
         } catch (RuntimeException error) {
@@ -371,11 +432,27 @@ public final class UndoSegmentFinalizer {
         }
     }
 
-    /** UPDATE-only prepared commit；没有需要转移的 INSERT slot owner。 */
+    /** UPDATE-only prepared commit；没有需要转移的 INSERT slot owner。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
+     * @param transaction 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
+     * @param prepared 当前算法已准备的中间状态；不得为 {@code null}，必须由本次扫描、日志组装或事务终结流程创建且尚未发布
+     * @param historyLease 参与 {@code commitPreparedUpdateOnly} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @throws UndoFinalizationException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
+     */
     private void commitPreparedUpdateOnly(Transaction transaction, PreparedHistoryAppend prepared,
                                           HistoryList.AppendLease historyLease) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         MiniTransaction mtr = mtrManager.begin(mtrManager.budgetFor(
                 RedoBudgetPurpose.UNDO_COMMIT, UndoRedoBudgetEstimator.commit(null)));
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         try {
             historyLease.physicalMutationStarted();
             UndoLogBinding update = prepared.update().binding();
@@ -391,9 +468,11 @@ public final class UndoSegmentFinalizer {
             throw new UndoFinalizationException(
                     "prepared UPDATE commit finalization failed", error);
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         UndoLogBinding update = prepared.update().binding();
         faultInjector.afterCommit(
                 UndoFinalizationKind.PREPARED_COMMIT, update.slotId(), update.firstPageId());
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         try {
             historyLease.complete();
         } catch (RuntimeException error) {
@@ -407,6 +486,8 @@ public final class UndoSegmentFinalizer {
      *
      * @param transaction 正处于 ROLLING_BACK 的 live 事务。
      * @param context     已发布 EMPTY logical head 的 undo context。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws TransactionStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
      */
     void finalizeLiveRollback(Transaction transaction, UndoContext context) {
         if (transaction == null || context == null) {
@@ -500,7 +581,11 @@ public final class UndoSegmentFinalizer {
         }
     }
 
-    /** recovery 对同一 creator 的 INSERT/UPDATE slots 做一次原子 cache/free/drop owner 终结与 terminal delta。 */
+    /** recovery 对同一 creator 的 INSERT/UPDATE slots 做一次原子 cache/free/drop owner 终结与 terminal delta。
+     *
+     * @param bindings 参与 {@code finalizeRecoveredRollback} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @param creatorTransactionId 事务的稳定标识；不得为 {@code null}，{@code NONE} 只表示尚未绑定事务，不能代替活跃事务身份
+     */
     void finalizeRecoveredRollback(Collection<UndoLogBinding> bindings, TransactionId creatorTransactionId) {
         finalizeActiveBatch(UndoFinalizationKind.RECOVERY_ROLLBACK, bindings, creatorTransactionId, null);
     }
@@ -716,6 +801,9 @@ public final class UndoSegmentFinalizer {
      * committed purge：只允许回收 header identity 与 history entry 完全一致的 COMMITTED segment。
      *
      * @param entry 当前 committed history 队首 identity。
+     * @param historyLease 参与 {@code finalizePurgedHistory} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws UndoFinalizationException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
      */
     void finalizePurgedHistory(HistoryEntry entry, HistoryList.HeadRemovalLease historyLease) {
         if (entry == null || historyLease == null || !entry.equals(historyLease.expected())) {
@@ -920,7 +1008,12 @@ public final class UndoSegmentFinalizer {
         }
     }
 
-    /** 运行期 free tail/count 必须与所有预检看到的 page3 base 一致，不能把 stale 目录直接写回磁盘。 */
+    /** 运行期 free tail/count 必须与所有预检看到的 page3 base 一致，不能把 stale 目录直接写回磁盘。
+     *
+     * @param candidates 参与 {@code requireFreeProjectionMatchesPage3} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @param lease 调用方持有的 {@code UndoSegmentReuseDirectory.FreePushLease} 资源句柄；不得为 {@code null} 且必须处于有效期，方法返回前所有权仍归调用方
+     * @throws UndoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     private static void requireFreeProjectionMatchesPage3(List<PreparedActive> candidates,
                                                           UndoSegmentReuseDirectory.FreePushLease lease) {
         RollbackSegmentFreeListBase base = candidates.getFirst().freeBase();
@@ -975,7 +1068,11 @@ public final class UndoSegmentFinalizer {
         }
     }
 
-    /** 只在 MTR 仍 ACTIVE 时释放 memo；COMMITTING 失败保持原始结果不确定原因。 */
+    /** 只在 MTR 仍 ACTIVE 时释放 memo；COMMITTING 失败保持原始结果不确定原因。
+     *
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param original 需要分类或包装的原始失败；不得为 {@code null}，包装时必须保留 cause 与 suppressed 异常图
+     */
     private void rollbackActiveMtr(MiniTransaction mtr, RuntimeException original) {
         if (mtr.state() != MiniTransactionState.ACTIVE) {
             return;
@@ -987,6 +1084,13 @@ public final class UndoSegmentFinalizer {
         }
     }
 
+    /**
+     * 封装事务、MVCC 与锁中 {@code PreparedActive} 已校验但尚待发布的事务阶段状态；字段共同固定 owner、物理证据和补偿边界，防止提交/回滚重复执行。
+     *
+     * @param binding 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param handle 调用方持有的 {@code UndoSegmentHandle} 资源句柄；不得为 {@code null} 且必须处于有效期，方法返回前所有权仍归调用方
+     * @param freeBase 参与 {@code 构造} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     */
     private record PreparedActive(UndoLogBinding binding, UndoSegmentHandle handle,
                                   RollbackSegmentFreeListBase freeBase) {
         private PreparedActive {
@@ -996,6 +1100,13 @@ public final class UndoSegmentFinalizer {
         }
     }
 
+    /**
+     * 封装事务、MVCC 与锁中 {@code PreparedHistoryAppend} 已校验但尚待发布的事务阶段状态；字段共同固定 owner、物理证据和补偿边界，防止提交/回滚重复执行。
+     *
+     * @param update 当前算法已准备的中间状态；不得为 {@code null}，必须由本次扫描、日志组装或事务终结流程创建且尚未发布
+     * @param base 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param oldTail 可选的 {@code oldTail}；参数本身不得为 {@code null}，空 {@code Optional} 明确表示调用方未提供该领域值
+     */
     private record PreparedHistoryAppend(PreparedActive update, RollbackSegmentHistoryBase base,
                                          Optional<UndoHistoryNodeSnapshot> oldTail) {
         private PreparedHistoryAppend {
@@ -1005,6 +1116,14 @@ public final class UndoSegmentFinalizer {
         }
     }
 
+    /**
+     * 封装事务、MVCC 与锁中 {@code PreparedPurge} 已校验但尚待发布的事务阶段状态；字段共同固定 owner、物理证据和补偿边界，防止提交/回滚重复执行。
+     *
+     * @param base 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param freeBase 参与 {@code 构造} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @param removed 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param newHead 可选的 {@code newHead}；参数本身不得为 {@code null}，空 {@code Optional} 明确表示调用方未提供该领域值
+     */
     private record PreparedPurge(RollbackSegmentHistoryBase base, RollbackSegmentFreeListBase freeBase,
                                  UndoHistoryNodeSnapshot removed,
                                  Optional<UndoHistoryNodeSnapshot> newHead) {
@@ -1015,6 +1134,14 @@ public final class UndoSegmentFinalizer {
         }
     }
 
+    /**
+     * 封装事务、MVCC 与锁中 {@code FinalizationDisposition} 已校验但尚待发布的事务阶段状态；字段共同固定 owner、物理证据和补偿边界，防止提交/回滚重复执行。
+     *
+     * @param prepared 当前算法已准备的中间状态；不得为 {@code null}，必须由本次扫描、日志组装或事务终结流程创建且尚未发布
+     * @param dropPlan 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param cachePush 调用方持有的 {@code UndoSegmentReuseDirectory.CachePushLease} 资源句柄；不得为 {@code null} 且必须处于有效期，方法返回前所有权仍归调用方
+     * @param free 资源是否处于删除、空闲、静默、持久化或终态；必须与权威状态机一致，不能由调用方猜测
+     */
     private record FinalizationDisposition(PreparedActive prepared, UndoSegmentDropPlan dropPlan,
                                            UndoSegmentReuseDirectory.CachePushLease cachePush,
                                            boolean free) {
@@ -1034,8 +1161,17 @@ public final class UndoSegmentFinalizer {
 
     /** cache/free push lease 的 RAII 组合；物理写前统一立 fence，commit 后统一发布运行期 owner。 */
     private static final class ReusePushGroup implements AutoCloseable {
+        /**
+         * 本对象拥有的 {@code dispositions} 受控集合；元素生命周期与外层对象一致，仅由本类方法更新，对外暴露时必须返回副本或不可变视图。
+         */
         private final List<FinalizationDisposition> dispositions;
+        /**
+         * 本对象拥有的 {@code leases} 受控集合；元素生命周期与外层对象一致，仅由本类方法更新，对外暴露时必须返回副本或不可变视图。
+         */
         private final List<UndoSegmentReuseDirectory.CachePushLease> leases;
+        /**
+         * 本次事务链路持有的 {@code freeLease} undo/rollback 状态；事务身份、roll pointer 与段代际必须一致，提交、回滚和 purge 路径依赖它完成收口。
+         */
         private final UndoSegmentReuseDirectory.FreePushLease freeLease;
 
         private ReusePushGroup(List<FinalizationDisposition> dispositions,
@@ -1072,9 +1208,22 @@ public final class UndoSegmentFinalizer {
             }
         }
 
+        /**
+         * 释放本方法拥有的事务、MVCC 与锁资源；遵守既定释放顺序，重复或失败调用不得掩盖原始状态。
+         * <p>数据流：</p>
+         * <ol>
+         *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+         *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+         *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+         *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+         * </ol>
+         *
+         */
         @Override
         public void close() {
+            // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
             RuntimeException failure = null;
+            // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
             if (freeLease != null) {
                 try {
                     freeLease.close();
@@ -1082,6 +1231,7 @@ public final class UndoSegmentFinalizer {
                     failure = closeFailure;
                 }
             }
+            // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
             for (int i = leases.size() - 1; i >= 0; i--) {
                 try {
                     leases.get(i).close();
@@ -1093,6 +1243,7 @@ public final class UndoSegmentFinalizer {
                     }
                 }
             }
+            // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
             if (failure != null) {
                 throw failure;
             }

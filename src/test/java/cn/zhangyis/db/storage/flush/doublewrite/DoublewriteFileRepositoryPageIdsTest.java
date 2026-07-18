@@ -29,6 +29,9 @@ class DoublewriteFileRepositoryPageIdsTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code pageIdsReturnsDistinctValidSlotPages} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void pageIdsReturnsDistinctValidSlotPages() {
         try (DoublewriteFileRepository dw = DoublewriteFileRepository.open(dir.resolve("dw.dat"), PS)) {
@@ -42,6 +45,9 @@ class DoublewriteFileRepositoryPageIdsTest {
         }
     }
 
+    /**
+     * 验证 {@code pageIdsSkipsSlotsFailingPageChecksum} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void pageIdsSkipsSlotsFailingPageChecksum() {
         try (DoublewriteFileRepository dw = DoublewriteFileRepository.open(dir.resolve("dw.dat"), PS)) {

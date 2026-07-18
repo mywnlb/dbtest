@@ -25,7 +25,11 @@ public record SearchKey(List<ColumnValue> values) {
         return values.size();
     }
 
-    /** 第 i 个 key part 值。 */
+    /** 第 i 个 key part 值。
+     *
+     * @param i 参与 {@code value} 的零基位置 {@code i}；必须非负且小于所属页面、集合或持久结构的容量
+     * @return {@code value} 编码、解码或重建的记录数据；成功时不为 {@code null}，字段顺序、隐藏列和字节边界满足当前 schema
+     */
     public ColumnValue value(int i) {
         return values.get(i);
     }

@@ -17,9 +17,17 @@ import java.util.List;
  */
 public interface LockObservationService extends RowLockEventSink {
 
-    /** 从 LockManager 只读快照构造诊断快照行。 */
+    /** 从 LockManager 只读快照构造诊断快照行。
+     *
+     * @param lockSnapshot 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @param request 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @return {@code captureSnapshot} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     */
     LockDiagnosticSnapshot captureSnapshot(LockSnapshot lockSnapshot, SnapshotRequest request);
 
-    /** 最近 deadlock report，最新在列表首位。 */
+    /** 最近 deadlock report，最新在列表首位。
+     *
+     * @return 调用时刻的不可变状态集合或映射；没有已发布条目时返回空集合，调用方修改不会影响权威状态
+     */
     List<DeadlockReport> latestDeadlocks();
 }

@@ -64,6 +64,9 @@ class DiskSpaceManagerTest {
         }
     }
 
+    /**
+     * 验证 {@code createTablespaceThenUsageAndSegment} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void createTablespaceThenUsageAndSegment() {
         withDsm((dsm, mgr) -> {
@@ -81,6 +84,9 @@ class DiskSpaceManagerTest {
         });
     }
 
+    /**
+     * 验证 {@code allocateFreeReallocateRecyclesPage} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void allocateFreeReallocateRecyclesPage() {
         withDsm((dsm, mgr) -> {
@@ -95,6 +101,9 @@ class DiskSpaceManagerTest {
         });
     }
 
+    /**
+     * 验证 {@code allocateAutoextendsWhenExhausted} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void allocateAutoextendsWhenExhausted() {
         withDsm((dsm, mgr) -> {
@@ -110,6 +119,9 @@ class DiskSpaceManagerTest {
         });
     }
 
+    /**
+     * 验证 {@code allocatePageAcceptsDirectionalHintWithoutChangingLegacyPageInitialization} 所描述的边界场景保持既有领域不变量，不产生方法名明确禁止的副作用。
+     */
     @Test
     void allocatePageAcceptsDirectionalHintWithoutChangingLegacyPageInitialization() {
         withDsm((dsm, mgr) -> {
@@ -122,6 +134,9 @@ class DiskSpaceManagerTest {
         });
     }
 
+    /**
+     * 验证 {@code allocateThrowsNoFreeSpaceOnTinyTablespace} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void allocateThrowsNoFreeSpaceOnTinyTablespace() {
         withDsm((dsm, mgr) -> {
@@ -133,6 +148,9 @@ class DiskSpaceManagerTest {
         });
     }
 
+    /**
+     * 验证 {@code dropSegmentReclaimsAndAllowsSlotReuse} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void dropSegmentReclaimsAndAllowsSlotReuse() {
         withDsm((dsm, mgr) -> {
@@ -195,6 +213,9 @@ class DiskSpaceManagerTest {
         });
     }
 
+    /**
+     * 验证 {@code allocatePageEmitsPageInitAndStampsEnvelope} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void allocatePageEmitsPageInitAndStampsEnvelope() {
         PageStore store = new FileChannelPageStore();
@@ -223,6 +244,9 @@ class DiskSpaceManagerTest {
         }
     }
 
+    /**
+     * 验证 {@code allocatePageEmitsFspLogicalRedoBeforePageInit} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void allocatePageEmitsFspLogicalRedoBeforePageInit() {
         PageStore store = new FileChannelPageStore();
@@ -249,6 +273,9 @@ class DiskSpaceManagerTest {
         }
     }
 
+    /**
+     * 验证 {@code autoextendAllocationMarksFspLogicalRedoRetry} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void autoextendAllocationMarksFspLogicalRedoRetry() {
         PageStore store = new FileChannelPageStore();
@@ -272,6 +299,9 @@ class DiskSpaceManagerTest {
         }
     }
 
+    /**
+     * 验证 {@code fspOperationsEmitMetadataDeltaRecordsAndPageFreeIntent} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void fspOperationsEmitMetadataDeltaRecordsAndPageFreeIntent() {
         PageStore store = new FileChannelPageStore();
@@ -306,6 +336,9 @@ class DiskSpaceManagerTest {
         }
     }
 
+    /**
+     * 验证 {@code reallocateResidentPageReinitializes} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void reallocateResidentPageReinitializes() {
         PageStore store = new FileChannelPageStore();

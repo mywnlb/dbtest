@@ -32,7 +32,10 @@ public final class TransactionSystem {
      */
     private final Set<ReadView> liveReadViews = new HashSet<>();
 
-    /** 分配单调事务写 id 并登记为活跃读写事务（首次写入时调用）。 */
+    /** 分配单调事务写 id 并登记为活跃读写事务（首次写入时调用）。
+     *
+     * @return {@code allocateWriteId} 定位或分配的稳定值对象；成功时不为 {@code null}，其身份、范围和特殊值已由构造校验保证
+     */
     TransactionId allocateWriteId() {
         lock.lock();
         try {
@@ -44,7 +47,10 @@ public final class TransactionSystem {
         }
     }
 
-    /** 分配单调提交序号（commit 时给读写事务调用）。 */
+    /** 分配单调提交序号（commit 时给读写事务调用）。
+     *
+     * @return {@code allocateTransactionNo} 定位或分配的稳定值对象；成功时不为 {@code null}，其身份、范围和特殊值已由构造校验保证
+     */
     TransactionNo allocateTransactionNo() {
         lock.lock();
         try {
@@ -54,7 +60,10 @@ public final class TransactionSystem {
         }
     }
 
-    /** 从活跃表移出（commit/rollback 读写事务）。 */
+    /** 从活跃表移出（commit/rollback 读写事务）。
+     *
+     * @param txnId 参与 {@code removeActive} 的原始数值身份 {@code txnId}；必须非负，零值仅用于对应格式明确声明的系统或空身份
+     */
     void removeActive(long txnId) {
         lock.lock();
         try {
@@ -97,6 +106,7 @@ public final class TransactionSystem {
      *
      * @param nextTransactionId 复位后下一个待分配写 id（&gt;=1）。
      * @param nextTransactionNo 复位后下一个待分配提交序号（&gt;=1）。
+     * @throws TransactionStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
      */
     public void restoreCounters(long nextTransactionId, long nextTransactionNo) {
         if (nextTransactionId < 1 || nextTransactionNo < 1) {
@@ -132,7 +142,10 @@ public final class TransactionSystem {
         }
     }
 
-    /** 活跃读写事务 id 的不可变快照（拷贝后立即释放锁）。 */
+    /** 活跃读写事务 id 的不可变快照（拷贝后立即释放锁）。
+     *
+     * @return 调用时刻的不可变状态集合或映射；没有已发布条目时返回空集合，调用方修改不会影响权威状态
+     */
     public Set<Long> snapshotActiveReadWriteIds() {
         lock.lock();
         try {
@@ -154,6 +167,7 @@ public final class TransactionSystem {
      *
      * @param txn 发起一致性读的事务（只读 creator 保持 NONE；可写则在此分配 creator）。
      * @return 该时刻的一致性读快照。
+     * @throws TransactionStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
      */
     ReadView openReadViewSnapshot(Transaction txn) {
         if (txn == null) {
@@ -188,6 +202,7 @@ public final class TransactionSystem {
      * RC 由调用方语句末经 {@link ReadViewManager#closeReadView} 调用。幂等：重复/未登记的 view 注销为 no-op。
      *
      * @param view 待注销的一致性读快照，不能为 null。
+     * @throws TransactionStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
      */
     void closeReadView(ReadView view) {
         if (view == null) {
@@ -232,6 +247,10 @@ public final class TransactionSystem {
      * 对每个存活 ReadView 均已可见。active 检查不可省略：live 集合为空时，单靠“对所有快照可见”会真空成立。
      *
      * <p>锁内只读不可变 ReadView 和计数器，不执行 IO；purge 在调用后仍须通过 history lease 串行化物理 unlink。
+     * @param commitNo 参与 {@code isPurgeEligible} 的稳定领域标识 {@code TransactionNo}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param creatorTransactionId 事务的稳定标识；不得为 {@code null}，{@code NONE} 只表示尚未绑定事务，不能代替活跃事务身份
+     * @return {@code isPurgeEligible} 命名的领域事实成立时为 {@code true}，否则为 {@code false}；查询本身不改变权威状态
+     * @throws TransactionStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
      */
     public boolean isPurgeEligible(TransactionNo commitNo, TransactionId creatorTransactionId) {
         if (commitNo == null || commitNo.isNone() || creatorTransactionId == null

@@ -49,6 +49,8 @@ class TransactionRecoveryCheckpointStoreTest {
     /**
      * 最新槽所在的整个 4 KiB 物理页损坏时仍必须回退旧槽。该测试固定双槽不共享同一物理页，避免一次
      * torn sector/page write 同时抹掉两份 CRC 副本。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
      */
     @Test
     void corruptNewestSlotPageFallsBackToOlderValidBaseline() throws Exception {

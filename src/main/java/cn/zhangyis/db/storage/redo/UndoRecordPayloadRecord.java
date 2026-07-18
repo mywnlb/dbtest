@@ -27,7 +27,10 @@ public record UndoRecordPayloadRecord(
         int recordOffset,
         byte[] slotImage) implements RedoRecord {
 
-    /** tag(1)+pageId(12)+transactionId(8)+undoNo(8)+recordOffset(4)+payloadLen(4)。 */
+    /** tag(1)+pageId(12)+transactionId(8)+undoNo(8)+recordOffset(4)+payloadLen(4)。
+     *
+     * 稳定布局常量，参与页内偏移、长度或位域计算；编解码两端必须保持完全一致。
+     */
     private static final int HEADER_BYTES = 37;
 
     public UndoRecordPayloadRecord {
@@ -63,7 +66,11 @@ public record UndoRecordPayloadRecord(
         return HEADER_BYTES + slotImage.length;
     }
 
-    /** redo payload 是值对象，数组字段按内容比较。 */
+    /** redo payload 是值对象，数组字段按内容比较。
+     *
+     * @param obj 待比较对象；允许为 {@code null} 或其他类型，此时按 {@code equals} 契约返回 {@code false}
+     * @return 比较对象类型与全部值语义相等时为 {@code true}；对象为 {@code null}、类型不同或任一组件不等时为 {@code false}
+     */
     @Override
     public boolean equals(Object obj) {
         if (this == obj) {
@@ -79,6 +86,11 @@ public record UndoRecordPayloadRecord(
                 && Arrays.equals(slotImage, that.slotImage);
     }
 
+    /**
+     * 实现 {@code hashCode} 的稳定值语义；比较只读取输入与本对象，不改变Redo/WAL状态。
+     *
+     * @return 由参与值语义的全部组件计算出的稳定哈希值；与 {@code equals} 相等的对象必须返回相同结果
+     */
     @Override
     public int hashCode() {
         int result = pageId.hashCode();

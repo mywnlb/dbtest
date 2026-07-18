@@ -35,8 +35,17 @@ public final class LinearReadAheadTracker {
     private int runLength;
     /** 去重：最近一次已发出预取的 (space, nextExtent)，避免同一 extent 重复提交。 */
     private SpaceId emittedSpace;
+    /**
+     * 记录 {@code emittedNextExtent} 的权威数值状态；仅由本类受控路径更新，取值范围和特殊值遵循所属格式或状态机，溢出必须拒绝。
+     */
     private long emittedNextExtent = -1;
 
+    /**
+     * 创建 {@code LinearReadAheadTracker}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param threshold 控制 {@code 构造} 触发边界的阈值 {@code threshold}；必须非负，百分比不得超过 100，计数阈值不得超过所属资源容量
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public LinearReadAheadTracker(int threshold) {
         if (threshold < 1 || threshold > PAGES_PER_EXTENT) {
             throw new DatabaseValidationException("read-ahead threshold must be in [1, " + PAGES_PER_EXTENT
@@ -51,15 +60,26 @@ public final class LinearReadAheadTracker {
      * <p>数据流：判定本次访问相对上次是否「同表空间、页号 +1」的顺序访问→在同一 extent 内则累计 run、顺序跨入下一
      * extent 则重置为新 extent 的 run、乱序/反向/换表空间则重置 run；run 达阈值且该「下一 extent」未发过则产出请求。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>按 PageId 路由分片并读取 page hash、frame 代际与生命周期状态，过期映射在返回前拒绝。</li>
+     *     <li>遵守 pageHashLock、frameMutex、列表锁与 page latch 顺序固定 frame，慢 IO 或条件等待移到内部锁外。</li>
+     *     <li>完成页载入、替换、dirty snapshot 或状态转换，并向等待者发布唯一完成或失败信号。</li>
+     *     <li>返回受控 Guard/快照或释放 fix；失败回收占位且不错误清除并发产生的 dirty 状态。</li>
+     * </ol>
+     *
      * @param pageId 被访问的页。
      * @return 若应预取下一 extent，则为对应请求；否则 empty。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public Optional<ReadAheadRequest> record(PageId pageId) {
+        // 1、按 PageId 路由分片并读取 page hash、frame 代际与生命周期状态，在共享或持久副作用前拒绝非法状态。
         if (pageId == null) {
             throw new DatabaseValidationException("read-ahead access pageId must not be null");
         }
         SpaceId space = pageId.spaceId();
         long pageNo = pageId.pageNo().value();
+        // 2、继续完成范围、身份与候选校验；通过后，遵守 pageHashLock、frameMutex、列表锁与 page latch 顺序固定 frame，保持处理顺序与资源边界。
         long extent = pageNo / PAGES_PER_EXTENT;
 
         boolean sequential = hasLast && space.equals(runSpace) && pageNo == lastPageNo + 1;
@@ -75,6 +95,7 @@ public final class LinearReadAheadTracker {
             runExtent = extent;
             runLength = 1;
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，完成页载入、替换、dirty snapshot 或状态转换，并维持领域不变量。
         lastPageNo = pageNo;
         hasLast = true;
 
@@ -87,6 +108,7 @@ public final class LinearReadAheadTracker {
                 return Optional.of(new ReadAheadRequest(space, nextExtent * PAGES_PER_EXTENT, PAGES_PER_EXTENT));
             }
         }
+        // 4、返回受控 Guard/快照或释放 fix，以稳定返回或领域异常完成收口。
         return Optional.empty();
     }
 }

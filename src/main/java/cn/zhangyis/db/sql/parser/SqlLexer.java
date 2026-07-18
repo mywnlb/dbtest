@@ -7,13 +7,35 @@ import java.util.List;
 
 /** 每次实例只持输入 cursor 的线性 lexer；不使用正则回溯。 */
 final class SqlLexer {
+    /**
+     * 构造时冻结的 {@code sql} 文本；保存规范化标识、SQL 或诊断上下文，不得为空白，字符顺序在本对象生命周期内保持不变。
+     */
     private final String sql;
+    /**
+     * 记录 {@code offset} 的非负位置、容量或计数；写入前必须校验所属页/集合上界，溢出会破坏布局或资源记账。
+     */
     private int offset;
+    /**
+     * 记录 {@code line} 的权威数值状态；仅由本类受控路径更新，取值范围和特殊值遵循所属格式或状态机，溢出必须拒绝。
+     */
     private int line = 1;
+    /**
+     * 记录 {@code column} 的权威数值状态；仅由本类受控路径更新，取值范围和特殊值遵循所属格式或状态机，溢出必须拒绝。
+     */
     private int column = 1;
 
+    /**
+     * 创建 {@code SqlLexer}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param sql 传给 {@code 构造} 的文本值；不得为 {@code null} 或空白，并保持调用方提供的字符顺序
+     */
     SqlLexer(String sql) { this.sql = sql; }
 
+    /**
+     * 从当前 SQL token 与局部游标解析 {@code lex} 对应的语法结构；成功推进到确定边界，失败报告位置且不发布半解析 AST。
+     *
+     * @return 按物理页、日志或 SQL 源顺序扫描并物化的元素；无匹配内容时返回空集合，不用 {@code null} 表示缺失
+     */
     List<Token> lex() {
         List<Token> tokens = new ArrayList<>();
         while (true) {

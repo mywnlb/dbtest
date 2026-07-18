@@ -15,6 +15,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class FilLockTest {
 
+    /**
+     * 验证 {@code exclusiveShouldBeAvailableAfterSharedGuardClosed} 所描述的 B+Tree 定位或结构变化，并断言键序、父子链接、页资源和唯一性不变量。
+     */
     @Test
     void exclusiveShouldBeAvailableAfterSharedGuardClosed() {
         TablespaceLifecycleLatch latch = new TablespaceLifecycleLatch();
@@ -24,6 +27,11 @@ class FilLockTest {
         assertTrue(tryExclusive(latch), "exclusive should be acquirable after shared released");
     }
 
+    /**
+     * 验证 {@code exclusiveShouldBeBlockedWhileSharedHeld} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     *
+     * @throws InterruptedException 等待被中断时抛出；调用方应恢复中断标志并终止当前资源获取流程
+     */
     @Test
     void exclusiveShouldBeBlockedWhileSharedHeld() throws InterruptedException {
         TablespaceLifecycleLatch latch = new TablespaceLifecycleLatch();
@@ -34,6 +42,9 @@ class FilLockTest {
         }
     }
 
+    /**
+     * 验证 {@code fileSizeLockShouldBeReleasedByGuard} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void fileSizeLockShouldBeReleasedByGuard() {
         FileSizeLock lock = new FileSizeLock();

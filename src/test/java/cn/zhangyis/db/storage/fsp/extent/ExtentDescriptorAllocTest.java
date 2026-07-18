@@ -51,6 +51,9 @@ class ExtentDescriptorAllocTest {
         }
     }
 
+    /**
+     * 验证 {@code nodeAddrRoundTrip} 对应的表空间、区与段分配行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void nodeAddrRoundTrip() {
         withRepo((repo, mtr) -> {
@@ -62,6 +65,9 @@ class ExtentDescriptorAllocTest {
         });
     }
 
+    /**
+     * 验证 {@code extentIdOfNodeRejectsBadOffsetOrPage} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void extentIdOfNodeRejectsBadOffsetOrPage() {
         withRepo((repo, mtr) -> {
@@ -72,6 +78,9 @@ class ExtentDescriptorAllocTest {
         });
     }
 
+    /**
+     * 验证 {@code bitmapQueriesReflectAllocation} 对应的表空间、区与段分配行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void bitmapQueriesReflectAllocation() {
         withRepo((repo, mtr) -> {

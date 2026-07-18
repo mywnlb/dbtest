@@ -44,14 +44,29 @@ public final class RedoCapacityThrottle {
      */
     private final AtomicLong reservedAppendBytes = new AtomicLong();
 
+    /**
+     * 创建 {@code RedoCapacityThrottle}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝 null、越界和相互矛盾的组合。</li>
+     *     <li>完成跨参数校验并推导不可变配置；若构造过程创建自有资源，后续失败必须在异常路径关闭。</li>
+     *     <li>把已校验协作者与配置绑定到字段，并初始化本对象拥有的状态、显式锁、队列或缓存，不允许 this 提前逃逸。</li>
+     *     <li>构造完成后对象处于类契约声明的初始状态；任一步失败都抛出领域异常且不发布半初始化实例。</li>
+     * </ol>
+     *
+     */
     private RedoCapacityThrottle() {
+        // 1、校验必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝非法组合。
         this.capacityPolicy = null;
         this.currentLsnSupplier = null;
+        // 2、完成跨参数校验并推导不可变配置；后续失败仍由当前构造路径收口已创建资源。
         this.checkpointLsnSupplier = null;
         this.asyncFlushRequest = null;
+        // 3、绑定已校验协作者并初始化本对象拥有的状态、显式锁、队列或缓存，不允许半初始化实例逃逸。
         this.blockingFlushOnce = null;
         this.timeout = Duration.ZERO;
         this.noOp = true;
+        // 4、完成初始状态发布；失败以领域异常终止构造，成功对象满足类级生命周期不变量。
         this.maxPhysicalBatchBytes = Long.MAX_VALUE;
     }
 
@@ -78,7 +93,22 @@ public final class RedoCapacityThrottle {
     /**
      * 创建同时校验单批物理 file-fit 的生产 throttle。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝 null、越界和相互矛盾的组合。</li>
+     *     <li>完成跨参数校验并推导不可变配置；若构造过程创建自有资源，后续失败必须在异常路径关闭。</li>
+     *     <li>把已校验协作者与配置绑定到字段，并初始化本对象拥有的状态、显式锁、队列或缓存，不允许 this 提前逃逸。</li>
+     *     <li>构造完成后对象处于类契约声明的初始状态；任一步失败都抛出领域异常且不发布半初始化实例。</li>
+     * </ol>
+     *
      * @param maxPhysicalBatchBytes repository 可原子写入一个 sealed batch 的最大物理字节。
+     * @param capacityPolicy 调用方提供的长度或容量值对象；不得为 {@code null}，且必须已通过其构造范围校验
+     * @param currentLsnSupplier redo 日志边界；不得为 {@code null}，必须单调且与调用方已发布的页或事务状态一致
+     * @param checkpointLsnSupplier redo 日志边界；不得为 {@code null}，必须单调且与调用方已发布的页或事务状态一致
+     * @param asyncFlushRequest 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @param blockingFlushOnce 在契约指定成功、失败或释放边界调用的回调；不得为 {@code null}，且不得破坏当前资源所有权和异常传播规则
+     * @param timeout 本次等待或操作的最大时长；不得为 {@code null} 或负值，零表示只做一次立即检查而不阻塞
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public RedoCapacityThrottle(RedoCapacityPolicy capacityPolicy,
                                 Supplier<Lsn> currentLsnSupplier,
@@ -87,6 +117,7 @@ public final class RedoCapacityThrottle {
                                 Runnable blockingFlushOnce,
                                 Duration timeout,
                                 long maxPhysicalBatchBytes) {
+        // 1、校验必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝非法组合。
         if (capacityPolicy == null || currentLsnSupplier == null || checkpointLsnSupplier == null
                 || asyncFlushRequest == null || blockingFlushOnce == null || timeout == null) {
             throw new DatabaseValidationException("redo capacity throttle dependencies must not be null");
@@ -98,13 +129,16 @@ public final class RedoCapacityThrottle {
             throw new DatabaseValidationException("redo maximum physical batch bytes must be positive: "
                     + maxPhysicalBatchBytes);
         }
+        // 2、完成跨参数校验并推导不可变配置；后续失败仍由当前构造路径收口已创建资源。
         this.capacityPolicy = capacityPolicy;
         this.currentLsnSupplier = currentLsnSupplier;
         this.checkpointLsnSupplier = checkpointLsnSupplier;
+        // 3、绑定已校验协作者并初始化本对象拥有的状态、显式锁、队列或缓存，不允许半初始化实例逃逸。
         this.asyncFlushRequest = asyncFlushRequest;
         this.blockingFlushOnce = blockingFlushOnce;
         this.timeout = timeout;
         this.noOp = false;
+        // 4、完成初始状态发布；失败以领域异常终止构造，成功对象满足类级生命周期不变量。
         this.maxPhysicalBatchBytes = maxPhysicalBatchBytes;
     }
 
@@ -156,6 +190,11 @@ public final class RedoCapacityThrottle {
     /**
      * 在任何 page/FSP 资源获取前按操作预算执行 logical capacity 与 physical batch-fit 双重准入。
      * physical 超限无需 flush 即失败，因为 checkpoint 推进不能让单个 sealed batch 变小。
+     *
+     * @param budget redo 收集、定位或重放所需的日志对象；不得为 {@code null}，其 LSN 范围和记录格式必须连续且属于当前恢复或 MTR 上下文
+     * @return {@code reserveAppendBudget} 取得或创建的受控存储资源；成功时不为 {@code null}，调用方必须按其 Guard/lease 契约释放
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws RedoBudgetTooLargeException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
      */
     public Reservation reserveAppendBudget(RedoAppendBudget budget) {
         if (noOp) {
@@ -223,6 +262,12 @@ public final class RedoCapacityThrottle {
                 + ", reserved=" + reservedAppendBytes.get());
     }
 
+    /**
+     * 释放本方法拥有的Redo/WAL资源；遵守既定释放顺序，重复或失败调用不得掩盖原始状态。
+     *
+     * @param bytes 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     private void releaseReservation(long bytes) {
         if (bytes == 0) {
             return;
@@ -284,6 +329,9 @@ public final class RedoCapacityThrottle {
      */
     public static final class Reservation implements AutoCloseable {
 
+        /**
+         * 类级不可变配置常量；所有实例共享该边界，非法调整会破坏Redo/WAL的不变量。
+         */
         private static final Reservation NO_OP = new Reservation(null, 0);
 
         /** 拥有该预算的 throttle；no-op 句柄为空。 */
@@ -309,6 +357,9 @@ public final class RedoCapacityThrottle {
             releaseOnce();
         }
 
+        /**
+         * 释放本方法拥有的Redo/WAL资源；遵守既定释放顺序，重复或失败调用不得掩盖原始状态。
+         */
         @Override
         public void close() {
             releaseOnce();

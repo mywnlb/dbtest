@@ -124,7 +124,15 @@ public final class RollbackService {
                 null, null, null, null, null);
     }
 
-    /** DD 模式构造器：rollback/recovery 逐条解析 undo 的 tableId/indexId。 */
+    /** DD 模式构造器：rollback/recovery 逐条解析 undo 的 tableId/indexId。
+     *
+     * @param btree 由组合根提供的 {@code SplitCapableBTreeIndexService} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param undoAccess 由组合根提供的 {@code UndoLogSegmentAccess} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param txnMgr 由组合根提供的 {@code TransactionManager} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param mtrMgr 由组合根提供的 {@code MiniTransactionManager} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param finalizer 由组合根提供的 {@code UndoSegmentFinalizer} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param indexResolver 由组合根提供的 {@code IndexMetadataResolver} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     */
     public RollbackService(SplitCapableBTreeIndexService btree, UndoLogSegmentAccess undoAccess,
                            TransactionManager txnMgr, MiniTransactionManager mtrMgr,
                            UndoSegmentFinalizer finalizer, IndexMetadataResolver indexResolver) {
@@ -132,7 +140,16 @@ public final class RollbackService {
                 indexResolver, null, null, null, null);
     }
 
-    /** DD 生产模式：full/recovery rollback 同时解析精确聚簇索引与权威 LOB segment。 */
+    /** DD 生产模式：full/recovery rollback 同时解析精确聚簇索引与权威 LOB segment。
+     *
+     * @param btree 由组合根提供的 {@code SplitCapableBTreeIndexService} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param undoAccess 由组合根提供的 {@code UndoLogSegmentAccess} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param txnMgr 由组合根提供的 {@code TransactionManager} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param mtrMgr 由组合根提供的 {@code MiniTransactionManager} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param finalizer 由组合根提供的 {@code UndoSegmentFinalizer} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param lobStorage 由组合根提供的 {@code LobStorage} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param targetResolver 由组合根提供的 {@code UndoTargetMetadataResolver} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     */
     public RollbackService(SplitCapableBTreeIndexService btree, UndoLogSegmentAccess undoAccess,
                            TransactionManager txnMgr, MiniTransactionManager mtrMgr,
                            UndoSegmentFinalizer finalizer, LobStorage lobStorage,
@@ -166,6 +183,13 @@ public final class RollbackService {
 
     /**
      * 包内测试构造器。只有同包 crash-point 测试可以替换 injector；生产组合根继续调用五参数公开构造器。
+     *
+     * @param btree 由组合根提供的 {@code SplitCapableBTreeIndexService} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param undoAccess 由组合根提供的 {@code UndoLogSegmentAccess} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param txnMgr 由组合根提供的 {@code TransactionManager} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param mtrMgr 由组合根提供的 {@code MiniTransactionManager} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param finalizer 由组合根提供的 {@code UndoSegmentFinalizer} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param progressFaultInjector 由当前模块组合根提供的领域协作者；不得为 {@code null}，其状态和生命周期必须覆盖本次调用且不能绕过模块边界
      */
     RollbackService(SplitCapableBTreeIndexService btree, UndoLogSegmentAccess undoAccess,
                     TransactionManager txnMgr, MiniTransactionManager mtrMgr,
@@ -180,6 +204,7 @@ public final class RollbackService {
      *
      * @param injector 仅在已提交的 inverse/progress 边界后触发的故障注入器。
      * @return 与当前实例共享无状态协作者、但使用指定 crash hook 的独立回滚执行器。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     RollbackService withProgressFaultInjectorForTest(RollbackProgressFaultInjector injector) {
         if (injector == null) {
@@ -189,26 +214,54 @@ public final class RollbackService {
                 indexResolver, targetResolver, lobStorage, rootSnapshots, rowGuards);
     }
 
+    /**
+     * 创建 {@code RollbackService}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝 null、越界和相互矛盾的组合。</li>
+     *     <li>完成跨参数校验并推导不可变配置；若构造过程创建自有资源，后续失败必须在异常路径关闭。</li>
+     *     <li>把已校验协作者与配置绑定到字段，并初始化本对象拥有的状态、显式锁、队列或缓存，不允许 this 提前逃逸。</li>
+     *     <li>构造完成后对象处于类契约声明的初始状态；任一步失败都抛出领域异常且不发布半初始化实例。</li>
+     * </ol>
+     *
+     * @param btree 由组合根提供的 {@code SplitCapableBTreeIndexService} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param undoAccess 由组合根提供的 {@code UndoLogSegmentAccess} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param txnMgr 由组合根提供的 {@code TransactionManager} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param mtrMgr 由组合根提供的 {@code MiniTransactionManager} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param finalizer 由组合根提供的 {@code UndoSegmentFinalizer} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param progressFaultInjector 由当前模块组合根提供的领域协作者；不得为 {@code null}，其状态和生命周期必须覆盖本次调用且不能绕过模块边界
+     * @param indexResolver 由组合根提供的 {@code IndexMetadataResolver} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param targetResolver 由组合根提供的 {@code UndoTargetMetadataResolver} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param lobStorage 由组合根提供的 {@code LobStorage} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param rootSnapshots 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @param rowGuards 调用方持有的 {@code PurgeDmlRowGuardManager} 资源句柄；不得为 {@code null} 且必须处于有效期，方法返回前所有权仍归调用方
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     private RollbackService(SplitCapableBTreeIndexService btree, UndoLogSegmentAccess undoAccess,
                     TransactionManager txnMgr, MiniTransactionManager mtrMgr,
                      UndoSegmentFinalizer finalizer, RollbackProgressFaultInjector progressFaultInjector,
                      IndexMetadataResolver indexResolver, UndoTargetMetadataResolver targetResolver,
                      LobStorage lobStorage, BTreeRootSnapshotService rootSnapshots,
                      PurgeDmlRowGuardManager rowGuards) {
+        // 1、校验必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝非法组合。
         if (btree == null || undoAccess == null || txnMgr == null || mtrMgr == null
                 || finalizer == null || progressFaultInjector == null) {
             throw new DatabaseValidationException("rollback service collaborators must not be null");
         }
         this.btree = btree;
         this.undoAccess = undoAccess;
+        // 2、完成跨参数校验并推导不可变配置；后续失败仍由当前构造路径收口已创建资源。
         this.txnMgr = txnMgr;
         this.mtrMgr = mtrMgr;
         this.finalizer = finalizer;
         this.progressFaultInjector = progressFaultInjector;
+        // 3、绑定已校验协作者并初始化本对象拥有的状态、显式锁、队列或缓存，不允许半初始化实例逃逸。
         this.indexResolver = indexResolver;
         this.targetResolver = targetResolver;
         this.lobStorage = lobStorage;
         this.rootSnapshots = rootSnapshots;
+        // 4、完成初始状态发布；失败以领域异常终止构造，成功对象满足类级生命周期不变量。
         this.rowGuards = rowGuards;
     }
 
@@ -230,6 +283,7 @@ public final class RollbackService {
      * @param txn            待回滚事务，必须为 ACTIVE 或可重试的 ROLLING_BACK。
      * @param clusteredIndex 该事务写入的聚簇索引（提供 keyDef/schema 解码 undo + 删除目标）。
      * @return 本次回滚应用的 undo record 条数摘要。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public RollbackSummary rollback(Transaction txn, BTreeIndex clusteredIndex) {
         if (txn == null || clusteredIndex == null) {
@@ -241,6 +295,9 @@ public final class RollbackService {
     /**
      * 生产 full rollback 入口。每条 undo 都通过 {@link UndoTargetMetadataResolver} 解析自身 table/index target，
      * 因而同一事务可跨多表回滚；无 undo 的只读事务无需 resolver 也可直接进入 ROLLED_BACK。
+     * @param txn 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
+     * @return {@code rollback} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public RollbackSummary rollback(Transaction txn) {
         if (txn == null) {
@@ -252,12 +309,30 @@ public final class RollbackService {
         return rollbackInternal(txn, null);
     }
 
+    /**
+     * 校验当前状态后推进事务、MVCC 与锁状态机；成功发布唯一终态，失败保留可回滚或可恢复的原始状态。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
+     * @param txn 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
+     * @param clusteredIndex 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @return {@code rollbackInternal} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     * @throws TransactionStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
+     */
     private RollbackSummary rollbackInternal(Transaction txn, BTreeIndex clusteredIndex) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         TransactionState initialState = txn.state();
         if (initialState != TransactionState.ACTIVE && initialState != TransactionState.ROLLING_BACK) {
             throw new TransactionStateException(
                     "rollback requires ACTIVE or ROLLING_BACK transaction: " + initialState);
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         UndoContext ctx = txn.undoContext();
         if (ctx != null) {
             preflightAllBindings(clusteredIndex, ctx, emptyTargets());
@@ -266,6 +341,7 @@ public final class RollbackService {
             txnMgr.beginRollback(txn);
         }
 
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         int applied = ctx == null ? 0 : rollbackAllBindings(ctx, clusteredIndex);
         if (ctx != null) {
             finalizer.finalizeLiveRollback(txn, ctx);
@@ -274,6 +350,7 @@ public final class RollbackService {
             writeRollbackCompleteRedo(txn);
         }
         txnMgr.finishRollback(txn);
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         return new RollbackSummary(applied);
     }
 
@@ -293,6 +370,7 @@ public final class RollbackService {
      * @param clusteredIndex legacy 单聚簇 metadata；DD resolver模式仍会按每条 undo identity解析
      * @return 本次实际应用的 undo record数量
      * @throws TransactionStateException 事务状态或 undo context不符合 prepared rollback条件时抛出
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public RollbackSummary rollbackPrepared(Transaction txn, BTreeIndex clusteredIndex) {
         if (txn == null || clusteredIndex == null) {
@@ -307,6 +385,7 @@ public final class RollbackService {
      *
      * @param txn 待决议 prepared transaction
      * @return 本次应用的 undo record数量
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public RollbackSummary rollbackPrepared(Transaction txn) {
         if (txn == null) {
@@ -320,7 +399,21 @@ public final class RollbackService {
         return rollbackPreparedInternal(txn, null);
     }
 
-    /** prepared rollback 两种 metadata入口共用实现。 */
+    /** prepared rollback 两种 metadata入口共用实现。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
+     * @param txn 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
+     * @param clusteredIndex 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @return {@code rollbackPreparedInternal} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     * @throws TransactionStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
+     */
     private RollbackSummary rollbackPreparedInternal(Transaction txn, BTreeIndex clusteredIndex) {
         // 1、重试态显式保留 prepared origin；普通 ROLLING_BACK 不能进入。
         TransactionState initialState = txn.state();
@@ -347,7 +440,12 @@ public final class RollbackService {
         return new RollbackSummary(applied);
     }
 
-    /** 普通与 prepared full rollback 共用的逐条 inverse/marker 循环；终结状态由各自调用方处理。 */
+    /** 普通与 prepared full rollback 共用的逐条 inverse/marker 循环；终结状态由各自调用方处理。
+     *
+     * @param context 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param clusteredIndex 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @return {@code rollbackAllBindings} 实际完成的资源、绑定、页或槽位数量；未处理任何对象时为零，结果不得超过输入候选数
+     */
     private int rollbackAllBindings(UndoContext context, BTreeIndex clusteredIndex) {
         int applied = 0;
         while (true) {
@@ -376,6 +474,8 @@ public final class RollbackService {
      *
      * @param txn 当前 ACTIVE 且尚未首写的事务。
      * @return 绑定本 service 与事务的一次性空 undo 边界能力。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws TransactionStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
      */
     public EmptyUndoBoundary createEmptyStatementBoundary(Transaction txn) {
         if (txn == null) {
@@ -409,6 +509,8 @@ public final class RollbackService {
      *
      * @param txn 当前 ACTIVE 且已经写过 undo 的事务。
      * @return 绑定到该事务 undo context 的保存点。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws TransactionStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
      */
     public TransactionSavepoint createSavepoint(Transaction txn) {
         if (txn == null) {
@@ -441,9 +543,12 @@ public final class RollbackService {
      * @param clusteredIndex 该事务写入的聚簇索引（提供 keyDef/schema 解码 undo + 删除/恢复目标）。
      * @param savepoint      目标保存点。
      * @return 本次 partial rollback 实际应用的 undo record 条数。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws TransactionStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
      */
     public RollbackSummary rollbackToSavepoint(Transaction txn, BTreeIndex clusteredIndex,
                                                TransactionSavepoint savepoint) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         if (txn == null || clusteredIndex == null || savepoint == null) {
             throw new DatabaseValidationException("rollbackToSavepoint txn/index/savepoint must not be null");
         }
@@ -454,16 +559,19 @@ public final class RollbackService {
             throw new DatabaseValidationException("savepoint belongs to a different transaction");
         }
 
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         UndoContext ctx = txn.undoContext();
         if (ctx == null) {
             return new RollbackSummary(0);
         }
         ctx.requireOwnedSavepoint(savepoint);
         Map<UndoLogKind, UndoLogicalHead> targets = new EnumMap<>(UndoLogKind.class);
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         targets.put(UndoLogKind.INSERT, savepoint.insertHead());
         targets.put(UndoLogKind.UPDATE, savepoint.updateHead());
         int applied = rollbackMergedAfter(txn, clusteredIndex, ctx, targets);
         ctx.completeRollbackToSavepoint(savepoint);
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         return new RollbackSummary(applied);
     }
 
@@ -475,13 +583,24 @@ public final class RollbackService {
      * 独立写 MTR 把已存在的一个或两个 logical heads 同批持久为空，再清空运行期保存点。
      * {@link UndoContext#lastUndoNo()}、undo slot、ReadView、事务行锁和事务状态均保持不变，使事务可以继续写入。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
      * @param txn            当前 ACTIVE 事务。
      * @param clusteredIndex 该事务写入的聚簇索引，用于解码和反向应用 undo。
      * @param boundary       本 service 在该事务首写前创建的一次性空边界能力。
      * @return 本次回滚实际应用的 undo record 条数；语句没有写入时为 0。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws TransactionStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
      */
     public RollbackSummary rollbackToEmptyStatementBoundary(Transaction txn, BTreeIndex clusteredIndex,
                                                             EmptyUndoBoundary boundary) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         if (txn == null || clusteredIndex == null || boundary == null) {
             throw new DatabaseValidationException("empty statement rollback txn/index/boundary must not be null");
         }
@@ -489,6 +608,7 @@ public final class RollbackService {
             throw new TransactionStateException(
                     "empty statement rollback requires ACTIVE transaction: " + txn.state());
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         boundary.requireOpen(this, txn);
         UndoContext ctx = txn.undoContext();
         if (ctx == null) {
@@ -496,9 +616,11 @@ public final class RollbackService {
             return new RollbackSummary(0);
         }
 
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         int applied = rollbackMergedAfter(txn, clusteredIndex, ctx, emptyTargets());
         ctx.completeRollbackToEmptyBoundary();
         boundary.markRolledBack();
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         return new RollbackSummary(applied);
     }
 
@@ -508,6 +630,8 @@ public final class RollbackService {
      *
      * @param txn      边界所属 ACTIVE 事务。
      * @param boundary 要关闭的一次性空 undo 边界能力。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws TransactionStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
      */
     public void releaseEmptyStatementBoundary(Transaction txn, EmptyUndoBoundary boundary) {
         if (txn == null || boundary == null) {
@@ -526,23 +650,37 @@ public final class RollbackService {
      * 调用本方法，避免已经离开语句作用域的边界继续留在 {@link UndoContext} 中。事务必须仍为 ACTIVE，且保存点
      * 必须属于该事务当前的 undo context；非法或重复释放会以领域异常暴露调用方生命周期错误。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
      * @param txn       保存点所属 ACTIVE 事务。
      * @param savepoint 要释放的运行期保存点。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws TransactionStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
      */
     public void releaseSavepoint(Transaction txn, TransactionSavepoint savepoint) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         if (txn == null || savepoint == null) {
             throw new DatabaseValidationException("releaseSavepoint txn/savepoint must not be null");
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         if (txn.state() != TransactionState.ACTIVE) {
             throw new TransactionStateException("releaseSavepoint requires ACTIVE transaction: " + txn.state());
         }
         if (savepoint.transaction() != txn) {
             throw new DatabaseValidationException("savepoint belongs to a different transaction");
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         UndoContext ctx = txn.undoContext();
         if (ctx == null) {
             throw new DatabaseValidationException("savepoint transaction has no undo context");
         }
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         ctx.releaseSavepoint(savepoint);
     }
 
@@ -556,20 +694,32 @@ public final class RollbackService {
      * 已成功提交的前序命令仍保持幂等可恢复，但事务会由上层 Guard 标为 rollback-only，禁止提交不确定结果。
      * 本方法不移动 context 链头，只有调用方在整个边界成功到达后才能提交运行期边界状态。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
      * @param txn            仅用于明确该链属于哪个事务；事务状态已由公开入口校验。
      * @param clusteredIndex undo 解码和聚簇反向命令所需的索引快照。
      * @param ctx            当前事务的 undo context。
      * @param boundaryUndoNo      边界 undoNo；{@link UndoNo#NONE} 表示走到物理链尾即到达空边界。
      * @param boundaryRollPointer 边界记录的精确指针；空边界必须为 {@link RollPointer#NULL}。
      * @return 实际反向应用的 undo record 数量。
+     * @param targets 参与 {@code rollbackMergedAfter} 的键值映射；不得为 {@code null}，空映射表示没有条目，键和值均不得包含 Java {@code null}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     private int rollbackMergedAfter(Transaction txn, BTreeIndex clusteredIndex, UndoContext ctx,
                                     Map<UndoLogKind, UndoLogicalHead> targets) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         if (txn.undoContext() != ctx) {
             throw new DatabaseValidationException("rollback undo context is not owned by transaction");
         }
         preflightAllBindings(clusteredIndex, ctx, targets);
         EnumMap<UndoLogKind, UndoLogicalHead> working = new EnumMap<>(UndoLogKind.class);
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         EnumMap<UndoLogKind, UndoLogicalHead> original = new EnumMap<>(UndoLogKind.class);
         for (UndoLogBinding binding : ctx.bindings()) {
             working.put(binding.kind(), binding.logicalHead());
@@ -577,6 +727,7 @@ public final class RollbackService {
         }
         int applied = 0;
         List<RecordAt> appliedRecords = new ArrayList<>();
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         while (true) {
             UndoLogBinding binding = newestBinding(ctx, targets, working);
             if (binding == null) {
@@ -599,6 +750,7 @@ public final class RollbackService {
             }
         }
         persistLogicalHeads(updates, clusteredIndex, appliedRecords);
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         return applied;
     }
 
@@ -614,15 +766,34 @@ public final class RollbackService {
         }
     }
 
+    /**
+     * 把语法对象绑定到稳定元数据与类型；绑定期间保持版本一致，失败不发布半绑定结果。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
+     * @param clusteredIndex 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param binding 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param target 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @throws UndoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     private void preflightBinding(BTreeIndex clusteredIndex, UndoLogBinding binding,
                                   UndoLogicalHead target) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         UndoLogicalHead persistentHead = readPersistentLogicalHead(binding.firstPageId());
         if (!persistentHead.equals(binding.logicalHead())) {
             throw new UndoLogFormatException("in-memory " + binding.kind() + " logical head "
                     + binding.logicalHead() + " differs from persistent head " + persistentHead);
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         RollPointer rp = binding.logicalHead().rollPointer();
         long previousUndoNo = 0L;
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         boolean first = true;
         while (!rp.isNull()) {
             RecordAt at = readUndoRecord(binding.firstPageId(), clusteredIndex, rp);
@@ -652,6 +823,7 @@ public final class RollbackService {
             previousUndoNo = undoNo;
             rp = rec.prevRollPointer();
         }
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         if (!target.isEmpty()) {
             throw new UndoLogFormatException("savepoint boundary is not reachable from current undo chain");
         }
@@ -671,6 +843,13 @@ public final class RollbackService {
         return targets.get(kind);
     }
 
+    /**
+     * 把语法对象绑定到稳定元数据与类型；绑定期间保持版本一致，失败不发布半绑定结果。
+     *
+     * @param ctx 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param targets 参与 {@code newestBinding} 的键值映射；不得为 {@code null}，空映射表示没有条目，键和值均不得包含 Java {@code null}
+     * @return {@code newestBinding} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     */
     private static UndoLogBinding newestBinding(UndoContext ctx,
                                                 Map<UndoLogKind, UndoLogicalHead> targets) {
         EnumMap<UndoLogKind, UndoLogicalHead> current = new EnumMap<>(UndoLogKind.class);
@@ -678,11 +857,31 @@ public final class RollbackService {
         return newestBinding(ctx, targets, current);
     }
 
+    /**
+     * 把语法对象绑定到稳定元数据与类型；绑定期间保持版本一致，失败不发布半绑定结果。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
+     * @param ctx 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param targets 参与 {@code newestBinding} 的键值映射；不得为 {@code null}，空映射表示没有条目，键和值均不得包含 Java {@code null}
+     * @param current 参与 {@code newestBinding} 的键值映射；不得为 {@code null}，空映射表示没有条目，键和值均不得包含 Java {@code null}
+     * @return {@code newestBinding} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     * @throws UndoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     private static UndoLogBinding newestBinding(UndoContext ctx,
                                                 Map<UndoLogKind, UndoLogicalHead> targets,
                                                 Map<UndoLogKind, UndoLogicalHead> current) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         UndoLogBinding newest = null;
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         long newestUndoNo = 0L;
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         for (UndoLogBinding binding : ctx.bindings()) {
             UndoLogicalHead head = current.get(binding.kind());
             if (head.equals(targetFor(targets, binding.kind()))) {
@@ -697,12 +896,18 @@ public final class RollbackService {
             newest = binding;
             newestUndoNo = head.undoNo().value();
         }
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         return newest;
     }
 
     /**
      * 用独立只读 MTR 物化一条 undo record，返回前释放所有 undo page latch/fix。live、partial 与 recovery 共用
      * 该入口，避免不同回滚路径对 pointer/segment/transaction/index 校验产生漂移。
+     *
+     * @param firstPageId 目标页的稳定物理标识；必须属于当前已准入表空间，且不得为 {@code null}
+     * @param clusteredIndex 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param rp 参与 {@code readUndoRecord} 的稳定领域标识 {@code RollPointer}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @return {@code readUndoRecord} 编码、解码或重建的记录数据；成功时不为 {@code null}，字段顺序、隐藏列和字节边界满足当前 schema
      */
     private RecordAt readUndoRecord(PageId firstPageId, BTreeIndex clusteredIndex, RollPointer rp) {
         MiniTransaction readMtr = mtrMgr.beginReadOnly();
@@ -799,7 +1004,10 @@ public final class RollbackService {
         }
     }
 
-    /** 在独立短 MTR 内执行聚簇 inverse；异常时释放当前 MTR 资源且不移动 undo logical head。 */
+    /** 在独立短 MTR 内执行聚簇 inverse；异常时释放当前 MTR 资源且不移动 undo logical head。
+     *
+     * @param at 参与记录编解码或索引比较的字段值；不得为 {@code null}，其类型、字节边界和 SQL NULL 语义必须与当前 schema 一致
+     */
     private void applyClusteredInverseInOwnMtr(RecordAt at) {
         BTreeIndex resolved = at.index();
         MiniTransaction inverseMtr = mtrMgr.begin(mtrMgr.budgetFor(
@@ -849,6 +1057,12 @@ public final class RollbackService {
     /**
      * 校验当前聚簇版本仍是本 undo 要撤销的前向版本。所有权由 DB_TRX_ID+DB_ROLL_PTR 双重确定，delete 位还需与
      * undo 类型一致；任一错配都 fail-closed，避免用旧 history 覆盖较新已提交版本。
+     *
+     * @param record 参与本次操作的记录或记录集合；不得为 {@code null}，顺序、身份与编码必须满足当前索引或日志格式
+     * @param pointer 参与 {@code requireUndoOwnedCurrentRecord} 的稳定领域标识 {@code RollPointer}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param current 可选的 {@code current}；参数本身不得为 {@code null}，空 {@code Optional} 明确表示调用方未提供该领域值
+     * @return {@code requireUndoOwnedCurrentRecord} 编码、解码或重建的记录数据；成功时不为 {@code null}，字段顺序、隐藏列和字节边界满足当前 schema
+     * @throws UndoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     private static LogicalRecord requireUndoOwnedCurrentRecord(UndoRecord record, RollPointer pointer,
                                                                 Optional<LogicalRecord> current) {
@@ -880,6 +1094,10 @@ public final class RollbackService {
     /**
      * 对一个 exact-version 二级索引应用反向动作。UPDATE 先 revive 旧 identity，再按落盘前态 remove/re-mark 新 identity；
      * 即使阶段间 crash，重试也可依赖显式 CHANGED/ALREADY/ABSENT 状态收敛。
+     *
+     * @param at 参与记录编解码或索引比较的字段值；不得为 {@code null}，其类型、字节边界和 SQL NULL 语义必须与当前 schema 一致
+     * @param mutation 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param currentRow 参与记录编解码或索引比较的字段值；不得为 {@code null}，其类型、字节边界和 SQL NULL 语义必须与当前 schema 一致
      */
     private void applySecondaryInverse(RecordAt at, SecondaryUndoMutation mutation,
                                        LogicalRecord currentRow) {
@@ -949,7 +1167,14 @@ public final class RollbackService {
         applySecondaryDeleteState(secondary, key, true, false);
     }
 
-    /** 在独立 point-rewrite MTR 中翻转二级 delete 位，并按调用方语义分类 ABSENT。 */
+    /** 在独立 point-rewrite MTR 中翻转二级 delete 位，并按调用方语义分类 ABSENT。
+     *
+     * @param secondary 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @param key 参与 {@code applySecondaryDeleteState} 的稳定领域标识 {@code SearchKey}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param deleted 资源是否处于删除、空闲、静默、持久化或终态；必须与权威状态机一致，不能由调用方猜测
+     * @param absentIsComplete 恢复容错策略标志；只允许在契约明确的损坏或结果不确定场景放宽校验，不得掩盖其他数据损坏
+     * @throws UndoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     private void applySecondaryDeleteState(SecondaryIndexMetadata secondary, SearchKey key,
                                            boolean deleted, boolean absentIsComplete) {
         BTreeIndex index = refreshRootSnapshot(secondary.index());
@@ -1002,17 +1227,35 @@ public final class RollbackService {
      * 在所有 statement 逆操作成功后，用独立短写 MTR compare-and-set first-page 持久 logical head。marker
      * commit 返回前绝不移动内存 context；stale expected、目标 record 损坏或 MTR 失败都会向上传播，使 Guard
      * 把事务标成 rollback-only。由于 marker 永不领先数据修改，crash 最坏只会让 recovery 幂等重做已完成逆操作。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
+     * @param firstPageId 目标页的稳定物理标识；必须属于当前已准入表空间，且不得为 {@code null}
+     * @param expectedHead 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param targetHead 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param current 参与记录编解码或索引比较的字段值；不得为 {@code null}，其类型、字节边界和 SQL NULL 语义必须与当前 schema 一致
+     * @param clusteredIndex 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
      */
     private void persistLogicalHead(PageId firstPageId, UndoLogicalHead expectedHead,
                                     UndoLogicalHead targetHead, RecordAt current,
                                     BTreeIndex clusteredIndex) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         BTreeIndex markerIndex = targetHead.isEmpty()
                 ? current.index()
                 : resolveIndexAt(firstPageId, targetHead.rollPointer(), clusteredIndex);
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         List<LobFreeBatchPlan> lobFreePlans = planRollbackLobFrees(List.of(current));
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         RedoBudgetWorkload markerWorkload = rollbackMarkerWorkload(lobFreePlans);
         MiniTransaction markerMtr = mtrMgr.begin(
                 mtrMgr.budgetFor(RedoBudgetPurpose.ROLLBACK_MARKER, markerWorkload));
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         try {
             UndoLogSegment writable = undoAccess.open(
                     markerMtr, firstPageId, PageLatchMode.EXCLUSIVE);
@@ -1032,12 +1275,26 @@ public final class RollbackService {
     /**
      * partial rollback 的所有 inverse 完成后，在一个 marker MTR 中按 PageId 排序更新一个或两个 first-page heads。
      * marker 永不领先数据修改；任一 CAS 失败都不发布内存保存点边界，事务由上层转为 rollback-only。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
+     * @param updates 参与 {@code persistLogicalHeads} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @param clusteredIndex 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param appliedRecords 参与本次操作的记录或记录集合；不得为 {@code null}，顺序、身份与编码必须满足当前索引或日志格式
      */
     private void persistLogicalHeads(List<HeadUpdate> updates, BTreeIndex clusteredIndex,
                                      List<RecordAt> appliedRecords) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         if (updates.isEmpty()) {
             return;
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         List<ResolvedHeadUpdate> ordered = updates.stream()
                 .map(update -> new ResolvedHeadUpdate(update,
                         update.target().isEmpty() ? requireFallbackIndex(clusteredIndex)
@@ -1045,9 +1302,11 @@ public final class RollbackService {
                 .sorted(Comparator.comparingInt((ResolvedHeadUpdate item) -> item.firstPageId().spaceId().value())
                         .thenComparingLong(item -> item.firstPageId().pageNo().value()))
                 .toList();
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         List<LobFreeBatchPlan> lobFreePlans = planRollbackLobFrees(appliedRecords);
         MiniTransaction marker = mtrMgr.begin(mtrMgr.budgetFor(
                 RedoBudgetPurpose.ROLLBACK_MARKER, rollbackMarkerWorkload(lobFreePlans)));
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         try {
             try (var ignored = marker.allowOutOfOrderPageLatch(
                     "dual undo marker: target records may live on non-monotonic chain pages after sorted first pages")) {
@@ -1101,6 +1360,7 @@ public final class RollbackService {
      * @param records 当前 marker 即将越过的 undo records；不能为空容器或包含 {@code null}。
      * @return 按 authoritative segment 排序的不可变批量 free plans；无 ownership 时为空列表。
      * @throws UndoLogFormatException metadata/ordinal/segment 缺失或 rollback 未配置 LobStorage 时抛出。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     private List<LobFreeBatchPlan> planRollbackLobFrees(List<RecordAt> records) {
         if (records == null || records.stream().anyMatch(java.util.Objects::isNull)) {
@@ -1174,6 +1434,7 @@ public final class RollbackService {
      * ROLLING_BACK，redo record 能记录真实的 from-state；若写入失败，slot 仍由本事务占用，调用方可安全重试。
      * recovery table 消费该 record 重建终态和 counter 高水位；若事务存在 undo slot，恢复仍必须与 page3/header
      * 交叉校验，不能把 logical redo 当成绕过物理状态检查的许可。
+     * @param txn 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
      */
     private void writeRollbackCompleteRedo(Transaction txn) {
         MiniTransaction stateMtr = mtrMgr.begin(
@@ -1187,6 +1448,12 @@ public final class RollbackService {
         }
     }
 
+    /**
+     * 校验当前状态后推进事务、MVCC 与锁状态机；成功发布唯一终态，失败保留可回滚或可恢复的原始状态。
+     *
+     * @param stateMtr 调用方请求的目标状态、阶段或模式；不得为 {@code null}，且必须是当前状态机允许的后继值
+     * @param original 需要分类或包装的原始失败；不得为 {@code null}，包装时必须保留 cause 与 suppressed 异常图
+     */
     private void rollbackActiveStateMtr(MiniTransaction stateMtr, RuntimeException original) {
         if (stateMtr.state() != MiniTransactionState.ACTIVE) {
             return;
@@ -1219,6 +1486,7 @@ public final class RollbackService {
      * @param creatorTrxId   恢复 header 中的 creator transaction id，finalization 前再次校验。
      * @param clusteredIndex 显式配置的聚簇索引（提供 keyDef/schema 解码 undo + 删除/恢复目标）。
      * @return 本次回滚应用的 undo record 条数摘要。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public RollbackSummary rollbackRecovered(UndoSlotId slotId, PageId firstPageId,
                                                TransactionId creatorTrxId, BTreeIndex clusteredIndex) {
@@ -1232,15 +1500,32 @@ public final class RollbackService {
                 creatorTrxId, clusteredIndex);
     }
 
-    /** 同一 recovered ACTIVE 事务的一个或两个局部链按全局 undoNo 归并回滚，并一次性终结全部 slots。 */
+    /** 同一 recovered ACTIVE 事务的一个或两个局部链按全局 undoNo 归并回滚，并一次性终结全部 slots。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取 checkpoint、redo、doublewrite 或事务持久证据，并校验阶段、范围与文件身份。</li>
+     *     <li>依据 page LSN、恢复进度和稳定标识判断跳过或续作，保证重复启动不会重复产生副作用。</li>
+     *     <li>按恢复阶段应用物理页或事务状态变化，并在每个可恢复边界记录已完成进度。</li>
+     *     <li>发布恢复结果并释放恢复专用资源；失败保持 fail-closed，不能提前开放普通 SQL 流量。</li>
+     * </ol>
+     *
+     * @param logs 参与 {@code rollbackRecovered} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @param creatorTrxId 参与 {@code rollbackRecovered} 的稳定领域标识 {@code TransactionId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param clusteredIndex 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @return {@code rollbackRecovered} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public RollbackSummary rollbackRecovered(Collection<RecoveredUndoLogIdentity> logs,
                                               TransactionId creatorTrxId,
                                               BTreeIndex clusteredIndex) {
+        // 1、读取 checkpoint、redo、doublewrite 或事务持久证据，在共享或持久副作用前拒绝非法状态。
         if (logs == null || logs.isEmpty() || creatorTrxId == null
                 || clusteredIndex == null && indexResolver == null && targetResolver == null) {
             throw new DatabaseValidationException("recovered rollback group fields must not be empty/null");
         }
         List<UndoLogBinding> bindings = new ArrayList<>();
+        // 2、继续完成范围、身份与候选校验；通过后，依据 page LSN、恢复进度和稳定标识判断跳过或续作，保持处理顺序与资源边界。
         EnumMap<UndoLogKind, Boolean> kinds = new EnumMap<>(UndoLogKind.class);
         for (RecoveredUndoLogIdentity log : logs) {
             if (log == null || kinds.putIfAbsent(log.kind(), Boolean.TRUE) != null) {
@@ -1252,6 +1537,7 @@ public final class RollbackService {
         for (UndoLogBinding binding : bindings) {
             preflightRecoveredBinding(clusteredIndex, binding);
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，按恢复阶段应用物理页或事务状态变化，并维持领域不变量。
         int applied = 0;
         while (true) {
             UndoLogBinding binding = newestRecoveredBinding(bindings);
@@ -1271,10 +1557,17 @@ public final class RollbackService {
             progressFaultInjector.after(RollbackProgressPhase.AFTER_PROGRESS_COMMIT, targetHead);
         }
         finalizer.finalizeRecoveredRollback(bindings, creatorTrxId);
+        // 4、发布恢复结果并释放恢复专用资源，以稳定返回或领域异常完成收口。
         return new RollbackSummary(applied);
     }
 
-    /** recovery 生产入口；每条 undo identity 通过 DD target resolver 定位，不接受 last-index fallback。 */
+    /** recovery 生产入口；每条 undo identity 通过 DD target resolver 定位，不接受 last-index fallback。
+     *
+     * @param logs 参与 {@code rollbackRecovered} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @param creatorTrxId 参与 {@code rollbackRecovered} 的稳定领域标识 {@code TransactionId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @return {@code rollbackRecovered} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public RollbackSummary rollbackRecovered(Collection<RecoveredUndoLogIdentity> logs,
                                               TransactionId creatorTrxId) {
         if (targetResolver == null) {
@@ -1283,6 +1576,13 @@ public final class RollbackService {
         return rollbackRecovered(logs, creatorTrxId, null);
     }
 
+    /**
+     * 执行事务、MVCC 与锁恢复或重放步骤；按持久证据校验并幂等推进状态，不执行普通 SQL 业务语义。
+     *
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param binding 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @throws UndoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     private void preflightRecoveredBinding(BTreeIndex index, UndoLogBinding binding) {
         RollPointer pointer = binding.logicalHead().rollPointer();
         long previous = Long.MAX_VALUE;
@@ -1296,6 +1596,13 @@ public final class RollbackService {
         }
     }
 
+    /**
+     * 执行事务、MVCC 与锁恢复或重放步骤；按持久证据校验并幂等推进状态，不执行普通 SQL 业务语义。
+     *
+     * @param bindings 参与 {@code newestRecoveredBinding} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @return {@code newestRecoveredBinding} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     * @throws UndoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     private static UndoLogBinding newestRecoveredBinding(List<UndoLogBinding> bindings) {
         UndoLogBinding newest = null;
         for (UndoLogBinding binding : bindings) {
@@ -1313,6 +1620,12 @@ public final class RollbackService {
         return newest;
     }
 
+    /**
+     * 执行事务、MVCC 与锁恢复或重放步骤；按持久证据校验并幂等推进状态，不执行普通 SQL 业务语义。
+     *
+     * @param firstPageId 目标页的稳定物理标识；必须属于当前已准入表空间，且不得为 {@code null}
+     * @return {@code readRecoveredKind} 解析或选择出的已知领域类型；成功时不为 {@code null}，未知编码或非法状态通过领域异常报告
+     */
     private UndoLogKind readRecoveredKind(PageId firstPageId) {
         MiniTransaction read = mtrMgr.beginReadOnly();
         try {
@@ -1325,7 +1638,11 @@ public final class RollbackService {
         }
     }
 
-    /** 用独立只读 MTR 读取持久权威 logical head，供 live preflight 与 recovery 建链，返回前释放 page 资源。 */
+    /** 用独立只读 MTR 读取持久权威 logical head，供 live preflight 与 recovery 建链，返回前释放 page 资源。
+     *
+     * @param firstPageId 目标页的稳定物理标识；必须属于当前已准入表空间，且不得为 {@code null}
+     * @return {@code readPersistentLogicalHead} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     */
     private UndoLogicalHead readPersistentLogicalHead(PageId firstPageId) {
         MiniTransaction readMtr = mtrMgr.beginReadOnly();
         try {
@@ -1388,15 +1705,35 @@ public final class RollbackService {
         return fallback;
     }
 
+    /**
+     * 封装事务、MVCC 与锁中 {@code RecordAt} 已校验但尚待发布的事务阶段状态；字段共同固定 owner、物理证据和补偿边界，防止提交/回滚重复执行。
+     *
+     * @param record 参与本次操作的记录或记录集合；不得为 {@code null}，顺序、身份与编码必须满足当前索引或日志格式
+     * @param pointer 参与 {@code 构造} 的稳定领域标识 {@code RollPointer}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param target 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     */
     private record RecordAt(UndoRecord record, RollPointer pointer, UndoTargetMetadata target) {
         private BTreeIndex index() {
             return target.clusteredIndex();
         }
     }
 
+    /**
+     * 封装事务、MVCC 与锁中 {@code HeadUpdate} 已校验但尚待发布的事务阶段状态；字段共同固定 owner、物理证据和补偿边界，防止提交/回滚重复执行。
+     *
+     * @param firstPageId 目标页的稳定物理标识；必须属于当前已准入表空间，且不得为 {@code null}
+     * @param expected 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param target 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     */
     private record HeadUpdate(PageId firstPageId, UndoLogicalHead expected, UndoLogicalHead target) {
     }
 
+    /**
+     * 封装事务、MVCC 与锁中 {@code ResolvedHeadUpdate} 已校验但尚待发布的事务阶段状态；字段共同固定 owner、物理证据和补偿边界，防止提交/回滚重复执行。
+     *
+     * @param update 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     */
     private record ResolvedHeadUpdate(HeadUpdate update, BTreeIndex index) {
         PageId firstPageId() {
             return update.firstPageId();
@@ -1415,6 +1752,11 @@ public final class RollbackService {
      *   <li>{@code DELETE_MARK}（T1.3f）：{@code setClusteredDeleteMark(deleted=false, newHidden=rec.oldHiddenColumns(),
      *       expected=(rec.transactionId(), rp))} 取消删除标记并还原删除前旧隐藏列（恢复存活版本）。</li>
      * </ul>
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param rec 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param rp 参与 {@code applyUndoRecord} 的稳定领域标识 {@code RollPointer}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @throws DatabaseRuntimeException 可恢复的数据库运行期协作失败时抛出；调用方应依据当前事务状态选择回滚、重试或关闭资源
      */
     private void applyUndoRecord(MiniTransaction mtr, UndoRecord rec, RollPointer rp, BTreeIndex index) {
         if (rec.indexId() != index.indexId()) {
@@ -1435,7 +1777,13 @@ public final class RollbackService {
         }
     }
 
-    /** INSERT inverse 可能沿整棵树 merge/shrink；UPDATE/DELETE_MARK inverse 仅做单叶页等长改写。 */
+    /** INSERT inverse 可能沿整棵树 merge/shrink；UPDATE/DELETE_MARK inverse 仅做单叶页等长改写。
+     *
+     * @param record 参与本次操作的记录或记录集合；不得为 {@code null}，顺序、身份与编码必须满足当前索引或日志格式
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @return {@code rollbackInverseWorkload} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     private static RedoBudgetWorkload rollbackInverseWorkload(UndoRecord record, BTreeIndex index) {
         if (record == null || index == null) {
             throw new DatabaseValidationException("rollback redo budget record/index must not be null");

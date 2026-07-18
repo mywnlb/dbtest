@@ -28,6 +28,9 @@ class DecimalCodecTest {
         return FieldSlice.compareUnsigned(new FieldSlice(a, 0, a.length), new FieldSlice(b, 0, b.length));
     }
 
+    /**
+     * 验证 {@code roundTripAndWidth} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void roundTripAndWidth() {
         DecimalCodec c = new DecimalCodec(10, 2);
@@ -37,6 +40,9 @@ class DecimalCodecTest {
         assertEquals(new BigDecimal("0.00"), dec(c, enc(c, new BigDecimal("0.00"))));
     }
 
+    /**
+     * 验证 {@code orderPreserving} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void orderPreserving() {
         DecimalCodec c = new DecimalCodec(10, 2);
@@ -45,6 +51,9 @@ class DecimalCodecTest {
         assertTrue(cmp(enc(c, new BigDecimal("99.99")), enc(c, new BigDecimal("100.00"))) < 0);
     }
 
+    /**
+     * 验证 {@code rejectsScaleAndPrecisionOverflow} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void rejectsScaleAndPrecisionOverflow() {
         DecimalCodec c = new DecimalCodec(10, 2);

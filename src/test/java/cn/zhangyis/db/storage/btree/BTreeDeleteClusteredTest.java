@@ -68,6 +68,9 @@ class BTreeDeleteClusteredTest {
 
     private final TypeCodecRegistry registry = new TypeCodecRegistry();
 
+    /**
+     * 验证 {@code matchingDeleteRemovesRecord} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void matchingDeleteRemovesRecord() {
         onPool(ctx -> {
@@ -91,6 +94,9 @@ class BTreeDeleteClusteredTest {
         });
     }
 
+    /**
+     * 验证 {@code missingKeyIsIdempotentNoOp} 对应的B+Tree 索引行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void missingKeyIsIdempotentNoOp() {
         onPool(ctx -> {
@@ -108,6 +114,9 @@ class BTreeDeleteClusteredTest {
         });
     }
 
+    /**
+     * 验证 {@code ownershipMismatchDoesNotDelete} 所描述的边界场景保持既有领域不变量，不产生方法名明确禁止的副作用。
+     */
     @Test
     void ownershipMismatchDoesNotDelete() {
         onPool(ctx -> {
@@ -138,6 +147,9 @@ class BTreeDeleteClusteredTest {
         });
     }
 
+    /**
+     * 验证 {@code alreadyDeleteMarkedGoesStraightToPurge} 对应的B+Tree 索引行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void alreadyDeleteMarkedGoesStraightToPurge() {
         onPool(ctx -> {
@@ -169,6 +181,9 @@ class BTreeDeleteClusteredTest {
         });
     }
 
+    /**
+     * 验证 {@code levelOneCrossLeafDeleteLeavesOthersQueryable} 所描述的 B+Tree 定位或结构变化，并断言键序、父子链接、页资源和唯一性不变量。
+     */
     @Test
     void levelOneCrossLeafDeleteLeavesOthersQueryable() {
         onPool(ctx -> {
@@ -201,6 +216,9 @@ class BTreeDeleteClusteredTest {
         });
     }
 
+    /**
+     * 验证 {@code multiLevelClusteredDeleteReplaceMarkPurge} 对应的B+Tree 索引行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void multiLevelClusteredDeleteReplaceMarkPurge() {
         onPool(ctx -> {
@@ -265,6 +283,9 @@ class BTreeDeleteClusteredTest {
         });
     }
 
+    /**
+     * 验证 {@code underfullLeafMergesIntoSiblingAndRemovesParentPointer} 所描述的 B+Tree 定位或结构变化，并断言键序、父子链接、页资源和唯一性不变量。
+     */
     @Test
     void underfullLeafMergesIntoSiblingAndRemovesParentPointer() {
         onPool(ctx -> {
@@ -301,6 +322,9 @@ class BTreeDeleteClusteredTest {
         });
     }
 
+    /**
+     * 验证 {@code deleteAllRowsShrinksTreeToLevelZero} 对应的B+Tree 索引行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void deleteAllRowsShrinksTreeToLevelZero() {
         onPool(ctx -> {
@@ -354,6 +378,9 @@ class BTreeDeleteClusteredTest {
         });
     }
 
+    /**
+     * 验证 {@code internalUnderflowPropagatesAndShrinksRoot} 对应的B+Tree 索引行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void internalUnderflowPropagatesAndShrinksRoot() {
         onPool(ctx -> {
@@ -398,6 +425,9 @@ class BTreeDeleteClusteredTest {
         });
     }
 
+    /**
+     * 验证 {@code underfullLeafBorrowsFromFullSiblingViaRedistribute} 所描述的 B+Tree 定位或结构变化，并断言键序、父子链接、页资源和唯一性不变量。
+     */
     @Test
     void underfullLeafBorrowsFromFullSiblingViaRedistribute() {
         onPool(ctx -> {
@@ -607,6 +637,9 @@ class BTreeDeleteClusteredTest {
         return ((ColumnValue.IntValue) row.record().columnValues().get(1)).value();
     }
 
+    /**
+     * 验证 {@code internalRedistributeKeepsSubtreesBalanced} 所描述的返回值或状态会按契约保留，并断言原始信息与领域不变量未丢失。
+     */
     @Test
     void internalRedistributeKeepsSubtreesBalanced() {
         onPool(ctx -> {

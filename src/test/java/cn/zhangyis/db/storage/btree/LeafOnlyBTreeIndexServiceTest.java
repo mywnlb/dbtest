@@ -125,6 +125,9 @@ class LeafOnlyBTreeIndexServiceTest {
         mgr.commit(m);
     }
 
+    /**
+     * 验证 {@code lookupReturnsEmptyWhenKeyMissing} 对应的B+Tree 索引行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void lookupReturnsEmptyWhenKeyMissing() {
         onPool((pool, access, mgr) -> {
@@ -137,6 +140,9 @@ class LeafOnlyBTreeIndexServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code scanLeafReturnsBoundedRowsInKeyOrder} 所描述的 B+Tree 定位或结构变化，并断言键序、父子链接、页资源和唯一性不变量。
+     */
     @Test
     void scanLeafReturnsBoundedRowsInKeyOrder() {
         onPool((pool, access, mgr) -> {
@@ -152,6 +158,9 @@ class LeafOnlyBTreeIndexServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code insertThroughBTreeEmitsRedoAndCanBeLookedUp} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void insertThroughBTreeEmitsRedoAndCanBeLookedUp() {
         onPool((pool, access, mgr) -> {
@@ -174,6 +183,9 @@ class LeafOnlyBTreeIndexServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code uniqueInsertRejectsDuplicatePhysicalKey} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void uniqueInsertRejectsDuplicatePhysicalKey() {
         onPool((pool, access, mgr) -> {
@@ -223,6 +235,9 @@ class LeafOnlyBTreeIndexServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code nonLeafRootIsRejected} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void nonLeafRootIsRejected() {
         onPool((pool, access, mgr) -> {
@@ -236,6 +251,9 @@ class LeafOnlyBTreeIndexServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code leafOverflowIsReportedAsSplitRequired} 所描述的 B+Tree 定位或结构变化，并断言键序、父子链接、页资源和唯一性不变量。
+     */
     @Test
     void leafOverflowIsReportedAsSplitRequired() {
         onPool((pool, access, mgr) -> {

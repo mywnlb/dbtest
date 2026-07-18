@@ -14,6 +14,12 @@ import java.util.Set;
  * DD catalog 持久化的 table→tablespace/index/LOB 物理绑定。{@code rowFormatVersion} 是聚簇记录编码格式，
  * metadata-only CREATE INDEX 推进字典版本时必须保持它不变。LOB segment 是表级共享资源：只有 LOB-capable
  * 表的新 catalog 才携带；旧 catalog 允许为空，但普通 DML 不得在缺失时临时创建 segment。
+ * @param tableId 目标表的原始字典标识；必须为已分配的正数并与当前元数据和物理绑定一致
+ * @param spaceId 目标表空间的稳定标识；不得为 {@code null}，且必须已注册并满足当前生命周期准入条件
+ * @param path 受控目录内的规范化文件路径；不得为 {@code null}，也不得逃逸所属表空间或日志目录
+ * @param rowFormatVersion 参与 {@code 构造} 的稳定编码 {@code rowFormatVersion}；必须命中当前版本声明的编码集合，未知值以格式或校验异常拒绝
+ * @param indexes 参与 {@code 构造} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+ * @param lobSegment 可选的 {@code lobSegment}；参数本身不得为 {@code null}，空 {@code Optional} 明确表示调用方未提供该领域值
  */
 public record TableStorageBinding(long tableId, SpaceId spaceId, Path path, long rowFormatVersion,
                                   List<IndexStorageBinding> indexes, Optional<SegmentRef> lobSegment) {

@@ -43,6 +43,14 @@ public final class PreparedTransactionService {
     /**
      * 构造共享生产组合根协作者的 prepared transaction facade。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝 null、越界和相互矛盾的组合。</li>
+     *     <li>完成跨参数校验并推导不可变配置；若构造过程创建自有资源，后续失败必须在异常路径关闭。</li>
+     *     <li>把已校验协作者与配置绑定到字段，并初始化本对象拥有的状态、显式锁、队列或缓存，不允许 this 提前逃逸。</li>
+     *     <li>构造完成后对象处于类契约声明的初始状态；任一步失败都抛出领域异常且不发布半初始化实例。</li>
+     * </ol>
+     *
      * @param transactionManager 事务状态与 active table 管理器
      * @param undoLogManager undo prepare/commit 物理终结器
      * @param rollbackService prepared rollback 执行器
@@ -57,16 +65,20 @@ public final class PreparedTransactionService {
                                       RedoLogManager redo,
                                       RecoveryTrafficGate recoveryGate,
                                       LockManager lockManager) {
+        // 1、校验必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝非法组合。
         if (transactionManager == null || undoLogManager == null || rollbackService == null
                 || redo == null || recoveryGate == null || lockManager == null) {
             throw new DatabaseValidationException(
                     "prepared transaction service collaborators must not be null");
         }
         this.transactionManager = transactionManager;
+        // 2、完成跨参数校验并推导不可变配置；后续失败仍由当前构造路径收口已创建资源。
         this.undoLogManager = undoLogManager;
         this.rollbackService = rollbackService;
+        // 3、绑定已校验协作者并初始化本对象拥有的状态、显式锁、队列或缓存，不允许半初始化实例逃逸。
         this.redo = redo;
         this.recoveryGate = recoveryGate;
+        // 4、完成初始状态发布；失败以领域异常终止构造，成功对象满足类级生命周期不变量。
         this.lockManager = lockManager;
     }
 
@@ -84,6 +96,7 @@ public final class PreparedTransactionService {
      * @param command ACTIVE 写事务与正 durability timeout
      * @return phase-one durable 事务 id/LSN
      * @throws PreparedTransactionOperationException gate 未开放、物理 prepare 或 durability 失败时抛出
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public PreparedTransactionPrepareResult prepare(PrepareTransactionCommand command) {
         // 1、live XA 不能与 crash recovery 并行触碰 page3/undo owner。
@@ -119,6 +132,8 @@ public final class PreparedTransactionService {
      * @param command PREPARED/可确认重试的 COMMITTED 事务与正 timeout
      * @return durable COMMITTED 结果
      * @throws PreparedTransactionOperationException 物理终结、durability 或锁清理失败时抛出
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws TransactionStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
      */
     public PreparedTransactionCompletionResult commitPrepared(
             CommitPreparedTransactionCommand command) {
@@ -165,6 +180,7 @@ public final class PreparedTransactionService {
      * @param command prepared 写事务、稳定聚簇索引和正 timeout
      * @return durable ROLLED_BACK 结果
      * @throws PreparedTransactionOperationException inverse、owner 终结、durability 或锁清理失败时抛出
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public PreparedTransactionCompletionResult rollbackPrepared(
             RollbackPreparedTransactionCommand command) {
@@ -184,6 +200,7 @@ public final class PreparedTransactionService {
      * @param command prepared 写事务与正 durability timeout
      * @return durable ROLLED_BACK 结果
      * @throws PreparedTransactionOperationException resolver 缺失、inverse、物理终结或 durability 失败时抛出
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public PreparedTransactionCompletionResult rollbackPrepared(
             ResolvedRollbackPreparedTransactionCommand command) {
@@ -204,6 +221,7 @@ public final class PreparedTransactionService {
      * @param resolved 是否要求 RollbackService 按 undo identity 解析 exact target
      * @param timeout terminal redo durability 等待上限
      * @return durable ROLLED_BACK 结果
+     * @throws TransactionStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
      */
     private PreparedTransactionCompletionResult rollbackPreparedInternal(
             Transaction transaction,

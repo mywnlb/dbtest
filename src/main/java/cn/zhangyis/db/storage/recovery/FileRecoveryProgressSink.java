@@ -27,6 +27,7 @@ public final class FileRecoveryProgressSink implements RecoveryProgressSink {
      * 创建文件 sink。构造时不打开文件，实际 append 时创建父目录和文件，避免构造 StorageEngine 产生 IO 副作用。
      *
      * @param path JSONL 文件路径，不能为 null。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public FileRecoveryProgressSink(Path path) {
         if (path == null) {
@@ -41,6 +42,8 @@ public final class FileRecoveryProgressSink implements RecoveryProgressSink {
      * {@link CrashRecoveryService} fail closed。
      *
      * @param event 已生成的不可变 progress 事件。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws DatabaseRuntimeException 可恢复的数据库运行期协作失败时抛出；调用方应依据当前事务状态选择回滚、重试或关闭资源
      */
     @Override
     public void append(RecoveryProgressEvent event) {

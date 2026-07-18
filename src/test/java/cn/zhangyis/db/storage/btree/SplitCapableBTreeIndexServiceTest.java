@@ -83,6 +83,9 @@ class SplitCapableBTreeIndexServiceTest {
 
     private final TypeCodecRegistry registry = new TypeCodecRegistry();
 
+    /**
+     * 验证 {@code btreeIndexKeepsNoSplitConstructorAndCanCarrySegments} 所描述的返回值或状态会按契约保留，并断言原始信息与领域不变量未丢失。
+     */
     @Test
     void btreeIndexKeepsNoSplitConstructorAndCanCarrySegments() {
         BTreeIndex legacy = new BTreeIndex(INDEX_ID, LEGACY_ROOT, 0, idKey(), wideSchema(), true);
@@ -96,6 +99,9 @@ class SplitCapableBTreeIndexServiceTest {
         assertEquals(nonLeaf, split.nonLeafSegment());
     }
 
+    /**
+     * 验证 {@code insertResultKeepsOldConstructorAndExposesSplitMetadata} 所描述的返回值或状态会按契约保留，并断言原始信息与领域不变量未丢失。
+     */
     @Test
     void insertResultKeepsOldConstructorAndExposesSplitMetadata() {
         BTreeIndex idx = new BTreeIndex(INDEX_ID, LEGACY_ROOT, 0, idKey(), wideSchema(), true);
@@ -108,6 +114,9 @@ class SplitCapableBTreeIndexServiceTest {
         assertEquals(List.of(), legacy.allocatedPages());
     }
 
+    /**
+     * 验证 {@code indexPageHandleUpdatesSiblingLinksWithoutRewritingWholeHeader} 所描述的边界场景保持既有领域不变量，不产生方法名明确禁止的副作用。
+     */
     @Test
     void indexPageHandleUpdatesSiblingLinksWithoutRewritingWholeHeader() {
         onBTreePool((ctx) -> {
@@ -128,6 +137,9 @@ class SplitCapableBTreeIndexServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code nodePointerRoundTripsThroughDerivedSchema} 所描述的字典/DDL 协作，并断言版本、对象身份、缓存失效和物理绑定保持一致。
+     */
     @Test
     void nodePointerRoundTripsThroughDerivedSchema() {
         BTreeNodePointerSchema pointerSchema = BTreeNodePointerSchema.from(
@@ -144,6 +156,9 @@ class SplitCapableBTreeIndexServiceTest {
         assertEquals(2, pointerSchema.childPageColumnOrdinal());
     }
 
+    /**
+     * 验证 {@code rootLeafOverflowSplitsStableRootAndLookupFindsBothLeaves} 所描述的 B+Tree 定位或结构变化，并断言键序、父子链接、页资源和唯一性不变量。
+     */
     @Test
     void rootLeafOverflowSplitsStableRootAndLookupFindsBothLeaves() {
         onBTreePool((ctx) -> {
@@ -267,6 +282,9 @@ class SplitCapableBTreeIndexServiceTest {
         }
     }
 
+    /**
+     * 验证 {@code rootSplitLinksChildLeavesAndRangeScanCrossesSibling} 所描述的 B+Tree 定位或结构变化，并断言键序、父子链接、页资源和唯一性不变量。
+     */
     @Test
     void rootSplitLinksChildLeavesAndRangeScanCrossesSibling() {
         onBTreePool((ctx) -> {
@@ -284,6 +302,9 @@ class SplitCapableBTreeIndexServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code rootSplitEmitsBtreeSiblingLinkDeltasWithoutPhysicalSiblingBytes} 所描述的边界场景保持既有领域不变量，不产生方法名明确禁止的副作用。
+     */
     @Test
     void rootSplitEmitsBtreeSiblingLinkDeltasWithoutPhysicalSiblingBytes() {
         onBTreePool((ctx) -> {
@@ -352,6 +373,9 @@ class SplitCapableBTreeIndexServiceTest {
         return true;
     }
 
+    /**
+     * 验证 {@code levelOneInsertSplitsOnlyTargetLeafAndUpdatesRootPointers} 所描述的 B+Tree 定位或结构变化，并断言键序、父子链接、页资源和唯一性不变量。
+     */
     @Test
     void levelOneInsertSplitsOnlyTargetLeafAndUpdatesRootPointers() {
         onBTreePool((ctx) -> {
@@ -371,6 +395,9 @@ class SplitCapableBTreeIndexServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code parentOverflowGrowsTreeInsteadOfFailing} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void parentOverflowGrowsTreeInsteadOfFailing() {
         onBTreePool((ctx) -> {
@@ -404,6 +431,9 @@ class SplitCapableBTreeIndexServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code redoReplayRestoresSplitRootAndSiblingScan} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void redoReplayRestoresSplitRootAndSiblingScan() {
         onBTreePool((ctx) -> {
@@ -437,6 +467,9 @@ class SplitCapableBTreeIndexServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code rootSplitGrowsTreeToLevelTwo} 所描述的 B+Tree 定位或结构变化，并断言键序、父子链接、页资源和唯一性不变量。
+     */
     @Test
     void rootSplitGrowsTreeToLevelTwo() {
         onBTreePool((ctx) -> {
@@ -467,6 +500,9 @@ class SplitCapableBTreeIndexServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code internalNonRootSplitPropagatesToLevelThree} 所描述的 B+Tree 定位或结构变化，并断言键序、父子链接、页资源和唯一性不变量。
+     */
     @Test
     void internalNonRootSplitPropagatesToLevelThree() {
         onBTreePool((ctx) -> {
@@ -496,6 +532,9 @@ class SplitCapableBTreeIndexServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code multiLevelScanReturnsAllInOrder} 对应的B+Tree 索引行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void multiLevelScanReturnsAllInOrder() {
         onBTreePool((ctx) -> {

@@ -36,6 +36,14 @@ public record ClusteredInsertCommand(Transaction transaction, BTreeIndex index, 
     /**
      * 校验 INSERT/UPDATE/DELETE 共用输入边界。该方法集中保护 facade 的第一层不变量：显式事务必须存在、
      * 目标必须是聚簇索引、key/tableId 可用于 undo 与 current-read 定位、锁等待必须有正超时。
+     *
+     * @param transaction 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param key 参与 {@code validateCommon} 的稳定领域标识 {@code SearchKey}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param tableId 目标表的原始字典标识；必须为已分配的正数并与当前元数据和物理绑定一致
+     * @param lockWaitTimeout 本次等待或操作的最大时长；不得为 {@code null} 且必须为正，超时不得留下未释放资源
+     * @param operation 传给 {@code validateCommon} 的文本值；不得为 {@code null} 或空白，并保持调用方提供的字符顺序
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     static void validateCommon(Transaction transaction, BTreeIndex index, SearchKey key,
                                long tableId, Duration lockWaitTimeout, String operation) {

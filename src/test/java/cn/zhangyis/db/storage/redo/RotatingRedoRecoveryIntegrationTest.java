@@ -41,6 +41,9 @@ class RotatingRedoRecoveryIntegrationTest {
                 new RedoLogBatch(new LogRange(Lsn.of(0), Lsn.of(r.byteLength())), List.of(r)), 0).byteLength();
     }
 
+    /**
+     * 验证 {@code durableManagerRoundTripsThroughRotatedRing} 所描述的刷脏与持久化协作，并断言 redo durable 边界先覆盖 page LSN、失败后仍保留脏状态。
+     */
     @Test
     void durableManagerRoundTripsThroughRotatedRing() {
         Lsn lastEnd;
@@ -60,6 +63,9 @@ class RotatingRedoRecoveryIntegrationTest {
         }
     }
 
+    /**
+     * 验证 {@code continuesInActiveFileAfterRecoveredBoundary} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void continuesInActiveFileAfterRecoveredBoundary() {
         long capacity = 2L * oneFrameBytes(); // 每文件容两批，留出续写余量
@@ -95,6 +101,8 @@ class RotatingRedoRecoveryIntegrationTest {
     /**
      * 已回收历史后，唯一 retained 文件可能只含 checkpoint 之后的 torn 首批；空 batch 列表仍必须携带
      * header 的非零起点，使 recovery 接受“没有 durable 新批次”并停在 checkpoint，而不是误报 redo 丢失。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
      */
     @Test
     void recoversCheckpointWhenOnlyRetainedBatchIsTorn() throws Exception {

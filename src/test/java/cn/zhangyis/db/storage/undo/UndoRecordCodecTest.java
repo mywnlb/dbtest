@@ -34,12 +34,18 @@ class UndoRecordCodecTest {
 
     // ---- Task 3：枚举落盘值钉死 ----
 
+    /**
+     * 验证 {@code undoLogKindOrdinalsStable} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test void undoLogKindOrdinalsStable() {
         assertEquals(0, UndoLogKind.INSERT.ordinal());
         assertEquals(1, UndoLogKind.UPDATE.ordinal());
         assertEquals(2, UndoLogKind.TEMPORARY.ordinal());
     }
 
+    /**
+     * 验证 {@code undoRecordTypeCodesStable} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test void undoRecordTypeCodesStable() {
         assertEquals(1, UndoRecordType.INSERT_ROW.code());
         assertEquals(2, UndoRecordType.UPDATE_ROW.code());
@@ -69,6 +75,9 @@ class UndoRecordCodecTest {
         return UndoRecord.insert(UndoNo.of(5), TransactionId.of(0x1122334455L), 7L, 9L, key, prev);
     }
 
+    /**
+     * 验证 {@code roundTripsTwoColKeyNullRollPtr} 对应的Undo 日志行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test void roundTripsTwoColKeyNullRollPtr() {
         UndoRecord r = rec(List.of(new ColumnValue.IntValue(42),
                 new ColumnValue.StringValue("alice")), RollPointer.NULL);
@@ -93,6 +102,9 @@ class UndoRecordCodecTest {
         assertEquals(9L, identity.indexId());
     }
 
+    /**
+     * 验证 {@code roundTripsNonNullPrevAndNullKeyColumn} 对应的Undo 日志行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test void roundTripsNonNullPrevAndNullKeyColumn() {
         RollPointer prev = new RollPointer(true, PageNo.of(0x01020304L), 0xABCD);
         UndoRecord r = rec(List.of(new ColumnValue.IntValue(1),
@@ -125,6 +137,9 @@ class UndoRecordCodecTest {
         assertEquals(expected, codec.decode(codec.encode(expected, keyDef, schema), 0, keyDef, schema));
     }
 
+    /**
+     * 验证 {@code decodeRejectsTruncated} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test void decodeRejectsTruncated() {
         UndoRecordCodec codec = new UndoRecordCodec(registry);
         byte[] buf = codec.encode(rec(List.of(new ColumnValue.IntValue(1),
@@ -144,6 +159,9 @@ class UndoRecordCodecTest {
                 () -> codec.decode(withTrailingGarbage, 0, twoColKey(), twoColSchema()));
     }
 
+    /**
+     * 验证 {@code decodeRejectsKeyColCountMismatch} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test void decodeRejectsKeyColCountMismatch() {
         UndoRecordCodec codec = new UndoRecordCodec(registry);
         byte[] buf = codec.encode(rec(List.of(new ColumnValue.IntValue(1),
@@ -152,6 +170,9 @@ class UndoRecordCodecTest {
         assertThrows(UndoLogFormatException.class, () -> codec.decode(buf, 0, twoColKey(), twoColSchema()));
     }
 
+    /**
+     * 验证 {@code decodeRejectsUnknownTypeOnDisk} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test void decodeRejectsUnknownTypeOnDisk() {
         UndoRecordCodec codec = new UndoRecordCodec(registry);
         byte[] buf = codec.encode(rec(List.of(new ColumnValue.IntValue(1),
@@ -170,6 +191,9 @@ class UndoRecordCodecTest {
         return UndoRecord.update(UndoNo.of(6), TransactionId.of(0x99), 7L, 9L, key, oldRow, OLD_HIDDEN, prev);
     }
 
+    /**
+     * 验证 {@code roundTripsUpdateRowFullOldImage} 对应的Undo 日志行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test void roundTripsUpdateRowFullOldImage() {
         UndoRecord r = updateRec(
                 List.of(new ColumnValue.IntValue(42), new ColumnValue.StringValue("alice")),
@@ -184,6 +208,9 @@ class UndoRecordCodecTest {
         assertEquals("alice-old", ((ColumnValue.StringValue) back.oldColumnValues().get(1)).value());
     }
 
+    /**
+     * 验证 {@code roundTripsDeleteMarkRowFullOldImage} 对应的Undo 日志行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test void roundTripsDeleteMarkRowFullOldImage() {
         UndoRecord r = UndoRecord.deleteMark(UndoNo.of(7), TransactionId.of(0x99), 7L, 9L,
                 List.of(new ColumnValue.IntValue(42), new ColumnValue.StringValue("alice")),
@@ -196,6 +223,9 @@ class UndoRecordCodecTest {
         assertEquals(OLD_HIDDEN, back.oldHiddenColumns());
     }
 
+    /**
+     * 验证 {@code updateRoundTripsNullColumnInOldImage} 对应的Undo 日志行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test void updateRoundTripsNullColumnInOldImage() {
         UndoRecord r = updateRec(
                 List.of(new ColumnValue.IntValue(1), new ColumnValue.StringValue("k")),
@@ -225,6 +255,9 @@ class UndoRecordCodecTest {
         assertEquals(external, decoded.oldColumnValues().get(1));
     }
 
+    /**
+     * 验证 {@code decodeRejectsUpdateTruncated} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test void decodeRejectsUpdateTruncated() {
         UndoRecordCodec codec = new UndoRecordCodec(registry);
         byte[] buf = codec.encode(updateRec(
@@ -235,6 +268,9 @@ class UndoRecordCodecTest {
         assertThrows(UndoLogFormatException.class, () -> codec.decode(cut, 0, twoColKey(), twoColSchema()));
     }
 
+    /**
+     * 验证 {@code decodeRejectsRowColCountSchemaMismatch} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test void decodeRejectsRowColCountSchemaMismatch() {
         // 2 列 schema 编码（rowColCount=2），用 3 列 schema 解码：key 列(0,1)仍可解析，但 row 阶段 2≠3 必抛。
         UndoRecordCodec codec = new UndoRecordCodec(registry);
@@ -249,6 +285,9 @@ class UndoRecordCodecTest {
         assertThrows(UndoLogFormatException.class, () -> codec.decode(buf, 0, twoColKey(), threeCol));
     }
 
+    /**
+     * 验证 {@code insertGoldenBytesStable} 对应的Undo 日志行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test void insertGoldenBytesStable() {
         // 固定 INSERT_ROW 编码（NULL key 列，完全确定，不依赖列 codec）证明 undo framing 字节不漂移。
         TableSchema oneCol = new TableSchema(1, List.of(

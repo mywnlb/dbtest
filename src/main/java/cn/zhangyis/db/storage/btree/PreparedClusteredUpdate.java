@@ -83,25 +83,41 @@ public final class PreparedClusteredUpdate implements AutoCloseable {
     /**
      * 正常 published 后幂等结束；未发布即关闭表示业务 MTR 已越过 prepared 物理边界但没有形成可恢复行版本。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取并校验调用参数与当前领域状态，确保失败发生在本方法创建共享或持久副作用之前。</li>
+     *     <li>按类级并发协议取得本阶段所需协作者与 Guard，竞争后重新校验资源身份和生命周期。</li>
+     *     <li>执行核心状态转换或数据变换，并只通过本包稳定协作者发布可观察副作用。</li>
+     *     <li>汇总稳定结果并沿现有 finally/Guard 释放资源；异常不得伪造成功或清除未完成状态。</li>
+     * </ol>
+     *
      * @throws PreparedUpdateStateException 未发布关闭、跨线程、MTR 非 ACTIVE 或 scope 释放失败时抛出。
      */
     @Override
     public void close() {
+        // 1、读取并校验调用参数与当前领域状态，在共享或持久副作用前拒绝非法状态。
         if (closed) return;
+        // 2、继续完成范围、身份与候选校验；通过后，按类级并发协议取得本阶段所需协作者与 Guard，保持处理顺序与资源边界。
         requireOwner();
         closed = true;
+        // 3、在中间分支复核阶段性结果；满足条件后，执行核心状态转换或数据变换，并维持领域不变量。
         RuntimeException releaseFailure = releaseScope();
         if (!published) {
             throw new PreparedUpdateStateException(
                     "prepared clustered update closed before row publication", releaseFailure);
         }
+        // 4、汇总稳定结果并沿现有 finally/Guard 释放资源，以稳定返回或领域异常完成收口。
         if (releaseFailure != null) {
             throw new PreparedUpdateStateException(
                     "prepared clustered update resource release failed", releaseFailure);
         }
     }
 
-    /** 校验 guard 仍由创建线程在 ACTIVE MTR 中独占且尚未发布。 */
+    /** 校验 guard 仍由创建线程在 ACTIVE MTR 中独占且尚未发布。
+     *
+     * @param operation 传给 {@code requireOpen} 的文本值；不得为 {@code null} 或空白，并保持调用方提供的字符顺序
+     * @throws PreparedUpdateStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
+     */
     private void requireOpen(String operation) {
         requireOwner();
         if (closed || published) {
@@ -119,7 +135,10 @@ public final class PreparedClusteredUpdate implements AutoCloseable {
         }
     }
 
-    /** 退出 index→LOB/FSP 显式锁序 scope；返回异常供调用方保持主失败。 */
+    /** 退出 index→LOB/FSP 显式锁序 scope；返回异常供调用方保持主失败。
+     *
+     * @return {@code releaseScope} 未找到或条件不满足时返回 {@code null}；否则返回满足构造不变量的 {@code RuntimeException} 结果
+     */
     private RuntimeException releaseScope() {
         try {
             latchOrderScope.close();

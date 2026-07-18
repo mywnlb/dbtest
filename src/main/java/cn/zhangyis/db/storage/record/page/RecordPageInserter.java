@@ -36,6 +36,12 @@ public final class RecordPageInserter {
     /** key 有序前驱定位（findInsertPosition）。 */
     private final RecordPageSearch search;
 
+    /**
+     * 创建 {@code RecordPageInserter}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param registry 由组合根提供的 {@code TypeCodecRegistry} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public RecordPageInserter(TypeCodecRegistry registry) {
         if (registry == null) {
             throw new DatabaseValidationException("type codec registry must not be null");
@@ -52,11 +58,21 @@ public final class RecordPageInserter {
      * {@code prev -> new -> next(prev)} → 更新 header 计数器（nRecs/lastInsert/direction）→ 维护 owner n_owned
      * 并按需 split。允许重复 key（插到相等记录之后，稳定；唯一性由上层保证）。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验表空间生命周期、页号、区段身份与容量边界，非法或损坏元数据在分配/IO 前拒绝。</li>
+     *     <li>按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，避免锁序反转。</li>
+     *     <li>执行空间元数据或物理文件变化，并把需要的 allocation intent、redo、dirty 或 force 副作用交给既有下游。</li>
+     *     <li>发布稳定结果并逆序释放 lease、latch 与 fix；失败保留可由恢复流程识别的权威状态。</li>
+     * </ol>
+     *
      * @param page   目标 INDEX 页（须已 format，X latch 有效）。
      * @param pageId 该页页号，用于产出 RecordRef。
      * @param rec    待插逻辑记录（列序同 schema；recordType 通常 CONVENTIONAL）。
      * @param keyDef 索引 key 定义（决定取哪些列、ASC/DESC）。
      * @param schema 表结构（编码与比较的权威类型来源）。
+     * @return {@code insert} 定位或分配的稳定值对象；成功时不为 {@code null}，其身份、范围和特殊值已由构造校验保证
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public RecordRef insert(RecordPage page, PageId pageId, LogicalRecord rec, IndexKeyDef keyDef, TableSchema schema) {
         if (page == null || pageId == null || rec == null || keyDef == null || schema == null) {

@@ -61,6 +61,15 @@ public final class MiniTransaction {
      */
     private int outOfOrderPageLatchScopeDepth;
 
+    /**
+     * 创建 {@code MiniTransaction}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param id 参与 {@code 构造} 的原始数值身份 {@code id}；必须非负，零值仅用于对应格式明确声明的系统或空身份
+     * @param redoLogManager 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param accessController 由组合根提供的 {@code TablespaceAccessController} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param redoBudget redo 收集、定位或重放所需的日志对象；不得为 {@code null}，其 LSN 范围和记录格式必须连续且属于当前恢复或 MTR 上下文
+     * @param redoReservation redo 收集、定位或重放所需的日志对象；不得为 {@code null}，其 LSN 范围和记录格式必须连续且属于当前恢复或 MTR 上下文
+     */
     MiniTransaction(long id, RedoLogManager redoLogManager, TablespaceAccessController accessController,
                     RedoAppendBudget redoBudget, RedoCapacityThrottle.Reservation redoReservation) {
         this.id = id;
@@ -70,7 +79,11 @@ public final class MiniTransaction {
         this.redoReservation = redoReservation;
     }
 
-    /** 包内兼容构造，仅供不参与生命周期协作的 MTR 状态单测使用。 */
+    /** 包内兼容构造，仅供不参与生命周期协作的 MTR 状态单测使用。
+     *
+     * @param id 参与 {@code 构造} 的原始数值身份 {@code id}；必须非负，零值仅用于对应格式明确声明的系统或空身份
+     * @param redoLogManager 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     */
     MiniTransaction(long id, RedoLogManager redoLogManager) {
         this(id, redoLogManager, new TablespaceAccessController(), RedoAppendBudget.testingUnbounded(),
                 RedoCapacityThrottle.NO_OP.reserveAppendBudget(RedoAppendBudget.testingUnbounded()));
@@ -111,6 +124,8 @@ public final class MiniTransaction {
      * @param pageId 新页。
      * @param mode 通常 X。
      * @return 受控页句柄。
+     * @param pageType 选择 {@code newPage} 分支的 {@code PageType} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public PageGuard newPage(BufferPool pool, PageId pageId, PageLatchMode mode, PageType pageType) {
         if (pageType == null) {
@@ -125,6 +140,7 @@ public final class MiniTransaction {
      * 同一 MTR/SpaceId 重复调用为 no-op，lease 由 memo 在所有页资源之后释放。
      *
      * @param spaceId 要进入的表空间。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public void acquireTablespaceLease(SpaceId spaceId) {
         ensureActive();
@@ -153,6 +169,7 @@ public final class MiniTransaction {
      *
      * @param reason 例外理由，必须写清调用方依赖的无环不变量，便于 review 和诊断。
      * @return 必须用 try-with-resources 关闭的作用域 guard。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public MtrLatchOrderScope allowOutOfOrderPageLatch(String reason) {
         ensureActive();
@@ -163,7 +180,10 @@ public final class MiniTransaction {
         return new MtrLatchOrderScope(this, reason);
     }
 
-    /** 关闭由 {@link #allowOutOfOrderPageLatch(String)} 创建的作用域。 */
+    /** 关闭由 {@link #allowOutOfOrderPageLatch(String)} 创建的作用域。
+     * @param reason 传给 {@code closeOutOfOrderPageLatchScope} 的文本值；不得为 {@code null} 或空白，并保持调用方提供的字符顺序
+     * @throws MtrStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
+     */
     void closeOutOfOrderPageLatchScope(String reason) {
         if (outOfOrderPageLatchScopeDepth <= 0) {
             throw new MtrStateException("out-of-order page latch scope underflow: " + reason);
@@ -239,6 +259,9 @@ public final class MiniTransaction {
     /**
      * 独立多页 page latch 默认全序守卫。若当前 MTR 仍持有更大的 PageId，又请求一个尚未持有的更小 PageId，
      * 两个线程按相反顺序获取相同页集时会形成 hold-and-wait 环；这里在进入 page latch 等待前快速失败。
+     *
+     * @param pageId 目标页的稳定物理标识；必须属于当前已准入表空间，且不得为 {@code null}
+     * @throws MtrStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
      */
     private void enforcePageLatchOrder(PageId pageId) {
         if (outOfOrderPageLatchScopeDepth > 0 || memo.holdsAnyPageLatch(pageId)) {
@@ -266,6 +289,8 @@ public final class MiniTransaction {
      *
      * @param pageId 待释放 guard 所在页（用于 touched 判定与诊断）。
      * @param guard  本 MTR memo 仍持有的 page guard（按身份匹配）。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws MtrStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
      */
     public void releaseLatch(PageId pageId, PageGuard guard) {
         ensureActive();
@@ -281,6 +306,10 @@ public final class MiniTransaction {
     /**
      * 返回本 MTR 已持有的 X guard，未持有则返回 null。该入口供同一 MTR 写后校验读取复用 touched 页；调用方不得
      * close/release 返回 guard，生命周期仍归 memo，避免为了短读重复 fix 后被 savepoint 误判为释放写页。
+     *
+     * @param pageId 目标页的稳定物理标识；必须属于当前已准入表空间，且不得为 {@code null}
+     * @return {@code retainedExclusivePage} 取得或创建的受控存储资源；成功时不为 {@code null}，调用方必须按其 Guard/lease 契约释放
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public PageGuard retainedExclusivePage(PageId pageId) {
         ensureActive();
@@ -290,7 +319,10 @@ public final class MiniTransaction {
         return memo.holds(pageId, PageLatchMode.EXCLUSIVE) ? memo.guardFor(pageId) : null;
     }
 
-    /** 记录当前 memo 深度为保存点。 */
+    /** 记录当前 memo 深度为保存点。
+     *
+     * @return {@code savepoint} 创建或观察到的事务/锁状态；成功时不为 {@code null}，owner、可见性与生命周期来自当前会话
+     */
     public MtrSavepoint savepoint() {
         ensureActive();
         return new MtrSavepoint(id, memo.depth());
@@ -300,13 +332,26 @@ public final class MiniTransaction {
      * 释放保存点之后获取的 latch/fix（§9.2 提前释放局部 latch）。不撤销页内容；释放的页若写过仍标脏。
      * 建议只对未修改页使用。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
      * @param savepoint 本 MTR 的保存点。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws MtrStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
      */
     public void rollbackToSavepoint(MtrSavepoint savepoint) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         ensureActive();
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         if (savepoint == null) {
             throw new DatabaseValidationException("savepoint must not be null");
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         if (savepoint.mtrId() != id) {
             throw new MtrStateException("savepoint does not belong to this mini transaction: "
                     + savepoint.mtrId() + " vs " + id);
@@ -318,6 +363,7 @@ public final class MiniTransaction {
                 throw new MtrStateException("cannot release a written (touched) page in savepoint rollback: " + pid);
             }
         }
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         memo.releaseTo(savepoint.depth());
     }
 
@@ -328,23 +374,36 @@ public final class MiniTransaction {
      * 使随后的 pageLSN 盖戳写**不**进 redo（决策④：先分配 LSN 再盖 pageLSN，盖戳不入本批）；对 collector.touchedPages
      * 逐页 {@link PageEnvelope#stampPageLsn} 盖 endLsn（恢复幂等基线）；随后 LIFO 释放 memo（按 wrote 标脏）。
      * 只有释放完成后才关闭 redo range，保证 checkpoint 不会越过尚未发布到 Buffer Pool dirty view 的页面修改。
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
+     * @return {@code commit} 定位或分配的稳定值对象；成功时不为 {@code null}，其身份、范围和特殊值已由构造校验保证
      */
     Lsn commit() {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         transitTo(MiniTransactionState.COMMITTING);
         // persisted records 只冻结一次：预算结算、LSN 分配和 repository 编码必须观察完全相同的列表。
         List<RedoRecord> persistedRecords = collector.records();
         redoBudget.requireCovers(persistedRecords);
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         LogRange range = redoLogManager.append(persistedRecords);
         // append 已把 actual bytes 纳入 current LSN；立即解除 admission 账本，避免直到 page 发布后仍双计数。
         redoReservation.transferToAppend();
         Lsn endLsn = range.end();
         collector.disable();
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         for (PageId pid : collector.touchedPages()) {
             PageEnvelope.stampPageLsn(memo.guardFor(pid), endLsn);
         }
         memo.releaseAll();
         redoLogManager.markClosed(range);
         transitTo(MiniTransactionState.COMMITTED);
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         return endLsn;
     }
 

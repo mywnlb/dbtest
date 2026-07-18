@@ -22,6 +22,9 @@ class ExtentAllocationPolicyTest {
 
     private static final PageSize PS = PageSize.ofBytes(16 * 1024);
 
+    /**
+     * 验证 {@code noDirectionOrNonLeafAcquiresOneExtentOnly} 所描述的 B+Tree 定位或结构变化，并断言键序、父子链接、页资源和唯一性不变量。
+     */
     @Test
     void noDirectionOrNonLeafAcquiresOneExtentOnly() {
         ExtentAllocationPolicy p = new DefaultExtentAllocationPolicy();
@@ -33,6 +36,9 @@ class ExtentAllocationPolicyTest {
                 ExtentAllocationDirection.DOWN, 10, 1)));
     }
 
+    /**
+     * 验证 {@code leafDirectionalGrowthClampsOwnedExtentCountToFour} 所描述的 B+Tree 定位或结构变化，并断言键序、父子链接、页资源和唯一性不变量。
+     */
     @Test
     void leafDirectionalGrowthClampsOwnedExtentCountToFour() {
         ExtentAllocationPolicy p = new DefaultExtentAllocationPolicy();
@@ -48,6 +54,9 @@ class ExtentAllocationPolicyTest {
                 ExtentAllocationDirection.DOWN, 10, 1)));
     }
 
+    /**
+     * 验证 {@code pagesNeededRaisesLowerBoundButStillCapsAtFour} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void pagesNeededRaisesLowerBoundButStillCapsAtFour() {
         ExtentAllocationPolicy p = new DefaultExtentAllocationPolicy();
@@ -57,6 +66,9 @@ class ExtentAllocationPolicyTest {
                 ExtentAllocationDirection.UP, 10, PS.pagesPerExtent() * 10L)));
     }
 
+    /**
+     * 验证 {@code directionalRequestRequiresHintPage} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void directionalRequestRequiresHintPage() {
         assertThrows(DatabaseValidationException.class, () -> new ExtentAllocationRequest(
@@ -71,6 +83,9 @@ class ExtentAllocationPolicyTest {
                 PS));
     }
 
+    /**
+     * 验证 {@code noFreeSpaceIsRecoverable} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void noFreeSpaceIsRecoverable() {
         assertInstanceOf(DatabaseRuntimeException.class, new NoFreeSpaceException("x"));

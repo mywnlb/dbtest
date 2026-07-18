@@ -22,6 +22,11 @@ class DataFileHandleGatewayTest {
     private static final PageSize PS = PageSize.ofBytes(16 * 1024);
     private static final SpaceId SPACE = SpaceId.of(1);
 
+    /**
+     * 验证 {@code createDelegatesInitializationToGateway} 对应的表空间物理文件行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     *
+     * @param tempDir 受控目录内的规范化文件路径；不得为 {@code null}，也不得逃逸所属表空间或日志目录
+     */
     @Test
     void createDelegatesInitializationToGateway(@TempDir Path tempDir) {
         RecordingGateway gateway = new RecordingGateway();
@@ -35,6 +40,11 @@ class DataFileHandleGatewayTest {
         }
     }
 
+    /**
+     * 验证 {@code autoExtendDoesNotPublishSizeWhenGatewayFails} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     *
+     * @param tempDir 受控目录内的规范化文件路径；不得为 {@code null}，也不得逃逸所属表空间或日志目录
+     */
     @Test
     void autoExtendDoesNotPublishSizeWhenGatewayFails(@TempDir Path tempDir) {
         DataFileGateway failing = new DataFileGateway() {
@@ -60,6 +70,11 @@ class DataFileHandleGatewayTest {
         }
     }
 
+    /**
+     * 验证 {@code ensureCapacityUsesGatewayOnlyWhenGrowing} 对应的表空间物理文件行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     *
+     * @param tempDir 受控目录内的规范化文件路径；不得为 {@code null}，也不得逃逸所属表空间或日志目录
+     */
     @Test
     void ensureCapacityUsesGatewayOnlyWhenGrowing(@TempDir Path tempDir) {
         RecordingGateway gateway = new RecordingGateway();

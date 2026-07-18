@@ -16,7 +16,10 @@ interface RedoLogIo {
      */
     Lsn write(RedoLogBatch batch);
 
-    /** 当前已经写入 OS/page cache、但未必 fsync 的最高 LSN。 */
+    /** 当前已经写入 OS/page cache、但未必 fsync 的最高 LSN。
+     *
+     * @return {@code writtenToDiskLsn} 定位或分配的稳定值对象；成功时不为 {@code null}，其身份、范围和特殊值已由构造校验保证
+     */
     Lsn writtenToDiskLsn();
 
     /**

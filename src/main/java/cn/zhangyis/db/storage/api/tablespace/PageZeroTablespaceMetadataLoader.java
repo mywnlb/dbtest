@@ -73,7 +73,13 @@ public final class PageZeroTablespaceMetadataLoader implements TablespaceMetadat
         this(pageStore, pageSize, new TablespaceAccessController());
     }
 
-    /** 创建可与 lifecycle 编排共享 operation lease 的 loader。 */
+    /** 创建可与 lifecycle 编排共享 operation lease 的 loader。
+     *
+     * @param pageStore 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param pageSize 调用方提供的长度或容量值对象；不得为 {@code null}，且必须已通过其构造范围校验
+     * @param accessController 由组合根提供的 {@code TablespaceAccessController} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public PageZeroTablespaceMetadataLoader(PageStore pageStore, PageSize pageSize,
                                             TablespaceAccessController accessController) {
         if (pageStore == null || pageSize == null || accessController == null) {
@@ -90,6 +96,7 @@ public final class PageZeroTablespaceMetadataLoader implements TablespaceMetadat
      *
      * @param spaceId 表空间编号。
      * @return 可从 page0 重建时返回 metadata，否则返回 empty。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     @Override
     public Optional<TablespaceMetadata> load(SpaceId spaceId) {
@@ -101,8 +108,22 @@ public final class PageZeroTablespaceMetadataLoader implements TablespaceMetadat
         }
     }
 
-    /** 调用方已持目标空间共享 lease；path/read/decode 不能跨越物理 truncate。 */
+    /** 调用方已持目标空间共享 lease；path/read/decode 不能跨越物理 truncate。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验表空间生命周期、页号、区段身份与容量边界，非法或损坏元数据在分配/IO 前拒绝。</li>
+     *     <li>按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，避免锁序反转。</li>
+     *     <li>执行空间元数据或物理文件变化，并把需要的 allocation intent、redo、dirty 或 force 副作用交给既有下游。</li>
+     *     <li>发布稳定结果并逆序释放 lease、latch 与 fix；失败保留可由恢复流程识别的权威状态。</li>
+     * </ol>
+     *
+     * @param spaceId 目标表空间的稳定标识；不得为 {@code null}，且必须已注册并满足当前生命周期准入条件
+     * @return {@code loadUnderLease} 按身份或键定位到的对象；未找到、不可见或尚未持久化时为空 {@code Optional}，从不返回 Java {@code null}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     private Optional<TablespaceMetadata> loadUnderLease(SpaceId spaceId) {
+        // 1、校验表空间生命周期、页号、区段身份与容量边界，在共享或持久副作用前拒绝非法状态。
         Path path;
         try {
             path = pageStore.pathOf(spaceId);
@@ -111,6 +132,7 @@ public final class PageZeroTablespaceMetadataLoader implements TablespaceMetadat
         }
         ByteBuffer page = ByteBuffer.allocate(pageSize.bytes());
         pageStore.readPage(PageId.of(spaceId, PageNo.of(0)), page);
+        // 2、继续完成范围、身份与候选校验；通过后，按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，保持处理顺序与资源边界。
         validateFspHdrEnvelope(spaceId, page);
         validateChecksumOrLegacyUnstamped(spaceId, page);
         SpaceHeaderPhysical physical = SpaceHeaderRawCodec.readPhysical(page);
@@ -119,6 +141,7 @@ public final class PageZeroTablespaceMetadataLoader implements TablespaceMetadat
                     + " got " + physical.spaceId().value());
         }
         TablespaceType type = TablespaceTypeFlags.decode(physical.spaceFlags());
+        // 3、在中间分支复核阶段性结果；满足条件后，执行空间元数据或物理文件变化，并维持领域不变量。
         Optional<TablespaceLifecycleHeader> lifecycle = TablespaceLifecycleRawCodec.read(page);
         TablespaceState state = lifecycle.map(TablespaceLifecycleHeader::state).orElse(TablespaceState.NORMAL);
         validateLifecycleState(spaceId, type, state, lifecycle.isPresent());
@@ -126,6 +149,7 @@ public final class PageZeroTablespaceMetadataLoader implements TablespaceMetadat
         TablespaceMetadata metadata = new TablespaceMetadata(spaceId, "space-" + spaceId.value(), type,
                 physical.pageSize(), state, List.of(dataFile), new SpaceFlags(physical.spaceFlags()),
                 physical.currentSizeInPages(), physical.freeLimitPageNo(), physical.spaceVersion());
+        // 4、发布稳定结果并逆序释放 lease、latch 与 fix，以稳定返回或领域异常完成收口。
         return Optional.of(metadata);
     }
 

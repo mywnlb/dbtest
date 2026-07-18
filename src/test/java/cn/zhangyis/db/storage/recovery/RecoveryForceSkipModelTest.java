@@ -34,6 +34,9 @@ class RecoveryForceSkipModelTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code skipPolicyMatchesBySpaceAndPage} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void skipPolicyMatchesBySpaceAndPage() {
         RecoverySkipPolicy policy = RecoverySkipPolicy.of(Set.of(SpaceId.of(7)));
@@ -44,6 +47,11 @@ class RecoveryForceSkipModelTest {
         assertEquals(Set.of(SpaceId.of(7)), policy.skippedSpaces());
     }
 
+    /**
+     * 验证 {@code forceSkipRequestRequiresNonEmptySkippedSpaces} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void forceSkipRequestRequiresNonEmptySkippedSpaces() throws Exception {
         try (FileChannelPageStore store = new FileChannelPageStore();
@@ -57,6 +65,11 @@ class RecoveryForceSkipModelTest {
         }
     }
 
+    /**
+     * 验证 {@code forceSkipRequestCarriesImmutablePolicy} 对应的崩溃恢复行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void forceSkipRequestCarriesImmutablePolicy() throws Exception {
         try (FileChannelPageStore store = new FileChannelPageStore();
@@ -73,6 +86,11 @@ class RecoveryForceSkipModelTest {
         }
     }
 
+    /**
+     * 验证 {@code normalAndReadOnlyRequestsDoNotCarrySkipPolicy} 对应的崩溃恢复行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void normalAndReadOnlyRequestsDoNotCarrySkipPolicy() throws Exception {
         try (FileChannelPageStore store = new FileChannelPageStore();
@@ -87,6 +105,9 @@ class RecoveryForceSkipModelTest {
         }
     }
 
+    /**
+     * 验证 {@code forceSkipReportCapturesSkippedDiagnostics} 对应的崩溃恢复行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void forceSkipReportCapturesSkippedDiagnostics() {
         RecoveryReport report = RecoveryReport.forceSkip(RecoveryState.OPEN,

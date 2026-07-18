@@ -29,11 +29,23 @@ public interface TablePurgeBarrier {
      * 不维护 persistent history 的低层 DDL 测试兼容实现。生产 DatabaseEngine 必须注入 StorageEngine 的真实 barrier。
      */
     TablePurgeBarrier NONE = new TablePurgeBarrier() {
+        /**
+         * 按存储引擎稳定 API并发协议获取或等待资源；等待必须有界，失败路径保持锁顺序并释放已取得资源。
+         *
+         * @param tableId 目标表的原始字典标识；必须为已分配的正数并与当前元数据和物理绑定一致
+         * @param timeout 本次等待或操作的最大时长；不得为 {@code null} 或负值，零表示只做一次立即检查而不阻塞
+         */
         @Override
         public void awaitUnreferenced(long tableId, Duration timeout) {
             // 兼容层没有 history owner；参数校验由真实实现和 DDL 入口负责。
         }
 
+        /**
+         * 计算 {@code referenceCount} 所表达的存储引擎稳定 API数量、容量或物理位置；计算只读取输入，溢出或越界以领域异常报告。
+         *
+         * @param tableId 目标表的原始字典标识；必须为已分配的正数并与当前元数据和物理绑定一致
+         * @return {@code referenceCount} 计算出的非负长度、位置或数量；结果必须落在所属页、集合或持久格式容量内，溢出通过领域异常报告
+         */
         @Override
         public int referenceCount(long tableId) {
             return 0;

@@ -34,6 +34,14 @@ public final class BTreeCurrentReadService {
     /** 事务锁真相来源；本服务只构造 key 和调用 acquire。 */
     private final LockManager lockManager;
 
+    /**
+     * 创建 {@code BTreeCurrentReadService}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param mtrManager 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param btree 由组合根提供的 {@code SplitCapableBTreeIndexService} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param lockManager 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public BTreeCurrentReadService(MiniTransactionManager mtrManager,
                                    SplitCapableBTreeIndexService btree,
                                    LockManager lockManager) {
@@ -50,6 +58,11 @@ public final class BTreeCurrentReadService {
      * RC miss 不锁 gap，RR miss 按模式取 GAP_S/GAP_X。
      *
      * @return 命中时返回授锁后重新定位得到的当前记录；miss 返回 empty。
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param key 参与 {@code lockPoint} 的稳定领域标识 {@code SearchKey}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param request 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @param mode 调用方请求的目标状态、阶段或模式；不得为 {@code null}，且必须是当前状态机允许的后继值
+     * @throws BTreeCurrentReadRelocationException 索引定位、结构修改或等待后重定位无法保持 B+Tree 不变量时抛出；调用方应释放 Guard 并回滚或重试
      */
     public Optional<BTreeLookupResult> lockPoint(BTreeIndex index, SearchKey key,
                                                  BTreeCurrentReadRequest request,
@@ -81,6 +94,12 @@ public final class BTreeCurrentReadService {
     /**
      * unique insert 前的 current-read 物理重复检查。若同 key 记录存在，先取 REC_S 并重定位确认后返回 duplicate；
      * 若不存在，则对目标 gap 取 INSERT_INTENTION 并重定位确认后返回 available。
+     *
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param key 参与 {@code checkUniqueForInsert} 的稳定领域标识 {@code SearchKey}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param request 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @return {@code checkUniqueForInsert} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     * @throws BTreeCurrentReadRelocationException 索引定位、结构修改或等待后重定位无法保持 B+Tree 不变量时抛出；调用方应释放 Guard 并回滚或重试
      */
     public BTreeUniqueCheckResult checkUniqueForInsert(BTreeIndex index, SearchKey key,
                                                        BTreeCurrentReadRequest request) {
@@ -115,6 +134,11 @@ public final class BTreeCurrentReadService {
      * 按隔离级别申请事务锁 → 短 MTR 重扫并校验锁落点。RC 只锁返回记录；RR 使用 next-key 加终止 gap 防幻读。
      *
      * @return 授锁后重新定位得到的当前范围记录，按索引顺序排列。
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param range 调用方已校验的执行计划、批次、范围或候选对象；不得为 {@code null}，边界必须有序且不得跨越所属事务、表或日志批次
+     * @param request 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @param mode 调用方请求的目标状态、阶段或模式；不得为 {@code null}，且必须是当前状态机允许的后继值
+     * @throws BTreeCurrentReadRelocationException 索引定位、结构修改或等待后重定位无法保持 B+Tree 不变量时抛出；调用方应释放 Guard 并回滚或重试
      */
     public List<BTreeLookupResult> lockRange(BTreeIndex index, BTreeScanRange range,
                                              BTreeCurrentReadRequest request,
@@ -192,6 +216,14 @@ public final class BTreeCurrentReadService {
         }
     }
 
+    /**
+     * 按B+Tree 索引并发协议获取或等待资源；等待必须有界，失败路径保持锁顺序并释放已取得资源。
+     *
+     * @param position 调用方已校验的执行计划、批次、范围或候选对象；不得为 {@code null}，边界必须有序且不得跨越所属事务、表或日志批次
+     * @param request 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @param mode 调用方请求的目标状态、阶段或模式；不得为 {@code null}，且必须是当前状态机允许的后继值
+     * @param handles 参与 {@code acquireRangeLocks} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     */
     private void acquireRangeLocks(BTreeCurrentReadRangePosition position, BTreeCurrentReadRequest request,
                                    BTreeCurrentReadMode mode, List<LockHandle> handles) {
         for (BTreeCurrentReadPosition record : position.records()) {
@@ -269,6 +301,11 @@ public final class BTreeCurrentReadService {
                 || before.terminalGap().equals(after.terminalGap());
     }
 
+    /**
+     * 释放本方法拥有的B+Tree 索引资源；遵守既定释放顺序，重复或失败调用不得掩盖原始状态。
+     *
+     * @param handles 参与 {@code closeAll} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     */
     private static void closeAll(List<LockHandle> handles) {
         for (int i = handles.size() - 1; i >= 0; i--) {
             handles.get(i).close();

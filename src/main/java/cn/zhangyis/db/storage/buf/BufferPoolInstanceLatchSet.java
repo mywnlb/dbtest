@@ -51,7 +51,10 @@ final class BufferPoolInstanceLatchSet {
         pageHashLock.unlock();
     }
 
-    /** 进入单 frame 元数据临界区。调用方必须用 try/finally 调用 {@link #unlockFrame(BufferFrame)}。 */
+    /** 进入单 frame 元数据临界区。调用方必须用 try/finally 调用 {@link #unlockFrame(BufferFrame)}。
+     * @param frame 已固定的页面、frame 或页头视图；不得为 {@code null}，必须指向目标 PageId，并在访问期间持有契约要求的 fix/latch
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     void lockFrame(BufferFrame frame) {
         if (frame == null) {
             throw new DatabaseValidationException("buffer frame must not be null");
@@ -60,7 +63,11 @@ final class BufferPoolInstanceLatchSet {
         HOLD_COUNTS.get().frameDepth++;
     }
 
-    /** 退出单 frame 元数据临界区。 */
+    /** 退出单 frame 元数据临界区。
+     *
+     * @param frame 已固定的页面、frame 或页头视图；不得为 {@code null}，必须指向目标 PageId，并在访问期间持有契约要求的 fix/latch
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     void unlockFrame(BufferFrame frame) {
         if (frame == null) {
             throw new DatabaseValidationException("buffer frame must not be null");
@@ -159,6 +166,7 @@ final class BufferPoolInstanceLatchSet {
      * 确认当前线程没有持有 Buffer Pool 内部锁。用于进入物理 IO、dirty victim flush、PageLoadFuture wait 前的守卫。
      *
      * @param operation 即将执行的阻塞操作名，用于诊断消息。
+     * @throws BufferPoolLatchViolationException 页固定、闩锁、淘汰或 frame 代际校验失败时抛出；调用方应释放已持 Guard 后重试或终止操作
      */
     void assertMetadataUnlocked(String operation) {
         HoldCounts counts = HOLD_COUNTS.get();
@@ -169,7 +177,10 @@ final class BufferPoolInstanceLatchSet {
         }
     }
 
-    /** 测试与 IO 边界诊断用：当前线程是否仍持有 pageHashLock 或任一 frameMutex。 */
+    /** 测试与 IO 边界诊断用：当前线程是否仍持有 pageHashLock 或任一 frameMutex。
+     *
+     * @return {@code currentThreadHoldsPageHashOrFrameLock} 成功完成其命名的受控动作并发布结果时为 {@code true}；未命中、未执行或状态竞争失败时为 {@code false}
+     */
     static boolean currentThreadHoldsPageHashOrFrameLock() {
         HoldCounts counts = HOLD_COUNTS.get();
         return counts.pageHashDepth > 0 || counts.frameDepth > 0;
@@ -177,11 +188,29 @@ final class BufferPoolInstanceLatchSet {
 
     /** ThreadLocal 内的持锁深度计数，支持同线程可重入锁重入。 */
     private static final class HoldCounts {
+        /**
+         * 记录 {@code pageHashDepth} 的权威数值状态；仅由本类受控路径更新，取值范围和特殊值遵循所属格式或状态机，溢出必须拒绝。
+         */
         private int pageHashDepth;
+        /**
+         * 记录 {@code frameDepth} 的权威数值状态；仅由本类受控路径更新，取值范围和特殊值遵循所属格式或状态机，溢出必须拒绝。
+         */
         private int frameDepth;
+        /**
+         * 记录 {@code metadataDepth} 的权威数值状态；仅由本类受控路径更新，取值范围和特殊值遵循所属格式或状态机，溢出必须拒绝。
+         */
         private int metadataDepth;
+        /**
+         * 记录 {@code freeListDepth} 的权威数值状态；仅由本类受控路径更新，取值范围和特殊值遵循所属格式或状态机，溢出必须拒绝。
+         */
         private int freeListDepth;
+        /**
+         * 记录 {@code lruListDepth} 的权威数值状态；仅由本类受控路径更新，取值范围和特殊值遵循所属格式或状态机，溢出必须拒绝。
+         */
         private int lruListDepth;
+        /**
+         * 记录 {@code flushListDepth} 的权威数值状态；仅由本类受控路径更新，取值范围和特殊值遵循所属格式或状态机，溢出必须拒绝。
+         */
         private int flushListDepth;
     }
 }

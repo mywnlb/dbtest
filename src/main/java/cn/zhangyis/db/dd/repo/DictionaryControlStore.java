@@ -28,8 +28,17 @@ public final class DictionaryControlStore implements AutoCloseable {
     /** 每个副本独占一个 4 KiB 扇区/页，避免一次 torn write 同时破坏两代。 */
     public static final int SLOT_BYTES = 4096;
 
+    /**
+     * 持久格式魔数；读取端用它拒绝错文件或损坏内容，修改会破坏已有数据兼容性。
+     */
     private static final long MAGIC = 0x4D_49_4E_49_44_44_43_54L; // MINIDDCT
+    /**
+     * 当前稳定格式版本；编解码与恢复路径共同依赖该值，升级时必须保留旧版本判定。
+     */
     private static final int FORMAT_VERSION = 1;
+    /**
+     * 稳定布局常量，参与页内偏移、长度或位域计算；编解码两端必须保持完全一致。
+     */
     private static final int CRC_OFFSET = SLOT_BYTES - Integer.BYTES;
 
     /** 串行化 generation 切换与关闭；不会跨越外部调用。 */
@@ -53,6 +62,13 @@ public final class DictionaryControlStore implements AutoCloseable {
     /**
      * 打开已有 control，或在文件不存在时创建初始 generation。初始 schema/version 从 2 开始，1 保留给
      * bootstrap mysql schema/version；table/index/DDL 从 1，用户 space 从配置的安全下界开始。
+     *
+     * @param path 受控目录内的规范化文件路径；不得为 {@code null}，也不得逃逸所属表空间或日志目录
+     * @param dictionarySpaceId 目标表空间的稳定标识；不得为 {@code null}，且必须已注册并满足当前生命周期准入条件
+     * @param firstUserSpaceId 目标表空间的原始数值标识；必须非负、已注册并满足当前生命周期准入条件
+     * @return {@code openOrCreate} 创建的模块协作者；成功时不为 {@code null}，其依赖和生命周期由当前组合根拥有
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws DictionaryPersistenceException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
      */
     public static DictionaryControlStore openOrCreate(Path path, SpaceId dictionarySpaceId, int firstUserSpaceId) {
         validateOpenArguments(path, dictionarySpaceId);
@@ -81,7 +97,13 @@ public final class DictionaryControlStore implements AutoCloseable {
         }
     }
 
-    /** 打开已有 control；文件缺失、space id 不符或双槽均损坏都 fail-closed。 */
+    /** 打开已有 control；文件缺失、space id 不符或双槽均损坏都 fail-closed。
+     *
+     * @param path 受控目录内的规范化文件路径；不得为 {@code null}，也不得逃逸所属表空间或日志目录
+     * @param dictionarySpaceId 目标表空间的稳定标识；不得为 {@code null}，且必须已注册并满足当前生命周期准入条件
+     * @return {@code openExisting} 创建的模块协作者；成功时不为 {@code null}，其依赖和生命周期由当前组合根拥有
+     * @throws DictionaryPersistenceException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
+     */
     public static DictionaryControlStore openExisting(Path path, SpaceId dictionarySpaceId) {
         validateOpenArguments(path, dictionarySpaceId);
         try {
@@ -92,11 +114,31 @@ public final class DictionaryControlStore implements AutoCloseable {
         }
     }
 
+    /**
+     * 校验 {@code openValidated} 涉及的数据字典结构、范围与交叉字段；合法输入不修改状态，非法输入在副作用前抛出领域异常。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验语法/命令、会话状态与元数据身份，构造统一 deadline，纯输入错误在事务或持久副作用前失败。</li>
+     *     <li>按 session、transaction、MDL 与 metadata scope 顺序取得受控资源，并在等待后复核版本与状态。</li>
+     *     <li>调用 binder、executor、字典或 storage 稳定接口完成领域动作，成功后才发布缓存、事务或结果状态。</li>
+     *     <li>关闭 scope 并返回不可变结果；异常保留 cause/suppressed 图，按 autocommit 或显式事务边界回滚。</li>
+     * </ol>
+     *
+     * @param path 受控目录内的规范化文件路径；不得为 {@code null}，也不得逃逸所属表空间或日志目录
+     * @param channel 调用方打开的定位 IO 或编码写入对象；不得为 {@code null}，方法不接管所有权，失败时仍由创建方关闭
+     * @param expectedSpaceId 目标表空间的稳定标识；不得为 {@code null}，且必须已注册并满足当前生命周期准入条件
+     * @return {@code openValidated} 创建的模块协作者；成功时不为 {@code null}，其依赖和生命周期由当前组合根拥有
+     * @throws DictionaryCatalogCorruptionException 检测到不能安全解释的持久数据损坏时抛出；调用方不得继续发布普通服务或覆盖原始证据
+     */
     private static DictionaryControlStore openValidated(Path path, FileChannel channel, SpaceId expectedSpaceId) {
         try {
+            // 1、校验语法/命令、会话状态与元数据身份，在共享或持久副作用前拒绝非法状态。
             List<DictionaryControlSnapshot> candidates = new ArrayList<>(2);
+            // 2、继续完成范围、身份与候选校验；通过后，按 session、transaction、MDL 与 metadata scope 顺序取得受控资源，保持处理顺序与资源边界。
             decodeSlot(channel, 0).ifPresent(candidates::add);
             decodeSlot(channel, 1).ifPresent(candidates::add);
+            // 3、在中间分支复核阶段性结果；满足条件后，调用 binder、executor、字典或 storage 稳定接口完成领域动作，并维持领域不变量。
             DictionaryControlSnapshot latest = candidates.stream()
                     .max(Comparator.comparingLong(DictionaryControlSnapshot::generation))
                     .orElseThrow(() -> new DictionaryCatalogCorruptionException(
@@ -105,6 +147,7 @@ public final class DictionaryControlStore implements AutoCloseable {
                 throw new DictionaryCatalogCorruptionException("dictionary control space id mismatch: expected="
                         + expectedSpaceId.value() + ", actual=" + latest.dictionarySpaceId().value());
             }
+            // 4、关闭 scope 并返回不可变结果，以稳定返回或领域异常完成收口。
             return new DictionaryControlStore(path, channel, latest);
         } catch (RuntimeException failure) {
             try {
@@ -119,6 +162,11 @@ public final class DictionaryControlStore implements AutoCloseable {
     /**
      * 原子预留各身份区间。溢出校验在任何写盘前完成；写槽和 force 成功后才替换 current，因此异常返回时
      * 调用方绝不能使用 allocation，内存也不会声称未 durable 的 generation 已生效。
+     *
+     * @param request 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @return {@code reserve} 准备或解码出的中间领域对象；成功时不为 {@code null}，其边界、资源归属和后续发布阶段已明确
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws DictionaryPersistenceException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
      */
     public DictionaryIdAllocation reserve(DictionaryIdRequest request) {
         if (request == null) {
@@ -159,7 +207,10 @@ public final class DictionaryControlStore implements AutoCloseable {
         }
     }
 
-    /** 返回最近 durable 槽的不可变快照。 */
+    /** 返回最近 durable 槽的不可变快照。
+     *
+     * @return {@code snapshot} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     */
     public DictionaryControlSnapshot snapshot() {
         ioLock.lock();
         try {
@@ -169,6 +220,11 @@ public final class DictionaryControlStore implements AutoCloseable {
         }
     }
 
+    /**
+     * 释放本方法拥有的数据字典资源；遵守既定释放顺序，重复或失败调用不得掩盖原始状态。
+     *
+     * @throws DictionaryPersistenceException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
+     */
     @Override
     public void close() {
         ioLock.lock();
@@ -195,27 +251,62 @@ public final class DictionaryControlStore implements AutoCloseable {
         }
     }
 
+    /**
+     * 校验输入与当前状态后修改数据字典领域数据；成功发布完整结果，异常路径保留既有持久化与并发不变量。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验语法/命令、会话状态与元数据身份，构造统一 deadline，纯输入错误在事务或持久副作用前失败。</li>
+     *     <li>按 session、transaction、MDL 与 metadata scope 顺序取得受控资源，并在等待后复核版本与状态。</li>
+     *     <li>调用 binder、executor、字典或 storage 稳定接口完成领域动作，成功后才发布缓存、事务或结果状态。</li>
+     *     <li>关闭 scope 并返回不可变结果；异常保留 cause/suppressed 图，按 autocommit 或显式事务边界回滚。</li>
+     * </ol>
+     *
+     * @param channel 调用方打开的定位 IO 或编码写入对象；不得为 {@code null}，方法不接管所有权，失败时仍由创建方关闭
+     * @param snapshot 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @throws IOException 底层文件读写失败时抛出；调用方不得据此发布持久化成功状态
+     */
     private static void writeSlot(FileChannel channel, DictionaryControlSnapshot snapshot) throws IOException {
+        // 1、校验语法/命令、会话状态与元数据身份，在共享或持久副作用前拒绝非法状态。
         ByteBuffer buffer = ByteBuffer.allocate(SLOT_BYTES).order(ByteOrder.BIG_ENDIAN);
         buffer.putLong(MAGIC);
         buffer.putInt(FORMAT_VERSION);
         buffer.putLong(snapshot.generation());
         buffer.putInt(snapshot.dictionarySpaceId().value());
+        // 2、继续完成范围、身份与候选校验；通过后，按 session、transaction、MDL 与 metadata scope 顺序取得受控资源，保持处理顺序与资源边界。
         buffer.putLong(snapshot.nextSchemaId());
         buffer.putLong(snapshot.nextTableId());
         buffer.putLong(snapshot.nextIndexId());
         buffer.putLong(snapshot.nextSpaceId());
         buffer.putLong(snapshot.nextDdlId());
+        // 3、在中间分支复核阶段性结果；满足条件后，调用 binder、executor、字典或 storage 稳定接口完成领域动作，并维持领域不变量。
         buffer.putLong(snapshot.nextDictionaryVersion());
         int crc = crc(buffer.array(), CRC_OFFSET);
         buffer.position(CRC_OFFSET);
         buffer.putInt(crc);
         buffer.flip();
+        // 4、关闭 scope 并返回不可变结果，以稳定返回或领域异常完成收口。
         writeFully(channel, buffer, slotOffset(snapshot.generation()));
     }
 
+    /**
+     * 从稳定表示解码数据字典领域值；先校验边界、标识与长度，损坏输入以领域异常拒绝。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取输入长度、游标边界与必要标识，损坏、截断或超限数据在创建结果前失败。</li>
+     *     <li>按稳定字段或 token 顺序推进游标并调用对应编解码分支，任何分支都不得越过输入边界。</li>
+     *     <li>交叉校验聚合计数、类型、校验值和剩余输入，防止截断或多余内容形成半解析对象。</li>
+     *     <li>完成剩余字段写入或稳定领域结果构造；失败只保留领域异常与根因，不修改调用方输入或其他持久状态。</li>
+     * </ol>
+     *
+     * @param channel 调用方打开的定位 IO 或编码写入对象；不得为 {@code null}，方法不接管所有权，失败时仍由创建方关闭
+     * @param slot 参与 {@code decodeSlot} 的零基位置 {@code slot}；必须非负且小于所属页面、集合或持久结构的容量
+     * @return {@code decodeSlot} 按身份或键定位到的对象；未找到、不可见或尚未持久化时为空 {@code Optional}，从不返回 Java {@code null}
+     */
     private static java.util.Optional<DictionaryControlSnapshot> decodeSlot(FileChannel channel, int slot) {
         try {
+            // 1、读取输入长度、游标边界与必要标识，在共享或持久副作用前拒绝非法状态。
             if (channel.size() < (slot + 1L) * SLOT_BYTES) {
                 return java.util.Optional.empty();
             }
@@ -223,6 +314,7 @@ public final class DictionaryControlStore implements AutoCloseable {
             readFully(channel, buffer, slot * (long) SLOT_BYTES);
             byte[] bytes = buffer.array();
             int storedCrc = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN).getInt(CRC_OFFSET);
+            // 2、继续完成范围、身份与候选校验；通过后，按稳定字段或 token 顺序推进游标并调用对应编解码分支，保持处理顺序与资源边界。
             if (storedCrc != crc(bytes, CRC_OFFSET)) {
                 return java.util.Optional.empty();
             }
@@ -233,6 +325,7 @@ public final class DictionaryControlStore implements AutoCloseable {
             long generation = buffer.getLong();
             int spaceId = buffer.getInt();
             long nextSchema = buffer.getLong();
+            // 3、在中间分支复核阶段性结果；满足条件后，交叉校验聚合计数、类型、校验值和剩余输入，并维持领域不变量。
             long nextTable = buffer.getLong();
             long nextIndex = buffer.getLong();
             long nextSpace = buffer.getLong();
@@ -242,6 +335,7 @@ public final class DictionaryControlStore implements AutoCloseable {
                     || nextSpace <= 0 || nextSpace > Integer.MAX_VALUE || nextDdl <= 0 || nextVersion <= 0) {
                 return java.util.Optional.empty();
             }
+            // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
             return java.util.Optional.of(new DictionaryControlSnapshot(generation, SpaceId.of(spaceId),
                     nextSchema, nextTable, nextIndex, nextSpace, nextDdl, nextVersion));
         } catch (IOException | RuntimeException ignored) {
@@ -259,6 +353,14 @@ public final class DictionaryControlStore implements AutoCloseable {
         return (int) crc.getValue();
     }
 
+    /**
+     * 校验输入与当前状态后修改数据字典领域数据；成功发布完整结果，异常路径保留既有持久化与并发不变量。
+     *
+     * @param channel 调用方打开的定位 IO 或编码写入对象；不得为 {@code null}，方法不接管所有权，失败时仍由创建方关闭
+     * @param buffer 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @param offset 目标结构内的零基偏移；必须落在当前页、记录或持久槽位的合法范围
+     * @throws IOException 底层文件读写失败时抛出；调用方不得据此发布持久化成功状态
+     */
     private static void writeFully(FileChannel channel, ByteBuffer buffer, long offset) throws IOException {
         long position = offset;
         while (buffer.hasRemaining()) {
@@ -270,6 +372,14 @@ public final class DictionaryControlStore implements AutoCloseable {
         }
     }
 
+    /**
+     * 定位并读取数据字典领域对象；先校验标识与准入状态，返回值只暴露稳定视图或受控句柄。
+     *
+     * @param channel 调用方打开的定位 IO 或编码写入对象；不得为 {@code null}，方法不接管所有权，失败时仍由创建方关闭
+     * @param buffer 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @param offset 目标结构内的零基偏移；必须落在当前页、记录或持久槽位的合法范围
+     * @throws IOException 底层文件读写失败时抛出；调用方不得据此发布持久化成功状态
+     */
     private static void readFully(FileChannel channel, ByteBuffer buffer, long offset) throws IOException {
         long position = offset;
         while (buffer.hasRemaining()) {

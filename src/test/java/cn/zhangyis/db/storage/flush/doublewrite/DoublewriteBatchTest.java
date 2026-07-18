@@ -31,6 +31,11 @@ class DoublewriteBatchTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code appendsBatchIntoBoundedConsecutiveSlotsAndReusesThemAfterRelease} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void appendsBatchIntoBoundedConsecutiveSlotsAndReusesThemAfterRelease() throws Exception {
         Path path = dir.resolve("dw-batch.dat");

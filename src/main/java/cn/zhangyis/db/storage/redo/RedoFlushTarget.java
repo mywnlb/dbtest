@@ -10,12 +10,19 @@ import cn.zhangyis.db.domain.Lsn;
  */
 public interface RedoFlushTarget {
 
-    /** 下一个空闲 LSN（已分配边界）。worker 用它与 {@link #flushedToDiskLsn()} 比较判断是否有待刷 redo。 */
+    /** 下一个空闲 LSN（已分配边界）。worker 用它与 {@link #flushedToDiskLsn()} 比较判断是否有待刷 redo。
+     * @return {@code currentLsn} 定位或分配的稳定值对象；成功时不为 {@code null}，其身份、范围和特殊值已由构造校验保证
+     */
     Lsn currentLsn();
 
-    /** 已 fsync 的最高 LSN。 */
+    /** 已 fsync 的最高 LSN。
+     *
+     * @return {@code flushedToDiskLsn} 定位或分配的稳定值对象；成功时不为 {@code null}，其身份、范围和特殊值已由构造校验保证
+     */
     Lsn flushedToDiskLsn();
 
-    /** 同步写出并 fsync 待刷 redo，返回推进后的 durable LSN；IO 失败抛 {@link RedoLogIoException}。 */
+    /** 同步写出并 fsync 待刷 redo，返回推进后的 durable LSN；IO 失败抛 {@link RedoLogIoException}。
+     * @return {@code flush} 定位或分配的稳定值对象；成功时不为 {@code null}，其身份、范围和特殊值已由构造校验保证
+     */
     Lsn flush();
 }

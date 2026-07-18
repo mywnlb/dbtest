@@ -36,6 +36,11 @@ public interface BTreeIndexService {
 
     /**
      * B3 起对外表达真正的 B+Tree range scan；默认委托给历史 scanLeaf 方法以保持 B1/B2 实现源码兼容。
+     *
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param range 调用方已校验的执行计划、批次、范围或候选对象；不得为 {@code null}，边界必须有序且不得跨越所属事务、表或日志批次
+     * @return 按物理页、日志或 SQL 源顺序扫描并物化的元素；无匹配内容时返回空集合，不用 {@code null} 表示缺失
      */
     default List<BTreeLookupResult> scan(MiniTransaction mtr, BTreeIndex index, BTreeScanRange range) {
         return scanLeaf(mtr, index, range);

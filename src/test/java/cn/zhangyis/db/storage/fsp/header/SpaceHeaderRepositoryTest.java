@@ -53,6 +53,9 @@ class SpaceHeaderRepositoryTest {
                 PageNo.of(2), 0L, 80046, 1L);
     }
 
+    /**
+     * 验证 {@code initializeThenReadRoundTrips} 对应的表空间、区与段分配行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void initializeThenReadRoundTrips() {
         PageStore store = new FileChannelPageStore();
@@ -144,6 +147,9 @@ class SpaceHeaderRepositoryTest {
         }
     }
 
+    /**
+     * 验证 {@code scalarSettersUpdateFields} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void scalarSettersUpdateFields() {
         PageStore store = new FileChannelPageStore();
@@ -166,6 +172,9 @@ class SpaceHeaderRepositoryTest {
         }
     }
 
+    /**
+     * 验证 {@code freeExtentListBaseManagedByFlst} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void freeExtentListBaseManagedByFlst() {
         PageStore store = new FileChannelPageStore();
@@ -193,6 +202,9 @@ class SpaceHeaderRepositoryTest {
         }
     }
 
+    /**
+     * 验证 {@code allocateNextSegmentIdIncrements} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void allocateNextSegmentIdIncrements() {
         PageStore store = new FileChannelPageStore();
@@ -208,6 +220,9 @@ class SpaceHeaderRepositoryTest {
         }
     }
 
+    /**
+     * 验证 {@code shouldRejectZeroNextSegmentId} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void shouldRejectZeroNextSegmentId() {
         assertThrows(DatabaseValidationException.class, () -> new SpaceHeaderSnapshot(SPACE, PS, 0,
@@ -216,6 +231,9 @@ class SpaceHeaderRepositoryTest {
                 PageNo.of(2), 0L, 80046, 1L));
     }
 
+    /**
+     * 验证 {@code allocateNextSegmentIdRejectsZeroStoredOnPage} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void allocateNextSegmentIdRejectsZeroStoredOnPage() {
         PageStore store = new FileChannelPageStore();

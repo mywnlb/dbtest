@@ -80,6 +80,9 @@ class BTreeCurrentReadServiceTest {
 
     private final TypeCodecRegistry registry = new TypeCodecRegistry();
 
+    /**
+     * 验证 {@code pointForUpdateWaitsWithoutHoldingPageLatchOrBufferFix} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void pointForUpdateWaitsWithoutHoldingPageLatchOrBufferFix() {
         onPool(ctx -> {
@@ -109,6 +112,9 @@ class BTreeCurrentReadServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code pointReadRelocatesAfterRecordRefChangesDuringWait} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void pointReadRelocatesAfterRecordRefChangesDuringWait() {
         onPool(ctx -> {
@@ -147,6 +153,9 @@ class BTreeCurrentReadServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code readCommittedPointMissDoesNotTakeGapLock} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void readCommittedPointMissDoesNotTakeGapLock() {
         onPool(ctx -> {
@@ -166,6 +175,9 @@ class BTreeCurrentReadServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code repeatableReadPointMissTakesGapLock} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void repeatableReadPointMissTakesGapLock() {
         onPool(ctx -> {
@@ -188,6 +200,9 @@ class BTreeCurrentReadServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code uniqueInsertCheckWaitsWithInsertIntentionOnTargetGap} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void uniqueInsertCheckWaitsWithInsertIntentionOnTargetGap() {
         onPool(ctx -> {
@@ -216,6 +231,9 @@ class BTreeCurrentReadServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code uniqueInsertCheckWaitsOnDuplicateRecordAndReportsDuplicate} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void uniqueInsertCheckWaitsOnDuplicateRecordAndReportsDuplicate() {
         onPool(ctx -> {
@@ -245,6 +263,9 @@ class BTreeCurrentReadServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code currentReadPropagatesLockWaitTimeoutAndCleansWaitingState} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void currentReadPropagatesLockWaitTimeoutAndCleansWaitingState() {
         onPool(ctx -> {
@@ -272,6 +293,9 @@ class BTreeCurrentReadServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code currentReadPropagatesDeadlockDetectedExceptionAndCleansVictimState} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void currentReadPropagatesDeadlockDetectedExceptionAndCleansVictimState() {
         onPool(ctx -> {
@@ -311,6 +335,9 @@ class BTreeCurrentReadServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code currentReadReleasesGrantedLockWhenRelocationFails} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void currentReadReleasesGrantedLockWhenRelocationFails() {
         onPool(ctx -> {
@@ -342,6 +369,9 @@ class BTreeCurrentReadServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code repeatableReadRangeTakesNextKeyAndTerminalGapLocks} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void repeatableReadRangeTakesNextKeyAndTerminalGapLocks() {
         onPool(ctx -> {
@@ -378,6 +408,9 @@ class BTreeCurrentReadServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code repeatableReadEmptyRangeTakesGapLockAndBlocksInsertIntention} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void repeatableReadEmptyRangeTakesGapLockAndBlocksInsertIntention() {
         onPool(ctx -> {
@@ -405,6 +438,9 @@ class BTreeCurrentReadServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code readCommittedRangeTakesRecordLocksOnly} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void readCommittedRangeTakesRecordLocksOnly() {
         onPool(ctx -> {
@@ -437,6 +473,9 @@ class BTreeCurrentReadServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code rangeWaitsWithoutHoldingPageLatchOrBufferFix} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void rangeWaitsWithoutHoldingPageLatchOrBufferFix() {
         onPool(ctx -> {
@@ -467,6 +506,9 @@ class BTreeCurrentReadServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code rangeRelocatesAfterRowsChangeDuringWait} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void rangeRelocatesAfterRowsChangeDuringWait() {
         onPool(ctx -> {
@@ -502,6 +544,9 @@ class BTreeCurrentReadServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code rangeTimeoutReleasesPreviouslyGrantedLocks} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void rangeTimeoutReleasesPreviouslyGrantedLocks() {
         onPool(ctx -> {
@@ -530,6 +575,9 @@ class BTreeCurrentReadServiceTest {
         });
     }
 
+    /**
+     * 验证 {@code rangeDeadlockReleasesAttemptLocksButKeepsPreExistingOwnerLocks} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void rangeDeadlockReleasesAttemptLocksButKeepsPreExistingOwnerLocks() {
         onPool(ctx -> {

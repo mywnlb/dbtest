@@ -47,10 +47,20 @@ final class MidpointLruReplacementPolicy implements ReplacementPolicy {
     /** 各 old 页进入 old 子链的毫秒时刻；只对 old 子链成员有效，提升或移除时清除。用于 {@code oldBlocksTime} 窗判定。 */
     private final Map<BufferFrame, Long> oldSinceMillis = new HashMap<>();
 
+    /**
+     * 创建 {@code MidpointLruReplacementPolicy}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param clockMillis 在契约指定成功、失败或释放边界调用的回调；不得为 {@code null}，且不得破坏当前资源所有权和异常传播规则
+     */
     MidpointLruReplacementPolicy(LongSupplier clockMillis) {
         this.clockMillis = clockMillis;
     }
 
+    /**
+     * 接收 {@code onAccess} 对应的Buffer Pool生命周期事件；只更新本策略拥有的统计或顺序状态，不接管事件来源资源。
+     *
+     * @param frame 已固定的页面、frame 或页头视图；不得为 {@code null}，必须指向目标 PageId，并在访问期间持有契约要求的 fix/latch
+     */
     @Override
     public void onAccess(BufferFrame frame) {
         Long oldSince = oldSinceMillis.get(frame);
@@ -90,6 +100,11 @@ final class MidpointLruReplacementPolicy implements ReplacementPolicy {
         return newList.size() - 1 - found;
     }
 
+    /**
+     * 接收 {@code onInsert} 对应的Buffer Pool生命周期事件；只更新本策略拥有的统计或顺序状态，不接管事件来源资源。
+     *
+     * @param frame 已固定的页面、frame 或页头视图；不得为 {@code null}，必须指向目标 PageId，并在访问期间持有契约要求的 fix/latch
+     */
     @Override
     public void onInsert(BufferFrame frame) {
         // 读入页进 old 子链 midpoint（= old 子链 back，least evictable of old），记录进入时刻供提升窗判定。
@@ -97,6 +112,11 @@ final class MidpointLruReplacementPolicy implements ReplacementPolicy {
         oldSinceMillis.put(frame, clockMillis.getAsLong());
     }
 
+    /**
+     * 接收 {@code onRemove} 对应的Buffer Pool生命周期事件；只更新本策略拥有的统计或顺序状态，不接管事件来源资源。
+     *
+     * @param frame 已固定的页面、frame 或页头视图；不得为 {@code null}，必须指向目标 PageId，并在访问期间持有契约要求的 fix/latch
+     */
     @Override
     public void onRemove(BufferFrame frame) {
         if (oldList.remove(frame)) {
@@ -106,6 +126,11 @@ final class MidpointLruReplacementPolicy implements ReplacementPolicy {
         newList.remove(frame);
     }
 
+    /**
+     * 生成淘汰候选顺序快照：先遍历 old 区，再遍历 new 区；快照与后续 LRU 结构修改隔离，不转移 frame 所有权。
+     *
+     * @return {@code victimOrder} 取得或创建的受控存储资源；成功时不为 {@code null}，调用方必须按其 Guard/lease 契约释放
+     */
     @Override
     public Iterable<BufferFrame> victimOrder() {
         // 快照拼接 old→new；调用方在 list/meta 兼容锁下遍历、逐帧加 frameMutex 校验，快照避免迭代期结构改动风险。

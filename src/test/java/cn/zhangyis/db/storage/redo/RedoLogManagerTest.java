@@ -24,6 +24,9 @@ class RedoLogManagerTest {
 
     private static final PageId PID = PageId.of(SpaceId.of(1), PageNo.of(3));
 
+    /**
+     * 验证 {@code appendAssignsContiguousMonotonicRanges} 对应的Redo/WAL行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void appendAssignsContiguousMonotonicRanges() {
         RedoLogManager mgr = new RedoLogManager();
@@ -41,6 +44,9 @@ class RedoLogManagerTest {
         assertEquals(2, mgr.bufferedRecords().size());
     }
 
+    /**
+     * 验证 {@code appendDoesNotAdvanceClosedLsnUntilRangeIsClosed} 所描述的边界场景保持既有领域不变量，不产生方法名明确禁止的副作用。
+     */
     @Test
     void appendDoesNotAdvanceClosedLsnUntilRangeIsClosed() {
         RedoLogManager mgr = new RedoLogManager();
@@ -53,6 +59,9 @@ class RedoLogManagerTest {
         assertEquals(range.end(), mgr.closedLsn(), "closing the range publishes it to checkpoint");
     }
 
+    /**
+     * 验证 {@code appendPublishesReadyForWriteLsn} 对应的Redo/WAL行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void appendPublishesReadyForWriteLsn() {
         RedoLogManager mgr = new RedoLogManager();
@@ -63,6 +72,9 @@ class RedoLogManagerTest {
                 "synchronous append writes the log buffer before returning");
     }
 
+    /**
+     * 验证 {@code recentClosedMergesOutOfOrderRangesOnlyWhenContiguous} 所描述的 B+Tree 定位或结构变化，并断言键序、父子链接、页资源和唯一性不变量。
+     */
     @Test
     void recentClosedMergesOutOfOrderRangesOnlyWhenContiguous() {
         RedoLogManager mgr = new RedoLogManager();
@@ -76,6 +88,11 @@ class RedoLogManagerTest {
         assertEquals(second.end(), mgr.closedLsn(), "closing the missing prefix merges pending later ranges");
     }
 
+    /**
+     * 验证 {@code appendDoesNotWaitForOngoingFlushFsync} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void appendDoesNotWaitForOngoingFlushFsync() throws Exception {
         BlockingRedoIo io = new BlockingRedoIo();
@@ -100,6 +117,9 @@ class RedoLogManagerTest {
         }
     }
 
+    /**
+     * 验证 {@code emptyBatchDoesNotAdvanceLsn} 所描述的边界场景保持既有领域不变量，不产生方法名明确禁止的副作用。
+     */
     @Test
     void emptyBatchDoesNotAdvanceLsn() {
         RedoLogManager mgr = new RedoLogManager();
@@ -108,6 +128,9 @@ class RedoLogManagerTest {
         assertEquals(0, mgr.bufferedRecords().size());
     }
 
+    /**
+     * 验证 {@code bufferedRecordsIsImmutableSnapshot} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void bufferedRecordsIsImmutableSnapshot() {
         RedoLogManager mgr = new RedoLogManager();

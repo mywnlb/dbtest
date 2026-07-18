@@ -312,6 +312,8 @@ class SecondaryMvccReaderTest {
     /**
      * FOR SHARE 先取得稳定 logical-prefix S，再锁聚簇当前行；同 prefix INSERT 的 X 必须等待 reader 事务终态，
      * 且等待路径不能依赖瞬时 secondary page/heapNo。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
      */
     @Test
     @DisplayName("secondary locking range blocks same-prefix DML until transaction end")
@@ -356,6 +358,8 @@ class SecondaryMvccReaderTest {
     /**
      * 空 prefix 的 FOR SHARE 仍保护 predicate，key-changing UPDATE 不能制造 phantom；已有行的 FOR SHARE
      * 同时持 prefix 与 clustered S，DELETE 必须等待读事务终态后才能标删二级和聚簇记录。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
      */
     @Test
     @DisplayName("secondary locking range blocks key-changing update and delete")

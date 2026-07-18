@@ -38,6 +38,9 @@ class SpaceHeaderRawCodecTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code readPhysicalParsesWrittenHeader} 所描述的 SQL 解析或绑定语义，并断言 AST、名称解析、类型推导及错误位置。
+     */
     @Test
     void readPhysicalParsesWrittenHeader() {
         Path path = dir.resolve("hdr.ibd");

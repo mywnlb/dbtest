@@ -9,8 +9,17 @@ import ch.qos.logback.classic.spi.ILoggingEvent;
  */
 public final class ColoredLevelConverter extends ClassicConverter {
 
+    /**
+     * 类级不可变配置常量；所有实例共享该边界，非法调整会破坏数据库通用基础设施的不变量。
+     */
     private static final String RESET = "\u001B[0m";
+    /**
+     * 类级不可变配置常量；所有实例共享该边界，非法调整会破坏数据库通用基础设施的不变量。
+     */
     private static final String RED = "\u001B[31m";
+    /**
+     * 类级不可变配置常量；所有实例共享该边界，非法调整会破坏数据库通用基础设施的不变量。
+     */
     private static final String YELLOW = "\u001B[33m";
 
     /**

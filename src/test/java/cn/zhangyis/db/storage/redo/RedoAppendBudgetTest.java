@@ -16,6 +16,9 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
  */
 class RedoAppendBudgetTest {
 
+    /**
+     * 验证 {@code sizingCoversZeroSingleBlockAndCrossBlockBoundary} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void sizingCoversZeroSingleBlockAndCrossBlockBoundary() {
         assertEquals(0, RedoLogBlockSizing.physicalBytesForLogical(0));
@@ -24,6 +27,9 @@ class RedoAppendBudgetTest {
         assertEquals(1_024, RedoLogBlockSizing.physicalBytesForLogical(441));
     }
 
+    /**
+     * 验证 {@code sizingMatchesRealCodecForRepresentativePayloads} 所描述的稳定格式转换，并断言往返值、字节布局、版本与损坏输入处理。
+     */
     @Test
     void sizingMatchesRealCodecForRepresentativePayloads() {
         for (int payload : List.of(0, 1, 418, 419, 900, 4_096)) {
@@ -39,6 +45,9 @@ class RedoAppendBudgetTest {
         }
     }
 
+    /**
+     * 验证 {@code builderUsesCheckedArithmeticAndRejectsUnrecoverableBatch} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void builderUsesCheckedArithmeticAndRejectsUnrecoverableBatch() {
         assertThrows(cn.zhangyis.db.common.exception.DatabaseValidationException.class,
@@ -50,6 +59,9 @@ class RedoAppendBudgetTest {
                         .addLogicalBytes(1));
     }
 
+    /**
+     * 验证 {@code actualUsageMustFitBothBudgetDimensions} 对应的Redo/WAL行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void actualUsageMustFitBothBudgetDimensions() {
         RedoRecord record = new PageBytesRecord(

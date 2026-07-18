@@ -37,6 +37,9 @@ class RedoRuntimeRecoveryTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code flushPersistsBatchAndWaitsForDurability} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void flushPersistsBatchAndWaitsForDurability() {
         Path redoPath = dir.resolve("redo.log");
@@ -64,6 +67,9 @@ class RedoRuntimeRecoveryTest {
         }
     }
 
+    /**
+     * 验证 {@code waitFlushedTimesOutWhenNoFlusherAdvances} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void waitFlushedTimesOutWhenNoFlusherAdvances() {
         try (RedoLogFileRepository repo = RedoLogFileRepository.open(dir.resolve("redo.log"))) {
@@ -75,6 +81,9 @@ class RedoRuntimeRecoveryTest {
         }
     }
 
+    /**
+     * 验证 {@code recoveryAppliesPageInitAndBytesThenStampsBatchEndLsn} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void recoveryAppliesPageInitAndBytesThenStampsBatchEndLsn() {
         byte[] payload = new byte[]{9, 8, 7, 6};
@@ -127,6 +136,9 @@ class RedoRuntimeRecoveryTest {
         }
     }
 
+    /**
+     * 验证 {@code recoverySkipsPageWhosePageLsnAlreadyCoversBatch} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void recoverySkipsPageWhosePageLsnAlreadyCoversBatch() {
         byte[] oldPayload = new byte[]{4, 4, 4};
@@ -160,6 +172,11 @@ class RedoRuntimeRecoveryTest {
         }
     }
 
+    /**
+     * 验证 {@code recoveryReaderStopsAtIncompleteTail} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void recoveryReaderStopsAtIncompleteTail() throws Exception {
         Path redoPath = dir.resolve("redo.log");

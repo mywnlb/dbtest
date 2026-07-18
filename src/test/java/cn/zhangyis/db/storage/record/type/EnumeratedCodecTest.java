@@ -13,6 +13,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /** ENUM ordinal 与 SET bitmap 的定长往返、宽度、范围和 unsigned byte 保序测试。 */
 class EnumeratedCodecTest {
 
+    /**
+     * 验证 {@code enumUsesOneOrTwoUnsignedBytes} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void enumUsesOneOrTwoUnsignedBytes() {
         ColumnType smallType = ColumnType.enumType(List.of("A", "B", "C"), false);
@@ -34,6 +37,9 @@ class EnumeratedCodecTest {
                 () -> small.validate(new ColumnValue.EnumValue(4), smallType));
     }
 
+    /**
+     * 验证 {@code setUsesMinimalUnsignedBitmapWidth} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void setUsesMinimalUnsignedBitmapWidth() {
         ColumnType type = ColumnType.setType(List.of("A", "B", "C", "D", "E", "F", "G", "H", "I"), false);
@@ -46,6 +52,9 @@ class EnumeratedCodecTest {
                 () -> codec.validate(new ColumnValue.SetValue(1L << 9), type));
     }
 
+    /**
+     * 验证 {@code encodedOrderMatchesOrdinalAndBitmapOrder} 所描述的稳定格式转换，并断言往返值、字节布局、版本与损坏输入处理。
+     */
     @Test
     void encodedOrderMatchesOrdinalAndBitmapOrder() {
         ColumnType enumType = ColumnType.enumType(List.of("A", "B"), false);

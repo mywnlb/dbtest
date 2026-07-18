@@ -94,6 +94,9 @@ class IndexPageAccessTest {
         }
     }
 
+    /**
+     * 验证 {@code createIndexPageEmitsInitAndFormatRedo} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void createIndexPageEmitsInitAndFormatRedo() {
         onPool((pool, access, mgr) -> {
@@ -119,6 +122,9 @@ class IndexPageAccessTest {
         });
     }
 
+    /**
+     * 验证 {@code insertThroughMtrOwnedPageEmitsRedo} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void insertThroughMtrOwnedPageEmitsRedo() {
         onPool((pool, access, mgr) -> {
@@ -146,6 +152,9 @@ class IndexPageAccessTest {
         });
     }
 
+    /**
+     * 验证 {@code openSharedProducesNoRedo} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void openSharedProducesNoRedo() {
         onPool((pool, access, mgr) -> {
@@ -228,6 +237,9 @@ class IndexPageAccessTest {
         });
     }
 
+    /**
+     * 验证 {@code createIndexPageValidatesArgsBeforeTouchingPage} 所描述的 B+Tree 定位或结构变化，并断言键序、父子链接、页资源和唯一性不变量。
+     */
     @Test
     void createIndexPageValidatesArgsBeforeTouchingPage() {
         onPool((pool, access, mgr) -> {

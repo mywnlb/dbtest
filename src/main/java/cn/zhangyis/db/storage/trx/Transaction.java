@@ -47,6 +47,12 @@ public final class Transaction {
      */
     private ReadView readView;
 
+    /**
+     * 创建 {@code Transaction}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param options 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @param startTimeMillis 参与 {@code 构造} 的时间量 {@code startTimeMillis}；必须非负，零表示立即检查或尚未累计等待
+     */
     Transaction(TransactionOptions options, long startTimeMillis) {
         this.isolationLevel = options.isolationLevel();
         this.readOnly = options.readOnly();
@@ -104,10 +110,20 @@ public final class Transaction {
 
     // ---- 包内可见：仅 TransactionManager / UndoLogManager 调用 ----
 
+    /**
+     * 更新 {@code setTransactionId} 指定的事务、MVCC 与锁局部状态；写入前校验身份和范围，成功后由所属对象维护一致性。
+     *
+     * @param id 参与 {@code setTransactionId} 的稳定领域标识 {@code TransactionId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     */
     void setTransactionId(TransactionId id) {
         this.transactionId = id;
     }
 
+    /**
+     * 更新 {@code setTransactionNo} 指定的事务、MVCC 与锁局部状态；写入前校验身份和范围，成功后由所属对象维护一致性。
+     *
+     * @param no 参与 {@code setTransactionNo} 的稳定领域标识 {@code TransactionNo}；不得为 {@code null}，并须由对应值对象构造校验产生
+     */
     void setTransactionNo(TransactionNo no) {
         this.transactionNo = no;
     }
@@ -117,6 +133,7 @@ public final class Transaction {
      * （避免隐藏 NPE），但调用方控制单次绑定，本 mutator 不强制单次以保持生命周期约束集中在 manager。
      *
      * @param ctx undo 子状态，不能为 null。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     void setUndoContext(UndoContext ctx) {
         if (ctx == null) {
@@ -127,6 +144,8 @@ public final class Transaction {
 
     /**
      * 绑定事务级一致性读快照（RR）。仅 {@code ReadViewManager.openReadView} 调用；不能为 null。
+     * @param view 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     void bindReadView(ReadView view) {
         if (view == null) {
@@ -143,6 +162,9 @@ public final class Transaction {
     /**
      * 把 ACTIVE 事务标记为只能完整回滚。重复调用保留首次原因，避免后续清理异常覆盖最初的数据一致性故障。
      * 主状态仍保持 ACTIVE，使事务继续留在活跃表并能被普通/恢复 rollback 消费 undo。
+     *
+     * @param reason 传给 {@code markRollbackOnly} 的文本值；不得为 {@code null} 或空白，并保持调用方提供的字符顺序
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     void markRollbackOnly(String reason) {
         if (reason == null || reason.isBlank()) {
@@ -154,7 +176,10 @@ public final class Transaction {
         }
     }
 
-    /** 经状态机校验后推进状态；非法转换抛 {@link TransactionStateException}。 */
+    /** 经状态机校验后推进状态；非法转换抛 {@link TransactionStateException}。
+     * @param target 选择 {@code transitionTo} 分支的 {@code TransactionState} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     * @throws TransactionStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
+     */
     void transitionTo(TransactionState target) {
         if (!state.canTransitionTo(target)) {
             throw new TransactionStateException("illegal transition " + state + " -> " + target);

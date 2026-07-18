@@ -32,7 +32,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /** Dictionary object cache 的 single-flight、版本 publish 和 pin 生命周期 TDD。 */
 class DictionaryObjectCacheTest {
 
-    /** 同一 table miss 只有 leader 执行 repository loader，等待线程只挂 CompletableFuture 且有 timeout。 */
+    /** 同一 table miss 只有 leader 执行 repository loader，等待线程只挂 CompletableFuture 且有 timeout。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void coalescesConcurrentLoadsWithoutHoldingCacheLockDuringIo() throws Exception {
         DictionaryObjectCache cache = new DictionaryObjectCache(16);

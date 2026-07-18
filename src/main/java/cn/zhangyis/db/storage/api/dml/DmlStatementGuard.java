@@ -62,14 +62,28 @@ public final class DmlStatementGuard implements AutoCloseable {
         CLOSED
     }
 
-    /** 创建首写前空 undo 边界 Guard；仅由同包 DML facade 调用。 */
+    /** 创建首写前空 undo 边界 Guard；仅由同包 DML facade 调用。
+     *
+     * @param rollbackService 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param transaction 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
+     * @param clusteredIndex 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param boundary 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @return {@code emptyBoundary} 取得或创建的受控存储资源；成功时不为 {@code null}，调用方必须按其 Guard/lease 契约释放
+     */
     static DmlStatementGuard emptyBoundary(RollbackService rollbackService, Transaction transaction,
                                            BTreeIndex clusteredIndex, EmptyUndoBoundary boundary) {
         return new DmlStatementGuard(rollbackService, transaction, clusteredIndex,
                 BoundaryKind.EMPTY_UNDO, boundary, null);
     }
 
-    /** 创建已有 undo context 的保存点 Guard；仅由同包 DML facade 调用。 */
+    /** 创建已有 undo context 的保存点 Guard；仅由同包 DML facade 调用。
+     *
+     * @param rollbackService 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param transaction 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
+     * @param clusteredIndex 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param savepoint 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
+     * @return {@code savepointBoundary} 取得或创建的受控存储资源；成功时不为 {@code null}，调用方必须按其 Guard/lease 契约释放
+     */
     static DmlStatementGuard savepointBoundary(RollbackService rollbackService, Transaction transaction,
                                                BTreeIndex clusteredIndex, TransactionSavepoint savepoint) {
         return new DmlStatementGuard(rollbackService, transaction, clusteredIndex,
@@ -140,6 +154,8 @@ public final class DmlStatementGuard implements AutoCloseable {
      * 完成语句成功路径。保存点会被释放或空边界令牌会被消费，undo 链保持原样；两者都不持有物理页资源。
      * rollback 完成、rollback 失败后调用或重复 close 均为 no-op，便于异常分支与 finally/try-with-resources
      * 组合使用；其中失败状态不释放边界，必须由事务级收尾处理。
+     *
+     * @throws DmlOperationException DML/DDL 的校验、物理变更或原子收口失败时抛出；调用方应按语句与事务边界回滚
      */
     @Override
     public void close() {

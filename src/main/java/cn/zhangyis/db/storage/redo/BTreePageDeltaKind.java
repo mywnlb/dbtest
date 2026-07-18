@@ -18,6 +18,11 @@ public enum BTreePageDeltaKind {
     /** redo 文件中的稳定 1 字节分类码；只能追加，不能重排。 */
     private final byte code;
 
+    /**
+     * 创建 {@code BTreePageDeltaKind}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param code 参与 {@code 构造} 的稳定编码 {@code code}；必须命中当前版本声明的编码集合，未知值以格式或校验异常拒绝
+     */
     BTreePageDeltaKind(byte code) {
         this.code = code;
     }
@@ -32,6 +37,7 @@ public enum BTreePageDeltaKind {
      *
      * @param code redo 文件中的 1 字节分类码。
      * @return 对应分类。
+     * @throws RedoLogCorruptedException 检测到不能安全解释的持久数据损坏时抛出；调用方不得继续发布普通服务或覆盖原始证据
      */
     public static BTreePageDeltaKind fromCode(byte code) {
         for (BTreePageDeltaKind kind : values()) {

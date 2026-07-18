@@ -35,6 +35,7 @@ public final class RecoveryProgressJournal {
      * 由 recovery 总控决定是否 fail closed。
      *
      * @param sink progress 观察端口，不能为 null。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public RecoveryProgressJournal(RecoveryProgressSink sink) {
         if (sink == null) {
@@ -55,6 +56,9 @@ public final class RecoveryProgressJournal {
 
     /**
      * 记录阶段开始。开始事件只说明阶段已进入，redo 边界尚未知，用 0 作为诊断占位。
+     *
+     * @param mode 调用方请求的目标状态、阶段或模式；不得为 {@code null}，且必须是当前状态机允许的后继值
+     * @param stageName 恢复、checkpoint、doublewrite 或刷脏阶段的协作状态；不得为 {@code null}，阶段和持久化边界必须与当前实例的恢复状态机一致
      */
     public void stageStarted(RecoveryMode mode, RecoveryStageName stageName) {
         append(mode, stageName, RecoveryProgressEventKind.STARTED,
@@ -92,6 +96,10 @@ public final class RecoveryProgressJournal {
 
     /**
      * 记录阶段失败。异常只转换为简短诊断文本，原始 cause 仍由 {@link CrashRecoveryService#lastError()} 保存。
+     * @param mode 调用方请求的目标状态、阶段或模式；不得为 {@code null}，且必须是当前状态机允许的后继值
+     * @param stageName 恢复、checkpoint、doublewrite 或刷脏阶段的协作状态；不得为 {@code null}，阶段和持久化边界必须与当前实例的恢复状态机一致
+     * @param cause 需要分类或包装的原始失败；不得为 {@code null}，包装时必须保留 cause 与 suppressed 异常图
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public void stageFailed(RecoveryMode mode, RecoveryStageName stageName, Throwable cause) {
         if (cause == null) {
@@ -105,6 +113,8 @@ public final class RecoveryProgressJournal {
 
     /**
      * 返回不可变事件快照。调用方拿到的是列表拷贝，无法修改 journal 内部状态，也不持有 journal 锁。
+     *
+     * @return 调用时刻的不可变状态集合或映射；没有已发布条目时返回空集合，调用方修改不会影响权威状态
      */
     public List<RecoveryProgressEvent> snapshot() {
         lock.lock();

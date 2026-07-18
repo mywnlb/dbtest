@@ -76,7 +76,10 @@ class DefaultSqlSessionTest {
         }
     }
 
-    /** 一个 execute 阻塞在 begin 时，第二个调用只等待 statement timeout，不能无界进入同一 Session。 */
+    /** 一个 execute 阻塞在 begin 时，第二个调用只等待 statement timeout，不能无界进入同一 Session。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void rejectsConcurrentExecuteAfterBoundedWait() throws Exception {
         try (SessionTestDictionary dictionary = new SessionTestDictionary(directory)) {
@@ -93,7 +96,10 @@ class DefaultSqlSessionTest {
         }
     }
 
-    /** execute 等待 Engine admission 时不得先占 Session 锁，否则 shutdown write gate 与 Session.close 会反向等待。 */
+    /** execute 等待 Engine admission 时不得先占 Session 锁，否则 shutdown write gate 与 Session.close 会反向等待。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void engineAdmissionWaitDoesNotHoldSessionOperationLock() throws Exception {
         try (SessionTestDictionary dictionary = new SessionTestDictionary(directory)) {

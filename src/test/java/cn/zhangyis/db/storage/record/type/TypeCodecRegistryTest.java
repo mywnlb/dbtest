@@ -17,6 +17,9 @@ class TypeCodecRegistryTest {
 
     private final TypeCodecRegistry registry = new TypeCodecRegistry();
 
+    /**
+     * 验证 {@code picksIntegerCodecsWithRightWidth} 所描述的稳定格式转换，并断言往返值、字节布局、版本与损坏输入处理。
+     */
     @Test
     void picksIntegerCodecsWithRightWidth() {
         assertEquals(1, registry.codecFor(ColumnType.tinyint(false, false))
@@ -26,6 +29,9 @@ class TypeCodecRegistryTest {
         assertInstanceOf(IntegerCodec.class, registry.codecFor(ColumnType.intType(false, false)));
     }
 
+    /**
+     * 验证 {@code picksFloatingDecimalTemporal} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void picksFloatingDecimalTemporal() {
         assertEquals(4, registry.codecFor(ColumnType.floatType(false))
@@ -46,6 +52,9 @@ class TypeCodecRegistryTest {
                 .encodedLength(new ColumnValue.TemporalValue(TemporalKind.YEAR, 2026), ColumnType.year(false)));
     }
 
+    /**
+     * 验证 {@code picksBytesCodecs} 所描述的稳定格式转换，并断言往返值、字节布局、版本与损坏输入处理。
+     */
     @Test
     void picksBytesCodecs() {
         ColumnType ch = ColumnType.charType(5, false);
@@ -65,6 +74,9 @@ class TypeCodecRegistryTest {
         assertInstanceOf(LobCodec.class, registry.codecFor(ColumnType.json(false)));
     }
 
+    /**
+     * 验证 {@code validatesAndResolvesExactCharsetCollationPair} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void validatesAndResolvesExactCharsetCollationPair() {
         assertSame(AsciiCaseInsensitiveCollation.INSTANCE,

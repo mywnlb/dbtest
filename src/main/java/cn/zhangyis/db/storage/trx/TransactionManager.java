@@ -30,6 +30,12 @@ public final class TransactionManager {
      */
     private final ReadViewManager readViewManager;
 
+    /**
+     * 创建 {@code TransactionManager}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param system 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public TransactionManager(TransactionSystem system) {
         if (system == null) {
             throw new DatabaseValidationException("transaction system must not be null");
@@ -48,7 +54,12 @@ public final class TransactionManager {
         return readViewManager;
     }
 
-    /** 开启事务，状态 ACTIVE；读写事务此时不分配写 id（惰性，§7.1）。 */
+    /** 开启事务，状态 ACTIVE；读写事务此时不分配写 id（惰性，§7.1）。
+     *
+     * @param options 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @return {@code begin} 创建或观察到的事务/锁状态；成功时不为 {@code null}，owner、可见性与生命周期来自当前会话
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public Transaction begin(TransactionOptions options) {
         if (options == null) {
             throw new DatabaseValidationException("transaction options must not be null");
@@ -101,17 +112,32 @@ public final class TransactionManager {
     /**
      * 首次写入分配写 id（幂等：已分配则返回原 id）。只读事务调用直接拒绝。
      * 调用方在 B+Tree 聚簇写入前调用，再把 {@code txn.transactionId()} 传入写入路径。
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
+     * @param txn 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
+     * @return {@code assignWriteId} 定位或分配的稳定值对象；成功时不为 {@code null}，其身份、范围和特殊值已由构造校验保证
+     * @throws TransactionStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
      */
     public TransactionId assignWriteId(Transaction txn) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         requireUsableActive(txn);
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         if (txn.readOnly()) {
             throw new TransactionStateException("read-only transaction cannot assign a write id");
         }
         if (!txn.transactionId().isNone()) {
             return txn.transactionId();
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         TransactionId id = system.allocateWriteId();
         txn.setTransactionId(id);
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         return id;
     }
 
@@ -201,10 +227,23 @@ public final class TransactionManager {
     /**
      * 提交：ACTIVE→COMMITTING→COMMITTED。读写事务分配提交序号并移出活跃表；只读事务（id 仍 NONE）
      * 不分配序号、无需移出。不刷数据页、不撤销记录。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
+     * @param txn 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
      */
     public void commit(Transaction txn) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         requireUsableActive(txn);
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         txn.transitionTo(TransactionState.COMMITTING);
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         if (!txn.transactionId().isNone()) {
             if (txn.transactionNo().isNone()) {
                 txn.setTransactionNo(system.allocateTransactionNo());
@@ -213,6 +252,7 @@ public final class TransactionManager {
         }
         // 移出活跃表后、进入终态前释放事务级 ReadView（T1.4；RC/未开 ReadView 时为 no-op）
         readViewManager.release(txn);
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         txn.transitionTo(TransactionState.COMMITTED);
     }
 
@@ -223,6 +263,7 @@ public final class TransactionManager {
      * 本方法是「无 undo 链可走」（只读/未写事务）的便捷组合：{@code RollbackService} 对有 {@code UndoContext} 的
      * 事务改为先 {@code beginRollback}、反向走 undo 链、原子终结段并释放 slot，再 {@code finishRollback}，使撤销发生在真正的
      * {@code ROLLING_BACK} 状态内（设计 §7.6）。本组合行为与旧实现完全一致。
+     * @param txn 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
      */
     public void rollback(Transaction txn) {
         beginRollback(txn);
@@ -232,6 +273,7 @@ public final class TransactionManager {
     /**
      * 进入回滚：ACTIVE→ROLLING_BACK。供 {@code RollbackService} 在反向走 undo 链前调用，使整段撤销处于
      * {@code ROLLING_BACK} 状态。此阶段**不**移出活跃表——事务在撤销完成前仍是活跃读写事务（设计 §7.6 step 1）。
+     * @param txn 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
      */
     void beginRollback(Transaction txn) {
         requireActive(txn);
@@ -254,33 +296,58 @@ public final class TransactionManager {
      * 收尾回滚：ROLLING_BACK→ROLLED_BACK，读写事务移出活跃表。只有 undo 链**完整**走到 prev=NULL、持久终结并释放 slot 后
      * 才调用；单条 undo 失败不应到达此处（{@code RollbackService} 让异常传播、事务停在 {@code ROLLING_BACK} 可重试）。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
      * @throws TransactionStateException 当前不在 {@code ROLLING_BACK}（未先 {@link #beginRollback}）。
+     * @param txn 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     void finishRollback(Transaction txn) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         if (txn == null) {
             throw new DatabaseValidationException("transaction must not be null");
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         if (txn.state() != TransactionState.ROLLING_BACK) {
             throw new TransactionStateException("finishRollback requires ROLLING_BACK: " + txn.state());
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         if (!txn.transactionId().isNone()) {
             system.removeActive(txn.transactionId().value());
         }
         // 移出活跃表后、进入终态前释放事务级 ReadView（T1.4）
         readViewManager.release(txn);
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         txn.transitionTo(TransactionState.ROLLED_BACK);
     }
 
     /**
      * prepared undo inverse、segment drop、page3 clear 与终态 redo 全部提交后完成回滚。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
      * @param txn 正处于 PREPARED_ROLLING_BACK 的事务
      * @throws TransactionStateException 物理终结前误调用或事务身份缺失时抛出；active membership 保持
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     void finishPreparedRollback(Transaction txn) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         if (txn == null) {
             throw new DatabaseValidationException("prepared rollback transaction must not be null");
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         if (txn.state() != TransactionState.PREPARED_ROLLING_BACK) {
             throw new TransactionStateException(
                     "finishPreparedRollback requires PREPARED_ROLLING_BACK: " + txn.state());
@@ -288,8 +355,10 @@ public final class TransactionManager {
         if (txn.transactionId().isNone()) {
             throw new TransactionStateException("prepared rollback requires an assigned write id");
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         system.removeActive(txn.transactionId().value());
         readViewManager.release(txn);
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         txn.transitionTo(TransactionState.ROLLED_BACK);
     }
 
@@ -299,6 +368,7 @@ public final class TransactionManager {
      *
      * @param txn   发生不确定 statement rollback 的 ACTIVE 事务。
      * @param cause 触发失败的原始领域异常，用于保留首个诊断原因。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     void markRollbackOnly(Transaction txn, RuntimeException cause) {
         requireActive(txn);

@@ -1,4 +1,7 @@
 /**
- * Tests for shared database domain value objects.
+ * {@code cn.zhangyis.db.domain} 包的自动化测试。
+ *
+ * <p>测试围绕以下生产职责建立可重复断言：通用领域值对象包，用不可变类型表达页、空间、LSN 与事务等稳定身份，不依赖具体存储实现。
+ * 同时覆盖正常路径、边界条件与领域异常，避免用控制台输出代替行为验证。
  */
 package cn.zhangyis.db.domain;

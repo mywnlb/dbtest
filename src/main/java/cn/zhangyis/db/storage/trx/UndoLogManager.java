@@ -80,26 +80,40 @@ public final class UndoLogManager {
      * 构造生产 undo 门面。slot claim 必须持久到 page3；纯 insert commit 必须经 finalizer 在同一 redo batch
      * cache/free/drop segment + 转移 page3 owner，故不再提供绕过持久生命周期的构造方式。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝 null、越界和相互矛盾的组合。</li>
+     *     <li>完成跨参数校验并推导不可变配置；若构造过程创建自有资源，后续失败必须在异常路径关闭。</li>
+     *     <li>把已校验协作者与配置绑定到字段，并初始化本对象拥有的状态、显式锁、队列或缓存，不允许 this 提前逃逸。</li>
+     *     <li>构造完成后对象处于类契约声明的初始状态；任一步失败都抛出领域异常且不发布半初始化实例。</li>
+     * </ol>
+     *
      * @param access      undo 物理设施入口，不能为 null。
      * @param slotManager 内存 rseg slot 目录，不能为 null。
      * @param undoSpace   undo 表空间，不能为 null。
      * @param history     已提交 undo log 的 history list，不能为 null。
      * @param headerRepo  持久 rseg header 仓储。
      * @param finalizer   atomic undo segment 终态协作者。
+     * @param reuseDirectory 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public UndoLogManager(UndoLogSegmentAccess access, RollbackSegmentSlotManager slotManager, SpaceId undoSpace,
                            HistoryList history, RollbackSegmentHeaderRepository headerRepo,
                            UndoSegmentFinalizer finalizer, UndoSegmentReuseDirectory reuseDirectory) {
+        // 1、校验必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝非法组合。
         if (access == null || slotManager == null || undoSpace == null || history == null
                 || headerRepo == null || finalizer == null || reuseDirectory == null) {
             throw new DatabaseValidationException("undo log manager args must not be null");
         }
         this.access = access;
+        // 2、完成跨参数校验并推导不可变配置；后续失败仍由当前构造路径收口已创建资源。
         this.slotManager = slotManager;
         this.undoSpace = undoSpace;
+        // 3、绑定已校验协作者并初始化本对象拥有的状态、显式锁、队列或缓存，不允许半初始化实例逃逸。
         this.history = history;
         this.headerRepo = headerRepo;
         this.finalizer = finalizer;
+        // 4、完成初始状态发布；失败以领域异常终止构造，成功对象满足类级生命周期不变量。
         this.reuseDirectory = reuseDirectory;
     }
 
@@ -227,6 +241,11 @@ public final class UndoLogManager {
     /**
      * 在同一业务 MTR 中先固定 undo owner/root/payload 页而不发布 placeholder。调用顺序必须位于 B+Tree prepare 与
      * LOB allocation 之前；返回 guard 后任何未发布退出均属于 fail-stop 边界。
+     *
+     * @param txn 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param deferred 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @return {@code prepareUndoAppend} 构造或恢复的 undo/rollback 对象；成功时不为 {@code null}，事务身份和 roll pointer 链保持一致
      */
     public PreparedUndoAppend<InsertedLobOwnership> prepareUndoAppend(Transaction txn, MiniTransaction mtr,
                                                                       DeferredInsertUndoPlan deferred) {
@@ -252,6 +271,14 @@ public final class UndoLogManager {
     /**
      * 根据冻结 acquisition 分派共享的 deferred owner/root/payload prepare 协议。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
      * @param txn      当前 ACTIVE 写事务。
      * @param mtr      已完成组合 redo admission 的业务 MTR。
      * @param deferred INSERT/UPDATE 对应的 placeholder 物理形状计划。
@@ -263,14 +290,18 @@ public final class UndoLogManager {
      */
     private <T> PreparedUndoAppend<T> prepareDeferredUndoAppend(Transaction txn, MiniTransaction mtr,
                                                                 DeferredUndoPlan<T> deferred) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         if (txn == null || mtr == null || deferred == null) {
             throw new TransactionStateException("prepareUndoAppend txn/mtr/plan must not be null");
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         requireActiveTransaction(txn);
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         UndoWritePlan plan = deferred.placeholderPlan();
         if (!txn.transactionId().equals(plan.transactionId())) {
             throw new UndoWriteStalePlanException("deferred undo transaction id no longer matches target");
         }
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         return switch (plan.acquisition()) {
             case ALLOCATE_NEW -> prepareAllocatedLog(txn, mtr, deferred);
             case REUSE_CACHED -> prepareCachedLog(txn, mtr, deferred);
@@ -528,6 +559,12 @@ public final class UndoLogManager {
     /**
      * 在调用方已经按 {@link UndoWritePlan#redoWorkload()} 完成 admission 的 MTR 中执行计划。所有 stale 校验先于
      * reservation；进入 reservation/append 后任意失败转为 fatal，因为 MTR rollback 不撤销 buffer content。
+     * @param txn 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param plan 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @return {@code appendPlanned} 定位或分配的稳定值对象；成功时不为 {@code null}，其身份、范围和特殊值已由构造校验保证
+     * @throws TransactionStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
+     * @throws UndoWriteStalePlanException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
      */
     public RollPointer appendPlanned(Transaction txn, MiniTransaction mtr, UndoWritePlan plan) {
         if (txn == null || mtr == null || plan == null) {
@@ -559,18 +596,39 @@ public final class UndoLogManager {
                 UndoRedoBudgetEstimator.append(context.acquisition(), physical.externalPageCount()));
     }
 
-    /** fresh INSERT log 的 owner/root prepare；segment 首页和 page3 slot 在 actual record 之前先成为稳定 owner。 */
+    /** fresh INSERT log 的 owner/root prepare；segment 首页和 page3 slot 在 actual record 之前先成为稳定 owner。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
+     * @param txn 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param deferred 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param <T> 调用方提供的类型参数，必须满足声明的上界约束
+     * @return {@code prepareAllocatedLog} 构造或恢复的 undo/rollback 对象；成功时不为 {@code null}，事务身份和 roll pointer 链保持一致
+     * @throws UndoWriteStalePlanException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
+     * @throws UndoWriteFatalException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
+     */
     private <T> PreparedUndoAppend<T> prepareAllocatedLog(Transaction txn, MiniTransaction mtr,
                                                           DeferredUndoPlan<T> deferred) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         UndoWritePlan plan = deferred.placeholderPlan();
         UndoContext current = txn.undoContext();
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         UndoNo currentGlobal = current == null ? UndoNo.NONE : current.lastUndoNo();
         if (!currentGlobal.equals(plan.expectedGlobalLastUndoNo())
                 || current != null && current.hasBinding(plan.kind())) {
             throw new UndoWriteStalePlanException("new deferred undo log plan is stale");
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         PreparedResources resources = new PreparedResources();
         boolean physical = false;
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         try {
             RollbackSegmentSlotManager.ClaimLease claim = resources.add(slotManager.reserveClaim());
             requirePersistentSlotFree(mtr, claim.slotId());
@@ -639,13 +697,33 @@ public final class UndoLogManager {
         }
     }
 
-    /** free FIFO owner transition 的 deferred prepare，锁序与普通 free reuse 首写保持一致。 */
+    /** free FIFO owner transition 的 deferred prepare，锁序与普通 free reuse 首写保持一致。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
+     * @param txn 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param deferred 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param <T> 调用方提供的类型参数，必须满足声明的上界约束
+     * @return {@code prepareFreeLog} 构造或恢复的 undo/rollback 对象；成功时不为 {@code null}，事务身份和 roll pointer 链保持一致
+     * @throws UndoWriteFatalException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
+     */
     private <T> PreparedUndoAppend<T> prepareFreeLog(Transaction txn, MiniTransaction mtr,
                                                      DeferredUndoPlan<T> deferred) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         UndoWritePlan plan = deferred.placeholderPlan();
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         UndoContext current = requireNoKindBinding(txn, plan, "free deferred undo");
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         PreparedResources resources = new PreparedResources();
         boolean physical = false;
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         try {
             RollbackSegmentSlotManager.ClaimLease claim = resources.add(slotManager.reserveClaim());
             UndoSegmentReuseDirectory.FreePopLease freePop = resources.add(
@@ -731,6 +809,15 @@ public final class UndoLogManager {
         }, resources::close);
     }
 
+    /**
+     * 校验 {@code requireNoKindBinding} 涉及的事务、MVCC 与锁结构、范围与交叉字段；合法输入不修改状态，非法输入在副作用前抛出领域异常。
+     *
+     * @param txn 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
+     * @param plan 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param operation 传给 {@code requireNoKindBinding} 的文本值；不得为 {@code null} 或空白，并保持调用方提供的字符顺序
+     * @return {@code requireNoKindBinding} 构造或恢复的 undo/rollback 对象；成功时不为 {@code null}，事务身份和 roll pointer 链保持一致
+     * @throws UndoWriteStalePlanException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
+     */
     private static UndoContext requireNoKindBinding(Transaction txn, UndoWritePlan plan, String operation) {
         UndoContext current = txn.undoContext();
         UndoNo currentGlobal = current == null ? UndoNo.NONE : current.lastUndoNo();
@@ -743,7 +830,13 @@ public final class UndoLogManager {
 
     /** prepared handle 跨方法保留的租约集合；按获取逆序关闭并聚合 suppressed。 */
     private static final class PreparedResources {
+        /**
+         * 本对象拥有的 {@code resources} 受控集合；元素生命周期与外层对象一致，仅由本类方法更新，对外暴露时必须返回副本或不可变视图。
+         */
         private final List<AutoCloseable> resources = new ArrayList<>();
+        /**
+         * 记录 {@code closed} 生命周期事实是否成立；只由本类状态转换更新，共享访问受所属显式锁、原子发布或单一 owner 线程保护。
+         */
         private boolean closed;
 
         private <T extends AutoCloseable> T add(T resource) {
@@ -753,11 +846,25 @@ public final class UndoLogManager {
             return resource;
         }
 
+        /**
+         * 释放本方法拥有的事务、MVCC 与锁资源；遵守既定释放顺序，重复或失败调用不得掩盖原始状态。
+         * <p>数据流：</p>
+         * <ol>
+         *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+         *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+         *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+         *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+         * </ol>
+         *
+         */
         private void close() {
+            // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
             if (closed) {
                 return;
             }
+            // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
             closed = true;
+            // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
             RuntimeException first = null;
             for (int i = resources.size() - 1; i >= 0; i--) {
                 try {
@@ -778,11 +885,17 @@ public final class UndoLogManager {
                     }
                 }
             }
+            // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
             if (first != null) {
                 throw first;
             }
         }
 
+        /**
+         * 释放本方法拥有的事务、MVCC 与锁资源；遵守既定释放顺序，重复或失败调用不得掩盖原始状态。
+         *
+         * @param primary 需要分类或包装的原始失败；不得为 {@code null}，包装时必须保留 cause 与 suppressed 异常图
+         */
         private void closeSuppressing(RuntimeException primary) {
             try {
                 close();
@@ -821,13 +934,35 @@ public final class UndoLogManager {
                 binding.firstPageId(), globalLast, binding.logicalHead(), snapshot, null, null);
     }
 
+    /**
+     * 按冻结的 UndoWritePlan 为事务创建并追加新的 undo log；先复核计划和事务快照，再在同一 MTR 内声明持久 slot、写入 undo 页并发布绑定。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
+     * @param txn 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param plan 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @return {@code appendAllocatedLogPlanned} 定位或分配的稳定值对象；成功时不为 {@code null}，其身份、范围和特殊值已由构造校验保证
+     * @throws UndoWriteStalePlanException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
+     * @throws UndoWriteFatalException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
+     */
     private RollPointer appendAllocatedLogPlanned(Transaction txn, MiniTransaction mtr, UndoWritePlan plan) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         UndoContext current = txn.undoContext();
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         UndoNo currentGlobal = current == null ? UndoNo.NONE : current.lastUndoNo();
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         if (!currentGlobal.equals(plan.expectedGlobalLastUndoNo())
                 || (current != null && current.hasBinding(plan.kind()))) {
             throw new UndoWriteStalePlanException("new undo log plan is stale because transaction state changed");
         }
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         try (RollbackSegmentSlotManager.ClaimLease claim = slotManager.reserveClaim()) {
             requirePersistentSlotFree(mtr, claim.slotId());
             UndoSpaceReservation reservation = access.reservePages(mtr, undoSpace, plan.pagesToReserve());
@@ -901,14 +1036,33 @@ public final class UndoLogManager {
     /**
      * 用跨 kind free FIFO 队首开启事务的新 undo log。page3 摘头/slot claim、successor.prev 清空、首页激活和首条
      * append 同属一个业务 MTR；物理边界后的异常保留 free/slot fence 并转 fatal。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
+     * @param txn 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param plan 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @return {@code appendFreeLogPlanned} 定位或分配的稳定值对象；成功时不为 {@code null}，其身份、范围和特殊值已由构造校验保证
+     * @throws UndoWriteStalePlanException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
+     * @throws UndoWriteFatalException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
      */
     private RollPointer appendFreeLogPlanned(Transaction txn, MiniTransaction mtr, UndoWritePlan plan) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         UndoContext current = txn.undoContext();
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         UndoNo currentGlobal = current == null ? UndoNo.NONE : current.lastUndoNo();
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         if (!currentGlobal.equals(plan.expectedGlobalLastUndoNo())
                 || (current != null && current.hasBinding(plan.kind()))) {
             throw new UndoWriteStalePlanException("free undo plan is stale because transaction state changed");
         }
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         try (RollbackSegmentSlotManager.ClaimLease claim = slotManager.reserveClaim();
              UndoSegmentReuseDirectory.FreePopLease freePop = reuseDirectory.reserveFreePop(plan.freeCandidate())) {
             requirePersistentSlotFree(mtr, claim.slotId());
@@ -999,6 +1153,12 @@ public final class UndoLogManager {
         return new UndoWriteFatalException(message, error);
     }
 
+    /**
+     * 校验 {@code requireActiveTransaction} 涉及的事务、MVCC 与锁结构、范围与交叉字段；合法输入不修改状态，非法输入在副作用前抛出领域异常。
+     *
+     * @param txn 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
+     * @throws TransactionStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
+     */
     private static void requireActiveTransaction(Transaction txn) {
         if (txn == null) {
             throw new TransactionStateException("undo planning transaction must not be null");
@@ -1011,7 +1171,18 @@ public final class UndoLogManager {
         }
     }
 
-    /** 规划期冻结的事务链入口。 */
+    /** 规划期冻结的事务链入口。
+     *
+     * @param transactionId 事务的稳定标识；不得为 {@code null}，{@code NONE} 只表示尚未绑定事务，不能代替活跃事务身份
+     * @param kind 选择 {@code 构造} 分支的 {@code UndoLogKind} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     * @param acquisition 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param firstPageId 目标页的稳定物理标识；必须属于当前已准入表空间，且不得为 {@code null}
+     * @param globalLastUndoNo 参与 {@code 构造} 的稳定领域标识 {@code UndoNo}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param logicalHead 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param persistentSnapshot 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @param cachedCandidate 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param freeCandidate 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     */
     private record PlanningContext(TransactionId transactionId, UndoLogKind kind,
                                    UndoSegmentAcquisition acquisition,
                                     PageId firstPageId, UndoNo globalLastUndoNo, UndoLogicalHead logicalHead,
@@ -1040,13 +1211,24 @@ public final class UndoLogManager {
      * 再调用本方法持久化 undo 终态，最后才 {@code commit(txn)} 移出 active table。纯 insert 在此缓存或回收；
      * update/delete 原子更新 page3 base 与 first-page links 后才发布内存 history 投影，保留给 MVCC/purge。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
      * @param txn 提交中的事务，不能为 null。
+     * @throws TransactionStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
      */
     public void onCommit(Transaction txn) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         if (txn == null) {
             throw new TransactionStateException("onCommit txn must not be null");
         }
         UndoContext ctx = txn.undoContext();
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         if (ctx == null) {
             return; // 未写事务：无 undo 段
         }
@@ -1055,6 +1237,7 @@ public final class UndoLogManager {
             throw new TransactionStateException(
                     "onCommit requires an assigned TransactionNo; call TransactionManager.prepareCommit first");
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         UndoLogBinding update = ctx.binding(UndoLogKind.UPDATE);
         if (update == null) {
             finalizer.finalizeCommit(txn, ctx, null);
@@ -1063,6 +1246,7 @@ public final class UndoLogManager {
         HistoryEntry entry = new HistoryEntry(no, txn.transactionId(), undoSpace,
                 update.firstPageId(), update.slotId(), ctx.affectedTableIds());
         // transition 在任何 page/FSP 写前取得；timeout/interrupt 不会留下半持久 commit，可由上层重试。
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         try (HistoryList.AppendLease lease = history.beginAppend(entry)) {
             finalizer.finalizeCommit(txn, ctx, lease);
         }
@@ -1128,18 +1312,30 @@ public final class UndoLogManager {
      * 恢复期 prepared commit 变体：affected-table 集合从持久 UPDATE logical chain重建，而非依赖已丢失的
      * live side projection。live 入口也复用本方法。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
      * @param txn live 或 recovery 重建的 PREPARED transaction aggregate
      * @param affectedTableIds 当前 UPDATE logical chain涉及的稳定表 id；INSERT-only 可为空
+     * @throws TransactionStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
      */
     public void onCommitPrepared(Transaction txn, java.util.Set<Long> affectedTableIds) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         if (txn == null || txn.state() != TransactionState.PREPARED
                 || txn.undoContext() == null || txn.transactionNo().isNone()
                 || affectedTableIds == null) {
             throw new TransactionStateException(
                     "prepared commit fields/state are invalid");
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         UndoContext context = txn.undoContext();
         UndoLogBinding update = context.binding(UndoLogKind.UPDATE);
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         if (update == null) {
             if (!affectedTableIds.isEmpty()) {
                 throw new TransactionStateException(
@@ -1151,6 +1347,7 @@ public final class UndoLogManager {
         HistoryEntry entry = new HistoryEntry(
                 txn.transactionNo(), txn.transactionId(), undoSpace,
                 update.firstPageId(), update.slotId(), affectedTableIds);
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         try (HistoryList.AppendLease lease = history.beginAppend(entry)) {
             finalizer.finalizePreparedCommit(txn, context, affectedTableIds, lease);
         }

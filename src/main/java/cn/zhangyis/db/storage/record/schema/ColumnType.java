@@ -115,155 +115,324 @@ public record ColumnType(TypeId typeId, boolean nullable, int length, int scale,
         }
     }
 
+    /**
+     * 根据调用参数创建或转换 {@code tinyint} 返回的 {@code ColumnType}；输入先完成领域校验，成功结果不为 {@code null}。
+     *
+     * @param unsigned 整数值是否按无符号域解释；{@code true} 使用无符号范围与排序，{@code false} 保留 Java 有符号语义
+     * @param nullable 列或表达式是否允许 SQL NULL；{@code true} 允许写入 NULL，{@code false} 时绑定或编码阶段必须拒绝 NULL
+     * @return {@code tinyint} 解析或选择出的已知领域类型；成功时不为 {@code null}，未知编码或非法状态通过领域异常报告
+     */
     public static ColumnType tinyint(boolean unsigned, boolean nullable) {
         return fixed(TypeId.TINYINT, 0, 0, unsigned, nullable);
     }
 
+    /**
+     * 根据调用参数创建或转换 {@code smallint} 返回的 {@code ColumnType}；输入先完成领域校验，成功结果不为 {@code null}。
+     *
+     * @param unsigned 整数值是否按无符号域解释；{@code true} 使用无符号范围与排序，{@code false} 保留 Java 有符号语义
+     * @param nullable 列或表达式是否允许 SQL NULL；{@code true} 允许写入 NULL，{@code false} 时绑定或编码阶段必须拒绝 NULL
+     * @return {@code smallint} 解析或选择出的已知领域类型；成功时不为 {@code null}，未知编码或非法状态通过领域异常报告
+     */
     public static ColumnType smallint(boolean unsigned, boolean nullable) {
         return fixed(TypeId.SMALLINT, 0, 0, unsigned, nullable);
     }
 
+    /**
+     * 根据调用参数创建或转换 {@code intType} 返回的 {@code ColumnType}；输入先完成领域校验，成功结果不为 {@code null}。
+     *
+     * @param unsigned 整数值是否按无符号域解释；{@code true} 使用无符号范围与排序，{@code false} 保留 Java 有符号语义
+     * @param nullable 列或表达式是否允许 SQL NULL；{@code true} 允许写入 NULL，{@code false} 时绑定或编码阶段必须拒绝 NULL
+     * @return {@code intType} 解析或选择出的已知领域类型；成功时不为 {@code null}，未知编码或非法状态通过领域异常报告
+     */
     public static ColumnType intType(boolean unsigned, boolean nullable) {
         return fixed(TypeId.INT, 0, 0, unsigned, nullable);
     }
 
+    /**
+     * 根据调用参数创建或转换 {@code bigint} 返回的 {@code ColumnType}；输入先完成领域校验，成功结果不为 {@code null}。
+     *
+     * @param unsigned 整数值是否按无符号域解释；{@code true} 使用无符号范围与排序，{@code false} 保留 Java 有符号语义
+     * @param nullable 列或表达式是否允许 SQL NULL；{@code true} 允许写入 NULL，{@code false} 时绑定或编码阶段必须拒绝 NULL
+     * @return {@code bigint} 解析或选择出的已知领域类型；成功时不为 {@code null}，未知编码或非法状态通过领域异常报告
+     */
     public static ColumnType bigint(boolean unsigned, boolean nullable) {
         return fixed(TypeId.BIGINT, 0, 0, unsigned, nullable);
     }
 
+    /**
+     * 根据调用参数创建或转换 {@code floatType} 返回的 {@code ColumnType}；输入先完成领域校验，成功结果不为 {@code null}。
+     *
+     * @param nullable 列或表达式是否允许 SQL NULL；{@code true} 允许写入 NULL，{@code false} 时绑定或编码阶段必须拒绝 NULL
+     * @return {@code floatType} 解析或选择出的已知领域类型；成功时不为 {@code null}，未知编码或非法状态通过领域异常报告
+     */
     public static ColumnType floatType(boolean nullable) {
         return fixed(TypeId.FLOAT, 0, 0, false, nullable);
     }
 
+    /**
+     * 根据调用参数创建或转换 {@code doubleType} 返回的 {@code ColumnType}；输入先完成领域校验，成功结果不为 {@code null}。
+     *
+     * @param nullable 列或表达式是否允许 SQL NULL；{@code true} 允许写入 NULL，{@code false} 时绑定或编码阶段必须拒绝 NULL
+     * @return {@code doubleType} 解析或选择出的已知领域类型；成功时不为 {@code null}，未知编码或非法状态通过领域异常报告
+     */
     public static ColumnType doubleType(boolean nullable) {
         return fixed(TypeId.DOUBLE, 0, 0, false, nullable);
     }
 
+    /**
+     * 根据调用参数创建或转换 {@code decimal} 返回的 {@code ColumnType}；输入先完成领域校验，成功结果不为 {@code null}。
+     *
+     * @param precision 参与 {@code decimal} 的上界或规格值 {@code precision}；必须非负且不能使容量、页数或编码长度计算溢出
+     * @param scale 参与 {@code decimal} 的上界或规格值 {@code scale}；必须非负且不能使容量、页数或编码长度计算溢出
+     * @param nullable 列或表达式是否允许 SQL NULL；{@code true} 允许写入 NULL，{@code false} 时绑定或编码阶段必须拒绝 NULL
+     * @return {@code decimal} 解析或选择出的已知领域类型；成功时不为 {@code null}，未知编码或非法状态通过领域异常报告
+     */
     public static ColumnType decimal(int precision, int scale, boolean nullable) {
         return fixed(TypeId.DECIMAL, precision, scale, false, nullable);
     }
 
+    /**
+     * 根据调用参数创建或转换 {@code charType} 返回的 {@code ColumnType}；输入先完成领域校验，成功结果不为 {@code null}。
+     *
+     * @param nBytes 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @param nullable 列或表达式是否允许 SQL NULL；{@code true} 允许写入 NULL，{@code false} 时绑定或编码阶段必须拒绝 NULL
+     * @return {@code charType} 解析或选择出的已知领域类型；成功时不为 {@code null}，未知编码或非法状态通过领域异常报告
+     */
     public static ColumnType charType(int nBytes, boolean nullable) {
         return charType(nBytes, nullable, CharsetId.UTF8, CollationId.BINARY);
     }
 
     /**
      * 创建显式字符集与排序规则的 CHAR；pair 的生产支持性由只读类型 registry 在 codec 选择时复核。
+     *
+     * @param nBytes 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @param nullable 列或表达式是否允许 SQL NULL；{@code true} 允许写入 NULL，{@code false} 时绑定或编码阶段必须拒绝 NULL
+     * @param charset 参与 {@code charType} 的稳定领域标识 {@code CharsetId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param collation 参与 {@code charType} 的稳定领域标识 {@code CollationId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @return {@code charType} 解析或选择出的已知领域类型；成功时不为 {@code null}，未知编码或非法状态通过领域异常报告
      */
     public static ColumnType charType(int nBytes, boolean nullable, CharsetId charset, CollationId collation) {
         return new ColumnType(TypeId.CHAR, nullable, nBytes, 0, false, charset, collation,
                 StorageKind.FIXED, List.of());
     }
 
+    /**
+     * 根据调用参数创建或转换 {@code binary} 返回的 {@code ColumnType}；输入先完成领域校验，成功结果不为 {@code null}。
+     *
+     * @param nBytes 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @param nullable 列或表达式是否允许 SQL NULL；{@code true} 允许写入 NULL，{@code false} 时绑定或编码阶段必须拒绝 NULL
+     * @return {@code binary} 解析或选择出的已知领域类型；成功时不为 {@code null}，未知编码或非法状态通过领域异常报告
+     */
     public static ColumnType binary(int nBytes, boolean nullable) {
         return fixed(TypeId.BINARY, nBytes, 0, false, nullable);
     }
 
+    /**
+     * 根据调用参数创建或转换 {@code date} 返回的 {@code ColumnType}；输入先完成领域校验，成功结果不为 {@code null}。
+     *
+     * @param nullable 列或表达式是否允许 SQL NULL；{@code true} 允许写入 NULL，{@code false} 时绑定或编码阶段必须拒绝 NULL
+     * @return {@code date} 解析或选择出的已知领域类型；成功时不为 {@code null}，未知编码或非法状态通过领域异常报告
+     */
     public static ColumnType date(boolean nullable) {
         return fixed(TypeId.DATE, 0, 0, false, nullable);
     }
 
-    /** 创建 8B 带符号毫秒 duration 类型；MySQL TIME 业务范围留给 SQL 层校验。 */
+    /** 创建 8B 带符号毫秒 duration 类型；MySQL TIME 业务范围留给 SQL 层校验。
+     *
+     * @param nullable 列或表达式是否允许 SQL NULL；{@code true} 允许写入 NULL，{@code false} 时绑定或编码阶段必须拒绝 NULL
+     * @return {@code time} 解析或选择出的已知领域类型；成功时不为 {@code null}，未知编码或非法状态通过领域异常报告
+     */
     public static ColumnType time(boolean nullable) {
         return fixed(TypeId.TIME, 0, 0, false, nullable);
     }
 
+    /**
+     * 根据调用参数创建或转换 {@code datetime} 返回的 {@code ColumnType}；输入先完成领域校验，成功结果不为 {@code null}。
+     *
+     * @param nullable 列或表达式是否允许 SQL NULL；{@code true} 允许写入 NULL，{@code false} 时绑定或编码阶段必须拒绝 NULL
+     * @return {@code datetime} 解析或选择出的已知领域类型；成功时不为 {@code null}，未知编码或非法状态通过领域异常报告
+     */
     public static ColumnType datetime(boolean nullable) {
         return fixed(TypeId.DATETIME, 0, 0, false, nullable);
     }
 
-    /** 创建 8B UTC epoch millis 类型；session 时区转换不能进入 Record 层。 */
+    /** 创建 8B UTC epoch millis 类型；session 时区转换不能进入 Record 层。
+     *
+     * @param nullable 列或表达式是否允许 SQL NULL；{@code true} 允许写入 NULL，{@code false} 时绑定或编码阶段必须拒绝 NULL
+     * @return {@code timestamp} 解析或选择出的已知领域类型；成功时不为 {@code null}，未知编码或非法状态通过领域异常报告
+     */
     public static ColumnType timestamp(boolean nullable) {
         return fixed(TypeId.TIMESTAMP, 0, 0, false, nullable);
     }
 
-    /** 创建 2B unsigned 教学年份类型；物理可表达范围由 TemporalCodec 校验。 */
+    /** 创建 2B unsigned 教学年份类型；物理可表达范围由 TemporalCodec 校验。
+     *
+     * @param nullable 列或表达式是否允许 SQL NULL；{@code true} 允许写入 NULL，{@code false} 时绑定或编码阶段必须拒绝 NULL
+     * @return {@code year} 解析或选择出的已知领域类型；成功时不为 {@code null}，未知编码或非法状态通过领域异常报告
+     */
     public static ColumnType year(boolean nullable) {
         return fixed(TypeId.YEAR, 0, 0, false, nullable);
     }
 
-    /** 创建 1..64 位定长 bit string；length 表示 bit 数而非编码 byte 数。 */
+    /** 创建 1..64 位定长 bit string；length 表示 bit 数而非编码 byte 数。
+     *
+     * @param bitWidth 参与 {@code bit} 的原始数值身份 {@code bitWidth}；必须非负，零值仅用于对应格式明确声明的系统或空身份
+     * @param nullable 列或表达式是否允许 SQL NULL；{@code true} 允许写入 NULL，{@code false} 时绑定或编码阶段必须拒绝 NULL
+     * @return {@code bit} 解析或选择出的已知领域类型；成功时不为 {@code null}，未知编码或非法状态通过领域异常报告
+     */
     public static ColumnType bit(int bitWidth, boolean nullable) {
         return fixed(TypeId.BIT, bitWidth, 0, false, nullable);
     }
 
-    /** 创建声明顺序固定的 ENUM；逻辑值使用 1-based ordinal。 */
+    /** 创建声明顺序固定的 ENUM；逻辑值使用 1-based ordinal。
+     *
+     * @param symbols 参与 {@code enumType} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @param nullable 列或表达式是否允许 SQL NULL；{@code true} 允许写入 NULL，{@code false} 时绑定或编码阶段必须拒绝 NULL
+     * @return {@code enumType} 解析或选择出的已知领域类型；成功时不为 {@code null}，未知编码或非法状态通过领域异常报告
+     */
     public static ColumnType enumType(List<String> symbols, boolean nullable) {
         int count = symbols == null ? 0 : symbols.size();
         return new ColumnType(TypeId.ENUM, nullable, count, 0, false,
                 CharsetId.UTF8, CollationId.BINARY, StorageKind.FIXED, symbols);
     }
 
-    /** 创建最多 64 个 member 的 SET；逻辑值使用 ordinal 对应 bit 的 bitmap。 */
+    /** 创建最多 64 个 member 的 SET；逻辑值使用 ordinal 对应 bit 的 bitmap。
+     *
+     * @param symbols 参与 {@code setType} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @param nullable 列或表达式是否允许 SQL NULL；{@code true} 允许写入 NULL，{@code false} 时绑定或编码阶段必须拒绝 NULL
+     * @return {@code setType} 解析或选择出的已知领域类型；成功时不为 {@code null}，未知编码或非法状态通过领域异常报告
+     */
     public static ColumnType setType(List<String> symbols, boolean nullable) {
         int count = symbols == null ? 0 : symbols.size();
         return new ColumnType(TypeId.SET, nullable, count, 0, false,
                 CharsetId.UTF8, CollationId.BINARY, StorageKind.FIXED, symbols);
     }
 
+    /**
+     * 根据调用参数创建或转换 {@code varchar} 返回的 {@code ColumnType}；输入先完成领域校验，成功结果不为 {@code null}。
+     *
+     * @param nBytes 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @param nullable 列或表达式是否允许 SQL NULL；{@code true} 允许写入 NULL，{@code false} 时绑定或编码阶段必须拒绝 NULL
+     * @return {@code varchar} 解析或选择出的已知领域类型；成功时不为 {@code null}，未知编码或非法状态通过领域异常报告
+     */
     public static ColumnType varchar(int nBytes, boolean nullable) {
         return varchar(nBytes, nullable, CharsetId.UTF8, CollationId.BINARY);
     }
 
     /**
      * 创建显式字符集与排序规则的 VARCHAR；长度继续按编码后最大字节数解释，不按字符数解释。
+     *
+     * @param nBytes 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @param nullable 列或表达式是否允许 SQL NULL；{@code true} 允许写入 NULL，{@code false} 时绑定或编码阶段必须拒绝 NULL
+     * @param charset 参与 {@code varchar} 的稳定领域标识 {@code CharsetId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param collation 参与 {@code varchar} 的稳定领域标识 {@code CollationId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @return {@code varchar} 解析或选择出的已知领域类型；成功时不为 {@code null}，未知编码或非法状态通过领域异常报告
      */
     public static ColumnType varchar(int nBytes, boolean nullable, CharsetId charset, CollationId collation) {
         return new ColumnType(TypeId.VARCHAR, nullable, nBytes, 0, false, charset, collation,
                 StorageKind.VARIABLE, List.of());
     }
 
+    /**
+     * 根据调用参数创建或转换 {@code varbinary} 返回的 {@code ColumnType}；输入先完成领域校验，成功结果不为 {@code null}。
+     *
+     * @param nBytes 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @param nullable 列或表达式是否允许 SQL NULL；{@code true} 允许写入 NULL，{@code false} 时绑定或编码阶段必须拒绝 NULL
+     * @return {@code varbinary} 解析或选择出的已知领域类型；成功时不为 {@code null}，未知编码或非法状态通过领域异常报告
+     */
     public static ColumnType varbinary(int nBytes, boolean nullable) {
         return new ColumnType(TypeId.VARBINARY, nullable, nBytes, 0, false, CharsetId.UTF8, CollationId.BINARY,
                 StorageKind.VARIABLE, List.of());
     }
 
-    /** 创建 UTF-8/BINARY TINYTEXT（最大 255B）。 */
+    /** 创建 UTF-8/BINARY TINYTEXT（最大 255B）。
+     *
+     * @param nullable 列或表达式是否允许 SQL NULL；{@code true} 允许写入 NULL，{@code false} 时绑定或编码阶段必须拒绝 NULL
+     * @return {@code tinyText} 解析或选择出的已知领域类型；成功时不为 {@code null}，未知编码或非法状态通过领域异常报告
+     */
     public static ColumnType tinyText(boolean nullable) {
         return textType(TypeId.TINYTEXT, 255, nullable, CharsetId.UTF8, CollationId.BINARY);
     }
 
-    /** 创建 UTF-8/BINARY TEXT（最大 65535B）。 */
+    /** 创建 UTF-8/BINARY TEXT（最大 65535B）。
+     *
+     * @param nullable 列或表达式是否允许 SQL NULL；{@code true} 允许写入 NULL，{@code false} 时绑定或编码阶段必须拒绝 NULL
+     * @return {@code text} 解析或选择出的已知领域类型；成功时不为 {@code null}，未知编码或非法状态通过领域异常报告
+     */
     public static ColumnType text(boolean nullable) {
         return textType(TypeId.TEXT, 65_535, nullable, CharsetId.UTF8, CollationId.BINARY);
     }
 
-    /** 创建显式字符语义的 TEXT。 */
+    /** 创建显式字符语义的 TEXT。
+     *
+     * @param nullable 列或表达式是否允许 SQL NULL；{@code true} 允许写入 NULL，{@code false} 时绑定或编码阶段必须拒绝 NULL
+     * @param charset 参与 {@code text} 的稳定领域标识 {@code CharsetId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param collation 参与 {@code text} 的稳定领域标识 {@code CollationId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @return {@code text} 解析或选择出的已知领域类型；成功时不为 {@code null}，未知编码或非法状态通过领域异常报告
+     */
     public static ColumnType text(boolean nullable, CharsetId charset, CollationId collation) {
         return textType(TypeId.TEXT, 65_535, nullable, charset, collation);
     }
 
-    /** 创建 UTF-8/BINARY MEDIUMTEXT（最大 16777215B）。 */
+    /** 创建 UTF-8/BINARY MEDIUMTEXT（最大 16777215B）。
+     *
+     * @param nullable 列或表达式是否允许 SQL NULL；{@code true} 允许写入 NULL，{@code false} 时绑定或编码阶段必须拒绝 NULL
+     * @return {@code mediumText} 解析或选择出的已知领域类型；成功时不为 {@code null}，未知编码或非法状态通过领域异常报告
+     */
     public static ColumnType mediumText(boolean nullable) {
         return textType(TypeId.MEDIUMTEXT, 16_777_215, nullable, CharsetId.UTF8, CollationId.BINARY);
     }
 
-    /** 创建 UTF-8/BINARY LONGTEXT；Java 数组边界使 v1 封顶 Integer.MAX_VALUE。 */
+    /** 创建 UTF-8/BINARY LONGTEXT；Java 数组边界使 v1 封顶 Integer.MAX_VALUE。
+     *
+     * @param nullable 列或表达式是否允许 SQL NULL；{@code true} 允许写入 NULL，{@code false} 时绑定或编码阶段必须拒绝 NULL
+     * @return {@code longText} 解析或选择出的已知领域类型；成功时不为 {@code null}，未知编码或非法状态通过领域异常报告
+     */
     public static ColumnType longText(boolean nullable) {
         return textType(TypeId.LONGTEXT, Integer.MAX_VALUE, nullable, CharsetId.UTF8, CollationId.BINARY);
     }
 
-    /** 创建 TINYBLOB（最大 255B）。 */
+    /** 创建 TINYBLOB（最大 255B）。
+     *
+     * @param nullable 列或表达式是否允许 SQL NULL；{@code true} 允许写入 NULL，{@code false} 时绑定或编码阶段必须拒绝 NULL
+     * @return {@code tinyBlob} 解析或选择出的已知领域类型；成功时不为 {@code null}，未知编码或非法状态通过领域异常报告
+     */
     public static ColumnType tinyBlob(boolean nullable) {
         return binaryLob(TypeId.TINYBLOB, 255, nullable);
     }
 
-    /** 创建 BLOB（最大 65535B）。 */
+    /** 创建 BLOB（最大 65535B）。
+     *
+     * @param nullable 列或表达式是否允许 SQL NULL；{@code true} 允许写入 NULL，{@code false} 时绑定或编码阶段必须拒绝 NULL
+     * @return {@code blob} 解析或选择出的已知领域类型；成功时不为 {@code null}，未知编码或非法状态通过领域异常报告
+     */
     public static ColumnType blob(boolean nullable) {
         return binaryLob(TypeId.BLOB, 65_535, nullable);
     }
 
-    /** 创建 MEDIUMBLOB（最大 16777215B）。 */
+    /** 创建 MEDIUMBLOB（最大 16777215B）。
+     *
+     * @param nullable 列或表达式是否允许 SQL NULL；{@code true} 允许写入 NULL，{@code false} 时绑定或编码阶段必须拒绝 NULL
+     * @return {@code mediumBlob} 解析或选择出的已知领域类型；成功时不为 {@code null}，未知编码或非法状态通过领域异常报告
+     */
     public static ColumnType mediumBlob(boolean nullable) {
         return binaryLob(TypeId.MEDIUMBLOB, 16_777_215, nullable);
     }
 
-    /** 创建 LONGBLOB；Java 数组边界使 v1 封顶 Integer.MAX_VALUE。 */
+    /** 创建 LONGBLOB；Java 数组边界使 v1 封顶 Integer.MAX_VALUE。
+     *
+     * @param nullable 列或表达式是否允许 SQL NULL；{@code true} 允许写入 NULL，{@code false} 时绑定或编码阶段必须拒绝 NULL
+     * @return {@code longBlob} 解析或选择出的已知领域类型；成功时不为 {@code null}，未知编码或非法状态通过领域异常报告
+     */
     public static ColumnType longBlob(boolean nullable) {
         return binaryLob(TypeId.LONGBLOB, Integer.MAX_VALUE, nullable);
     }
 
-    /** 创建 v1 JSON：严格 UTF-8 文本、不可进入核心索引比较。 */
+    /** 创建 v1 JSON：严格 UTF-8 文本、不可进入核心索引比较。
+     *
+     * @param nullable 列或表达式是否允许 SQL NULL；{@code true} 允许写入 NULL，{@code false} 时绑定或编码阶段必须拒绝 NULL
+     * @return {@code json} 解析或选择出的已知领域类型；成功时不为 {@code null}，未知编码或非法状态通过领域异常报告
+     */
     public static ColumnType json(boolean nullable) {
         return textType(TypeId.JSON, Integer.MAX_VALUE, nullable, CharsetId.UTF8, CollationId.BINARY);
     }

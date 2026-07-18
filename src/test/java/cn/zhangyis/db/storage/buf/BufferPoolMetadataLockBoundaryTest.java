@@ -35,6 +35,9 @@ class BufferPoolMetadataLockBoundaryTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code latchSetRejectsIoWhileMetadataLocked} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void latchSetRejectsIoWhileMetadataLocked() {
         BufferPoolInstanceLatchSet latchSet = new BufferPoolInstanceLatchSet();
@@ -47,6 +50,11 @@ class BufferPoolMetadataLockBoundaryTest {
         }
     }
 
+    /**
+     * 验证 {@code metadataLockReleasedBeforePhysicalRead} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void metadataLockReleasedBeforePhysicalRead() throws Exception {
         PageId p0 = page(0);
@@ -74,6 +82,11 @@ class BufferPoolMetadataLockBoundaryTest {
         }
     }
 
+    /**
+     * 验证 {@code metadataLockReleasedBeforeLoadingWait} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void metadataLockReleasedBeforeLoadingWait() throws Exception {
         PageId loading = page(0);
@@ -114,6 +127,11 @@ class BufferPoolMetadataLockBoundaryTest {
         }
     }
 
+    /**
+     * 验证 {@code metadataLockReleasedBeforeDirtyVictimFlush} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void metadataLockReleasedBeforeDirtyVictimFlush() throws Exception {
         PageId dirty = page(0);

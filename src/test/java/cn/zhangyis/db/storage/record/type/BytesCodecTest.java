@@ -28,6 +28,9 @@ class BytesCodecTest {
         return c.decode(new FieldSlice(b, 0, b.length), t);
     }
 
+    /**
+     * 验证 {@code charPadsAndStripsTrailingSpaces} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void charPadsAndStripsTrailingSpaces() {
         FixedBytesCodec c = new FixedBytesCodec(5, (byte) 0x20, true);
@@ -36,6 +39,9 @@ class BytesCodecTest {
         assertEquals("ab", ((ColumnValue.StringValue) dec(c, CHAR5, e)).value());
     }
 
+    /**
+     * 验证 {@code charRejectsTooLong} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void charRejectsTooLong() {
         FixedBytesCodec c = new FixedBytesCodec(5, (byte) 0x20, true);
@@ -43,6 +49,9 @@ class BytesCodecTest {
                 () -> c.validate(new ColumnValue.StringValue("abcdef"), CHAR5));
     }
 
+    /**
+     * 验证 {@code binaryZeroPadsAndKeeps} 所描述的返回值或状态会按契约保留，并断言原始信息与领域不变量未丢失。
+     */
     @Test
     void binaryZeroPadsAndKeeps() {
         FixedBytesCodec c = new FixedBytesCodec(4, (byte) 0x00, false);
@@ -51,6 +60,9 @@ class BytesCodecTest {
         assertArrayEquals(new byte[] {1, 2, 0, 0}, ((ColumnValue.BinaryValue) dec(c, BIN4, e)).value());
     }
 
+    /**
+     * 验证 {@code varcharRoundTripEmptyAndValue} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void varcharRoundTripEmptyAndValue() {
         VarBytesCodec c = new VarBytesCodec(10, true);
@@ -61,6 +73,9 @@ class BytesCodecTest {
         assertEquals("hello", ((ColumnValue.StringValue) dec(c, VC10, hello)).value());
     }
 
+    /**
+     * 验证 {@code varRejectsTooLong} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void varRejectsTooLong() {
         VarBytesCodec c = new VarBytesCodec(10, false);
@@ -68,6 +83,9 @@ class BytesCodecTest {
                 () -> c.validate(new ColumnValue.BinaryValue(new byte[11]), VB10));
     }
 
+    /**
+     * 验证 {@code byteOrderCompare} 所描述的值对象语义，并断言相等性、哈希、排序及非法构造边界一致。
+     */
     @Test
     void byteOrderCompare() {
         VarBytesCodec c = new VarBytesCodec(10, true);
@@ -78,6 +96,9 @@ class BytesCodecTest {
         assertTrue(c.compare(new FieldSlice(ab, 0, ab.length), new FieldSlice(abc, 0, abc.length), VC10) < 0);
     }
 
+    /**
+     * 验证 {@code varcharUsesDeclaredCharsetAndCollation} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void varcharUsesDeclaredCharsetAndCollation() {
         TypeCodecRegistry registry = new TypeCodecRegistry();
@@ -93,6 +114,9 @@ class BytesCodecTest {
                 new FieldSlice(upper, 0, upper.length), new FieldSlice(lower, 0, lower.length), latin1Ci));
     }
 
+    /**
+     * 验证 {@code characterCodecRejectsUnmappableAndMalformedValues} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void characterCodecRejectsUnmappableAndMalformedValues() {
         TypeCodecRegistry registry = new TypeCodecRegistry();

@@ -71,6 +71,9 @@ class MvccReaderTest {
 
     private final TypeCodecRegistry registry = new TypeCodecRegistry();
 
+    /**
+     * 验证 {@code uncommittedInsertIsInvisible} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void uncommittedInsertIsInvisible() {
         onPool(ctx -> {
@@ -86,6 +89,9 @@ class MvccReaderTest {
         });
     }
 
+    /**
+     * 验证 {@code committedRowVisibleThenLaterUpdateNotVisibleUnderRrSnapshot} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void committedRowVisibleThenLaterUpdateNotVisibleUnderRrSnapshot() {
         onPool(ctx -> {
@@ -110,6 +116,9 @@ class MvccReaderTest {
         });
     }
 
+    /**
+     * 验证 {@code selfWriteIsVisible} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void selfWriteIsVisible() {
         onPool(ctx -> {
@@ -122,6 +131,9 @@ class MvccReaderTest {
         });
     }
 
+    /**
+     * 验证 {@code readCommittedSeesNewerCommitOnNextReadView} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void readCommittedSeesNewerCommitOnNextReadView() {
         onPool(ctx -> {
@@ -145,6 +157,9 @@ class MvccReaderTest {
         });
     }
 
+    /**
+     * 验证 {@code multiUpdateChainReadsBackOldestVisibleVersion} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void multiUpdateChainReadsBackOldestVisibleVersion() {
         onPool(ctx -> {
@@ -172,6 +187,9 @@ class MvccReaderTest {
 
     // ---- T1.3f：delete-mark 可见性 + 版本链所有权校验 + MTR 异常清理 ----
 
+    /**
+     * 验证 {@code committedDeleteVisibleToNewReadViewShowsGone} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void committedDeleteVisibleToNewReadViewShowsGone() {
         onPool(ctx -> {
@@ -191,6 +209,9 @@ class MvccReaderTest {
         });
     }
 
+    /**
+     * 验证 {@code oldReadViewSeesPreDeleteVersion} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void oldReadViewSeesPreDeleteVersion() {
         onPool(ctx -> {
@@ -211,6 +232,9 @@ class MvccReaderTest {
         });
     }
 
+    /**
+     * 验证 {@code selfDeleteVisibleAsGone} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void selfDeleteVisibleAsGone() {
         onPool(ctx -> {
@@ -224,6 +248,9 @@ class MvccReaderTest {
         });
     }
 
+    /**
+     * 验证 {@code ownerMismatchInVersionChainThrows} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void ownerMismatchInVersionChainThrows() {
         onPool(ctx -> {
@@ -243,6 +270,9 @@ class MvccReaderTest {
         });
     }
 
+    /**
+     * 验证 {@code mtrReusableAfterReadException} 所描述的 B+Tree 定位或结构变化，并断言键序、父子链接、页资源和唯一性不变量。
+     */
     @Test
     void mtrReusableAfterReadException() {
         onPool(ctx -> {
@@ -266,6 +296,11 @@ class MvccReaderTest {
 
     // ---- 并发：reader（自有 MTR 管理器）与 writer 并行，验证读路径 latch 纪律不与写路径(undo→index)死锁 ----
 
+    /**
+     * 验证 {@code concurrentReaderAndCommittedWriterNoDeadlock} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     *
+     * @throws InterruptedException 等待被中断时抛出；调用方应恢复中断标志并终止当前资源获取流程
+     */
     @Test
     void concurrentReaderAndCommittedWriterNoDeadlock() throws InterruptedException {
         PageStore store = new FileChannelPageStore();
@@ -329,6 +364,9 @@ class MvccReaderTest {
 
     // ---- 损坏/边界快速失败（更底层的 undo 指针损坏由 UndoLogSegmentTest.readRecordByRollPointer* 覆盖） ----
 
+    /**
+     * 验证 {@code nonClusteredIndexRejected} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void nonClusteredIndexRejected() {
         onPool(ctx -> {
@@ -345,6 +383,9 @@ class MvccReaderTest {
         });
     }
 
+    /**
+     * 验证 {@code versionChainExceedingMaxHopsFailsFast} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void versionChainExceedingMaxHopsFailsFast() {
         onPool(ctx -> {

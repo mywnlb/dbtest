@@ -14,6 +14,12 @@ public final class EncodedKeyPartComparator {
     /** 类型与字符策略入口；只读且由上层比较器共享。 */
     private final TypeCodecRegistry registry;
 
+    /**
+     * 创建 {@code EncodedKeyPartComparator}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param registry 由组合根提供的 {@code TypeCodecRegistry} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public EncodedKeyPartComparator(TypeCodecRegistry registry) {
         if (registry == null) {
             throw new DatabaseValidationException("type codec registry must not be null");
@@ -35,6 +41,7 @@ public final class EncodedKeyPartComparator {
      * @param type key part 列类型。
      * @param part key part 的列、方向与 byte-prefix 定义。
      * @return 仅为 -1、0、1 的索引序比较结果。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public int compare(boolean leftNull, FieldSlice left, boolean rightNull, FieldSlice right,
                        ColumnType type, KeyPartDef part) {

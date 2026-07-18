@@ -202,7 +202,10 @@ class DefaultSqlStorageGatewayTest {
         }
     }
 
-    /** statement 的绝对 deadline 必须截断 gateway 自己更长的 handle wait，不能在前序阶段耗时后重新计时。 */
+    /** statement 的绝对 deadline 必须截断 gateway 自己更长的 handle wait，不能在前序阶段耗时后重新计时。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void statementDeadlineCapsTransactionHandleWait() throws Exception {
         try (DatabaseEngine database = openDatabase();

@@ -28,6 +28,9 @@ class IndexPageHeaderTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code roundTripThroughGuard} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void roundTripThroughGuard() {
         PageStore store = new FileChannelPageStore();
@@ -42,6 +45,9 @@ class IndexPageHeaderTest {
         }
     }
 
+    /**
+     * 验证 {@code constructorRejectsInvalidFields} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void constructorRejectsInvalidFields() {
         assertThrows(DatabaseValidationException.class, () -> header(0x10000, 98, 2)); // nDirSlots u16

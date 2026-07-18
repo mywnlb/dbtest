@@ -9,7 +9,10 @@ import java.util.Optional;
 @FunctionalInterface
 public interface TransactionRecoveryCheckpointSource {
 
-    /** 读取最新有效基线；文件缺失/无有效 slot 返回 empty。 */
+    /** 读取最新有效基线；文件缺失/无有效 slot 返回 empty。
+     *
+     * @return {@code readLatest} 按身份或键定位到的对象；未找到、不可见或尚未持久化时为空 {@code Optional}，从不返回 Java {@code null}
+     */
     Optional<TransactionRecoveryCheckpoint> readLatest();
 
     /** 表达文件不存在的只读 source；不执行任何文件系统写入。 */

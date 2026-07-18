@@ -199,6 +199,9 @@ public final class TableDmlService {
     /**
      * 在同一次 FOR_UPDATE current-read 物化的旧行上应用列 patch。未赋值列直接复制锁定版本，
      * 因而 external LOB 引用不会被 gateway hydrate 后重写，且读取与更新之间不存在竞态窗口。
+     *
+     * @param command 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @return {@code update} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
      */
     public DmlWriteResult update(TableUpdatePatchCommand command) {
         requireActive(command == null ? null : command.transaction());
@@ -213,6 +216,27 @@ public final class TableDmlService {
         }, command.lobSegment(), command.lockWaitTimeout());
     }
 
+    /**
+     * 校验输入与当前状态后修改存储引擎稳定 API领域数据；成功发布完整结果，异常路径保留既有持久化与并发不变量。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取并校验调用参数与当前领域状态，确保失败发生在本方法创建共享或持久副作用之前。</li>
+     *     <li>按类级并发协议取得本阶段所需协作者与 Guard，竞争后重新校验资源身份和生命周期。</li>
+     *     <li>执行核心状态转换或数据变换，并只通过本包稳定协作者发布可观察副作用。</li>
+     *     <li>汇总稳定结果并沿现有 finally/Guard 释放资源；异常不得伪造成功或清除未完成状态。</li>
+     * </ol>
+     *
+     * @param txn 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
+     * @param metadata 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @param clusterKey 参与 {@code updateInternal} 的稳定领域标识 {@code SearchKey}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param rowFactory 参与记录编解码或索引比较的字段值；不得为 {@code null}，其类型、字节边界和 SQL NULL 语义必须与当前 schema 一致
+     * @param lobSegment 可选的 {@code lobSegment}；参数本身不得为 {@code null}，空 {@code Optional} 明确表示调用方未提供该领域值
+     * @param lockWaitTimeout 本次等待或操作的最大时长；不得为 {@code null} 且必须为正，超时不得留下未释放资源
+     * @return {@code updateInternal} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws DmlDuplicateKeyException 目标身份或唯一键已被占用时抛出；调用方应回滚本次变更或改用其他合法身份
+     */
     private DmlWriteResult updateInternal(Transaction txn, TableIndexMetadata metadata, SearchKey clusterKey,
                                           java.util.function.Function<LogicalRecord, LogicalRecord> rowFactory,
                                           Optional<cn.zhangyis.db.storage.api.SegmentRef> lobSegment,
@@ -378,6 +402,8 @@ public final class TableDmlService {
     /**
      * 安装包内测试故障接缝。调用方必须在单线程、无在途 DML 时设置，并在 finally 中恢复
      * {@link TableDmlProgressFaultInjector#NO_OP}；该入口不属于 storage 公共 API。
+     * @param faultInjector 由当前模块组合根提供的领域协作者；不得为 {@code null}，其状态和生命周期必须覆盖本次调用且不能绕过模块边界
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     void installFaultInjectorForTest(TableDmlProgressFaultInjector faultInjector) {
         if (faultInjector == null) {

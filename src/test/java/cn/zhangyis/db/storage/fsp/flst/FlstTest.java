@@ -55,6 +55,9 @@ class FlstTest {
         }
     }
 
+    /**
+     * 验证 {@code addLastBuildsInsertionOrder} 所描述的字典/DDL 协作，并断言版本、对象身份、缓存失效和物理绑定保持一致。
+     */
     @Test
     void addLastBuildsInsertionOrder() {
         withFlst((flst, mtr) -> {
@@ -72,6 +75,9 @@ class FlstTest {
         });
     }
 
+    /**
+     * 验证 {@code addFirstBuildsReverseOrder} 对应的表空间、区与段分配行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void addFirstBuildsReverseOrder() {
         withFlst((flst, mtr) -> {
@@ -84,6 +90,9 @@ class FlstTest {
         });
     }
 
+    /**
+     * 验证 {@code removeHeadMiddleTailMaintainsLinks} 所描述的字典/DDL 协作，并断言版本、对象身份、缓存失效和物理绑定保持一致。
+     */
     @Test
     void removeHeadMiddleTailMaintainsLinks() {
         withFlst((flst, mtr) -> {
@@ -109,6 +118,9 @@ class FlstTest {
         });
     }
 
+    /**
+     * 验证 {@code crossPageAddRemoveRespectsLockOrder} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void crossPageAddRemoveRespectsLockOrder() {
         // base 在 page4、node 在 page3：np(3) < bp(4)，Flst 应先取 page3 再取 page4（升序），不死锁、不残留阻塞线程。
@@ -127,6 +139,9 @@ class FlstTest {
         });
     }
 
+    /**
+     * 验证 {@code rejectsNullAndEmptyRemove} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void rejectsNullAndEmptyRemove() {
         withFlst((flst, mtr) -> {

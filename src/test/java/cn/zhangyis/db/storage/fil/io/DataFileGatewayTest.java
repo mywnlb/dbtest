@@ -19,6 +19,12 @@ class DataFileGatewayTest {
 
     private static final PageSize PS = PageSize.ofBytes(16 * 1024);
 
+    /**
+     * 验证 {@code zeroFillGatewayWritesFullPageRange} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     *
+     * @param tempDir 受控目录内的规范化文件路径；不得为 {@code null}，也不得逃逸所属表空间或日志目录
+     * @throws IOException 底层文件读写失败时抛出；调用方不得据此发布持久化成功状态
+     */
     @Test
     void zeroFillGatewayWritesFullPageRange(@TempDir Path tempDir) throws IOException {
         Path file = tempDir.resolve("space.ibd");
@@ -38,6 +44,12 @@ class DataFileGatewayTest {
         }
     }
 
+    /**
+     * 验证 {@code preallocatingGatewayCallsStrategyBeforeZeroFillAndKeepsPagesZero} 所描述的返回值或状态会按契约保留，并断言原始信息与领域不变量未丢失。
+     *
+     * @param tempDir 受控目录内的规范化文件路径；不得为 {@code null}，也不得逃逸所属表空间或日志目录
+     * @throws IOException 底层文件读写失败时抛出；调用方不得据此发布持久化成功状态
+     */
     @Test
     void preallocatingGatewayCallsStrategyBeforeZeroFillAndKeepsPagesZero(@TempDir Path tempDir) throws IOException {
         Path file = tempDir.resolve("preallocated.ibd");

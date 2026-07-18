@@ -30,7 +30,11 @@ public final class EmptyUndoBoundary {
         CLOSED
     }
 
-    /** 仅同包 {@link RollbackService} 可以铸造令牌。 */
+    /** 仅同包 {@link RollbackService} 可以铸造令牌。
+     * @param owner 由组合根提供的 {@code RollbackService} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param transaction 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     EmptyUndoBoundary(RollbackService owner, Transaction transaction) {
         if (owner == null || transaction == null) {
             throw new DatabaseValidationException("empty undo boundary owner/transaction must not be null");
@@ -39,7 +43,13 @@ public final class EmptyUndoBoundary {
         this.transaction = transaction;
     }
 
-    /** 校验 service、事务归属与一次性 OPEN 状态，任何状态修改前都必须调用。 */
+    /** 校验 service、事务归属与一次性 OPEN 状态，任何状态修改前都必须调用。
+     *
+     * @param expectedOwner 由组合根提供的 {@code RollbackService} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code requireOpen} 调用
+     * @param expectedTransaction 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws TransactionStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
+     */
     void requireOpen(RollbackService expectedOwner, Transaction expectedTransaction) {
         if (owner != expectedOwner || transaction != expectedTransaction) {
             throw new DatabaseValidationException("empty undo boundary belongs to a different service or transaction");

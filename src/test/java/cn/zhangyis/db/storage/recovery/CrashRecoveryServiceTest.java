@@ -84,6 +84,9 @@ class CrashRecoveryServiceTest {
         }
     }
 
+    /**
+     * 验证 {@code recoverRepairsDoublewriteBeforeCheckpointAwareRedoReplay} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void recoverRepairsDoublewriteBeforeCheckpointAwareRedoReplay() {
         Path redoPath = dir.resolve("redo.log");
@@ -136,6 +139,9 @@ class CrashRecoveryServiceTest {
         }
     }
 
+    /**
+     * 验证 {@code recoverReportsDetectOnlyPagesSeparatelyFromRepairedPages} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void recoverReportsDetectOnlyPagesSeparatelyFromRepairedPages() {
         Path redoPath = dir.resolve("detect-only-redo.log");
@@ -164,6 +170,11 @@ class CrashRecoveryServiceTest {
         }
     }
 
+    /**
+     * 验证 {@code recoverRecordsProgressForNormalStages} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void recoverRecordsProgressForNormalStages() throws Exception {
         Path redoPath = dir.resolve("progress-redo.log");
@@ -206,6 +217,9 @@ class CrashRecoveryServiceTest {
         }
     }
 
+    /**
+     * 验证 {@code readOnlyValidateReportsRecoverableDoublewriteCopyWithoutRepairingDataPage} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void readOnlyValidateReportsRecoverableDoublewriteCopyWithoutRepairingDataPage() {
         Path redoPath = dir.resolve("readonly-dw-redo.log");
@@ -251,6 +265,9 @@ class CrashRecoveryServiceTest {
         }
     }
 
+    /**
+     * 验证 {@code readOnlyValidateScansRedoWithoutApplyingPageChanges} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void readOnlyValidateScansRedoWithoutApplyingPageChanges() {
         Path redoPath = dir.resolve("readonly-redo.log");
@@ -284,6 +301,9 @@ class CrashRecoveryServiceTest {
         }
     }
 
+    /**
+     * 验证 {@code recoveryGateCanEnterReadOnlyDiagnosticAfterFailure} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void recoveryGateCanEnterReadOnlyDiagnosticAfterFailure() {
         RecoveryTrafficGate gate = new RecoveryTrafficGate();
@@ -296,6 +316,11 @@ class CrashRecoveryServiceTest {
                 "read-only diagnostic is a successful validation state and must clear stale failure");
     }
 
+    /**
+     * 验证 {@code recoverFailsClosedWhenRedoIsCorrupted} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void recoverFailsClosedWhenRedoIsCorrupted() throws Exception {
         try (PageStore store = new FileChannelPageStore();
@@ -324,6 +349,9 @@ class CrashRecoveryServiceTest {
         }
     }
 
+    /**
+     * 验证 {@code recoverFailsClosedWhenCheckpointIsAheadOfRedo} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void recoverFailsClosedWhenCheckpointIsAheadOfRedo() {
         Path redoPath = dir.resolve("ahead-redo.log");

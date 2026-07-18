@@ -28,6 +28,9 @@ class RecordPageHeapTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code allocateAdvancesHeapAndLeavesStructureUntouched} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void allocateAdvancesHeapAndLeavesStructureUntouched() {
         PageStore store = new FileChannelPageStore();
@@ -57,6 +60,9 @@ class RecordPageHeapTest {
         }
     }
 
+    /**
+     * 验证 {@code rejectsNonPositiveAndOverflow} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void rejectsNonPositiveAndOverflow() {
         PageStore store = new FileChannelPageStore();

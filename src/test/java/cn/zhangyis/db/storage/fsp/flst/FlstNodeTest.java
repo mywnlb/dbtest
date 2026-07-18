@@ -31,12 +31,18 @@ class FlstNodeTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code shouldRejectNullPointers} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void shouldRejectNullPointers() {
         assertThrows(DatabaseValidationException.class, () -> new FlstNode(null, FileAddress.NULL));
         assertThrows(DatabaseValidationException.class, () -> new FlstNode(FileAddress.NULL, null));
     }
 
+    /**
+     * 验证 {@code shouldRoundTripThroughPageGuard} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void shouldRoundTripThroughPageGuard() {
         PageStore store = new FileChannelPageStore();

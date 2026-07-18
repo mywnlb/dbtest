@@ -19,6 +19,12 @@ public final class ReadViewManager {
     /** 全局协调器；原子捕获活跃集合 + 水位、按需为可写事务分配 creator 写 id。 */
     private final TransactionSystem system;
 
+    /**
+     * 创建 {@code ReadViewManager}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param system 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public ReadViewManager(TransactionSystem system) {
         if (system == null) {
             throw new DatabaseValidationException("transaction system must not be null");
@@ -29,6 +35,9 @@ public final class ReadViewManager {
     /**
      * 按隔离级别为 {@code txn} 取一致性读 ReadView。要求 {@code txn} ACTIVE。RR 复用事务级缓存、RC 每次新建、
      * RU/SERIALIZABLE 拒绝。可写事务首次建 ReadView 时由 {@link TransactionSystem#openReadViewSnapshot} 分配 creator 写 id。
+     * @param txn 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
+     * @return {@code openReadView} 创建或观察到的事务/锁状态；成功时不为 {@code null}，owner、可见性与生命周期来自当前会话
+     * @throws TransactionStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
      */
     public ReadView openReadView(Transaction txn) {
         if (txn == null) {
@@ -57,6 +66,8 @@ public final class ReadViewManager {
     /**
      * 释放事务级 ReadView（清 RR 缓存）。幂等，允许 ACTIVE/COMMITTING/ROLLING_BACK——由
      * {@code TransactionManager.commit}/{@code finishRollback} 在移出活跃表后、进入终态前调用。RC 无缓存，调用为 no-op。
+     * @param txn 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
+     * @throws TransactionStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
      */
     public void release(Transaction txn) {
         if (txn == null) {
@@ -76,6 +87,7 @@ public final class ReadViewManager {
      * （评审 #2：RC openReadView 每次新建，不注销会让 purge 边界卡死）。幂等。
      *
      * @param view RC 一致性读快照，不能为 null。
+     * @throws TransactionStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
      */
     public void closeReadView(ReadView view) {
         if (view == null) {

@@ -36,6 +36,10 @@ public final class DictionaryStorageMetadataMapper {
     /**
      * 映射一个精确 DD 版本。ACTIVE 与 recovery 可见的 DROP_PENDING 可映射；DROPPED 或无 binding 必须 fail-closed。
      * 所有逻辑/物理 index 先完整配对，再返回结果，避免半映射对象逃逸。
+     *
+     * @param table 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @return {@code map} 产生的非空集合容器；元素身份与顺序遵循当前模块契约，无元素时返回空集合而非 {@code null}
+     * @throws DictionaryStorageMappingException 字典定义无法完整映射为当前存储 schema 或索引绑定时抛出；调用方不得发布半映射对象，应刷新元数据或回滚 DDL
      */
     public MappedTableStorage map(TableDefinition table) {
         if (table == null) {

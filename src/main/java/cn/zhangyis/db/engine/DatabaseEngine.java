@@ -56,34 +56,90 @@ import java.util.concurrent.locks.ReentrantLock;
 @Slf4j
 public final class DatabaseEngine implements AutoCloseable {
 
+    /**
+     * 类级不可变配置常量；所有实例共享该边界，非法调整会破坏数据库引擎组合根的不变量。
+     */
     private static final SpaceId DICTIONARY_SPACE_ID = SpaceId.of(1);
+    /**
+     * 类级不可变配置常量；所有实例共享该边界，非法调整会破坏数据库引擎组合根的不变量。
+     */
     private static final int FIRST_USER_SPACE_ID = 1024;
+    /**
+     * 类级校验或资源上界；所有实例以该值拒绝超限输入，调整时必须复核容量、等待与格式约束。
+     */
     private static final int DICTIONARY_CACHE_CAPACITY = 256;
 
     /** 只保护组合根 open/close 状态，不参与任何页、MDL 或事务操作。 */
     private final ReentrantLock lifecycleLock = new ReentrantLock();
     /** 序列化可能跨 lifecycle lock 外等待 Session 的 close 尝试；使用有界 tryLock。 */
     private final ReentrantLock closeWorkLock = new ReentrantLock(true);
+    /**
+     * 构造时冻结的 {@code baseConfig} 配置快照；已完成范围和组合校验，运行期策略读取它但不得就地修改。
+     */
     private final EngineConfig baseConfig;
     /** 上层协调器持久 XA 决议端口；默认 unresolved，使未知 PREPARED 启动 fail-closed。 */
     private final PreparedTransactionDecisionProvider preparedDecisionProvider;
     /** 用户语句并发 read / shutdown write gate；不串行不同 Session。 */
     private final EngineSessionExecutionGate sessionExecutionGate;
 
+    /**
+     * 跨线程发布的权威状态或计数；更新只允许通过本类定义的原子状态转换完成。
+     */
     private volatile DatabaseEngineState state = DatabaseEngineState.NEW;
+    /**
+     * 本对象持有的 {@code catalogStore} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private FileInternalCatalogStore catalogStore;
+    /**
+     * 本对象持有的 {@code controlStore} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private DictionaryControlStore controlStore;
+    /**
+     * 本对象持有的 {@code repository} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private PersistentDictionaryRepository repository;
+    /**
+     * 本对象持有的 {@code cache} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private DictionaryObjectCache cache;
+    /**
+     * 本对象持有的 {@code metadataLocks} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private MetadataLockManager metadataLocks;
+    /**
+     * 本对象持有的 {@code storage} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private StorageEngine storage;
+    /**
+     * 本对象持有的 {@code dictionary} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private DataDictionaryService dictionary;
+    /**
+     * 本对象持有的 {@code ddl} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private DictionaryDdlService ddl;
+    /**
+     * 本对象拥有的 {@code sqlMetadataMapper} 受控集合；元素生命周期与外层对象一致，仅由本类方法更新，对外暴露时必须返回副本或不可变视图。
+     */
     private DictionaryStorageMetadataMapper sqlMetadataMapper;
+    /**
+     * 本对象持有的 {@code sqlParser} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private DefaultSqlParser sqlParser;
+    /**
+     * 本对象持有的 {@code sqlBinder} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private DefaultSqlBinder sqlBinder;
+    /**
+     * 本对象持有的 {@code sessions} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private SessionRegistry sessions;
 
+    /**
+     * 创建 {@code DatabaseEngine}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param config 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     */
     public DatabaseEngine(EngineConfig config) {
         this(config, PreparedTransactionDecisionProvider.unresolved());
     }
@@ -115,6 +171,8 @@ public final class DatabaseEngine implements AutoCloseable {
     /**
      * 启动顺序：打开 DD catalog/control → 从 committed binding discovery → StorageEngine recovery → 构造 facade
      * → 续作 DROP_PENDING/清 orphan → 发布 OPEN。任一失败都关闭已创建资源并保持 FAILED。
+     *
+     * @throws DatabaseRuntimeException 可恢复的数据库运行期协作失败时抛出；调用方应依据当前事务状态选择回滚、重试或关闭资源
      */
     public void open() {
         lifecycleLock.lock();
@@ -169,19 +227,28 @@ public final class DatabaseEngine implements AutoCloseable {
         }
     }
 
-    /** 返回强制 MDL+pin 租约语义的 DD 读取 facade。 */
+    /** 返回强制 MDL+pin 租约语义的 DD 读取 facade。
+     *
+     * @return {@code dictionary} 创建的模块协作者；成功时不为 {@code null}，其依赖和生命周期由当前组合根拥有
+     */
     public DataDictionaryService dictionary() {
         requireOpen();
         return dictionary;
     }
 
-    /** 返回逻辑 DD 与物理 tablespace 的统一 DDL 协调器。 */
+    /** 返回逻辑 DD 与物理 tablespace 的统一 DDL 协调器。
+     *
+     * @return {@code ddl} 创建的模块协作者；成功时不为 {@code null}，其依赖和生命周期由当前组合根拥有
+     */
     public DictionaryDdlService ddl() {
         requireOpen();
         return ddl;
     }
 
-    /** 返回已完成 discovery/recovery 的底层存储组合根。 */
+    /** 返回已完成 discovery/recovery 的底层存储组合根。
+     *
+     * @return {@code storage} 创建的模块协作者；成功时不为 {@code null}，其依赖和生命周期由当前组合根拥有
+     */
     public StorageEngine storage() {
         requireOpen();
         return storage;
@@ -190,6 +257,10 @@ public final class DatabaseEngine implements AutoCloseable {
     /**
      * 创建一个进程内 SQL Session。构造、初始 implicit transaction 和 registry publish 都在 lifecycle lock 内，
      * 因而 close 一旦切到 CLOSING，后续 openSession 不可能漏进 close 快照。
+     *
+     * @param options 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @return {@code openSession} 产生的 SQL 语句、绑定或执行对象；成功时不为 {@code null}，并保留当前 schema 版本和会话语义
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public SqlSession openSession(SessionOptions options) {
         if (options == null) throw new DatabaseValidationException("session options must not be null");
@@ -225,6 +296,8 @@ public final class DatabaseEngine implements AutoCloseable {
      *     <li>仅在语句已静默后关闭 StorageEngine 与 DD sidecar，发布 CLOSED；任一 close 异常用 suppressed 聚合。</li>
      * </ol>
      * 若第 1、3、4 步 timeout，保持 CLOSING 且绝不关闭仍可能被执行线程访问的 storage。
+     *
+     * @throws DatabaseRuntimeException 可恢复的数据库运行期协作失败时抛出；调用方应依据当前事务状态选择回滚、重试或关闭资源
      */
     @Override
     public void close() {
@@ -271,10 +344,25 @@ public final class DatabaseEngine implements AutoCloseable {
     /**
      * 用 virtual thread 并发请求 snapshot 中所有 Session close，共享单一 engine deadline。close 异常只聚合，仍等待
      * 其它 Session；超时/中断则取消等待并返回 quiesced=false，禁止下游资源关闭。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验语法/命令、会话状态与元数据身份，构造统一 deadline，纯输入错误在事务或持久副作用前失败。</li>
+     *     <li>按 session、transaction、MDL 与 metadata scope 顺序取得受控资源，并在等待后复核版本与状态。</li>
+     *     <li>调用 binder、executor、字典或 storage 稳定接口完成领域动作，成功后才发布缓存、事务或结果状态。</li>
+     *     <li>关闭 scope 并返回不可变结果；异常保留 cause/suppressed 图，按 autocommit 或显式事务边界回滚。</li>
+     * </ol>
+     *
+     * @param snapshot 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @param timeout 本次等待或操作的最大时长；不得为 {@code null} 且必须为正，超时不得留下未释放资源
+     * @return {@code closeSessions} 未找到或条件不满足时返回 {@code null}；否则返回满足构造不变量的 {@code SessionCloseResult} 结果
+     * @throws TimeoutException 操作在约定时限内无法完成时抛出；调用方可回滚或稍后重试
      */
     private static SessionCloseResult closeSessions(List<SqlSession> snapshot, java.time.Duration timeout) {
+        // 1、校验语法/命令、会话状态与元数据身份，在共享或持久副作用前拒绝非法状态。
         if (snapshot.isEmpty()) return new SessionCloseResult(true, null);
         ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+        // 2、继续完成范围、身份与候选校验；通过后，按 session、transaction、MDL 与 metadata scope 顺序取得受控资源，保持处理顺序与资源边界。
         List<Future<RuntimeException>> futures = new ArrayList<>(snapshot.size());
         for (SqlSession session : snapshot) {
             futures.add(executor.submit(() -> {
@@ -283,6 +371,7 @@ public final class DatabaseEngine implements AutoCloseable {
             }));
         }
         long deadline = deadline(timeout);
+        // 3、在中间分支复核阶段性结果；满足条件后，调用 binder、executor、字典或 storage 稳定接口完成领域动作，并维持领域不变量。
         RuntimeException failure = null;
         boolean quiesced = true;
         try {
@@ -309,10 +398,26 @@ public final class DatabaseEngine implements AutoCloseable {
             if (!quiesced) for (Future<RuntimeException> future : futures) future.cancel(true);
             executor.shutdownNow();
         }
+        // 4、关闭 scope 并返回不可变结果，以稳定返回或领域异常完成收口。
         return new SessionCloseResult(quiesced, failure);
     }
 
+    /**
+     * 释放本方法拥有的数据库引擎组合根资源；遵守既定释放顺序，重复或失败调用不得掩盖原始状态。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验语法/命令、会话状态与元数据身份，构造统一 deadline，纯输入错误在事务或持久副作用前失败。</li>
+     *     <li>按 session、transaction、MDL 与 metadata scope 顺序取得受控资源，并在等待后复核版本与状态。</li>
+     *     <li>调用 binder、executor、字典或 storage 稳定接口完成领域动作，成功后才发布缓存、事务或结果状态。</li>
+     *     <li>关闭 scope 并返回不可变结果；异常保留 cause/suppressed 图，按 autocommit 或显式事务边界回滚。</li>
+     * </ol>
+     *
+     * @param primary 需要分类或包装的原始失败；不得为 {@code null}，包装时必须保留 cause 与 suppressed 异常图
+     * @return {@code closeResources} 分类或包装后的领域异常；成功时不为 {@code null}，原始 cause 与 suppressed 异常关系保持不变
+     */
     private RuntimeException closeResources(RuntimeException primary) {
+        // 1、校验语法/命令、会话状态与元数据身份，在共享或持久副作用前拒绝非法状态。
         RuntimeException failure = primary;
         if (storage != null) {
             try {
@@ -322,20 +427,25 @@ public final class DatabaseEngine implements AutoCloseable {
             }
         }
         storage = null;
+        // 2、继续完成范围、身份与候选校验；通过后，按 session、transaction、MDL 与 metadata scope 顺序取得受控资源，保持处理顺序与资源边界。
         sqlMetadataMapper = null;
         sqlParser = null;
         sqlBinder = null;
         sessions = null;
+        // 3、在中间分支复核阶段性结果；满足条件后，调用 binder、executor、字典或 storage 稳定接口完成领域动作，并维持领域不变量。
         failure = closeOne(controlStore, failure);
         controlStore = null;
         failure = closeOne(catalogStore, failure);
         catalogStore = null;
+        // 4、关闭 scope 并返回不可变结果，以稳定返回或领域异常完成收口。
         return failure;
     }
 
     /**
      * 任一 Session 观察到 DatabaseFatalException 时立即关闭新 Session/statement 准入。这里只发布状态并记录根因，
      * 不在活动 execute 线程中递归 close/flush；调用方随后显式 close，由 statement gate 先完成 quiescence。
+     *
+     * @param failure 需要分类或包装的原始失败；不得为 {@code null}，包装时必须保留 cause 与 suppressed 异常图
      */
     private void failClosed(cn.zhangyis.db.common.exception.DatabaseFatalException failure) {
         lifecycleLock.lock();
@@ -349,6 +459,13 @@ public final class DatabaseEngine implements AutoCloseable {
         }
     }
 
+    /**
+     * 根据调用参数创建或转换 {@code closeOne} 返回的 {@code RuntimeException}；输入先完成领域校验，成功结果不为 {@code null}。
+     *
+     * @param resource 调用方打开的定位 IO 或编码写入对象；不得为 {@code null}，方法不接管所有权，失败时仍由创建方关闭
+     * @param failure 需要分类或包装的原始失败；不得为 {@code null}，包装时必须保留 cause 与 suppressed 异常图
+     * @return {@code closeOne} 分类或包装后的领域异常；成功时不为 {@code null}，原始 cause 与 suppressed 异常关系保持不变
+     */
     private static RuntimeException closeOne(AutoCloseable resource, RuntimeException failure) {
         if (resource == null) {
             return failure;
@@ -378,6 +495,12 @@ public final class DatabaseEngine implements AutoCloseable {
         catch (ArithmeticException overflow) { return Long.MAX_VALUE; }
     }
 
+    /**
+     * 封装数据库引擎组合根中 {@code SessionCloseResult} 的槽位、预留或阶段结果；组件在创建时交叉校验，使恢复和释放路径能区分已完成与剩余工作。
+     *
+     * @param quiesced 资源是否处于删除、空闲、静默、持久化或终态；必须与权威状态机一致，不能由调用方猜测
+     * @param failure 需要分类或包装的原始失败；不得为 {@code null}，包装时必须保留 cause 与 suppressed 异常图
+     */
     private record SessionCloseResult(boolean quiesced, RuntimeException failure) { }
 
     private void ensureBaseDirectory() {

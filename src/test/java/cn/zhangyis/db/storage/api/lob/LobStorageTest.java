@@ -49,6 +49,9 @@ class LobStorageTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code writesReadsAndFreesMultiPageTextChainWithGenericRedo} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void writesReadsAndFreesMultiPageTextChainWithGenericRedo() {
         try (Fixture fixture = new Fixture(dir.resolve("lob.ibd"))) {
@@ -83,6 +86,9 @@ class LobStorageTest {
         }
     }
 
+    /**
+     * 验证 {@code rejectsWrongSegmentPurposeBeforeAllocatingPages} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void rejectsWrongSegmentPurposeBeforeAllocatingPages() {
         try (Fixture fixture = new Fixture(dir.resolve("wrong-purpose.ibd"))) {
@@ -98,6 +104,9 @@ class LobStorageTest {
         }
     }
 
+    /**
+     * 验证 {@code wholeValueCrcDetectsPayloadCorruption} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void wholeValueCrcDetectsPayloadCorruption() {
         try (Fixture fixture = new Fixture(dir.resolve("crc.ibd"))) {
@@ -233,7 +242,10 @@ class LobStorageTest {
         }
     }
 
-    /** guard 只能由创建线程在 ACTIVE MTR 内转移/补偿；终态 MTR 上 close 必须拒绝伪造成功。 */
+    /** guard 只能由创建线程在 ACTIVE MTR 内转移/补偿；终态 MTR 上 close 必须拒绝伪造成功。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void rejectsWrongThreadAndNonActiveMtrCompensation() throws Exception {
         try (Fixture fixture = new Fixture(dir.resolve("guard-owner.ibd"))) {

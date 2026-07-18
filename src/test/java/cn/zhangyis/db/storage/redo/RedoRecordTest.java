@@ -14,6 +14,9 @@ class RedoRecordTest {
 
     private static final PageId PID = PageId.of(SpaceId.of(1), PageNo.of(3));
 
+    /**
+     * 验证 {@code pageBytesRecordDefensivelyCopies} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void pageBytesRecordDefensivelyCopies() {
         byte[] src = {1, 2, 3};
@@ -25,6 +28,9 @@ class RedoRecordTest {
         assertEquals(24, r.byteLength());
     }
 
+    /**
+     * 验证 {@code pageInitRecordLengthMatchesFileEncoding} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void pageInitRecordLengthMatchesFileEncoding() {
         PageInitRecord r = new PageInitRecord(PID, cn.zhangyis.db.storage.page.PageType.INDEX);

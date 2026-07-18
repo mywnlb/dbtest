@@ -40,7 +40,10 @@ class DictionaryControlStoreTest {
         }
     }
 
-    /** 最新槽 torn/corrupt 时读取上一槽，允许产生 ID 空洞但绝不能复用已由上一槽之外证明的编号。 */
+    /** 最新槽 torn/corrupt 时读取上一槽，允许产生 ID 空洞但绝不能复用已由上一槽之外证明的编号。
+     *
+     * @throws IOException 底层文件读写失败时抛出；调用方不得据此发布持久化成功状态
+     */
     @Test
     void fallsBackToPreviousValidSlotWhenNewestSlotIsCorrupted() throws IOException {
         Path path = directory.resolve("mysql.dd.ctrl");

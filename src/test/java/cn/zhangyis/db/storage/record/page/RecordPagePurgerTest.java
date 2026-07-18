@@ -83,6 +83,9 @@ class RecordPagePurgerTest {
         }
     }
 
+    /**
+     * 验证 {@code purgeInteriorRecordUnlinksAndReclaims} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void purgeInteriorRecordUnlinksAndReclaims() {
         onPage((rp, schema) -> {
@@ -105,6 +108,9 @@ class RecordPagePurgerTest {
         });
     }
 
+    /**
+     * 验证 {@code purgedSpaceIsReusedByInsert} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void purgedSpaceIsReusedByInsert() {
         onPage((rp, schema) -> {
@@ -121,6 +127,9 @@ class RecordPagePurgerTest {
         });
     }
 
+    /**
+     * 验证 {@code purgeGroupEndRepointsSlot} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void purgeGroupEndRepointsSlot() {
         onPage((rp, schema) -> {
@@ -156,6 +165,9 @@ class RecordPagePurgerTest {
         });
     }
 
+    /**
+     * 验证 {@code purgeManyKeepsInvariantsAndMerges} 所描述的返回值或状态会按契约保留，并断言原始信息与领域不变量未丢失。
+     */
     @Test
     void purgeManyKeepsInvariantsAndMerges() {
         onPage((rp, schema) -> {
@@ -187,6 +199,9 @@ class RecordPagePurgerTest {
         });
     }
 
+    /**
+     * 验证 {@code rejectsNonDeletedAndSystemRecord} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void rejectsNonDeletedAndSystemRecord() {
         onPage((rp, schema) -> {

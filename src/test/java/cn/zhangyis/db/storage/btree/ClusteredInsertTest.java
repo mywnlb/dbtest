@@ -58,6 +58,9 @@ class ClusteredInsertTest {
 
     private final TypeCodecRegistry registry = new TypeCodecRegistry();
 
+    /**
+     * 验证 {@code clusteredInsertStampsTrxIdAndPassedRollPtr} 对应的B+Tree 索引行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void clusteredInsertStampsTrxIdAndPassedRollPtr() {
         onPool(ctx -> {
@@ -80,6 +83,9 @@ class ClusteredInsertTest {
         });
     }
 
+    /**
+     * 验证 {@code splitPreservesHiddenColumnsAcrossLeavesAndRootHasNoHidden} 所描述的返回值或状态会按契约保留，并断言原始信息与领域不变量未丢失。
+     */
     @Test
     void splitPreservesHiddenColumnsAcrossLeavesAndRootHasNoHidden() {
         onPool(ctx -> {
@@ -121,6 +127,9 @@ class ClusteredInsertTest {
         });
     }
 
+    /**
+     * 验证 {@code rejectsNoneTransactionId} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void rejectsNoneTransactionId() {
         onPool(ctx -> {
@@ -133,6 +142,9 @@ class ClusteredInsertTest {
         });
     }
 
+    /**
+     * 验证 {@code rejectsNonClusteredIndex} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void rejectsNonClusteredIndex() {
         onPool(ctx -> {
@@ -146,6 +158,9 @@ class ClusteredInsertTest {
         });
     }
 
+    /**
+     * 验证 {@code rejectsNullRollPointer} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void rejectsNullRollPointer() {
         onPool(ctx -> {

@@ -28,6 +28,9 @@ class IntegerCodecTest {
         return FieldSlice.compareUnsigned(new FieldSlice(a, 0, a.length), new FieldSlice(b, 0, b.length));
     }
 
+    /**
+     * 验证 {@code signedIntRoundTripAndOrder} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void signedIntRoundTripAndOrder() {
         IntegerCodec c = new IntegerCodec(4, false);
@@ -40,6 +43,9 @@ class IntegerCodecTest {
         assertTrue(cmp(enc(c, INT_S, 1), enc(c, INT_S, Integer.MAX_VALUE)) < 0);
     }
 
+    /**
+     * 验证 {@code unsignedTinyintRoundTripAndOrder} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void unsignedTinyintRoundTripAndOrder() {
         IntegerCodec c = new IntegerCodec(1, true);
@@ -49,6 +55,9 @@ class IntegerCodecTest {
         assertTrue(cmp(enc(c, TINY_U, 127), enc(c, TINY_U, 128)) < 0);
     }
 
+    /**
+     * 验证 {@code bigintRoundTrip} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void bigintRoundTrip() {
         IntegerCodec c = new IntegerCodec(8, false);
@@ -58,6 +67,9 @@ class IntegerCodecTest {
         assertTrue(cmp(enc(c, BIG_S, Long.MIN_VALUE), enc(c, BIG_S, Long.MAX_VALUE)) < 0);
     }
 
+    /**
+     * 验证 {@code rangeChecks} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void rangeChecks() {
         IntegerCodec c4 = new IntegerCodec(4, false);

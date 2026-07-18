@@ -237,10 +237,10 @@ Java 中建议让 `PageHandle` 实现 `AutoCloseable`，但主要释放路径仍
 - `FREE`：frame 不绑定任何 page，位于 free list。
 - `LOADING`：page hash 中有占位或 frame 正在读盘。
 - `CLEAN`：绑定 page，内容与磁盘一致，位于 LRU。
-- `DIRTY_PENDING`：page image 已被持有 X latch 的活跃 MTR 修改，但 redo LSN 尚未分配，不在 flush list 中，不能刷盘。
+- `DIRTY_PENDING`：page image 已被持有 X latch 的活跃 MTR 修改，但 redo LSN 尚未分配，不在 flush list 中，不能刷盘；MTR 发布 pageLSN 后才转为 DIRTY。
 - `DIRTY`：绑定 page，存在未刷盘修改，位于 LRU 和 flush list。
 - `FLUSHING`：dirty page 正在写出，仍可被读；写路径需遵守 page latch 和 flush observer。
-- `EVICTING`：淘汰候选已摘出 LRU，等待最后检查。
+- `EVICTING`：淘汰候选已摘出 LRU/hash，等待最后检查和复用。
 - `STALE`：所属 tablespace 被 drop/truncate/discard，不能再返回给普通读路径。
 
 状态转换只能由 `FrameStateMachine` 执行，避免多个服务直接修改布尔字段造成不一致。

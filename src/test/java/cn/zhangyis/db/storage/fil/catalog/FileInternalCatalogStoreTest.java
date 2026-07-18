@@ -43,7 +43,10 @@ class FileInternalCatalogStoreTest {
         }
     }
 
-    /** data 已落盘但 header generation 未发布模拟 crash tail；重启只能看到旧 committedLength。 */
+    /** data 已落盘但 header generation 未发布模拟 crash tail；重启只能看到旧 committedLength。
+     *
+     * @throws IOException 底层文件读写失败时抛出；调用方不得据此发布持久化成功状态
+     */
     @Test
     void ignoresBytesBeyondDurableCommittedLength() throws IOException {
         Path path = directory.resolve("mysql.ibd");
@@ -62,7 +65,10 @@ class FileInternalCatalogStoreTest {
         }
     }
 
-    /** committedLength 内的 frame CRC 错误不是可忽略尾部，而是已提交字典损坏，必须 fail-closed。 */
+    /** committedLength 内的 frame CRC 错误不是可忽略尾部，而是已提交字典损坏，必须 fail-closed。
+     *
+     * @throws IOException 底层文件读写失败时抛出；调用方不得据此发布持久化成功状态
+     */
     @Test
     void rejectsCorruptionInsideCommittedCatalogRegion() throws IOException {
         Path path = directory.resolve("mysql.ibd");

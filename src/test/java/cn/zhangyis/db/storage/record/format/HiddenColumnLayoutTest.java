@@ -10,11 +10,17 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 /** HiddenColumnLayout：15B 隐藏区 trxId+rollPtr 往返（含非零偏移）。 */
 class HiddenColumnLayoutTest {
 
+    /**
+     * 验证 {@code fifteenBytesWide} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void fifteenBytesWide() {
         assertEquals(15, HiddenColumnLayout.HIDDEN_BYTES);
     }
 
+    /**
+     * 验证 {@code encodeDecodeRoundTripAtOffset} 所描述的稳定格式转换，并断言往返值、字节布局、版本与损坏输入处理。
+     */
     @Test
     void encodeDecodeRoundTripAtOffset() {
         byte[] buf = new byte[5 + HiddenColumnLayout.HIDDEN_BYTES];
@@ -25,6 +31,9 @@ class HiddenColumnLayoutTest {
         assertEquals(rp, HiddenColumnLayout.decodeRollPtr(buf, 5));
     }
 
+    /**
+     * 验证 {@code nullRollPtrRoundTrips} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void nullRollPtrRoundTrips() {
         byte[] buf = new byte[HiddenColumnLayout.HIDDEN_BYTES];

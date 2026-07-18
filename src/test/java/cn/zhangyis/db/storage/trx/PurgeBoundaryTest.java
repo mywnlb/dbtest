@@ -32,6 +32,9 @@ class PurgeBoundaryTest {
         txnMgr.commit(rw);
     }
 
+    /**
+     * 验证 {@code noLiveReadViewBoundaryIsNextTransactionNo} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void noLiveReadViewBoundaryIsNextTransactionNo() {
         setup();
@@ -40,6 +43,9 @@ class PurgeBoundaryTest {
         assertEquals(2L, system.purgeLowWaterNo().value(), "提交推进后仍无存活 ReadView：边界=nextTransactionNo");
     }
 
+    /**
+     * 验证 {@code boundaryIsMinLowLimitNoOverLiveReadViews} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void boundaryIsMinLowLimitNoOverLiveReadViews() {
         setup();
@@ -58,6 +64,9 @@ class PurgeBoundaryTest {
         assertEquals(2L, system.purgeLowWaterNo().value(), "无存活 → nextTransactionNo=2");
     }
 
+    /**
+     * 验证 {@code readCommittedViewReleasedByCloseAdvancesBoundary} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void readCommittedViewReleasedByCloseAdvancesBoundary() {
         setup();

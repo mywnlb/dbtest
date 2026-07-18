@@ -40,6 +40,9 @@ class RollbackSegmentSlotManagerTest {
         return PageId.of(UNDO_SPACE, PageNo.of(pageNo));
     }
 
+    /**
+     * 验证 {@code freshManagerHasAllSlotsEmpty} 对应的事务、MVCC 与锁行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void freshManagerHasAllSlotsEmpty() {
         RollbackSegmentSlotManager mgr = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 8);
@@ -51,6 +54,9 @@ class RollbackSegmentSlotManagerTest {
         assertEquals(RollbackSegmentId.of(0), mgr.rollbackSegmentId());
     }
 
+    /**
+     * 验证 {@code claimReturnsDistinctSlots} 所描述的字典/DDL 协作，并断言版本、对象身份、缓存失效和物理绑定保持一致。
+     */
     @Test
     void claimReturnsDistinctSlots() {
         RollbackSegmentSlotManager mgr = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 8);
@@ -65,6 +71,9 @@ class RollbackSegmentSlotManagerTest {
         assertEquals(3, mgr.activeSlotCount());
     }
 
+    /**
+     * 验证 {@code claimedSlotPointsToInsertUndoFirstPage} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void claimedSlotPointsToInsertUndoFirstPage() {
         RollbackSegmentSlotManager mgr = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 8);
@@ -75,6 +84,9 @@ class RollbackSegmentSlotManagerTest {
         assertTrue(mgr.isOccupied(slot));
     }
 
+    /**
+     * 验证 {@code slotExhaustionThrowsDomainException} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void slotExhaustionThrowsDomainException() {
         RollbackSegmentSlotManager mgr = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 2);
@@ -89,6 +101,11 @@ class RollbackSegmentSlotManagerTest {
         assertEquals(2, mgr.activeSlotCount(), "exhaustion must not occupy a slot");
     }
 
+    /**
+     * 验证 {@code concurrentClaimProducesNoDuplicates} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     *
+     * @throws InterruptedException 等待被中断时抛出；调用方应恢复中断标志并终止当前资源获取流程
+     */
     @Test
     void concurrentClaimProducesNoDuplicates() throws InterruptedException {
         int capacity = 32;
@@ -125,6 +142,9 @@ class RollbackSegmentSlotManagerTest {
         assertEquals(capacity, mgr.activeSlotCount());
     }
 
+    /**
+     * 验证 {@code claimRejectsNullFirstPage} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void claimRejectsNullFirstPage() {
         RollbackSegmentSlotManager mgr = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 8);
@@ -229,6 +249,9 @@ class RollbackSegmentSlotManagerTest {
         assertEquals(page(66), mgr.undoFirstPageId(reused), "stale command leaves the new owner untouched");
     }
 
+    /**
+     * 验证 {@code undoFirstPageIdRejectsUnoccupiedOrOutOfRange} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void undoFirstPageIdRejectsUnoccupiedOrOutOfRange() {
         RollbackSegmentSlotManager mgr = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 4);
@@ -240,6 +263,9 @@ class RollbackSegmentSlotManagerTest {
 
     // ---- T1.3d：slot 回收（commit/rollback 后释放，供后续事务重认领） ----
 
+    /**
+     * 验证 {@code completedFinalizationFreesSlotForReclaim} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void completedFinalizationFreesSlotForReclaim() {
         RollbackSegmentSlotManager mgr = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 2);
@@ -255,6 +281,9 @@ class RollbackSegmentSlotManagerTest {
         assertEquals(page(67), mgr.undoFirstPageId(reclaimed), "reclaimed slot points to new first page");
     }
 
+    /**
+     * 验证 {@code completedFinalizationDropsActiveCount} 对应的事务、MVCC 与锁行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void completedFinalizationDropsActiveCount() {
         RollbackSegmentSlotManager mgr = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 8);
@@ -268,6 +297,9 @@ class RollbackSegmentSlotManagerTest {
         assertEquals(0, mgr.activeSlotCount(), "all released → empty");
     }
 
+    /**
+     * 验证 {@code finalizationOfUnoccupiedStaleOrNullOwnerThrows} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void finalizationOfUnoccupiedStaleOrNullOwnerThrows() {
         RollbackSegmentSlotManager mgr = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 4);
@@ -287,6 +319,9 @@ class RollbackSegmentSlotManagerTest {
 
     // ---- 0.3：恢复期 restore（扫 page3 rseg header 后按下标精确重建内存目录） ----
 
+    /**
+     * 验证 {@code restoreRepopulatesSlotByIndex} 所描述的 B+Tree 定位或结构变化，并断言键序、父子链接、页资源和唯一性不变量。
+     */
     @Test
     void restoreRepopulatesSlotByIndex() {
         RollbackSegmentSlotManager mgr = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 8);
@@ -300,6 +335,9 @@ class RollbackSegmentSlotManagerTest {
         assertEquals(UndoSlotId.of(0), mgr.claim(page(71)));
     }
 
+    /**
+     * 验证 {@code restoreRejectsOccupiedOutOfRangeOrNull} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void restoreRejectsOccupiedOutOfRangeOrNull() {
         RollbackSegmentSlotManager mgr = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 4);
@@ -309,6 +347,9 @@ class RollbackSegmentSlotManagerTest {
         assertThrows(DatabaseRuntimeException.class, () -> mgr.restore(UndoSlotId.of(2), null));
     }
 
+    /**
+     * 验证 {@code batchFinalizationCompletesAllSlotsAtomically} 对应的事务、MVCC 与锁行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void batchFinalizationCompletesAllSlotsAtomically() {
         RollbackSegmentSlotManager mgr = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 4);
@@ -328,6 +369,9 @@ class RollbackSegmentSlotManagerTest {
         assertFalse(mgr.isOccupied(updateSlot));
     }
 
+    /**
+     * 验证 {@code batchFinalizationBeforePhysicalMutationRestoresEveryOwner} 对应的事务、MVCC 与锁行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void batchFinalizationBeforePhysicalMutationRestoresEveryOwner() {
         RollbackSegmentSlotManager mgr = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), 4);

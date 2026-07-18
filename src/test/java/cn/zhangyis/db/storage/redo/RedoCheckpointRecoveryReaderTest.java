@@ -26,6 +26,9 @@ class RedoCheckpointRecoveryReaderTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code checkpointSkipsBatchesWhoseEndLsnIsCovered} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void checkpointSkipsBatchesWhoseEndLsnIsCovered() {
         Path redo = dir.resolve("redo.log");
@@ -49,6 +52,9 @@ class RedoCheckpointRecoveryReaderTest {
         }
     }
 
+    /**
+     * 验证 {@code checkpointInsideBatchKeepsBatchForPageLsnIdempotence} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void checkpointInsideBatchKeepsBatchForPageLsnIdempotence() {
         Path redo = dir.resolve("redo.log");
@@ -73,6 +79,9 @@ class RedoCheckpointRecoveryReaderTest {
         }
     }
 
+    /**
+     * 验证 {@code checkpointAheadOfRedoIsReportedAsCorruption} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void checkpointAheadOfRedoIsReportedAsCorruption() {
         Path redo = dir.resolve("redo.log");

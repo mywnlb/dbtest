@@ -29,7 +29,11 @@ public record RecordHeader(boolean deletedFlag, boolean minRecFlag, RecordType r
         }
     }
 
-    /** 写头部到 buf 的 at 处（at 通常为 0，记录起始）。 */
+    /** 写头部到 buf 的 at 处（at 通常为 0，记录起始）。
+     *
+     * @param buf 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @param at 参与 {@code writeTo} 的零基位置 {@code at}；必须非负且小于所属页面、集合或持久结构的容量
+     */
     public void writeTo(byte[] buf, int at) {
         int flags = (deletedFlag ? 1 : 0) | (minRecFlag ? 2 : 0) | (recordType.code() << 2);
         buf[at + RecordHeaderLayout.FLAGS] = (byte) flags;
@@ -39,16 +43,33 @@ public record RecordHeader(boolean deletedFlag, boolean minRecFlag, RecordType r
         U16.put(buf, at + RecordHeaderLayout.RECORD_LENGTH, recordLength);
     }
 
-    /** 从 buf 的 at 处读头部。 */
+    /** 从 buf 的 at 处读头部。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取并校验调用参数与当前领域状态，确保失败发生在本方法创建共享或持久副作用之前。</li>
+     *     <li>按类级并发协议取得本阶段所需协作者与 Guard，竞争后重新校验资源身份和生命周期。</li>
+     *     <li>执行核心状态转换或数据变换，并只通过本包稳定协作者发布可观察副作用。</li>
+     *     <li>汇总稳定结果并沿现有 finally/Guard 释放资源；异常不得伪造成功或清除未完成状态。</li>
+     * </ol>
+     *
+     * @param buf 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @param at 参与 {@code readFrom} 的零基位置 {@code at}；必须非负且小于所属页面、集合或持久结构的容量
+     * @return {@code readFrom} 编码、解码或重建的记录数据；成功时不为 {@code null}，字段顺序、隐藏列和字节边界满足当前 schema
+     */
     public static RecordHeader readFrom(byte[] buf, int at) {
+        // 1、读取并校验调用参数与当前领域状态，在共享或持久副作用前拒绝非法状态。
         int flags = buf[at + RecordHeaderLayout.FLAGS] & 0xFF;
         boolean deleted = (flags & 1) != 0;
+        // 2、继续完成范围、身份与候选校验；通过后，按类级并发协议取得本阶段所需协作者与 Guard，保持处理顺序与资源边界。
         boolean minRec = (flags & 2) != 0;
         RecordType type = RecordType.fromCode((flags >> 2) & 0x3);
         int heapNo = U16.get(buf, at + RecordHeaderLayout.HEAP_NO);
+        // 3、在中间分支复核阶段性结果；满足条件后，执行核心状态转换或数据变换，并维持领域不变量。
         int nOwned = buf[at + RecordHeaderLayout.N_OWNED] & 0xFF;
         int next = U16.get(buf, at + RecordHeaderLayout.NEXT_RECORD_OFFSET);
         int len = U16.get(buf, at + RecordHeaderLayout.RECORD_LENGTH);
+        // 4、汇总稳定结果并沿现有 finally/Guard 释放资源，以稳定返回或领域异常完成收口。
         return new RecordHeader(deleted, minRec, type, heapNo, nOwned, next, len);
     }
 

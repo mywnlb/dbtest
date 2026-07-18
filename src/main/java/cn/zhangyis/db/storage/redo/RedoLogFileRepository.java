@@ -47,6 +47,8 @@ public interface RedoLogFileRepository extends AutoCloseable {
     /**
      * 返回一次恢复扫描及其 retained 逻辑边界。默认实现适用于从 LSN 0 开始的单文件和测试仓储；
      * 文件环覆盖此方法，以便在“仅剩 torn batch”时仍保留非零 header startLsn。
+     *
+     * @return {@code readRecoveryScan} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
      */
     default RedoRecoveryScan readRecoveryScan() {
         List<RedoLogBatch> batches = readBatches();
@@ -57,6 +59,9 @@ public interface RedoLogFileRepository extends AutoCloseable {
                 batches.getLast().range().end());
     }
 
+    /**
+     * 释放本方法拥有的Redo/WAL资源；遵守既定释放顺序，重复或失败调用不得掩盖原始状态。
+     */
     @Override
     void close();
 
@@ -66,6 +71,7 @@ public interface RedoLogFileRepository extends AutoCloseable {
      *
      * @param path redo 文件路径。
      * @return 单文件仓储。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     static RedoLogFileRepository open(Path path) {
         if (path == null) {
@@ -74,7 +80,11 @@ public interface RedoLogFileRepository extends AutoCloseable {
         return SingleFileRedoLogRepository.open(path);
     }
 
-    /** 只读打开已存在单 redo 文件；不创建或修复恢复输入。 */
+    /** 只读打开已存在单 redo 文件；不创建或修复恢复输入。
+     *
+     * @param path 受控目录内的规范化文件路径；不得为 {@code null}，也不得逃逸所属表空间或日志目录
+     * @return {@code openReadOnly} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     */
     static RedoLogFileRepository openReadOnly(Path path) {
         return SingleFileRedoLogRepository.openReadOnly(path);
     }
@@ -91,7 +101,13 @@ public interface RedoLogFileRepository extends AutoCloseable {
         return RotatingRedoLogRepository.open(dir, fileCount, fileBytes);
     }
 
-    /** 只读打开完整 existing redo ring；不创建缺失目录/文件或修复 torn tail。 */
+    /** 只读打开完整 existing redo ring；不创建缺失目录/文件或修复 torn tail。
+     *
+     * @param dir 受控目录内的规范化文件路径；不得为 {@code null}，也不得逃逸所属表空间或日志目录
+     * @param fileCount 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @param fileBytes 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @return {@code openRingReadOnly} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     */
     static RotatingRedoLogRepository openRingReadOnly(Path dir, int fileCount, long fileBytes) {
         return RotatingRedoLogRepository.openReadOnly(dir, fileCount, fileBytes);
     }

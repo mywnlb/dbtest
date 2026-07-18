@@ -25,11 +25,20 @@ import cn.zhangyis.db.storage.record.format.RecordType;
  */
 public final class RecordComparator {
 
+    /**
+     * 本对象持有的 {@code registry} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private final TypeCodecRegistry registry;
 
     /** leaf record 与 node pointer 共享的单 part 排序规则。 */
     private final EncodedKeyPartComparator keyPartComparator;
 
+    /**
+     * 创建 {@code RecordComparator}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param registry 由组合根提供的 {@code TypeCodecRegistry} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public RecordComparator(TypeCodecRegistry registry) {
         if (registry == null) {
             throw new DatabaseValidationException("type codec registry must not be null");
@@ -43,6 +52,12 @@ public final class RecordComparator {
      *
      * <p>数据流：先按记录类型判哨兵（infimum/supremum 直接返回，避免对系统记录解析字段）；否则逐 key part
      * 取记录列 NULL/切片与 key 值，按 NULL 序或 codec.compare 比较，遇不等即返回（DESC 取反）。
+     *
+     * @param record 参与本次操作的记录或记录集合；不得为 {@code null}，顺序、身份与编码必须满足当前索引或日志格式
+     * @param key 参与 {@code compare} 的稳定领域标识 {@code SearchKey}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param keyDef 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @param schema 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @return 左值小于、等于或大于右值时分别返回负数、零或正数；排序规则与对应索引或无符号格式一致
      */
     public int compare(RecordCursor record, SearchKey key, IndexKeyDef keyDef, TableSchema schema) {
         RecordType type = record.recordType();
@@ -80,6 +95,7 @@ public final class RecordComparator {
      * @param keyDef 索引 key 定义。
      * @param schema 两条记录共享的物理 schema。
      * @return 规范化为 -1、0、1 的索引序比较结果。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public int compare(RecordCursor left, RecordCursor right, IndexKeyDef keyDef, TableSchema schema) {
         if (left == null || right == null || keyDef == null || schema == null) {
@@ -108,7 +124,13 @@ public final class RecordComparator {
         return 0;
     }
 
-    /** 把 key 值编码进临时 buffer，得到与记录侧同编码的切片用于保序比较。 */
+    /** 把 key 值编码进临时 buffer，得到与记录侧同编码的切片用于保序比较。
+     *
+     * @param value 参与记录编解码或索引比较的字段值；不得为 {@code null}，其类型、字节边界和 SQL NULL 语义必须与当前 schema 一致
+     * @param ct 选择 {@code encodeKey} 分支的 {@code ColumnType} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     * @param codec 由组合根提供的 {@code TypeCodec} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code encodeKey} 调用
+     * @return {@code encodeKey} 编码、解码或重建的记录数据；成功时不为 {@code null}，字段顺序、隐藏列和字节边界满足当前 schema
+     */
     private FieldSlice encodeKey(ColumnValue value, ColumnType ct, TypeCodec codec) {
         codec.validate(value, ct);
         byte[] buf = new byte[codec.encodedLength(value, ct)];

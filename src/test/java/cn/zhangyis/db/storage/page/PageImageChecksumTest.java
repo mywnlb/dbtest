@@ -15,6 +15,9 @@ class PageImageChecksumTest {
 
     private static final PageSize PS = PageSize.ofBytes(16 * 1024);
 
+    /**
+     * 验证 {@code stampAndVerifyPageImageChecksumAndTrailer} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void stampAndVerifyPageImageChecksumAndTrailer() {
         byte[] page = new byte[PS.bytes()];

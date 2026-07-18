@@ -20,6 +20,9 @@ public final class RecordPageReorganizer {
 
     /**
      * 重组 page（要求 X）。先按链快照（含 delete-marked），format 重置，再稠密重排 + 重建目录。
+     *
+     * @param page 已固定的页面、frame 或页头视图；不得为 {@code null}，必须指向目标 PageId，并在访问期间持有契约要求的 fix/latch
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public void reorganize(RecordPage page) {
         if (page == null) {

@@ -16,7 +16,10 @@ import static org.junit.jupiter.api.Assertions.*;
 /** DatabaseEngine statement admission 与 shutdown quiescence 的并发边界测试。 */
 class EngineSessionExecutionGateTest {
 
-    /** CLOSING 后拒绝新 reader，且 write quiescence 必须等已准入 reader 释放，不能把 timeout 当成功。 */
+    /** CLOSING 后拒绝新 reader，且 write quiescence 必须等已准入 reader 释放，不能把 timeout 当成功。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void closingRejectsNewStatementsAndWaitsForAdmittedStatement() throws Exception {
         AtomicReference<DatabaseEngineState> state = new AtomicReference<>(DatabaseEngineState.OPEN);

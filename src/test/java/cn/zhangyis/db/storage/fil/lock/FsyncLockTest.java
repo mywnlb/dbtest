@@ -13,6 +13,9 @@ import static org.junit.jupiter.api.Assertions.assertNull;
  */
 class FsyncLockTest {
 
+    /**
+     * 验证 {@code tryAcquireTimesOutWhileAnotherFsyncOwnsThePermitAndSucceedsAfterRelease} 对应的表空间物理文件行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void tryAcquireTimesOutWhileAnotherFsyncOwnsThePermitAndSucceedsAfterRelease() {
         FsyncLock lock = new FsyncLock();

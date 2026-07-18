@@ -19,6 +19,7 @@ public final class RollbackSegmentHeaderCapacity {
      * @param pageSize 实例页大小。
      * @param slotCapacity active undo slot 数，必须为正。
      * @param cacheCapacityPerKind 每个 INSERT/UPDATE 栈的容量，0 表禁用。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public static void validate(PageSize pageSize, int slotCapacity, int cacheCapacityPerKind) {
         if (pageSize == null) {

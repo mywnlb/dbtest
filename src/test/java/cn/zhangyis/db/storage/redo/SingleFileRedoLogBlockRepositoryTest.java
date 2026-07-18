@@ -27,7 +27,10 @@ class SingleFileRedoLogBlockRepositoryTest {
     @TempDir
     Path dir;
 
-    /** 每批独立封块，重开后仍按逻辑 LSN 顺序返回完整 batch。 */
+    /** 每批独立封块，重开后仍按逻辑 LSN 顺序返回完整 batch。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void appendsAlignedBlocksAndReopens() throws Exception {
         Path path = dir.resolve("redo.log");
@@ -46,7 +49,10 @@ class SingleFileRedoLogBlockRepositoryTest {
         }
     }
 
-    /** 最后一批 checksum 损坏时只保留前批；首次续写必须覆盖 torn block，不能把新 redo 追加到不可达尾部之后。 */
+    /** 最后一批 checksum 损坏时只保留前批；首次续写必须覆盖 torn block，不能把新 redo 追加到不可达尾部之后。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void overwritesTornTailOnFirstAppend() throws Exception {
         Path path = dir.resolve("redo.log");
@@ -67,7 +73,10 @@ class SingleFileRedoLogBlockRepositoryTest {
         assertEquals(2L * RedoLogBlockCodec.BLOCK_BYTES, Files.size(path));
     }
 
-    /** 非最后 block 的 checksum 损坏意味着后面仍存在 redo，不能按 torn tail 静默截断。 */
+    /** 非最后 block 的 checksum 损坏意味着后面仍存在 redo，不能按 torn tail 静默截断。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void middleBlockChecksumDamageIsFatal() throws Exception {
         Path path = dir.resolve("redo.log");
@@ -83,7 +92,10 @@ class SingleFileRedoLogBlockRepositoryTest {
         assertThrows(RedoLogCorruptedException.class, () -> SingleFileRedoLogRepository.open(path));
     }
 
-    /** 旧裸 frame 必须在打开阶段给出明确格式异常，而不是作为最后 torn block 返回空日志。 */
+    /** 旧裸 frame 必须在打开阶段给出明确格式异常，而不是作为最后 torn block 返回空日志。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void legacyRawFrameIsRejectedOnOpen() throws Exception {
         Path path = dir.resolve("redo.log");
@@ -96,7 +108,10 @@ class SingleFileRedoLogBlockRepositoryTest {
         assertThrows(RedoLogFormatException.class, () -> SingleFileRedoLogRepository.open(path));
     }
 
-    /** read-only 打开不创建缺失文件，也不允许 append；扫描 torn tail 后文件长度保持原样。 */
+    /** read-only 打开不创建缺失文件，也不允许 append；扫描 torn tail 后文件长度保持原样。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void readOnlyOpenNeverCreatesOrRepairs() throws Exception {
         Path missing = dir.resolve("missing.log");

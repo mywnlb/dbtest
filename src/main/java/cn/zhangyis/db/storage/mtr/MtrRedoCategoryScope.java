@@ -24,6 +24,14 @@ public final class MtrRedoCategoryScope implements AutoCloseable {
     /** 幂等关闭标志。 */
     private boolean closed;
 
+    /**
+     * 创建 {@code MtrRedoCategoryScope}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param owner redo 收集、定位或重放所需的日志对象；不得为 {@code null}，其 LSN 范围和记录格式必须连续且属于当前恢复或 MTR 上下文
+     * @param previousCategory redo 收集、定位或重放所需的日志对象；不得为 {@code null}，其 LSN 范围和记录格式必须连续且属于当前恢复或 MTR 上下文
+     * @param category redo 收集、定位或重放所需的日志对象；不得为 {@code null}，其 LSN 范围和记录格式必须连续且属于当前恢复或 MTR 上下文
+     * @param reason 传给 {@code 构造} 的文本值；不得为 {@code null} 或空白，并保持调用方提供的字符顺序
+     */
     MtrRedoCategoryScope(MtrRedoCollector owner,
                          MtrRedoCategory previousCategory,
                          MtrRedoCategory category,

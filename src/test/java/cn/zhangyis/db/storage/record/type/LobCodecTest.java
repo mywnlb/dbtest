@@ -19,6 +19,9 @@ class LobCodecTest {
 
     private final TypeCodecRegistry registry = new TypeCodecRegistry();
 
+    /**
+     * 验证 {@code inlineTextAndBinaryRoundTrip} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void inlineTextAndBinaryRoundTrip() {
         assertEquals(new ColumnValue.StringValue("中文 text"), roundTrip(
@@ -28,6 +31,9 @@ class LobCodecTest {
         assertArrayEquals(new byte[]{0, 1, (byte) 0xFF}, decoded.value());
     }
 
+    /**
+     * 验证 {@code externalEnvelopeRoundTripsStableReferenceAndPrefix} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void externalEnvelopeRoundTripsStableReferenceAndPrefix() {
         ColumnType type = ColumnType.longText(false);
@@ -42,6 +48,9 @@ class LobCodecTest {
         assertArrayEquals(value.inlinePrefix(), decoded.inlinePrefix());
     }
 
+    /**
+     * 验证 {@code oversizeInlineRequiresExternalizationAndWrongReferenceTypeIsRejected} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void oversizeInlineRequiresExternalizationAndWrongReferenceTypeIsRejected() {
         ColumnType type = ColumnType.text(false);
@@ -55,6 +64,9 @@ class LobCodecTest {
                 new ColumnValue.ExternalValue(TypeId.BLOB, ref, new byte[0]), type));
     }
 
+    /**
+     * 验证 {@code jsonValidatesSyntaxAndCannotParticipateInIndexComparison} 所描述的 B+Tree 定位或结构变化，并断言键序、父子链接、页资源和唯一性不变量。
+     */
     @Test
     void jsonValidatesSyntaxAndCannotParticipateInIndexComparison() {
         ColumnType type = ColumnType.json(false);
@@ -81,6 +93,9 @@ class LobCodecTest {
                 new FieldSlice(encoded, 0, encoded.length), new FieldSlice(encoded, 0, encoded.length), type, 1));
     }
 
+    /**
+     * 验证 {@code referenceRejectsMetadataPagesAndFilNullSentinel} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void referenceRejectsMetadataPagesAndFilNullSentinel() {
         assertThrows(cn.zhangyis.db.common.exception.DatabaseValidationException.class,
@@ -90,6 +105,9 @@ class LobCodecTest {
                         10, 1, SegmentId.of(1), 0, 0));
     }
 
+    /**
+     * 验证 {@code textAndBlobRequirePrefixAndCompareLogicalPayloadInsteadOfEnvelope} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void textAndBlobRequirePrefixAndCompareLogicalPayloadInsteadOfEnvelope() {
         ColumnType type = ColumnType.text(false);

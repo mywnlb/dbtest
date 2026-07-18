@@ -11,6 +11,9 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
  */
 class BufExceptionTest {
 
+    /**
+     * 验证 {@code exhaustedShouldBeRecoverableRuntime} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void exhaustedShouldBeRecoverableRuntime() {
         Throwable cause = new IllegalStateException("all fixed");
@@ -19,6 +22,9 @@ class BufExceptionTest {
         assertEquals(cause, ex.getCause());
     }
 
+    /**
+     * 验证 {@code pageLatchModeShouldHaveSharedSharedExclusiveAndExclusive} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void pageLatchModeShouldHaveSharedSharedExclusiveAndExclusive() {
         // 0.13d 引入 SHARED_EXCLUSIVE（SIX），page latch 模式由 2 个增至 3 个。

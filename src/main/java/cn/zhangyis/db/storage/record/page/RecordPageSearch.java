@@ -30,6 +30,12 @@ public final class RecordPageSearch {
     /** 类型 codec 注册表；构造页内字段游标时透传给 {@link RecordCursor}。 */
     private final TypeCodecRegistry registry;
 
+    /**
+     * 创建 {@code RecordPageSearch}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param registry 由组合根提供的 {@code TypeCodecRegistry} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public RecordPageSearch(TypeCodecRegistry registry) {
         if (registry == null) {
             throw new DatabaseValidationException("type codec registry must not be null");
@@ -64,6 +70,11 @@ public final class RecordPageSearch {
      *
      * <p>数据流：二分得起始 group 的 {@code slot(low)} → 从其 {@code nextRecord} 起沿链比较；遇 cmp==0 命中，
      * 遇 cmp&gt;0（记录已大于 key，因链按 key 升序）提前止损，走到 supremum 则未命中。允许重复 key 时返回**首个**相等记录。
+     * @param page 已固定的页面、frame 或页头视图；不得为 {@code null}，必须指向目标 PageId，并在访问期间持有契约要求的 fix/latch
+     * @param key 参与 {@code findEqual} 的稳定领域标识 {@code SearchKey}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param keyDef 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @param schema 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @return {@code findEqual} 按身份或键定位到的对象；未找到、不可见或尚未持久化时为空 {@code Optional}，从不返回 Java {@code null}
      */
     public OptionalInt findEqual(RecordPage page, SearchKey key, IndexKeyDef keyDef, TableSchema schema) {
         RecordPageDirectory dir = page.directory();
@@ -89,17 +100,34 @@ public final class RecordPageSearch {
      *
      * <p>数据流：二分得 {@code slot(low)} 作初始 prev；只要其 next 不是 supremum 且 next 记录 key ≤ 目标 key，
      * 就把 prev 前移到 next。守卫 {@code next(prev)!=supremum} 保证不对 supremum 建字段游标。
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验表空间生命周期、页号、区段身份与容量边界，非法或损坏元数据在分配/IO 前拒绝。</li>
+     *     <li>按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，避免锁序反转。</li>
+     *     <li>执行空间元数据或物理文件变化，并把需要的 allocation intent、redo、dirty 或 force 副作用交给既有下游。</li>
+     *     <li>发布稳定结果并逆序释放 lease、latch 与 fix；失败保留可由恢复流程识别的权威状态。</li>
+     * </ol>
+     *
+     * @param page 已固定的页面、frame 或页头视图；不得为 {@code null}，必须指向目标 PageId，并在访问期间持有契约要求的 fix/latch
+     * @param key 参与 {@code findInsertPosition} 的稳定领域标识 {@code SearchKey}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param keyDef 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @param schema 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @return {@code findInsertPosition} 计算出的非负长度、位置或数量；结果必须落在所属页、集合或持久格式容量内，溢出通过领域异常报告
      */
     public int findInsertPosition(RecordPage page, SearchKey key, IndexKeyDef keyDef, TableSchema schema) {
+        // 1、校验表空间生命周期、页号、区段身份与容量边界，在共享或持久副作用前拒绝非法状态。
         RecordPageDirectory dir = page.directory();
         int low = startGroupSlotLow(page, key, keyDef, schema);
+        // 2、继续完成范围、身份与候选校验；通过后，按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，保持处理顺序与资源边界。
         int supremum = page.supremumOffset();
         int prev = dir.slot(low);
+        // 3、在中间分支复核阶段性结果；满足条件后，执行空间元数据或物理文件变化，并维持领域不变量。
         int next = page.nextRecord(prev);
         while (next != supremum && compareAt(page, next, key, keyDef, schema) <= 0) {
             prev = next;
             next = page.nextRecord(prev);
         }
+        // 4、发布稳定结果并逆序释放 lease、latch 与 fix，以稳定返回或领域异常完成收口。
         return prev;
     }
 
@@ -107,6 +135,12 @@ public final class RecordPageSearch {
      * 命中则返回相等记录的字段级游标，否则抛 {@link RecordNotFoundException}（供读路径「按 key 取行」）。
      *
      * @param pageId 记录所在页，用于游标产出 {@link RecordRef} 时的稳定定位（游标本身不依赖它做字段读）。
+     * @param page 已固定的页面、frame 或页头视图；不得为 {@code null}，必须指向目标 PageId，并在访问期间持有契约要求的 fix/latch
+     * @param key 参与 {@code findEqualCursor} 的稳定领域标识 {@code SearchKey}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param keyDef 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @param schema 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @return {@code findEqualCursor} 编码、解码或重建的记录数据；成功时不为 {@code null}，字段顺序、隐藏列和字节边界满足当前 schema
+     * @throws RecordNotFoundException 按稳定身份无法定位所需领域对象时抛出；调用方应刷新元数据或终止当前操作
      */
     public RecordCursor findEqualCursor(RecordPage page, SearchKey key, IndexKeyDef keyDef, TableSchema schema) {
         OptionalInt found = findEqual(page, key, keyDef, schema);

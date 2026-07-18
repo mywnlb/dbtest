@@ -19,6 +19,9 @@ public final class UndoRecordWritePlan {
     private final UndoRecord record;
     /** 解码该记录所需的稳定 key/schema。 */
     private final IndexKeyDef keyDef;
+    /**
+     * 本对象持有的 {@code schema} 页面、记录或布局状态；身份与 schema 必须匹配，访问期间遵守 fix/latch 和字节边界，不能泄漏未发布修改。
+     */
     private final TableSchema schema;
     /** 完整 UndoRecord 编码（包含非空 INSERT LOB ownership 尾部）；不向跨包调用者暴露可变引用。 */
     private final byte[] encodedPayload;
@@ -29,6 +32,17 @@ public final class UndoRecordWritePlan {
     /** 完整编码 CRC32；inline 也预计算，便于计划保持单一构造路径。 */
     private final long crc32;
 
+    /**
+     * 创建 {@code UndoRecordWritePlan}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param record 参与本次操作的记录或记录集合；不得为 {@code null}，顺序、身份与编码必须满足当前索引或日志格式
+     * @param keyDef 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @param schema 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @param encodedPayload 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @param external 值的编码或展示形态；为 {@code true} 时按名称所示文本、JSON 或外部引用格式处理
+     * @param externalPageCount 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @param crc32 参与 {@code 构造} 的位域或校验值 {@code crc32}；只允许当前格式定义的位，数值按无符号位模式解释
+     */
     private UndoRecordWritePlan(UndoRecord record, IndexKeyDef keyDef, TableSchema schema,
                                 byte[] encodedPayload, boolean external, int externalPageCount, long crc32) {
         this.record = record;
@@ -40,7 +54,18 @@ public final class UndoRecordWritePlan {
         this.crc32 = crc32;
     }
 
-    /** 在任何写 MTR/页分配前形成物理计划，并执行单条 external 页数上限。 */
+    /** 在任何写 MTR/页分配前形成物理计划，并执行单条 external 页数上限。
+     *
+     * @param codec 由组合根提供的 {@code UndoRecordCodec} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code create} 调用
+     * @param pageSize 调用方提供的长度或容量值对象；不得为 {@code null}，且必须已通过其构造范围校验
+     * @param record 参与本次操作的记录或记录集合；不得为 {@code null}，顺序、身份与编码必须满足当前索引或日志格式
+     * @param keyDef 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @param schema 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @param maxExternalPages 参与 {@code create} 的上界或规格值 {@code maxExternalPages}；必须非负且不能使容量、页数或编码长度计算溢出
+     * @return {@code create} 编码、解码或重建的记录数据；成功时不为 {@code null}，字段顺序、隐藏列和字节边界满足当前 schema
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws UndoPayloadTooLargeException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
+     */
     static UndoRecordWritePlan create(UndoRecordCodec codec, PageSize pageSize, UndoRecord record,
                                       IndexKeyDef keyDef, TableSchema schema, int maxExternalPages) {
         if (codec == null || pageSize == null || record == null || keyDef == null || schema == null) {
@@ -92,6 +117,9 @@ public final class UndoRecordWritePlan {
     /**
      * 判断另一个计划是否可复用本计划已经固定的 root/payload 页布局；内容与 CRC 可以因 LOB 首页号变化，
      * 但完整长度、inline/external 分支、external 页数与 root descriptor 长度必须完全一致。
+     *
+     * @param other 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @return {@code samePhysicalShape} 命名的领域事实成立时为 {@code true}，否则为 {@code false}；查询本身不改变权威状态
      */
     public boolean samePhysicalShape(UndoRecordWritePlan other) {
         return other != null

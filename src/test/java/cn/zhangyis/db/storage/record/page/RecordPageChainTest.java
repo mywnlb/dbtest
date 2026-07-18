@@ -28,6 +28,9 @@ class RecordPageChainTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code walkReturnsRecordsInChainOrder} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void walkReturnsRecordsInChainOrder() {
         PageStore store = new FileChannelPageStore();
@@ -51,6 +54,9 @@ class RecordPageChainTest {
         }
     }
 
+    /**
+     * 验证 {@code cycleIsDetected} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void cycleIsDetected() {
         PageStore store = new FileChannelPageStore();
@@ -71,6 +77,9 @@ class RecordPageChainTest {
         }
     }
 
+    /**
+     * 验证 {@code outOfBodyOffsetIsDetected} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void outOfBodyOffsetIsDetected() {
         PageStore store = new FileChannelPageStore();

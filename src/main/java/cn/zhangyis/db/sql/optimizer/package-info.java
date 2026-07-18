@@ -1,4 +1,7 @@
 /**
- * Logical rewrites, access path selection, cost estimation, and plan selection.
+ * 查询优化包，负责逻辑改写、访问路径与代价选择，不直接修改记录或存储页。
+ *
+ * <p>本包只通过显式接口与相邻模块协作；调用方不得绕过稳定 API 读取内部可变状态，
+ * 包内实现也不得反向依赖 SQL、会话或其他上层语义。
  */
 package cn.zhangyis.db.sql.optimizer;

@@ -30,10 +30,26 @@ import cn.zhangyis.db.storage.api.ddl.IndexStorageBinding;
  */
 public final class SdiPageRepository {
 
+    /**
+     * 本对象持有的 {@code pool} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private final BufferPool pool;
+    /**
+     * 本对象持有的 {@code pageSize} 页面、记录或布局状态；身份与 schema 必须匹配，访问期间遵守 fix/latch 和字节边界，不能泄漏未发布修改。
+     */
     private final PageSize pageSize;
+    /**
+     * 本对象持有的 {@code spaceHeaders} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private final SpaceHeaderRepository spaceHeaders;
 
+    /**
+     * 创建 {@code SdiPageRepository}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param pool 由组合根提供的 {@code BufferPool} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param pageSize 调用方提供的长度或容量值对象；不得为 {@code null}，且必须已通过其构造范围校验
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public SdiPageRepository(BufferPool pool, PageSize pageSize) {
         if (pool == null || pageSize == null) {
             throw new DatabaseValidationException("SDI page repository pool/pageSize must not be null");
@@ -78,12 +94,21 @@ public final class SdiPageRepository {
     /**
      * 读取并校验 SDI。legacy root=0 与已格式化空页都返回 empty，任何部分 identity 或 CRC 错配都拒绝。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验表空间生命周期、页号、区段身份与容量边界，非法或损坏元数据在分配/IO 前拒绝。</li>
+     *     <li>按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，避免锁序反转。</li>
+     *     <li>执行空间元数据或物理文件变化，并把需要的 allocation intent、redo、dirty 或 force 副作用交给既有下游。</li>
+     *     <li>发布稳定结果并逆序释放 lease、latch 与 fix；失败保留可由恢复流程识别的权威状态。</li>
+     * </ol>
+     *
      * @param mtr 只读或活动 MTR，负责 page0→page3 的 latch/fix 生命周期
      * @param spaceId 已打开 GENERAL 表空间
      * @return 有效快照，或 legacy/空 SDI 的 empty
      * @throws SdiPageCorruptionException root、envelope、format、长度、identity 或 CRC 不合法时抛出
      */
     public Optional<SdiPageSnapshot> read(MiniTransaction mtr, SpaceId spaceId) {
+        // 1、校验表空间生命周期、页号、区段身份与容量边界，在共享或持久副作用前拒绝非法状态。
         require(mtr, spaceId);
         SpaceHeaderSnapshot header = spaceHeaders.read(mtr, spaceId);
         if (header.sdiRootPageNo() == 0) {
@@ -91,11 +116,13 @@ public final class SdiPageRepository {
         }
         requireV1Root(header.sdiRootPageNo());
         PageGuard page = mtr.getPage(pool, pageId(spaceId), PageLatchMode.SHARED);
+        // 2、继续完成范围、身份与候选校验；通过后，按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，保持处理顺序与资源边界。
         validateEnvelope(page, spaceId);
         validateFormat(page);
         long tableId = page.readLong(SdiPageLayout.TABLE_ID_OFFSET);
         long version = page.readLong(SdiPageLayout.DICTIONARY_VERSION_OFFSET);
         int length = page.readInt(SdiPageLayout.PAYLOAD_LENGTH_OFFSET);
+        // 3、在中间分支复核阶段性结果；满足条件后，执行空间元数据或物理文件变化，并维持领域不变量。
         int expectedCrc = page.readInt(SdiPageLayout.PAYLOAD_CRC32C_OFFSET);
         if (tableId == 0 && version == 0 && length == 0 && expectedCrc == 0) {
             return Optional.empty();
@@ -109,6 +136,7 @@ public final class SdiPageRepository {
         if (crc32c(payload) != expectedCrc) {
             throw new SdiPageCorruptionException("SDI payload CRC32C mismatch: table=" + tableId);
         }
+        // 4、发布稳定结果并逆序释放 lease、latch 与 fix，以稳定返回或领域异常完成收口。
         return Optional.of(new SdiPageSnapshot(tableId, version, payload));
     }
 
@@ -160,11 +188,20 @@ public final class SdiPageRepository {
         byte[] copied = java.util.Arrays.copyOf(payload, payload.length);
 
         // 3. body 缓冲包含零填充尾部，单次 page write 令旧快照不可见；MTR commit 再盖 LSN/发布 dirty。
+        // 4、发布稳定结果并逆序释放 lease、latch 与 fix，以稳定返回或领域异常完成收口。
         page.writeBytes(SdiPageLayout.MAGIC_OFFSET, body(tableId, dictionaryVersion, copied));
     }
 
     /**
      * 读取 page3 footer 中未决 CREATE INDEX 资源；全零 footer 返回 empty，未知 magic/version/CRC 拒绝恢复。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验表空间生命周期、页号、区段身份与容量边界，非法或损坏元数据在分配/IO 前拒绝。</li>
+     *     <li>按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，避免锁序反转。</li>
+     *     <li>执行空间元数据或物理文件变化，并把需要的 allocation intent、redo、dirty 或 force 副作用交给既有下游。</li>
+     *     <li>发布稳定结果并逆序释放 lease、latch 与 fix；失败保留可由恢复流程识别的权威状态。</li>
+     * </ol>
      *
      * @param mtr 负责 page0→page3 S latch/fix 的短只读 MTR
      * @param spaceId 已打开的目标表空间
@@ -172,30 +209,44 @@ public final class SdiPageRepository {
      * @throws SdiPageCorruptionException footer 与 SDI payload 重叠、损坏或物理 identity 跨 space 时抛出
      */
     public Optional<SdiIndexBuildDescriptor> readIndexBuild(MiniTransaction mtr, SpaceId spaceId) {
+        // 1、校验表空间生命周期、页号、区段身份与容量边界，在共享或持久副作用前拒绝非法状态。
         require(mtr, spaceId);
         SpaceHeaderSnapshot header = spaceHeaders.read(mtr, spaceId);
         requireV1Root(header.sdiRootPageNo());
+        // 2、继续完成范围、身份与候选校验；通过后，按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，保持处理顺序与资源边界。
         PageGuard page = mtr.getPage(pool, pageId(spaceId), PageLatchMode.SHARED);
         validateEnvelope(page, spaceId);
         validateFormat(page);
+        // 3、在中间分支复核阶段性结果；满足条件后，执行空间元数据或物理文件变化，并维持领域不变量。
         requireFooterAvailable(page);
         byte[] footer = page.readBytes(SdiPageLayout.indexBuildFooterOffset(pageSize),
                 SdiPageLayout.INDEX_BUILD_FOOTER_BYTES);
         if (java.util.Arrays.equals(footer, new byte[footer.length])) {
             return Optional.empty();
         }
+        // 4、发布稳定结果并逆序释放 lease、latch 与 fix，以稳定返回或领域异常完成收口。
         return Optional.of(decodeIndexBuild(spaceId, footer));
     }
 
     /**
      * 把 staged segment/root 与 DDL identity 写入 page3。调用方必须与 segment/root 创建放在同一 MTR。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验表空间生命周期、页号、区段身份与容量边界，非法或损坏元数据在分配/IO 前拒绝。</li>
+     *     <li>按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，避免锁序反转。</li>
+     *     <li>执行空间元数据或物理文件变化，并把需要的 allocation intent、redo、dirty 或 force 副作用交给既有下游。</li>
+     *     <li>发布稳定结果并逆序释放 lease、latch 与 fix；失败保留可由恢复流程识别的权威状态。</li>
+     * </ol>
+     *
      * @param mtr 正在创建新 index 物理资源的活动 MTR
      * @param spaceId 既有表空间
      * @param descriptor 待持久化的未决资源所有权
      * @throws SdiPageCorruptionException footer 已占用、旧 payload 占用保留区或页损坏时抛出
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public void writeIndexBuild(MiniTransaction mtr, SpaceId spaceId, SdiIndexBuildDescriptor descriptor) {
+        // 1、校验表空间生命周期、页号、区段身份与容量边界，在共享或持久副作用前拒绝非法状态。
         require(mtr, spaceId);
         if (descriptor == null || !descriptor.indexBinding().rootPageId().spaceId().equals(spaceId)
                 || !descriptor.indexBinding().leafSegment().spaceId().equals(spaceId)
@@ -203,9 +254,11 @@ public final class SdiPageRepository {
             throw new DatabaseValidationException("SDI index build descriptor does not belong to target space");
         }
         SpaceHeaderSnapshot header = spaceHeaders.readForUpdate(mtr, spaceId);
+        // 2、继续完成范围、身份与候选校验；通过后，按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，保持处理顺序与资源边界。
         requireV1Root(header.sdiRootPageNo());
         PageGuard page = mtr.getPage(pool, pageId(spaceId), PageLatchMode.EXCLUSIVE);
         validateEnvelope(page, spaceId);
+        // 3、在中间分支复核阶段性结果；满足条件后，执行空间元数据或物理文件变化，并维持领域不变量。
         validateFormat(page);
         requireFooterAvailable(page);
         byte[] current = page.readBytes(SdiPageLayout.indexBuildFooterOffset(pageSize),
@@ -213,11 +266,18 @@ public final class SdiPageRepository {
         if (!java.util.Arrays.equals(current, new byte[current.length])) {
             throw new SdiPageCorruptionException("SDI index build footer is already occupied");
         }
+        // 4、发布稳定结果并逆序释放 lease、latch 与 fix，以稳定返回或领域异常完成收口。
         page.writeBytes(SdiPageLayout.indexBuildFooterOffset(pageSize), encodeIndexBuild(descriptor));
     }
 
     /**
      * 只在 footer 与 expected 完全相等时清空 build descriptor，避免旧恢复任务擦除另一条 DDL 的所有权证据。
+     *
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param spaceId 目标表空间的稳定标识；不得为 {@code null}，且必须已注册并满足当前生命周期准入条件
+     * @param expected 调用方已校验的执行计划、批次、范围或候选对象；不得为 {@code null}，边界必须有序且不得跨越所属事务、表或日志批次
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws SdiPageCorruptionException 检测到不能安全解释的持久数据损坏时抛出；调用方不得继续发布普通服务或覆盖原始证据
      */
     public void clearIndexBuild(MiniTransaction mtr, SpaceId spaceId, SdiIndexBuildDescriptor expected) {
         require(mtr, spaceId);
@@ -261,6 +321,12 @@ public final class SdiPageRepository {
         }
     }
 
+    /**
+     * 把调用方领域值编码为数据库内核的稳定表示；编码前校验范围，成功不修改输入对象。
+     *
+     * @param descriptor 调用方已校验的执行计划、批次、范围或候选对象；不得为 {@code null}，边界必须有序且不得跨越所属事务、表或日志批次
+     * @return {@code encodeIndexBuild} 生成的非空字节表示；调用方获得独立结果或受控视图，格式失败通过领域异常报告
+     */
     private static byte[] encodeIndexBuild(SdiIndexBuildDescriptor descriptor) {
         IndexStorageBinding index = descriptor.indexBinding();
         ByteBuffer footer = ByteBuffer.allocate(SdiPageLayout.INDEX_BUILD_FOOTER_BYTES)
@@ -282,8 +348,25 @@ public final class SdiPageRepository {
         return footer.array();
     }
 
+    /**
+     * 从稳定表示解码数据库内核领域值；先校验边界、标识与长度，损坏输入以领域异常拒绝。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取输入长度、游标边界与必要标识，损坏、截断或超限数据在创建结果前失败。</li>
+     *     <li>按稳定字段或 token 顺序推进游标并调用对应编解码分支，任何分支都不得越过输入边界。</li>
+     *     <li>交叉校验聚合计数、类型、校验值和剩余输入，防止截断或多余内容形成半解析对象。</li>
+     *     <li>完成剩余字段写入或稳定领域结果构造；失败只保留领域异常与根因，不修改调用方输入或其他持久状态。</li>
+     * </ol>
+     *
+     * @param spaceId 目标表空间的稳定标识；不得为 {@code null}，且必须已注册并满足当前生命周期准入条件
+     * @param footer 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @return {@code decodeIndexBuild} 形成的不可变定义、计划或元数据快照；成功时不为 {@code null}，内部身份、版本和范围已完成交叉校验
+     * @throws SdiPageCorruptionException 检测到不能安全解释的持久数据损坏时抛出；调用方不得继续发布普通服务或覆盖原始证据
+     */
     private static SdiIndexBuildDescriptor decodeIndexBuild(SpaceId spaceId, byte[] footer) {
         try {
+            // 1、读取输入长度、游标边界与必要标识，在共享或持久副作用前拒绝非法状态。
             ByteBuffer buffer = ByteBuffer.wrap(footer).order(ByteOrder.BIG_ENDIAN);
             if (buffer.getInt() != SdiPageLayout.INDEX_BUILD_MAGIC
                     || buffer.getInt() != SdiPageLayout.INDEX_BUILD_FORMAT_VERSION) {
@@ -292,11 +375,13 @@ public final class SdiPageRepository {
             long ddlId = buffer.getLong();
             long version = buffer.getLong();
             long tableId = buffer.getLong();
+            // 2、继续完成范围、身份与候选校验；通过后，按稳定字段或 token 顺序推进游标并调用对应编解码分支，保持处理顺序与资源边界。
             long indexId = buffer.getLong();
             long rootPageNo = buffer.getLong();
             int rootLevel = buffer.getInt();
             SegmentRef leaf = new SegmentRef(spaceId, buffer.getInt(), SegmentId.of(buffer.getLong()));
             SegmentRef nonLeaf = new SegmentRef(spaceId, buffer.getInt(), SegmentId.of(buffer.getLong()));
+            // 3、在中间分支复核阶段性结果；满足条件后，交叉校验聚合计数、类型、校验值和剩余输入，并维持领域不变量。
             int crcOffset = buffer.position();
             int expectedCrc = buffer.getInt();
             if (expectedCrc != crc32c(java.util.Arrays.copyOf(footer, crcOffset))) {
@@ -309,6 +394,7 @@ public final class SdiPageRepository {
             }
             IndexStorageBinding binding = new IndexStorageBinding(indexId,
                     PageId.of(spaceId, PageNo.of(rootPageNo)), rootLevel, leaf, nonLeaf);
+            // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
             return new SdiIndexBuildDescriptor(ddlId, version, tableId, binding);
         } catch (SdiPageCorruptionException failure) {
             throw failure;

@@ -5,6 +5,7 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
 /**
  * MDL owner 身份；独立于 session 包，使 DD 内核不反向依赖 session 生命周期。低半区由显式 DD/DDL 调用方使用，
  * 高半区由 {@link #forSession(long)} 专门编码 Session owner，避免相同数字的外部 DDL owner 被误判为可重入 Session。
+ * @param value 由 {@code 构造} 转换或编码的原始 {@code long} 值；超出目标值对象或持久格式范围时以领域异常拒绝
  */
 public record MdlOwnerId(long value) {
 
@@ -19,7 +20,12 @@ public record MdlOwnerId(long value) {
         }
     }
 
-    /** 创建普通 DD/DDL owner；高半区保留给 Session，调用方不能通过猜数字与 Session 锁合并。 */
+    /** 创建普通 DD/DDL owner；高半区保留给 Session，调用方不能通过猜数字与 Session 锁合并。
+     *
+     * @param value 由 {@code of} 转换或编码的原始 {@code long} 值；超出目标值对象或持久格式范围时以领域异常拒绝
+     * @return {@code of} 定位或分配的稳定值对象；成功时不为 {@code null}，其身份、范围和特殊值已由构造校验保证
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public static MdlOwnerId of(long value) {
         if (value >= DDL_STATEMENT_NAMESPACE_BASE) {
             throw new DatabaseValidationException("metadata lock owner id enters reserved SQL namespace: " + value);
@@ -29,6 +35,10 @@ public record MdlOwnerId(long value) {
 
     /**
      * 把实例内 SessionId 映射到不可与普通 DDL owner 碰撞的高半区。SessionId 仍由 session 模块管理，DD 只接收数值。
+     *
+     * @param sessionId 参与 {@code forSession} 的原始数值身份 {@code sessionId}；必须非负，零值仅用于对应格式明确声明的系统或空身份
+     * @return {@code forSession} 定位或分配的稳定值对象；成功时不为 {@code null}，其身份、范围和特殊值已由构造校验保证
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public static MdlOwnerId forSession(long sessionId) {
         if (sessionId <= 0 || sessionId > Long.MAX_VALUE - SESSION_NAMESPACE_BASE) {
@@ -43,6 +53,7 @@ public record MdlOwnerId(long value) {
      *
      * @param statementId 当前 DatabaseEngine 内单调正序号
      * @return 只能用于该 DDL statement 生命周期的低于 Session 区 owner
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public static MdlOwnerId forDdlStatement(long statementId) {
         if (statementId <= 0 || statementId >= SESSION_NAMESPACE_BASE - DDL_STATEMENT_NAMESPACE_BASE) {

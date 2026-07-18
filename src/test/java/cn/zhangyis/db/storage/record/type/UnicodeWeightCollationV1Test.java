@@ -13,6 +13,9 @@ class UnicodeWeightCollationV1Test {
 
     private final UnicodeWeightCollationV1 collation = UnicodeWeightCollationV1.INSTANCE;
 
+    /**
+     * 验证 {@code foldsCaseAccentAndCombiningMarks} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void foldsCaseAccentAndCombiningMarks() {
         assertEquals(0, compare("École", "e\u0301COLE"));
@@ -21,12 +24,18 @@ class UnicodeWeightCollationV1Test {
         assertEquals(0, compare("МОСКВА", "москва"));
     }
 
+    /**
+     * 验证 {@code unmappedCodePointsKeepStableCodePointOrder} 所描述的返回值或状态会按契约保留，并断言原始信息与领域不变量未丢失。
+     */
     @Test
     void unmappedCodePointsKeepStableCodePointOrder() {
         assertTrue(compare("中", "文") < 0);
         assertTrue(compare("😀", "😁") < 0);
     }
 
+    /**
+     * 验证 {@code malformedUtf8IsRejectedWithCause} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void malformedUtf8IsRejectedWithCause() {
         byte[] malformed = {(byte) 0xC3, 0x28};

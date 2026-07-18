@@ -26,6 +26,9 @@ class FspPageAllocationRedoTest {
     private static final SpaceId SPACE = SpaceId.of(7);
     private static final PageId ALLOCATED = PageId.of(SPACE, PageNo.of(130));
 
+    /**
+     * 验证 {@code fspPageAllocationRecordRoundTripsThroughRedoFrameCodec} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void fspPageAllocationRecordRoundTripsThroughRedoFrameCodec() {
         FspPageAllocationRecord record = new FspPageAllocationRecord(
@@ -42,6 +45,9 @@ class FspPageAllocationRedoTest {
                 "tag + pageId + inodeSlot + segmentId + autoExtendRetry must stay aligned with codec");
     }
 
+    /**
+     * 验证 {@code fspHandlerEnsuresCapacityWithoutReadingOrWritingPageBytes} 所描述的边界场景保持既有领域不变量，不产生方法名明确禁止的副作用。
+     */
     @Test
     void fspHandlerEnsuresCapacityWithoutReadingOrWritingPageBytes() {
         RecordingPageStore store = new RecordingPageStore();
@@ -58,6 +64,9 @@ class FspPageAllocationRedoTest {
         assertEquals(0, store.writeCount);
     }
 
+    /**
+     * 验证 {@code forceSkipSkipsFspAllocationBeforeOpeningHandler} 对应的Redo/WAL行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void forceSkipSkipsFspAllocationBeforeOpeningHandler() {
         RecordingPageStore store = new RecordingPageStore();

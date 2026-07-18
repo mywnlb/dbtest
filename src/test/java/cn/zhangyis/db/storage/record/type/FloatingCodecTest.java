@@ -26,6 +26,9 @@ class FloatingCodecTest {
         return FieldSlice.compareUnsigned(new FieldSlice(a, 0, a.length), new FieldSlice(b, 0, b.length));
     }
 
+    /**
+     * 验证 {@code doubleRoundTrip} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void doubleRoundTrip() {
         FloatingCodec c = new FloatingCodec(8);
@@ -36,6 +39,9 @@ class FloatingCodecTest {
         assertTrue(Double.isNaN(dec(c, DBL, enc(c, DBL, Double.NaN))));
     }
 
+    /**
+     * 验证 {@code totalOrder} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void totalOrder() {
         FloatingCodec c = new FloatingCodec(8);
@@ -52,12 +58,18 @@ class FloatingCodecTest {
         assertTrue(cmp(posInf, nan) < 0);
     }
 
+    /**
+     * 验证 {@code negativeZeroEqualsPositiveZero} 所描述的值对象语义，并断言相等性、哈希、排序及非法构造边界一致。
+     */
     @Test
     void negativeZeroEqualsPositiveZero() {
         FloatingCodec c = new FloatingCodec(8);
         assertEquals(0, cmp(enc(c, DBL, -0.0), enc(c, DBL, 0.0)));
     }
 
+    /**
+     * 验证 {@code floatNarrowsAndRoundTrips} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void floatNarrowsAndRoundTrips() {
         FloatingCodec c = new FloatingCodec(4);

@@ -24,6 +24,11 @@ class RedoCheckpointStoreTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code emptyControlReturnsInitialCheckpoint} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void emptyControlReturnsInitialCheckpoint() throws Exception {
         Path control = dir.resolve("redo-control");
@@ -37,6 +42,9 @@ class RedoCheckpointStoreTest {
         assertEquals(2L * RedoCheckpointStore.SLOT_STRIDE_BYTES, Files.size(control));
     }
 
+    /**
+     * 验证 {@code latestValidCheckpointSurvivesReopen} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void latestValidCheckpointSurvivesReopen() {
         Path control = dir.resolve("redo-control");
@@ -54,6 +62,11 @@ class RedoCheckpointStoreTest {
         }
     }
 
+    /**
+     * 验证 {@code corruptNewestSlotPageFallsBackToOlderValidSlot} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void corruptNewestSlotPageFallsBackToOlderValidSlot() throws Exception {
         Path control = dir.resolve("redo-control");
@@ -75,7 +88,10 @@ class RedoCheckpointStoreTest {
         }
     }
 
-    /** torn slot 可能只改坏 version 字节；必须先验 CRC，再决定是否为“不支持格式”。 */
+    /** torn slot 可能只改坏 version 字节；必须先验 CRC，再决定是否为“不支持格式”。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void checksumFailureTakesPrecedenceOverCorruptedControlVersion() throws Exception {
         Path control = dir.resolve("version-torn-control");
@@ -94,7 +110,10 @@ class RedoCheckpointStoreTest {
         }
     }
 
-    /** 已知 v1 control 不能退化成“两个槽都坏→checkpoint 0”，必须明确拒绝旧格式。 */
+    /** 已知 v1 control 不能退化成“两个槽都坏→checkpoint 0”，必须明确拒绝旧格式。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void legacyControlVersionIsRejected() throws Exception {
         Path control = dir.resolve("legacy-control");

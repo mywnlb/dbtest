@@ -44,6 +44,9 @@ class RotatingRedoLogRepositoryTest {
         return RedoLogBlockCodec.encodeBatch(batch(0), 0).byteLength();
     }
 
+    /**
+     * 验证 {@code rotatesToNextFileWhenActiveFull} 对应的Redo/WAL行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void rotatesToNextFileWhenActiveFull() {
         try (RotatingRedoLogRepository repo = RotatingRedoLogRepository.open(dir, 3, oneFrameBytes())) {
@@ -60,6 +63,9 @@ class RotatingRedoLogRepositoryTest {
         }
     }
 
+    /**
+     * 验证 {@code recoveryScansAcrossRotatedFiles} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void recoveryScansAcrossRotatedFiles() {
         try (RotatingRedoLogRepository repo = RotatingRedoLogRepository.open(dir, 3, oneFrameBytes())) {
@@ -78,6 +84,9 @@ class RotatingRedoLogRepositoryTest {
         }
     }
 
+    /**
+     * 验证 {@code reclaimsFileOnlyBehindCheckpoint} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void reclaimsFileOnlyBehindCheckpoint() {
         try (RotatingRedoLogRepository repo = RotatingRedoLogRepository.open(dir, 2, oneFrameBytes())) {
@@ -98,6 +107,9 @@ class RotatingRedoLogRepositoryTest {
         }
     }
 
+    /**
+     * 验证 {@code refusesAppendWhenRingFullWithoutCheckpointAndKeepsOldRedo} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void refusesAppendWhenRingFullWithoutCheckpointAndKeepsOldRedo() {
         try (RotatingRedoLogRepository repo = RotatingRedoLogRepository.open(dir, 2, oneFrameBytes())) {
@@ -114,6 +126,9 @@ class RotatingRedoLogRepositoryTest {
         }
     }
 
+    /**
+     * 验证 {@code rejectsBatchLargerThanFileCapacity} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void rejectsBatchLargerThanFileCapacity() {
         try (RotatingRedoLogRepository repo = RotatingRedoLogRepository.open(dir, 2, oneFrameBytes())) {

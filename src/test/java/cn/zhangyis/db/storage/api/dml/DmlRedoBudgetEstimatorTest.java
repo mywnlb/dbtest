@@ -21,6 +21,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /** DML workload 必须组合树结构与 undo 首写成本，且在取页前只消费索引元数据快照。 */
 class DmlRedoBudgetEstimatorTest {
 
+    /**
+     * 验证 {@code insertCombinesTreeHeightAndUndoFirstWrite} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void insertCombinesTreeHeightAndUndoFirstWrite() {
         BTreeIndex index = indexAtLevel(2);
@@ -33,6 +36,9 @@ class DmlRedoBudgetEstimatorTest {
         assertTrue(firstWrite > existingUndo);
     }
 
+    /**
+     * 验证 {@code pointRewriteKeepsTreeCostFixedButStillAccountsForUndo} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void pointRewriteKeepsTreeCostFixedButStillAccountsForUndo() {
         BTreeIndex index = indexAtLevel(4);

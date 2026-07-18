@@ -61,6 +61,9 @@ class ExtentDescriptorRepositoryTest {
         return ExtentId.of(SPACE, no);
     }
 
+    /**
+     * 验证 {@code zeroInitDecodesAsFreeUnownedNull} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void zeroInitDecodesAsFreeUnownedNull() {
         withRepo((repo, mtr) -> {
@@ -73,6 +76,9 @@ class ExtentDescriptorRepositoryTest {
         });
     }
 
+    /**
+     * 验证 {@code reserveSystemExtentMarksFixedPagesAndRejectsInitFree} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void reserveSystemExtentMarksFixedPagesAndRejectsInitFree() {
         withRepo((repo, mtr) -> {
@@ -91,6 +97,9 @@ class ExtentDescriptorRepositoryTest {
         });
     }
 
+    /**
+     * 验证 {@code stateOwnerPrevNextRoundTrip} 对应的表空间、区与段分配行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void stateOwnerPrevNextRoundTrip() {
         withRepo((repo, mtr) -> {
@@ -107,6 +116,9 @@ class ExtentDescriptorRepositoryTest {
         });
     }
 
+    /**
+     * 验证 {@code shouldRejectOwnerSegmentZero} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void shouldRejectOwnerSegmentZero() {
         withRepo((repo, mtr) ->
@@ -114,6 +126,9 @@ class ExtentDescriptorRepositoryTest {
                         () -> repo.writeOwner(mtr, ext(2), Optional.of(SegmentId.of(0)))));
     }
 
+    /**
+     * 验证 {@code pageSizeBoundariesUsePagesPerExtent} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void pageSizeBoundariesUsePagesPerExtent() {
         assertEquals(256, PageSize.ofBytes(4 * 1024).pagesPerExtent());
@@ -121,6 +136,9 @@ class ExtentDescriptorRepositoryTest {
         assertEquals(64, PageSize.ofBytes(16 * 1024).pagesPerExtent());
     }
 
+    /**
+     * 验证 {@code bitmapSetClearGet} 对应的表空间、区与段分配行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void bitmapSetClearGet() {
         withRepo((repo, mtr) -> {
@@ -134,6 +152,9 @@ class ExtentDescriptorRepositoryTest {
         });
     }
 
+    /**
+     * 验证 {@code shouldRejectExtentBeyondFirstBatchAndBadIndex} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void shouldRejectExtentBeyondFirstBatchAndBadIndex() {
         withRepo((repo, mtr) -> {
@@ -143,6 +164,9 @@ class ExtentDescriptorRepositoryTest {
         });
     }
 
+    /**
+     * 验证 {@code badStateOrdinalThrowsMetadataException} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void badStateOrdinalThrowsMetadataException() {
         PageStore store = new FileChannelPageStore();

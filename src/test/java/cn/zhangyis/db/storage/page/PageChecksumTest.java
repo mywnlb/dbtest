@@ -38,6 +38,9 @@ class PageChecksumTest {
         }
     }
 
+    /**
+     * 验证 {@code stampThenVerifyPassesAndWritesLow32Lsn} 对应的物理页信封行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void stampThenVerifyPassesAndWritesLow32Lsn() {
         withGuard(PageSize.ofBytes(16 * 1024), (g, ps) -> {
@@ -51,6 +54,9 @@ class PageChecksumTest {
         });
     }
 
+    /**
+     * 验证 {@code tamperFailsVerify} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void tamperFailsVerify() {
         withGuard(PageSize.ofBytes(16 * 1024), (g, ps) -> {
@@ -61,6 +67,9 @@ class PageChecksumTest {
         });
     }
 
+    /**
+     * 验证 {@code worksAcross4kAnd16k} 对应的物理页信封行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void worksAcross4kAnd16k() {
         for (int kb : new int[] {4, 16}) {

@@ -48,6 +48,9 @@ class RecordEncoderHiddenTest {
         return new HiddenColumns(TransactionId.of(0x99), new RollPointer(true, PageNo.of(3), 4));
     }
 
+    /**
+     * 验证 {@code clusteredAppendsFifteenBytes} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void clusteredAppendsFifteenBytes() {
         byte[] plain = encoder.encode(
@@ -57,18 +60,27 @@ class RecordEncoderHiddenTest {
         assertEquals(plain.length + HiddenColumnLayout.HIDDEN_BYTES, withHidden.length);
     }
 
+    /**
+     * 验证 {@code clusteredSchemaButNoHiddenRejected} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void clusteredSchemaButNoHiddenRejected() {
         LogicalRecord noHidden = new LogicalRecord(1, vals(), false, RecordType.CONVENTIONAL);
         assertThrows(DatabaseValidationException.class, () -> encoder.encode(noHidden, clustered()));
     }
 
+    /**
+     * 验证 {@code nonClusteredWithHiddenRejected} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void nonClusteredWithHiddenRejected() {
         LogicalRecord withHidden = new LogicalRecord(1, vals(), false, RecordType.CONVENTIONAL, hidden());
         assertThrows(DatabaseValidationException.class, () -> encoder.encode(withHidden, nonClustered()));
     }
 
+    /**
+     * 验证 {@code clusteredRoundTripCarriesHiddenAndKeepsColumnsClean} 所描述的返回值或状态会按契约保留，并断言原始信息与领域不变量未丢失。
+     */
     @Test
     void clusteredRoundTripCarriesHiddenAndKeepsColumnsClean() {
         HiddenColumns h = hidden();
@@ -78,6 +90,9 @@ class RecordEncoderHiddenTest {
         assertEquals(vals(), back.columnValues());
     }
 
+    /**
+     * 验证 {@code nonClusteredRoundTripHasNoHidden} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void nonClusteredRoundTripHasNoHidden() {
         byte[] buf = encoder.encode(new LogicalRecord(1, vals(), false, RecordType.CONVENTIONAL), nonClustered());
@@ -85,6 +100,9 @@ class RecordEncoderHiddenTest {
         assertNull(back.hiddenColumns());
     }
 
+    /**
+     * 验证 {@code decoderRejectsClusteredSchemaOnNonClusteredBytes} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void decoderRejectsClusteredSchemaOnNonClusteredBytes() {
         byte[] plain = encoder.encode(
@@ -92,6 +110,9 @@ class RecordEncoderHiddenTest {
         assertThrows(RecordFormatException.class, () -> decoder.decode(plain, clustered()));
     }
 
+    /**
+     * 验证 {@code decoderRejectsNonClusteredSchemaOnClusteredBytes} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void decoderRejectsNonClusteredSchemaOnClusteredBytes() {
         byte[] withHidden = encoder.encode(

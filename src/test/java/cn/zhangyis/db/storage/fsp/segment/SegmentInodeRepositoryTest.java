@@ -59,6 +59,9 @@ class SegmentInodeRepositoryTest {
         }
     }
 
+    /**
+     * 验证 {@code allocateThenReadRoundTrips} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void allocateThenReadRoundTrips() {
         withRepo((repo, mtr) -> {
@@ -74,6 +77,9 @@ class SegmentInodeRepositoryTest {
         });
     }
 
+    /**
+     * 验证 {@code shouldRejectSegmentIdZero} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void shouldRejectSegmentIdZero() {
         withRepo((repo, mtr) ->
@@ -81,6 +87,9 @@ class SegmentInodeRepositoryTest {
                         () -> repo.allocateSlot(mtr, SPACE, SegmentId.of(0), SegmentPurpose.SYSTEM)));
     }
 
+    /**
+     * 验证 {@code freeSlotAllowsReuseAndReadingFreeSlotThrows} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void freeSlotAllowsReuseAndReadingFreeSlotThrows() {
         withRepo((repo, mtr) -> {
@@ -95,6 +104,9 @@ class SegmentInodeRepositoryTest {
         });
     }
 
+    /**
+     * 验证 {@code scalarSettersAndFragmentSlots} 对应的表空间、区与段分配行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void scalarSettersAndFragmentSlots() {
         withRepo((repo, mtr) -> {
@@ -112,6 +124,9 @@ class SegmentInodeRepositoryTest {
         });
     }
 
+    /**
+     * 验证 {@code fullFragmentSlotsAndPageZeroThrow} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void fullFragmentSlotsAndPageZeroThrow() {
         withRepo((repo, mtr) -> {
@@ -125,6 +140,9 @@ class SegmentInodeRepositoryTest {
         });
     }
 
+    /**
+     * 验证 {@code badFragmentIndexThrows} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void badFragmentIndexThrows() {
         withRepo((repo, mtr) -> {
@@ -134,6 +152,9 @@ class SegmentInodeRepositoryTest {
         });
     }
 
+    /**
+     * 验证 {@code badPurposeOrdinalThrowsMetadataException} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void badPurposeOrdinalThrowsMetadataException() {
         PageStore store = new FileChannelPageStore();
@@ -156,6 +177,9 @@ class SegmentInodeRepositoryTest {
         }
     }
 
+    /**
+     * 验证 {@code segmentExtentListBaseManagedByFlstCrossPage} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void segmentExtentListBaseManagedByFlstCrossPage() {
         PageStore store = new FileChannelPageStore();
@@ -186,6 +210,9 @@ class SegmentInodeRepositoryTest {
         }
     }
 
+    /**
+     * 验证 {@code hasFreeFragmentSlotReflectsUsage} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void hasFreeFragmentSlotReflectsUsage() {
         withRepo((repo, mtr) -> {

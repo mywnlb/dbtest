@@ -74,6 +74,9 @@ class SegmentPageAllocatorTest {
         }
     }
 
+    /**
+     * 验证 {@code fragmentFirst32ThenExtentPath} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void fragmentFirst32ThenExtentPath() {
         withAlloc(192, new DefaultExtentAllocationPolicy(), (header, inode, flst, alloc, mgr) -> {
@@ -91,6 +94,9 @@ class SegmentPageAllocatorTest {
         });
     }
 
+    /**
+     * 验证 {@code returnsEmptyWhenNoSpaceAndNoAutoextend} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void returnsEmptyWhenNoSpaceAndNoAutoextend() {
         withAlloc(64, new DefaultExtentAllocationPolicy(), (header, inode, flst, alloc, mgr) -> {
@@ -104,6 +110,9 @@ class SegmentPageAllocatorTest {
         });
     }
 
+    /**
+     * 验证 {@code directionalAllocationRequiresHintBeforeFragmentPath} 对应的表空间、区与段分配行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void directionalAllocationRequiresHintBeforeFragmentPath() {
         withAlloc(192, new DefaultExtentAllocationPolicy(), (header, inode, flst, alloc, mgr) -> {
@@ -118,6 +127,9 @@ class SegmentPageAllocatorTest {
         });
     }
 
+    /**
+     * 验证 {@code honorsPolicyAcquiringMultipleExtents} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void honorsPolicyAcquiringMultipleExtents() {
         ExtentAllocationPolicy two = request -> 2;
@@ -137,6 +149,9 @@ class SegmentPageAllocatorTest {
         });
     }
 
+    /**
+     * 验证 {@code noHintKeepsDefaultPolicyToSingleExtentEvenForLargeLeafSegment} 所描述的返回值或状态会按契约保留，并断言原始信息与领域不变量未丢失。
+     */
     @Test
     void noHintKeepsDefaultPolicyToSingleExtentEvenForLargeLeafSegment() {
         withAlloc(384, new DefaultExtentAllocationPolicy(), (header, inode, flst, alloc, mgr) -> {
@@ -155,6 +170,9 @@ class SegmentPageAllocatorTest {
         });
     }
 
+    /**
+     * 验证 {@code directionalLeafGrowthCanAssignMultipleExtents} 所描述的 B+Tree 定位或结构变化，并断言键序、父子链接、页资源和唯一性不变量。
+     */
     @Test
     void directionalLeafGrowthCanAssignMultipleExtents() {
         withAlloc(384, new DefaultExtentAllocationPolicy(), (header, inode, flst, alloc, mgr) -> {

@@ -20,6 +20,7 @@ public sealed interface RedoRecord permits BTreePageDeltaRecord, FspMetadataDelt
      * {@link RedoLogManager#append} 据此分配 LSN 区间，
      * {@link RedoLogBatch} 校验「range 长度 == Σ byteLength」。新增 redo 类型时 byteLength 必须与其文件编码同步推进，
      * 否则批次 LSN 区间会与文件实际字节错位，恢复 reader 将拒绝该批次或读出错位数据。
+     * @return {@code byteLength} 计算出的非负长度、位置或数量；结果必须落在所属页、集合或持久格式容量内，溢出通过领域异常报告
      */
     int byteLength();
 }

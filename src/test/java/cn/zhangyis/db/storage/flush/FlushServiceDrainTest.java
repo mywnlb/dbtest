@@ -66,6 +66,9 @@ class FlushServiceDrainTest {
         assertTrue(found);
     }
 
+    /**
+     * 验证 {@code drainTablespaceFlushesOnlyTargetSpace} 所描述的刷脏与持久化协作，并断言 redo durable 边界先覆盖 page LSN、失败后仍保留脏状态。
+     */
     @Test
     void drainTablespaceFlushesOnlyTargetSpace() {
         try (PageStore store = new FileChannelPageStore();
@@ -91,6 +94,9 @@ class FlushServiceDrainTest {
         }
     }
 
+    /**
+     * 验证 {@code drainTablespaceReturnsTimeoutWhenTargetPageCannotBeSnapshotted} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void drainTablespaceReturnsTimeoutWhenTargetPageCannotBeSnapshotted() {
         try (PageStore store = new FileChannelPageStore();
@@ -136,7 +142,10 @@ class FlushServiceDrainTest {
         }
     }
 
-    /** fixed dirty page 释放后必须唤醒 drain 重试，否则 truncate drain 会等完整超时。 */
+    /** fixed dirty page 释放后必须唤醒 drain 重试，否则 truncate drain 会等完整超时。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void drainTablespaceWakesWhenFixedDirtyPageIsReleased() throws Exception {
         try (PageStore store = new FileChannelPageStore();

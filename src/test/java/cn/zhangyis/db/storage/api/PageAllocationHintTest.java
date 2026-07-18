@@ -13,6 +13,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class PageAllocationHintTest {
 
+    /**
+     * 验证 {@code noneKeepsLegacyNoDirectionDefaults} 所描述的返回值或状态会按契约保留，并断言原始信息与领域不变量未丢失。
+     */
     @Test
     void noneKeepsLegacyNoDirectionDefaults() {
         PageAllocationHint hint = PageAllocationHint.none();
@@ -21,6 +24,9 @@ class PageAllocationHintTest {
         assertEquals(1L, hint.pagesNeeded());
     }
 
+    /**
+     * 验证 {@code directionalFactoriesRequireHintAndPositivePagesNeeded} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void directionalFactoriesRequireHintAndPositivePagesNeeded() {
         PageAllocationHint up = PageAllocationHint.up(PageNo.of(128), 2L);

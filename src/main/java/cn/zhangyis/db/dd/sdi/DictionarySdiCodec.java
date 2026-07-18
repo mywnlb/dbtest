@@ -39,17 +39,32 @@ import java.util.Optional;
  */
 public final class DictionarySdiCodec {
 
-    /** payload magic：ASCII `DDS1`。 */
+    /** payload magic：ASCII `DDS1`。
+     *
+     * 持久格式魔数；读取端用它拒绝错文件或损坏内容，修改会破坏已有数据兼容性。
+     */
     private static final int MAGIC = 0x44445331;
     /** v2 为 binding 增加独立物理行格式版本；decoder 继续接受 v1。 */
     private static final int FORMAT_VERSION = 2;
+    /**
+     * 当前稳定格式版本；编解码与恢复路径共同依赖该值，升级时必须保留旧版本判定。
+     */
     private static final int LEGACY_FORMAT_VERSION = 1;
     /** 单个名称、路径或 ENUM/SET symbol 的 UTF-8 上界。 */
     private static final int MAX_STRING_BYTES = 8 * 1024;
     /** 防止损坏 count 导致无界分配。 */
     private static final int MAX_COLUMNS = 4_096;
+    /**
+     * 类级校验或资源上界；所有实例以该值拒绝超限输入，调整时必须复核容量、等待与格式约束。
+     */
     private static final int MAX_INDEXES = 1_024;
+    /**
+     * 类级校验或资源上界；所有实例以该值拒绝超限输入，调整时必须复核容量、等待与格式约束。
+     */
     private static final int MAX_KEY_PARTS = 1_024;
+    /**
+     * 类级校验或资源上界；所有实例以该值拒绝超限输入，调整时必须复核容量、等待与格式约束。
+     */
     private static final int MAX_SYMBOLS = 65_535;
 
     /**
@@ -159,11 +174,29 @@ public final class DictionarySdiCodec {
         }
     }
 
+    /**
+     * 把语法对象绑定到稳定元数据与类型；绑定期间保持版本一致，失败不发布半绑定结果。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取输入长度、游标边界与必要标识，损坏、截断或超限数据在创建结果前失败。</li>
+     *     <li>按稳定字段或 token 顺序推进游标并调用对应编解码分支，任何分支都不得越过输入边界。</li>
+     *     <li>交叉校验聚合计数、类型、校验值和剩余输入，防止截断或多余内容形成半解析对象。</li>
+     *     <li>完成剩余字段写入或稳定领域结果构造；失败只保留领域异常与根因，不修改调用方输入或其他持久状态。</li>
+     * </ol>
+     *
+     * @param out 调用方打开的定位 IO 或编码写入对象；不得为 {@code null}，方法不接管所有权，失败时仍由创建方关闭
+     * @param binding 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @throws IOException 底层文件读写失败时抛出；调用方不得据此发布持久化成功状态
+     */
     private static void writeBinding(DataOutputStream out, TableStorageBinding binding) throws IOException {
+        // 1、读取输入长度、游标边界与必要标识，在共享或持久副作用前拒绝非法状态。
         out.writeLong(binding.tableId());
         out.writeInt(binding.spaceId().value());
+        // 2、继续完成范围、身份与候选校验；通过后，按稳定字段或 token 顺序推进游标并调用对应编解码分支，保持处理顺序与资源边界。
         writeString(out, binding.path().toString());
         out.writeInt(binding.indexes().size());
+        // 3、在中间分支复核阶段性结果；满足条件后，交叉校验聚合计数、类型、校验值和剩余输入，并维持领域不变量。
         for (IndexStorageBinding index : binding.indexes()) {
             out.writeLong(index.indexId());
             out.writeLong(index.rootPageId().pageNo().value());
@@ -175,19 +208,42 @@ public final class DictionarySdiCodec {
         if (binding.lobSegment().isPresent()) {
             writeSegment(out, binding.lobSegment().orElseThrow());
         }
+        // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
         out.writeLong(binding.rowFormatVersion());
     }
 
+    /**
+     * 把语法对象绑定到稳定元数据与类型；绑定期间保持版本一致，失败不发布半绑定结果。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取输入长度、游标边界与必要标识，损坏、截断或超限数据在创建结果前失败。</li>
+     *     <li>按稳定字段或 token 顺序推进游标并调用对应编解码分支，任何分支都不得越过输入边界。</li>
+     *     <li>交叉校验聚合计数、类型、校验值和剩余输入，防止截断或多余内容形成半解析对象。</li>
+     *     <li>完成剩余字段写入或稳定领域结果构造；失败只保留领域异常与根因，不修改调用方输入或其他持久状态。</li>
+     * </ol>
+     *
+     * @param in 调用方打开的定位 IO 或编码写入对象；不得为 {@code null}，方法不接管所有权，失败时仍由创建方关闭
+     * @param expectedTableId 目标表的稳定字典标识；不得为 {@code null}，且必须与当前元数据和物理绑定一致
+     * @param tableVersion 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @param format 参与 {@code readBinding} 的稳定编码 {@code format}；必须命中当前版本声明的编码集合，未知值以格式或校验异常拒绝
+     * @return {@code readBinding} 形成的不可变定义、计划或元数据快照；成功时不为 {@code null}，内部身份、版本和范围已完成交叉校验
+     * @throws IOException 底层文件读写失败时抛出；调用方不得据此发布持久化成功状态
+     * @throws DictionarySdiCorruptionException 检测到不能安全解释的持久数据损坏时抛出；调用方不得继续发布普通服务或覆盖原始证据
+     */
     private static TableStorageBinding readBinding(DataInputStream in, TableId expectedTableId,
                                                    DictionaryVersion tableVersion, int format) throws IOException {
+        // 1、读取输入长度、游标边界与必要标识，在共享或持久副作用前拒绝非法状态。
         long tableId = in.readLong();
         if (tableId != expectedTableId.value()) {
             throw new DictionarySdiCorruptionException("SDI root/binding table identity mismatch");
         }
         SpaceId spaceId = SpaceId.of(in.readInt());
+        // 2、继续完成范围、身份与候选校验；通过后，按稳定字段或 token 顺序推进游标并调用对应编解码分支，保持处理顺序与资源边界。
         Path path = Path.of(readString(in));
         int count = boundedPositiveCount(in.readInt(), MAX_INDEXES, "binding index");
         List<IndexStorageBinding> indexes = new ArrayList<>(count);
+        // 3、在中间分支复核阶段性结果；满足条件后，交叉校验聚合计数、类型、校验值和剩余输入，并维持领域不变量。
         for (int i = 0; i < count; i++) {
             long indexId = in.readLong();
             PageId root = PageId.of(spaceId, PageNo.of(in.readLong()));
@@ -198,36 +254,74 @@ public final class DictionarySdiCodec {
         Optional<SegmentRef> lob = in.readBoolean()
                 ? Optional.of(readSegment(in, spaceId)) : Optional.empty();
         long rowFormatVersion = format == LEGACY_FORMAT_VERSION ? tableVersion.value() : in.readLong();
+        // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
         return new TableStorageBinding(tableId, spaceId, path, rowFormatVersion, indexes, lob);
     }
 
+    /**
+     * 校验输入与当前状态后修改数据字典领域数据；成功发布完整结果，异常路径保留既有持久化与并发不变量。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取输入长度、游标边界与必要标识，损坏、截断或超限数据在创建结果前失败。</li>
+     *     <li>按稳定字段或 token 顺序推进游标并调用对应编解码分支，任何分支都不得越过输入边界。</li>
+     *     <li>交叉校验聚合计数、类型、校验值和剩余输入，防止截断或多余内容形成半解析对象。</li>
+     *     <li>完成剩余字段写入或稳定领域结果构造；失败只保留领域异常与根因，不修改调用方输入或其他持久状态。</li>
+     * </ol>
+     *
+     * @param out 调用方打开的定位 IO 或编码写入对象；不得为 {@code null}，方法不接管所有权，失败时仍由创建方关闭
+     * @param column 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @throws IOException 底层文件读写失败时抛出；调用方不得据此发布持久化成功状态
+     */
     private static void writeColumn(DataOutputStream out, ColumnDefinition column) throws IOException {
+        // 1、读取输入长度、游标边界与必要标识，在共享或持久副作用前拒绝非法状态。
         out.writeLong(column.columnId());
         writeName(out, column.name());
         out.writeInt(column.ordinal());
         ColumnTypeDefinition type = column.type();
+        // 2、继续完成范围、身份与候选校验；通过后，按稳定字段或 token 顺序推进游标并调用对应编解码分支，保持处理顺序与资源边界。
         out.writeInt(type.typeId().stableCode());
         out.writeBoolean(type.unsigned());
         out.writeBoolean(type.nullable());
         out.writeInt(type.length());
+        // 3、在中间分支复核阶段性结果；满足条件后，交叉校验聚合计数、类型、校验值和剩余输入，并维持领域不变量。
         out.writeInt(type.scale());
         out.writeInt(type.charsetId());
         out.writeInt(type.collationId());
         out.writeInt(type.symbols().size());
+        // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
         for (String symbol : type.symbols()) {
             writeString(out, symbol);
         }
     }
 
+    /**
+     * 根据调用参数创建或转换 {@code readColumn} 返回的 {@code ColumnDefinition}；输入先完成领域校验，成功结果不为 {@code null}。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取输入长度、游标边界与必要标识，损坏、截断或超限数据在创建结果前失败。</li>
+     *     <li>按稳定字段或 token 顺序推进游标并调用对应编解码分支，任何分支都不得越过输入边界。</li>
+     *     <li>交叉校验聚合计数、类型、校验值和剩余输入，防止截断或多余内容形成半解析对象。</li>
+     *     <li>完成剩余字段写入或稳定领域结果构造；失败只保留领域异常与根因，不修改调用方输入或其他持久状态。</li>
+     * </ol>
+     *
+     * @param in 调用方打开的定位 IO 或编码写入对象；不得为 {@code null}，方法不接管所有权，失败时仍由创建方关闭
+     * @return {@code readColumn} 形成的不可变定义、计划或元数据快照；成功时不为 {@code null}，内部身份、版本和范围已完成交叉校验
+     * @throws IOException 底层文件读写失败时抛出；调用方不得据此发布持久化成功状态
+     */
     private static ColumnDefinition readColumn(DataInputStream in) throws IOException {
+        // 1、读取输入长度、游标边界与必要标识，在共享或持久副作用前拒绝非法状态。
         long columnId = in.readLong();
         ObjectName name = readName(in);
         int ordinal = in.readInt();
         DictionaryTypeId typeId = DictionaryTypeId.fromStableCode(in.readInt());
+        // 2、继续完成范围、身份与候选校验；通过后，按稳定字段或 token 顺序推进游标并调用对应编解码分支，保持处理顺序与资源边界。
         boolean unsigned = in.readBoolean();
         boolean nullable = in.readBoolean();
         int length = in.readInt();
         int scale = in.readInt();
+        // 3、在中间分支复核阶段性结果；满足条件后，交叉校验聚合计数、类型、校验值和剩余输入，并维持领域不变量。
         int charset = in.readInt();
         int collation = in.readInt();
         int symbolCount = boundedCount(in.readInt(), MAX_SYMBOLS, "symbol");
@@ -235,17 +329,37 @@ public final class DictionarySdiCodec {
         for (int i = 0; i < symbolCount; i++) {
             symbols.add(readString(in));
         }
+        // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
         return new ColumnDefinition(columnId, name,
                 new ColumnTypeDefinition(typeId, unsigned, nullable, length, scale, charset, collation, symbols),
                 ordinal);
     }
 
+    /**
+     * 校验输入与当前状态后修改数据字典领域数据；成功发布完整结果，异常路径保留既有持久化与并发不变量。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取输入长度、游标边界与必要标识，损坏、截断或超限数据在创建结果前失败。</li>
+     *     <li>按稳定字段或 token 顺序推进游标并调用对应编解码分支，任何分支都不得越过输入边界。</li>
+     *     <li>交叉校验聚合计数、类型、校验值和剩余输入，防止截断或多余内容形成半解析对象。</li>
+     *     <li>完成剩余字段写入或稳定领域结果构造；失败只保留领域异常与根因，不修改调用方输入或其他持久状态。</li>
+     * </ol>
+     *
+     * @param out 调用方打开的定位 IO 或编码写入对象；不得为 {@code null}，方法不接管所有权，失败时仍由创建方关闭
+     * @param index 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @throws IOException 底层文件读写失败时抛出；调用方不得据此发布持久化成功状态
+     */
     private static void writeIndex(DataOutputStream out, IndexDefinition index) throws IOException {
+        // 1、读取输入长度、游标边界与必要标识，在共享或持久副作用前拒绝非法状态。
         out.writeLong(index.id().value());
+        // 2、继续完成范围、身份与候选校验；通过后，按稳定字段或 token 顺序推进游标并调用对应编解码分支，保持处理顺序与资源边界。
         writeName(out, index.name());
         out.writeBoolean(index.unique());
+        // 3、在中间分支复核阶段性结果；满足条件后，交叉校验聚合计数、类型、校验值和剩余输入，并维持领域不变量。
         out.writeBoolean(index.clustered());
         out.writeInt(index.keyParts().size());
+        // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
         for (IndexKeyPart part : index.keyParts()) {
             out.writeLong(part.columnId());
             out.writeByte(indexOrderCode(part.order()));
@@ -253,16 +367,35 @@ public final class DictionarySdiCodec {
         }
     }
 
+    /**
+     * 根据调用参数创建或转换 {@code readIndex} 返回的 {@code IndexDefinition}；输入先完成领域校验，成功结果不为 {@code null}。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取输入长度、游标边界与必要标识，损坏、截断或超限数据在创建结果前失败。</li>
+     *     <li>按稳定字段或 token 顺序推进游标并调用对应编解码分支，任何分支都不得越过输入边界。</li>
+     *     <li>交叉校验聚合计数、类型、校验值和剩余输入，防止截断或多余内容形成半解析对象。</li>
+     *     <li>完成剩余字段写入或稳定领域结果构造；失败只保留领域异常与根因，不修改调用方输入或其他持久状态。</li>
+     * </ol>
+     *
+     * @param in 调用方打开的定位 IO 或编码写入对象；不得为 {@code null}，方法不接管所有权，失败时仍由创建方关闭
+     * @return {@code readIndex} 形成的不可变定义、计划或元数据快照；成功时不为 {@code null}，内部身份、版本和范围已完成交叉校验
+     * @throws IOException 底层文件读写失败时抛出；调用方不得据此发布持久化成功状态
+     */
     private static IndexDefinition readIndex(DataInputStream in) throws IOException {
+        // 1、读取输入长度、游标边界与必要标识，在共享或持久副作用前拒绝非法状态。
         IndexId id = IndexId.of(in.readLong());
         ObjectName name = readName(in);
+        // 2、继续完成范围、身份与候选校验；通过后，按稳定字段或 token 顺序推进游标并调用对应编解码分支，保持处理顺序与资源边界。
         boolean unique = in.readBoolean();
         boolean clustered = in.readBoolean();
+        // 3、在中间分支复核阶段性结果；满足条件后，交叉校验聚合计数、类型、校验值和剩余输入，并维持领域不变量。
         int count = boundedPositiveCount(in.readInt(), MAX_KEY_PARTS, "index key part");
         List<IndexKeyPart> parts = new ArrayList<>(count);
         for (int i = 0; i < count; i++) {
             parts.add(new IndexKeyPart(in.readLong(), indexOrderFromCode(in.readUnsignedByte()), in.readInt()));
         }
+        // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
         return new IndexDefinition(id, name, unique, clustered, parts);
     }
 
@@ -280,6 +413,14 @@ public final class DictionarySdiCodec {
         writeString(out, name.canonicalName());
     }
 
+    /**
+     * 根据调用参数创建或转换 {@code readName} 返回的 {@code ObjectName}；输入先完成领域校验，成功结果不为 {@code null}。
+     *
+     * @param in 调用方打开的定位 IO 或编码写入对象；不得为 {@code null}，方法不接管所有权，失败时仍由创建方关闭
+     * @return {@code readName} 定位或分配的稳定值对象；成功时不为 {@code null}，其身份、范围和特殊值已由构造校验保证
+     * @throws IOException 底层文件读写失败时抛出；调用方不得据此发布持久化成功状态
+     * @throws DictionarySdiCorruptionException 检测到不能安全解释的持久数据损坏时抛出；调用方不得继续发布普通服务或覆盖原始证据
+     */
     private static ObjectName readName(DataInputStream in) throws IOException {
         String display = readString(in);
         String canonical = readString(in);
@@ -291,6 +432,14 @@ public final class DictionarySdiCodec {
         return name;
     }
 
+    /**
+     * 校验输入与当前状态后修改数据字典领域数据；成功发布完整结果，异常路径保留既有持久化与并发不变量。
+     *
+     * @param out 调用方打开的定位 IO 或编码写入对象；不得为 {@code null}，方法不接管所有权，失败时仍由创建方关闭
+     * @param value 传给 {@code writeString} 的文本值；不得为 {@code null} 或空白，并保持调用方提供的字符顺序
+     * @throws IOException 底层文件读写失败时抛出；调用方不得据此发布持久化成功状态
+     * @throws DictionarySdiCorruptionException 检测到不能安全解释的持久数据损坏时抛出；调用方不得继续发布普通服务或覆盖原始证据
+     */
     private static void writeString(DataOutputStream out, String value) throws IOException {
         if (value == null) {
             throw new DictionarySdiCorruptionException("dictionary SDI string must not be null");
@@ -303,6 +452,14 @@ public final class DictionarySdiCodec {
         out.write(bytes);
     }
 
+    /**
+     * 根据调用参数创建或转换 {@code readString} 返回的 {@code String}；输入先完成领域校验，成功结果不为 {@code null}。
+     *
+     * @param in 调用方打开的定位 IO 或编码写入对象；不得为 {@code null}，方法不接管所有权，失败时仍由创建方关闭
+     * @return {@code readString} 生成的非空文本表示；字符顺序保持 SQL、标识符或诊断格式约定，无结果时返回空串而非 {@code null}
+     * @throws IOException 底层文件读写失败时抛出；调用方不得据此发布持久化成功状态
+     * @throws DictionarySdiCorruptionException 检测到不能安全解释的持久数据损坏时抛出；调用方不得继续发布普通服务或覆盖原始证据
+     */
     private static String readString(DataInputStream in) throws IOException {
         int length = in.readInt();
         if (length < 0 || length > MAX_STRING_BYTES) {
@@ -336,6 +493,8 @@ public final class DictionarySdiCodec {
             case ACTIVE -> 1;
             case DROP_PENDING -> 2;
             case DROPPED -> 3;
+            case DISCARD_PENDING, DISCARDED, IMPORT_PENDING ->
+                    throw new DictionarySdiCorruptionException("non-active tablespace state cannot enter SDI: " + state);
         };
     }
 
@@ -363,6 +522,13 @@ public final class DictionarySdiCodec {
         };
     }
 
+    /**
+     * 根据调用参数创建或转换 {@code write} 返回的 {@code byte[]}；输入先完成领域校验，成功结果不为 {@code null}。
+     *
+     * @param writer 由组合根提供的 {@code IoWriter} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code write} 调用
+     * @return {@code write} 生成的非空字节表示；调用方获得独立结果或受控视图，格式失败通过领域异常报告
+     * @throws DictionarySdiCorruptionException 检测到不能安全解释的持久数据损坏时抛出；调用方不得继续发布普通服务或覆盖原始证据
+     */
     private static byte[] write(IoWriter writer) {
         try {
             ByteArrayOutputStream bytes = new ByteArrayOutputStream();
@@ -377,8 +543,17 @@ public final class DictionarySdiCodec {
         }
     }
 
+    /**
+     * 定义数据字典的 {@code IoWriter} 稳定协作契约；调用方只依赖该接口，不读取实现内部状态或资源。
+     */
     @FunctionalInterface
     private interface IoWriter {
+        /**
+         * 校验输入与当前状态后修改数据字典领域数据；成功发布完整结果，异常路径保留既有持久化与并发不变量。
+         *
+         * @param out 调用方打开的定位 IO 或编码写入对象；不得为 {@code null}，方法不接管所有权，失败时仍由创建方关闭
+         * @throws IOException 底层文件读写失败时抛出；调用方不得据此发布持久化成功状态
+         */
         void write(DataOutputStream out) throws IOException;
     }
 }

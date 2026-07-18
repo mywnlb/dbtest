@@ -48,6 +48,9 @@ class DiskSpaceManagerGeneralLifecyclePersistenceTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code generalTablespacePersistsNormalLifecycleOnCreate} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void generalTablespacePersistsNormalLifecycleOnCreate() {
         Path path = dir.resolve("general-normal.ibd");
@@ -72,6 +75,9 @@ class DiskSpaceManagerGeneralLifecyclePersistenceTest {
         }
     }
 
+    /**
+     * 验证 {@code persistedCorruptedBlocksOrdinaryAccessAfterReopen} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void persistedCorruptedBlocksOrdinaryAccessAfterReopen() {
         Path path = dir.resolve("general-corrupted.ibd");
@@ -92,6 +98,9 @@ class DiskSpaceManagerGeneralLifecyclePersistenceTest {
         }
     }
 
+    /**
+     * 验证 {@code recoveryOpenAllowsPersistedCorruptedTablespace} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void recoveryOpenAllowsPersistedCorruptedTablespace() {
         Path path = dir.resolve("general-corrupted-recovery.ibd");
@@ -108,6 +117,9 @@ class DiskSpaceManagerGeneralLifecyclePersistenceTest {
         }
     }
 
+    /**
+     * 验证 {@code legacyGeneralWithoutLifecycleMarkerOpensAsNormal} 所描述的边界场景保持既有领域不变量，不产生方法名明确禁止的副作用。
+     */
     @Test
     void legacyGeneralWithoutLifecycleMarkerOpensAsNormal() {
         Path path = dir.resolve("legacy-general.ibd");

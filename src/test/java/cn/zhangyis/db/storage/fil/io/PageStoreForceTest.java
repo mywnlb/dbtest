@@ -24,6 +24,9 @@ class PageStoreForceTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code forceExistingTablespaceSucceedsAndUnknownTablespaceFails} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void forceExistingTablespaceSucceedsAndUnknownTablespaceFails() {
         try (PageStore store = new FileChannelPageStore()) {

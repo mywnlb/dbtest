@@ -13,6 +13,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /** TransactionSystem：id/no 单调、活跃表快照拷贝隔离。 */
 class TransactionSystemTest {
 
+    /**
+     * 验证 {@code writeIdsAreMonotonic} 对应的事务、MVCC 与锁行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void writeIdsAreMonotonic() {
         TransactionSystem sys = new TransactionSystem();
@@ -21,6 +24,9 @@ class TransactionSystemTest {
         assertTrue(b.value() > a.value());
     }
 
+    /**
+     * 验证 {@code transactionNosAreMonotonic} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void transactionNosAreMonotonic() {
         TransactionSystem sys = new TransactionSystem();
@@ -29,6 +35,9 @@ class TransactionSystemTest {
         assertTrue(b.value() > a.value());
     }
 
+    /**
+     * 验证 {@code snapshotIsIsolatedCopy} 对应的事务、MVCC 与锁行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void snapshotIsIsolatedCopy() {
         TransactionSystem sys = new TransactionSystem();
@@ -41,6 +50,9 @@ class TransactionSystemTest {
         assertTrue(sys.snapshotActiveReadWriteIds().contains(b.value()));
     }
 
+    /**
+     * 验证 {@code removeActiveDropsId} 对应的事务、MVCC 与锁行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void removeActiveDropsId() {
         TransactionSystem sys = new TransactionSystem();
@@ -49,6 +61,9 @@ class TransactionSystemTest {
         assertEquals(Set.of(), sys.snapshotActiveReadWriteIds());
     }
 
+    /**
+     * 验证 {@code restoreCountersOnlyMovesForwardAndDrivesNextAllocations} 对应的事务、MVCC 与锁行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void restoreCountersOnlyMovesForwardAndDrivesNextAllocations() {
         TransactionSystem sys = new TransactionSystem();

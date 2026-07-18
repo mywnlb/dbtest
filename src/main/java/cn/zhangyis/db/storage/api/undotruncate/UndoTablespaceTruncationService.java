@@ -50,22 +50,84 @@ import java.util.Optional;
  */
 public final class UndoTablespaceTruncationService {
 
+    /**
+     * 本对象持有的 {@code bufferPool} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private final BufferPool bufferPool;
+    /**
+     * 本对象持有的 {@code pageStore} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private final PageStore pageStore;
+    /**
+     * 本对象持有的 {@code pageSize} 页面、记录或布局状态；身份与 schema 必须匹配，访问期间遵守 fix/latch 和字节边界，不能泄漏未发布修改。
+     */
     private final PageSize pageSize;
+    /**
+     * 本对象持有的 {@code registry} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private final TablespaceRegistry registry;
+    /**
+     * 本对象持有的 {@code accessController} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private final TablespaceAccessController accessController;
+    /**
+     * 本对象持有的 {@code mtrManager} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private final MiniTransactionManager mtrManager;
+    /**
+     * 本对象持有的 {@code redo} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private final RedoLogManager redo;
+    /**
+     * 本对象持有的 {@code flushService} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private final FlushService flushService;
+    /**
+     * 构造时冻结的 {@code waitTimeout} 时间边界；不得为负，零仅表示立即检查，等待路径依赖该值保证不会无界阻塞。
+     */
     private final Duration waitTimeout;
+    /**
+     * 本次事务链路持有的 {@code faultInjector} undo/rollback 状态；事务身份、roll pointer 与段代际必须一致，提交、回滚和 purge 路径依赖它完成收口。
+     */
     private final UndoTruncationFaultInjector faultInjector;
+    /**
+     * 本对象持有的 {@code headerRepository} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private final SpaceHeaderRepository headerRepository;
+    /**
+     * 本对象持有的 {@code inodeRepository} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private final SegmentInodeRepository inodeRepository;
+    /**
+     * 本对象持有的 {@code rebuilder} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private final UndoTablespaceFspRebuilder rebuilder;
     /** 负责 marker 前验证空 history/排空 cache/free owner，以及物理重建时恢复 page3 v4 空目录。 */
     private final UndoReusableSegmentTruncationCoordinator cachedSegmentCoordinator;
 
+    /**
+     * 创建 {@code UndoTablespaceTruncationService}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝 null、越界和相互矛盾的组合。</li>
+     *     <li>完成跨参数校验并推导不可变配置；若构造过程创建自有资源，后续失败必须在异常路径关闭。</li>
+     *     <li>把已校验协作者与配置绑定到字段，并初始化本对象拥有的状态、显式锁、队列或缓存，不允许 this 提前逃逸。</li>
+     *     <li>构造完成后对象处于类契约声明的初始状态；任一步失败都抛出领域异常且不发布半初始化实例。</li>
+     * </ol>
+     *
+     * @param bufferPool 由组合根提供的 {@code BufferPool} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param pageStore 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param pageSize 调用方提供的长度或容量值对象；不得为 {@code null}，且必须已通过其构造范围校验
+     * @param registry 由组合根提供的 {@code TablespaceRegistry} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param accessController 由组合根提供的 {@code TablespaceAccessController} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param mtrManager 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param flushService 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param waitTimeout 本次等待或操作的最大时长；不得为 {@code null} 且必须为正，超时不得留下未释放资源
+     * @param faultInjector 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param cachedSegmentCoordinator 由组合根提供的 {@code UndoReusableSegmentTruncationCoordinator} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public UndoTablespaceTruncationService(
             BufferPool bufferPool,
             PageStore pageStore,
@@ -77,6 +139,7 @@ public final class UndoTablespaceTruncationService {
             Duration waitTimeout,
             UndoTruncationFaultInjector faultInjector,
             UndoReusableSegmentTruncationCoordinator cachedSegmentCoordinator) {
+        // 1、校验必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝非法组合。
         if (bufferPool == null || pageStore == null || pageSize == null || registry == null
                 || accessController == null || mtrManager == null || flushService == null
                 || waitTimeout == null || faultInjector == null || cachedSegmentCoordinator == null) {
@@ -88,16 +151,19 @@ public final class UndoTablespaceTruncationService {
         this.bufferPool = bufferPool;
         this.pageStore = pageStore;
         this.pageSize = pageSize;
+        // 2、完成跨参数校验并推导不可变配置；后续失败仍由当前构造路径收口已创建资源。
         this.registry = registry;
         this.accessController = accessController;
         this.mtrManager = mtrManager;
         this.redo = mtrManager.redoLogManager();
         this.flushService = flushService;
+        // 3、绑定已校验协作者并初始化本对象拥有的状态、显式锁、队列或缓存，不允许半初始化实例逃逸。
         this.waitTimeout = waitTimeout;
         this.faultInjector = faultInjector;
         this.headerRepository = new SpaceHeaderRepository(bufferPool);
         this.inodeRepository = new SegmentInodeRepository(bufferPool, pageSize);
         this.rebuilder = new UndoTablespaceFspRebuilder(bufferPool, pageSize);
+        // 4、完成初始状态发布；失败以领域异常终止构造，成功对象满足类级生命周期不变量。
         this.cachedSegmentCoordinator = cachedSegmentCoordinator;
     }
 
@@ -108,6 +174,7 @@ public final class UndoTablespaceTruncationService {
      * @param spaceId 显式配置且已打开的 UNDO 表空间。
      * @param finishState 完成后 ACTIVE 或 INACTIVE；续作时必须与 marker 中记录的一致。
      * @return 稳定完成结果。
+     * @throws UndoTablespaceTruncationException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
      */
     public UndoTablespaceTruncationResult truncate(SpaceId spaceId, TablespaceState finishState) {
         validateRequest(spaceId, finishState);
@@ -211,6 +278,12 @@ public final class UndoTablespaceTruncationService {
         }
     }
 
+    /**
+     * 定位并读取存储引擎稳定 API领域对象；先校验标识与准入状态，返回值只暴露稳定视图或受控句柄。
+     *
+     * @param spaceId 目标表空间的稳定标识；不得为 {@code null}，且必须已注册并满足当前生命周期准入条件
+     * @return {@code readState} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     */
     private ReadState readState(SpaceId spaceId) {
         MiniTransaction mtr = mtrManager.beginReadOnly();
         try {
@@ -226,6 +299,12 @@ public final class UndoTablespaceTruncationService {
         }
     }
 
+    /**
+     * 校验 {@code ensureNoAllocatedInodes} 涉及的存储引擎稳定 API结构、范围与交叉字段；合法输入不修改状态，非法输入在副作用前抛出领域异常。
+     *
+     * @param spaceId 目标表空间的稳定标识；不得为 {@code null}，且必须已注册并满足当前生命周期准入条件
+     * @throws UndoTablespaceNotEmptyException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
+     */
     private void ensureNoAllocatedInodes(SpaceId spaceId) {
         MiniTransaction mtr = mtrManager.beginReadOnly();
         try {
@@ -241,6 +320,13 @@ public final class UndoTablespaceTruncationService {
         }
     }
 
+    /**
+     * 校验输入与当前状态后修改存储引擎稳定 API领域数据；成功发布完整结果，异常路径保留既有持久化与并发不变量。
+     *
+     * @param spaceId 目标表空间的稳定标识；不得为 {@code null}，且必须已注册并满足当前生命周期准入条件
+     * @param lifecycle 表空间文件或 segment 的稳定身份与生命周期快照；不得为 {@code null}，必须与已打开文件和当前 generation 一致
+     * @return {@code writeLifecycle} 定位或分配的稳定值对象；成功时不为 {@code null}，其身份、范围和特殊值已由构造校验保证
+     */
     private Lsn writeLifecycle(SpaceId spaceId, TablespaceLifecycleHeader lifecycle) {
         MiniTransaction mtr = mtrManager.begin(
                 mtrManager.budgetFor(RedoBudgetPurpose.UNDO_TRUNCATE_LIFECYCLE));
@@ -322,6 +408,13 @@ public final class UndoTablespaceTruncationService {
                 lifecycle.targetSizeInPages(), markerLsn, lifecycle.state());
     }
 
+    /**
+     * 封装存储引擎稳定 API中 {@code ReadState} 的槽位、预留或阶段结果；组件在创建时交叉校验，使恢复和释放路径能区分已完成与剩余工作。
+     *
+     * @param header 本次操作的不可变上下文或权威快照；不得为 {@code null}，其中的版本、owner 与资源边界必须来自同一次调用链
+     * @param lifecycle 可选的 {@code lifecycle}；参数本身不得为 {@code null}，空 {@code Optional} 明确表示调用方未提供该领域值
+     * @param pageLsn redo 日志边界；不得为 {@code null}，必须单调且与调用方已发布的页或事务状态一致
+     */
     private record ReadState(
             SpaceHeaderSnapshot header,
             Optional<TablespaceLifecycleHeader> lifecycle,

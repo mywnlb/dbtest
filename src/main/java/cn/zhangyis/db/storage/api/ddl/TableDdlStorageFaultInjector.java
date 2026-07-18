@@ -10,6 +10,9 @@ interface TableDdlStorageFaultInjector {
     /** 生产空实现。 */
     TableDdlStorageFaultInjector NO_OP = binding -> { };
 
-    /** DISCARDED marker 的 redo 和 page0 已 force，但 frame 尚未 invalidate、文件尚未删除。 */
+    /** DISCARDED marker 的 redo 和 page0 已 force，但 frame 尚未 invalidate、文件尚未删除。
+     *
+     * @param binding 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     */
     void afterDiscardedDurable(TableStorageBinding binding);
 }

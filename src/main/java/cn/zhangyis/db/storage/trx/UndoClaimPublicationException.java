@@ -9,12 +9,19 @@ import cn.zhangyis.db.common.exception.DatabaseFatalException;
  */
 public final class UndoClaimPublicationException extends DatabaseFatalException {
 
-    /** 创建只包含 fail-stop 发布诊断的异常。 */
+    /** 创建只包含 fail-stop 发布诊断的异常。
+     *
+     * @param message 包含领域上下文的诊断信息；不得为空白，也不能替代原始异常原因
+     */
     public UndoClaimPublicationException(String message) {
         super(message);
     }
 
-    /** 创建并保留持久 claim 或 context 发布失败的根因。 */
+    /** 创建并保留持久 claim 或 context 发布失败的根因。
+     *
+     * @param message 包含领域上下文的诊断信息；不得为空白，也不能替代原始异常原因
+     * @param cause 需要分类或包装的原始失败；不得为 {@code null}，包装时必须保留 cause 与 suppressed 异常图
+     */
     public UndoClaimPublicationException(String message, Throwable cause) {
         super(message, cause);
     }

@@ -33,6 +33,9 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
  */
 class MiniTransactionManagerTest {
 
+    /**
+     * 验证 {@code dynamicPurposeShouldRequireDomainWorkloadBeforeBegin} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void dynamicPurposeShouldRequireDomainWorkloadBeforeBegin() {
         MiniTransactionManager mgr = new MiniTransactionManager();
@@ -52,6 +55,9 @@ class MiniTransactionManagerTest {
                 lobBudget.logicalUpperBound());
     }
 
+    /**
+     * 验证 {@code beginShouldActivateAndBind} 对应的Mini Transaction行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void beginShouldActivateAndBind() {
         MiniTransactionManager mgr = new MiniTransactionManager();
@@ -61,6 +67,9 @@ class MiniTransactionManagerTest {
         mgr.commit(mtr);
     }
 
+    /**
+     * 验证 {@code nestedBeginShouldThrow} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void nestedBeginShouldThrow() {
         MiniTransactionManager mgr = new MiniTransactionManager();
@@ -69,12 +78,18 @@ class MiniTransactionManagerTest {
         mgr.commit(mtr);
     }
 
+    /**
+     * 验证 {@code currentWithoutActiveShouldThrow} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void currentWithoutActiveShouldThrow() {
         MiniTransactionManager mgr = new MiniTransactionManager();
         assertThrows(MtrStateException.class, mgr::current);
     }
 
+    /**
+     * 验证 {@code commitShouldUnbindAndAllowRebegin} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void commitShouldUnbindAndAllowRebegin() {
         MiniTransactionManager mgr = new MiniTransactionManager();
@@ -86,6 +101,9 @@ class MiniTransactionManagerTest {
         mgr.commit(second);
     }
 
+    /**
+     * 验证 {@code commitUnboundTransactionShouldThrow} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void commitUnboundTransactionShouldThrow() {
         MiniTransactionManager mgr = new MiniTransactionManager();
@@ -94,6 +112,9 @@ class MiniTransactionManagerTest {
         assertThrows(MtrStateException.class, () -> mgr.commit(mtr));
     }
 
+    /**
+     * 验证 {@code rollbackShouldUnbind} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void rollbackShouldUnbind() {
         MiniTransactionManager mgr = new MiniTransactionManager();
@@ -103,6 +124,11 @@ class MiniTransactionManagerTest {
         assertThrows(MtrStateException.class, mgr::current);
     }
 
+    /**
+     * 验证 {@code commitFromAnotherThreadShouldBeRejected} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     *
+     * @throws InterruptedException 等待被中断时抛出；调用方应恢复中断标志并终止当前资源获取流程
+     */
     @Test
     void commitFromAnotherThreadShouldBeRejected() throws InterruptedException {
         MiniTransactionManager mgr = new MiniTransactionManager();
@@ -121,6 +147,9 @@ class MiniTransactionManagerTest {
         mgr.commit(mtr);
     }
 
+    /**
+     * 验证 {@code beginReservesForegroundRedoBytesBeforePageLatch} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void beginReservesForegroundRedoBytesBeforePageLatch() {
         AtomicInteger flushRequests = new AtomicInteger();
@@ -145,6 +174,9 @@ class MiniTransactionManagerTest {
         mgr.commit(mtr);
     }
 
+    /**
+     * 验证 {@code readOnlyBeginUsesZeroBudgetUnderSmallCapacity} 对应的Mini Transaction行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void readOnlyBeginUsesZeroBudgetUnderSmallCapacity() {
         AtomicInteger flushRequests = new AtomicInteger();
@@ -160,6 +192,9 @@ class MiniTransactionManagerTest {
         assertEquals(0, flushRequests.get());
     }
 
+    /**
+     * 验证 {@code underestimatedBudgetFailsCommitWithoutPublishingRollbackPath} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void underestimatedBudgetFailsCommitWithoutPublishingRollbackPath() {
         MiniTransactionManager mgr = new MiniTransactionManager();

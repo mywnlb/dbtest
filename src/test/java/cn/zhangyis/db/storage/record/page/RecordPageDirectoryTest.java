@@ -27,6 +27,9 @@ class RecordPageDirectoryTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code readWriteSlots} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void readWriteSlots() {
         PageStore store = new FileChannelPageStore();
@@ -45,6 +48,9 @@ class RecordPageDirectoryTest {
         }
     }
 
+    /**
+     * 验证 {@code insertAndRemoveShiftSlots} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void insertAndRemoveShiftSlots() {
         PageStore store = new FileChannelPageStore();
@@ -70,6 +76,9 @@ class RecordPageDirectoryTest {
         }
     }
 
+    /**
+     * 验证 {@code insertSlotRejectedWhenNoRoom} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void insertSlotRejectedWhenNoRoom() {
         PageStore store = new FileChannelPageStore();

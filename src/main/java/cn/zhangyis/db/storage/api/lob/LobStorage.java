@@ -58,6 +58,15 @@ public final class LobStorage {
     /** Record 类型入口；必须与 B+Tree/Undo 使用同样的稳定编码规则。 */
     private final TypeCodecRegistry codecs;
 
+    /**
+     * 创建 {@code LobStorage}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param diskSpace 由组合根提供的 {@code DiskSpaceManager} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param pool 由组合根提供的 {@code BufferPool} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param pageSize 调用方提供的长度或容量值对象；不得为 {@code null}，且必须已通过其构造范围校验
+     * @param codecs 由组合根提供的 {@code TypeCodecRegistry} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public LobStorage(DiskSpaceManager diskSpace, BufferPool pool, PageSize pageSize,
                       TypeCodecRegistry codecs) {
         if (diskSpace == null || pool == null || pageSize == null || codecs == null) {
@@ -73,25 +82,38 @@ public final class LobStorage {
      * 无 IO 地冻结新的 LOB 页链计划。inline/空值不应进入 externalize 路径；segment purpose 刻意留到
      * {@link #writePlanned(MiniTransaction, LobWritePlan)} 开始物理动作前复核，使该方法可安全用于 begin admission。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取并校验调用参数与当前领域状态，确保失败发生在本方法创建共享或持久副作用之前。</li>
+     *     <li>按类级并发协议取得本阶段所需协作者与 Guard，竞争后重新校验资源身份和生命周期。</li>
+     *     <li>执行核心状态转换或数据变换，并只通过本包稳定协作者发布可观察副作用。</li>
+     *     <li>汇总稳定结果并沿现有 finally/Guard 释放资源；异常不得伪造成功或清除未完成状态。</li>
+     * </ol>
+     *
      * @param segment 精确 table binding 提供的候选 LOB segment identity。
      * @param type TEXT/BLOB/JSON family 类型。
      * @param value 完整 StringValue/BinaryValue，不能是已有 external reference。
      * @return 冻结 payload、CRC、页数、prefix 与 workload 的纯计划。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public LobWritePlan planWrite(SegmentRef segment, ColumnType type, ColumnValue value) {
+        // 1、读取并校验调用参数与当前领域状态，在共享或持久副作用前拒绝非法状态。
         if (segment == null || type == null || value == null) {
             throw new DatabaseValidationException("LOB write plan arguments must not be null");
         }
         LobCodec codec = requireLobCodec(type);
+        // 2、继续完成范围、身份与候选校验；通过后，按类级并发协议取得本阶段所需协作者与 Guard，保持处理顺序与资源边界。
         byte[] payload = codec.logicalBytesForStorage(value, type);
         if (payload.length == 0) {
             throw new DatabaseValidationException("empty LOB should remain inline instead of allocating a page chain");
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，执行核心状态转换或数据变换，并维持领域不变量。
         if (payload.length <= LobCodec.INLINE_PAYLOAD_LIMIT) {
             throw new DatabaseValidationException("LOB payload within inline limit must not allocate a page chain: "
                     + payload.length);
         }
         int count = pageCount(payload.length, LobPageLayout.payloadCapacity(pageSize));
+        // 4、汇总稳定结果并沿现有 finally/Guard 释放资源，以稳定返回或领域异常完成收口。
         return new LobWritePlan(segment, type, payload, count, crc32(payload),
                 codec.inlinePrefix(payload, type), writeWorkload(payload.length));
     }
@@ -99,6 +121,11 @@ public final class LobStorage {
     /**
      * 在 DML begin 前验证一个非 NULL LOB 逻辑值并判断是否超过 inline 阈值。该方法无 IO、无 allocation；
      * 已经 external 的值不是 INSERT raw input，交由 LobCodec 明确拒绝。
+     *
+     * @param type 选择 {@code requiresExternalization} 分支的 {@code ColumnType} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     * @param value 参与记录编解码或索引比较的字段值；不得为 {@code null}，其类型、字节边界和 SQL NULL 语义必须与当前 schema 一致
+     * @return {@code requiresExternalization} 命名的领域事实成立时为 {@code true}，否则为 {@code false}；查询本身不改变权威状态
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public boolean requiresExternalization(ColumnType type, ColumnValue value) {
         if (type == null || value == null) {
@@ -111,6 +138,10 @@ public final class LobStorage {
     /**
      * 用短只读 MTR 复核 table binding 指向的 segment identity/purpose。LOB-aware DML 在业务 MTR admission 前调用，
      * 使旧 catalog 缺 binding 或错误 purpose 不会留下 undo owner、row 或新 LOB 页副作用。
+     *
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param segment 参与 {@code preflightSegment} 的稳定领域标识 {@code SegmentRef}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public void preflightSegment(MiniTransaction mtr, SegmentRef segment) {
         if (mtr == null || segment == null) {
@@ -122,8 +153,23 @@ public final class LobStorage {
     /**
      * 按冻结计划写出新链并返回仍由调用方持有的 ownership guard。purpose preflight 是本方法的第一项 FSP 行为；
      * 任一 allocation/format 失败会在同一 active MTR 内尽力反序回收本次已分配页并保留原始失败。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取并校验调用参数与当前领域状态，确保失败发生在本方法创建共享或持久副作用之前。</li>
+     *     <li>按类级并发协议取得本阶段所需协作者与 Guard，竞争后重新校验资源身份和生命周期。</li>
+     *     <li>执行核心状态转换与受控 IO，把必要的 redo、dirty 或诊断副作用交给既有下游。</li>
+     *     <li>汇总稳定结果并沿现有 finally/Guard 释放资源；异常不得伪造成功或清除未完成状态。</li>
+     * </ol>
+     *
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param plan 调用方已校验的执行计划、批次、范围或候选对象；不得为 {@code null}，边界必须有序且不得跨越所属事务、表或日志批次
+     * @return {@code writePlanned} 准备或解码出的中间领域对象；成功时不为 {@code null}，其边界、资源归属和后续发布阶段已明确
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws LobAllocationStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
      */
     public LobWriteAllocation writePlanned(MiniTransaction mtr, LobWritePlan plan) {
+        // 1、读取并校验调用参数与当前领域状态，在共享或持久副作用前拒绝非法状态。
         if (mtr == null || plan == null) {
             throw new DatabaseValidationException("planned LOB write arguments must not be null");
         }
@@ -131,12 +177,14 @@ public final class LobStorage {
             throw new LobAllocationStateException("planned LOB write requires ACTIVE MTR: " + mtr.state());
         }
         validateFrozenPlan(plan);
+        // 2、继续完成范围、身份与候选校验；通过后，按类级并发协议取得本阶段所需协作者与 Guard，保持处理顺序与资源边界。
         SegmentRef segment = plan.segment();
         byte[] payload = plan.payloadUnsafe();
         int capacity = LobPageLayout.payloadCapacity(pageSize);
         List<PageId> allocated = new ArrayList<>(plan.pageCount());
 
         // identity/purpose 复核严格早于 reserve/allocate；纯 plan 阶段不读取 inode，也不产生任何物理副作用。
+        // 3、在中间分支复核阶段性结果；满足条件后，执行核心状态转换与受控 IO，并维持领域不变量。
         requireLobSegment(mtr, segment);
         try (SpaceReservation ignored = diskSpace.reserveSpace(
                 mtr, segment.spaceId(), SpaceReservationKind.BLOB, plan.pageCount(), 0)) {
@@ -165,6 +213,7 @@ public final class LobStorage {
                 plan.totalLength(), plan.pageCount(), segment.segmentId(), segment.inodeSlot(), plan.crc32());
         ColumnValue.ExternalValue external = new ColumnValue.ExternalValue(plan.type().typeId(), reference,
                 plan.inlinePrefix());
+        // 4、汇总稳定结果并沿现有 finally/Guard 释放资源，以稳定返回或领域异常完成收口。
         return new LobWriteAllocation(this, mtr, segment, allocated, external);
     }
 
@@ -189,6 +238,12 @@ public final class LobStorage {
 
     /**
      * 读取并校验 external value 的完整页链。链中任一信封、链接、归属、长度或 CRC 不一致都 fail-closed。
+     *
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param type 选择 {@code read} 分支的 {@code ColumnType} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     * @param external 参与记录编解码或索引比较的字段值；不得为 {@code null}，其类型、字节边界和 SQL NULL 语义必须与当前 schema 一致
+     * @return {@code read} 编码、解码或重建的记录数据；成功时不为 {@code null}，字段顺序、隐藏列和字节边界满足当前 schema
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public ColumnValue read(MiniTransaction mtr, ColumnType type, ColumnValue.ExternalValue external) {
         if (mtr == null || type == null || external == null) {
@@ -266,6 +321,7 @@ public final class LobStorage {
             }
         }
         // 3. 一 segment 批次只计一次固定 FSP/segment 成本；所有页数来自已验证 external envelope。
+        // 4、汇总稳定结果并沿现有 finally/Guard 释放资源，以稳定返回或领域异常完成收口。
         return new LobFreeBatchPlan(segment, ordered, freeBatchWorkload(totalPages));
     }
 
@@ -283,6 +339,9 @@ public final class LobStorage {
      * @param mtr 具备动态 redo admission 的 ACTIVE 写 MTR。
      * @param plan 由本实例冻结的一 segment 批量计划。
      * @throws DatabaseRuntimeException 计划、链、segment、FSP 或页重初始化失败时抛出；调用方必须按物理边界分类。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws LobAllocationStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
+     * @throws LobPageCorruptedException 检测到不能安全解释的持久数据损坏时抛出；调用方不得继续发布普通服务或覆盖原始证据
      */
     public void freePlannedBatch(MiniTransaction mtr, LobFreeBatchPlan plan) {
         // 1. admission 后仍重算计划，禁止损坏/陈旧对象改变 target 顺序、identity 或预算。
@@ -324,13 +383,22 @@ public final class LobStorage {
         }
     }
 
-    /** 写操作在 begin 前使用的保守 redo workload；每个 LOB 页另计 FSP/INODE/XDES 与 page body 余量。 */
+    /** 写操作在 begin 前使用的保守 redo workload；每个 LOB 页另计 FSP/INODE/XDES 与 page body 余量。
+     *
+     * @param logicalLength 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @return {@code writeWorkload} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     */
     public RedoBudgetWorkload writeWorkload(int logicalLength) {
         int count = pageCount(logicalLength, LobPageLayout.payloadCapacity(pageSize));
         return RedoBudgetWorkload.pageImages(checkedWorkload(8L + count * 8L));
     }
 
-    /** free 操作在 begin 前使用的保守 redo workload。 */
+    /** free 操作在 begin 前使用的保守 redo workload。
+     *
+     * @param pageCount 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @return {@code freeWorkload} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public RedoBudgetWorkload freeWorkload(int pageCount) {
         if (pageCount <= 0) {
             throw new DatabaseValidationException("LOB free page count must be positive");
@@ -349,8 +417,23 @@ public final class LobStorage {
         return freeWorkload(pageCount);
     }
 
-    /** 沿 reference 精确页数读取，逐页释放 S latch，并在返回前验证整值长度/CRC。 */
+    /** 沿 reference 精确页数读取，逐页释放 S latch，并在返回前验证整值长度/CRC。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取并校验调用参数与当前领域状态，确保失败发生在本方法创建共享或持久副作用之前。</li>
+     *     <li>按类级并发协议取得本阶段所需协作者与 Guard，竞争后重新校验资源身份和生命周期。</li>
+     *     <li>执行核心状态转换与受控 IO，把必要的 redo、dirty 或诊断副作用交给既有下游。</li>
+     *     <li>汇总稳定结果并沿现有 finally/Guard 释放资源；异常不得伪造成功或清除未完成状态。</li>
+     * </ol>
+     *
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param reference LOB 数据或其稳定外部引用；不得为 {@code null}，引用身份、长度与校验信息必须匹配所属记录
+     * @return {@code loadChain} 准备或解码出的中间领域对象；成功时不为 {@code null}，其边界、资源归属和后续发布阶段已明确
+     * @throws LobPageCorruptedException 检测到不能安全解释的持久数据损坏时抛出；调用方不得继续发布普通服务或覆盖原始证据
+     */
     private LoadedChain loadChain(MiniTransaction mtr, LobReference reference) {
+        // 1、读取并校验调用参数与当前领域状态，在共享或持久副作用前拒绝非法状态。
         int capacity = LobPageLayout.payloadCapacity(pageSize);
         int canonicalPageCount = pageCount(reference.totalLength(), capacity);
         if (reference.pageCount() != canonicalPageCount) {
@@ -358,10 +441,12 @@ public final class LobStorage {
                     + canonicalPageCount + ", actual=" + reference.pageCount());
         }
         byte[] payload = new byte[reference.totalLength()];
+        // 2、继续完成范围、身份与候选校验；通过后，按类级并发协议取得本阶段所需协作者与 Guard，保持处理顺序与资源边界。
         List<PageId> pageIds = new ArrayList<>(reference.pageCount());
         Set<Long> visited = new HashSet<>();
         long currentPageNo = reference.firstPageNo().value();
         long expectedPrevious = FilePageHeader.FIL_NULL;
+        // 3、在中间分支复核阶段性结果；满足条件后，执行核心状态转换与受控 IO，并维持领域不变量。
         int payloadOffset = 0;
 
         for (int index = 0; index < reference.pageCount(); index++) {
@@ -396,6 +481,7 @@ public final class LobStorage {
             throw new LobPageCorruptedException("LOB whole-value CRC mismatch: expected="
                     + reference.crc32() + ", actual=" + actualCrc);
         }
+        // 4、汇总稳定结果并沿现有 finally/Guard 释放资源，以稳定返回或领域异常完成收口。
         return new LoadedChain(payload, List.copyOf(pageIds));
     }
 
@@ -413,6 +499,13 @@ public final class LobStorage {
         }
     }
 
+    /**
+     * 校验 {@code requireLobSegment} 涉及的存储引擎稳定 API结构、范围与交叉字段；合法输入不修改状态，非法输入在副作用前抛出领域异常。
+     *
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param segment 参与 {@code requireLobSegment} 的稳定领域标识 {@code SegmentRef}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @throws LobSegmentMismatchException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
+     */
     private void requireLobSegment(MiniTransaction mtr, SegmentRef segment) {
         try {
             diskSpace.requireSegmentPurposeForWrite(mtr, segment, SegmentPurpose.LOB);
@@ -466,6 +559,12 @@ public final class LobStorage {
     /**
      * Guard 专用补偿原语：只接受当前 active MTR 刚分配且尚未发布的页，按 allocation 反序 free/reinitialize。
      * 继续尝试全部页并把后续失败压到首个根因，禁止对已发布普通 LOB 调用。
+     *
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param segment 参与 {@code compensateAllocation} 的稳定领域标识 {@code SegmentRef}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param allocated 参与 {@code compensateAllocation} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws LobAllocationStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
      */
     void compensateAllocation(MiniTransaction mtr, SegmentRef segment, List<PageId> allocated) {
         if (mtr == null || segment == null || allocated == null || allocated.isEmpty()) {
@@ -535,7 +634,11 @@ public final class LobStorage {
         return crc.getValue();
     }
 
-    /** 完整校验后的页链快照；读 latch 均已释放，可安全进入 FSP 修改阶段。 */
+    /** 完整校验后的页链快照；读 latch 均已释放，可安全进入 FSP 修改阶段。
+     *
+     * @param payload 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @param pageIds 参与 {@code 构造} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     */
     private record LoadedChain(byte[] payload, List<PageId> pageIds) {
     }
 }

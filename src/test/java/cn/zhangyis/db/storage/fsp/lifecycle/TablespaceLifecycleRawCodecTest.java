@@ -16,6 +16,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class TablespaceLifecycleRawCodecTest {
 
+    /**
+     * 验证 {@code oldFormatLifecycleMagicZeroReturnsEmpty} 所描述的稳定格式转换，并断言往返值、字节布局、版本与损坏输入处理。
+     */
     @Test
     void oldFormatLifecycleMagicZeroReturnsEmpty() {
         ByteBuffer page = ByteBuffer.allocate(PageSize.ofBytes(16 * 1024).bytes());
@@ -23,6 +26,9 @@ class TablespaceLifecycleRawCodecTest {
         assertTrue(TablespaceLifecycleRawCodec.read(page).isEmpty());
     }
 
+    /**
+     * 验证 {@code generalLifecycleRejectsTruncationEpoch} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void generalLifecycleRejectsTruncationEpoch() {
         PageNo initialSize = PageNo.of(64);
@@ -35,6 +41,9 @@ class TablespaceLifecycleRawCodecTest {
                 TablespaceState.NORMAL));
     }
 
+    /**
+     * 验证 {@code generalLifecycleRejectsTruncationTarget} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void generalLifecycleRejectsTruncationTarget() {
         assertThrows(DatabaseValidationException.class, () -> new TablespaceLifecycleHeader(

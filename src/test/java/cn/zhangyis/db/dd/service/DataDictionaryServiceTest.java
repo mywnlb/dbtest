@@ -47,7 +47,10 @@ class DataDictionaryServiceTest {
     @TempDir
     Path directory;
 
-    /** 执行者持有 lease 时 DROP 的 MDL X 不能越过；close 后 X 才能授予。 */
+    /** 执行者持有 lease 时 DROP 的 MDL X 不能越过；close 后 X 才能授予。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void tableLeasePinsVersionAndHoldsSharedMetadataLock() throws Exception {
         try (Fixture fixture = fixture()) {

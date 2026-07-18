@@ -82,6 +82,9 @@ class RecordPageDeleterTest {
         }
     }
 
+    /**
+     * 验证 {@code deleteMarkKeepsRecordInChainAndQueryable} 所描述的返回值或状态会按契约保留，并断言原始信息与领域不变量未丢失。
+     */
     @Test
     void deleteMarkKeepsRecordInChainAndQueryable() {
         onPage((rp, schema) -> {
@@ -101,6 +104,9 @@ class RecordPageDeleterTest {
         });
     }
 
+    /**
+     * 验证 {@code rejectsDoubleDeleteMarkAndSystemRecord} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void rejectsDoubleDeleteMarkAndSystemRecord() {
         onPage((rp, schema) -> {

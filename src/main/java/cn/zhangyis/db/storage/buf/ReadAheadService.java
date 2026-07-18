@@ -35,6 +35,9 @@ import java.util.concurrent.locks.ReentrantLock;
  */
 public final class ReadAheadService implements ReadAheadHook, AutoCloseable {
 
+    /**
+     * 类级不可变配置常量；所有实例共享该边界，非法调整会破坏Buffer Pool的不变量。
+     */
     private static final long NANOS_PER_SECOND = 1_000_000_000L;
 
     /** 预取目标池；worker 对其调 {@code prefetch}。 */
@@ -46,6 +49,9 @@ public final class ReadAheadService implements ReadAheadHook, AutoCloseable {
     /** 有界预取请求队列容量，防止后台停滞时无限堆积。 */
     private final int queueCapacity;
 
+    /**
+     * 保护本对象共享状态的显式并发闩；获取后必须在 {@code finally} 或 Guard 关闭路径释放。
+     */
     private final ReentrantLock lock = new ReentrantLock();
     /** 有新请求或停止时唤醒 worker。 */
     private final Condition workAvailable = lock.newCondition();
@@ -56,9 +62,15 @@ public final class ReadAheadService implements ReadAheadHook, AutoCloseable {
     /** worker 终止信号，stop(timeout) 等待它。 */
     private final CountDownLatch terminated = new CountDownLatch(1);
 
+    /**
+     * 本对象的权威状态机字段 {@code state}；只有合法转换方法可以更新，更新受显式锁、原子发布或单一 owner 线程保护，下游据此决定可执行阶段。
+     */
     private ReadAheadState state = ReadAheadState.NEW;
     /** 是否有一批预取正在锁外执行。 */
     private boolean inFlight;
+    /**
+     * 本对象拥有的后台工作线程；启动、停止与引用清理必须由生命周期锁协调，关闭后不得残留存活线程。
+     */
     private Thread thread;
 
     /**
@@ -73,31 +85,47 @@ public final class ReadAheadService implements ReadAheadHook, AutoCloseable {
     }
 
     /**
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝 null、越界和相互矛盾的组合。</li>
+     *     <li>完成跨参数校验并推导不可变配置；若构造过程创建自有资源，后续失败必须在异常路径关闭。</li>
+     *     <li>把已校验协作者与配置绑定到字段，并初始化本对象拥有的状态、显式锁、队列或缓存，不允许 this 提前逃逸。</li>
+     *     <li>构造完成后对象处于类契约声明的初始状态；任一步失败都抛出领域异常且不发布半初始化实例。</li>
+     * </ol>
+     *
      * @param bufferPool      预取目标池。
      * @param linearThreshold linear read-ahead 触发阈值（同一 extent 连续访问页数，1..64）。
      * @param randomThreshold random read-ahead 触发阈值（同一 extent 驻留页数，1..64）；<b>0 表示禁用</b>（不构造检测器、
      *                        普通路径不查 residentCountInRange），对齐 MySQL 默认 OFF。
      * @param queueCapacity   预取请求队列容量（≥1）。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public ReadAheadService(BufferPool bufferPool, int linearThreshold, int randomThreshold, int queueCapacity) {
+        // 1、校验必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝非法组合。
         if (bufferPool == null) {
             throw new DatabaseValidationException("read-ahead buffer pool must not be null");
         }
         if (queueCapacity < 1) {
             throw new DatabaseValidationException("read-ahead queue capacity must be >= 1: " + queueCapacity);
         }
+        // 2、完成跨参数校验并推导不可变配置；后续失败仍由当前构造路径收口已创建资源。
         if (randomThreshold < 0) {
             throw new DatabaseValidationException("random read-ahead threshold must be >= 0 (0 disables): "
                     + randomThreshold);
         }
         this.bufferPool = bufferPool;
+        // 3、绑定已校验协作者并初始化本对象拥有的状态、显式锁、队列或缓存，不允许半初始化实例逃逸。
         this.tracker = new LinearReadAheadTracker(linearThreshold);
         // threshold 0 → 不构造检测器（random 禁用），使普通 recordAccess 不查 residentCountInRange、零额外开销。
         this.randomDetector = randomThreshold == 0 ? null : new RandomReadAheadDetector(randomThreshold);
+        // 4、完成初始状态发布；失败以领域异常终止构造，成功对象满足类级生命周期不变量。
         this.queueCapacity = queueCapacity;
     }
 
-    /** 启动后台 worker。只能从 NEW 启动一次。 */
+    /** 启动后台 worker。只能从 NEW 启动一次。
+     *
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public void start() {
         lock.lock();
         try {
@@ -116,6 +144,7 @@ public final class ReadAheadService implements ReadAheadHook, AutoCloseable {
     /**
      * 上报一次页访问（{@link ReadAheadHook}）。喂检测器，若产出预取请求则入队（队满或已停止则丢弃）。
      * 该方法廉价、非阻塞、不抛异常——它在 demand read 热路径上被调用。
+     * @param pageId 目标页的稳定物理标识；必须属于当前已准入表空间，且不得为 {@code null}
      */
     @Override
     public void recordAccess(PageId pageId) {
@@ -227,7 +256,10 @@ public final class ReadAheadService implements ReadAheadHook, AutoCloseable {
         }
     }
 
-    /** 当前 worker 状态。 */
+    /** 当前 worker 状态。
+     *
+     * @return {@code state} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     */
     public ReadAheadState state() {
         lock.lock();
         try {
@@ -295,7 +327,10 @@ public final class ReadAheadService implements ReadAheadHook, AutoCloseable {
         }
     }
 
-    /** 锁外逐页预取一个 extent。prefetch 最佳努力（跳过已驻留 / 无空闲帧丢弃 / 吞 IO 失败），故不会让 worker 失败。 */
+    /** 锁外逐页预取一个 extent。prefetch 最佳努力（跳过已驻留 / 无空闲帧丢弃 / 吞 IO 失败），故不会让 worker 失败。
+     *
+     * @param request 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     */
     private void prefetchExtent(ReadAheadRequest request) {
         long first = request.firstPageNo();
         for (int i = 0; i < request.pageCount(); i++) {

@@ -45,12 +45,29 @@ import java.util.function.Supplier;
  * hydration 和 DML statement guard 均留在本包，SQL 层不会接触物理类型。
  */
 public final class DefaultSqlStorageGateway implements SqlStorageGateway {
+    /**
+     * 类级不可变配置常量；所有实例共享该边界，非法调整会破坏SQL 与存储引擎适配层的不变量。
+     */
     private static final BigInteger TWO = BigInteger.valueOf(2);
+    /**
+     * 本对象持有的 {@code engine} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private final StorageEngine engine;
+    /**
+     * 本对象拥有的 {@code mapper} 受控集合；元素生命周期与外层对象一致，仅由本类方法更新，对外暴露时必须返回副本或不可变视图。
+     */
     private final DictionaryStorageMetadataMapper mapper;
     /** 行锁等待与 handle 并发占用都必须有界；Session 可用 statement timeout 构造此 adapter。 */
     private final Duration operationTimeout;
 
+    /**
+     * 创建 {@code DefaultSqlStorageGateway}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param engine 由组合根提供的 {@code StorageEngine} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param mapper 参与 {@code 构造} 的键值映射；不得为 {@code null}，空映射表示没有条目，键和值均不得包含 Java {@code null}
+     * @param operationTimeout 本次等待或操作的最大时长；不得为 {@code null} 且必须为正，超时不得留下未释放资源
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public DefaultSqlStorageGateway(StorageEngine engine, DictionaryStorageMetadataMapper mapper,
                                     Duration operationTimeout) {
         if (engine == null || mapper == null || operationTimeout == null
@@ -62,7 +79,12 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
         this.operationTimeout = operationTimeout;
     }
 
-    /** 显式映射 SQL isolation；v1 只开放已有 RR/RC ReadView 语义。 */
+    /** 显式映射 SQL isolation；v1 只开放已有 RR/RC ReadView 语义。
+     *
+     * @param request 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @return {@code begin} 取得或创建的受控存储资源；成功时不为 {@code null}，调用方必须按其 Guard/lease 契约释放
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     @Override
     public SqlTransactionHandle begin(SqlTransactionRequest request) {
         if (request == null) throw new DatabaseValidationException("SQL transaction request must not be null");
@@ -89,6 +111,12 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
      *     <li>创建 statement guard 后调用 DML facade，row-lock timeout 取配置与 deadline 剩余值的较小者。</li>
      *     <li>成功关闭 guard 并发布 handle wrote；失败由 guard 做 partial rollback，异常保留 rollback-only/fatal 语义。</li>
      * </ol>
+     *
+     * @param transaction 调用方持有的 {@code SqlTransactionHandle} 资源句柄；不得为 {@code null} 且必须处于有效期，方法返回前所有权仍归调用方
+     * @param statement 调用方请求的目标状态、阶段或模式；不得为 {@code null}，且必须是当前状态机允许的后继值
+     * @param deadline SQL 解析、绑定或执行链路提供的语句、值或会话上下文；不得为 {@code null}，必须属于当前语句及会话的同一次执行
+     * @return {@code insert} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     @Override
     public SqlWriteOutcome insert(SqlTransactionHandle transaction, BoundClusteredInsert statement,
@@ -127,7 +155,14 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
         });
     }
 
-    /** 主键点 UPDATE：在 storage 的 FOR_UPDATE 锁定版本上应用 typed patch，避免 gateway 先读后写竞态。 */
+    /** 主键点 UPDATE：在 storage 的 FOR_UPDATE 锁定版本上应用 typed patch，避免 gateway 先读后写竞态。
+     *
+     * @param transaction 调用方持有的 {@code SqlTransactionHandle} 资源句柄；不得为 {@code null} 且必须处于有效期，方法返回前所有权仍归调用方
+     * @param statement 调用方请求的目标状态、阶段或模式；不得为 {@code null}，且必须是当前状态机允许的后继值
+     * @param deadline SQL 解析、绑定或执行链路提供的语句、值或会话上下文；不得为 {@code null}，必须属于当前语句及会话的同一次执行
+     * @return {@code update} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     @Override
     public SqlWriteOutcome update(SqlTransactionHandle transaction, BoundUpdate statement,
                                   SqlStatementDeadline deadline) {
@@ -166,7 +201,14 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
         });
     }
 
-    /** 主键点 DELETE：LOB binding 与 exact-version 多索引 metadata 一并交给表级 DML。 */
+    /** 主键点 DELETE：LOB binding 与 exact-version 多索引 metadata 一并交给表级 DML。
+     *
+     * @param transaction 调用方持有的 {@code SqlTransactionHandle} 资源句柄；不得为 {@code null} 且必须处于有效期，方法返回前所有权仍归调用方
+     * @param statement 调用方请求的目标状态、阶段或模式；不得为 {@code null}，且必须是当前状态机允许的后继值
+     * @param deadline SQL 解析、绑定或执行链路提供的语句、值或会话上下文；不得为 {@code null}，必须属于当前语句及会话的同一次执行
+     * @return {@code delete} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     @Override
     public SqlWriteOutcome delete(SqlTransactionHandle transaction, BoundDelete statement,
                                   SqlStatementDeadline deadline) {
@@ -208,6 +250,12 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
      *     <li>完整行 hydration 后才按 projection ordinal 转换公开 SqlValue，避免返回 partial row/reference。</li>
      *     <li>finally 注销 RC view；读取失败为主异常，close 失败作为 suppressed，fatal 严重度不得降级。</li>
      * </ol>
+     *
+     * @param transaction 调用方持有的 {@code SqlTransactionHandle} 资源句柄；不得为 {@code null} 且必须处于有效期，方法返回前所有权仍归调用方
+     * @param statement 调用方请求的目标状态、阶段或模式；不得为 {@code null}，且必须是当前状态机允许的后继值
+     * @param deadline SQL 解析、绑定或执行链路提供的语句、值或会话上下文；不得为 {@code null}，必须属于当前语句及会话的同一次执行
+     * @return {@code selectPoint} 按身份或键定位到的对象；未找到、不可见或尚未持久化时为空 {@code Optional}，从不返回 Java {@code null}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     @Override
     public Optional<SqlRow> selectPoint(SqlTransactionHandle transaction, BoundPointSelect statement,
@@ -348,7 +396,13 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
         });
     }
 
-    /** 首写事务走 DML durability/lock 收尾；未成功写入的事务直接完成内存生命周期且释放可能存在的行锁。 */
+    /** 首写事务走 DML durability/lock 收尾；未成功写入的事务直接完成内存生命周期且释放可能存在的行锁。
+     *
+     * @param transaction 调用方持有的 {@code SqlTransactionHandle} 资源句柄；不得为 {@code null} 且必须处于有效期，方法返回前所有权仍归调用方
+     * @param request 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @return {@code commit} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     @Override
     public SqlCommitOutcome commit(SqlTransactionHandle transaction, SqlCommitRequest request) {
         if (request == null) throw new DatabaseValidationException("SQL commit request must not be null");
@@ -378,7 +432,11 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
         });
     }
 
-    /** 有 undo 使用 DD resolver 做跨表 full rollback；无 undo 走轻量生命周期，终态后才释放锁。 */
+    /** 有 undo 使用 DD resolver 做跨表 full rollback；无 undo 走轻量生命周期，终态后才释放锁。
+     *
+     * @param transaction 调用方持有的 {@code SqlTransactionHandle} 资源句柄；不得为 {@code null} 且必须处于有效期，方法返回前所有权仍归调用方
+     * @return {@code rollback} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     */
     @Override
     public SqlRollbackOutcome rollback(SqlTransactionHandle transaction) {
         return withActive(transaction, null, handle -> {
@@ -524,6 +582,12 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
         return List.copyOf(rows);
     }
 
+    /**
+     * 校验当前状态后推进SQL 与存储引擎适配层状态机；成功发布唯一终态，失败保留可回滚或可恢复的原始状态。
+     *
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param original 需要分类或包装的原始失败；不得为 {@code null}，包装时必须保留 cause 与 suppressed 异常图
+     */
     private void rollbackMtr(MiniTransaction mtr, RuntimeException original) {
         if (mtr.state() != MiniTransactionState.ACTIVE) return;
         try { engine.miniTransactionManager().rollbackUncommitted(mtr); }

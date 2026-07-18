@@ -20,6 +20,7 @@ import cn.zhangyis.db.storage.api.ddl.TableDdlStorageService;
 import cn.zhangyis.db.storage.api.TablePurgeBarrier;
 import cn.zhangyis.db.storage.api.ddl.SecondaryIndexBuildDescriptor;
 import cn.zhangyis.db.storage.api.ddl.IndexStorageBinding;
+import cn.zhangyis.db.storage.api.tablespace.TablespaceFileIdentity;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;
@@ -78,6 +79,14 @@ public final class DictionaryDdlRecoveryService {
     /**
      * 构造生产 DDL 恢复服务；StorageEngine 完成 history rebuild/RESUME_PURGE 后，每个 pending 物理删除前仍复核 barrier。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝 null、越界和相互矛盾的组合。</li>
+     *     <li>完成跨参数校验并推导不可变配置；若构造过程创建自有资源，后续失败必须在异常路径关闭。</li>
+     *     <li>把已校验协作者与配置绑定到字段，并初始化本对象拥有的状态、显式锁、队列或缓存，不允许 this 提前逃逸。</li>
+     *     <li>构造完成后对象处于类契约声明的初始状态；任一步失败都抛出领域异常且不发布半初始化实例。</li>
+     * </ol>
+     *
      * @param control         字典 id/version 的 durable 单调分配器。
      * @param repository      committed catalog 仓储与 recovery snapshot 来源。
      * @param cache           table metadata cache/invalidation 入口。
@@ -92,17 +101,21 @@ public final class DictionaryDdlRecoveryService {
                                         TableDdlStorageService physical,
                                         Path tablesDirectory,
                                         TablePurgeBarrier purgeBarrier) {
+        // 1、校验必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝非法组合。
         if (control == null || repository == null || cache == null || physical == null || tablesDirectory == null
                 || purgeBarrier == null) {
             throw new DatabaseValidationException("dictionary DDL recovery collaborators/path must not be null");
         }
         this.control = control;
+        // 2、完成跨参数校验并推导不可变配置；后续失败仍由当前构造路径收口已创建资源。
         this.repository = repository;
         this.cache = cache;
         this.physical = physical;
+        // 3、绑定已校验协作者并初始化本对象拥有的状态、显式锁、队列或缓存，不允许半初始化实例逃逸。
         this.purgeBarrier = purgeBarrier;
         this.tablesDirectory = tablesDirectory.toAbsolutePath().normalize();
         this.discovery = new DictionaryTablespaceDiscovery(repository, tablesDirectory);
+        // 4、完成初始状态发布；失败以领域异常终止构造，成功对象满足类级生命周期不变量。
         this.sdi = new SerializedDictionaryInfoService(physical);
     }
 
@@ -170,7 +183,91 @@ public final class DictionaryDdlRecoveryService {
             case CREATE_TABLE -> recoverCreate(record);
             case CREATE_INDEX -> recoverCreateIndex(record, timeout);
             case DROP_TABLE -> recoverDrop(record, timeout);
+            case DISCARD_TABLESPACE -> recoverDiscard(record, timeout);
+            case IMPORT_TABLESPACE -> recoverImport(record, timeout);
         }
+    }
+
+    /**
+     * 执行数据字典恢复或重放步骤；按持久证据校验并幂等推进状态，不执行普通 SQL 业务语义。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取 checkpoint、redo、doublewrite 或事务持久证据，并校验阶段、范围与文件身份。</li>
+     *     <li>依据 page LSN、恢复进度和稳定标识判断跳过或续作，保证重复启动不会重复产生副作用。</li>
+     *     <li>按恢复阶段应用物理页或事务状态变化，并在每个可恢复边界记录已完成进度。</li>
+     *     <li>发布恢复结果并释放恢复专用资源；失败保持 fail-closed，不能提前开放普通 SQL 流量。</li>
+     * </ol>
+     *
+     * @param record 参与本次操作的记录或记录集合；不得为 {@code null}，顺序、身份与编码必须满足当前索引或日志格式
+     * @param timeout 本次等待或操作的最大时长；不得为 {@code null} 且必须为正，超时不得留下未释放资源
+     * @throws DictionaryRecoveryException 恢复证据、阶段顺序或事务重建无法继续时抛出；owner 应停止恢复并保持普通流量关闭
+     */
+    private void recoverDiscard(DdlLogRecord record, Duration timeout) {
+        // 1、读取 checkpoint、redo、doublewrite 或事务持久证据，在共享或持久副作用前拒绝非法状态。
+        Path path = checkedMarkerPath(record);
+        Path quarantine = record.auxiliaryPath().map(discovery::checkedPath).orElseThrow(() ->
+                new DictionaryRecoveryException("DISCARD marker has no quarantine path"));
+        // 2、继续完成范围、身份与候选校验；通过后，依据 page LSN、恢复进度和稳定标识判断跳过或续作，保持处理顺序与资源边界。
+        TableId tableId = TableId.of(record.marker().affectedObjectId());
+        TableDefinition table = repository.findTableForRecovery(tableId).orElseThrow(() ->
+                new DictionaryRecoveryException("DISCARD marker target table is absent: " + tableId.value()));
+        // 3、在中间分支复核阶段性结果；满足条件后，按恢复阶段应用物理页或事务状态变化，并维持领域不变量。
+        if (table.state() == TableState.ACTIVE) {
+            if (record.phase() != DdlLogPhase.PREPARED) throw new DictionaryRecoveryException("DISCARD ACTIVE phase mismatch");
+            repository.ddlLog().transition(DdlId.of(record.marker().ddlOperationId()), DdlLogPhase.PREPARED, DdlLogPhase.ROLLED_BACK);
+            return;
+        }
+        if (table.state() == TableState.DISCARD_PENDING) {
+            if (record.phase() == DdlLogPhase.PREPARED) repository.ddlLog().transition(DdlId.of(record.marker().ddlOperationId()), DdlLogPhase.PREPARED, DdlLogPhase.DICTIONARY_COMMITTED);
+            if (Files.exists(path)) physical.discardTablespace(table.storageBinding().orElseThrow(), quarantine, timeout);
+            if (repository.ddlLog().find(DdlId.of(record.marker().ddlOperationId())).orElseThrow().phase() == DdlLogPhase.DICTIONARY_COMMITTED)
+                repository.ddlLog().transition(DdlId.of(record.marker().ddlOperationId()), DdlLogPhase.DICTIONARY_COMMITTED, DdlLogPhase.ENGINE_DONE);
+            DictionaryIdAllocation ids = control.reserve(new DictionaryIdRequest(0,0,0,0,0,1));
+            try (DictionaryTransaction tx = repository.begin(DictionaryVersion.of(ids.dictionaryVersion()))) {
+                tx.updateTable(new TableDefinition(table.id(), table.schemaId(), table.name(), DictionaryVersion.of(ids.dictionaryVersion()), TableState.DISCARDED, table.columns(), table.indexes(), table.storageBinding())); tx.commit();
+            }
+            cache.invalidateTable(table.id(), DictionaryVersion.of(ids.dictionaryVersion()));
+            repository.ddlLog().transition(DdlId.of(record.marker().ddlOperationId()), DdlLogPhase.ENGINE_DONE, DdlLogPhase.COMMITTED);
+            return;
+        }
+        // 4、发布恢复结果并释放恢复专用资源，以稳定返回或领域异常完成收口。
+        if (table.state() == TableState.DISCARDED) finishDroppedMarker(record);
+    }
+
+    /**
+     * 执行数据字典恢复或重放步骤；按持久证据校验并幂等推进状态，不执行普通 SQL 业务语义。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取 checkpoint、redo、doublewrite 或事务持久证据，并校验阶段、范围与文件身份。</li>
+     *     <li>依据 page LSN、恢复进度和稳定标识判断跳过或续作，保证重复启动不会重复产生副作用。</li>
+     *     <li>按恢复阶段应用物理页或事务状态变化，并在每个可恢复边界记录已完成进度。</li>
+     *     <li>发布恢复结果并释放恢复专用资源；失败保持 fail-closed，不能提前开放普通 SQL 流量。</li>
+     * </ol>
+     *
+     * @param record 参与本次操作的记录或记录集合；不得为 {@code null}，顺序、身份与编码必须满足当前索引或日志格式
+     * @param timeout 本次等待或操作的最大时长；不得为 {@code null} 且必须为正，超时不得留下未释放资源
+     */
+    private void recoverImport(DdlLogRecord record, Duration timeout) {
+        // 1、读取 checkpoint、redo、doublewrite 或事务持久证据，在共享或持久副作用前拒绝非法状态。
+        Path target = checkedMarkerPath(record);
+        Path source = record.auxiliaryPath().map(discovery::checkedPath).orElseThrow(() -> new DictionaryRecoveryException("IMPORT marker has no source path"));
+        TablespaceFileIdentity identity = record.fileIdentity().orElseThrow(() -> new DictionaryRecoveryException("IMPORT marker has no file identity"));
+        TableId tableId = TableId.of(record.marker().affectedObjectId());
+        // 2、继续完成范围、身份与候选校验；通过后，依据 page LSN、恢复进度和稳定标识判断跳过或续作，保持处理顺序与资源边界。
+        TableDefinition table = repository.findTableForRecovery(tableId).orElseThrow(() -> new DictionaryRecoveryException("IMPORT marker target table is absent"));
+        if (table.state() != TableState.IMPORT_PENDING) { if (table.state() == TableState.ACTIVE) finishDroppedMarker(record); return; }
+        if (record.phase() == DdlLogPhase.PREPARED) repository.ddlLog().transition(DdlId.of(record.marker().ddlOperationId()), DdlLogPhase.PREPARED, DdlLogPhase.DICTIONARY_COMMITTED);
+        if (Files.exists(source) && !Files.exists(target)) physical.importTablespace(table.storageBinding().orElseThrow(), source, identity, timeout);
+        // 3、在中间分支复核阶段性结果；满足条件后，按恢复阶段应用物理页或事务状态变化，并维持领域不变量。
+        repository.ddlLog().transition(DdlId.of(record.marker().ddlOperationId()), DdlLogPhase.DICTIONARY_COMMITTED, DdlLogPhase.ENGINE_DONE);
+        DictionaryIdAllocation ids = control.reserve(new DictionaryIdRequest(0,0,0,0,0,1));
+        DictionaryVersion version = DictionaryVersion.of(ids.dictionaryVersion());
+        try (DictionaryTransaction tx = repository.begin(version)) { tx.updateTable(new TableDefinition(table.id(), table.schemaId(), table.name(), version, TableState.ACTIVE, table.columns(), table.indexes(), table.storageBinding())); tx.commit(); }
+        cache.invalidateTable(table.id(), version);
+        // 4、发布恢复结果并释放恢复专用资源，以稳定返回或领域异常完成收口。
+        repository.ddlLog().transition(DdlId.of(record.marker().ddlOperationId()), DdlLogPhase.ENGINE_DONE, DdlLogPhase.COMMITTED);
     }
 
     /**

@@ -201,12 +201,14 @@ public final class DiskSpaceManager {
         // 2. 仓储和服务共享同一 Buffer Pool/pageSize，调用时只使用上层传入的 MTR 管理 latch、redo 与释放顺序。
         this.headerRepo = new SpaceHeaderRepository(pool);
         this.xdes = new ExtentDescriptorRepository(pool, pageSize);
+        // 3、绑定已校验协作者并初始化本对象拥有的状态、显式锁、队列或缓存，不允许半初始化实例逃逸。
         this.inodeRepo = new SegmentInodeRepository(pool, pageSize);
         this.flst = new Flst(pool);
         this.freeExtents = new FreeExtentService(pool, pageSize, headerRepo, xdes, flst);
         this.segSpace = new SegmentSpaceService(pool, pageSize, headerRepo, inodeRepo, xdes, flst, freeExtents);
         this.allocator = new SegmentPageAllocator(pool, pageSize, headerRepo, inodeRepo, flst, segSpace,
                 new DefaultExtentAllocationPolicy());
+        // 4、完成初始状态发布；失败以领域异常终止构造，成功对象满足类级生命周期不变量。
         this.reservationService = new SpaceReservationService(pageStore, pageSize, headerRepo, flst);
     }
 
@@ -346,6 +348,7 @@ public final class DiskSpaceManager {
 
         // 2. PageStore 只打开物理句柄并校验文件几何，不在 FIL 层解释 FSP 或 lifecycle 状态。
         pageStore.open(spaceId, path, pageSize);
+        // 4、发布稳定结果并逆序释放 lease、latch 与 fix，以稳定返回或领域异常完成收口。
         try {
             // 3. loader 校验 page0 并发布真实 lifecycle；普通可用性留给后续 require 判定，异常时关闭物理句柄。
             registry.open(spaceId);
@@ -380,6 +383,7 @@ public final class DiskSpaceManager {
 
         // 2. 先建立物理 IO 句柄，page0 loader 才能读取权威 FSP/lifecycle metadata。
         pageStore.open(spaceId, path, pageSize);
+        // 4、发布恢复结果并释放恢复专用资源，以稳定返回或领域异常完成收口。
         try {
             // 3. recovery require 允许中间状态但不放松格式/identity 校验；失败统一关闭刚打开的句柄。
             registry.requireForRecovery(spaceId);
@@ -535,6 +539,54 @@ public final class DiskSpaceManager {
     }
 
     /**
+     * 将已通过外部文件 identity 校验的 DISCARDED GENERAL 表空间恢复为 NORMAL。
+     * 该入口只供 IMPORT/recovery 使用，不经过普通状态准入；成功后 page0 spaceVersion 单调递增。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验表空间生命周期、页号、区段身份与容量边界，非法或损坏元数据在分配/IO 前拒绝。</li>
+     *     <li>按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，避免锁序反转。</li>
+     *     <li>执行空间元数据或物理文件变化，并把需要的 allocation intent、redo、dirty 或 force 副作用交给既有下游。</li>
+     *     <li>发布稳定结果并逆序释放 lease、latch 与 fix；失败保留可由恢复流程识别的权威状态。</li>
+     * </ol>
+     *
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param spaceId 目标表空间的稳定标识；不得为 {@code null}，且必须已注册并满足当前生命周期准入条件
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
+    public void restoreTablespace(MiniTransaction mtr, SpaceId spaceId) {
+        // 1、校验表空间生命周期、页号、区段身份与容量边界，在共享或持久副作用前拒绝非法状态。
+        requireMtr(mtr);
+        requireSpace(spaceId);
+        // 2、继续完成范围、身份与候选校验；通过后，按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，保持处理顺序与资源边界。
+        SpaceHeaderSnapshot snapshot = headerRepo.readForUpdate(mtr, spaceId);
+        TablespaceType type = TablespaceTypeFlags.decode(snapshot.spaceFlags());
+        if (type != TablespaceType.GENERAL) {
+            throw new DatabaseValidationException("only GENERAL tablespace can be restored from DISCARD");
+        }
+        // 3、在中间分支复核阶段性结果；满足条件后，执行空间元数据或物理文件变化，并维持领域不变量。
+        TablespaceLifecycleHeader lifecycle = headerRepo.readLifecycle(mtr, spaceId)
+                .orElseThrow(() -> new DatabaseRuntimeException("discarded tablespace lacks lifecycle marker"));
+        if (lifecycle.state() != TablespaceState.DISCARDED) {
+            throw new DatabaseValidationException("tablespace is not DISCARDED: " + lifecycle.state());
+        }
+        headerRepo.bumpSpaceVersion(mtr, spaceId, snapshot.spaceVersion());
+        // 4、发布稳定结果并逆序释放 lease、latch 与 fix，以稳定返回或领域异常完成收口。
+        headerRepo.writeLifecycle(mtr, spaceId, new TablespaceLifecycleHeader(
+                TablespaceState.NORMAL, snapshot.currentSizeInPages(), 0L,
+                snapshot.currentSizeInPages(), TablespaceState.NORMAL));
+    }
+
+    /** 重新从已 force 的 page0 加载 runtime metadata；只用于 IMPORT/recovery 的完成阶段。
+     *
+     * @param spaceId 目标表空间的稳定标识；不得为 {@code null}，且必须已注册并满足当前生命周期准入条件
+     */
+    public void refreshTablespaceMetadata(SpaceId spaceId) {
+        requireSpace(spaceId);
+        registry.refresh(spaceId);
+    }
+
+    /**
      * 查询 runtime registry 中的表空间状态。该方法不触发 loader，避免诊断路径隐式打开或注册表空间。
      *
      * <p>数据流：</p>
@@ -593,6 +645,7 @@ public final class DiskSpaceManager {
         // 3. 先分配单调 identity，再写带用途的 inode；两页 latch/redo 由同一 MTR 统一提交或释放。
         long segId = headerRepo.allocateNextSegmentId(mtr, spaceId);
         int slot = inodeRepo.allocateSlot(mtr, spaceId, SegmentId.of(segId), purpose);
+        // 4、发布稳定结果并逆序释放 lease、latch 与 fix，以稳定返回或领域异常完成收口。
         return new SegmentRef(spaceId, slot, SegmentId.of(segId));
     }
 
@@ -791,6 +844,7 @@ public final class DiskSpaceManager {
         if (second.isPresent()) {
             return new AllocationResult(second.get(), true);
         }
+        // 4、发布稳定结果并逆序释放 lease、latch 与 fix，以稳定返回或领域异常完成收口。
         throw new NoFreeSpaceException("no free space for segment " + ref.segmentId().value()
                 + " in tablespace " + ref.spaceId().value());
     }

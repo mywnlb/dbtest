@@ -58,6 +58,9 @@ class BTreeDeleteMarkTest {
 
     private final TypeCodecRegistry registry = new TypeCodecRegistry();
 
+    /**
+     * 验证 {@code markFiltersFromLookupButVisibleViaIncludingDeleted} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void markFiltersFromLookupButVisibleViaIncludingDeleted() {
         onPool(ctx -> {
@@ -88,6 +91,9 @@ class BTreeDeleteMarkTest {
         });
     }
 
+    /**
+     * 验证 {@code unmarkRestoresToLookup} 对应的B+Tree 索引行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void unmarkRestoresToLookup() {
         onPool(ctx -> {
@@ -118,6 +124,9 @@ class BTreeDeleteMarkTest {
         });
     }
 
+    /**
+     * 验证 {@code ownershipMismatchNoChange} 对应的B+Tree 索引行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void ownershipMismatchNoChange() {
         onPool(ctx -> {
@@ -143,6 +152,9 @@ class BTreeDeleteMarkTest {
         });
     }
 
+    /**
+     * 验证 {@code illegalFlipThrows} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void illegalFlipThrows() {
         onPool(ctx -> {
@@ -163,6 +175,9 @@ class BTreeDeleteMarkTest {
         });
     }
 
+    /**
+     * 验证 {@code levelOneCrossLeafMark} 所描述的 B+Tree 定位或结构变化，并断言键序、父子链接、页资源和唯一性不变量。
+     */
     @Test
     void levelOneCrossLeafMark() {
         onPool(ctx -> {

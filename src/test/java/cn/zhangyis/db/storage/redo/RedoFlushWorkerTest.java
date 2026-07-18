@@ -26,6 +26,9 @@ class RedoFlushWorkerTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code advancesDurableLsnPeriodically} 所描述的刷脏与持久化协作，并断言 redo durable 边界先覆盖 page LSN、失败后仍保留脏状态。
+     */
     @Test
     void advancesDurableLsnPeriodically() {
         FakeTarget target = new FakeTarget();
@@ -41,6 +44,9 @@ class RedoFlushWorkerTest {
         }
     }
 
+    /**
+     * 验证 {@code requestFlushTriggersImmediateFlush} 所描述的刷脏与持久化协作，并断言 redo durable 边界先覆盖 page LSN、失败后仍保留脏状态。
+     */
     @Test
     void requestFlushTriggersImmediateFlush() {
         FakeTarget target = new FakeTarget();
@@ -57,6 +63,11 @@ class RedoFlushWorkerTest {
         }
     }
 
+    /**
+     * 验证 {@code idleTickDoesNotFsyncWhenNothingPending} 所描述的边界场景保持既有领域不变量，不产生方法名明确禁止的副作用。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void idleTickDoesNotFsyncWhenNothingPending() throws Exception {
         FakeTarget target = new FakeTarget(); // current == flushed == 0：无待刷
@@ -71,6 +82,9 @@ class RedoFlushWorkerTest {
         }
     }
 
+    /**
+     * 验证 {@code stopHaltsWorkerAndIsIdempotent} 所描述的组件生命周期，并断言状态转换、后台线程停止和资源恰好释放一次。
+     */
     @Test
     void stopHaltsWorkerAndIsIdempotent() {
         FakeTarget target = new FakeTarget();
@@ -81,6 +95,9 @@ class RedoFlushWorkerTest {
         assertTrue(worker.stop(Duration.ofSeconds(2)), "second stop must be idempotent");
     }
 
+    /**
+     * 验证 {@code flushFailureMovesToFailedState} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void flushFailureMovesToFailedState() {
         FakeTarget target = new FakeTarget();
@@ -97,6 +114,9 @@ class RedoFlushWorkerTest {
         }
     }
 
+    /**
+     * 验证 {@code realDurableManagerPathAdvancesDurableLsn} 所描述的刷脏与持久化协作，并断言 redo durable 边界先覆盖 page LSN、失败后仍保留脏状态。
+     */
     @Test
     void realDurableManagerPathAdvancesDurableLsn() {
         try (RedoLogFileRepository repo = RedoLogFileRepository.open(dir.resolve("redo.log"))) {

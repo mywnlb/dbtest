@@ -93,6 +93,17 @@ public final class ClusteredDmlService {
     /**
      * 构造 DML facade。所有 collaborator 都来自 {@code StorageEngine} 组合根，保证 DML 与测试/恢复/后台 purge
      * 使用同一套事务、undo、锁和 redo 状态，而不是另建旁路实例。
+     * @param transactionManager 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param undoLogManager 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param mtrManager 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param btree 由组合根提供的 {@code SplitCapableBTreeIndexService} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param currentRead 由组合根提供的 {@code BTreeCurrentReadService} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param rollbackService 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param lockManager 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param redo 由组合根提供的 {@code RedoLogManager} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param recoveryGate 由组合根提供的 {@code RecoveryTrafficGate} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param lobStorage 由组合根提供的 {@code LobStorage} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public ClusteredDmlService(TransactionManager transactionManager, UndoLogManager undoLogManager,
                                MiniTransactionManager mtrManager, SplitCapableBTreeIndexService btree,
@@ -130,6 +141,8 @@ public final class ClusteredDmlService {
      * @param txn            当前 ACTIVE 事务，不能为 null。
      * @param clusteredIndex 本语句写入的单一聚簇索引，不能为 null。
      * @return 绑定到当前 undo 边界的一次性 statement guard。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws TransactionStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
      */
     public DmlStatementGuard beginStatement(Transaction txn, BTreeIndex clusteredIndex) {
         if (txn == null || clusteredIndex == null) {
@@ -184,6 +197,7 @@ public final class ClusteredDmlService {
      * @throws DmlDuplicateKeyException 聚簇主键已存在时抛出。
      * @throws UndoWriteFatalException prepare 物理边界或 undo 已写入后后续步骤失败、无法安全继续事务时抛出。
      * @throws DatabaseRuntimeException 锁、LOB、B+Tree、MTR 或 redo 失败时抛出并保留底层 cause。
+     * @throws DmlOperationException DML/DDL 的校验、物理变更或原子收口失败时抛出；调用方应按语句与事务边界回滚
      */
     DmlWriteResult insert(ClusteredInsertCommand command,
                           List<SecondaryUndoMutation> secondaryMutations) {
@@ -292,6 +306,7 @@ public final class ClusteredDmlService {
      * @throws DatabaseValidationException 参数、隐藏列、mutation 或引擎状态无效时抛出。
      * @throws UndoWriteFatalException undo 已写入后聚簇替换/提交失败时抛出。
      * @throws DatabaseRuntimeException current-read、redo admission、B+Tree 或 MTR 操作失败时抛出。
+     * @throws DmlOperationException DML/DDL 的校验、物理变更或原子收口失败时抛出；调用方应按语句与事务边界回滚
      */
     DmlWriteResult update(ClusteredUpdateCommand command,
                           List<SecondaryUndoMutation> secondaryMutations) {
@@ -373,6 +388,8 @@ public final class ClusteredDmlService {
      * @return 成功替换一行的 DML 结果。
      * @throws UndoWriteFatalException prepared owner/page、actual undo 或聚簇发布边界失败时抛出。
      * @throws DatabaseRuntimeException LOB allocation、redo、B+Tree 或 MTR 提交失败时抛出并保留 cause。
+     * @throws PreparedUpdateStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
+     * @throws DmlOperationException DML/DDL 的校验、物理变更或原子收口失败时抛出；调用方应按语句与事务边界回滚
      */
     private DmlWriteResult updateWithExternalLobs(ClusteredUpdateCommand command,
                                                   List<SecondaryUndoMutation> secondaryMutations,
@@ -473,6 +490,7 @@ public final class ClusteredDmlService {
      * @throws DatabaseValidationException 参数、隐藏列、mutation 或引擎状态无效时抛出。
      * @throws UndoWriteFatalException undo 已写入后聚簇标记/提交失败时抛出。
      * @throws DatabaseRuntimeException current-read、redo admission、B+Tree 或 MTR 操作失败时抛出。
+     * @throws DmlOperationException DML/DDL 的校验、物理变更或原子收口失败时抛出；调用方应按语句与事务边界回滚
      */
     DmlWriteResult delete(ClusteredDeleteCommand command,
                           List<SecondaryUndoMutation> secondaryMutations) {
@@ -532,15 +550,32 @@ public final class ClusteredDmlService {
      * transaction commit(移出 active/进入 COMMITTED) -> redo durability policy 等待 -> row-lock release。
      * 这样 onCommit 失败时事务仍保持 ACTIVE 且 row locks 不释放，避免恢复期把“已对外提交但 undo 仍 ACTIVE”
      * 的事务误回滚。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
+     * @param command 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @return {@code commit} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws DmlOperationException DML/DDL 的校验、物理变更或原子收口失败时抛出；调用方应按语句与事务边界回滚
      */
     public DmlCommitResult commit(DmlCommitCommand command) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         if (command == null) {
             throw new DatabaseValidationException("DML commit command must not be null");
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         requireOpenForDml();
         Transaction txn = command.transaction();
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         TransactionId txnId = txn.transactionId();
         boolean transactionCommitted = false;
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         try {
             transactionManager.prepareCommit(txn);
             undoLogManager.onCommit(txn);
@@ -569,14 +604,30 @@ public final class ClusteredDmlService {
      * 回滚数据库事务。调用 rollback service 沿 undo 链反向应用记录级撤销，只有事务真正进入
      * {@link TransactionState#ROLLED_BACK} 后才释放 row locks。若 preflight/apply 失败而事务仍为 ACTIVE 或
      * ROLLING_BACK，必须保留锁隔离半回滚数据，供同连接重试或重启恢复；提前 releaseAll 会让其它事务改写尚待撤销的版本。
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
+     * @param command 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @return {@code rollback} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws DmlOperationException DML/DDL 的校验、物理变更或原子收口失败时抛出；调用方应按语句与事务边界回滚
      */
     public DmlRollbackResult rollback(DmlRollbackCommand command) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         if (command == null) {
             throw new DatabaseValidationException("DML rollback command must not be null");
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         requireOpenForDml();
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         Transaction txn = command.transaction();
         TransactionId txnId = txn.transactionId();
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         try {
             RollbackSummary summary = rollbackService.rollback(txn, command.clusteredIndex());
             int released = releaseLocks(txnId);
@@ -596,14 +647,31 @@ public final class ClusteredDmlService {
     /**
      * 通过 undo identity/DD resolver 完整回滚事务。该入口支持同一事务跨多表写入，不接收也不猜测最后一个索引；
      * 终态后才释放 row locks，失败时保持 ROLLING_BACK/锁所有权供重试。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
+     * @param command 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @return {@code rollback} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws DmlOperationException DML/DDL 的校验、物理变更或原子收口失败时抛出；调用方应按语句与事务边界回滚
      */
     public DmlRollbackResult rollback(ResolvedDmlRollbackCommand command) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         if (command == null) {
             throw new DatabaseValidationException("resolved DML rollback command must not be null");
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         requireOpenForDml();
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         Transaction txn = command.transaction();
         TransactionId txnId = txn.transactionId();
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         try {
             RollbackSummary summary = rollbackService.rollback(txn);
             int released = releaseLocks(txnId);
@@ -632,6 +700,12 @@ public final class ClusteredDmlService {
                 DEFAULT_RELOCATION_RETRIES);
     }
 
+    /**
+     * 校验当前状态后推进存储引擎稳定 API状态机；成功发布唯一终态，失败保留可回滚或可恢复的原始状态。
+     *
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param original 需要分类或包装的原始失败；不得为 {@code null}，包装时必须保留 cause 与 suppressed 异常图
+     */
     private void rollbackActiveMtr(MiniTransaction mtr, RuntimeException original) {
         if (mtr.state() != MiniTransactionState.ACTIVE) {
             return;
@@ -646,14 +720,29 @@ public final class ClusteredDmlService {
     /**
      * 在 begin 前把超过 256B 的 LOB raw value 替换为定长 placeholder，并冻结每列写计划/undo ownership。
      * inline、NULL 和普通类型原样保留；只有确实需要 externalization 时才要求命令携带权威 LOB segment。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取并校验调用参数与当前领域状态，确保失败发生在本方法创建共享或持久副作用之前。</li>
+     *     <li>按类级并发协议取得本阶段所需协作者与 Guard，竞争后重新校验资源身份和生命周期。</li>
+     *     <li>执行核心状态转换或数据变换，并只通过本包稳定协作者发布可观察副作用。</li>
+     *     <li>汇总稳定结果并沿现有 finally/Guard 释放资源；异常不得伪造成功或清除未完成状态。</li>
+     * </ol>
+     *
+     * @param command 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @return {@code planInsertLobs} 形成的不可变定义、计划或元数据快照；成功时不为 {@code null}，内部身份、版本和范围已完成交叉校验
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     private PlannedInsertLobs planInsertLobs(ClusteredInsertCommand command) {
+        // 1、读取并校验调用参数与当前领域状态，在共享或持久副作用前拒绝非法状态。
         List<ColumnValue> source = command.record().columnValues();
         if (source.size() != command.index().schema().columns().size()) {
             throw new DatabaseValidationException("clustered INSERT row width differs from table schema");
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按类级并发协议取得本阶段所需协作者与 Guard，保持处理顺序与资源边界。
         List<ColumnValue> placeholders = new ArrayList<>(source);
         List<PlannedLobValue> values = new ArrayList<>();
+        // 3、在中间分支复核阶段性结果；满足条件后，执行核心状态转换或数据变换，并维持领域不变量。
         List<InsertedLobOwnership> ownerships = new ArrayList<>();
         for (int ordinal = 0; ordinal < source.size(); ordinal++) {
             var column = command.index().schema().column(ordinal);
@@ -677,6 +766,7 @@ public final class ClusteredDmlService {
         }
         LogicalRecord placeholderRecord = new LogicalRecord(command.record().schemaVersion(), placeholders,
                 command.record().deleted(), command.record().recordType(), command.record().hiddenColumns());
+        // 4、汇总稳定结果并沿现有 finally/Guard 释放资源，以稳定返回或领域异常完成收口。
         return new PlannedInsertLobs(placeholderRecord, values, ownerships);
     }
 
@@ -773,6 +863,14 @@ public final class ClusteredDmlService {
     /**
      * 用独立短读 MTR 在业务 undo/B+Tree 写之前验证 authoritative LOB segment identity 和 purpose。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验表空间生命周期、页号、区段身份与容量边界，非法或损坏元数据在分配/IO 前拒绝。</li>
+     *     <li>按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，避免锁序反转。</li>
+     *     <li>执行空间元数据或物理文件变化，并把需要的 allocation intent、redo、dirty 或 force 副作用交给既有下游。</li>
+     *     <li>发布稳定结果并逆序释放 lease、latch 与 fix；失败保留可由恢复流程识别的权威状态。</li>
+     * </ol>
+     *
      * @param segment  exact DD binding 的可选 segment 容器。
      * @param required 本次 INSERT/UPDATE/DELETE 是否会写新链或持久化旧链 purge ownership。
      * @throws DmlLobBindingException required 但 binding 缺失，或 segment purpose/identity 预检失败时抛出。
@@ -780,12 +878,16 @@ public final class ClusteredDmlService {
      */
     private void preflightLobSegment(Optional<cn.zhangyis.db.storage.api.SegmentRef> segment,
                                      boolean required) {
+        // 1、校验表空间生命周期、页号、区段身份与容量边界，在共享或持久副作用前拒绝非法状态。
         if (!required) {
             return;
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，保持处理顺序与资源边界。
         var authoritative = segment.orElseThrow(() -> new DmlLobBindingException(
                 "LOB operation requires authoritative table LOB segment"));
+        // 3、在中间分支复核阶段性结果；满足条件后，执行空间元数据或物理文件变化，并维持领域不变量。
         MiniTransaction check = mtrManager.beginReadOnly();
+        // 4、发布稳定结果并逆序释放 lease、latch 与 fix，以稳定返回或领域异常完成收口。
         try {
             // 每张表只有一个 LOB segment；多列计划复用同一 identity，复核一次即可。
             lobStorage.preflightSegment(check, authoritative);
@@ -803,6 +905,14 @@ public final class ClusteredDmlService {
      * 失败收尾顺序：先反序补偿尚未转移的 LOB allocation，再关闭 index prepare scope，最后关闭 undo prepare。
      * 每个 close 失败作为 suppressed 保留；上层随后 rollback MTR memo，但不会误称页内容已撤销。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取并校验调用参数与当前领域状态，确保失败发生在本方法创建共享或持久副作用之前。</li>
+     *     <li>按类级并发协议取得本阶段所需协作者与 Guard，竞争后重新校验资源身份和生命周期。</li>
+     *     <li>执行核心状态转换或数据变换，并只通过本包稳定协作者发布可观察副作用。</li>
+     *     <li>汇总稳定结果并沿现有 finally/Guard 释放资源；异常不得伪造成功或清除未完成状态。</li>
+     * </ol>
+     *
      * @param allocations   已写出但尚未全部转移 ownership 的 INSERT LOB guards。
      * @param preparedInsert 已固定聚簇插入路径/slot 的 guard；可为 {@code null}。
      * @param preparedUndo  已固定 INSERT undo owner/root 的 guard；可为 {@code null}。
@@ -813,6 +923,7 @@ public final class ClusteredDmlService {
                                                                PreparedClusteredInsert preparedInsert,
                                                                PreparedUndoAppend<InsertedLobOwnership> preparedUndo,
                                                                RuntimeException primary) {
+        // 1、读取并校验调用参数与当前领域状态，在共享或持久副作用前拒绝非法状态。
         for (int i = allocations.size() - 1; i >= 0; i--) {
             try {
                 allocations.get(i).close();
@@ -820,6 +931,7 @@ public final class ClusteredDmlService {
                 primary.addSuppressed(cleanup);
             }
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按类级并发协议取得本阶段所需协作者与 Guard，保持处理顺序与资源边界。
         if (preparedInsert != null) {
             try {
                 preparedInsert.close();
@@ -827,6 +939,7 @@ public final class ClusteredDmlService {
                 primary.addSuppressed(cleanup);
             }
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，执行核心状态转换或数据变换，并维持领域不变量。
         if (preparedUndo != null) {
             try {
                 preparedUndo.close();
@@ -834,11 +947,20 @@ public final class ClusteredDmlService {
                 primary.addSuppressed(cleanup);
             }
         }
+        // 4、汇总稳定结果并沿现有 finally/Guard 释放资源，以稳定返回或领域异常完成收口。
         return primary;
     }
 
     /**
      * LOB-aware UPDATE 失败时按 ownership 获取逆序补偿；每个 cleanup 异常都压入主失败，不能覆盖原始根因。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取并校验调用参数与当前领域状态，确保失败发生在本方法创建共享或持久副作用之前。</li>
+     *     <li>按类级并发协议取得本阶段所需协作者与 Guard，竞争后重新校验资源身份和生命周期。</li>
+     *     <li>执行核心状态转换或数据变换，并只通过本包稳定协作者发布可观察副作用。</li>
+     *     <li>汇总稳定结果并沿现有 finally/Guard 释放资源；异常不得伪造成功或清除未完成状态。</li>
+     * </ol>
      *
      * @param allocations    已写出但尚未全部转移 ownership 的新 LOB guards。
      * @param preparedUpdate 已固定目标 leaf 的聚簇 UPDATE guard；可为 {@code null}。
@@ -851,18 +973,22 @@ public final class ClusteredDmlService {
             PreparedClusteredUpdate preparedUpdate,
             PreparedUndoAppend<LobVersionOwnership> preparedUndo,
             RuntimeException primary) {
+        // 1、读取并校验调用参数与当前领域状态，在共享或持久副作用前拒绝非法状态。
         for (int i = allocations.size() - 1; i >= 0; i--) {
             try { allocations.get(i).close(); }
             catch (RuntimeException cleanup) { primary.addSuppressed(cleanup); }
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按类级并发协议取得本阶段所需协作者与 Guard，保持处理顺序与资源边界。
         if (preparedUpdate != null) {
             try { preparedUpdate.close(); }
             catch (RuntimeException cleanup) { primary.addSuppressed(cleanup); }
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，执行核心状态转换或数据变换，并维持领域不变量。
         if (preparedUndo != null) {
             try { preparedUndo.close(); }
             catch (RuntimeException cleanup) { primary.addSuppressed(cleanup); }
         }
+        // 4、汇总稳定结果并沿现有 finally/Guard 释放资源，以稳定返回或领域异常完成收口。
         return primary;
     }
 
@@ -889,6 +1015,14 @@ public final class ClusteredDmlService {
      */
     private record PlannedInsertLobs(LogicalRecord placeholderRecord, List<PlannedLobValue> values,
                                      List<InsertedLobOwnership> placeholderOwnerships) {
+        /**
+         * 创建 {@code PlannedInsertLobs}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+         *
+         * @param placeholderRecord 参与本次操作的记录或记录集合；不得为 {@code null}，顺序、身份与编码必须满足当前索引或日志格式
+         * @param values 参与 {@code 构造} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+         * @param placeholderOwnerships 参与 {@code 构造} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+         * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+         */
         private PlannedInsertLobs {
             if (placeholderRecord == null || values == null || placeholderOwnerships == null
                     || values.size() != placeholderOwnerships.size()) {
@@ -912,6 +1046,14 @@ public final class ClusteredDmlService {
      */
     private record PlannedUpdateLobs(LogicalRecord placeholderRecord, List<PlannedLobValue> values,
                                      List<LobVersionOwnership> placeholderOwnerships) {
+        /**
+         * 创建 {@code PlannedUpdateLobs}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+         *
+         * @param placeholderRecord 参与本次操作的记录或记录集合；不得为 {@code null}，顺序、身份与编码必须满足当前索引或日志格式
+         * @param values 参与 {@code 构造} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+         * @param placeholderOwnerships 参与 {@code 构造} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+         * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+         */
         private PlannedUpdateLobs {
             if (placeholderRecord == null || values == null || placeholderOwnerships == null) {
                 throw new DatabaseValidationException("invalid planned UPDATE LOB aggregate");
@@ -946,6 +1088,12 @@ public final class ClusteredDmlService {
         return txnId.isNone() ? 0 : lockManager.releaseAll(txnId);
     }
 
+    /**
+     * 按存储引擎稳定 API并发协议获取或等待资源；等待必须有界，失败路径保持锁顺序并释放已取得资源。
+     *
+     * @param txnId 参与 {@code releaseLocksOnFailure} 的稳定领域标识 {@code TransactionId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param original 需要分类或包装的原始失败；不得为 {@code null}，包装时必须保留 cause 与 suppressed 异常图
+     */
     private void releaseLocksOnFailure(TransactionId txnId, RuntimeException original) {
         if (txnId.isNone()) {
             return;

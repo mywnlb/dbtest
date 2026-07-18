@@ -23,6 +23,14 @@ public final class IndexPageHandle {
     /** 页大小；RecordPage 需要它定位 page directory 与 trailer。 */
     private final PageSize pageSize;
 
+    /**
+     * 创建 {@code IndexPageHandle}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param pageId 目标页的稳定物理标识；必须属于当前已准入表空间，且不得为 {@code null}
+     * @param guard 调用方持有的 {@code PageGuard} 资源句柄；不得为 {@code null} 且必须处于有效期，方法返回前所有权仍归调用方
+     * @param pageSize 调用方提供的长度或容量值对象；不得为 {@code null}，且必须已通过其构造范围校验
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public IndexPageHandle(PageId pageId, PageGuard guard, PageSize pageSize) {
         if (pageId == null || guard == null || pageSize == null) {
             throw new DatabaseValidationException("index page handle pageId/guard/pageSize must not be null");
@@ -58,6 +66,9 @@ public final class IndexPageHandle {
     /**
      * 窄写 leaf sibling 链，只改 FIL_PAGE_PREV/NEXT。该方法要求当前 guard 为 EXCLUSIVE，
      * PageGuard 写原语会在模式不匹配时抛领域校验异常。
+     *
+     * @param prevPageNo 参与 {@code writeSiblingLinks} 的原始数值身份 {@code prevPageNo}；必须非负，零值仅用于对应格式明确声明的系统或空身份
+     * @param nextPageNo 参与 {@code writeSiblingLinks} 的原始数值身份 {@code nextPageNo}；必须非负，零值仅用于对应格式明确声明的系统或空身份
      */
     public void writeSiblingLinks(long prevPageNo, long nextPageNo) {
         PageEnvelope.writeSiblingLinks(guard, prevPageNo, nextPageNo);

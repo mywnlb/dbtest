@@ -39,7 +39,12 @@ public record RedoAppendBudget(RedoBudgetPurpose purpose,
         return new RedoAppendBudget(RedoBudgetPurpose.READ_ONLY, 0, 0);
     }
 
-    /** 从逻辑上界创建预算，物理值始终由 LogBlock v1 公式派生。 */
+    /** 从逻辑上界创建预算，物理值始终由 LogBlock v1 公式派生。
+     *
+     * @param purpose 选择 {@code upperBound} 分支的 {@code RedoBudgetPurpose} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     * @param logicalUpperBound redo 预算计算使用的非负工作量上界 {@code logicalUpperBound}；必须保守覆盖实际写入量，且累加时不得溢出
+     * @return {@code upperBound} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     */
     public static RedoAppendBudget upperBound(RedoBudgetPurpose purpose, long logicalUpperBound) {
         return new RedoAppendBudget(purpose, logicalUpperBound,
                 RedoLogBlockSizing.physicalBytesForLogical(logicalUpperBound));
@@ -50,7 +55,12 @@ public record RedoAppendBudget(RedoBudgetPurpose purpose,
         return upperBound(RedoBudgetPurpose.TEST_UNBOUNDED, RedoLogBlockSizing.MAX_LOGICAL_BATCH_BYTES);
     }
 
-    /** 精确计算已冻结 records 的逻辑与物理尺寸。 */
+    /** 精确计算已冻结 records 的逻辑与物理尺寸。
+     *
+     * @param records 参与本次操作的记录或记录集合；不得为 {@code null}，顺序、身份与编码必须满足当前索引或日志格式
+     * @return {@code measure} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public static RedoAppendUsage measure(List<RedoRecord> records) {
         if (records == null) {
             throw new DatabaseValidationException("redo records must not be null");
@@ -71,6 +81,10 @@ public record RedoAppendBudget(RedoBudgetPurpose purpose,
 
     /**
      * 在 append 前验证实际持久 records 没有超过 admission 上界。低估属于致命实现错误，调用方不得释放页资源继续服务。
+     *
+     * @param records 参与本次操作的记录或记录集合；不得为 {@code null}，顺序、身份与编码必须满足当前索引或日志格式
+     * @return {@code requireCovers} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     * @throws RedoBudgetExceededException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
      */
     public RedoAppendUsage requireCovers(List<RedoRecord> records) {
         RedoAppendUsage actual = measure(records);

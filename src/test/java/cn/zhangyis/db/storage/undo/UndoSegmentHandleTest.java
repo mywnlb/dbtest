@@ -21,6 +21,9 @@ class UndoSegmentHandleTest {
         return PageId.of(SPACE, PageNo.of(no));
     }
 
+    /**
+     * 验证 {@code buildsAndExposesFields} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void buildsAndExposesFields() {
         UndoSegmentHandle h = new UndoSegmentHandle(SPACE, 3, SegmentId.of(9), page(10), page(10));
@@ -31,6 +34,9 @@ class UndoSegmentHandleTest {
         assertEquals(page(10), h.lastPageId());
     }
 
+    /**
+     * 验证 {@code withLastPageReturnsNewInstanceOnlyChangingLast} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void withLastPageReturnsNewInstanceOnlyChangingLast() {
         UndoSegmentHandle h = new UndoSegmentHandle(SPACE, 3, SegmentId.of(9), page(10), page(10));
@@ -43,18 +49,27 @@ class UndoSegmentHandleTest {
         assertEquals(page(10), h.lastPageId());
     }
 
+    /**
+     * 验证 {@code rejectsNegativeSlot} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void rejectsNegativeSlot() {
         assertThrows(DatabaseValidationException.class,
                 () -> new UndoSegmentHandle(SPACE, -1, SegmentId.of(9), page(10), page(10)));
     }
 
+    /**
+     * 验证 {@code rejectsNonPositiveSegmentId} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void rejectsNonPositiveSegmentId() {
         assertThrows(DatabaseValidationException.class,
                 () -> new UndoSegmentHandle(SPACE, 0, SegmentId.of(0), page(10), page(10)));
     }
 
+    /**
+     * 验证 {@code rejectsPageSpaceMismatch} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void rejectsPageSpaceMismatch() {
         PageId other = PageId.of(SpaceId.of(88), PageNo.of(10));

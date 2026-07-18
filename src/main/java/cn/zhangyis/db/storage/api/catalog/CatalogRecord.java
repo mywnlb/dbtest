@@ -6,6 +6,9 @@ import java.util.Arrays;
 
 /**
  * 内部 catalog 的一个无语义 byte record。storage 只保证 key/payload 边界和批次 durability，不解析 DD kind。
+ *
+ * @param key 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+ * @param payload 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
  */
 public record CatalogRecord(byte[] key, byte[] payload) {
     public CatalogRecord {

@@ -19,7 +19,12 @@ public final class TypeCodecRegistry {
         this.characters = CharacterTypeRegistry.defaults();
     }
 
-    /** 按列类型返回 codec。 */
+    /** 按列类型返回 codec。
+     *
+     * @param type 选择 {@code codecFor} 分支的 {@code ColumnType} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     * @return {@code codecFor} 创建的模块协作者；成功时不为 {@code null}，其依赖和生命周期由当前组合根拥有
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public TypeCodec codecFor(ColumnType type) {
         if (type == null) {
             throw new DatabaseValidationException("column type must not be null");
@@ -58,19 +63,33 @@ public final class TypeCodecRegistry {
         };
     }
 
-    /** 比较两个已编码切片（按列类型 codec）。 */
+    /** 比较两个已编码切片（按列类型 codec）。
+     *
+     * @param left 参与记录编解码或索引比较的字段值；不得为 {@code null}，其类型、字节边界和 SQL NULL 语义必须与当前 schema 一致
+     * @param right 参与记录编解码或索引比较的字段值；不得为 {@code null}，其类型、字节边界和 SQL NULL 语义必须与当前 schema 一致
+     * @param type 选择 {@code compare} 分支的 {@code ColumnType} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     * @return 左值小于、等于或大于右值时分别返回负数、零或正数；排序规则与对应索引或无符号格式一致
+     */
     public int compare(FieldSlice left, FieldSlice right, ColumnType type) {
         return codecFor(type).compare(left, right, type);
     }
 
     /**
      * 返回精确 charset/collation pair 的比较策略；缺失 pair 禁止回退。
+     *
+     * @param charsetId 参与 {@code collationFor} 的稳定领域标识 {@code CharsetId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param collationId 参与 {@code collationFor} 的稳定领域标识 {@code CollationId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @return {@code collationFor} 创建的模块协作者；成功时不为 {@code null}，其依赖和生命周期由当前组合根拥有
      */
     public CollationStrategy collationFor(CharsetId charsetId, CollationId collationId) {
         return characters.collationFor(charsetId, collationId);
     }
 
-    /** 校验值与类型相容。 */
+    /** 校验值与类型相容。
+     *
+     * @param value 参与记录编解码或索引比较的字段值；不得为 {@code null}，其类型、字节边界和 SQL NULL 语义必须与当前 schema 一致
+     * @param type 选择 {@code validate} 分支的 {@code ColumnType} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     */
     public void validate(ColumnValue value, ColumnType type) {
         codecFor(type).validate(value, type);
     }

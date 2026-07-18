@@ -91,6 +91,9 @@ class RecordPageReorganizerTest {
         return ids;
     }
 
+    /**
+     * 验证 {@code reorganizeReclaimsGarbageAndKeepsOrder} 所描述的返回值或状态会按契约保留，并断言原始信息与领域不变量未丢失。
+     */
     @Test
     void reorganizeReclaimsGarbageAndKeepsOrder() {
         onPage((rp, schema) -> {
@@ -127,6 +130,9 @@ class RecordPageReorganizerTest {
         });
     }
 
+    /**
+     * 验证 {@code reorganizeKeepsDeleteMarkedRecords} 所描述的返回值或状态会按契约保留，并断言原始信息与领域不变量未丢失。
+     */
     @Test
     void reorganizeKeepsDeleteMarkedRecords() {
         onPage((rp, schema) -> {
@@ -146,6 +152,9 @@ class RecordPageReorganizerTest {
         });
     }
 
+    /**
+     * 验证 {@code reorganizeDensifiesHeapNo} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void reorganizeDensifiesHeapNo() {
         onPage((rp, schema) -> {

@@ -32,6 +32,9 @@ class FspMetadataRedoTest {
     private static final SpaceId SPACE = SpaceId.of(7);
     private static final PageId PAGE0 = PageId.of(SPACE, PageNo.of(0));
 
+    /**
+     * 验证 {@code fspMetadataDeltaAndFreeIntentRoundTripThroughRedoFrameCodec} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void fspMetadataDeltaAndFreeIntentRoundTripThroughRedoFrameCodec() {
         FspMetadataDeltaRecord delta = new FspMetadataDeltaRecord(PAGE0,
@@ -51,6 +54,9 @@ class FspMetadataRedoTest {
         assertEquals(1 + 12 + 4 + 8, free.byteLength());
     }
 
+    /**
+     * 验证 {@code metadataDeltaReplaysWithoutPageBytesAndStampsBatchEndLsn} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void metadataDeltaReplaysWithoutPageBytesAndStampsBatchEndLsn() {
         RecordingPageStore store = new RecordingPageStore();
@@ -71,6 +77,9 @@ class FspMetadataRedoTest {
         assertEquals(1, store.writeCount);
     }
 
+    /**
+     * 验证 {@code metadataDeltaAndPageBytesShareOnePagePatchWriteBack} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void metadataDeltaAndPageBytesShareOnePagePatchWriteBack() {
         RecordingPageStore store = new RecordingPageStore();
@@ -89,6 +98,9 @@ class FspMetadataRedoTest {
         assertEquals(1, store.writeCount);
     }
 
+    /**
+     * 验证 {@code forceSkipSkipsMetadataDeltaAndFreeIntentBeforeTouchingPageStore} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void forceSkipSkipsMetadataDeltaAndFreeIntentBeforeTouchingPageStore() {
         RecordingPageStore store = new RecordingPageStore();
@@ -108,6 +120,9 @@ class FspMetadataRedoTest {
         assertTrue(store.ensureCapacityCalls.isEmpty());
     }
 
+    /**
+     * 验证 {@code metadataDeltaRejectsOutOfPagePatch} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void metadataDeltaRejectsOutOfPagePatch() {
         RecordingPageStore store = new RecordingPageStore();

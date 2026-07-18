@@ -17,6 +17,11 @@ public enum TableAccessIntent {
     /** 本访问意图对应的 table 级 MDL；只供 DD service 组装请求，不向 SQL 层暴露 ticket。 */
     private final MdlMode tableMode;
 
+    /**
+     * 创建 {@code TableAccessIntent}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param tableMode 调用方请求的目标状态、阶段或模式；不得为 {@code null}，且必须是当前状态机允许的后继值
+     */
     TableAccessIntent(MdlMode tableMode) {
         this.tableMode = tableMode;
     }

@@ -24,18 +24,45 @@ import java.util.regex.Pattern;
 
 /** DD 28 类型的 strict-mode SQL literal 转换器；不依赖 Record codec 或 storage value。 */
 public final class SqlTypeCoercion {
+    /**
+     * 类级不可变配置常量；所有实例共享该边界，非法调整会破坏SQL 名称绑定与类型推导的不变量。
+     */
     private static final BigInteger TWO = BigInteger.valueOf(2);
+    /**
+     * 类级不可变配置常量；所有实例共享该边界，非法调整会破坏SQL 名称绑定与类型推导的不变量。
+     */
     private static final DateTimeFormatter LOCAL_DATE = DateTimeFormatter.ofPattern("uuuu-MM-dd")
             .withResolverStyle(ResolverStyle.STRICT);
+    /**
+     * 类级不可变配置常量；所有实例共享该边界，非法调整会破坏SQL 名称绑定与类型推导的不变量。
+     */
     private static final DateTimeFormatter LOCAL_DATE_TIME = new DateTimeFormatterBuilder()
             .appendPattern("uuuu-MM-dd HH:mm:ss")
             .optionalStart().appendFraction(ChronoField.MILLI_OF_SECOND, 1, 3, true).optionalEnd()
             .toFormatter().withResolverStyle(ResolverStyle.STRICT);
+    /**
+     * 类级不可变配置常量；所有实例共享该边界，非法调整会破坏SQL 名称绑定与类型推导的不变量。
+     */
     private static final Pattern SQL_TIME = Pattern.compile("([+-]?)(\\d{1,3}):(\\d{2}):(\\d{2})(?:\\.(\\d{1,3}))?");
+    /**
+     * 类级校验或资源上界；所有实例以该值拒绝超限输入，调整时必须复核容量、等待与格式约束。
+     */
     private static final Instant MIN_TIMESTAMP = Instant.parse("1970-01-01T00:00:01Z");
+    /**
+     * 类级校验或资源上界；所有实例以该值拒绝超限输入，调整时必须复核容量、等待与格式约束。
+     */
     private static final Instant MAX_TIMESTAMP = Instant.parse("2038-01-19T03:14:07.999Z");
 
-    /** 转换 literal；primaryKey=true 时 NULL 无条件拒绝。 */
+    /** 转换 literal；primaryKey=true 时 NULL 无条件拒绝。
+     *
+     * @param literal 参与记录编解码或索引比较的字段值；不得为 {@code null}，其类型、字节边界和 SQL NULL 语义必须与当前 schema 一致
+     * @param type 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @param zoneId 参与 {@code coerce} 的稳定领域标识 {@code ZoneId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param primaryKey 索引结构属性；为 {@code true} 时必须执行相应聚簇、唯一性或主键不变量校验
+     * @return {@code coerce} 产生的 SQL 语句、绑定或执行对象；成功时不为 {@code null}，并保留当前 schema 版本和会话语义
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws SqlTypeCoercionException SQL 绑定、会话准入或事务结果无法按当前状态完成时抛出；调用方应报告错误并按事务边界回滚或关闭
+     */
     public SqlValue coerce(LiteralNode literal, ColumnTypeDefinition type, ZoneId zoneId, boolean primaryKey) {
         if (literal == null || type == null || zoneId == null) {
             throw new DatabaseValidationException("SQL coercion literal/type/zone must not be null");

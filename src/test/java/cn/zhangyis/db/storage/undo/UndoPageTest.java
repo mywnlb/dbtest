@@ -54,6 +54,9 @@ class UndoPageTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code formatFirstPageInitsBothHeaders} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void formatFirstPageInitsBothHeaders() {
         onFirstPage((page, handle) -> {
@@ -109,6 +112,9 @@ class UndoPageTest {
         });
     }
 
+    /**
+     * 验证 {@code appendAdvancesPageHeaderOnlyAndReadsBack} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void appendAdvancesPageHeaderOnlyAndReadsBack() {
         onFirstPage((page, handle) -> {
@@ -151,6 +157,9 @@ class UndoPageTest {
                 () -> new UndoLogicalHead(UndoNo.of(1), RollPointer.NULL));
     }
 
+    /**
+     * 验证 {@code appendRejectsNoneUndoNo} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void appendRejectsNoneUndoNo() {
         onFirstPage((page, handle) ->
@@ -158,6 +167,9 @@ class UndoPageTest {
                         () -> page.appendRecord(new byte[]{1}, TransactionId.of(7), UndoNo.NONE)));
     }
 
+    /**
+     * 验证 {@code appendOverflowThrows} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void appendOverflowThrows() {
         onFirstPage((page, handle) ->
@@ -165,6 +177,9 @@ class UndoPageTest {
                         () -> page.appendRecord(new byte[PS.bytes()], TransactionId.of(7), UndoNo.of(1))));
     }
 
+    /**
+     * 验证 {@code recordAtRejectsOutOfArea} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void recordAtRejectsOutOfArea() {
         onFirstPage((page, handle) -> {
@@ -173,6 +188,9 @@ class UndoPageTest {
         });
     }
 
+    /**
+     * 验证 {@code chainPageIsNotFirstAndLogHeaderAccessorsThrow} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void chainPageIsNotFirstAndLogHeaderAccessorsThrow() {
         onPool((mgr, disk, undoAccess, pool) -> {
@@ -196,6 +214,9 @@ class UndoPageTest {
         });
     }
 
+    /**
+     * 验证 {@code linkNextPreservesPrevAndViceVersa} 所描述的返回值或状态会按契约保留，并断言原始信息与领域不变量未丢失。
+     */
     @Test
     void linkNextPreservesPrevAndViceVersa() {
         onPool((mgr, disk, undoAccess, pool) -> {
@@ -216,6 +237,9 @@ class UndoPageTest {
         });
     }
 
+    /**
+     * 验证 {@code openUndoPageRejectsAllocatedType} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void openUndoPageRejectsAllocatedType() {
         onPool((mgr, disk, undoAccess, pool) -> {
@@ -231,6 +255,9 @@ class UndoPageTest {
         });
     }
 
+    /**
+     * 验证 {@code openUndoPageRejectsIndexType} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void openUndoPageRejectsIndexType() {
         onPool((mgr, disk, undoAccess, pool) -> {

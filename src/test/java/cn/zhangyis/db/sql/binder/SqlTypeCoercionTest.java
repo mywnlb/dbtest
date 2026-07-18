@@ -34,6 +34,9 @@ class SqlTypeCoercionTest {
                 () -> coercion.coerce(str("01"), json, ZoneId.of("UTC"), false));
     }
 
+    /**
+     * 验证 {@code supportsEveryDictionaryTypeWithoutStorageValues} 所描述的边界场景保持既有领域不变量，不产生方法名明确禁止的副作用。
+     */
     @Test
     void supportsEveryDictionaryTypeWithoutStorageValues() {
         for (DictionaryTypeId id : DictionaryTypeId.values()) {
@@ -43,6 +46,9 @@ class SqlTypeCoercionTest {
         }
     }
 
+    /**
+     * 验证 {@code preservesUnsignedBigintAndRejectsLossyOrAmbiguousValues} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void preservesUnsignedBigintAndRejectsLossyOrAmbiguousValues() {
         BigInteger max = BigInteger.ONE.shiftLeft(64).subtract(BigInteger.ONE);

@@ -36,6 +36,9 @@ class PageGuardTest {
         return new PageGuard(releaser, frame, PageLatchMode.SHARED, latch, null);
     }
 
+    /**
+     * 验证 {@code shouldRoundTripIntAndBytesUnderExclusive} 对应的Buffer Pool行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void shouldRoundTripIntAndBytesUnderExclusive() {
         BufferFrame frame = new BufferFrame(PS);
@@ -47,6 +50,9 @@ class PageGuardTest {
         guard.close();
     }
 
+    /**
+     * 验证 {@code shouldRejectWriteUnderShared} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void shouldRejectWriteUnderShared() {
         BufferFrame frame = new BufferFrame(PS);
@@ -57,6 +63,9 @@ class PageGuardTest {
         guard.close();
     }
 
+    /**
+     * 验证 {@code shouldRejectOutOfBoundsAccess} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void shouldRejectOutOfBoundsAccess() {
         BufferFrame frame = new BufferFrame(PS);
@@ -66,6 +75,9 @@ class PageGuardTest {
         guard.close();
     }
 
+    /**
+     * 验证 {@code shouldRejectNullWriteSource} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void shouldRejectNullWriteSource() {
         BufferFrame frame = new BufferFrame(PS);
@@ -74,6 +86,9 @@ class PageGuardTest {
         guard.close();
     }
 
+    /**
+     * 验证 {@code shouldRejectAccessAfterClose} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void shouldRejectAccessAfterClose() {
         BufferFrame frame = new BufferFrame(PS);
@@ -83,6 +98,9 @@ class PageGuardTest {
         assertThrows(DatabaseValidationException.class, () -> guard.writeInt(0, 1));
     }
 
+    /**
+     * 验证 {@code closeShouldReleaseLatchAndReportWrote} 所描述的组件生命周期，并断言状态转换、后台线程停止和资源恰好释放一次。
+     */
     @Test
     void closeShouldReleaseLatchAndReportWrote() {
         BufferFrame frame = new BufferFrame(PS);
@@ -101,6 +119,9 @@ class PageGuardTest {
         guard.close(); // 幂等
     }
 
+    /**
+     * 验证 {@code closeWithoutWriteShouldReportNotWrote} 所描述的边界场景保持既有领域不变量，不产生方法名明确禁止的副作用。
+     */
     @Test
     void closeWithoutWriteShouldReportNotWrote() {
         BufferFrame frame = new BufferFrame(PS);
@@ -112,6 +133,9 @@ class PageGuardTest {
         assertEquals(0, frame.pageLatch.getReadLockCount());
     }
 
+    /**
+     * 验证 {@code shouldExposePageId} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void shouldExposePageId() {
         BufferFrame frame = new BufferFrame(PS);
@@ -121,6 +145,9 @@ class PageGuardTest {
         guard.close();
     }
 
+    /**
+     * 验证 {@code shouldRoundTripLongUnderExclusive} 对应的Buffer Pool行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void shouldRoundTripLongUnderExclusive() {
         BufferFrame frame = new BufferFrame(PS);
@@ -130,6 +157,9 @@ class PageGuardTest {
         guard.close();
     }
 
+    /**
+     * 验证 {@code shouldRejectWriteLongUnderShared} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void shouldRejectWriteLongUnderShared() {
         BufferFrame frame = new BufferFrame(PS);
@@ -138,6 +168,9 @@ class PageGuardTest {
         guard.close();
     }
 
+    /**
+     * 验证 {@code shouldRejectLongOutOfBounds} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void shouldRejectLongOutOfBounds() {
         BufferFrame frame = new BufferFrame(PS);

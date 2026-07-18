@@ -31,12 +31,18 @@ class BTreeIndexClusteredTest {
         return new IndexKeyDef(1, List.of(new KeyPartDef(new ColumnId(0), KeyOrder.ASC, 0)));
     }
 
+    /**
+     * 验证 {@code clusteredDerivesFromSchema} 所描述的字典/DDL 协作，并断言版本、对象身份、缓存失效和物理绑定保持一致。
+     */
     @Test
     void clusteredDerivesFromSchema() {
         BTreeIndex idx = new BTreeIndex(1, ROOT, 0, keyDef(), schema(true), true);
         assertTrue(idx.clustered());
     }
 
+    /**
+     * 验证 {@code nonClusteredSchemaMakesNonClusteredIndex} 所描述的 B+Tree 定位或结构变化，并断言键序、父子链接、页资源和唯一性不变量。
+     */
     @Test
     void nonClusteredSchemaMakesNonClusteredIndex() {
         BTreeIndex idx = new BTreeIndex(1, ROOT, 0, keyDef(), schema(false), true);

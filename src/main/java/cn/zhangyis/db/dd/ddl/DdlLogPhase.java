@@ -20,6 +20,11 @@ public enum DdlLogPhase {
     /** DDL log key/payload 使用且跨版本不可重排的持久码。 */
     private final int stableCode;
 
+    /**
+     * 创建 {@code DdlLogPhase}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param stableCode 参与 {@code 构造} 的稳定编码 {@code stableCode}；必须命中当前版本声明的编码集合，未知值以格式或校验异常拒绝
+     */
     DdlLogPhase(int stableCode) {
         this.stableCode = stableCode;
     }

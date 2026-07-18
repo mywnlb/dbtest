@@ -203,7 +203,7 @@ pressure 策略：
 
 输出：
 
-- 每轮 flush target pages。
+- 每轮 flush target pages，并在 free frame 紧张时拆分 FlushList/LRU batch。
 - flush list 与 LRU flush 配比。
 - 是否启用 neighbor flush。
 - 是否允许 foreground single page flush。

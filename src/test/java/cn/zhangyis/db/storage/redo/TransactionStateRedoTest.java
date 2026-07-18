@@ -26,6 +26,9 @@ class TransactionStateRedoTest {
 
     private static final PageSize PS = PageSize.ofBytes(16 * 1024);
 
+    /**
+     * 验证 {@code trxStateDeltaRoundTripsWithoutPageId} 所描述的边界场景保持既有领域不变量，不产生方法名明确禁止的副作用。
+     */
     @Test
     void trxStateDeltaRoundTripsWithoutPageId() {
         TransactionStateDeltaRecord delta = new TransactionStateDeltaRecord(
@@ -43,6 +46,9 @@ class TransactionStateRedoTest {
         assertEquals(1 + 8 + 1 + 1 + 8 + 1, delta.byteLength());
     }
 
+    /**
+     * 验证 {@code defaultDispatcherAppliesTrxStateDeltaWithoutPageSkipOrPageStoreIo} 所描述的边界场景保持既有领域不变量，不产生方法名明确禁止的副作用。
+     */
     @Test
     void defaultDispatcherAppliesTrxStateDeltaWithoutPageSkipOrPageStoreIo() {
         TransactionStateDeltaRecord delta = new TransactionStateDeltaRecord(

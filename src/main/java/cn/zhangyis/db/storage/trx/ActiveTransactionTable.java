@@ -15,17 +15,27 @@ final class ActiveTransactionTable {
     /** 当前活跃读写事务 id 集合（升序）。 */
     private final TreeSet<Long> activeReadWriteIds = new TreeSet<>();
 
-    /** 登记一个活跃读写事务（首次分配写 id 时）。 */
+    /** 登记一个活跃读写事务（首次分配写 id 时）。
+     *
+     * @param txnId 参与 {@code register} 的原始数值身份 {@code txnId}；必须非负，零值仅用于对应格式明确声明的系统或空身份
+     */
     void register(long txnId) {
         activeReadWriteIds.add(txnId);
     }
 
-    /** 移除（commit/rollback 读写事务）。 */
+    /** 移除（commit/rollback 读写事务）。
+     *
+     * @param txnId 参与 {@code remove} 的原始数值身份 {@code txnId}；必须非负，零值仅用于对应格式明确声明的系统或空身份
+     */
     void remove(long txnId) {
         activeReadWriteIds.remove(txnId);
     }
 
-    /** 判断事务是否仍处于活跃写集合；调用方必须持有 TransactionSystem 短锁。 */
+    /** 判断事务是否仍处于活跃写集合；调用方必须持有 TransactionSystem 短锁。
+     *
+     * @param txnId 参与 {@code contains} 的原始数值身份 {@code txnId}；必须非负，零值仅用于对应格式明确声明的系统或空身份
+     * @return {@code contains} 命名的领域事实成立时为 {@code true}，否则为 {@code false}；查询本身不改变权威状态
+     */
     boolean contains(long txnId) {
         return activeReadWriteIds.contains(txnId);
     }

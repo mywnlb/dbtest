@@ -489,6 +489,14 @@ public final class FileInternalCatalogStore implements InternalCatalogStore {
      * <p>先确认固定前缀位于 committed 边界内，再用 v1 最大 body 大小约束长度，最后读取 body
      * 并验证 CRC32C；只有全部通过才向扫描器返回字节和下一偏移。</p>
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验表空间生命周期、页号、区段身份与容量边界，非法或损坏元数据在分配/IO 前拒绝。</li>
+     *     <li>按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，避免锁序反转。</li>
+     *     <li>执行空间元数据或物理文件变化，并把需要的 allocation intent、redo、dirty 或 force 副作用交给既有下游。</li>
+     *     <li>发布稳定结果并逆序释放 lease、latch 与 fix；失败保留可由恢复流程识别的权威状态。</li>
+     * </ol>
+     *
      * @param channel catalog channel
      * @param position frame 起始偏移
      * @param committedLength 最新 header 发布的 exclusive 文件边界
@@ -497,15 +505,18 @@ public final class FileInternalCatalogStore implements InternalCatalogStore {
      * @throws InternalCatalogCorruptionException 前缀/body 越过提交边界、长度非法或 CRC 不匹配时抛出
      */
     private static Frame readFrame(FileChannel channel, long position, long committedLength) throws IOException {
+        // 1、校验表空间生命周期、页号、区段身份与容量边界，在共享或持久副作用前拒绝非法状态。
         if (position + FRAME_PREFIX_BYTES > committedLength) {
             throw new InternalCatalogCorruptionException("truncated internal catalog frame prefix");
         }
         ByteBuffer prefix = ByteBuffer.allocate(FRAME_PREFIX_BYTES).order(ByteOrder.BIG_ENDIAN);
         readFully(channel, prefix, position);
+        // 2、继续完成范围、身份与候选校验；通过后，按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，保持处理顺序与资源边界。
         prefix.flip();
         int length = prefix.getInt();
         int expectedCrc = prefix.getInt();
         int maxFrameBody = 1 + Long.BYTES + Integer.BYTES * 3 + MAX_KEY_BYTES + MAX_PAYLOAD_BYTES;
+        // 3、在中间分支复核阶段性结果；满足条件后，执行空间元数据或物理文件变化，并维持领域不变量。
         if (length < 1 + Long.BYTES + Integer.BYTES * 3 || length > maxFrameBody
                 || position + FRAME_PREFIX_BYTES + length > committedLength) {
             throw new InternalCatalogCorruptionException("invalid internal catalog frame length: " + length);
@@ -515,6 +526,7 @@ public final class FileInternalCatalogStore implements InternalCatalogStore {
         if (crc(body.array()) != expectedCrc) {
             throw new InternalCatalogCorruptionException("internal catalog frame CRC mismatch");
         }
+        // 4、发布稳定结果并逆序释放 lease、latch 与 fix，以稳定返回或领域异常完成收口。
         return new Frame(body.array(), position + FRAME_PREFIX_BYTES + length);
     }
 
@@ -544,23 +556,34 @@ public final class FileInternalCatalogStore implements InternalCatalogStore {
      * <p>slot 不完整、CRC/魔数/版本/基本范围非法或读取异常均返回空，交由上层与另一槽共同裁决；
      * 本方法不校验 committed length 是否超过物理 EOF，也不扫描 frame。</p>
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取输入长度、游标边界与必要标识，损坏、截断或超限数据在创建结果前失败。</li>
+     *     <li>按稳定字段或 token 顺序推进游标并调用对应编解码分支，任何分支都不得越过输入边界。</li>
+     *     <li>交叉校验聚合计数、类型、校验值和剩余输入，防止截断或多余内容形成半解析对象。</li>
+     *     <li>完成剩余字段写入或稳定领域结果构造；失败只保留领域异常与根因，不修改调用方输入或其他持久状态。</li>
+     * </ol>
+     *
      * @param channel catalog channel
      * @param slot header 槽号，只应为 0 或 1
      * @return 有效 header；槽不可用时返回 {@link Optional#empty()}
      */
     private static Optional<Header> decodeHeader(FileChannel channel, int slot) {
         try {
+            // 1、读取输入长度、游标边界与必要标识，在共享或持久副作用前拒绝非法状态。
             if (channel.size() < (slot + 1L) * HEADER_SLOT_BYTES) {
                 return Optional.empty();
             }
             ByteBuffer buffer = ByteBuffer.allocate(HEADER_SLOT_BYTES).order(ByteOrder.BIG_ENDIAN);
             readFully(channel, buffer, slot * (long) HEADER_SLOT_BYTES);
+            // 2、继续完成范围、身份与候选校验；通过后，按稳定字段或 token 顺序推进游标并调用对应编解码分支，保持处理顺序与资源边界。
             byte[] bytes = buffer.array();
             if (ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN).getInt(HEADER_CRC_OFFSET)
                     != crc(bytes, HEADER_CRC_OFFSET)) {
                 return Optional.empty();
             }
             buffer.flip();
+            // 3、在中间分支复核阶段性结果；满足条件后，交叉校验聚合计数、类型、校验值和剩余输入，并维持领域不变量。
             if (buffer.getLong() != HEADER_MAGIC || buffer.getInt() != FORMAT_VERSION) {
                 return Optional.empty();
             }
@@ -568,6 +591,7 @@ public final class FileInternalCatalogStore implements InternalCatalogStore {
             if (header.generation <= 0 || header.committedLength < DATA_START || header.nextBatchSequence <= 0) {
                 return Optional.empty();
             }
+            // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
             return Optional.of(header);
         } catch (IOException | RuntimeException ignored) {
             return Optional.empty();

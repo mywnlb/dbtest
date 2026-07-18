@@ -38,12 +38,21 @@ public record BTreeDeleteResult(boolean removed, BTreeIndex indexAfter, List<Pag
         freedPages = List.copyOf(freedPages);
     }
 
-    /** 幂等 no-op（未命中 / 所有权不匹配 / stale）：未删、索引不变、无回收。 */
+    /** 幂等 no-op（未命中 / 所有权不匹配 / stale）：未删、索引不变、无回收。
+     *
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @return {@code noChange} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     */
     public static BTreeDeleteResult noChange(BTreeIndex index) {
         return new BTreeDeleteResult(false, index, List.of());
     }
 
-    /** 成功删除：携带操作后索引快照（可能因 root shrink 降级）与回收页（可能为空，表示未触发 merge）。 */
+    /** 成功删除：携带操作后索引快照（可能因 root shrink 降级）与回收页（可能为空，表示未触发 merge）。
+     *
+     * @param indexAfter 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @param freedPages 参与 {@code removed} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @return {@code removed} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     */
     public static BTreeDeleteResult removed(BTreeIndex indexAfter, List<PageId> freedPages) {
         return new BTreeDeleteResult(true, indexAfter, freedPages);
     }

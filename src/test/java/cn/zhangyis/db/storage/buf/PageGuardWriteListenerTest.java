@@ -27,6 +27,9 @@ class PageGuardWriteListenerTest {
 
     private record Write(PageId pageId, int offset, byte[] bytes) { }
 
+    /**
+     * 验证 {@code reportsWritesAfterAttach} 对应的Buffer Pool行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void reportsWritesAfterAttach() {
         PageStore store = new FileChannelPageStore();
@@ -48,6 +51,9 @@ class PageGuardWriteListenerTest {
         assertArrayEquals(new byte[]{9, 8, 7}, seen.get(1).bytes());
     }
 
+    /**
+     * 验证 {@code noListenerByDefaultMeansNoCallback} 对应的Buffer Pool行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void noListenerByDefaultMeansNoCallback() {
         PageStore store = new FileChannelPageStore();

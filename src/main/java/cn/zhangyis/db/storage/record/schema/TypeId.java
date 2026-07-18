@@ -4,6 +4,19 @@ package cn.zhangyis.db.storage.record.schema;
  * Record 层可执行物理编码的列类型（innodb-record-design §8.2 子集）。
  *
  * <p>新常量只追加在既有常量之后，避免依赖枚举顺序的诊断或测试发生无意义漂移；磁盘格式本身不持久化 ordinal。
+ *
+ * <p>未单独声明 Javadoc 的枚举值语义：</p>
+ * <ul>
+ *     <li>{@code SMALLINT}：{@code SMALLINT} 列值的稳定逻辑类别；上下层必须显式映射，不能持久化 Java ordinal</li>
+ *     <li>{@code INT}：{@code INT} 列值的稳定逻辑类别；上下层必须显式映射，不能持久化 Java ordinal</li>
+ *     <li>{@code BIGINT}：{@code BIGINT} 列值的稳定逻辑类别；上下层必须显式映射，不能持久化 Java ordinal</li>
+ *     <li>{@code DOUBLE}：{@code DOUBLE} 列值的稳定逻辑类别；上下层必须显式映射，不能持久化 Java ordinal</li>
+ *     <li>{@code DECIMAL}：{@code DECIMAL} 列值的稳定逻辑类别；上下层必须显式映射，不能持久化 Java ordinal</li>
+ *     <li>{@code VARCHAR}：{@code VARCHAR} 列值的稳定逻辑类别；上下层必须显式映射，不能持久化 Java ordinal</li>
+ *     <li>{@code BINARY}：{@code BINARY} 列值的稳定逻辑类别；上下层必须显式映射，不能持久化 Java ordinal</li>
+ *     <li>{@code VARBINARY}：{@code VARBINARY} 列值的稳定逻辑类别；上下层必须显式映射，不能持久化 Java ordinal</li>
+ *     <li>{@code DATETIME}：{@code DATETIME} 列值的稳定逻辑类别；上下层必须显式映射，不能持久化 Java ordinal</li>
+ * </ul>
  */
 public enum TypeId {
     /** 1 字节整数，signed/unsigned 由 {@code ColumnType} 决定。 */

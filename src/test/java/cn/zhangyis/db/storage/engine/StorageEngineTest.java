@@ -121,6 +121,9 @@ class StorageEngineTest {
 
     // ---- 生命周期 ----
 
+    /**
+     * 验证 {@code openWiresServicesAndPublishesOpen} 对应的数据库引擎组合根行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void openWiresServicesAndPublishesOpen() {
         StorageEngine engine = new StorageEngine(config());
@@ -174,6 +177,9 @@ class StorageEngineTest {
         }
     }
 
+    /**
+     * 验证 {@code engineExposesLockDiagnosticSnapshotFromSharedLockManager} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void engineExposesLockDiagnosticSnapshotFromSharedLockManager() {
         StorageEngine engine = new StorageEngine(config());
@@ -197,6 +203,9 @@ class StorageEngineTest {
         }
     }
 
+    /**
+     * 验证 {@code closedEngineRejectsAccess} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void closedEngineRejectsAccess() {
         StorageEngine engine = new StorageEngine(config());
@@ -206,6 +215,9 @@ class StorageEngineTest {
         assertThrows(EngineStateException.class, engine::checkpoint);
     }
 
+    /**
+     * 验证 {@code doubleOpenRejected} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void doubleOpenRejected() {
         StorageEngine engine = new StorageEngine(config());
@@ -219,6 +231,9 @@ class StorageEngineTest {
 
     // ---- durable 往返 + 重开续写 ----
 
+    /**
+     * 验证 {@code engineRunsWithMultipleBufferPoolInstances} 对应的数据库引擎组合根行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void engineRunsWithMultipleBufferPoolInstances() {
         // 0.10d：验证 config.bufferPoolInstanceCount() 真正驱动生产 LruBufferPool 分片——
@@ -241,6 +256,9 @@ class StorageEngineTest {
         engine.close();
     }
 
+    /**
+     * 验证 {@code durableRoundTripAcrossRestart} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void durableRoundTripAcrossRestart() {
         EngineConfig cfg = config();
@@ -262,6 +280,9 @@ class StorageEngineTest {
         e2.close();
     }
 
+    /**
+     * 验证 {@code reopenInstallsRedoBoundaryAndAllowsContinuedWrites} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void reopenInstallsRedoBoundaryAndAllowsContinuedWrites() {
         EngineConfig cfg = config();
@@ -377,6 +398,9 @@ class StorageEngineTest {
         assertEquals(RecoveryState.FAILED, recovered.recoveryState());
     }
 
+    /**
+     * 验证 {@code bootstrapsWithRotatingRedoAndRecoversAcrossRestart} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void bootstrapsWithRotatingRedoAndRecoversAcrossRestart() {
         // 0.18b：config 启用文件环后，引擎 bootstrap 走 RotatingRedoLogRepository，checkpoint 经回收边界端口推动文件环回收，
@@ -411,6 +435,9 @@ class StorageEngineTest {
         e3.close();
     }
 
+    /**
+     * 验证 {@code warmupDumpsAtCloseAndReopensCleanly} 所描述的组件生命周期，并断言状态转换、后台线程停止和资源恰好释放一次。
+     */
     @Test
     void warmupDumpsAtCloseAndReopensCleanly() {
         // 0.10b：close 写出 buffer pool warmup dump，reopen 时 load 预取回池（最佳努力，不破坏恢复/数据）。
@@ -434,6 +461,9 @@ class StorageEngineTest {
         e2.close();
     }
 
+    /**
+     * 验证 {@code checkpointMakesRedoDurable} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void checkpointMakesRedoDurable() {
         StorageEngine engine = new StorageEngine(config());
@@ -447,6 +477,9 @@ class StorageEngineTest {
         engine.close();
     }
 
+    /**
+     * 验证 {@code foregroundRedoCapacityThrottleAdvancesCheckpointBeforeNextAppend} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void foregroundRedoCapacityThrottleAdvancesCheckpointBeforeNextAppend() {
         EngineConfig cfg = new EngineConfig(dir, PS, 256, SpaceId.of(5), PageNo.of(64), 64, 100,
@@ -473,6 +506,9 @@ class StorageEngineTest {
         }
     }
 
+    /**
+     * 验证 {@code foregroundRedoCapacityThrottleFlushesDirtyPagesWhenBackgroundMaxPagesIsZero} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void foregroundRedoCapacityThrottleFlushesDirtyPagesWhenBackgroundMaxPagesIsZero() {
         EngineConfig cfg = new EngineConfig(dir, PS, 256, SpaceId.of(5), PageNo.of(64), 64, 100,
@@ -501,6 +537,9 @@ class StorageEngineTest {
         }
     }
 
+    /**
+     * 验证 {@code backgroundPageCleanerAdvancesCheckpointTickAndStopsOnClose} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void backgroundPageCleanerAdvancesCheckpointTickAndStopsOnClose() {
         StorageEngine engine = new StorageEngine(configWithBackgroundTick(Duration.ofMillis(50)));
@@ -534,6 +573,11 @@ class StorageEngineTest {
         }
     }
 
+    /**
+     * 验证 {@code existingOpenRunsCrashRecoveryAndReplaysRedoIntoConfiguredTablespace} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void existingOpenRunsCrashRecoveryAndReplaysRedoIntoConfiguredTablespace() throws Exception {
         Path dataPath = dir.resolve("data-recovery.ibd");
@@ -568,6 +612,11 @@ class StorageEngineTest {
         recovered.close();
     }
 
+    /**
+     * 验证 {@code existingOpenWithReadOnlyValidatePublishesReadOnlyEngineAndRejectsAccessors} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void existingOpenWithReadOnlyValidatePublishesReadOnlyEngineAndRejectsAccessors() throws Exception {
         Path dataPath = dir.resolve("data-readonly-validate.ibd");
@@ -604,7 +653,10 @@ class StorageEngineTest {
         assertRedoInputsEqual(redoBefore, snapshotRedoInputs(cfg));
     }
 
-    /** 只读诊断必须报告 NORMAL 会遇到的事务 sidecar 缺失，同时不得为诊断偷偷重建空文件。 */
+    /** 只读诊断必须报告 NORMAL 会遇到的事务 sidecar 缺失，同时不得为诊断偷偷重建空文件。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void readOnlyValidateMissingTransactionSidecarFailsWithoutCreatingIt() throws Exception {
         EngineConfig cfg = config();
@@ -621,6 +673,9 @@ class StorageEngineTest {
         readOnly.close();
     }
 
+    /**
+     * 验证 {@code ordinaryAccessorsRejectWhenRecoveryGateLeavesOpenAfterStartup} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void ordinaryAccessorsRejectWhenRecoveryGateLeavesOpenAfterStartup() {
         RecoveryTrafficGate gate = new RecoveryTrafficGate();
@@ -648,6 +703,9 @@ class StorageEngineTest {
         }
     }
 
+    /**
+     * 验证 {@code freshOpenWithReadOnlyValidateIsRejectedBeforeFormattingFiles} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void freshOpenWithReadOnlyValidateIsRejectedBeforeFormattingFiles() {
         EngineConfig cfg = config().withRecoveryMode(RecoveryMode.READ_ONLY_VALIDATE);
@@ -666,7 +724,10 @@ class StorageEngineTest {
         assertFalse(Files.exists(cfg.doublewriteFile()));
     }
 
-    /** redo 目录里的无关诊断文件不能把 fresh 实例伪装成 existing ring。 */
+    /** redo 目录里的无关诊断文件不能把 fresh 实例伪装成 existing ring。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void readOnlyValidateTreatsRedoDirectoryWithoutRingFilesAsFresh() throws Exception {
         EngineConfig cfg = config().withRecoveryMode(RecoveryMode.READ_ONLY_VALIDATE);
@@ -684,6 +745,9 @@ class StorageEngineTest {
         assertFalse(Files.exists(cfg.undoFile()));
     }
 
+    /**
+     * 验证 {@code existingOpenForceSkipDoesNotOpenSkippedRecoveryTablespace} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void existingOpenForceSkipDoesNotOpenSkippedRecoveryTablespace() {
         EngineConfig cleanCfg = config();
@@ -710,6 +774,9 @@ class StorageEngineTest {
         recovered.close();
     }
 
+    /**
+     * 验证 {@code existingOpenForceSkipRequiresExplicitNonEmptySkipSet} 对应的数据库引擎组合根行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void existingOpenForceSkipRequiresExplicitNonEmptySkipSet() {
         EngineConfig cleanCfg = config();
@@ -723,6 +790,9 @@ class StorageEngineTest {
                 "force-skip mode must not start without an explicit skipped space set");
     }
 
+    /**
+     * 验证 {@code existingOpenForceSkipRejectsSystemUndoSpace} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void existingOpenForceSkipRejectsSystemUndoSpace() {
         EngineConfig cleanCfg = config();
@@ -735,6 +805,9 @@ class StorageEngineTest {
                 "system undo space cannot be skipped because undo rollback/purge recovery depends on it");
     }
 
+    /**
+     * 验证 {@code existingOpenForceSkipRejectsConfiguredClusteredIndexSpace} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void existingOpenForceSkipRejectsConfiguredClusteredIndexSpace() {
         Path dataPath = dir.resolve("clustered-skip.ibd");

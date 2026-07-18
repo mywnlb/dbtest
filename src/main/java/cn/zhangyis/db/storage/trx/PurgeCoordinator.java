@@ -157,6 +157,14 @@ public final class PurgeCoordinator implements PurgeTarget {
      * 共享同一 exact-version metadata 与 row guard 边界。{@code lobStorage} 可以为空以兼容没有 LOB 功能的旧装配；
      * 但只要 undo LV tail 出现 purge-old ownership，执行期就会 fail-closed，绝不会静默泄漏页链。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝 null、越界和相互矛盾的组合。</li>
+     *     <li>完成跨参数校验并推导不可变配置；若构造过程创建自有资源，后续失败必须在异常路径关闭。</li>
+     *     <li>把已校验协作者与配置绑定到字段，并初始化本对象拥有的状态、显式锁、队列或缓存，不允许 this 提前逃逸。</li>
+     *     <li>构造完成后对象处于类契约声明的初始状态；任一步失败都抛出领域异常且不发布半初始化实例。</li>
+     * </ol>
+     *
      * @param mgr             undo/index/记录进度短 MTR 的统一工厂和 redo admission 入口。
      * @param system          active transaction 与 live ReadView 共同形成的 purge boundary 权威来源。
      * @param history         page3 committed history 的运行时 FIFO 投影和 affected-table barrier owner。
@@ -178,6 +186,7 @@ public final class PurgeCoordinator implements PurgeTarget {
                             PurgeDmlRowGuardManager rowGuards,
                             SecondaryPurgeSafetyChecker secondarySafety,
                             LobStorage lobStorage) {
+        // 1、校验必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝非法组合。
         if (mgr == null || system == null || history == null || undoAccess == null || finalizer == null
                 || btree == null || targetResolver == null) {
             throw new DatabaseValidationException("purge coordinator collaborators must not be null");
@@ -189,14 +198,17 @@ public final class PurgeCoordinator implements PurgeTarget {
         }
         this.mgr = mgr;
         this.system = system;
+        // 2、完成跨参数校验并推导不可变配置；后续失败仍由当前构造路径收口已创建资源。
         this.history = history;
         this.undoAccess = undoAccess;
         this.finalizer = finalizer;
         this.btree = btree;
+        // 3、绑定已校验协作者并初始化本对象拥有的状态、显式锁、队列或缓存，不允许半初始化实例逃逸。
         this.targetResolver = targetResolver;
         this.rootSnapshots = rootSnapshots;
         this.rowGuards = rowGuards;
         this.secondarySafety = secondarySafety;
+        // 4、完成初始状态发布；失败以领域异常终止构造，成功对象满足类级生命周期不变量。
         this.lobStorage = lobStorage;
     }
 
@@ -544,6 +556,7 @@ public final class PurgeCoordinator implements PurgeTarget {
      * @param task 已完成版本链安全证明的 exact-version 二级 metadata 与完整 physical key。
      * @return 本次真实删除返回 1，crash 重试发现 ABSENT 返回 0。
      * @throws RuntimeException root 刷新、redo admission、B+Tree 删除/merge/root-shrink、状态冲突或 MTR 提交失败时抛出。
+     * @throws UndoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     private int purgeSecondary(SecondaryTask task) {
         // 1. 结构预算只消费当前 root header level，不能依赖 DD binding 的过期提示。
@@ -653,6 +666,7 @@ public final class PurgeCoordinator implements PurgeTarget {
      * @param pointer     logical chain 中待读取 record 的稳定 roll pointer。
      * @return 同时携带解码 undo record 与 exact-version 表级 target 的无页资源结果。
      * @throws RuntimeException 段/record 读取、identity peek、resolver 错配、格式校验或 MTR 提交失败时抛出。
+     * @throws UndoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     private ResolvedUndo readLogicalRecord(PageId firstPageId, RollPointer pointer) {
         // 1. identity peek 只依赖 undo 固定前缀，允许在选择 exact schema 前完成。
@@ -853,7 +867,10 @@ public final class PurgeCoordinator implements PurgeTarget {
         }
     }
 
-    /** 一次短读取得的持久逻辑链入口。 */
+    /** 一次短读取得的持久逻辑链入口。
+     *
+     * @param head 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     */
     private record LogicalChainStart(UndoLogicalHead head) {
     }
 }

@@ -19,6 +19,14 @@ public enum DurabilityPolicy {
 
     /** commit 等待 redo fsync 到磁盘（默认强 ACID）：宕机不丢已提交事务。 */
     FLUSH_ON_COMMIT {
+        /**
+         * 按Redo/WAL并发协议获取或等待资源；等待必须有界，失败路径保持锁顺序并释放已取得资源。
+         *
+         * @param redo 由组合根提供的 {@code RedoLogManager} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code awaitCommitDurable} 调用
+         * @param commitLsn redo 日志边界；不得为 {@code null}，必须单调且与调用方已发布的页或事务状态一致
+         * @param timeout 本次等待或操作的最大时长；不得为 {@code null} 或负值，零表示只做一次立即检查而不阻塞
+         * @return 在超时或取消前观察到 {@code awaitCommitDurable} 的目标状态时为 {@code true}；等待期限届满且状态仍未满足时为 {@code false}
+         */
         @Override
         public boolean awaitCommitDurable(RedoLogManager redo, Lsn commitLsn, Duration timeout) {
             redo.flush();
@@ -28,6 +36,14 @@ public enum DurabilityPolicy {
 
     /** commit 等待 redo 写到 OS page cache、不等 fsync：延迟更低，但宕机/断电可能丢最近已提交事务。 */
     WRITE_ON_COMMIT {
+        /**
+         * 按Redo/WAL并发协议获取或等待资源；等待必须有界，失败路径保持锁顺序并释放已取得资源。
+         *
+         * @param redo 由组合根提供的 {@code RedoLogManager} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code awaitCommitDurable} 调用
+         * @param commitLsn redo 日志边界；不得为 {@code null}，必须单调且与调用方已发布的页或事务状态一致
+         * @param timeout 本次等待或操作的最大时长；不得为 {@code null} 或负值，零表示只做一次立即检查而不阻塞
+         * @return 在超时或取消前观察到 {@code awaitCommitDurable} 的目标状态时为 {@code true}；等待期限届满且状态仍未满足时为 {@code false}
+         */
         @Override
         public boolean awaitCommitDurable(RedoLogManager redo, Lsn commitLsn, Duration timeout) {
             redo.write();
@@ -37,6 +53,14 @@ public enum DurabilityPolicy {
 
     /** commit 不等待 redo 落盘，立即返回，由后台 {@link RedoFlushWorker} 周期写/刷：测试或低可靠模式，崩溃可能丢。 */
     BACKGROUND_FLUSH {
+        /**
+         * 按Redo/WAL并发协议获取或等待资源；等待必须有界，失败路径保持锁顺序并释放已取得资源。
+         *
+         * @param redo 由组合根提供的 {@code RedoLogManager} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code awaitCommitDurable} 调用
+         * @param commitLsn redo 日志边界；不得为 {@code null}，必须单调且与调用方已发布的页或事务状态一致
+         * @param timeout 本次等待或操作的最大时长；不得为 {@code null} 或负值，零表示只做一次立即检查而不阻塞
+         * @return 在超时或取消前观察到 {@code awaitCommitDurable} 的目标状态时为 {@code true}；等待期限届满且状态仍未满足时为 {@code false}
+         */
         @Override
         public boolean awaitCommitDurable(RedoLogManager redo, Lsn commitLsn, Duration timeout) {
             // 刻意不等待：持久性由后台 flusher 最终保证，commit 立即返回。

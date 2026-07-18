@@ -50,8 +50,20 @@ final class RedoBatchFrameCodec {
     /**
      * 把一个批次编码为完整帧（含外层 header）。返回已 flip、可直接写入 channel 的缓冲；其 {@code remaining()} 即帧字节数，
      * 文件环据此判断当前文件剩余容量是否放得下整批。
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取输入长度、游标边界与必要标识，损坏、截断或超限数据在创建结果前失败。</li>
+     *     <li>按稳定字段或 token 顺序推进游标并调用对应编解码分支，任何分支都不得越过输入边界。</li>
+     *     <li>交叉校验聚合计数、类型、校验值和剩余输入，防止截断或多余内容形成半解析对象。</li>
+     *     <li>完成剩余字段写入或稳定领域结果构造；失败只保留领域异常与根因，不修改调用方输入或其他持久状态。</li>
+     * </ol>
+     *
+     * @param batch redo 收集、定位或重放所需的日志对象；不得为 {@code null}，其 LSN 范围和记录格式必须连续且属于当前恢复或 MTR 上下文
+     * @return {@code encodeFrame} 生成的非空字节表示；调用方获得独立结果或受控视图，格式失败通过领域异常报告
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     static ByteBuffer encodeFrame(RedoLogBatch batch) {
+        // 1、读取输入长度、游标边界与必要标识，在共享或持久副作用前拒绝非法状态。
         if (batch == null) {
             throw new DatabaseValidationException("redo log batch must not be null");
         }
@@ -60,12 +72,15 @@ final class RedoBatchFrameCodec {
             throw new DatabaseValidationException("redo batch payload exceeds recoverable frame limit: "
                     + payload.length + " > " + MAX_PAYLOAD_BYTES);
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按稳定字段或 token 顺序推进游标并调用对应编解码分支，保持处理顺序与资源边界。
         ByteBuffer frame = ByteBuffer.allocate(FRAME_HEADER_BYTES + payload.length);
         frame.putInt(MAGIC);
         frame.putInt(payload.length);
+        // 3、在中间分支复核阶段性结果；满足条件后，交叉校验聚合计数、类型、校验值和剩余输入，并维持领域不变量。
         frame.putInt(crc32(payload));
         frame.put(payload);
         frame.flip();
+        // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
         return frame;
     }
 
@@ -76,14 +91,27 @@ final class RedoBatchFrameCodec {
      * header 或 payload 的尾部即停止（视为 crash torn tail，position 停在该帧起点）；遇到「字节足够但结构非法」的完整帧则抛
      * {@link RedoLogCorruptedException}，不静默跳过。返回的批次顺序与文件内物理顺序一致。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取输入长度、游标边界与必要标识，损坏、截断或超限数据在创建结果前失败。</li>
+     *     <li>按稳定字段或 token 顺序推进游标并调用对应编解码分支，任何分支都不得越过输入边界。</li>
+     *     <li>交叉校验聚合计数、类型、校验值和剩余输入，防止截断或多余内容形成半解析对象。</li>
+     *     <li>完成剩余字段写入或稳定领域结果构造；失败只保留领域异常与根因，不修改调用方输入或其他持久状态。</li>
+     * </ol>
+     *
      * @param content 待扫描内容（position 在数据起点，limit 在数据末尾）。
      * @return 完整且校验通过的批次列表。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws RedoLogCorruptedException 检测到不能安全解释的持久数据损坏时抛出；调用方不得继续发布普通服务或覆盖原始证据
      */
     static List<RedoLogBatch> decodeFrames(ByteBuffer content) {
+        // 1、读取输入长度、游标边界与必要标识，在共享或持久副作用前拒绝非法状态。
         if (content == null) {
             throw new DatabaseValidationException("redo frame content must not be null");
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按稳定字段或 token 顺序推进游标并调用对应编解码分支，保持处理顺序与资源边界。
         List<RedoLogBatch> out = new ArrayList<>();
+        // 3、在中间分支复核阶段性结果；满足条件后，交叉校验聚合计数、类型、校验值和剩余输入，并维持领域不变量。
         while (content.remaining() >= FRAME_HEADER_BYTES) {
             int frameStart = content.position();
             int magic = content.getInt();
@@ -107,19 +135,36 @@ final class RedoBatchFrameCodec {
             }
             out.add(decodePayload(bytes));
         }
+        // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
         return out;
     }
 
-    /** 解码单个 payload（不含外层 header）。供单文件仓储的增量 channel 扫描复用。 */
+    /** 解码单个 payload（不含外层 header）。供单文件仓储的增量 channel 扫描复用。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取输入长度、游标边界与必要标识，损坏、截断或超限数据在创建结果前失败。</li>
+     *     <li>按稳定字段或 token 顺序推进游标并调用对应编解码分支，任何分支都不得越过输入边界。</li>
+     *     <li>交叉校验聚合计数、类型、校验值和剩余输入，防止截断或多余内容形成半解析对象。</li>
+     *     <li>完成剩余字段写入或稳定领域结果构造；失败只保留领域异常与根因，不修改调用方输入或其他持久状态。</li>
+     * </ol>
+     *
+     * @param bytes 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @return {@code decodePayload} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     * @throws RedoLogCorruptedException 检测到不能安全解释的持久数据损坏时抛出；调用方不得继续发布普通服务或覆盖原始证据
+     */
     static RedoLogBatch decodePayload(byte[] bytes) {
         try {
+            // 1、读取输入长度、游标边界与必要标识，在共享或持久副作用前拒绝非法状态。
             DataInputStream in = new DataInputStream(new ByteArrayInputStream(bytes));
             LogRange range = new LogRange(Lsn.of(in.readLong()), Lsn.of(in.readLong()));
+            // 2、继续完成范围、身份与候选校验；通过后，按稳定字段或 token 顺序推进游标并调用对应编解码分支，保持处理顺序与资源边界。
             int count = in.readInt();
             int remaining = bytes.length - PAYLOAD_HEADER_BYTES;
             if (count < 0 || count > remaining / MIN_RECORD_BYTES) {
                 throw new RedoLogCorruptedException("redo record count invalid: " + count);
             }
+            // 3、在中间分支复核阶段性结果；满足条件后，交叉校验聚合计数、类型、校验值和剩余输入，并维持领域不变量。
             List<RedoRecord> records = new ArrayList<>(count);
             for (int i = 0; i < count; i++) {
                 records.add(readRecord(in));
@@ -127,6 +172,7 @@ final class RedoBatchFrameCodec {
             if (in.available() != 0) {
                 throw new RedoLogCorruptedException("redo payload has trailing bytes: " + in.available());
             }
+            // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
             return new RedoLogBatch(range, records);
         } catch (IOException e) {
             throw new RedoLogCorruptedException("failed to decode redo payload", e);
@@ -135,30 +181,61 @@ final class RedoBatchFrameCodec {
         }
     }
 
-    /** CRC32 校验和（int 截断），帧 payload 完整性校验。 */
+    /** CRC32 校验和（int 截断），帧 payload 完整性校验。
+     *
+     * @param bytes 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @return 按当前持久格式计算的校验位模式；使用 Java 数值类型承载无符号结果，不代表有符号业务量
+     */
     static int crc32(byte[] bytes) {
         CRC32 crc = new CRC32();
         crc.update(bytes);
         return (int) crc.getValue();
     }
 
+    /**
+     * 把调用方领域值编码为Redo/WAL的稳定表示；编码前校验范围，成功不修改输入对象。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取输入长度、游标边界与必要标识，损坏、截断或超限数据在创建结果前失败。</li>
+     *     <li>按稳定字段或 token 顺序推进游标并调用对应编解码分支，任何分支都不得越过输入边界。</li>
+     *     <li>交叉校验聚合计数、类型、校验值和剩余输入，防止截断或多余内容形成半解析对象。</li>
+     *     <li>完成剩余字段写入或稳定领域结果构造；失败只保留领域异常与根因，不修改调用方输入或其他持久状态。</li>
+     * </ol>
+     *
+     * @param batch redo 收集、定位或重放所需的日志对象；不得为 {@code null}，其 LSN 范围和记录格式必须连续且属于当前恢复或 MTR 上下文
+     * @return {@code encodePayload} 生成的非空字节表示；调用方获得独立结果或受控视图，格式失败通过领域异常报告
+     * @throws RedoLogIoException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
+     */
     private static byte[] encodePayload(RedoLogBatch batch) {
         try {
+            // 1、读取输入长度、游标边界与必要标识，在共享或持久副作用前拒绝非法状态。
             ByteArrayOutputStream bytes = new ByteArrayOutputStream();
             DataOutputStream out = new DataOutputStream(bytes);
+            // 2、继续完成范围、身份与候选校验；通过后，按稳定字段或 token 顺序推进游标并调用对应编解码分支，保持处理顺序与资源边界。
             out.writeLong(batch.range().start().value());
             out.writeLong(batch.range().end().value());
+            // 3、在中间分支复核阶段性结果；满足条件后，交叉校验聚合计数、类型、校验值和剩余输入，并维持领域不变量。
             out.writeInt(batch.records().size());
             for (RedoRecord r : batch.records()) {
                 writeRecord(out, r);
             }
             out.flush();
+            // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
             return bytes.toByteArray();
         } catch (IOException e) {
             throw new RedoLogIoException("failed to encode redo payload", e);
         }
     }
 
+    /**
+     * 校验输入与当前状态后修改Redo/WAL领域数据；成功发布完整结果，异常路径保留既有持久化与并发不变量。
+     *
+     * @param out 调用方打开的定位 IO 或编码写入对象；不得为 {@code null}，方法不接管所有权，失败时仍由创建方关闭
+     * @param r redo 收集、定位或重放所需的日志对象；不得为 {@code null}，其 LSN 范围和记录格式必须连续且属于当前恢复或 MTR 上下文
+     * @throws IOException 底层文件读写失败时抛出；调用方不得据此发布持久化成功状态
+     * @throws RedoLogCorruptedException 检测到不能安全解释的持久数据损坏时抛出；调用方不得继续发布普通服务或覆盖原始证据
+     */
     private static void writeRecord(DataOutputStream out, RedoRecord r) throws IOException {
         if (r instanceof PageInitRecord pir) {
             out.writeByte(RedoRecordType.PAGE_INIT.tag());
@@ -233,6 +310,14 @@ final class RedoBatchFrameCodec {
         }
     }
 
+    /**
+     * 根据调用参数创建或转换 {@code readRecord} 返回的 {@code RedoRecord}；输入先完成领域校验，成功结果不为 {@code null}。
+     *
+     * @param in 调用方打开的定位 IO 或编码写入对象；不得为 {@code null}，方法不接管所有权，失败时仍由创建方关闭
+     * @return {@code readRecord} 编码、解码或重建的记录数据；成功时不为 {@code null}，字段顺序、隐藏列和字节边界满足当前 schema
+     * @throws IOException 底层文件读写失败时抛出；调用方不得据此发布持久化成功状态
+     * @throws RedoLogCorruptedException 检测到不能安全解释的持久数据损坏时抛出；调用方不得继续发布普通服务或覆盖原始证据
+     */
     private static RedoRecord readRecord(DataInputStream in) throws IOException {
         RedoRecordType type = RedoRecordType.fromTag(in.readByte());
         return switch (type) {
@@ -334,13 +419,30 @@ final class RedoBatchFrameCodec {
         return PageId.of(SpaceId.of(in.readInt()), PageNo.of(in.readLong()));
     }
 
+    /**
+     * 根据调用参数创建或转换 {@code pageIdOf} 返回的 {@code PageId}；输入先完成领域校验，成功结果不为 {@code null}。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取输入长度、游标边界与必要标识，损坏、截断或超限数据在创建结果前失败。</li>
+     *     <li>按稳定字段或 token 顺序推进游标并调用对应编解码分支，任何分支都不得越过输入边界。</li>
+     *     <li>交叉校验聚合计数、类型、校验值和剩余输入，防止截断或多余内容形成半解析对象。</li>
+     *     <li>完成剩余字段写入或稳定领域结果构造；失败只保留领域异常与根因，不修改调用方输入或其他持久状态。</li>
+     * </ol>
+     *
+     * @param r redo 收集、定位或重放所需的日志对象；不得为 {@code null}，其 LSN 范围和记录格式必须连续且属于当前恢复或 MTR 上下文
+     * @return {@code pageIdOf} 定位或分配的稳定值对象；成功时不为 {@code null}，其身份、范围和特殊值已由构造校验保证
+     * @throws RedoLogCorruptedException 检测到不能安全解释的持久数据损坏时抛出；调用方不得继续发布普通服务或覆盖原始证据
+     */
     private static PageId pageIdOf(RedoRecord r) {
+        // 1、读取输入长度、游标边界与必要标识，在共享或持久副作用前拒绝非法状态。
         if (r instanceof PageInitRecord pir) {
             return pir.pageId();
         }
         if (r instanceof PageBytesRecord pbr) {
             return pbr.pageId();
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按稳定字段或 token 顺序推进游标并调用对应编解码分支，保持处理顺序与资源边界。
         if (r instanceof FspPageAllocationRecord far) {
             return far.allocatedPageId();
         }
@@ -350,6 +452,7 @@ final class RedoBatchFrameCodec {
         if (r instanceof FspPageFreeRecord fpf) {
             return fpf.freedPageId();
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，交叉校验聚合计数、类型、校验值和剩余输入，并维持领域不变量。
         if (r instanceof UndoMetadataDeltaRecord umd) {
             return umd.pageId();
         }
@@ -359,6 +462,7 @@ final class RedoBatchFrameCodec {
         if (r instanceof BTreePageDeltaRecord btd) {
             return btd.pageId();
         }
+        // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
         throw new RedoLogCorruptedException("unsupported redo record type: " + r.getClass().getName());
     }
 }

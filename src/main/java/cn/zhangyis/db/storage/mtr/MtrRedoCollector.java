@@ -49,6 +49,13 @@ final class MtrRedoCollector implements PageWriteListener {
     /** commit 盖 pageLSN 前关闭 collector，避免 pageLSN stamp 自身被回收成 redo。 */
     private boolean enabled = true;
 
+    /**
+     * 接收 {@code onWrite} 对应的Mini Transaction生命周期事件；只更新本策略拥有的统计或顺序状态，不接管事件来源资源。
+     *
+     * @param pageId 目标页的稳定物理标识；必须属于当前已准入表空间，且不得为 {@code null}
+     * @param offset 目标结构内的零基偏移；必须落在当前页、记录或持久槽位的合法范围
+     * @param newBytes 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     */
     @Override
     public void onWrite(PageId pageId, int offset, byte[] newBytes) {
         if (!enabled) {
@@ -60,7 +67,11 @@ final class MtrRedoCollector implements PageWriteListener {
         touchedPages.add(pageId);
     }
 
-    /** 记录一次页初始化（newPage）。 */
+    /** 记录一次页初始化（newPage）。
+     *
+     * @param pageId 目标页的稳定物理标识；必须属于当前已准入表空间，且不得为 {@code null}
+     * @param pageType 选择 {@code recordInit} 分支的 {@code PageType} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     */
     void recordInit(PageId pageId, PageType pageType) {
         if (!enabled) {
             return;
@@ -75,30 +86,47 @@ final class MtrRedoCollector implements PageWriteListener {
      * 追加一条显式逻辑 redo record。它不来自 PageGuard 字节写监听，因此不会自动增加 touched page；
      * 调用方必须确保同一 MTR 内存在对应的物理页修改或恢复期安全副作用来承载该逻辑意图。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取并校验调用参数与当前领域状态，确保失败发生在本方法创建共享或持久副作用之前。</li>
+     *     <li>按类级并发协议取得本阶段所需协作者与 Guard，竞争后重新校验资源身份和生命周期。</li>
+     *     <li>执行核心状态转换或数据变换，并只通过本包稳定协作者发布可观察副作用。</li>
+     *     <li>汇总稳定结果并沿现有 finally/Guard 释放资源；异常不得伪造成功或清除未完成状态。</li>
+     * </ol>
+     *
      * @param record  将被持久化到 redo 文件的逻辑 record。
      * @param category 本地诊断分类，说明 record 来源模块；不进入 redo 文件。
      * @param reason  追加原因，必须说明数据库语义，便于 review 追踪。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     void recordLogical(RedoRecord record, MtrRedoCategory category, String reason) {
+        // 1、读取并校验调用参数与当前领域状态，在共享或持久副作用前拒绝非法状态。
         if (!enabled) {
             return;
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按类级并发协议取得本阶段所需协作者与 Guard，保持处理顺序与资源边界。
         if (record == null || category == null) {
             throw new DatabaseValidationException("logical redo record/category must not be null");
         }
         if (category == MtrRedoCategory.PAGE_INIT) {
             throw new DatabaseValidationException("PAGE_INIT category is reserved for MiniTransaction.newPage");
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，执行核心状态转换或数据变换，并维持领域不变量。
         if (reason == null || reason.isBlank()) {
             throw new DatabaseValidationException("logical redo reason must not be blank");
         }
         records.add(record);
+        // 4、汇总稳定结果并沿现有 finally/Guard 释放资源，以稳定返回或领域异常完成收口。
         entries.add(new MtrRedoEntry(record, category));
     }
 
     /**
      * 进入一个 redo 分类作用域。普通 {@code PAGE_BYTES} 写入使用当前分类；{@code PAGE_INIT} 永远保持自己的分类，
      * 以便恢复语义上继续作为唯一建页记录被审计。
+     * @param category redo 收集、定位或重放所需的日志对象；不得为 {@code null}，其 LSN 范围和记录格式必须连续且属于当前恢复或 MTR 上下文
+     * @param reason 传给 {@code enterCategory} 的文本值；不得为 {@code null} 或空白，并保持调用方提供的字符顺序
+     * @return {@code enterCategory} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     MtrRedoCategoryScope enterCategory(MtrRedoCategory category, String reason) {
         if (category == null) {
@@ -116,7 +144,11 @@ final class MtrRedoCollector implements PageWriteListener {
         return scope;
     }
 
-    /** 按 LIFO 关闭分类作用域，防止嵌套分类被乱序恢复。 */
+    /** 按 LIFO 关闭分类作用域，防止嵌套分类被乱序恢复。
+     *
+     * @param scope redo 收集、定位或重放所需的日志对象；不得为 {@code null}，其 LSN 范围和记录格式必须连续且属于当前恢复或 MTR 上下文
+     * @throws MtrStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
+     */
     void closeCategoryScope(MtrRedoCategoryScope scope) {
         if (categoryScopes.peek() != scope) {
             throw new MtrStateException("MTR redo category scope closed out of order: " + scope.reason());
@@ -155,7 +187,21 @@ final class MtrRedoCollector implements PageWriteListener {
         return touchedPages;
     }
 
+    /**
+     * 校验输入与当前状态后修改Mini Transaction领域数据；成功发布完整结果，异常路径保留既有持久化与并发不变量。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取并校验调用参数与当前领域状态，确保失败发生在本方法创建共享或持久副作用之前。</li>
+     *     <li>按类级并发协议取得本阶段所需协作者与 Guard，竞争后重新校验资源身份和生命周期。</li>
+     *     <li>执行核心状态转换或数据变换，并只通过本包稳定协作者发布可观察副作用。</li>
+     *     <li>汇总稳定结果并沿现有 finally/Guard 释放资源；异常不得伪造成功或清除未完成状态。</li>
+     * </ol>
+     *
+     * @return {@code persistedEntries} 产生的非空集合容器；元素身份与顺序遵循当前模块契约，无元素时返回空集合而非 {@code null}
+     */
     private List<MtrRedoEntry> persistedEntries() {
+        // 1、读取并校验调用参数与当前领域状态，在共享或持久副作用前拒绝非法状态。
         List<FspMetadataDeltaRecord> fspMetadataDeltas = entries.stream()
                 .map(MtrRedoEntry::record)
                 .filter(FspMetadataDeltaRecord.class::isInstance)
@@ -166,6 +212,7 @@ final class MtrRedoCollector implements PageWriteListener {
                 .filter(UndoMetadataDeltaRecord.class::isInstance)
                 .map(UndoMetadataDeltaRecord.class::cast)
                 .toList();
+        // 2、继续完成范围、身份与候选校验；通过后，按类级并发协议取得本阶段所需协作者与 Guard，保持处理顺序与资源边界。
         List<UndoRecordPayloadRecord> undoPayloadDeltas = entries.stream()
                 .map(MtrRedoEntry::record)
                 .filter(UndoRecordPayloadRecord.class::isInstance)
@@ -176,6 +223,7 @@ final class MtrRedoCollector implements PageWriteListener {
                 .filter(BTreePageDeltaRecord.class::isInstance)
                 .map(BTreePageDeltaRecord.class::cast)
                 .toList();
+        // 3、在中间分支复核阶段性结果；满足条件后，执行核心状态转换或数据变换，并维持领域不变量。
         if (fspMetadataDeltas.isEmpty() && undoMetadataDeltas.isEmpty()
                 && undoPayloadDeltas.isEmpty() && btreePageDeltas.isEmpty()) {
             return List.copyOf(entries);
@@ -189,6 +237,7 @@ final class MtrRedoCollector implements PageWriteListener {
                 retained.add(entry);
             }
         }
+        // 4、汇总稳定结果并沿现有 finally/Guard 释放资源，以稳定返回或领域异常完成收口。
         return retained;
     }
 
@@ -206,6 +255,13 @@ final class MtrRedoCollector implements PageWriteListener {
         return false;
     }
 
+    /**
+     * 判断 {@code isCoveredUndoMetadataBytes} 所表达的Mini Transaction条件；方法只读取稳定状态，并用返回值报告是否满足条件。
+     *
+     * @param entry redo 收集、定位或重放所需的日志对象；不得为 {@code null}，其 LSN 范围和记录格式必须连续且属于当前恢复或 MTR 上下文
+     * @param metadataDeltas 参与 {@code isCoveredUndoMetadataBytes} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @return {@code isCoveredUndoMetadataBytes} 命名的领域事实成立时为 {@code true}，否则为 {@code false}；查询本身不改变权威状态
+     */
     private static boolean isCoveredUndoMetadataBytes(MtrRedoEntry entry,
                                                       List<UndoMetadataDeltaRecord> metadataDeltas) {
         if (entry.category() != MtrRedoCategory.UNDO_PAGE_BYTES
@@ -220,6 +276,13 @@ final class MtrRedoCollector implements PageWriteListener {
         return false;
     }
 
+    /**
+     * 判断 {@code isCoveredUndoRecordPayloadBytes} 所表达的Mini Transaction条件；方法只读取稳定状态，并用返回值报告是否满足条件。
+     *
+     * @param entry redo 收集、定位或重放所需的日志对象；不得为 {@code null}，其 LSN 范围和记录格式必须连续且属于当前恢复或 MTR 上下文
+     * @param payloadDeltas 参与 {@code isCoveredUndoRecordPayloadBytes} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @return {@code isCoveredUndoRecordPayloadBytes} 命名的领域事实成立时为 {@code true}，否则为 {@code false}；查询本身不改变权威状态
+     */
     private static boolean isCoveredUndoRecordPayloadBytes(MtrRedoEntry entry,
                                                            List<UndoRecordPayloadRecord> payloadDeltas) {
         if (entry.category() != MtrRedoCategory.UNDO_PAGE_BYTES

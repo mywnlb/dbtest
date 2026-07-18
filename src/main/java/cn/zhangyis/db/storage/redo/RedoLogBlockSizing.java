@@ -18,6 +18,9 @@ public final class RedoLogBlockSizing {
     /**
      * 计算逻辑 record 字节对应的完整 block chain 字节数。零记录不会落盘，故返回零；正值公式为
      * {@code ceil((frameHeader + payloadHeader + logical)/blockPayload) * blockBytes}。
+     * @param logicalBytes 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @return {@code physicalBytesForLogical} 从受校验输入或持久字节中得到的 {@code long} 结果；位宽、符号和特殊值语义遵循当前格式，无法表示时抛出领域异常
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public static long physicalBytesForLogical(long logicalBytes) {
         if (logicalBytes < 0 || logicalBytes > MAX_LOGICAL_BATCH_BYTES) {

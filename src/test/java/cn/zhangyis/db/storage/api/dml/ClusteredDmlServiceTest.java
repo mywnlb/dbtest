@@ -91,6 +91,9 @@ class ClusteredDmlServiceTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code commandObjectsRejectNullRequiredFields} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     @DisplayName("DML command objects reject null required fields")
     void commandObjectsRejectNullRequiredFields() {
@@ -108,6 +111,9 @@ class ClusteredDmlServiceTest {
                 () -> new DmlRollbackCommand(transaction(), null));
     }
 
+    /**
+     * 验证 {@code insertThroughFacadeWritesClusteredRowWithUndoPointer} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     @DisplayName("INSERT through DML facade writes clustered row with transaction id and undo roll pointer")
     void insertThroughFacadeWritesClusteredRowWithUndoPointer() {
@@ -465,6 +471,9 @@ class ClusteredDmlServiceTest {
         }
     }
 
+    /**
+     * 验证 {@code updateThroughFacadeReplacesClusteredRowWithNewHiddenColumns} 对应的存储引擎稳定 API行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     @DisplayName("UPDATE through DML facade writes update undo and replaces clustered row")
     void updateThroughFacadeReplacesClusteredRowWithNewHiddenColumns() {
@@ -491,6 +500,9 @@ class ClusteredDmlServiceTest {
         }
     }
 
+    /**
+     * 验证 {@code deleteThroughFacadeMarksClusteredRowDeleted} 对应的存储引擎稳定 API行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     @DisplayName("DELETE through DML facade writes delete-mark undo and hides clustered row")
     void deleteThroughFacadeMarksClusteredRowDeleted() {
@@ -517,6 +529,9 @@ class ClusteredDmlServiceTest {
         }
     }
 
+    /**
+     * 验证 {@code commitThroughFacadeWaitsDurabilityAndReleasesLocks} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     @DisplayName("COMMIT through DML facade waits durability and releases transaction row locks")
     void commitThroughFacadeWaitsDurabilityAndReleasesLocks() {
@@ -687,6 +702,9 @@ class ClusteredDmlServiceTest {
         }
     }
 
+    /**
+     * 验证 {@code commitDurabilityTimeoutReleasesLocks} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     @DisplayName("COMMIT durability timeout leaves transaction committed but releases row locks")
     void commitDurabilityTimeoutReleasesLocks() {
@@ -714,6 +732,9 @@ class ClusteredDmlServiceTest {
         }
     }
 
+    /**
+     * 验证 {@code commitOnCommitFailureKeepsTransactionRecoverableAndLocksHeld} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     @DisplayName("COMMIT onCommit failure leaves transaction active and keeps row locks")
     void commitOnCommitFailureKeepsTransactionRecoverableAndLocksHeld() {
@@ -745,6 +766,9 @@ class ClusteredDmlServiceTest {
         }
     }
 
+    /**
+     * 验证 {@code rollbackThroughFacadeAppliesMixedUndoAndReleasesLocks} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     @DisplayName("ROLLBACK through DML facade applies mixed undo chain and releases row locks")
     void rollbackThroughFacadeAppliesMixedUndoAndReleasesLocks() {
@@ -808,6 +832,9 @@ class ClusteredDmlServiceTest {
         }
     }
 
+    /**
+     * 验证 {@code statementGuardRollsBackOnlyWritesAfterExistingUndoBoundary} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     @DisplayName("Statement guard rolls back only DML writes after an existing undo boundary")
     void statementGuardRollsBackOnlyWritesAfterExistingUndoBoundary() {
@@ -844,6 +871,9 @@ class ClusteredDmlServiceTest {
         }
     }
 
+    /**
+     * 验证 {@code statementGuardRollsBackFirstWriteToEmptyUndoBoundary} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     @DisplayName("Statement guard can roll back the first write to an empty undo boundary")
     void statementGuardRollsBackFirstWriteToEmptyUndoBoundary() {
@@ -883,6 +913,9 @@ class ClusteredDmlServiceTest {
         }
     }
 
+    /**
+     * 验证 {@code statementGuardCloseKeepsSuccessfulWritesForFullRollback} 所描述的返回值或状态会按契约保留，并断言原始信息与领域不变量未丢失。
+     */
     @Test
     @DisplayName("Closing a successful statement guard keeps writes for later transaction rollback")
     void statementGuardCloseKeepsSuccessfulWritesForFullRollback() {
@@ -910,6 +943,9 @@ class ClusteredDmlServiceTest {
         }
     }
 
+    /**
+     * 验证 {@code emptyStatementGuardCloseRequiresActiveTransaction} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     @DisplayName("Closing an empty statement guard still requires an active transaction")
     void emptyStatementGuardCloseRequiresActiveTransaction() {
@@ -928,6 +964,9 @@ class ClusteredDmlServiceTest {
         }
     }
 
+    /**
+     * 验证 {@code statementGuardRollbackFailureIsTerminal} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     @DisplayName("A statement rollback failure is terminal for the guard")
     void statementGuardRollbackFailureIsTerminal() {
@@ -983,6 +1022,9 @@ class ClusteredDmlServiceTest {
         }
     }
 
+    /**
+     * 验证 {@code duplicateInsertThroughFacadeThrowsAndKeepsOriginalRow} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     @DisplayName("INSERT duplicate through DML facade throws duplicate key and keeps original row")
     void duplicateInsertThroughFacadeThrowsAndKeepsOriginalRow() {
@@ -1004,6 +1046,9 @@ class ClusteredDmlServiceTest {
         }
     }
 
+    /**
+     * 验证 {@code missingRowsDoNotAllocateUndoContext} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     @DisplayName("UPDATE and DELETE miss through DML facade do not allocate undo context")
     void missingRowsDoNotAllocateUndoContext() {
@@ -1029,6 +1074,9 @@ class ClusteredDmlServiceTest {
         }
     }
 
+    /**
+     * 验证 {@code closedRecoveryGateRejectsDmlBeforeStateMutation} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     @DisplayName("DML facade rejects ordinary traffic while recovery gate is not open")
     void closedRecoveryGateRejectsDmlBeforeStateMutation() {
@@ -1047,6 +1095,9 @@ class ClusteredDmlServiceTest {
         }
     }
 
+    /**
+     * 验证 {@code lockTimeoutPropagatesAndSubsequentUpdateCanProceedAfterOwnerRollback} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     @DisplayName("Lock timeout from current-read propagates through DML facade without latch leak")
     void lockTimeoutPropagatesAndSubsequentUpdateCanProceedAfterOwnerRollback() {

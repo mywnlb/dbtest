@@ -30,6 +30,9 @@ class ReadViewManagerTest {
         return txnMgr.begin(new TransactionOptions(level, readOnly, true));
     }
 
+    /**
+     * 验证 {@code rrReusesSameReadView} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void rrReusesSameReadView() {
         setup();
@@ -39,6 +42,9 @@ class ReadViewManagerTest {
         assertSame(v1, v2, "RR 事务级 ReadView 复用同一对象");
     }
 
+    /**
+     * 验证 {@code rcCreatesFreshReadView} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void rcCreatesFreshReadView() {
         setup();
@@ -48,6 +54,9 @@ class ReadViewManagerTest {
         assertNotSame(v1, v2, "RC 每次一致性读新建 ReadView");
     }
 
+    /**
+     * 验证 {@code nonReadOnlyAllocatesCreatorIdOnFirstOpenAndSelfVisible} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void nonReadOnlyAllocatesCreatorIdOnFirstOpenAndSelfVisible() {
         setup();
@@ -62,6 +71,9 @@ class ReadViewManagerTest {
         assertTrue(v.isVisible(txn.transactionId()), "事务能看见自己之后写入的修改");
     }
 
+    /**
+     * 验证 {@code readOnlyCreatorStaysNone} 对应的事务、MVCC 与锁行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void readOnlyCreatorStaysNone() {
         setup();
@@ -71,6 +83,9 @@ class ReadViewManagerTest {
         assertTrue(txn.transactionId().isNone(), "建 ReadView 不为只读事务分配写 id");
     }
 
+    /**
+     * 验证 {@code readUncommittedAndSerializableRejected} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void readUncommittedAndSerializableRejected() {
         setup();
@@ -81,6 +96,9 @@ class ReadViewManagerTest {
         assertThrows(TransactionStateException.class, () -> rvm.openReadView(ser));
     }
 
+    /**
+     * 验证 {@code openReadViewRequiresActive} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void openReadViewRequiresActive() {
         setup();
@@ -89,6 +107,9 @@ class ReadViewManagerTest {
         assertThrows(TransactionStateException.class, () -> rvm.openReadView(txn));
     }
 
+    /**
+     * 验证 {@code releaseClearsRrCache} 对应的事务、MVCC 与锁行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void releaseClearsRrCache() {
         setup();
@@ -101,6 +122,9 @@ class ReadViewManagerTest {
         assertNotSame(v1, v2, "release 后重开建新 ReadView");
     }
 
+    /**
+     * 验证 {@code releaseIsIdempotentAndAllowsNonActive} 对应的事务、MVCC 与锁行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void releaseIsIdempotentAndAllowsNonActive() {
         setup();

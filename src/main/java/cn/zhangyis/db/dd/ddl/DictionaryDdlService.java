@@ -41,6 +41,7 @@ import cn.zhangyis.db.storage.api.ddl.TableDdlStorageService;
 import cn.zhangyis.db.storage.api.ddl.DdlUndoMarker;
 import cn.zhangyis.db.storage.api.TablePurgeBarrier;
 import cn.zhangyis.db.storage.api.ddl.TableStorageBinding;
+import cn.zhangyis.db.storage.api.tablespace.TablespaceFileIdentity;
 import cn.zhangyis.db.storage.api.ddl.SecondaryIndexBuildDescriptor;
 import cn.zhangyis.db.storage.api.ddl.SecondaryIndexBuildDuplicateKeyException;
 import cn.zhangyis.db.storage.api.ddl.IndexStorageBinding;
@@ -54,6 +55,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * MDL、ID/version control、持久 DD、cache 与物理 storage DDL 的唯一协调器。锁顺序固定为 schema→table；
@@ -62,14 +64,35 @@ import java.util.Map;
 @Slf4j
 public final class DictionaryDdlService {
 
+    /**
+     * 本对象持有的 {@code control} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private final DictionaryControlStore control;
+    /**
+     * 本对象持有的 {@code repository} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private final PersistentDictionaryRepository repository;
+    /**
+     * 本对象持有的 {@code cache} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private final DictionaryObjectCache cache;
+    /**
+     * 本对象持有的 {@code locks} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private final MetadataLockManager locks;
+    /**
+     * 本对象持有的 {@code physical} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private final TableDdlStorageService physical;
     /** DROP_PENDING 发布前等待 committed history 清零的稳定 storage API。 */
     private final TablePurgeBarrier purgeBarrier;
+    /**
+     * 构造时冻结的 {@code tablesDirectory} 规范化路径；必须位于所属表空间或日志目录内，IO 层依赖它防止访问错误文件。
+     */
     private final Path tablesDirectory;
+    /**
+     * 构造时冻结的 {@code faultInjector} 领域快照；其身份、版本与范围来自同一次权威读取，下游步骤依赖它检测并发变化和避免发布陈旧状态。
+     */
     private final DictionaryDdlFaultInjector faultInjector;
     /** ACTIVE DD 发布前写入完整 table SDI，保证文件冗余先于 catalog 提交 durable。 */
     private final SerializedDictionaryInfoService sdi;
@@ -165,7 +188,16 @@ public final class DictionaryDdlService {
         this.sdi = new SerializedDictionaryInfoService(physical);
     }
 
-    /** 创建 schema；X MDL 覆盖重复名称检查、ID/version 预留与 catalog publish。 */
+    /** 创建 schema；X MDL 覆盖重复名称检查、ID/version 预留与 catalog publish。
+     *
+     * @param owner 参与 {@code createSchema} 的稳定领域标识 {@code MdlOwnerId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param name 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @param charsetId 参与 {@code createSchema} 的原始数值身份 {@code charsetId}；必须非负，零值仅用于对应格式明确声明的系统或空身份
+     * @param collationId 参与 {@code createSchema} 的原始数值身份 {@code collationId}；必须非负，零值仅用于对应格式明确声明的系统或空身份
+     * @param timeout 本次等待或操作的最大时长；不得为 {@code null} 且必须为正，超时不得留下未释放资源
+     * @return {@code createSchema} 形成的不可变定义、计划或元数据快照；成功时不为 {@code null}，内部身份、版本和范围已完成交叉校验
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public SchemaDefinition createSchema(MdlOwnerId owner, ObjectName name, int charsetId, int collationId,
                                          Duration timeout) {
         validateOwnerTimeout(owner, timeout);
@@ -209,6 +241,7 @@ public final class DictionaryDdlService {
      * @throws DatabaseValidationException owner/command/timeout 无效时抛出，且不进入 DDL 流程。
      * @throws cn.zhangyis.db.common.exception.DatabaseRuntimeException 物理创建、DD 发布或 DDL marker 协作失败时抛出；
      *                                                               调用方必须停止本次 DDL，不得自行删除 marker path。
+     * @throws cn.zhangyis.db.dd.exception.DictionaryObjectExistsException 目标身份或唯一键已被占用时抛出；调用方应回滚本次变更或改用其他合法身份
      */
     public TableDefinition createTable(MdlOwnerId owner, CreateTableCommand command, Duration timeout) {
         validateOwnerTimeout(owner, timeout);
@@ -312,6 +345,8 @@ public final class DictionaryDdlService {
      *                                                   staged 资源清理成功后 marker 为 ROLLED_BACK
      * @throws cn.zhangyis.db.common.exception.DatabaseRuntimeException 物理、SDI、DD 或 marker 状态不确定时抛出；
      *                                                               调用方不得自行删除 segment
+     * @throws cn.zhangyis.db.dd.exception.DictionaryObjectExistsException 目标身份或唯一键已被占用时抛出；调用方应回滚本次变更或改用其他合法身份
+     * @throws DictionaryDdlException DML/DDL 的校验、物理变更或原子收口失败时抛出；调用方应按语句与事务边界回滚
      */
     public TableDefinition createSecondaryIndex(MdlOwnerId owner,
                                                 CreateSecondaryIndexCommand command,
@@ -518,6 +553,136 @@ public final class DictionaryDdlService {
         }
     }
 
+    /** 将 ACTIVE 表转换为 DISCARDED，并把物理文件移入受控 quarantine。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验表空间生命周期、页号、区段身份与容量边界，非法或损坏元数据在分配/IO 前拒绝。</li>
+     *     <li>按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，避免锁序反转。</li>
+     *     <li>执行空间元数据或物理文件变化，并把需要的 allocation intent、redo、dirty 或 force 副作用交给既有下游。</li>
+     *     <li>发布稳定结果并逆序释放 lease、latch 与 fix；失败保留可由恢复流程识别的权威状态。</li>
+     * </ol>
+     *
+     * @param owner 参与 {@code discardTablespace} 的稳定领域标识 {@code MdlOwnerId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param name 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @param quarantine 受控目录内的规范化文件路径；不得为 {@code null}，也不得逃逸所属表空间或日志目录
+     * @param timeout 本次等待或操作的最大时长；不得为 {@code null} 且必须为正，超时不得留下未释放资源
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws DictionaryDdlException DML/DDL 的校验、物理变更或原子收口失败时抛出；调用方应按语句与事务边界回滚
+     */
+    public void discardTablespace(MdlOwnerId owner, QualifiedTableName name, Path quarantine, Duration timeout) {
+        // 1、校验表空间生命周期、页号、区段身份与容量边界，在共享或持久副作用前拒绝非法状态。
+        validateOwnerTimeout(owner, timeout);
+        // 2、继续完成范围、身份与候选校验；通过后，按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，保持处理顺序与资源边界。
+        if (name == null || quarantine == null) {
+            throw new DatabaseValidationException("discard table name/quarantine must not be null");
+        }
+        // 3、在中间分支复核阶段性结果；满足条件后，执行空间元数据或物理文件变化，并维持领域不变量。
+        quarantine = checkedTransferPath(quarantine);
+        // 4、发布稳定结果并逆序释放 lease、latch 与 fix，以稳定返回或领域异常完成收口。
+        try (MdlTicket schemaTicket = locks.acquire(new MdlRequest(owner,
+                MdlKey.schema(name.schema().canonicalName()), MdlMode.INTENTION_EXCLUSIVE,
+                MdlDuration.TRANSACTION), timeout);
+             MdlTicket tableTicket = locks.acquire(new MdlRequest(owner, MdlKey.table(name.canonicalKey()),
+                     MdlMode.EXCLUSIVE, MdlDuration.TRANSACTION), timeout)) {
+            SchemaDefinition schema = repository.findSchema(name.schema()).orElseThrow(() ->
+                    new DictionaryObjectNotFoundException("schema does not exist: " + name.schema().displayName()));
+            TableDefinition active = repository.findTable(schema.id(), name.table()).orElseThrow(() ->
+                    new DictionaryObjectNotFoundException("table does not exist: " + name.canonicalKey()));
+            if (active.state() != TableState.ACTIVE) {
+                throw new DictionaryDdlException("table is not ACTIVE: " + active.id().value());
+            }
+            TableStorageBinding binding = active.storageBinding().orElseThrow(() ->
+                    new DictionaryDdlException("ACTIVE table has no physical binding: " + active.id().value()));
+            purgeBarrier.awaitUnreferenced(active.id().value(), timeout);
+            DictionaryIdAllocation ids = control.reserve(new DictionaryIdRequest(0, 0, 0, 0, 1, 2));
+            DictionaryVersion pendingVersion = DictionaryVersion.of(ids.dictionaryVersion());
+            DictionaryVersion discardedVersion = DictionaryVersion.of(ids.dictionaryVersion() + 1);
+            DdlId ddlId = DdlId.of(ids.firstDdlId());
+            DdlLogRecord prepared = new DdlLogRecord(new DdlUndoMarker(ddlId.value(), pendingVersion.value(), active.id().value()),
+                    DdlLogOperation.DISCARD_TABLESPACE, DdlLogPhase.PREPARED, binding.spaceId(), binding.path(),
+                    Optional.of(quarantine), Optional.<TablespaceFileIdentity>empty());
+            repository.ddlLog().prepare(prepared);
+            cache.invalidateTable(active.id(), pendingVersion);
+            commitUpdate(pendingVersion, lifecycle(active, pendingVersion, TableState.DISCARD_PENDING));
+            repository.ddlLog().transition(ddlId, DdlLogPhase.PREPARED, DdlLogPhase.DICTIONARY_COMMITTED);
+            if (!cache.awaitUnpinned(active.id(), timeout)) {
+                throw new DictionaryDdlException("timed out waiting dictionary pins before DISCARD: " + active.id().value());
+            }
+            physical.discardTablespace(binding, quarantine, timeout);
+            repository.ddlLog().transition(ddlId, DdlLogPhase.DICTIONARY_COMMITTED, DdlLogPhase.ENGINE_DONE);
+            commitUpdate(discardedVersion, lifecycle(active, discardedVersion, TableState.DISCARDED));
+            repository.ddlLog().transition(ddlId, DdlLogPhase.ENGINE_DONE, DdlLogPhase.COMMITTED);
+        }
+    }
+
+    /** 校验外部 DISCARDED 文件并重新挂载为 ACTIVE。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验表空间生命周期、页号、区段身份与容量边界，非法或损坏元数据在分配/IO 前拒绝。</li>
+     *     <li>按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，避免锁序反转。</li>
+     *     <li>执行空间元数据或物理文件变化，并把需要的 allocation intent、redo、dirty 或 force 副作用交给既有下游。</li>
+     *     <li>发布稳定结果并逆序释放 lease、latch 与 fix；失败保留可由恢复流程识别的权威状态。</li>
+     * </ol>
+     *
+     * @param owner 参与 {@code importTablespace} 的稳定领域标识 {@code MdlOwnerId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param name 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @param source 受控目录内的规范化文件路径；不得为 {@code null}，也不得逃逸所属表空间或日志目录
+     * @param identity 表空间文件或 segment 的稳定身份与生命周期快照；不得为 {@code null}，必须与已打开文件和当前 generation 一致
+     * @param timeout 本次等待或操作的最大时长；不得为 {@code null} 且必须为正，超时不得留下未释放资源
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws DictionaryDdlException DML/DDL 的校验、物理变更或原子收口失败时抛出；调用方应按语句与事务边界回滚
+     */
+    public void importTablespace(MdlOwnerId owner, QualifiedTableName name, Path source,
+                                 TablespaceFileIdentity identity, Duration timeout) {
+        // 1、校验表空间生命周期、页号、区段身份与容量边界，在共享或持久副作用前拒绝非法状态。
+        validateOwnerTimeout(owner, timeout);
+        // 2、继续完成范围、身份与候选校验；通过后，按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，保持处理顺序与资源边界。
+        if (name == null || source == null || identity == null) {
+            throw new DatabaseValidationException("import table/source/identity must not be null");
+        }
+        // 3、在中间分支复核阶段性结果；满足条件后，执行空间元数据或物理文件变化，并维持领域不变量。
+        source = checkedTransferPath(source);
+        // 4、发布稳定结果并逆序释放 lease、latch 与 fix，以稳定返回或领域异常完成收口。
+        try (MdlTicket schemaTicket = locks.acquire(new MdlRequest(owner,
+                MdlKey.schema(name.schema().canonicalName()), MdlMode.INTENTION_EXCLUSIVE,
+                MdlDuration.TRANSACTION), timeout);
+             MdlTicket tableTicket = locks.acquire(new MdlRequest(owner, MdlKey.table(name.canonicalKey()),
+                     MdlMode.EXCLUSIVE, MdlDuration.TRANSACTION), timeout)) {
+            SchemaDefinition schema = repository.findSchema(name.schema()).orElseThrow(() ->
+                    new DictionaryObjectNotFoundException("schema does not exist: " + name.schema().displayName()));
+            TableDefinition discarded = repository.findTableForRecovery(schema.id(), name.table()).orElseThrow(() ->
+                    new DictionaryObjectNotFoundException("table does not exist: " + name.canonicalKey()));
+            if (discarded.state() != TableState.DISCARDED) {
+                throw new DictionaryDdlException("table is not DISCARDED: " + discarded.id().value());
+            }
+            TableStorageBinding binding = discarded.storageBinding().orElseThrow(() ->
+                    new DictionaryDdlException("DISCARDED table has no physical binding: " + discarded.id().value()));
+            DictionaryIdAllocation ids = control.reserve(new DictionaryIdRequest(0, 0, 0, 0, 1, 2));
+            DictionaryVersion pendingVersion = DictionaryVersion.of(ids.dictionaryVersion());
+            DictionaryVersion activeVersion = DictionaryVersion.of(ids.dictionaryVersion() + 1);
+            DdlId ddlId = DdlId.of(ids.firstDdlId());
+            DdlLogRecord prepared = new DdlLogRecord(new DdlUndoMarker(ddlId.value(), pendingVersion.value(), discarded.id().value()),
+                    DdlLogOperation.IMPORT_TABLESPACE, DdlLogPhase.PREPARED, binding.spaceId(), binding.path(),
+                    Optional.of(source), Optional.of(identity));
+            repository.ddlLog().prepare(prepared);
+            cache.invalidateTable(discarded.id(), pendingVersion);
+            commitUpdate(pendingVersion, lifecycle(discarded, pendingVersion, TableState.IMPORT_PENDING));
+            repository.ddlLog().transition(ddlId, DdlLogPhase.PREPARED, DdlLogPhase.DICTIONARY_COMMITTED);
+            physical.importTablespace(binding, source, identity, timeout);
+            repository.ddlLog().transition(ddlId, DdlLogPhase.DICTIONARY_COMMITTED, DdlLogPhase.ENGINE_DONE);
+            commitUpdate(activeVersion, lifecycle(discarded, activeVersion, TableState.ACTIVE));
+            repository.ddlLog().transition(ddlId, DdlLogPhase.ENGINE_DONE, DdlLogPhase.COMMITTED);
+        }
+    }
+
+    /**
+     * 校验当前状态后推进数据字典状态机；成功发布唯一终态，失败保留可回滚或可恢复的原始状态。
+     *
+     * @param version 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @param table 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     */
     private void commitUpdate(DictionaryVersion version, TableDefinition table) {
         try (DictionaryTransaction transaction = repository.begin(version)) {
             transaction.updateTable(table);
@@ -633,5 +798,14 @@ public final class DictionaryDdlService {
         if (owner.sessionOwner()) {
             throw new DatabaseValidationException("public DDL cannot reuse a reserved Session MDL owner");
         }
+    }
+
+    /** 限制 DISCARD/IMPORT 外部路径在受控 tables 目录内，防止 DDL marker 携带任意文件路径。 */
+    private Path checkedTransferPath(Path path) {
+        Path normalized = path.toAbsolutePath().normalize();
+        if (!normalized.startsWith(tablesDirectory)) {
+            throw new DatabaseValidationException("tablespace transfer path escapes tables directory: " + normalized);
+        }
+        return normalized;
     }
 }

@@ -25,6 +25,9 @@ class BufferPoolRouterTest {
         return PageId.of(SPACE, PageNo.of(no));
     }
 
+    /**
+     * 验证 {@code singleInstanceAlwaysRoutesToZero} 对应的Buffer Pool行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void singleInstanceAlwaysRoutesToZero() {
         BufferPoolRouter router = new BufferPoolRouter(1);
@@ -33,6 +36,9 @@ class BufferPoolRouterTest {
         }
     }
 
+    /**
+     * 验证 {@code routeIsDeterministicAndInRange} 对应的Buffer Pool行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void routeIsDeterministicAndInRange() {
         BufferPoolRouter router = new BufferPoolRouter(4);
@@ -43,6 +49,9 @@ class BufferPoolRouterTest {
         }
     }
 
+    /**
+     * 验证 {@code distributesAcrossInstancesReasonablyEvenly} 对应的Buffer Pool行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void distributesAcrossInstancesReasonablyEvenly() {
         int instanceCount = 4;
@@ -61,6 +70,9 @@ class BufferPoolRouterTest {
         }
     }
 
+    /**
+     * 验证 {@code differentSpacesAlsoDistribute} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void differentSpacesAlsoDistribute() {
         BufferPoolRouter router = new BufferPoolRouter(4);
@@ -72,6 +84,9 @@ class BufferPoolRouterTest {
         assertTrue(counts.size() >= 2, "spaceId 应参与路由散列，不能让同页号全撞一个 instance");
     }
 
+    /**
+     * 验证 {@code rejectsInvalidArguments} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void rejectsInvalidArguments() {
         assertThrows(DatabaseValidationException.class, () -> new BufferPoolRouter(0));

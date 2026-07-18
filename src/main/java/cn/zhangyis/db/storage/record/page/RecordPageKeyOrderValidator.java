@@ -28,7 +28,11 @@ public final class RecordPageKeyOrderValidator {
     /** 两条记录间的权威复合 key 比较器。 */
     private final RecordComparator comparator;
 
-    /** 创建绑定统一类型/字符语义的页内 key 校验器。 */
+    /** 创建绑定统一类型/字符语义的页内 key 校验器。
+     *
+     * @param registry 由组合根提供的 {@code TypeCodecRegistry} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public RecordPageKeyOrderValidator(TypeCodecRegistry registry) {
         if (registry == null) {
             throw new DatabaseValidationException("key order validator registry must not be null");
@@ -50,6 +54,8 @@ public final class RecordPageKeyOrderValidator {
      * @param schema 当前页用户记录的权威 schema；internal 页应传派生 node-pointer schema。
      * @param keyDef 当前页内顺序的权威 key 定义。
      * @param expectedType leaf 为 CONVENTIONAL，internal 为 NODE_POINTER。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws RecordKeyOrderCorruptedException 检测到不能安全解释的持久数据损坏时抛出；调用方不得继续发布普通服务或覆盖原始证据
      */
     public void validate(PageId pageId, RecordPage page, TableSchema schema,
                          IndexKeyDef keyDef, RecordType expectedType) {

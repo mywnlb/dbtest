@@ -12,6 +12,9 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
  */
 class RedoCapacityPolicyTest {
 
+    /**
+     * 验证 {@code fixedPolicyClassifiesCheckpointAge} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void fixedPolicyClassifiesCheckpointAge() {
         RedoCapacityPolicy policy = RedoCapacityPolicy.fixed(100);
@@ -26,6 +29,9 @@ class RedoCapacityPolicyTest {
                 policy.evaluate(Lsn.of(90), Lsn.of(0)).pressure());
     }
 
+    /**
+     * 验证 {@code decisionReportsAgeAndTargetFlushLsn} 所描述的刷脏与持久化协作，并断言 redo durable 边界先覆盖 page LSN、失败后仍保留脏状态。
+     */
     @Test
     void decisionReportsAgeAndTargetFlushLsn() {
         RedoCapacityPolicy policy = RedoCapacityPolicy.fixed(100);
@@ -37,6 +43,9 @@ class RedoCapacityPolicyTest {
         assertEquals(RedoCapacityPressure.SYNC_FLUSH, decision.pressure());
     }
 
+    /**
+     * 验证 {@code invalidInputsAreRejected} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void invalidInputsAreRejected() {
         assertThrows(DatabaseValidationException.class, () -> RedoCapacityPolicy.fixed(0));

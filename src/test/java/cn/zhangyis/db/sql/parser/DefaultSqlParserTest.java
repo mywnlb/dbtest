@@ -19,6 +19,9 @@ import static org.junit.jupiter.api.Assertions.*;
 class DefaultSqlParserTest {
     private final DefaultSqlParser parser = new DefaultSqlParser(4096);
 
+    /**
+     * 验证 {@code parsesInsertAndPointSelectWithQuotedIdentifiersAndEscapedString} 所描述的 SQL 解析或绑定语义，并断言 AST、名称解析、类型推导及错误位置。
+     */
     @Test
     void parsesInsertAndPointSelectWithQuotedIdentifiersAndEscapedString() {
         InsertStatementNode insert = assertInstanceOf(InsertStatementNode.class,
@@ -32,6 +35,9 @@ class DefaultSqlParserTest {
         assertEquals(2, select.predicates().size());
     }
 
+    /**
+     * 验证 {@code parsesTransactionCommandsAndStrictAutocommit} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void parsesTransactionCommandsAndStrictAutocommit() {
         assertEquals(TransactionControlNode.Kind.BEGIN,
@@ -43,6 +49,9 @@ class DefaultSqlParserTest {
         assertThrows(SqlSyntaxException.class, () -> parser.parse("SET autocommit = true"));
     }
 
+    /**
+     * 验证 {@code parsesUpdateAndDeleteWithConjunctivePredicates} 所描述的 SQL 解析或绑定语义，并断言 AST、名称解析、类型推导及错误位置。
+     */
     @Test
     void parsesUpdateAndDeleteWithConjunctivePredicates() {
         UpdateStatementNode update = assertInstanceOf(UpdateStatementNode.class,
@@ -93,6 +102,9 @@ class DefaultSqlParserTest {
         assertEquals(SelectLockingClause.FOR_UPDATE, update.lockingClause());
     }
 
+    /**
+     * 验证 {@code rejectsUnsupportedShapesAndBrokenFraming} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void rejectsUnsupportedShapesAndBrokenFraming() {
         String[] invalid = {
@@ -111,6 +123,9 @@ class DefaultSqlParserTest {
         assertThrows(SqlSyntaxException.class, () -> new DefaultSqlParser(4).parse("SELECT"));
     }
 
+    /**
+     * 验证 {@code reportsStableLineColumnAndNormalizesKeywordsOnly} 对应的SQL 词法与语法解析行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void reportsStableLineColumnAndNormalizesKeywordsOnly() {
         SqlSyntaxException error = assertThrows(SqlSyntaxException.class,

@@ -37,6 +37,9 @@ class DataFileHandleTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code shouldRoundTripPageBytes} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void shouldRoundTripPageBytes() {
         Path file = dir.resolve("t.ibd");
@@ -50,6 +53,9 @@ class DataFileHandleTest {
         }
     }
 
+    /**
+     * 验证 {@code shouldRejectBufferWithWrongSize} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void shouldRejectBufferWithWrongSize() {
         Path file = dir.resolve("t.ibd");
@@ -59,6 +65,9 @@ class DataFileHandleTest {
         }
     }
 
+    /**
+     * 验证 {@code shouldRejectOutOfBoundsAccess} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void shouldRejectOutOfBoundsAccess() {
         Path file = dir.resolve("t.ibd");
@@ -68,6 +77,9 @@ class DataFileHandleTest {
         }
     }
 
+    /**
+     * 验证 {@code shouldExtendZeroFilledAndMakeNewPagesReadable} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void shouldExtendZeroFilledAndMakeNewPagesReadable() {
         Path file = dir.resolve("t.ibd");
@@ -84,6 +96,9 @@ class DataFileHandleTest {
         }
     }
 
+    /**
+     * 验证 {@code shouldRejectNullAutoExtendPolicy} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void shouldRejectNullAutoExtendPolicy() {
         Path file = dir.resolve("nullpolicy.ibd");
@@ -92,6 +107,11 @@ class DataFileHandleTest {
         }
     }
 
+    /**
+     * 验证 {@code shouldRejectCreateWhenFileExists} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     *
+     * @throws IOException 底层文件读写失败时抛出；调用方不得据此发布持久化成功状态
+     */
     @Test
     void shouldRejectCreateWhenFileExists() throws IOException {
         Path file = dir.resolve("exists.ibd");
@@ -99,12 +119,20 @@ class DataFileHandleTest {
         assertThrows(DataFilePhysicalException.class, () -> DataFileHandle.create(SPACE, file, PS, PageNo.of(1)));
     }
 
+    /**
+     * 验证 {@code shouldRejectOpenWhenFileMissing} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void shouldRejectOpenWhenFileMissing() {
         Path file = dir.resolve("missing.ibd");
         assertThrows(DataFilePhysicalException.class, () -> DataFileHandle.open(SPACE, file, PS));
     }
 
+    /**
+     * 验证 {@code shouldRejectOpenWhenFileNotPageAligned} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     *
+     * @throws IOException 底层文件读写失败时抛出；调用方不得据此发布持久化成功状态
+     */
     @Test
     void shouldRejectOpenWhenFileNotPageAligned() throws IOException {
         Path file = dir.resolve("misaligned.ibd");
@@ -112,6 +140,11 @@ class DataFileHandleTest {
         assertThrows(DataFileCorruptedException.class, () -> DataFileHandle.open(SPACE, file, PS));
     }
 
+    /**
+     * 验证 {@code shouldDeriveSizeFromExistingFileLength} 对应的表空间物理文件行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     *
+     * @throws IOException 底层文件读写失败时抛出；调用方不得据此发布持久化成功状态
+     */
     @Test
     void shouldDeriveSizeFromExistingFileLength() throws IOException {
         Path file = dir.resolve("sized.ibd");
@@ -123,6 +156,9 @@ class DataFileHandleTest {
         }
     }
 
+    /**
+     * 验证 {@code shouldRejectIoAfterClose} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void shouldRejectIoAfterClose() {
         Path file = dir.resolve("closed.ibd");
@@ -132,6 +168,11 @@ class DataFileHandleTest {
         assertThrows(TablespaceNotOpenException.class, () -> handle.readPage(PageNo.of(0), buf));
     }
 
+    /**
+     * 验证 {@code concurrentReadsDuringExtendShouldStayConsistent} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     *
+     * @throws InterruptedException 等待被中断时抛出；调用方应恢复中断标志并终止当前资源获取流程
+     */
     @Test
     void concurrentReadsDuringExtendShouldStayConsistent() throws InterruptedException {
         Path file = dir.resolve("concurrent.ibd");

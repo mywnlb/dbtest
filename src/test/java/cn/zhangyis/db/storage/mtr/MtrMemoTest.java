@@ -36,6 +36,9 @@ class MtrMemoTest {
         }
     }
 
+    /**
+     * 验证 {@code releaseAllShouldCloseInLifoOrder} 所描述的组件生命周期，并断言状态转换、后台线程停止和资源恰好释放一次。
+     */
     @Test
     void releaseAllShouldCloseInLifoOrder() {
         List<String> log = new ArrayList<>();
@@ -51,6 +54,9 @@ class MtrMemoTest {
         assertEquals(0, memo.depth());
     }
 
+    /**
+     * 验证 {@code releaseToShouldReleaseOnlyAboveSavepoint} 对应的Mini Transaction行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void releaseToShouldReleaseOnlyAboveSavepoint() {
         List<String> log = new ArrayList<>();
@@ -66,6 +72,9 @@ class MtrMemoTest {
         assertEquals(1, memo.depth());
     }
 
+    /**
+     * 验证 {@code releaseToBeyondDepthShouldBeNoOp} 对应的Mini Transaction行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void releaseToBeyondDepthShouldBeNoOp() {
         List<String> log = new ArrayList<>();
@@ -78,12 +87,18 @@ class MtrMemoTest {
         assertEquals(1, memo.depth());
     }
 
+    /**
+     * 验证 {@code releaseToNegativeShouldThrow} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void releaseToNegativeShouldThrow() {
         MtrMemo memo = new MtrMemo();
         assertThrows(DatabaseValidationException.class, () -> memo.releaseTo(-1));
     }
 
+    /**
+     * 验证 {@code releaseShouldContinueAndAggregateOnCloseFailure} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void releaseShouldContinueAndAggregateOnCloseFailure() {
         List<String> log = new ArrayList<>();
@@ -97,6 +112,9 @@ class MtrMemoTest {
         assertEquals(0, memo.depth());
     }
 
+    /**
+     * 验证 {@code pushNullShouldThrow} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void pushNullShouldThrow() {
         MtrMemo memo = new MtrMemo();

@@ -32,6 +32,9 @@ class FileAddressTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code ofAndNullSemantics} 对应的表空间、区与段分配行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void ofAndNullSemantics() {
         FileAddress a = FileAddress.of(PageNo.of(5), 100);
@@ -43,6 +46,9 @@ class FileAddressTest {
         assertEquals(FileAddress.of(PageNo.of(5), 100), a);
     }
 
+    /**
+     * 验证 {@code shouldRejectReservedZeroAndNegativeOffset} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void shouldRejectReservedZeroAndNegativeOffset() {
         assertThrows(DatabaseValidationException.class, () -> FileAddress.of(PageNo.of(0), 0));
@@ -50,6 +56,9 @@ class FileAddressTest {
         assertThrows(DatabaseValidationException.class, FileAddress.NULL::pageNo);
     }
 
+    /**
+     * 验证 {@code shouldRoundTripThroughPageGuard} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void shouldRoundTripThroughPageGuard() {
         PageStore store = new FileChannelPageStore();

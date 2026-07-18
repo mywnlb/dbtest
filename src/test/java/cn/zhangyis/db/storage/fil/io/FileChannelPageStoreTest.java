@@ -31,6 +31,9 @@ class FileChannelPageStoreTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code shouldRoundTripThroughFacade} 对应的表空间物理文件行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void shouldRoundTripThroughFacade() {
         SpaceId space = SpaceId.of(3);
@@ -46,6 +49,9 @@ class FileChannelPageStoreTest {
         }
     }
 
+    /**
+     * 验证 {@code shouldExtendThroughFacadeAndExposeNewSize} 对应的表空间物理文件行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void shouldExtendThroughFacadeAndExposeNewSize() {
         SpaceId space = SpaceId.of(3);
@@ -61,6 +67,9 @@ class FileChannelPageStoreTest {
         }
     }
 
+    /**
+     * 验证 {@code shouldReopenExistingFileThroughFacadeAndReadBack} 对应的表空间物理文件行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void shouldReopenExistingFileThroughFacadeAndReadBack() {
         SpaceId space = SpaceId.of(5);
@@ -81,6 +90,9 @@ class FileChannelPageStoreTest {
         }
     }
 
+    /**
+     * 验证 {@code shouldRejectIoOnUnopenedSpace} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void shouldRejectIoOnUnopenedSpace() {
         try (PageStore store = new FileChannelPageStore()) {
@@ -90,6 +102,9 @@ class FileChannelPageStoreTest {
         }
     }
 
+    /**
+     * 验证 {@code pathOfReturnsOpenFilePath} 对应的表空间物理文件行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void pathOfReturnsOpenFilePath() {
         SpaceId space = SpaceId.of(31);
@@ -101,6 +116,9 @@ class FileChannelPageStoreTest {
         }
     }
 
+    /**
+     * 验证 {@code pathOfRejectsUnopenedSpace} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void pathOfRejectsUnopenedSpace() {
         try (PageStore store = new FileChannelPageStore()) {
@@ -108,6 +126,9 @@ class FileChannelPageStoreTest {
         }
     }
 
+    /**
+     * 验证 {@code shouldRejectDuplicateRegistration} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void shouldRejectDuplicateRegistration() {
         SpaceId space = SpaceId.of(3);
@@ -118,6 +139,9 @@ class FileChannelPageStoreTest {
         }
     }
 
+    /**
+     * 验证 {@code shouldRejectIoAfterClose} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void shouldRejectIoAfterClose() {
         SpaceId space = SpaceId.of(3);
@@ -132,6 +156,8 @@ class FileChannelPageStoreTest {
 
     /**
      * 物理截断必须同时缩短文件、发布新页数，并让旧尾页立即变为越界，防止恢复后继续访问 stale tail。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
      */
     @Test
     void shouldPhysicallyTruncateAndPublishSmallerSize() throws Exception {
@@ -149,6 +175,9 @@ class FileChannelPageStoreTest {
         }
     }
 
+    /**
+     * 验证 {@code shouldRejectNonShrinkingPhysicalTruncate} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void shouldRejectNonShrinkingPhysicalTruncate() {
         SpaceId space = SpaceId.of(33);

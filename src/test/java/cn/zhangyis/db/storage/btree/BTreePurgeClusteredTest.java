@@ -56,6 +56,9 @@ class BTreePurgeClusteredTest {
 
     private final TypeCodecRegistry registry = new TypeCodecRegistry();
 
+    /**
+     * 验证 {@code purgesDeleteMarkedOwnedRecord} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void purgesDeleteMarkedOwnedRecord() {
         onPool(ctx -> {
@@ -84,6 +87,9 @@ class BTreePurgeClusteredTest {
         });
     }
 
+    /**
+     * 验证 {@code refusesLiveRow} 对应的B+Tree 索引行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void refusesLiveRow() {
         onPool(ctx -> {
@@ -109,6 +115,9 @@ class BTreePurgeClusteredTest {
         });
     }
 
+    /**
+     * 验证 {@code skipsStaleOwnershipMismatch} 对应的B+Tree 索引行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void skipsStaleOwnershipMismatch() {
         onPool(ctx -> {

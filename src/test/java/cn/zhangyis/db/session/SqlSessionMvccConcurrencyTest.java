@@ -72,7 +72,10 @@ class SqlSessionMvccConcurrencyTest {
         }
     }
 
-    /** SELECT 的 table SR 保持到 transaction end，DDL X 等待 rollback 后才可执行。 */
+    /** SELECT 的 table SR 保持到 transaction end，DDL X 等待 rollback 后才可执行。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void metadataExclusiveWaitsForTransactionScope() throws Exception {
         try (DatabaseEngine database = openWithTables();

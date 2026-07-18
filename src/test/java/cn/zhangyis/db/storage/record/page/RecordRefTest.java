@@ -14,6 +14,9 @@ class RecordRefTest {
 
     private static final PageId PAGE = PageId.of(SpaceId.of(1), PageNo.of(3));
 
+    /**
+     * 验证 {@code holdsValues} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void holdsValues() {
         RecordRef ref = new RecordRef(PAGE, 5, 98, 1L, 7L);
@@ -24,6 +27,9 @@ class RecordRefTest {
         assertEquals(7L, ref.indexId());
     }
 
+    /**
+     * 验证 {@code rejectsInvalid} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void rejectsInvalid() {
         assertThrows(DatabaseValidationException.class, () -> new RecordRef(null, 0, 0, 0, 0));

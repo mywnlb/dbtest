@@ -68,6 +68,15 @@ public record RecoveryReport(RecoveryMode mode,
 
     /**
      * 构造普通可写恢复报告。
+     *
+     * @param state 调用方请求的目标状态、阶段或模式；不得为 {@code null}，且必须是当前状态机允许的后继值
+     * @param checkpointLsn redo 日志边界；不得为 {@code null}，必须单调且与调用方已发布的页或事务状态一致
+     * @param recoveredToLsn redo 日志边界；不得为 {@code null}，必须单调且与调用方已发布的页或事务状态一致
+     * @param repairedPageCount 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @param detectedOnlyPageCount 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @param appliedBatchCount 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @param completedStages 参与 {@code normal} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @return {@code normal} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
      */
     public static RecoveryReport normal(RecoveryState state, Lsn checkpointLsn, Lsn recoveredToLsn,
                                         int repairedPageCount, int detectedOnlyPageCount,
@@ -79,6 +88,13 @@ public record RecoveryReport(RecoveryMode mode,
 
     /**
      * 构造只读诊断恢复报告。该模式不应用 redo，也不产生 skipped-space 语义。
+     *
+     * @param state 调用方请求的目标状态、阶段或模式；不得为 {@code null}，且必须是当前状态机允许的后继值
+     * @param checkpointLsn redo 日志边界；不得为 {@code null}，必须单调且与调用方已发布的页或事务状态一致
+     * @param recoveredToLsn redo 日志边界；不得为 {@code null}，必须单调且与调用方已发布的页或事务状态一致
+     * @param detectedOnlyPageCount 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @param completedStages 参与 {@code readOnlyValidate} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @return {@code readOnlyValidate} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
      */
     public static RecoveryReport readOnlyValidate(RecoveryState state, Lsn checkpointLsn, Lsn recoveredToLsn,
                                                   int detectedOnlyPageCount,
@@ -89,6 +105,19 @@ public record RecoveryReport(RecoveryMode mode,
 
     /**
      * 构造 FORCE_SKIP_CORRUPT_TABLESPACE 恢复报告，显式记录每个跳过阶段的诊断计数。
+     *
+     * @param state 调用方请求的目标状态、阶段或模式；不得为 {@code null}，且必须是当前状态机允许的后继值
+     * @param checkpointLsn redo 日志边界；不得为 {@code null}，必须单调且与调用方已发布的页或事务状态一致
+     * @param recoveredToLsn redo 日志边界；不得为 {@code null}，必须单调且与调用方已发布的页或事务状态一致
+     * @param repairedPageCount 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @param detectedOnlyPageCount 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @param appliedBatchCount 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @param skippedSpaces 参与 {@code forceSkip} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @param skippedDoublewritePageCount 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @param skippedRedoRecordCount 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @param skippedReconcileSpaceCount 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @param completedStages 参与 {@code forceSkip} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @return {@code forceSkip} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
      */
     public static RecoveryReport forceSkip(RecoveryState state, Lsn checkpointLsn, Lsn recoveredToLsn,
                                            int repairedPageCount, int detectedOnlyPageCount,
@@ -103,6 +132,10 @@ public record RecoveryReport(RecoveryMode mode,
 
     /**
      * 构造 fail-closed 报告。失败时可能尚未读出 checkpoint/redo 边界，因此 LSN 与计数均为 0。
+     *
+     * @param mode 调用方请求的目标状态、阶段或模式；不得为 {@code null}，且必须是当前状态机允许的后继值
+     * @param skippedSpaces 参与 {@code failed} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @return {@code failed} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
      */
     public static RecoveryReport failed(RecoveryMode mode, Set<SpaceId> skippedSpaces) {
         return new RecoveryReport(mode, RecoveryState.FAILED, Lsn.of(0), Lsn.of(0),

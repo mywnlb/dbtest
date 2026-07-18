@@ -18,6 +18,9 @@ class TransactionManagerTest {
         return new TransactionManager(new TransactionSystem());
     }
 
+    /**
+     * 验证 {@code beginCommitAssignsNoAndRemovesFromActive} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void beginCommitAssignsNoAndRemovesFromActive() {
         TransactionManager mgr = newManager();
@@ -36,6 +39,9 @@ class TransactionManagerTest {
         assertFalse(mgr.system().snapshotActiveReadWriteIds().contains(id.value()));
     }
 
+    /**
+     * 验证 {@code prepareCommitAssignsNoWithoutRemovingActiveTransaction} 所描述的边界场景保持既有领域不变量，不产生方法名明确禁止的副作用。
+     */
     @Test
     void prepareCommitAssignsNoWithoutRemovingActiveTransaction() {
         TransactionManager mgr = newManager();
@@ -110,6 +116,9 @@ class TransactionManagerTest {
         assertEquals(TransactionState.PREPARED, transaction.state());
     }
 
+    /**
+     * 验证 {@code readOnlyCommitAssignsNoTransactionNo} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void readOnlyCommitAssignsNoTransactionNo() {
         TransactionManager mgr = newManager();
@@ -120,6 +129,9 @@ class TransactionManagerTest {
         assertTrue(t.transactionNo().isNone(), "read-only txn gets no commit no");
     }
 
+    /**
+     * 验证 {@code rollbackRemovesFromActive} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void rollbackRemovesFromActive() {
         TransactionManager mgr = newManager();
@@ -130,6 +142,9 @@ class TransactionManagerTest {
         assertFalse(mgr.system().snapshotActiveReadWriteIds().contains(id.value()));
     }
 
+    /**
+     * 验证 {@code doubleCommitRejected} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void doubleCommitRejected() {
         TransactionManager mgr = newManager();
@@ -138,6 +153,9 @@ class TransactionManagerTest {
         assertThrows(TransactionStateException.class, () -> mgr.commit(t));
     }
 
+    /**
+     * 验证 {@code rollbackAfterCommitRejected} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void rollbackAfterCommitRejected() {
         TransactionManager mgr = newManager();
@@ -172,6 +190,9 @@ class TransactionManagerTest {
 
     // ---- T1.3d：两阶段 rollback（RollbackService 把 undo 走链夹在 ROLLING_BACK 状态内） ----
 
+    /**
+     * 验证 {@code twoPhaseRollbackKeepsActiveDuringRollingBack} 所描述的返回值或状态会按契约保留，并断言原始信息与领域不变量未丢失。
+     */
     @Test
     void twoPhaseRollbackKeepsActiveDuringRollingBack() {
         TransactionManager mgr = newManager();
@@ -190,6 +211,9 @@ class TransactionManagerTest {
                 "finishRollback removes from active table");
     }
 
+    /**
+     * 验证 {@code finishRollbackRequiresRollingBack} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void finishRollbackRequiresRollingBack() {
         TransactionManager mgr = newManager();
@@ -199,6 +223,9 @@ class TransactionManagerTest {
         assertThrows(TransactionStateException.class, () -> mgr.finishRollback(t));
     }
 
+    /**
+     * 验证 {@code beginRollbackRequiresActive} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void beginRollbackRequiresActive() {
         TransactionManager mgr = newManager();
@@ -209,6 +236,9 @@ class TransactionManagerTest {
 
     // ---- T1.4：commit/rollback 释放事务级 ReadView ----
 
+    /**
+     * 验证 {@code commitReleasesReadView} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void commitReleasesReadView() {
         TransactionManager mgr = newManager();
@@ -219,6 +249,9 @@ class TransactionManagerTest {
         assertNull(t.readView(), "commit 移出活跃表后释放 ReadView");
     }
 
+    /**
+     * 验证 {@code rollbackReleasesReadView} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void rollbackReleasesReadView() {
         TransactionManager mgr = newManager();
@@ -229,6 +262,9 @@ class TransactionManagerTest {
         assertNull(t.readView(), "rollback finish 后释放 ReadView");
     }
 
+    /**
+     * 验证 {@code neverOpenedReadViewCommitUnaffected} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void neverOpenedReadViewCommitUnaffected() {
         TransactionManager mgr = newManager();

@@ -16,6 +16,11 @@ public enum CharsetId {
     /** 与枚举声明顺序无关的稳定编号。 */
     private final int stableId;
 
+    /**
+     * 创建 {@code CharsetId}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param stableId 目标表的原始字典标识；必须为已分配的正数并与当前元数据和物理绑定一致
+     */
     CharsetId(int stableId) {
         this.stableId = stableId;
     }

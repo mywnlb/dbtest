@@ -8,12 +8,18 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /** TransactionState 状态机：合法 commit/rollback 路径与非法转换。 */
 class TransactionStateTest {
 
+    /**
+     * 验证 {@code legalCommitPath} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void legalCommitPath() {
         assertTrue(TransactionState.ACTIVE.canTransitionTo(TransactionState.COMMITTING));
         assertTrue(TransactionState.COMMITTING.canTransitionTo(TransactionState.COMMITTED));
     }
 
+    /**
+     * 验证 {@code legalRollbackPath} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void legalRollbackPath() {
         assertTrue(TransactionState.ACTIVE.canTransitionTo(TransactionState.ROLLING_BACK));
@@ -31,6 +37,9 @@ class TransactionStateTest {
         assertFalse(TransactionState.PREPARED_ROLLING_BACK.canTransitionTo(TransactionState.ROLLING_BACK));
     }
 
+    /**
+     * 验证 {@code illegalTransitionsRejected} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void illegalTransitionsRejected() {
         assertFalse(TransactionState.COMMITTED.canTransitionTo(TransactionState.ACTIVE));

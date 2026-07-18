@@ -18,6 +18,7 @@ import cn.zhangyis.db.storage.undo.UndoLogKind;
  * @param state first-page ACTIVE/PREPARED/COMMITTED 状态。
  * @param creatorTransactionId first-page creator 写事务 id。
  * @param transactionNo COMMITTED 的提交号；ACTIVE 为 NONE。
+ * @param kind 选择 {@code 构造} 分支的 {@code UndoLogKind} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
  */
 public record RecoveredUndoSlotEvidence(UndoSlotId slotId,
                                        PageId firstPageId,
@@ -53,21 +54,43 @@ public record RecoveredUndoSlotEvidence(UndoSlotId slotId,
         }
     }
 
-    /** 构造未提交的 ACTIVE slot 证据。 */
+    /** 构造未提交的 ACTIVE slot 证据。
+     *
+     * @param slotId 参与 {@code active} 的稳定领域标识 {@code UndoSlotId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param firstPageId 目标页的稳定物理标识；必须属于当前已准入表空间，且不得为 {@code null}
+     * @param kind 选择 {@code active} 分支的 {@code UndoLogKind} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     * @param creatorTransactionId 事务的稳定标识；不得为 {@code null}，{@code NONE} 只表示尚未绑定事务，不能代替活跃事务身份
+     * @return {@code active} 构造或恢复的 undo/rollback 对象；成功时不为 {@code null}，事务身份和 roll pointer 链保持一致
+     */
     public static RecoveredUndoSlotEvidence active(
             UndoSlotId slotId, PageId firstPageId, UndoLogKind kind, TransactionId creatorTransactionId) {
         return new RecoveredUndoSlotEvidence(slotId, firstPageId, kind, RecoveredUndoState.ACTIVE,
                 creatorTransactionId, TransactionNo.NONE);
     }
 
-    /** 构造已完成 phase one、尚待上层决议的 PREPARED slot 证据。 */
+    /** 构造已完成 phase one、尚待上层决议的 PREPARED slot 证据。
+     *
+     * @param slotId 参与 {@code prepared} 的稳定领域标识 {@code UndoSlotId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param firstPageId 目标页的稳定物理标识；必须属于当前已准入表空间，且不得为 {@code null}
+     * @param kind 选择 {@code prepared} 分支的 {@code UndoLogKind} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     * @param creatorTransactionId 事务的稳定标识；不得为 {@code null}，{@code NONE} 只表示尚未绑定事务，不能代替活跃事务身份
+     * @return {@code prepared} 构造或恢复的 undo/rollback 对象；成功时不为 {@code null}，事务身份和 roll pointer 链保持一致
+     */
     public static RecoveredUndoSlotEvidence prepared(
             UndoSlotId slotId, PageId firstPageId, UndoLogKind kind, TransactionId creatorTransactionId) {
         return new RecoveredUndoSlotEvidence(slotId, firstPageId, kind, RecoveredUndoState.PREPARED,
                 creatorTransactionId, TransactionNo.NONE);
     }
 
-    /** 构造已提交、待 history rebuild 的 slot 证据。 */
+    /** 构造已提交、待 history rebuild 的 slot 证据。
+     *
+     * @param slotId 参与 {@code committed} 的稳定领域标识 {@code UndoSlotId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param firstPageId 目标页的稳定物理标识；必须属于当前已准入表空间，且不得为 {@code null}
+     * @param kind 选择 {@code committed} 分支的 {@code UndoLogKind} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     * @param creatorTransactionId 事务的稳定标识；不得为 {@code null}，{@code NONE} 只表示尚未绑定事务，不能代替活跃事务身份
+     * @param transactionNo 参与 {@code committed} 的稳定领域标识 {@code TransactionNo}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @return {@code committed} 构造或恢复的 undo/rollback 对象；成功时不为 {@code null}，事务身份和 roll pointer 链保持一致
+     */
     public static RecoveredUndoSlotEvidence committed(
             UndoSlotId slotId, PageId firstPageId, UndoLogKind kind, TransactionId creatorTransactionId,
             TransactionNo transactionNo) {

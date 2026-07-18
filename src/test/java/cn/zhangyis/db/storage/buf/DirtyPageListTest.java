@@ -21,6 +21,9 @@ class DirtyPageListTest {
 
     private static final SpaceId SPACE = SpaceId.of(95);
 
+    /**
+     * 验证 {@code upsertKeepsSingleEntryAndOrdersByOldestLsn} 所描述的返回值或状态会按契约保留，并断言原始信息与领域不变量未丢失。
+     */
     @Test
     void upsertKeepsSingleEntryAndOrdersByOldestLsn() {
         DirtyPageList list = new DirtyPageList();
@@ -42,6 +45,9 @@ class DirtyPageListTest {
                 "同一页重复 upsert 应刷新 newest LSN 供 WAL gate 使用");
     }
 
+    /**
+     * 验证 {@code removeClearsDirtyBoundary} 所描述的刷脏与持久化协作，并断言 redo durable 边界先覆盖 page LSN、失败后仍保留脏状态。
+     */
     @Test
     void removeClearsDirtyBoundary() {
         DirtyPageList list = new DirtyPageList();

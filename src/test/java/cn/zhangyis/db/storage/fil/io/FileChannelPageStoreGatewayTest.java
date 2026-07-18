@@ -23,6 +23,9 @@ class FileChannelPageStoreGatewayTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code defaultConstructorKeepsZeroFillBehavior} 所描述的返回值或状态会按契约保留，并断言原始信息与领域不变量未丢失。
+     */
     @Test
     void defaultConstructorKeepsZeroFillBehavior() {
         try (PageStore store = new FileChannelPageStore()) {

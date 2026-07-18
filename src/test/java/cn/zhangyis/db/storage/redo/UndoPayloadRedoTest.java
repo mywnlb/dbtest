@@ -30,6 +30,9 @@ class UndoPayloadRedoTest {
     private static final SpaceId SPACE = SpaceId.of(9);
     private static final PageId UNDO_PAGE = PageId.of(SPACE, PageNo.of(64));
 
+    /**
+     * 验证 {@code undoRecordPayloadRoundTripsThroughRedoFrameCodec} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void undoRecordPayloadRoundTripsThroughRedoFrameCodec() {
         byte[] slotImage = new byte[]{0, 3, 9, 8, 7};
@@ -46,6 +49,9 @@ class UndoPayloadRedoTest {
         assertEquals(1 + 12 + 8 + 8 + 4 + 4 + slotImage.length, record.byteLength());
     }
 
+    /**
+     * 验证 {@code undoRecordPayloadReplaysWithoutPageBytesAndStampsBatchEndLsn} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void undoRecordPayloadReplaysWithoutPageBytesAndStampsBatchEndLsn() {
         RecordingPageStore store = new RecordingPageStore();

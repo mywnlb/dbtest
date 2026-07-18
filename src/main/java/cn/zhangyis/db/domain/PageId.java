@@ -15,6 +15,13 @@ public record PageId(SpaceId spaceId, PageNo pageNo) {
         Objects.requireNonNull(pageNo, "pageNo");
     }
 
+    /**
+     * 根据调用参数构造 {@code of} 对应的数据库内核值对象领域对象；构造前完成范围与组合校验，成功结果不为 {@code null}。
+     *
+     * @param spaceId 目标表空间的稳定标识；不得为 {@code null}，且必须已注册并满足当前生命周期准入条件
+     * @param pageNo 参与 {@code of} 的稳定领域标识 {@code PageNo}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @return {@code of} 定位或分配的稳定值对象；成功时不为 {@code null}，其身份、范围和特殊值已由构造校验保证
+     */
     public static PageId of(SpaceId spaceId, PageNo pageNo) {
         return new PageId(spaceId, pageNo);
     }

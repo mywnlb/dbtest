@@ -32,6 +32,9 @@ class BufferPoolPageHashFrameLockSplitTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code latchSetRejectsIoWhilePageHashLocked} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void latchSetRejectsIoWhilePageHashLocked() {
         BufferPoolInstanceLatchSet latchSet = new BufferPoolInstanceLatchSet();
@@ -44,6 +47,9 @@ class BufferPoolPageHashFrameLockSplitTest {
         }
     }
 
+    /**
+     * 验证 {@code latchSetRejectsIoWhileFrameMutexLocked} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void latchSetRejectsIoWhileFrameMutexLocked() {
         BufferPoolInstanceLatchSet latchSet = new BufferPoolInstanceLatchSet();
@@ -57,6 +63,9 @@ class BufferPoolPageHashFrameLockSplitTest {
         }
     }
 
+    /**
+     * 验证 {@code physicalReadDoesNotHoldPageHashOrFrameMutex} 所描述的边界场景保持既有领域不变量，不产生方法名明确禁止的副作用。
+     */
     @Test
     void physicalReadDoesNotHoldPageHashOrFrameMutex() {
         PageId page = page(0);
@@ -70,6 +79,9 @@ class BufferPoolPageHashFrameLockSplitTest {
         }
     }
 
+    /**
+     * 验证 {@code flushCoordinatorWriteDoesNotHoldPageHashOrFrameMutex} 所描述的边界场景保持既有领域不变量，不产生方法名明确禁止的副作用。
+     */
     @Test
     void flushCoordinatorWriteDoesNotHoldPageHashOrFrameMutex() {
         PageId page = page(1);

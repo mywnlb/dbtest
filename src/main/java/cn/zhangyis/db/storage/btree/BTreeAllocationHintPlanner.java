@@ -31,6 +31,7 @@ final class BTreeAllocationHintPlanner {
      * @param index 索引元数据。
      * @param comparator SearchKey 比较器。
      * @return 保守方向 hint 或 none。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     static PageAllocationHint leafSplitHint(PageId leafId, SearchKey insertedKey, SearchKey minKey, SearchKey maxKey,
                                             boolean hasLeftSibling, boolean hasRightSibling, long pagesNeeded,

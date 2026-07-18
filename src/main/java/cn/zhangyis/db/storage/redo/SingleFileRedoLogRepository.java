@@ -36,6 +36,13 @@ public final class SingleFileRedoLogRepository implements RedoLogFileRepository 
     /** 最后完整 batch 的逻辑 end LSN。由 ioLock 保护。 */
     private long endLsn;
 
+    /**
+     * 创建 {@code SingleFileRedoLogRepository}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param path 受控目录内的规范化文件路径；不得为 {@code null}，也不得逃逸所属表空间或日志目录
+     * @param channel 调用方打开的定位 IO 或编码写入对象；不得为 {@code null}，方法不接管所有权，失败时仍由创建方关闭
+     * @param writable 资源的访问模式；写模式允许受控修改，读模式禁止产生 dirty、redo 或元数据发布副作用
+     */
     private SingleFileRedoLogRepository(Path path, FileChannel channel, boolean writable) {
         this.path = path;
         this.channel = channel;
@@ -43,7 +50,13 @@ public final class SingleFileRedoLogRepository implements RedoLogFileRepository 
         loadState();
     }
 
-    /** 打开或创建 writable 单文件 repository；已有内容必须是 LogBlock v1。 */
+    /** 打开或创建 writable 单文件 repository；已有内容必须是 LogBlock v1。
+     *
+     * @param path 受控目录内的规范化文件路径；不得为 {@code null}，也不得逃逸所属表空间或日志目录
+     * @return {@code open} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws RedoLogIoException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
+     */
     public static SingleFileRedoLogRepository open(Path path) {
         if (path == null) {
             throw new DatabaseValidationException("redo log path must not be null");
@@ -61,7 +74,13 @@ public final class SingleFileRedoLogRepository implements RedoLogFileRepository 
         }
     }
 
-    /** 只读打开已存在单文件 repository；不创建父目录或缺失文件。 */
+    /** 只读打开已存在单文件 repository；不创建父目录或缺失文件。
+     *
+     * @param path 受控目录内的规范化文件路径；不得为 {@code null}，也不得逃逸所属表空间或日志目录
+     * @return {@code openReadOnly} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws RedoLogIoException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
+     */
     public static SingleFileRedoLogRepository openReadOnly(Path path) {
         if (path == null) {
             throw new DatabaseValidationException("read-only redo log path must not be null");
@@ -90,6 +109,11 @@ public final class SingleFileRedoLogRepository implements RedoLogFileRepository 
     /**
      * 追加一个 LSN 连续的 batch。编码和逻辑边界校验发生在 truncate/write 前；若上次扫描存在 torn tail，
      * 只在本次真正写入时从 {@link #validBytes} 截断，避免新 redo 落到不可达损坏字节之后。
+     * @param batch redo 收集、定位或重放所需的日志对象；不得为 {@code null}，其 LSN 范围和记录格式必须连续且属于当前恢复或 MTR 上下文
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws RedoLogCorruptedException 检测到不能安全解释的持久数据损坏时抛出；调用方不得继续发布普通服务或覆盖原始证据
+     * @throws RedoLogCapacityExceededException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
+     * @throws RedoLogIoException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
      */
     @Override
     public void append(RedoLogBatch batch) {
@@ -126,7 +150,10 @@ public final class SingleFileRedoLogRepository implements RedoLogFileRepository 
         }
     }
 
-    /** force 只允许 writable 生命周期调用；read-only 绝不把扫描变成隐式写入。 */
+    /** force 只允许 writable 生命周期调用；read-only 绝不把扫描变成隐式写入。
+     *
+     * @throws RedoLogIoException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
+     */
     @Override
     public void force() {
         requireWritable("force");
@@ -140,7 +167,10 @@ public final class SingleFileRedoLogRepository implements RedoLogFileRepository 
         }
     }
 
-    /** 扫描全部完整 batch 并刷新内存续写边界；方法本身不 truncate 或改写文件。 */
+    /** 扫描全部完整 batch 并刷新内存续写边界；方法本身不 truncate 或改写文件。
+     *
+     * @return 按物理页、日志或 SQL 源顺序扫描并物化的元素；无匹配内容时返回空集合，不用 {@code null} 表示缺失
+     */
     @Override
     public List<RedoLogBatch> readBatches() {
         ioLock.lock();
@@ -157,7 +187,10 @@ public final class SingleFileRedoLogRepository implements RedoLogFileRepository 
         return RedoLogBlockCodec.FORMAT_VERSION;
     }
 
-    /** 关闭 channel；失败保留底层 cause。 */
+    /** 关闭 channel；失败保留底层 cause。
+     *
+     * @throws RedoLogIoException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
+     */
     @Override
     public void close() {
         ioLock.lock();
@@ -219,7 +252,13 @@ public final class SingleFileRedoLogRepository implements RedoLogFileRepository 
         }
     }
 
-    /** positional write 必须持续前进；零进度按 IO 失败处理，避免持 ioLock 无限自旋。 */
+    /** positional write 必须持续前进；零进度按 IO 失败处理，避免持 ioLock 无限自旋。
+     *
+     * @param offset 目标结构内的零基偏移；必须落在当前页、记录或持久槽位的合法范围
+     * @param source 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @throws IOException 底层文件读写失败时抛出；调用方不得据此发布持久化成功状态
+     * @throws RedoLogIoException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
+     */
     private void writeFullyAt(long offset, ByteBuffer source) throws IOException {
         long position = offset;
         while (source.hasRemaining()) {

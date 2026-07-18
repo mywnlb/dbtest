@@ -46,7 +46,12 @@ public record RollbackSegmentHeaderSnapshot(RollbackSegmentId rollbackSegmentId,
         cachedUpdateSegments = List.copyOf(cachedUpdateSegments);
     }
 
-    /** 返回指定普通 undo kind 的缓存栈；TEMPORARY 没有持久 cache。 */
+    /** 返回指定普通 undo kind 的缓存栈；TEMPORARY 没有持久 cache。
+     *
+     * @param kind 选择 {@code cachedSegments} 分支的 {@code UndoLogKind} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     * @return {@code cachedSegments} 产生的非空集合容器；元素身份与顺序遵循当前模块契约，无元素时返回空集合而非 {@code null}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public List<PageId> cachedSegments(UndoLogKind kind) {
         if (kind == null) {
             throw new DatabaseValidationException("cached undo kind must not be null");

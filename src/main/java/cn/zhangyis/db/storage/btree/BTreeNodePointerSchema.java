@@ -37,6 +37,10 @@ public record BTreeNodePointerSchema(TableSchema schema, IndexKeyDef keyDef, int
     /**
      * 从 leaf 索引元数据派生非叶 schema。数据流：按 index.keyDef 的 part 顺序拷贝 leaf 列类型到连续 key 列，
      * 生成新的 keyDef 指向这些派生列，再追加两个无符号 BIGINT child 定位列。
+     *
+     * @param index 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @return {@code from} 定位或分配的稳定值对象；成功时不为 {@code null}，其身份、范围和特殊值已由构造校验保证
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public static BTreeNodePointerSchema from(BTreeIndex index) {
         if (index == null) {

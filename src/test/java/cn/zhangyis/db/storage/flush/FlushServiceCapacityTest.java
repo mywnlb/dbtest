@@ -44,6 +44,9 @@ class FlushServiceCapacityTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code capacityPressureFlushesDirtyPagesAndAdvancesCheckpoint} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void capacityPressureFlushesDirtyPagesAndAdvancesCheckpoint() {
         try (PageStore store = new FileChannelPageStore();
@@ -66,6 +69,9 @@ class FlushServiceCapacityTest {
         }
     }
 
+    /**
+     * 验证 {@code noCapacityPressureDoesNotFlushDirtyPages} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void noCapacityPressureDoesNotFlushDirtyPages() {
         try (PageStore store = new FileChannelPageStore();

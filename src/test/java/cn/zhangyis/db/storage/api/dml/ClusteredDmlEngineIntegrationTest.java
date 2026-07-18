@@ -50,6 +50,11 @@ class ClusteredDmlEngineIntegrationTest {
     private static final long INDEX_ID = 9L;
     private static final long TABLE_ID = 1L;
 
+    /**
+     * 验证 {@code engineExposesDmlFacadeAfterOpen} 对应的存储引擎稳定 API行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     *
+     * @param dir 受控目录内的规范化文件路径；不得为 {@code null}，也不得逃逸所属表空间或日志目录
+     */
     @Test
     @DisplayName("StorageEngine exposes clustered DML facade after open")
     void engineExposesDmlFacadeAfterOpen(@TempDir Path dir) {
@@ -62,6 +67,11 @@ class ClusteredDmlEngineIntegrationTest {
         }
     }
 
+    /**
+     * 验证 {@code committedDmlFacadeWritesSurviveReopen} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     *
+     * @param dir 受控目录内的规范化文件路径；不得为 {@code null}，也不得逃逸所属表空间或日志目录
+     */
     @Test
     @DisplayName("Committed clustered DML facade writes survive engine reopen")
     void committedDmlFacadeWritesSurviveReopen(@TempDir Path dir) {

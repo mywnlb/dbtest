@@ -41,6 +41,9 @@ class CheckpointCoordinatorPersistentTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code advanceCheckpointPersistsRedoControlLabel} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void advanceCheckpointPersistsRedoControlLabel() {
         try (PageStore store = new FileChannelPageStore();
@@ -63,6 +66,9 @@ class CheckpointCoordinatorPersistentTest {
         }
     }
 
+    /**
+     * 验证 {@code persistedCheckpointDoesNotMoveBackwardWhenSafeBoundaryDrops} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void persistedCheckpointDoesNotMoveBackwardWhenSafeBoundaryDrops() {
         try (PageStore store = new FileChannelPageStore();

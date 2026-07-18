@@ -38,6 +38,9 @@ class SharedExclusiveLatchTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code sharedAndSharedExclusiveCoexistEitherOrder} 对应的Buffer Pool行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void sharedAndSharedExclusiveCoexistEitherOrder() {
         onPool(4, (pool, p) -> {
@@ -57,6 +60,9 @@ class SharedExclusiveLatchTest {
         });
     }
 
+    /**
+     * 验证 {@code sharedExclusiveExcludesAnotherSharedExclusive} 对应的Buffer Pool行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void sharedExclusiveExcludesAnotherSharedExclusive() {
         onPool(4, (pool, p) -> {
@@ -70,6 +76,9 @@ class SharedExclusiveLatchTest {
         });
     }
 
+    /**
+     * 验证 {@code sharedExclusiveExcludesExclusive} 对应的Buffer Pool行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void sharedExclusiveExcludesExclusive() {
         onPool(4, (pool, p) -> {
@@ -83,6 +92,9 @@ class SharedExclusiveLatchTest {
         });
     }
 
+    /**
+     * 验证 {@code exclusiveExcludesSharedExclusive} 对应的Buffer Pool行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void exclusiveExcludesSharedExclusive() {
         onPool(4, (pool, p) -> {
@@ -96,6 +108,9 @@ class SharedExclusiveLatchTest {
         });
     }
 
+    /**
+     * 验证 {@code sharedExclusiveGrantsReadOnlyContentAccess} 对应的Buffer Pool行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void sharedExclusiveGrantsReadOnlyContentAccess() {
         onPool(4, (pool, p) -> {

@@ -70,7 +70,10 @@ class BufferPoolConcurrentLoadTest {
         });
     }
 
-    /** <b>核心</b>：两个不同页的 miss 读盘必须能并发进行（IO 已移出 poolLock）。插桩读用 latch 证两次读同时在场。 */
+    /** <b>核心</b>：两个不同页的 miss 读盘必须能并发进行（IO 已移出 poolLock）。插桩读用 latch 证两次读同时在场。
+     *
+     * @throws InterruptedException 等待被中断时抛出；调用方应恢复中断标志并终止当前资源获取流程
+     */
     @Test
     void concurrentMissOnDistinctPagesReadInParallel() throws InterruptedException {
         try (HookablePageStore store = openStore(8)) {
@@ -102,7 +105,10 @@ class BufferPoolConcurrentLoadTest {
         }
     }
 
-    /** 同页并发 miss 只发一次读：后到者命中 LOADING、等待 future、醒来重查 residentMap 拿同帧自 fix。 */
+    /** 同页并发 miss 只发一次读：后到者命中 LOADING、等待 future、醒来重查 residentMap 拿同帧自 fix。
+     *
+     * @throws InterruptedException 等待被中断时抛出；调用方应恢复中断标志并终止当前资源获取流程
+     */
     @Test
     void concurrentMissOnSamePageReadsOnce() throws InterruptedException {
         try (HookablePageStore store = openStore(8)) {
@@ -155,7 +161,10 @@ class BufferPoolConcurrentLoadTest {
         }
     }
 
-    /** IO owner 卡死时，命中 LOADING 的等待者必在 load 超时后抛 BufferPoolLoadTimeoutException，不悬挂。 */
+    /** IO owner 卡死时，命中 LOADING 的等待者必在 load 超时后抛 BufferPoolLoadTimeoutException，不悬挂。
+     *
+     * @throws InterruptedException 等待被中断时抛出；调用方应恢复中断标志并终止当前资源获取流程
+     */
     @Test
     void loadWaiterTimesOutWhenOwnerStalls() throws InterruptedException {
         try (HookablePageStore store = openStore(8)) {
@@ -188,7 +197,10 @@ class BufferPoolConcurrentLoadTest {
         }
     }
 
-    /** 命中 LOADING 的等待者被中断时，恢复中断位并抛 BufferPoolLoadTimeoutException，不悬挂。 */
+    /** 命中 LOADING 的等待者被中断时，恢复中断位并抛 BufferPoolLoadTimeoutException，不悬挂。
+     *
+     * @throws InterruptedException 等待被中断时抛出；调用方应恢复中断标志并终止当前资源获取流程
+     */
     @Test
     void loadWaiterInterruptedDoesNotHang() throws InterruptedException {
         try (HookablePageStore store = openStore(8)) {

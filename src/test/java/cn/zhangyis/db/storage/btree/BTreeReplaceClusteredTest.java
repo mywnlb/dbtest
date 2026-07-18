@@ -58,6 +58,9 @@ class BTreeReplaceClusteredTest {
 
     private final TypeCodecRegistry registry = new TypeCodecRegistry();
 
+    /**
+     * 验证 {@code matchingOwnershipReplacesRecord} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void matchingOwnershipReplacesRecord() {
         onPool(ctx -> {
@@ -86,6 +89,9 @@ class BTreeReplaceClusteredTest {
         });
     }
 
+    /**
+     * 验证 {@code ownershipMismatchDoesNotReplace} 所描述的边界场景保持既有领域不变量，不产生方法名明确禁止的副作用。
+     */
     @Test
     void ownershipMismatchDoesNotReplace() {
         onPool(ctx -> {
@@ -114,6 +120,9 @@ class BTreeReplaceClusteredTest {
         });
     }
 
+    /**
+     * 验证 {@code changingClusterKeyThrows} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void changingClusterKeyThrows() {
         onPool(ctx -> {
@@ -135,6 +144,9 @@ class BTreeReplaceClusteredTest {
         });
     }
 
+    /**
+     * 验证 {@code levelOneCrossLeafReplace} 所描述的 B+Tree 定位或结构变化，并断言键序、父子链接、页资源和唯一性不变量。
+     */
     @Test
     void levelOneCrossLeafReplace() {
         onPool(ctx -> {

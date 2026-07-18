@@ -45,6 +45,9 @@ class CoordinatedDirtyVictimFlusherTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code returnsTrueAndWritesPageWhenRedoDurable} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void returnsTrueAndWritesPageWhenRedoDurable() {
         try (PageStore store = new FileChannelPageStore();
@@ -67,6 +70,9 @@ class CoordinatedDirtyVictimFlusherTest {
         }
     }
 
+    /**
+     * 验证 {@code returnsFalseWhenRedoNotDurable} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void returnsFalseWhenRedoNotDurable() {
         try (PageStore store = new FileChannelPageStore(); BufferPool pool = new LruBufferPool(store, PS, 4)) {
@@ -85,6 +91,9 @@ class CoordinatedDirtyVictimFlusherTest {
         }
     }
 
+    /**
+     * 验证 {@code throwsCarriedCauseWhenFlushFails} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void throwsCarriedCauseWhenFlushFails() {
         try (PageStore store = new FileChannelPageStore();

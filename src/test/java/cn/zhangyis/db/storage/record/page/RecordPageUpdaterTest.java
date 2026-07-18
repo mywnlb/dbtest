@@ -98,6 +98,9 @@ class RecordPageUpdaterTest {
         return ids;
     }
 
+    /**
+     * 验证 {@code inPlaceWhenSameOrShorter} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void inPlaceWhenSameOrShorter() {
         onPage((rp, schema) -> {
@@ -117,6 +120,9 @@ class RecordPageUpdaterTest {
         });
     }
 
+    /**
+     * 验证 {@code movesWhenLonger} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void movesWhenLonger() {
         onPage((rp, schema) -> {
@@ -138,6 +144,9 @@ class RecordPageUpdaterTest {
         });
     }
 
+    /**
+     * 验证 {@code keyChangeReturnsRequiresReinsertWithoutMutating} 所描述的边界场景保持既有领域不变量，不产生方法名明确禁止的副作用。
+     */
     @Test
     void keyChangeReturnsRequiresReinsertWithoutMutating() {
         onPage((rp, schema) -> {
@@ -154,6 +163,9 @@ class RecordPageUpdaterTest {
         });
     }
 
+    /**
+     * 验证 {@code moveOverflowLeavesPageUnchanged} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void moveOverflowLeavesPageUnchanged() {
         onPage((rp, schema) -> {
@@ -177,6 +189,9 @@ class RecordPageUpdaterTest {
         });
     }
 
+    /**
+     * 验证 {@code rejectsSystemAndDeleteMarked} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void rejectsSystemAndDeleteMarked() {
         onPage((rp, schema) -> {

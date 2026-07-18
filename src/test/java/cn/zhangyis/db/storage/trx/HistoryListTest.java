@@ -40,6 +40,9 @@ class HistoryListTest {
                 java.util.Arrays.stream(tableIds).boxed().collect(java.util.stream.Collectors.toSet()));
     }
 
+    /**
+     * 验证 {@code committedIsFifoPeekThenCompleteExpectedHead} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void committedIsFifoPeekThenCompleteExpectedHead() {
         HistoryList h = new HistoryList();
@@ -69,6 +72,9 @@ class HistoryListTest {
         assertEquals(0, h.committedSize());
     }
 
+    /**
+     * 验证 {@code completeRejectsWrongOrRepeatedHead} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void completeRejectsWrongOrRepeatedHead() {
         HistoryList h = new HistoryList();
@@ -100,6 +106,9 @@ class HistoryListTest {
         assertEquals(TransactionNo.of(20), history.peekCommitted().orElseThrow().transactionNo());
     }
 
+    /**
+     * 验证 {@code prePhysicalCloseReleasesTransitionButPostPhysicalCloseFencesWriters} 所描述的组件生命周期，并断言状态转换、后台线程停止和资源恰好释放一次。
+     */
     @Test
     void prePhysicalCloseReleasesTransitionButPostPhysicalCloseFencesWriters() {
         HistoryList history = new HistoryList(Duration.ofMillis(30));
@@ -114,6 +123,11 @@ class HistoryListTest {
                 "越过物理边界的未知状态必须保持 fail-stop transition");
     }
 
+    /**
+     * 验证 {@code waitingTransitionIsInterruptibleAndRestoresInterruptFlag} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void waitingTransitionIsInterruptibleAndRestoresInterruptFlag() throws Exception {
         HistoryList history = new HistoryList(Duration.ofSeconds(2));
@@ -139,6 +153,11 @@ class HistoryListTest {
         assertTrue(interruptRestored.get(), "domain exception must not consume the caller's interrupt signal");
     }
 
+    /**
+     * 验证 {@code purgeRemovalAndConcurrentCommitAppendPublishWithoutLostUpdate} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void purgeRemovalAndConcurrentCommitAppendPublishWithoutLostUpdate() throws Exception {
         HistoryList history = new HistoryList(Duration.ofSeconds(1));
@@ -165,7 +184,10 @@ class HistoryListTest {
         assertEquals(List.of(newCommit), history.snapshot());
     }
 
-    /** commit 发布增加表引用，purge finalization 发布减少引用并唤醒等待中的 DROP barrier。 */
+    /** commit 发布增加表引用，purge finalization 发布减少引用并唤醒等待中的 DROP barrier。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void tableBarrierTracksPublishedHistoryAndWakesAfterPurge() throws Exception {
         HistoryList history = new HistoryList(Duration.ofSeconds(1));

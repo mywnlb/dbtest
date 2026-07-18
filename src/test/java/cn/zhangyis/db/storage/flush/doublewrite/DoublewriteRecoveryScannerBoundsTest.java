@@ -25,6 +25,9 @@ class DoublewriteRecoveryScannerBoundsTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code skipsPageBeyondCurrentFileSize} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void skipsPageBeyondCurrentFileSize() {
         try (PageStore store = new FileChannelPageStore();

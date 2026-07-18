@@ -55,6 +55,10 @@ import cn.zhangyis.db.storage.buf.ReadAheadService;
 import cn.zhangyis.db.storage.buf.BufferPoolWarmupService;
 import cn.zhangyis.db.storage.flush.checkpoint.CheckpointCoordinator;
 import cn.zhangyis.db.storage.flush.doublewrite.DoublewriteFileRepository;
+import cn.zhangyis.db.storage.flush.doublewrite.DoublewriteChannel;
+import cn.zhangyis.db.storage.flush.doublewrite.DoublewriteMode;
+import cn.zhangyis.db.storage.flush.doublewrite.DetectOnlyDoublewriteStrategy;
+import cn.zhangyis.db.storage.flush.doublewrite.NoDoublewriteStrategy;
 import cn.zhangyis.db.storage.flush.doublewrite.DoublewriteRecoveryScanner;
 import cn.zhangyis.db.storage.flush.doublewrite.RecoverableDoublewriteStrategy;
 import cn.zhangyis.db.storage.flush.policy.AdaptiveFlushPolicy;
@@ -174,21 +178,41 @@ import java.util.Set;
  */
 public final class StorageEngine {
 
+    /**
+     * 构造时冻结的 {@code config} 配置快照；已完成范围和组合校验，运行期策略读取它但不得就地修改。
+     */
     private final EngineConfig config;
     /** 恢复 PREPARED 的外部权威决议源；默认 unresolved，绝不由存储层猜测全局事务结果。 */
     private final PreparedTransactionDecisionProvider preparedDecisionProvider;
+    /**
+     * 本对象的权威状态机字段 {@code state}；只有合法转换方法可以更新，更新受显式锁、原子发布或单一 owner 线程保护，下游据此决定可执行阶段。
+     */
     private EngineState state = EngineState.NEW;
 
     // AutoCloseable 句柄（close 时关闭）
+    /**
+     * 本对象持有的 {@code store} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private PageStore store;
+    /**
+     * 本对象持有的 {@code redoRepo} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private RedoLogFileRepository redoRepo;
+    /**
+     * 本对象持有的 {@code checkpointStore} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private RedoCheckpointStore checkpointStore;
     /**
      * fuzzy checkpoint 的事务 id/no 高水位 sidecar；NORMAL/FORCE/fresh 打开，READ_ONLY_VALIDATE 不创建或写入。
      */
     private TransactionRecoveryCheckpointStore transactionRecoveryCheckpointStore;
-    /** doublewrite buffer 文件仓储；前向刷脏写整页副本，恢复期供 scanner 修复 torn data page。 */
-    private DoublewriteFileRepository doublewriteRepo;
+    /** FlushList/LRU 双物理 doublewrite 通道；OFF 模式为空。 */
+    private DoublewriteChannel doublewriteChannel;
+    /** 旧版单文件副本，仅作为恢复输入兼容，不再作为前向写入目标。 */
+    private DoublewriteFileRepository legacyDoublewriteRepo;
+    /**
+     * 本对象持有的 {@code pool} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private BufferPool pool;
     /** E2 起由 engine 显式持有的运行时表空间 registry，确保 disk facade 与 undo recovery 共享同一状态视图。 */
     private TablespaceRegistry registry;
@@ -200,13 +224,31 @@ public final class StorageEngine {
     private final RecoveryProgressJournal recoveryProgressJournal;
 
     // 接线的服务
+    /**
+     * 本对象持有的 {@code redo} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private RedoLogManager redo;
+    /**
+     * 本对象持有的 {@code miniTransactionManager} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private MiniTransactionManager miniTransactionManager;
+    /**
+     * 本对象持有的 {@code diskSpaceManager} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private DiskSpaceManager diskSpaceManager;
     /** 0.21h off-page TEXT/BLOB/JSON 门面；与 B+Tree/Undo 共享同一 type registry、pool 与 FSP facade。 */
     private LobStorage lobStorage;
+    /**
+     * 本对象持有的 {@code transactionManager} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private TransactionManager transactionManager;
+    /**
+     * 本对象持有的 {@code undoLogManager} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private UndoLogManager undoLogManager;
+    /**
+     * 本对象持有的 {@code btreeService} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private SplitCapableBTreeIndexService btreeService;
     /** 0.17 事务锁内核；聚簇 current-read、secondary logical-prefix S/X 与事务终态共享这一实例。 */
     private LockManager lockManager;
@@ -224,14 +266,23 @@ public final class StorageEngine {
     private PurgeDmlRowGuardManager purgeDmlRowGuards;
     /** 组合根共享的类型/排序 registry，保证 DD、record 与 secondary comparator 使用同一语义。 */
     private TypeCodecRegistry typeRegistry;
+    /**
+     * 本对象持有的 {@code indexPageAccess} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private IndexPageAccess indexPageAccess;
     /** DD/DDL 上层唯一可调用的物理 CREATE/DROP TABLE facade。 */
     private TableDdlStorageService tableDdlStorageService;
+    /**
+     * 本对象持有的 {@code mvccReader} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private MvccReader mvccReader;
     /** unique point/non-unique logical-prefix 候选回表并复核聚簇可见版本的 MVCC 读服务。 */
     private SecondaryMvccReader secondaryMvccReader;
     /** non-unique logical-prefix 锁定读；predicate 与 clustered 锁保持到事务终态。 */
     private SecondaryCurrentReadService secondaryCurrentReadService;
+    /**
+     * 本对象持有的 {@code rollbackService} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private RollbackService rollbackService;
     /** phase-one/phase-two 强持久边界与事务锁收尾的稳定 storage resource-manager facade。 */
     private PreparedTransactionService preparedTransactionService;
@@ -266,6 +317,9 @@ public final class StorageEngine {
     private PurgeDriverWorker purgeDriverWorker;
     /** 前台测试、后台 driver 与 recovery RESUME_PURGE 共用的单线程协调器；无索引 metadata 时为空。 */
     private PurgeCoordinator purgeCoordinator;
+    /**
+     * 本对象持有的 {@code flushService} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private FlushService flushService;
     /** E3a 后台 page cleaner；只由 engine 生命周期启动/停止，所有刷脏仍走 {@link FlushService}。 */
     private PageCleanerSupervisor pageCleanerSupervisor;
@@ -287,6 +341,11 @@ public final class StorageEngine {
     /** 最近一次 existing-open 恢复报告；fresh open 为 null，避免把无恢复路径误报成已恢复。 */
     private RecoveryReport lastRecoveryReport;
 
+    /**
+     * 创建 {@code StorageEngine}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param config 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     */
     public StorageEngine(EngineConfig config) {
         this(config, PreparedTransactionDecisionProvider.unresolved());
     }
@@ -303,11 +362,27 @@ public final class StorageEngine {
                 preparedDecisionProvider);
     }
 
+    /**
+     * 创建 {@code StorageEngine}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param config 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @param recoveryGate 由组合根提供的 {@code RecoveryTrafficGate} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param recoveryProgressJournal 由组合根提供的 {@code RecoveryProgressJournal} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     */
     StorageEngine(EngineConfig config, RecoveryTrafficGate recoveryGate, RecoveryProgressJournal recoveryProgressJournal) {
         this(config, recoveryGate, recoveryProgressJournal,
                 PreparedTransactionDecisionProvider.unresolved());
     }
 
+    /**
+     * 创建 {@code StorageEngine}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param config 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @param recoveryGate 由组合根提供的 {@code RecoveryTrafficGate} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param recoveryProgressJournal 由组合根提供的 {@code RecoveryProgressJournal} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param preparedDecisionProvider 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     StorageEngine(EngineConfig config, RecoveryTrafficGate recoveryGate,
                   RecoveryProgressJournal recoveryProgressJournal,
                   PreparedTransactionDecisionProvider preparedDecisionProvider) {
@@ -336,6 +411,7 @@ public final class StorageEngine {
      * {@link EngineConfig#recoveryTablespaces()} 中列出的数据表空间，再由 {@link CrashRecoveryService} 执行
      * checkpoint-aware redo replay、安装恢复边界、UNDO TRUNCATING 续作和 SPACE_FILE_RECONCILE。恢复/建库完成后先
      * 启动后台 page cleaner，再发布 OPEN。
+     * @throws EngineStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
      */
     public void open() {
         if (state != EngineState.NEW) {
@@ -349,8 +425,19 @@ public final class StorageEngine {
         }
     }
 
-    /** 执行实际 bootstrap/recovery；任何异常由 {@link #open()} 统一停止 worker 并关闭部分初始化句柄。 */
+    /** 执行实际 bootstrap/recovery；任何异常由 {@link #open()} 统一停止 worker 并关闭部分初始化句柄。
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验语法/命令、会话状态与元数据身份，构造统一 deadline，纯输入错误在事务或持久副作用前失败。</li>
+     *     <li>按 session、transaction、MDL 与 metadata scope 顺序取得受控资源，并在等待后复核版本与状态。</li>
+     *     <li>调用 binder、executor、字典或 storage 稳定接口完成领域动作，成功后才发布缓存、事务或结果状态。</li>
+     *     <li>关闭 scope 并返回不可变结果；异常保留 cause/suppressed 图，按 autocommit 或显式事务边界回滚。</li>
+     * </ol>
+     *
+     * @throws DatabaseRuntimeException 可恢复的数据库运行期协作失败时抛出；调用方应依据当前事务状态选择回滚、重试或关闭资源
+     */
     private void openInternal() {
+        // 1、校验语法/命令、会话状态与元数据身份，在共享或持久副作用前拒绝非法状态。
         try {
             Files.createDirectories(config.baseDir());
         } catch (IOException e) {
@@ -395,8 +482,20 @@ public final class StorageEngine {
             this.transactionRecoveryCheckpointStore = TransactionRecoveryCheckpointStore.open(
                     config.transactionRecoveryCheckpointFile());
         }
-        // doublewrite 文件早于 FlushCoordinator/recovery 打开、跨进程持久：恢复枚举到的是上一进程的整页副本。
-        this.doublewriteRepo = DoublewriteFileRepository.open(config.doublewriteFile(), config.pageSize());
+        // 双物理文件早于 FlushCoordinator/recovery 打开；OFF 不创建文件，旧单文件只读作恢复兼容输入。
+        if (config.doublewriteMode() != DoublewriteMode.OFF) {
+            this.doublewriteChannel = readOnlyValidate
+                    ? DoublewriteChannel.openReadOnly(config.flushListDoublewriteFile(),
+                            config.lruDoublewriteFile(), config.pageSize())
+                    : DoublewriteChannel.open(config.flushListDoublewriteFile(),
+                            config.lruDoublewriteFile(), config.pageSize());
+            if (Files.exists(config.doublewriteFile())) {
+                this.legacyDoublewriteRepo = readOnlyValidate
+                        ? DoublewriteFileRepository.openReadOnlyIfExists(config.doublewriteFile(), config.pageSize())
+                                .orElse(null)
+                        : DoublewriteFileRepository.open(config.doublewriteFile(), config.pageSize());
+            }
+        }
         this.accessController = new TablespaceAccessController();
         this.store = new FileChannelPageStore();
         // 0.10d：按 config 分片数构造 buffer pool（默认 1=单实例池，生产保守；测试经 withBufferPoolInstanceCount 配 N>1）。
@@ -409,8 +508,13 @@ public final class StorageEngine {
         // TransactionSystem 必须早于 CheckpointCoordinator：checkpoint participant 在 redo label 前短锁读取其 next-counter。
         this.txnSystem = new TransactionSystem();
 
+        var doublewriteStrategy = switch (config.doublewriteMode()) {
+            case OFF -> new NoDoublewriteStrategy();
+            case DETECT_ONLY -> new DetectOnlyDoublewriteStrategy(doublewriteChannel);
+            case DETECT_AND_RECOVER -> new RecoverableDoublewriteStrategy(doublewriteChannel);
+        };
         FlushCoordinator flushCoordinator = new FlushCoordinator(pool, store, redo, config.pageSize(),
-                new RecoverableDoublewriteStrategy(doublewriteRepo), config.flushTimeout(), accessController);
+                doublewriteStrategy, config.flushTimeout(), accessController);
         CheckpointCoordinator checkpointCoordinator =
                 transactionRecoveryCheckpointStore == null
                         ? new CheckpointCoordinator(pool, redo, checkpointStore, redoReclaim)
@@ -419,6 +523,7 @@ public final class StorageEngine {
         this.flushService = new FlushService(pool, flushCoordinator, checkpointCoordinator, redo,
                 RedoCapacityPolicy.fixed(config.redoCapacityBytes()),
                 AdaptiveFlushPolicy.adaptive(1, 1, config.bufferPoolCapacityFrames()));
+        // 2、继续完成范围、身份与候选校验；通过后，按 session、transaction、MDL 与 metadata scope 顺序取得受控资源，保持处理顺序与资源边界。
         RedoCapacityThrottle redoCapacityThrottle = new RedoCapacityThrottle(
                 RedoCapacityPolicy.fixed(config.redoCapacityBytes()),
                 redo::currentLsn,
@@ -460,6 +565,7 @@ public final class StorageEngine {
                 indexPageAccess, pool, store, flushService, accessController, config.pageSize(),
                 btreeService, btreeRootSnapshots);
         this.lockObservationService = new DefaultLockObservationService();
+        // 3、在中间分支复核阶段性结果；满足条件后，调用 binder、executor、字典或 storage 稳定接口完成领域动作，并维持领域不变量。
         this.lockManager = new LockManager(lockObservationService);
         this.btreeCurrentReadService =
                 new BTreeCurrentReadService(miniTransactionManager, btreeService, lockManager);
@@ -538,6 +644,7 @@ public final class StorageEngine {
         if (fresh) {
             recoveryGate.openForUserTraffic();
         }
+        // 4、关闭 scope 并返回不可变结果，以稳定返回或领域异常完成收口。
         this.state = EngineState.OPEN;
     }
 
@@ -560,13 +667,26 @@ public final class StorageEngine {
      *   <li>系统 undo 不能跳过，否则 UNDO_ROLLBACK/RESUME_PURGE 没有安全语义；</li>
      *   <li>显式配置的 legacy 聚簇索引所在空间不能跳过；DD resolver 模式若解析到被跳过表空间，会在恢复访问时 fail-closed。</li>
      * </ul>
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取 checkpoint、redo、doublewrite 或事务持久证据，并校验阶段、范围与文件身份。</li>
+     *     <li>依据 page LSN、恢复进度和稳定标识判断跳过或续作，保证重复启动不会重复产生副作用。</li>
+     *     <li>按恢复阶段应用物理页或事务状态变化，并在每个可恢复边界记录已完成进度。</li>
+     *     <li>发布恢复结果并释放恢复专用资源；失败保持 fail-closed，不能提前开放普通 SQL 流量。</li>
+     * </ol>
+     *
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     private void validateRecoverySkipConfiguration() {
+        // 1、读取 checkpoint、redo、doublewrite 或事务持久证据，在共享或持久副作用前拒绝非法状态。
         Set<SpaceId> skipped = config.forceSkippedSpaces();
+        // 2、继续完成范围、身份与候选校验；通过后，依据 page LSN、恢复进度和稳定标识判断跳过或续作，保持处理顺序与资源边界。
         if (config.recoveryMode() != RecoveryMode.FORCE_SKIP_CORRUPT_TABLESPACE && !skipped.isEmpty()) {
             throw new DatabaseValidationException(
                     "force skipped spaces are only allowed in FORCE_SKIP_CORRUPT_TABLESPACE mode");
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，按恢复阶段应用物理页或事务状态变化，并维持领域不变量。
         if (config.recoveryMode() == RecoveryMode.FORCE_SKIP_CORRUPT_TABLESPACE && skipped.isEmpty()) {
             throw new DatabaseValidationException("FORCE_SKIP_CORRUPT_TABLESPACE requires skipped spaces");
         }
@@ -574,6 +694,7 @@ public final class StorageEngine {
             throw new DatabaseValidationException("system undo tablespace cannot be force-skipped: "
                     + config.undoSpaceId().value());
         }
+        // 4、发布恢复结果并释放恢复专用资源，以稳定返回或领域异常完成收口。
         if (clusteredIndex != null && skipped.contains(clusteredIndex.rootPageId().spaceId())) {
             throw new DatabaseValidationException("configured clustered index space cannot be force-skipped: "
                     + clusteredIndex.rootPageId().spaceId().value());
@@ -613,12 +734,22 @@ public final class StorageEngine {
         // （系统 undo + 配置的 recoveryTablespaces）——没有 DD discovery 前恢复只能触达这些空间，对未打开空间的页
         // 调 scanner 会触发 TablespaceNotOpenException；其它空间的 torn 页留待该空间被显式打开/未来 discovery 时修复。
         List<SpaceId> recoverySpaces = recoverySpaceIds();
-        DoublewriteRecoveryScanner doublewriteScanner =
-                new DoublewriteRecoveryScanner(doublewriteRepo, store, config.pageSize());
+        DoublewriteRecoveryScanner doublewriteScanner = doublewriteChannel == null
+                ? null
+                : new DoublewriteRecoveryScanner(doublewriteChannel, legacyDoublewriteRepo, store, config.pageSize());
         List<PageId> doublewritePages = new ArrayList<>();
-        for (PageId pageId : doublewriteRepo.pageIds()) {
-            if (recoverySpaces.contains(pageId.spaceId())) {
-                doublewritePages.add(pageId);
+        if (doublewriteChannel != null) {
+            for (PageId pageId : doublewriteChannel.pageIds()) {
+                if (recoverySpaces.contains(pageId.spaceId())) {
+                    doublewritePages.add(pageId);
+                }
+            }
+        }
+        if (legacyDoublewriteRepo != null) {
+            for (PageId pageId : legacyDoublewriteRepo.pageIds()) {
+                if (recoverySpaces.contains(pageId.spaceId()) && !doublewritePages.contains(pageId)) {
+                    doublewritePages.add(pageId);
+                }
             }
         }
         TransactionRecoveryCheckpointSource transactionRecoverySource =
@@ -664,12 +795,22 @@ public final class StorageEngine {
      */
     private TransactionUndoRecoveryParticipant transactionUndoRecoveryParticipant() {
         return new TransactionUndoRecoveryParticipant() {
+            /**
+             * 执行数据库引擎组合根恢复或重放步骤；按持久证据校验并幂等推进状态，不执行普通 SQL 业务语义。
+             *
+             * @param recoveredToLsn redo 日志边界；不得为 {@code null}，必须单调且与调用方已发布的页或事务状态一致
+             * @param transactionSnapshot 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+             * @return {@code recoverAfterRedo} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+             */
             @Override
             public TransactionUndoRecoveryResult recoverAfterRedo(
                     Lsn recoveredToLsn, RecoveredTransactionSnapshot transactionSnapshot) {
                 return recoverTransactionUndoAfterRedo(recoveredToLsn, transactionSnapshot);
             }
 
+            /**
+             * 在 redo 与事务 undo 恢复完成后转交引擎级 purge 恢复步骤；调用返回前普通 SQL 流量仍保持关闭。
+             */
             @Override
             public void resumePurgeAfterRedo() {
                 StorageEngine.this.resumePurgeAfterRedo();
@@ -686,6 +827,8 @@ public final class StorageEngine {
      *     <li>按 rollback slot 容量循环执行 purge batch；每个 batch 内部只持单个短 undo/index MTR，不跨批保留 latch。</li>
      *     <li>每次正进展后校验运行时 history 恰好减少已完成日志数；无进展表示到达 purge boundary 或 guard 延后，保留 head 后返回。</li>
      * </ol>
+     *
+     * @throws TransactionRecoveryException 恢复证据、阶段顺序或事务重建无法继续时抛出；owner 应停止恢复并保持普通流量关闭
      */
     private void resumePurgeAfterRedo() {
         // 1、persistent history 非空却没有 metadata 定位能力时，不能假装 RESUME_PURGE 已完成后开放流量。
@@ -700,6 +843,7 @@ public final class StorageEngine {
         }
 
         // 2、恢复期没有用户事务和后台 purge worker；循环只推进当前安全 boundary，单批上限沿用 slot 容量。
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         while (historyBefore > 0) {
             PurgeSummary summary = purgeCoordinator.runBatch(config.slotCapacity());
             int historyAfter = history.committedSize();
@@ -737,16 +881,27 @@ public final class StorageEngine {
      * {@code TransactionUndoRecoveryParticipant} 实现阶段端口。若发现 ACTIVE 但既无 legacy 索引也无 DD resolver，
      * 恢复 fail-closed，绝不保留未回滚 slot 后开放流量。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取 checkpoint、redo、doublewrite 或事务持久证据，并校验阶段、范围与文件身份。</li>
+     *     <li>依据 page LSN、恢复进度和稳定标识判断跳过或续作，保证重复启动不会重复产生副作用。</li>
+     *     <li>按恢复阶段应用物理页或事务状态变化，并在每个可恢复边界记录已完成进度。</li>
+     *     <li>发布恢复结果并释放恢复专用资源；失败保持 fail-closed，不能提前开放普通 SQL 流量。</li>
+     * </ol>
+     *
      * @param recoveredToLsn redo replay 连续恢复边界；作为 page3 合成证据 LSN，并用于 sidecar/redo 覆盖诊断。
      * @param transactionSnapshot checkpoint/redo 合并后的不可变事务证据；page3 扫描必须与它交叉校验。
      * @return 事务 undo 恢复摘要。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     private TransactionUndoRecoveryResult recoverTransactionUndoAfterRedo(
             Lsn recoveredToLsn, RecoveredTransactionSnapshot transactionSnapshot) {
+        // 1、读取 checkpoint、redo、doublewrite 或事务持久证据，在共享或持久副作用前拒绝非法状态。
         if (recoveredToLsn == null || transactionSnapshot == null) {
             throw new DatabaseValidationException("transaction undo recovery inputs must not be null");
         }
         MiniTransaction scan = miniTransactionManager.beginReadOnly();
+        // 2、继续完成范围、身份与候选校验；通过后，依据 page LSN、恢复进度和稳定标识判断跳过或续作，保持处理顺序与资源边界。
         RollbackSegmentHeaderSnapshot snapshot;
         try {
             snapshot = rsegHeaderRepo.read(scan, config.undoSpaceId(),
@@ -757,12 +912,14 @@ public final class StorageEngine {
             rollbackRecoveryScanMtr(scan, error);
             throw error;
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，按恢复阶段应用物理页或事务状态变化，并维持领域不变量。
         List<CachedUndoSegmentRef> cachedInsert = readRecoveredUndoCache(
                 snapshot.cachedInsertSegments(), UndoLogKind.INSERT);
         List<CachedUndoSegmentRef> cachedUpdate = readRecoveredUndoCache(
                 snapshot.cachedUpdateSegments(), UndoLogKind.UPDATE);
         List<FreeUndoSegmentRef> free = readRecoveredUndoFree(snapshot.freeListBase(),
                 snapshot.occupiedSlots().values(), cachedInsert, cachedUpdate);
+        // 4、发布恢复结果并释放恢复专用资源，以稳定返回或领域异常完成收口。
         return recoverRollbackSegmentTransactions(recoveredToLsn, transactionSnapshot,
                 snapshot.occupiedSlots(), snapshot.historyBase(), cachedInsert, cachedUpdate, free);
     }
@@ -773,7 +930,23 @@ public final class StorageEngine {
      * history，按外部决议完成 PREPARED，再 rollback ACTIVE，purge 留给独立恢复阶段。这样不会在 undo latch 下访问
      * B+Tree，也避免 recovery 抢跑 history/phase-two 的物理顺序。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取 checkpoint、redo、doublewrite 或事务持久证据，并校验阶段、范围与文件身份。</li>
+     *     <li>依据 page LSN、恢复进度和稳定标识判断跳过或续作，保证重复启动不会重复产生副作用。</li>
+     *     <li>按恢复阶段应用物理页或事务状态变化，并在每个可恢复边界记录已完成进度。</li>
+     *     <li>发布恢复结果并释放恢复专用资源；失败保持 fail-closed，不能提前开放普通 SQL 流量。</li>
+     * </ol>
+     *
      * @param occupiedSlots page3 扫描得到的 slot->undo first page 映射。
+     * @param recoveredToLsn redo 日志边界；不得为 {@code null}，必须单调且与调用方已发布的页或事务状态一致
+     * @param transactionSnapshot 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @param historyBase 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param cachedInsert 参与 {@code recoverRollbackSegmentTransactions} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @param cachedUpdate 参与 {@code recoverRollbackSegmentTransactions} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @param free 参与 {@code recoverRollbackSegmentTransactions} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @return {@code recoverRollbackSegmentTransactions} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     * @throws TransactionRecoveryException 恢复证据、阶段顺序或事务重建无法继续时抛出；owner 应停止恢复并保持普通流量关闭
      */
     private TransactionUndoRecoveryResult recoverRollbackSegmentTransactions(
             Lsn recoveredToLsn,
@@ -783,6 +956,7 @@ public final class StorageEngine {
             List<CachedUndoSegmentRef> cachedInsert,
             List<CachedUndoSegmentRef> cachedUpdate,
             List<FreeUndoSegmentRef> free) {
+        // 1、读取 checkpoint、redo、doublewrite 或事务持久证据，在共享或持久副作用前拒绝非法状态。
         List<RecoveredUndoSlotEvidence> recoveredSlots = new ArrayList<>();
         for (Map.Entry<UndoSlotId, PageId> entry : occupiedSlots.entrySet()) {
             recoveredSlots.add(readRecoveredUndoSlot(entry.getKey(), entry.getValue()));
@@ -800,6 +974,7 @@ public final class StorageEngine {
                             + "cannot skip undo rollback before opening traffic: activeSlots="
                             + reconciliation.activeSlots().size());
         }
+        // 2、继续完成范围、身份与候选校验；通过后，依据 page LSN、恢复进度和稳定标识判断跳过或续作，保持处理顺序与资源边界。
         Map<TransactionId, List<RecoveredUndoSlotEvidence>> preparedGroups = groupByCreator(
                 reconciliation.preparedSlots());
         Map<TransactionId, PreparedTransactionDecision> preparedDecisions = new LinkedHashMap<>();
@@ -826,6 +1001,7 @@ public final class StorageEngine {
                         reconciliation.snapshot().nextTransactionNo().value()));
         occupiedSlots.forEach(rollbackSlots::restore);
         // 已有 physical history 必须先恢复，prepared UPDATE commit 的 append lease 才能与 page3 tail 精确衔接。
+        // 3、在中间分支复核阶段性结果；满足条件后，按恢复阶段应用物理页或事务状态变化，并维持领域不变量。
         history.restore(committed);
         int resolvedPreparedSlots = resolveRecoveredPreparedTransactions(
                 preparedGroups, preparedDecisions);
@@ -846,6 +1022,7 @@ public final class StorageEngine {
         if (resolvedPreparedSlots > 0 || rolledBackActiveSlots > 0) {
             redo.flush();
         }
+        // 4、发布恢复结果并释放恢复专用资源，以稳定返回或领域异常完成收口。
         return new TransactionUndoRecoveryResult(occupiedSlots.size(), rolledBackActiveSlots,
                 0, committed.size());
     }
@@ -930,6 +1107,10 @@ public final class StorageEngine {
 
     /**
      * 从 PREPARED first page 复制运行时 binding 所需字段。读取完成前不访问 B+Tree、决议 provider 或 active table。
+     *
+     * @param evidence 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @return {@code readRecoveredPreparedBinding} 形成的不可变定义、计划或元数据快照；成功时不为 {@code null}，内部身份、版本和范围已完成交叉校验
+     * @throws TransactionRecoveryException 恢复证据、阶段顺序或事务重建无法继续时抛出；owner 应停止恢复并保持普通流量关闭
      */
     private RecoveredPreparedBinding readRecoveredPreparedBinding(
             RecoveredUndoSlotEvidence evidence) {
@@ -956,7 +1137,11 @@ public final class StorageEngine {
         }
     }
 
-    /** history recovery 每个 first page 使用独立短 MTR，返回后不保留 latch/fix。 */
+    /** history recovery 每个 first page 使用独立短 MTR，返回后不保留 latch/fix。
+     *
+     * @param firstPageId 目标页的稳定物理标识；必须属于当前已准入表空间，且不得为 {@code null}
+     * @return {@code readRecoveredHistoryNode} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     */
     private UndoHistoryNodeSnapshot readRecoveredHistoryNode(PageId firstPageId) {
         MiniTransaction read = miniTransactionManager.beginReadOnly();
         try {
@@ -983,6 +1168,9 @@ public final class StorageEngine {
      * @param firstPageId 当前 committed UPDATE undo log 首页。
      * @param logicalHead first-page header 中恢复出的权威逻辑链头。
      * @return 当前 logical chain 实际涉及的稳定 table id 集合。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws UndoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws TransactionRecoveryException 恢复证据、阶段顺序或事务重建无法继续时抛出；owner 应停止恢复并保持普通流量关闭
      */
     private Set<Long> readRecoveredHistoryAffectedTables(PageId firstPageId, UndoLogicalHead logicalHead) {
         if (firstPageId == null || logicalHead == null) {
@@ -1058,7 +1246,12 @@ public final class StorageEngine {
         return Set.copyOf(affected);
     }
 
-    /** recovery affected-table 投影按 undo identity 选择 exact-version 聚簇 metadata。 */
+    /** recovery affected-table 投影按 undo identity 选择 exact-version 聚簇 metadata。
+     *
+     * @param identity 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @return {@code resolveRecoveryHistoryIndex} 取得或创建的受控存储资源；成功时不为 {@code null}，调用方必须按其 Guard/lease 契约释放
+     * @throws TransactionRecoveryException 恢复证据、阶段顺序或事务重建无法继续时抛出；owner 应停止恢复并保持普通流量关闭
+     */
     private BTreeIndex resolveRecoveryHistoryIndex(UndoRecordIdentity identity) {
         if (indexMetadataResolver != null) {
             return indexMetadataResolver.resolve(identity.tableId(), identity.indexId());
@@ -1075,6 +1268,10 @@ public final class StorageEngine {
      * 恢复一个持久 cached 栈。每个 owner 先在短 MTR 中校验空单页 undo header，再在另一个短 MTR 中读取
      * page0/page2 FSP inode；刻意不同时持有 undo first-page latch 与 FSP latch，维持“空间账本先于数据页”的锁序。
      * 只有 {@code used=fragment=1, extent=0} 的 segment 才能恢复为可复用缓存，否则 page3 owner 视为损坏。
+     * @param firstPages 参与 {@code readRecoveredUndoCache} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @param kind 选择 {@code readRecoveredUndoCache} 分支的 {@code UndoLogKind} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     * @return 按物理页、日志或 SQL 源顺序扫描并物化的元素；无匹配内容时返回空集合，不用 {@code null} 表示缺失
+     * @throws UndoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     private List<CachedUndoSegmentRef> readRecoveredUndoCache(List<PageId> firstPages, UndoLogKind kind) {
         List<CachedUndoSegmentRef> recovered = new ArrayList<>(firstPages.size());
@@ -1109,10 +1306,27 @@ public final class StorageEngine {
     /**
      * 按 page3 v4 length 有界恢复 free FIFO。每个节点使用独立首页 MTR，FSP identity 再用另一个 MTR 校验；
      * prev/next、cycle、tail、资格或与 active/cache owner 重复时一律 fail-closed。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取 checkpoint、redo、doublewrite 或事务持久证据，并校验阶段、范围与文件身份。</li>
+     *     <li>依据 page LSN、恢复进度和稳定标识判断跳过或续作，保证重复启动不会重复产生副作用。</li>
+     *     <li>按恢复阶段应用物理页或事务状态变化，并在每个可恢复边界记录已完成进度。</li>
+     *     <li>发布恢复结果并释放恢复专用资源；失败保持 fail-closed，不能提前开放普通 SQL 流量。</li>
+     * </ol>
+     *
+     * @param base 参与 {@code readRecoveredUndoFree} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @param activeOwners 参与 {@code readRecoveredUndoFree} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @param cachedInsert 参与 {@code readRecoveredUndoFree} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @param cachedUpdate 参与 {@code readRecoveredUndoFree} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @return 按物理页、日志或 SQL 源顺序扫描并物化的元素；无匹配内容时返回空集合，不用 {@code null} 表示缺失
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws UndoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     private List<FreeUndoSegmentRef> readRecoveredUndoFree(
             RollbackSegmentFreeListBase base, Collection<PageId> activeOwners,
             List<CachedUndoSegmentRef> cachedInsert, List<CachedUndoSegmentRef> cachedUpdate) {
+        // 1、读取 checkpoint、redo、doublewrite 或事务持久证据，在共享或持久副作用前拒绝非法状态。
         if (base == null || activeOwners == null || cachedInsert == null || cachedUpdate == null) {
             throw new DatabaseValidationException("recovered undo free inputs must not be null");
         }
@@ -1120,9 +1334,11 @@ public final class StorageEngine {
             return List.of();
         }
         Set<PageId> owners = new LinkedHashSet<>(activeOwners);
+        // 2、继续完成范围、身份与候选校验；通过后，依据 page LSN、恢复进度和稳定标识判断跳过或续作，保持处理顺序与资源边界。
         cachedInsert.forEach(item -> owners.add(item.handle().firstPageId()));
         cachedUpdate.forEach(item -> owners.add(item.handle().firstPageId()));
         List<FreeUndoSegmentRef> recovered = new ArrayList<>((int) base.length());
+        // 3、在中间分支复核阶段性结果；满足条件后，按恢复阶段应用物理页或事务状态变化，并维持领域不变量。
         Optional<PageId> expectedPrevious = Optional.empty();
         PageId current = base.headPageId().orElseThrow();
         for (int index = 0; index < (int) base.length(); index++) {
@@ -1169,12 +1385,18 @@ public final class StorageEngine {
                 current = node.nextFreePageId().orElseThrow();
             }
         }
+        // 4、发布恢复结果并释放恢复专用资源，以稳定返回或领域异常完成收口。
         return List.copyOf(recovered);
     }
 
     /**
      * 只读读取一个 restored undo slot 的恢复 header。异常时回滚该只读 MTR，避免损坏 undo 页导致 guard/lease 泄漏。
      * 返回值只含内存快照，不持有 page latch；调用方可安全地在之后进入 B+Tree rollback 或 history 入队。
+     *
+     * @param slotId 参与 {@code readRecoveredUndoSlot} 的稳定领域标识 {@code UndoSlotId}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param firstPageId 目标页的稳定物理标识；必须属于当前已准入表空间，且不得为 {@code null}
+     * @return {@code readRecoveredUndoSlot} 构造或恢复的 undo/rollback 对象；成功时不为 {@code null}，事务身份和 roll pointer 链保持一致
+     * @throws UndoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     private RecoveredUndoSlotEvidence readRecoveredUndoSlot(UndoSlotId slotId, PageId firstPageId) {
         MiniTransaction stateMtr = miniTransactionManager.beginReadOnly();
@@ -1207,7 +1429,11 @@ public final class StorageEngine {
         }
     }
 
-    /** 恢复只读扫描失败时释放 memo；清理异常只作 suppressed，不能覆盖原始损坏/IO 根因。 */
+    /** 恢复只读扫描失败时释放 memo；清理异常只作 suppressed，不能覆盖原始损坏/IO 根因。
+     *
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param original 需要分类或包装的原始失败；不得为 {@code null}，包装时必须保留 cause 与 suppressed 异常图
+     */
     private void rollbackRecoveryScanMtr(MiniTransaction mtr, RuntimeException original) {
         try {
             miniTransactionManager.rollbackUncommitted(mtr);
@@ -1216,7 +1442,11 @@ public final class StorageEngine {
         }
     }
 
-    /** 恢复 PREPARED 聚合所需的无 latch binding 与物理 undoNo 高水位。 */
+    /** 恢复 PREPARED 聚合所需的无 latch binding 与物理 undoNo 高水位。
+     *
+     * @param binding 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param lastUndoNo 参与 {@code 构造} 的稳定领域标识 {@code UndoNo}；不得为 {@code null}，并须由对应值对象构造校验产生
+     */
     private record RecoveredPreparedBinding(UndoLogBinding binding, UndoNo lastUndoNo) {
         private RecoveredPreparedBinding {
             if (binding == null || lastUndoNo == null) {
@@ -1246,6 +1476,7 @@ public final class StorageEngine {
     /**
      * SPACE_FILE_RECONCILE 输入集合。系统 undo 由引擎固定加入；数据表空间仅限配置显式列出的集合。使用
      * {@link LinkedHashSet} 保持诊断顺序稳定，同时防御未来构造器变化导致的重复 SpaceId。
+     * @return {@code recoverySpaceIds} 产生的非空集合容器；元素身份与顺序遵循当前模块契约，无元素时返回空集合而非 {@code null}
      */
     private List<SpaceId> recoverySpaceIds() {
         LinkedHashSet<SpaceId> spaces = new LinkedHashSet<>();
@@ -1289,6 +1520,9 @@ public final class StorageEngine {
         return Math.max(1, config.bufferPoolCapacityFrames());
     }
 
+    /**
+     * 推进数据库引擎组合根刷盘或检查点边界；写数据前遵守 WAL，失败时不得清除尚未安全持久化的状态。
+     */
     private void startBackgroundRedoFlusher() {
         if (!config.backgroundFlushEnabled()) {
             return;
@@ -1315,6 +1549,7 @@ public final class StorageEngine {
      * 0.10a/0.10c：启动后台 read-ahead 服务并接 Buffer Pool 钩子。仅在后台启用时启动；linear 阈值取 InnoDB 默认 56，
      * random 阈值取 {@link #RANDOM_READ_AHEAD_THRESHOLD}=0（禁用，对齐 MySQL OFF），故一般负载（含既有测试）不触发
      * 预取、行为不变。必须晚于 bootstrap/recover，使其只跟踪普通 getPage 访问。
+     * @param lruPool 由组合根提供的 {@code LruBufferPool} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code startBackgroundReadAhead} 调用
      */
     private void startBackgroundReadAhead(LruBufferPool lruPool) {
         if (!config.backgroundFlushEnabled()) {
@@ -1338,8 +1573,18 @@ public final class StorageEngine {
      * 关闭引擎。先 {@link FlushService#flushThrough}（WAL 顺序持久 + 清空 dirty），再依次关闭 pool（此时 dirty 已空，
      * legacy flushAll 为 no-op，不绕 WAL gate）、store、redoRepo、redo/transaction checkpoint stores。幂等：
      * CLOSED 再 close 为 no-op。
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验语法/命令、会话状态与元数据身份，构造统一 deadline，纯输入错误在事务或持久副作用前失败。</li>
+     *     <li>按 session、transaction、MDL 与 metadata scope 顺序取得受控资源，并在等待后复核版本与状态。</li>
+     *     <li>调用 binder、executor、字典或 storage 稳定接口完成领域动作，成功后才发布缓存、事务或结果状态。</li>
+     *     <li>关闭 scope 并返回不可变结果；异常保留 cause/suppressed 图，按 autocommit 或显式事务边界回滚。</li>
+     * </ol>
+     *
+     * @throws EngineStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
      */
     public void close() {
+        // 1、校验语法/命令、会话状态与元数据身份，在共享或持久副作用前拒绝非法状态。
         if (state == EngineState.CLOSED) {
             return;
         }
@@ -1350,29 +1595,45 @@ public final class StorageEngine {
         if (state != EngineState.OPEN) {
             throw new EngineStateException("close requires OPEN state: " + state);
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按 session、transaction、MDL 与 metadata scope 顺序取得受控资源，保持处理顺序与资源边界。
         stopBackgroundReadAhead();
         stopBackgroundPageCleaner();
         stopBackgroundRedoFlusher();
+        // 3、在中间分支复核阶段性结果；满足条件后，调用 binder、executor、字典或 storage 稳定接口完成领域动作，并维持领域不变量。
         stopBackgroundPurgeDriver();
         flushService.flushThrough(redo.currentLsn(), config.flushTimeout());
         // warmup dump：后台 worker 已停、dirty 已刷，residentMap 稳定，保存热页定位供下次 open 预取。最佳努力（IO 失败不抛）。
         new BufferPoolWarmupService().dump(pool, config.bufferPoolDumpFile());
+        // 4、关闭 scope 并返回不可变结果，以稳定返回或领域异常完成收口。
         closeOpenedHandles();
     }
 
     /**
      * 释放引擎打开的底层句柄。普通 OPEN close 在调用前已经停后台 worker、flushThrough 并写 warmup dump；
      * READ_ONLY_VALIDATE close 则直接走这里，避免把诊断实例的关闭动作变成隐式刷盘或预热状态写入。
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验语法/命令、会话状态与元数据身份，构造统一 deadline，纯输入错误在事务或持久副作用前失败。</li>
+     *     <li>按 session、transaction、MDL 与 metadata scope 顺序取得受控资源，并在等待后复核版本与状态。</li>
+     *     <li>调用 binder、executor、字典或 storage 稳定接口完成领域动作，成功后才发布缓存、事务或结果状态。</li>
+     *     <li>关闭 scope 并返回不可变结果；异常保留 cause/suppressed 图，按 autocommit 或显式事务边界回滚。</li>
+     * </ol>
+     *
      */
     private void closeOpenedHandles() {
+        // 1、校验语法/命令、会话状态与元数据身份，在共享或持久副作用前拒绝非法状态。
         List<RuntimeException> errors = new ArrayList<>();
         closeQuietly(pool, errors);
         closeQuietly(store, errors);
+        // 2、继续完成范围、身份与候选校验；通过后，按 session、transaction、MDL 与 metadata scope 顺序取得受控资源，保持处理顺序与资源边界。
         closeQuietly(redoRepo, errors);
         closeQuietly(checkpointStore, errors);
         closeQuietly(transactionRecoveryCheckpointStore, errors);
-        closeQuietly(doublewriteRepo, errors);
+        // 3、在中间分支复核阶段性结果；满足条件后，调用 binder、executor、字典或 storage 稳定接口完成领域动作，并维持领域不变量。
+        closeQuietly(doublewriteChannel, errors);
+        closeQuietly(legacyDoublewriteRepo, errors);
         state = EngineState.CLOSED;
+        // 4、关闭 scope 并返回不可变结果，以稳定返回或领域异常完成收口。
         if (!errors.isEmpty()) {
             DatabaseRuntimeException aggregate =
                     new DatabaseRuntimeException("engine close failed to release " + errors.size() + " handle(s)",
@@ -1385,12 +1646,26 @@ public final class StorageEngine {
     /**
      * open 失败清理。停止顺序与普通 close 一致，但每个失败只作为原始启动异常的 suppressed，不能覆盖导致
      * fail-closed 的 redo/sidecar/page3 根因；句柄聚合关闭结束后状态固定为 CLOSED，调用方可安全重复 close。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验语法/命令、会话状态与元数据身份，构造统一 deadline，纯输入错误在事务或持久副作用前失败。</li>
+     *     <li>按 session、transaction、MDL 与 metadata scope 顺序取得受控资源，并在等待后复核版本与状态。</li>
+     *     <li>调用 binder、executor、字典或 storage 稳定接口完成领域动作，成功后才发布缓存、事务或结果状态。</li>
+     *     <li>关闭 scope 并返回不可变结果；异常保留 cause/suppressed 图，按 autocommit 或显式事务边界回滚。</li>
+     * </ol>
+     *
+     * @param original 需要分类或包装的原始失败；不得为 {@code null}，包装时必须保留 cause 与 suppressed 异常图
      */
     private void cleanupAfterFailedOpen(RuntimeException original) {
+        // 1、校验语法/命令、会话状态与元数据身份，在共享或持久副作用前拒绝非法状态。
         stopAfterFailedOpen(this::stopBackgroundReadAhead, original);
+        // 2、继续完成范围、身份与候选校验；通过后，按 session、transaction、MDL 与 metadata scope 顺序取得受控资源，保持处理顺序与资源边界。
         stopAfterFailedOpen(this::stopBackgroundPageCleaner, original);
+        // 3、在中间分支复核阶段性结果；满足条件后，调用 binder、executor、字典或 storage 稳定接口完成领域动作，并维持领域不变量。
         stopAfterFailedOpen(this::stopBackgroundRedoFlusher, original);
         stopAfterFailedOpen(this::stopBackgroundPurgeDriver, original);
+        // 4、关闭 scope 并返回不可变结果，以稳定返回或领域异常完成收口。
         try {
             closeOpenedHandles();
         } catch (RuntimeException closeFailure) {
@@ -1398,6 +1673,12 @@ public final class StorageEngine {
         }
     }
 
+    /**
+     * 定位并读取数据库引擎组合根领域对象；先校验标识与准入状态，返回值只暴露稳定视图或受控句柄。
+     *
+     * @param stopAction 在契约指定成功、失败或释放边界调用的回调；不得为 {@code null}，且不得破坏当前资源所有权和异常传播规则
+     * @param original 需要分类或包装的原始失败；不得为 {@code null}，包装时必须保留 cause 与 suppressed 异常图
+     */
     private static void stopAfterFailedOpen(Runnable stopAction, RuntimeException original) {
         try {
             stopAction.run();
@@ -1409,6 +1690,8 @@ public final class StorageEngine {
     /**
      * 停止后台 page cleaner 后再进入 final flush。若 worker 仍在执行 flush cycle，stop 会等待该轮完成；
      * 超时不继续关闭 page store/buffer pool，避免后台 IO 与句柄释放并发。
+     *
+     * @throws DatabaseRuntimeException 可恢复的数据库运行期协作失败时抛出；调用方应依据当前事务状态选择回滚、重试或关闭资源
      */
     private void stopBackgroundPageCleaner() {
         if (pageCleanerSupervisor == null) {
@@ -1421,7 +1704,10 @@ public final class StorageEngine {
         }
     }
 
-    /** 在 final flush / 关 store 之前停止后台 read-ahead，避免预取盘 IO 与句柄释放并发；超时则中止关闭。 */
+    /** 在 final flush / 关 store 之前停止后台 read-ahead，避免预取盘 IO 与句柄释放并发；超时则中止关闭。
+     *
+     * @throws DatabaseRuntimeException 可恢复的数据库运行期协作失败时抛出；调用方应依据当前事务状态选择回滚、重试或关闭资源
+     */
     private void stopBackgroundReadAhead() {
         if (readAheadService == null) {
             return;
@@ -1436,6 +1722,8 @@ public final class StorageEngine {
     /**
      * 在 final flush 前停止后台 redo flusher：worker 若正在 flush 会等待该轮 fsync 完成，超时则中止关闭，
      * 避免后台 redo IO 与 redoRepo 句柄释放并发。
+     *
+     * @throws DatabaseRuntimeException 可恢复的数据库运行期协作失败时抛出；调用方应依据当前事务状态选择回滚、重试或关闭资源
      */
     private void stopBackgroundRedoFlusher() {
         if (redoFlushWorker == null) {
@@ -1448,7 +1736,10 @@ public final class StorageEngine {
         }
     }
 
-    /** 在 final flush 前停止后台 purge driver；worker 正跑批次会等其完成，超时中止关闭。 */
+    /** 在 final flush 前停止后台 purge driver；worker 正跑批次会等其完成，超时中止关闭。
+     *
+     * @throws DatabaseRuntimeException 可恢复的数据库运行期协作失败时抛出；调用方应依据当前事务状态选择回滚、重试或关闭资源
+     */
     private void stopBackgroundPurgeDriver() {
         if (purgeDriverWorker == null) {
             return;
@@ -1460,37 +1751,70 @@ public final class StorageEngine {
         }
     }
 
+    /**
+     * 返回 {@code miniTransactionManager} 对应的数据库引擎组合根受控对象；调用方获得使用权但不接管组合根或 owner 的生命周期。
+     *
+     * @return {@code miniTransactionManager} 创建或观察到的事务/锁状态；成功时不为 {@code null}，owner、可见性与生命周期来自当前会话
+     */
     public MiniTransactionManager miniTransactionManager() {
         requireOpen();
         return miniTransactionManager;
     }
 
+    /**
+     * 返回 {@code transactionManager} 对应的数据库引擎组合根受控对象；调用方获得使用权但不接管组合根或 owner 的生命周期。
+     *
+     * @return {@code transactionManager} 创建或观察到的事务/锁状态；成功时不为 {@code null}，owner、可见性与生命周期来自当前会话
+     */
     public TransactionManager transactionManager() {
         requireOpen();
         return transactionManager;
     }
 
+    /**
+     * 返回 {@code diskSpaceManager} 对应的数据库引擎组合根受控对象；调用方获得使用权但不接管组合根或 owner 的生命周期。
+     *
+     * @return {@code diskSpaceManager} 创建的模块协作者；成功时不为 {@code null}，其依赖和生命周期由当前组合根拥有
+     */
     public DiskSpaceManager diskSpaceManager() {
         requireOpen();
         return diskSpaceManager;
     }
 
-    /** Off-page TEXT/BLOB/JSON 页链门面；调用方必须用本 engine 的 MiniTransactionManager 开启 MTR。 */
+    /** Off-page TEXT/BLOB/JSON 页链门面；调用方必须用本 engine 的 MiniTransactionManager 开启 MTR。
+     *
+     * @return {@code lobStorage} 创建的模块协作者；成功时不为 {@code null}，其依赖和生命周期由当前组合根拥有
+     */
     public LobStorage lobStorage() {
         requireOpen();
         return lobStorage;
     }
 
+    /**
+     * 返回 {@code btreeService} 对应的数据库引擎组合根受控对象；调用方获得使用权但不接管组合根或 owner 的生命周期。
+     *
+     * @return {@code btreeService} 取得或创建的受控存储资源；成功时不为 {@code null}，调用方必须按其 Guard/lease 契约释放
+     */
     public SplitCapableBTreeIndexService btreeService() {
         requireOpen();
         return btreeService;
     }
 
+    /**
+     * 按数据库引擎组合根并发协议获取或等待资源；等待必须有界，失败路径保持锁顺序并释放已取得资源。
+     *
+     * @return {@code lockManager} 创建或观察到的事务/锁状态；成功时不为 {@code null}，owner、可见性与生命周期来自当前会话
+     */
     public LockManager lockManager() {
         requireOpen();
         return lockManager;
     }
 
+    /**
+     * 返回 {@code btreeCurrentReadService} 对应的数据库引擎组合根受控对象；调用方获得使用权但不接管组合根或 owner 的生命周期。
+     *
+     * @return {@code btreeCurrentReadService} 创建的模块协作者；成功时不为 {@code null}，其依赖和生命周期由当前组合根拥有
+     */
     public BTreeCurrentReadService btreeCurrentReadService() {
         requireOpen();
         return btreeCurrentReadService;
@@ -1499,6 +1823,7 @@ public final class StorageEngine {
     /**
      * 返回聚簇 DML 内核 facade。SQL gateway 通过它创建 statement guard 和执行事务终态；普通 INSERT 写入由
      * {@link #tableDmlService()} 先编排全部 secondary，再复用本入口的聚簇 undo anchor。低层单聚簇测试仍可显式调用。
+     * @return {@code dmlService} 创建的模块协作者；成功时不为 {@code null}，其依赖和生命周期由当前组合根拥有
      */
     public ClusteredDmlService dmlService() {
         requireOpen();
@@ -1523,6 +1848,7 @@ public final class StorageEngine {
      *
      * @param request 快照请求，不能为 null。
      * @return 不可变诊断快照。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public LockDiagnosticSnapshot lockDiagnosticSnapshot(SnapshotRequest request) {
         requireOpen();
@@ -1532,13 +1858,18 @@ public final class StorageEngine {
         return lockObservationService.captureSnapshot(lockManager.snapshot(), request);
     }
 
-    /** 索引页格式化入口；物理 DDL 用它初始化聚簇/二级索引 root，低层页格式测试也可显式调用。 */
+    /** 索引页格式化入口；物理 DDL 用它初始化聚簇/二级索引 root，低层页格式测试也可显式调用。
+     *
+     * @return {@code indexPageAccess} 取得或创建的受控存储资源；成功时不为 {@code null}，调用方必须按其 Guard/lease 契约释放
+     */
     public IndexPageAccess indexPageAccess() {
         requireOpen();
         return indexPageAccess;
     }
 
-    /** 物理 CREATE/DROP TABLE 门面；DD/MDL publish 由更上层 {@code DatabaseEngine} 协调。 */
+    /** 物理 CREATE/DROP TABLE 门面；DD/MDL publish 由更上层 {@code DatabaseEngine} 协调。
+     * @return {@code tableDdlStorageService} 创建的模块协作者；成功时不为 {@code null}，其依赖和生命周期由当前组合根拥有
+     */
     public TableDdlStorageService tableDdlStorageService() {
         requireOpen();
         return tableDdlStorageService;
@@ -1546,18 +1877,28 @@ public final class StorageEngine {
 
     /**
      * 返回 DD DROP 使用的 persistent history barrier。该 API 不暴露 HistoryEntry、undo page 或内部 Condition。
+     *
+     * @return {@code tablePurgeBarrier} 构造或恢复的 undo/rollback 对象；成功时不为 {@code null}，事务身份和 roll pointer 链保持一致
      */
     public TablePurgeBarrier tablePurgeBarrier() {
         requireOpen();
         return tablePurgeBarrier;
     }
 
+    /**
+     * 返回 {@code undoLogManager} 对应的数据库引擎组合根受控对象；调用方获得使用权但不接管组合根或 owner 的生命周期。
+     *
+     * @return {@code undoLogManager} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     */
     public UndoLogManager undoLogManager() {
         requireOpen();
         return undoLogManager;
     }
 
-    /** 内存 rseg slot 目录（0.3：claim/release 持久到 page3，恢复期由 page3 重建）。 */
+    /** 内存 rseg slot 目录（0.3：claim/release 持久到 page3，恢复期由 page3 重建）。
+     *
+     * @return {@code rollbackSegmentSlotManager} 取得或创建的受控存储资源；成功时不为 {@code null}，调用方必须按其 Guard/lease 契约释放
+     */
     public RollbackSegmentSlotManager rollbackSegmentSlotManager() {
         requireOpen();
         return rollbackSlots;
@@ -1567,6 +1908,8 @@ public final class StorageEngine {
      * 配置本 engine 的兼容单聚簇索引（主要供不经 DD 组合根的低层测试），**必须在 {@link #open()} 之前**调用。
      * 同时服务恢复期回滚（R 1.2）与后台 purge driver（0.4）。未配置时不启动 purge；existing-open 仅在
      * 未发现 ACTIVE undo 时可继续，发现 ACTIVE 则 fail-closed，绝不以缺少索引为由跳过恢复回滚。
+     * @param clusteredIndex 目标索引的 B+Tree 访问入口；不得为 {@code null}，必须与当前表、索引定义和表空间绑定一致
+     * @throws EngineStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
      */
     public void configureClusteredIndex(BTreeIndex clusteredIndex) {
         if (state == EngineState.OPEN) {
@@ -1578,6 +1921,10 @@ public final class StorageEngine {
     /**
      * 配置 DD 索引解析器，必须早于 open/recovery。ACTIVE undo rollback 与后台 purge 会逐条读取 undo identity，
      * 解析器返回错误/缺失索引时启动 fail-closed，绝不回退 legacy 全局索引。
+     *
+     * @param resolver 由组合根提供的 {@code IndexMetadataResolver} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code configureIndexMetadataResolver} 调用
+     * @throws EngineStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public void configureIndexMetadataResolver(IndexMetadataResolver resolver) {
         if (state != EngineState.NEW) {
@@ -1589,6 +1936,11 @@ public final class StorageEngine {
         this.indexMetadataResolver = resolver;
     }
 
+    /**
+     * 定位并读取数据库引擎组合根领域对象；先校验标识与准入状态，返回值只暴露稳定视图或受控句柄。
+     *
+     * @return {@code mvccReader} 创建的模块协作者；成功时不为 {@code null}，其依赖和生命周期由当前组合根拥有
+     */
     public MvccReader mvccReader() {
         requireOpen();
         return mvccReader;
@@ -1615,6 +1967,11 @@ public final class StorageEngine {
         return secondaryCurrentReadService;
     }
 
+    /**
+     * 校验当前状态后推进数据库引擎组合根状态机；成功发布唯一终态，失败保留可回滚或可恢复的原始状态。
+     *
+     * @return {@code rollbackService} 构造或恢复的 undo/rollback 对象；成功时不为 {@code null}，事务身份和 roll pointer 链保持一致
+     */
     public RollbackService rollbackService() {
         requireOpen();
         return rollbackService;
@@ -1631,7 +1988,11 @@ public final class StorageEngine {
         return preparedTransactionService;
     }
 
-    /** 返回与后台 driver/recovery 共用的 purge 协调器；只有配置可解析索引 metadata 时可用。 */
+    /** 返回与后台 driver/recovery 共用的 purge 协调器；只有配置可解析索引 metadata 时可用。
+     *
+     * @return {@code purgeCoordinator} 构造或恢复的 undo/rollback 对象；成功时不为 {@code null}，事务身份和 roll pointer 链保持一致
+     * @throws EngineStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
+     */
     public PurgeCoordinator purgeCoordinator() {
         requireOpen();
         if (purgeCoordinator == null) {
@@ -1664,6 +2025,8 @@ public final class StorageEngine {
     /**
      * 生成 recovery control-plane 诊断快照。该入口不要求引擎处于 OPEN：READ_ONLY_VALIDATE、FAILED recovery
      * 或启动失败后的上层诊断都需要读取 gate/report/progress。快照只复制不可变值，不暴露 gate/journal 可变对象。
+     *
+     * @return {@code recoveryDiagnostics} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
      */
     public RecoveryDiagnosticsSnapshot recoveryDiagnostics() {
         Optional<RecoveryReport> report = Optional.ofNullable(lastRecoveryReport);
@@ -1696,7 +2059,10 @@ public final class StorageEngine {
         return pageCleanerSupervisor == null ? Optional.empty() : pageCleanerSupervisor.lastCycle();
     }
 
-    /** 后台 page cleaner supervisor metrics；未启动时返回 NEW 状态的空快照。 */
+    /** 后台 page cleaner supervisor metrics；未启动时返回 NEW 状态的空快照。
+     *
+     * @return {@code pageCleanerMetrics} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     */
     public PageCleanerMetricsSnapshot pageCleanerMetrics() {
         if (pageCleanerSupervisor == null) {
             return new PageCleanerMetricsSnapshot(PageCleanerState.NEW, 0, 0, 0, false, "", 0, 0);
@@ -1707,6 +2073,9 @@ public final class StorageEngine {
     /**
      * 等待后台 worker 清空显式请求并离开正在执行的 cycle。禁用后台 worker 时直接返回 true；超时语义和
      * {@link PageCleanerWorker#awaitIdle(Duration)} 一致。
+     * @param timeout 本次等待或操作的最大时长；不得为 {@code null} 或负值，零表示只做一次立即检查而不阻塞
+     * @return 在超时或取消前观察到 {@code awaitBackgroundFlushIdle} 的目标状态时为 {@code true}；等待期限届满且状态仍未满足时为 {@code false}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public boolean awaitBackgroundFlushIdle(Duration timeout) {
         if (timeout == null) {
@@ -1715,6 +2084,11 @@ public final class StorageEngine {
         return pageCleanerSupervisor == null || pageCleanerSupervisor.awaitIdle(timeout);
     }
 
+    /**
+     * 校验 {@code requireOpen} 涉及的数据库引擎组合根结构、范围与交叉字段；合法输入不修改状态，非法输入在副作用前抛出领域异常。
+     *
+     * @throws EngineStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
+     */
     private void requireOpen() {
         if (state != EngineState.OPEN) {
             throw new EngineStateException("engine not OPEN: " + state);
@@ -1725,6 +2099,12 @@ public final class StorageEngine {
         }
     }
 
+    /**
+     * 释放本方法拥有的数据库引擎组合根资源；遵守既定释放顺序，重复或失败调用不得掩盖原始状态。
+     *
+     * @param handle 调用方打开的定位 IO 或编码写入对象；不得为 {@code null}，方法不接管所有权，失败时仍由创建方关闭
+     * @param errors 需要分类或包装的原始失败；不得为 {@code null}，包装时必须保留 cause 与 suppressed 异常图
+     */
     private static void closeQuietly(AutoCloseable handle, List<RuntimeException> errors) {
         if (handle == null) {
             return;

@@ -30,6 +30,9 @@ class BufferPoolDirtyViewTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code dirtyCandidatesAreOrderedByOldestModificationLsn} 所描述的刷脏与持久化协作，并断言 redo durable 边界先覆盖 page LSN、失败后仍保留脏状态。
+     */
     @Test
     void dirtyCandidatesAreOrderedByOldestModificationLsn() {
         try (PageStore store = openStore(8); BufferPool pool = new LruBufferPool(store, PS, 4)) {
@@ -46,6 +49,9 @@ class BufferPoolDirtyViewTest {
         }
     }
 
+    /**
+     * 验证 {@code completeFlushKeepsDirtyWhenFrameWasModifiedAgain} 所描述的返回值或状态会按契约保留，并断言原始信息与领域不变量未丢失。
+     */
     @Test
     void completeFlushKeepsDirtyWhenFrameWasModifiedAgain() {
         try (PageStore store = openStore(8); BufferPool pool = new LruBufferPool(store, PS, 4)) {
@@ -60,6 +66,9 @@ class BufferPoolDirtyViewTest {
         }
     }
 
+    /**
+     * 验证 {@code completeFlushMarksCleanWhenSnapshotStillCurrent} 所描述的刷脏与持久化协作，并断言 redo durable 边界先覆盖 page LSN、失败后仍保留脏状态。
+     */
     @Test
     void completeFlushMarksCleanWhenSnapshotStillCurrent() {
         try (PageStore store = openStore(8); BufferPool pool = new LruBufferPool(store, PS, 4)) {

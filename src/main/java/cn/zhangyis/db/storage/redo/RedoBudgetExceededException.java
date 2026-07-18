@@ -8,7 +8,10 @@ import cn.zhangyis.db.common.exception.DatabaseFatalException;
  */
 public final class RedoBudgetExceededException extends DatabaseFatalException {
 
-    /** 创建保留用途、预算和实际尺寸的致命诊断。 */
+    /** 创建保留用途、预算和实际尺寸的致命诊断。
+     *
+     * @param message 包含领域上下文的诊断信息；不得为空白，也不能替代原始异常原因
+     */
     public RedoBudgetExceededException(String message) {
         super(message);
     }

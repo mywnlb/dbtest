@@ -47,6 +47,14 @@ public final class SecondaryPurgeSafetyChecker {
     /**
      * 创建与 StorageEngine 共享页访问、undo 表空间和 comparator 语义的安全检查器。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝 null、越界和相互矛盾的组合。</li>
+     *     <li>完成跨参数校验并推导不可变配置；若构造过程创建自有资源，后续失败必须在异常路径关闭。</li>
+     *     <li>把已校验协作者与配置绑定到字段，并初始化本对象拥有的状态、显式锁、队列或缓存，不允许 this 提前逃逸。</li>
+     *     <li>构造完成后对象处于类契约声明的初始状态；任一步失败都抛出领域异常且不发布半初始化实例。</li>
+     * </ol>
+     *
      * @param mtrManager    clustered 与 undo 每跳短读 MTR 的工厂。
      * @param btree         读取当前聚簇物理版本的 B+Tree 服务。
      * @param undoAccess    按 target/历史 roll pointer 读取 undo record 的访问端口。
@@ -61,15 +69,19 @@ public final class SecondaryPurgeSafetyChecker {
                                        SpaceId undoSpace,
                                        int maxVersionHops,
                                        TypeCodecRegistry registry) {
+        // 1、校验必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝非法组合。
         if (mtrManager == null || btree == null || undoAccess == null || undoSpace == null || registry == null
                 || maxVersionHops <= 0) {
             throw new DatabaseValidationException("secondary purge safety checker collaborators are invalid");
         }
         this.mtrManager = mtrManager;
+        // 2、完成跨参数校验并推导不可变配置；后续失败仍由当前构造路径收口已创建资源。
         this.btree = btree;
         this.undoAccess = undoAccess;
+        // 3、绑定已校验协作者并初始化本对象拥有的状态、显式锁、队列或缓存，不允许半初始化实例逃逸。
         this.undoSpace = undoSpace;
         this.maxVersionHops = maxVersionHops;
+        // 4、完成初始状态发布；失败以领域异常终止构造，成功对象满足类级生命周期不变量。
         this.keyComparator = new SearchKeyComparator(registry);
     }
 

@@ -28,6 +28,10 @@ final class DirtyPageList {
     /**
      * 插入或更新一个 dirty 页条目。调用方应传入 frame 当前的 oldest/newest LSN；若同页已在链表中，先摘旧节点再按新的
      * oldest 重新挂入，从而避免重复候选。
+     *
+     * @param pageId 目标页的稳定物理标识；必须属于当前已准入表空间，且不得为 {@code null}
+     * @param oldestModificationLsn redo 日志边界；不得为 {@code null}，必须单调且与调用方已发布的页或事务状态一致
+     * @param newestModificationLsn redo 日志边界；不得为 {@code null}，必须单调且与调用方已发布的页或事务状态一致
      */
     void upsert(PageId pageId, Lsn oldestModificationLsn, Lsn newestModificationLsn) {
         DirtyPageCandidate candidate = new DirtyPageCandidate(pageId, oldestModificationLsn, newestModificationLsn);
@@ -39,7 +43,11 @@ final class DirtyPageList {
                 .put(pageId, candidate);
     }
 
-    /** 从 flush list 移除一个页；页已 clean、FREE、stale 或从 page hash 摘除时调用。 */
+    /** 从 flush list 移除一个页；页已 clean、FREE、stale 或从 page hash 摘除时调用。
+     *
+     * @param pageId 目标页的稳定物理标识；必须属于当前已准入表空间，且不得为 {@code null}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     void remove(PageId pageId) {
         if (pageId == null) {
             throw new DatabaseValidationException("dirty page id must not be null");
@@ -52,6 +60,11 @@ final class DirtyPageList {
 
     /**
      * 返回 oldest <= targetLsn 的候选快照，按 oldest LSN 升序排列。maxPages 为 0 时只做参数校验并返回空列表。
+     *
+     * @param targetLsn redo 日志边界；不得为 {@code null}，必须单调且与调用方已发布的页或事务状态一致
+     * @param maxPages 参与 {@code candidatesUpTo} 的上界或规格值 {@code maxPages}；必须非负且不能使容量、页数或编码长度计算溢出
+     * @return 按当前快照筛出的候选页、脏页或阻塞关系；保持方法声明的稳定顺序，无候选时返回空集合而非 {@code null}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     List<DirtyPageCandidate> candidatesUpTo(Lsn targetLsn, int maxPages) {
         if (targetLsn == null) {
@@ -78,7 +91,10 @@ final class DirtyPageList {
         return List.copyOf(result);
     }
 
-    /** 返回当前最老 dirty LSN；没有 dirty 页时返回 null。FLUSHING 页仍保留在本链表中，所以仍约束 checkpoint。 */
+    /** 返回当前最老 dirty LSN；没有 dirty 页时返回 null。FLUSHING 页仍保留在本链表中，所以仍约束 checkpoint。
+     *
+     * @return {@code oldestDirtyLsnOrNull} 未找到或条件不满足时返回 {@code null}；否则返回满足构造不变量的 {@code Lsn} 结果
+     */
     Lsn oldestDirtyLsnOrNull() {
         if (byOldestLsn.isEmpty()) {
             return null;

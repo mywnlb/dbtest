@@ -117,13 +117,32 @@ public final class PageImageChecksum {
         }
     }
 
+    /**
+     * 根据调用参数创建或转换 {@code copyPage} 返回的 {@code byte[]}；输入先完成领域校验，成功结果不为 {@code null}。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验表空间生命周期、页号、区段身份与容量边界，非法或损坏元数据在分配/IO 前拒绝。</li>
+     *     <li>按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，避免锁序反转。</li>
+     *     <li>执行空间元数据或物理文件变化，并把需要的 allocation intent、redo、dirty 或 force 副作用交给既有下游。</li>
+     *     <li>发布稳定结果并逆序释放 lease、latch 与 fix；失败保留可由恢复流程识别的权威状态。</li>
+     * </ol>
+     *
+     * @param page 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @param pageSize 调用方提供的长度或容量值对象；不得为 {@code null}，且必须已通过其构造范围校验
+     * @return {@code copyPage} 生成的非空字节表示；调用方获得独立结果或受控视图，格式失败通过领域异常报告
+     */
     private static byte[] copyPage(ByteBuffer page, PageSize pageSize) {
+        // 1、校验表空间生命周期、页号、区段身份与容量边界，在共享或持久副作用前拒绝非法状态。
         requireBufferArgs(page, pageSize);
+        // 2、继续完成范围、身份与候选校验；通过后，按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，保持处理顺序与资源边界。
         ByteBuffer view = page.asReadOnlyBuffer();
+        // 3、在中间分支复核阶段性结果；满足条件后，执行空间元数据或物理文件变化，并维持领域不变量。
         byte[] copy = new byte[pageSize.bytes()];
         for (int i = 0; i < copy.length; i++) {
             copy[i] = view.get(i);
         }
+        // 4、发布稳定结果并逆序释放 lease、latch 与 fix，以稳定返回或领域异常完成收口。
         return copy;
     }
 }

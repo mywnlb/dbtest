@@ -38,13 +38,25 @@ public record RedoCheckpointLabel(Lsn checkpointLsn, Lsn currentLsnAtCheckpoint,
 
     /**
      * 创建普通 checkpoint label。使用静态工厂让测试和生产代码表达字段语义，避免三个 long/Lsn 参数混淆。
+     *
+     * @param checkpointLsn redo 日志边界；不得为 {@code null}，必须单调且与调用方已发布的页或事务状态一致
+     * @param currentLsnAtCheckpoint redo 日志边界；不得为 {@code null}，必须单调且与调用方已发布的页或事务状态一致
+     * @param createdAtMillis 参与 {@code of} 的时间量 {@code createdAtMillis}；必须非负，零表示立即检查或尚未累计等待
+     * @return {@code of} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
      */
     public static RedoCheckpointLabel of(Lsn checkpointLsn, Lsn currentLsnAtCheckpoint, long createdAtMillis) {
         return new RedoCheckpointLabel(checkpointLsn, currentLsnAtCheckpoint,
                 createdAtMillis, RedoLogBlockCodec.FORMAT_VERSION);
     }
 
-    /** control v2 解码入口；版本与 data repository 的匹配由 recovery 编排层再次校验。 */
+    /** control v2 解码入口；版本与 data repository 的匹配由 recovery 编排层再次校验。
+     *
+     * @param checkpointLsn redo 日志边界；不得为 {@code null}，必须单调且与调用方已发布的页或事务状态一致
+     * @param currentLsnAtCheckpoint redo 日志边界；不得为 {@code null}，必须单调且与调用方已发布的页或事务状态一致
+     * @param createdAtMillis 参与 {@code decoded} 的时间量 {@code createdAtMillis}；必须非负，零表示立即检查或尚未累计等待
+     * @param redoFormatVersion 参与 {@code decoded} 的稳定编码 {@code redoFormatVersion}；必须命中当前版本声明的编码集合，未知值以格式或校验异常拒绝
+     * @return {@code decoded} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     */
     static RedoCheckpointLabel decoded(Lsn checkpointLsn, Lsn currentLsnAtCheckpoint,
                                        long createdAtMillis, int redoFormatVersion) {
         return new RedoCheckpointLabel(

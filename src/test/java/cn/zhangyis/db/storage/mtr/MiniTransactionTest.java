@@ -61,6 +61,9 @@ class MiniTransactionTest {
         return mtr;
     }
 
+    /**
+     * 验证 {@code commitShouldReleaseHeldFixes} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void commitShouldReleaseHeldFixes() {
         try (PageStore store = openStore(8)) {
@@ -78,6 +81,9 @@ class MiniTransactionTest {
         }
     }
 
+    /**
+     * 验证 {@code savepointShouldReleaseResourcesAcquiredAfterIt} 对应的Mini Transaction行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void savepointShouldReleaseResourcesAcquiredAfterIt() {
         try (PageStore store = openStore(8)) {
@@ -97,6 +103,9 @@ class MiniTransactionTest {
         }
     }
 
+    /**
+     * 验证 {@code rollbackUncommittedShouldReleaseAndTerminate} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void rollbackUncommittedShouldReleaseAndTerminate() {
         try (PageStore store = openStore(8)) {
@@ -112,6 +121,9 @@ class MiniTransactionTest {
         }
     }
 
+    /**
+     * 验证 {@code sharedExclusiveToExclusiveUpgradeIsForbidden} 对应的Mini Transaction行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void sharedExclusiveToExclusiveUpgradeIsForbidden() {
         try (PageStore store = openStore(8)) {
@@ -127,6 +139,9 @@ class MiniTransactionTest {
         }
     }
 
+    /**
+     * 验证 {@code operationsAfterTerminalShouldThrow} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void operationsAfterTerminalShouldThrow() {
         try (PageStore store = openStore(8)) {
@@ -140,6 +155,9 @@ class MiniTransactionTest {
         }
     }
 
+    /**
+     * 验证 {@code writesShouldBeDirtyAndPersistAfterCommitAndFlush} 所描述的刷脏与持久化协作，并断言 redo durable 边界先覆盖 page LSN、失败后仍保留脏状态。
+     */
     @Test
     void writesShouldBeDirtyAndPersistAfterCommitAndFlush() {
         try (PageStore store = openStore(8);
@@ -162,6 +180,9 @@ class MiniTransactionTest {
         }
     }
 
+    /**
+     * 验证 {@code savepointFromAnotherMtrShouldBeRejected} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void savepointFromAnotherMtrShouldBeRejected() {
         try (PageStore store = openStore(8)) {
@@ -176,6 +197,9 @@ class MiniTransactionTest {
         }
     }
 
+    /**
+     * 验证 {@code newPageShouldHoldZeroFrameAndPersistAfterCommit} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void newPageShouldHoldZeroFrameAndPersistAfterCommit() {
         try (PageStore store = openStore(8);
@@ -199,6 +223,9 @@ class MiniTransactionTest {
         }
     }
 
+    /**
+     * 验证 {@code rollbackToSavepointShouldRejectNull} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void rollbackToSavepointShouldRejectNull() {
         try (PageStore store = openStore(8)) {

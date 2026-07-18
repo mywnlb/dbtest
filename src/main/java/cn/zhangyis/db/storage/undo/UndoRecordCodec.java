@@ -147,18 +147,35 @@ public final class UndoRecordCodec {
         return out.toByteArray();
     }
 
-    /** 写一列自带 framing：NULL→[1]；非 NULL→[0][len u16][bytes]。供 key 列与 UPDATE 旧 image 全列共用。 */
+    /** 写一列自带 framing：NULL→[1]；非 NULL→[0][len u16][bytes]。供 key 列与 UPDATE 旧 image 全列共用。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取输入长度、游标边界与必要标识，损坏、截断或超限数据在创建结果前失败。</li>
+     *     <li>按稳定字段或 token 顺序推进游标并调用对应编解码分支，任何分支都不得越过输入边界。</li>
+     *     <li>交叉校验聚合计数、类型、校验值和剩余输入，防止截断或多余内容形成半解析对象。</li>
+     *     <li>完成剩余字段写入或稳定领域结果构造；失败只保留领域异常与根因，不修改调用方输入或其他持久状态。</li>
+     * </ol>
+     *
+     * @param out 调用方打开的定位 IO 或编码写入对象；不得为 {@code null}，方法不接管所有权，失败时仍由创建方关闭
+     * @param v 参与记录编解码或索引比较的字段值；不得为 {@code null}，其类型、字节边界和 SQL NULL 语义必须与当前 schema 一致
+     * @param ct 选择 {@code writeFramedColumn} 分支的 {@code ColumnType} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     */
     private void writeFramedColumn(ByteArrayOutputStream out, ColumnValue v, ColumnType ct) {
+        // 1、读取输入长度、游标边界与必要标识，在共享或持久副作用前拒绝非法状态。
         if (v == ColumnValue.NullValue.INSTANCE) {
             out.write(1);
             return;
         }
         out.write(0);
+        // 2、继续完成范围、身份与候选校验；通过后，按稳定字段或 token 顺序推进游标并调用对应编解码分支，保持处理顺序与资源边界。
         TypeCodec codec = registry.codecFor(ct);
         int len = codec.encodedLength(v, ct);
+        // 3、在中间分支复核阶段性结果；满足条件后，交叉校验聚合计数、类型、校验值和剩余输入，并维持领域不变量。
         byte[] colBuf = new byte[len];
         codec.encode(v, ct, new FieldWriter(colBuf, 0));
         writeU16(out, len);
+        // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
         out.writeBytes(colBuf);
     }
 
@@ -265,6 +282,12 @@ public final class UndoRecordCodec {
     /**
      * 只读取固定 33B 前缀中的 type/undoNo/trxId/tableId/indexId，不触碰依赖 schema 的 key/old-image。
      * 截断或未知类型按磁盘格式损坏处理，禁止调用方猜测默认索引继续解码。
+     *
+     * @param buf 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @param off 参与 {@code peekIdentity} 的零基位置 {@code off}；必须非负且小于所属页面、集合或持久结构的容量
+     * @return {@code peekIdentity} 定位或分配的稳定值对象；成功时不为 {@code null}，其身份、范围和特殊值已由构造校验保证
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws UndoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public UndoRecordIdentity peekIdentity(byte[] buf, int off) {
         if (buf == null || off < 0) {
@@ -288,33 +311,69 @@ public final class UndoRecordCodec {
         }
     }
 
-    /** 读一列自带 framing：nullFlag==1→NULL；否则 [len u16][bytes] 按类型解码。截断抛 {@link UndoLogFormatException}。 */
+    /** 读一列自带 framing：nullFlag==1→NULL；否则 [len u16][bytes] 按类型解码。截断抛 {@link UndoLogFormatException}。
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取输入长度、游标边界与必要标识，损坏、截断或超限数据在创建结果前失败。</li>
+     *     <li>按稳定字段或 token 顺序推进游标并调用对应编解码分支，任何分支都不得越过输入边界。</li>
+     *     <li>交叉校验聚合计数、类型、校验值和剩余输入，防止截断或多余内容形成半解析对象。</li>
+     *     <li>完成剩余字段写入或稳定领域结果构造；失败只保留领域异常与根因，不修改调用方输入或其他持久状态。</li>
+     * </ol>
+     *
+     * @param buf 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @param c 参与 {@code readFramedColumn} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @param ct 选择 {@code readFramedColumn} 分支的 {@code ColumnType} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     * @param what 传给 {@code readFramedColumn} 的文本值；不得为 {@code null} 或空白，并保持调用方提供的字符顺序
+     * @return {@code readFramedColumn} 编码、解码或重建的记录数据；成功时不为 {@code null}，字段顺序、隐藏列和字节边界满足当前 schema
+     * @throws UndoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     private ColumnValue readFramedColumn(byte[] buf, int[] c, ColumnType ct, String what) {
+        // 1、读取输入长度、游标边界与必要标识，在共享或持久副作用前拒绝非法状态。
         int nullFlag = readU8(buf, c);
         if (nullFlag == 1) {
             return ColumnValue.NullValue.INSTANCE;
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按稳定字段或 token 顺序推进游标并调用对应编解码分支，保持处理顺序与资源边界。
         int len = readU16(buf, c);
         if (c[0] + len > buf.length) {
             throw new UndoLogFormatException("undo record truncated (" + what + ")");
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，交叉校验聚合计数、类型、校验值和剩余输入，并维持领域不变量。
         ColumnValue v = registry.codecFor(ct).decode(new FieldSlice(buf, c[0], len), ct);
         c[0] += len;
+        // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
         return v;
     }
 
     /**
      * 编码 INSERT ownership 尾部。所有 schema/type 校验发生在 UndoRecordWritePlan 冻结、写 MTR admission 之前；
      * external bytes 复用列自己的 LobCodec envelope，避免形成第二套 LobReference 磁盘协议。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取输入长度、游标边界与必要标识，损坏、截断或超限数据在创建结果前失败。</li>
+     *     <li>按稳定字段或 token 顺序推进游标并调用对应编解码分支，任何分支都不得越过输入边界。</li>
+     *     <li>交叉校验聚合计数、类型、校验值和剩余输入，防止截断或多余内容形成半解析对象。</li>
+     *     <li>完成剩余字段写入或稳定领域结果构造；失败只保留领域异常与根因，不修改调用方输入或其他持久状态。</li>
+     * </ol>
+     *
+     * @param out 调用方打开的定位 IO 或编码写入对象；不得为 {@code null}，方法不接管所有权，失败时仍由创建方关闭
+     * @param ownerships 参与 {@code writeInsertedLobTail} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @param schema 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     private void writeInsertedLobTail(ByteArrayOutputStream out, List<InsertedLobOwnership> ownerships,
                                       TableSchema schema) {
+        // 1、读取输入长度、游标边界与必要标识，在共享或持久副作用前拒绝非法状态。
         if (ownerships.size() > 0xFFFF) {
             throw new DatabaseValidationException("too many inserted LOB ownership entries: " + ownerships.size());
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按稳定字段或 token 顺序推进游标并调用对应编解码分支，保持处理顺序与资源边界。
         writeU16(out, INSERT_LOB_TAIL_MAGIC);
+        // 3、在中间分支复核阶段性结果；满足条件后，交叉校验聚合计数、类型、校验值和剩余输入，并维持领域不变量。
         out.write(INSERT_LOB_TAIL_VERSION);
         writeU16(out, ownerships.size());
+        // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
         for (InsertedLobOwnership ownership : ownerships) {
             int ordinal = ownership.columnOrdinal();
             if (ordinal > 0xFFFF) {
@@ -336,13 +395,30 @@ public final class UndoRecordCodec {
         }
     }
 
-    /** 有任何剩余字节就必须完整命中 magic/version/count/entries；不存在可跳过的未知扩展。 */
+    /** 有任何剩余字节就必须完整命中 magic/version/count/entries；不存在可跳过的未知扩展。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取输入长度、游标边界与必要标识，损坏、截断或超限数据在创建结果前失败。</li>
+     *     <li>按稳定字段或 token 顺序推进游标并调用对应编解码分支，任何分支都不得越过输入边界。</li>
+     *     <li>交叉校验聚合计数、类型、校验值和剩余输入，防止截断或多余内容形成半解析对象。</li>
+     *     <li>完成剩余字段写入或稳定领域结果构造；失败只保留领域异常与根因，不修改调用方输入或其他持久状态。</li>
+     * </ol>
+     *
+     * @param buf 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @param cursor 参与 {@code readInsertedLobTail} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @param schema 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @return 按物理页、日志或 SQL 源顺序扫描并物化的元素；无匹配内容时返回空集合，不用 {@code null} 表示缺失
+     * @throws UndoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     private List<InsertedLobOwnership> readInsertedLobTail(byte[] buf, int[] cursor, TableSchema schema) {
+        // 1、读取输入长度、游标边界与必要标识，在共享或持久副作用前拒绝非法状态。
         int magic = readU16(buf, cursor);
         if (magic != INSERT_LOB_TAIL_MAGIC) {
             throw new UndoLogFormatException("unknown INSERT LOB ownership tail magic: " + magic);
         }
         int version = readU8(buf, cursor);
+        // 2、继续完成范围、身份与候选校验；通过后，按稳定字段或 token 顺序推进游标并调用对应编解码分支，保持处理顺序与资源边界。
         if (version != INSERT_LOB_TAIL_VERSION) {
             throw new UndoLogFormatException("unknown INSERT LOB ownership tail version: " + version);
         }
@@ -350,6 +426,7 @@ public final class UndoRecordCodec {
         if (count == 0) {
             throw new UndoLogFormatException("INSERT LOB ownership tail must not encode an empty list");
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，交叉校验聚合计数、类型、校验值和剩余输入，并维持领域不变量。
         List<InsertedLobOwnership> ownerships = new ArrayList<>(count);
         int previousOrdinal = -1;
         for (int i = 0; i < count; i++) {
@@ -384,6 +461,7 @@ public final class UndoRecordCodec {
             }
             cursor[0] += encodedLength;
         }
+        // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
         return List.copyOf(ownerships);
     }
 
@@ -421,6 +499,7 @@ public final class UndoRecordCodec {
         out.write(LOB_VERSION_TAIL_VERSION);
         writeU16(out, ownerships.size());
         // 2. exact schema 与 old image 是 purge-old 的权威类型/引用来源。
+        // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
         for (LobVersionOwnership ownership : ownerships) {
             int ordinal = ownership.columnOrdinal();
             if (ordinal > 0xFFFF || ordinal >= schema.columnCount()) {
@@ -579,6 +658,7 @@ public final class UndoRecordCodec {
         out.write(SECONDARY_TAIL_VERSION);
         writeU16(out, mutations.size());
         // 3. 保持领域列表的稳定顺序，恢复阶段据此获得确定的跨树 inverse 顺序。
+        // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
         for (SecondaryUndoMutation mutation : mutations) {
             writeU64(out, mutation.indexId());
             out.write(mutation.action().code());
@@ -672,6 +752,12 @@ public final class UndoRecordCodec {
         out.write(v & 0xFF);
     }
 
+    /**
+     * 校验输入与当前状态后修改Undo 日志领域数据；成功发布完整结果，异常路径保留既有持久化与并发不变量。
+     *
+     * @param out 调用方打开的定位 IO 或编码写入对象；不得为 {@code null}，方法不接管所有权，失败时仍由创建方关闭
+     * @param v 参与 {@code writeU64} 的无符号位模式 {@code v}；保留全部原始位，不能按 Java 有符号数值语义截断或重排
+     */
     private static void writeU64(ByteArrayOutputStream out, long v) {
         for (int shift = 56; shift >= 0; shift -= 8) {
             out.write((int) ((v >>> shift) & 0xFF));
@@ -685,6 +771,14 @@ public final class UndoRecordCodec {
         return b[c[0]++] & 0xFF;
     }
 
+    /**
+     * 定位并读取Undo 日志领域对象；先校验标识与准入状态，返回值只暴露稳定视图或受控句柄。
+     *
+     * @param b 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @param c 参与 {@code readU16} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @return {@code readU16} 从受校验输入或持久字节中得到的 {@code int} 结果；位宽、符号和特殊值语义遵循当前格式，无法表示时抛出领域异常
+     * @throws UndoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     private static int readU16(byte[] b, int[] c) {
         if (c[0] + 2 > b.length) {
             throw new UndoLogFormatException("undo record truncated (u16)");
@@ -694,15 +788,35 @@ public final class UndoRecordCodec {
         return v;
     }
 
+    /**
+     * 定位并读取Undo 日志领域对象；先校验标识与准入状态，返回值只暴露稳定视图或受控句柄。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取输入长度、游标边界与必要标识，损坏、截断或超限数据在创建结果前失败。</li>
+     *     <li>按稳定字段或 token 顺序推进游标并调用对应编解码分支，任何分支都不得越过输入边界。</li>
+     *     <li>交叉校验聚合计数、类型、校验值和剩余输入，防止截断或多余内容形成半解析对象。</li>
+     *     <li>完成剩余字段写入或稳定领域结果构造；失败只保留领域异常与根因，不修改调用方输入或其他持久状态。</li>
+     * </ol>
+     *
+     * @param b 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @param c 参与 {@code readU64} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @return {@code readU64} 从受校验输入或持久字节中得到的 {@code long} 结果；位宽、符号和特殊值语义遵循当前格式，无法表示时抛出领域异常
+     * @throws UndoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     private static long readU64(byte[] b, int[] c) {
+        // 1、读取输入长度、游标边界与必要标识，在共享或持久副作用前拒绝非法状态。
         if (c[0] + 8 > b.length) {
             throw new UndoLogFormatException("undo record truncated (u64)");
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按稳定字段或 token 顺序推进游标并调用对应编解码分支，保持处理顺序与资源边界。
         long v = 0;
+        // 3、在中间分支复核阶段性结果；满足条件后，交叉校验聚合计数、类型、校验值和剩余输入，并维持领域不变量。
         for (int i = 0; i < 8; i++) {
             v = (v << 8) | (b[c[0] + i] & 0xFFL);
         }
         c[0] += 8;
+        // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
         return v;
     }
 }

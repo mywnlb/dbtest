@@ -12,6 +12,9 @@ import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.fil.access.TablespaceAccessController;
 import cn.zhangyis.db.storage.fil.access.TablespaceAccessLease;
 import cn.zhangyis.db.storage.fil.io.PageStore;
+import cn.zhangyis.db.storage.fil.io.TablespaceFileTransfer;
+import cn.zhangyis.db.storage.api.tablespace.TablespaceFileIdentity;
+import cn.zhangyis.db.storage.api.tablespace.TablespaceFileInspection;
 import cn.zhangyis.db.storage.fil.state.TablespaceType;
 import cn.zhangyis.db.storage.fil.state.TablespaceState;
 import cn.zhangyis.db.storage.flush.FlushService;
@@ -49,15 +52,39 @@ import java.util.Optional;
 @Slf4j
 public final class TableDdlStorageService {
 
+    /**
+     * 本对象持有的 {@code mtrManager} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private final MiniTransactionManager mtrManager;
+    /**
+     * 本对象持有的 {@code disk} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private final DiskSpaceManager disk;
+    /**
+     * 本对象持有的 {@code indexPages} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private final IndexPageAccess indexPages;
+    /**
+     * 本对象持有的 {@code pool} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private final BufferPool pool;
+    /**
+     * 本对象持有的 {@code store} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private final PageStore store;
+    /**
+     * 本对象持有的 {@code flush} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private final FlushService flush;
+    /**
+     * 本对象持有的 {@code accessController} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private final TablespaceAccessController accessController;
     /** 固定 page3 SDI 物理仓储；只处理 opaque payload 和页级完整性。 */
     private final SdiPageRepository sdiPages;
+    /**
+     * 本对象拥有的 {@code schemaMapper} 受控集合；元素生命周期与外层对象一致，仅由本类方法更新，对外暴露时必须返回副本或不可变视图。
+     */
     private final StorageTableSchemaMapper schemaMapper = new StorageTableSchemaMapper();
     /** CREATE INDEX backfill 复用生产 B+Tree scan/insert，不另写页算法。 */
     private final SplitCapableBTreeIndexService btree;
@@ -65,7 +92,30 @@ public final class TableDdlStorageService {
     private final BTreeRootSnapshotService rootSnapshots;
     /** 稳定 storage DTO/binding 到聚簇/二级 exact-version descriptor 的唯一工厂。 */
     private final BTreeIndexMetadataFactory indexMetadataFactory = new BTreeIndexMetadataFactory();
+    /**
+     * 本对象持有的 {@code fileTransfer} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
+    private final TablespaceFileTransfer fileTransfer = new TablespaceFileTransfer();
+    /**
+     * 本对象持有的 {@code fileInspection} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
+    private final TablespaceFileInspection fileInspection = new TablespaceFileInspection();
 
+    /**
+     * 创建 {@code TableDdlStorageService}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param mtrManager 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param disk 由组合根提供的 {@code DiskSpaceManager} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param indexPages 由组合根提供的 {@code IndexPageAccess} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param pool 由组合根提供的 {@code BufferPool} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param store 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param flush 由组合根提供的 {@code FlushService} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param accessController 由组合根提供的 {@code TablespaceAccessController} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param pageSize 调用方提供的长度或容量值对象；不得为 {@code null}，且必须已通过其构造范围校验
+     * @param btree 由组合根提供的 {@code SplitCapableBTreeIndexService} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param rootSnapshots 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public TableDdlStorageService(MiniTransactionManager mtrManager, DiskSpaceManager disk,
                                   IndexPageAccess indexPages, BufferPool pool, PageStore store,
                                   FlushService flush, TablespaceAccessController accessController,
@@ -236,17 +286,29 @@ public final class TableDdlStorageService {
     /**
      * 从 binding 指向的 GENERAL 表空间读取已校验 SDI；legacy root=0 或空 page3 返回 empty。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取并校验调用参数与当前领域状态，确保失败发生在本方法创建共享或持久副作用之前。</li>
+     *     <li>按类级并发协议取得本阶段所需协作者与 Guard，竞争后重新校验资源身份和生命周期。</li>
+     *     <li>执行核心状态转换与受控 IO，把必要的 redo、dirty 或诊断副作用交给既有下游。</li>
+     *     <li>汇总稳定结果并沿现有 finally/Guard 释放资源；异常不得伪造成功或清除未完成状态。</li>
+     * </ol>
+     *
      * @param binding 用于复核 table/space/path 的稳定物理 binding
      * @return CRC、envelope 与 identity 全部有效的快照，或尚未写入的 empty
      * @throws DatabaseValidationException binding 为空时抛出
      * @throws SerializedDictionaryInfoException path、页格式、CRC 或 table identity 不一致时抛出
      */
     public Optional<SerializedDictionaryInfo> readSerializedDictionaryInfo(TableStorageBinding binding) {
+        // 1、读取并校验调用参数与当前领域状态，在共享或持久副作用前拒绝非法状态。
         if (binding == null) {
             throw new DatabaseValidationException("SDI read binding must not be null");
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按类级并发协议取得本阶段所需协作者与 Guard，保持处理顺序与资源边界。
         requireOpenedPath(binding, "SDI read");
+        // 3、在中间分支复核阶段性结果；满足条件后，执行核心状态转换与受控 IO，并维持领域不变量。
         MiniTransaction mtr = mtrManager.beginReadOnly();
+        // 4、汇总稳定结果并沿现有 finally/Guard 释放资源，以稳定返回或领域异常完成收口。
         try {
             Optional<SerializedDictionaryInfo> result = sdiPages.read(mtr, binding.spaceId())
                     .map(snapshot -> new SerializedDictionaryInfo(snapshot.tableId(),
@@ -341,16 +403,29 @@ public final class TableDdlStorageService {
     /**
      * 读取当前 page3 的未决二级索引 build descriptor，不修改页或 DDL 状态。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取并校验调用参数与当前领域状态，确保失败发生在本方法创建共享或持久副作用之前。</li>
+     *     <li>按类级并发协议取得本阶段所需协作者与 Guard，竞争后重新校验资源身份和生命周期。</li>
+     *     <li>执行核心状态转换或数据变换，并只通过本包稳定协作者发布可观察副作用。</li>
+     *     <li>汇总稳定结果并沿现有 finally/Guard 释放资源；异常不得伪造成功或清除未完成状态。</li>
+     * </ol>
+     *
      * @param table 用于校验 space/path/table identity 的稳定 binding
      * @return 未决 descriptor，或 footer 为空
      * @throws SerializedDictionaryInfoException 页/footer 损坏或 table identity 不匹配时抛出
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public Optional<SecondaryIndexBuildDescriptor> readSecondaryIndexBuild(TableStorageBinding table) {
+        // 1、读取并校验调用参数与当前领域状态，在共享或持久副作用前拒绝非法状态。
         if (table == null) {
             throw new DatabaseValidationException("secondary index build read table must not be null");
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按类级并发协议取得本阶段所需协作者与 Guard，保持处理顺序与资源边界。
         requireOpenedPath(table, "CREATE INDEX descriptor read");
+        // 3、在中间分支复核阶段性结果；满足条件后，执行核心状态转换或数据变换，并维持领域不变量。
         MiniTransaction mtr = mtrManager.beginReadOnly();
+        // 4、汇总稳定结果并沿现有 finally/Guard 释放资源，以稳定返回或领域异常完成收口。
         try {
             Optional<SecondaryIndexBuildDescriptor> result = sdiPages.readIndexBuild(mtr, table.spaceId())
                     .map(TableDdlStorageService::fromSdi);
@@ -374,6 +449,7 @@ public final class TableDdlStorageService {
      * @param expected 调用方已与 marker/committed DD 交叉校验的 descriptor
      * @param timeout redo/dirty/file durable 的正时限
      * @throws SerializedDictionaryInfoException footer 已改变、损坏或持久化失败时抛出
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public void clearSecondaryIndexBuild(TableStorageBinding table,
                                          SecondaryIndexBuildDescriptor expected, Duration timeout) {
@@ -616,15 +692,32 @@ public final class TableDdlStorageService {
     /**
      * 保守估算两个 segment 的 free intent、inode/list/XDES 与 footer 写放大；checked arithmetic
      * 失败时禁止进入物理回收。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取并校验调用参数与当前领域状态，确保失败发生在本方法创建共享或持久副作用之前。</li>
+     *     <li>按类级并发协议取得本阶段所需协作者与 Guard，竞争后重新校验资源身份和生命周期。</li>
+     *     <li>执行核心状态转换或数据变换，并只通过本包稳定协作者发布可观察副作用。</li>
+     *     <li>汇总稳定结果并沿现有 finally/Guard 释放资源；异常不得伪造成功或清除未完成状态。</li>
+     * </ol>
+     *
+     * @param leaf 调用方已校验的执行计划、批次、范围或候选对象；不得为 {@code null}，边界必须有序且不得跨越所属事务、表或日志批次
+     * @param nonLeaf 调用方已校验的执行计划、批次、范围或候选对象；不得为 {@code null}，边界必须有序且不得跨越所属事务、表或日志批次
+     * @return {@code indexDropWorkload} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     private static RedoBudgetWorkload indexDropWorkload(SegmentDropPlan leaf, SegmentDropPlan nonLeaf) {
         try {
+            // 1、读取并校验调用参数与当前领域状态，在共享或持久副作用前拒绝非法状态。
             long fragments = Math.addExact(leaf.fragmentPageCount(), nonLeaf.fragmentPageCount());
             long extents = Math.addExact(leaf.extentCount(), nonLeaf.extentCount());
+            // 2、继续完成范围、身份与候选校验；通过后，按类级并发协议取得本阶段所需协作者与 Guard，保持处理顺序与资源边界。
             long used = Math.addExact(leaf.usedPageCount(), nonLeaf.usedPageCount());
             long images = Math.addExact(12L, Math.multiplyExact(fragments, 4L));
+            // 3、在中间分支复核阶段性结果；满足条件后，执行核心状态转换或数据变换，并维持领域不变量。
             images = Math.addExact(images, Math.multiplyExact(extents, 6L));
             images = Math.addExact(images, Math.multiplyExact(used, 2L));
+            // 4、汇总稳定结果并沿现有 finally/Guard 释放资源，以稳定返回或领域异常完成收口。
             return RedoBudgetWorkload.pageImages(images);
         } catch (ArithmeticException overflow) {
             throw new DatabaseValidationException("secondary index drop redo workload overflows", overflow);
@@ -639,14 +732,121 @@ public final class TableDdlStorageService {
     /**
      * 删除已由 DD 标记不可见的物理表。独占 operation lease 阻止新 MTR 进入；drain 后写 DISCARDED marker 并
      * flushThrough，随后失效所有 frame、关闭 FileChannel 再删除。任何失败都保留 fail-closed 状态供恢复续作。
+     *
+     * @param binding 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @param timeout 本次等待或操作的最大时长；不得为 {@code null} 且必须为正，超时不得留下未释放资源
      */
     public void dropTable(TableStorageBinding binding, Duration timeout) {
         dropTable(binding, timeout, TableDdlStorageFaultInjector.NO_OP);
     }
 
     /**
+     * 将 GENERAL 表空间 durable 标记为 DISCARDED、排空 BufferPool 并原子移动到 quarantine。
+     * DD 状态和 DDL log 由上层 DictionaryDdlService 拥有，本方法只产生物理结果。
+     *
+     * @param binding 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @param quarantine 受控目录内的规范化文件路径；不得为 {@code null}，也不得逃逸所属表空间或日志目录
+     * @param timeout 本次等待或操作的最大时长；不得为 {@code null} 且必须为正，超时不得留下未释放资源
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws TableDdlStorageException DML/DDL 的校验、物理变更或原子收口失败时抛出；调用方应按语句与事务边界回滚
+     */
+    public void discardTablespace(TableStorageBinding binding, Path quarantine, Duration timeout) {
+        if (binding == null || quarantine == null || timeout == null || timeout.isZero() || timeout.isNegative()) {
+            throw new DatabaseValidationException("discard binding/quarantine/positive timeout required");
+        }
+        requireOpenedPath(binding, "DISCARD TABLESPACE");
+        try (TablespaceAccessLease ignored = accessController.acquireExclusive(binding.spaceId())) {
+            TablespaceDrainResult drained = flush.drainTablespace(binding.spaceId(), timeout);
+            if (drained.timedOut()) {
+                throw new TableDdlStorageException("timed out draining tablespace before discard: " + binding.spaceId().value());
+            }
+            if (disk.tablespaceState(binding.spaceId()) != TablespaceState.DISCARDED) {
+                MiniTransaction marker = mtrManager.begin(mtrManager.budgetFor(RedoBudgetPurpose.DDL_TABLE_DROP));
+                Lsn markerLsn;
+                try {
+                    disk.markTablespaceDiscarded(marker, binding.spaceId());
+                    markerLsn = mtrManager.commit(marker);
+                } catch (RuntimeException failure) {
+                    rollbackIfBound(marker, failure);
+                    throw failure;
+                }
+                flush.flushThrough(markerLsn, timeout);
+                store.force(binding.spaceId());
+            }
+            pool.invalidateTablespace(binding.spaceId(), timeout);
+            disk.closeTablespace(binding.spaceId());
+            fileTransfer.discard(binding.path(), quarantine);
+            log.info("discarded physical tablespace: table={} space={} quarantine={}", binding.tableId(),
+                    binding.spaceId().value(), quarantine);
+        }
+    }
+
+    /**
+     * 校验外部 DISCARDED 文件、复制到 canonical path，并恢复 page0 NORMAL。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验表空间生命周期、页号、区段身份与容量边界，非法或损坏元数据在分配/IO 前拒绝。</li>
+     *     <li>按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，避免锁序反转。</li>
+     *     <li>执行空间元数据或物理文件变化，并把需要的 allocation intent、redo、dirty 或 force 副作用交给既有下游。</li>
+     *     <li>发布稳定结果并逆序释放 lease、latch 与 fix；失败保留可由恢复流程识别的权威状态。</li>
+     * </ol>
+     *
+     * @param binding 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @param source 受控目录内的规范化文件路径；不得为 {@code null}，也不得逃逸所属表空间或日志目录
+     * @param expected 表空间文件或 segment 的稳定身份与生命周期快照；不得为 {@code null}，必须与已打开文件和当前 generation 一致
+     * @param timeout 本次等待或操作的最大时长；不得为 {@code null} 且必须为正，超时不得留下未释放资源
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws TableDdlStorageException DML/DDL 的校验、物理变更或原子收口失败时抛出；调用方应按语句与事务边界回滚
+     */
+    public void importTablespace(TableStorageBinding binding, Path source, TablespaceFileIdentity expected,
+                                 Duration timeout) {
+        // 1、校验表空间生命周期、页号、区段身份与容量边界，在共享或持久副作用前拒绝非法状态。
+        if (binding == null || source == null || expected == null || timeout == null
+                || timeout.isZero() || timeout.isNegative()) {
+            throw new DatabaseValidationException("import binding/source/identity/positive timeout required");
+        }
+        // 2、继续完成范围、身份与候选校验；通过后，按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，保持处理顺序与资源边界。
+        if (!expected.spaceId().equals(binding.spaceId())) {
+            throw new DatabaseValidationException("import identity does not match binding space");
+        }
+        TablespaceFileIdentity actual = fileInspection.inspect(source, binding.spaceId(), expected.pageSize());
+        // 3、在中间分支复核阶段性结果；满足条件后，执行空间元数据或物理文件变化，并维持领域不变量。
+        if (!actual.equals(expected)) {
+            throw new TableDdlStorageException("import tablespace file identity mismatch: " + source);
+        }
+        Path temporary = binding.path().resolveSibling(binding.path().getFileName() + ".import.tmp");
+        // 4、发布稳定结果并逆序释放 lease、latch 与 fix，以稳定返回或领域异常完成收口。
+        try (TablespaceAccessLease ignored = accessController.acquireExclusive(binding.spaceId())) {
+            fileTransfer.importFile(source, binding.path(), temporary);
+            disk.openTablespaceForRecovery(binding.spaceId(), binding.path());
+            pool.invalidateTablespace(binding.spaceId(), timeout);
+            MiniTransaction restore = mtrManager.begin(mtrManager.budgetFor(RedoBudgetPurpose.DDL_TABLE_DROP));
+            Lsn restoreLsn;
+            try {
+                disk.restoreTablespace(restore, binding.spaceId());
+                restoreLsn = mtrManager.commit(restore);
+            } catch (RuntimeException failure) {
+                rollbackIfBound(restore, failure);
+                throw failure;
+            }
+            flush.flushThrough(restoreLsn, timeout);
+            store.force(binding.spaceId());
+            disk.refreshTablespaceMetadata(binding.spaceId());
+            log.info("imported physical tablespace: table={} space={} source={}", binding.tableId(),
+                    binding.spaceId().value(), source);
+        }
+    }
+
+    /**
      * 测试可见的故障注入版本。先复核 DD binding path 与已打开 space 的真实文件一致，
      * 再进入任何 marker/close/delete 副作；避免损坏 catalog 令引擎标记一个 space 却删另一条路径。
+     *
+     * @param binding 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @param timeout 本次等待或操作的最大时长；不得为 {@code null} 且必须为正，超时不得留下未释放资源
+     * @param faultInjector 由当前模块组合根提供的领域协作者；不得为 {@code null}，其状态和生命周期必须覆盖本次调用且不能绕过模块边界
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws TableDdlStorageException DML/DDL 的校验、物理变更或原子收口失败时抛出；调用方应按语句与事务边界回滚
      */
     void dropTable(TableStorageBinding binding, Duration timeout, TableDdlStorageFaultInjector faultInjector) {
         if (binding == null || timeout == null || timeout.isZero() || timeout.isNegative()) {
@@ -689,6 +889,13 @@ public final class TableDdlStorageService {
         }
     }
 
+    /**
+     * 校验当前状态后推进存储引擎稳定 API状态机；成功发布唯一终态，失败保留可回滚或可恢复的原始状态。
+     *
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param definition 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @param failure 需要分类或包装的原始失败；不得为 {@code null}，包装时必须保留 cause 与 suppressed 异常图
+     */
     private void rollbackAndRemoveFailedCreate(MiniTransaction mtr, StorageTableDefinition definition,
                                                RuntimeException failure) {
         rollbackIfBound(mtr, failure);
@@ -702,7 +909,12 @@ public final class TableDdlStorageService {
         }
     }
 
-    /** 任何按 binding 读写物理页/文件的入口都先拒绝 catalog path 与真实句柄错绑。 */
+    /** 任何按 binding 读写物理页/文件的入口都先拒绝 catalog path 与真实句柄错绑。
+     *
+     * @param binding 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @param operation 传给 {@code requireOpenedPath} 的文本值；不得为 {@code null} 或空白，并保持调用方提供的字符顺序
+     * @throws TableDdlStorageException DML/DDL 的校验、物理变更或原子收口失败时抛出；调用方应按语句与事务边界回滚
+     */
     private void requireOpenedPath(TableStorageBinding binding, String operation) {
         Path openedPath = store.pathOf(binding.spaceId()).toAbsolutePath().normalize();
         Path bindingPath = binding.path().toAbsolutePath().normalize();
@@ -721,7 +933,11 @@ public final class TableDdlStorageService {
         return new SerializedDictionaryInfoException(message, failure);
     }
 
-    /** commit 失败会由 manager 自行解绑；仅仍绑定时才做 uncommitted rollback。 */
+    /** commit 失败会由 manager 自行解绑；仅仍绑定时才做 uncommitted rollback。
+     *
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param failure 需要分类或包装的原始失败；不得为 {@code null}，包装时必须保留 cause 与 suppressed 异常图
+     */
     private void rollbackIfBound(MiniTransaction mtr, RuntimeException failure) {
         try {
             if (mtr.state() == MiniTransactionState.ACTIVE) {

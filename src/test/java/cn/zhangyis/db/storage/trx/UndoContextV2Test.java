@@ -18,6 +18,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /** 1.6：事务必须分别持有 INSERT/UPDATE undo 绑定，并只共享全局 undoNo 高水位。 */
 class UndoContextV2Test {
 
+    /**
+     * 验证 {@code keepsIndependentHeadsWhileGlobalUndoNumberAdvances} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void keepsIndependentHeadsWhileGlobalUndoNumberAdvances() {
         UndoContext context = new UndoContext(RollbackSegmentId.of(0));

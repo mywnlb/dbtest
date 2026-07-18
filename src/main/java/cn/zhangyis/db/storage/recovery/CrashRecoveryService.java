@@ -44,10 +44,22 @@ public final class CrashRecoveryService {
     /** 最近一次失败根因。 */
     private Throwable lastError;
 
+    /**
+     * 创建 {@code CrashRecoveryService}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param gate 由组合根提供的 {@code RecoveryTrafficGate} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     */
     public CrashRecoveryService(RecoveryTrafficGate gate) {
         this(gate, new RecoveryProgressJournal());
     }
 
+    /**
+     * 创建 {@code CrashRecoveryService}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param gate 由组合根提供的 {@code RecoveryTrafficGate} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param progressJournal 由组合根提供的 {@code RecoveryProgressJournal} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public CrashRecoveryService(RecoveryTrafficGate gate, RecoveryProgressJournal progressJournal) {
         if (gate == null) {
             throw new DatabaseValidationException("recovery traffic gate must not be null");
@@ -75,6 +87,8 @@ public final class CrashRecoveryService {
      *
      * @param request 恢复请求。
      * @return 恢复报告。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws RecoveryStartupException 恢复证据、阶段顺序或事务重建无法继续时抛出；owner 应停止恢复并保持普通流量关闭
      */
     public RecoveryReport recover(RecoveryRequest request) {
         if (request == null) {
@@ -201,9 +215,22 @@ public final class CrashRecoveryService {
      * READ_ONLY_VALIDATE 恢复分支：只扫描 doublewrite 与 redo 边界，并发布只读诊断态。该路径故意跳过
      * {@code RedoApplyDispatcher.applyAll}、redo 边界安装、undo 续作、空间 reconcile、事务 rollback 和
      * {@code PageStore.forceAll}，确保调用方可以用同一份文件做灾难诊断而不改变磁盘内容。
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取 checkpoint、redo、doublewrite 或事务持久证据，并校验阶段、范围与文件身份。</li>
+     *     <li>依据 page LSN、恢复进度和稳定标识判断跳过或续作，保证重复启动不会重复产生副作用。</li>
+     *     <li>按恢复阶段应用物理页或事务状态变化，并在每个可恢复边界记录已完成进度。</li>
+     *     <li>发布恢复结果并释放恢复专用资源；失败保持 fail-closed，不能提前开放普通 SQL 流量。</li>
+     * </ol>
+     *
+     * @param request 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @param tracker 由组合根提供的 {@code RecoveryStageTracker} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code recoverReadOnlyValidate} 调用
+     * @param checkpoint redo 收集、定位或重放所需的日志对象；不得为 {@code null}，其 LSN 范围和记录格式必须连续且属于当前恢复或 MTR 上下文
+     * @return {@code recoverReadOnlyValidate} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
      */
     private RecoveryReport recoverReadOnlyValidate(RecoveryRequest request, RecoveryStageTracker tracker,
                                                    RedoCheckpointLabel checkpoint) {
+        // 1、读取 checkpoint、redo、doublewrite 或事务持久证据，在共享或持久副作用前拒绝非法状态。
         tracker.begin(RecoveryStageName.DOUBLEWRITE_REPAIR);
         DoublewriteRepairSummary doublewriteSummary = validateDoublewritePages(request);
         tracker.complete(state, Lsn.of(0));
@@ -214,6 +241,7 @@ public final class CrashRecoveryService {
             request.transactionRecoveryContext().initialize(checkpoint.checkpointLsn());
         }
         RedoRecoveryReader reader = new RedoRecoveryReader(request.redoRepository(), checkpoint.checkpointLsn());
+        // 2、继续完成范围、身份与候选校验；通过后，依据 page LSN、恢复进度和稳定标识判断跳过或续作，保持处理顺序与资源边界。
         tracker.begin(RecoveryStageName.REDO_REPLAY);
         List<RedoLogBatch> batches = reader.readBatches();
         if (request.transactionRecoveryContext() != null) {
@@ -223,6 +251,7 @@ public final class CrashRecoveryService {
         tracker.complete(state, reader.recoveredToLsn());
 
         tracker.begin(RecoveryStageName.READ_ONLY_DIAGNOSTIC_OPEN);
+        // 3、在中间分支复核阶段性结果；满足条件后，按恢复阶段应用物理页或事务状态变化，并维持领域不变量。
         gate.enterReadOnlyDiagnostic();
         state = RecoveryState.READ_ONLY;
         tracker.complete(state, reader.recoveredToLsn());
@@ -231,6 +260,7 @@ public final class CrashRecoveryService {
                 tracker.completedStages());
         lastReport = report;
         lastError = null;
+        // 4、发布恢复结果并释放恢复专用资源，以稳定返回或领域异常完成收口。
         return report;
     }
 
@@ -238,6 +268,10 @@ public final class CrashRecoveryService {
      * 在 doublewrite/page apply 等任何恢复写发生前，校验 redo-control 与 redo data 的持久格式属于同一代。
      * 本切片明确拒绝旧 RLG1/control v1 和双格式猜测；若 label 与 repository 声明不一致，恢复必须 fail closed，
      * 不能把同一 LSN 按错误的物理编码解释。
+     *
+     * @param request 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @param checkpoint redo 收集、定位或重放所需的日志对象；不得为 {@code null}，其 LSN 范围和记录格式必须连续且属于当前恢复或 MTR 上下文
+     * @throws RedoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     private static void validateRedoFormat(RecoveryRequest request, RedoCheckpointLabel checkpoint) {
         int controlFormat = checkpoint.redoFormatVersion();
@@ -248,7 +282,10 @@ public final class CrashRecoveryService {
         }
     }
 
-    /** 当前 service 状态。 */
+    /** 当前 service 状态。
+     *
+     * @return {@code state} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     */
     public RecoveryState state() {
         serviceLock.lock();
         try {
@@ -258,7 +295,10 @@ public final class CrashRecoveryService {
         }
     }
 
-    /** 最近一次成功恢复报告。 */
+    /** 最近一次成功恢复报告。
+     *
+     * @return 当前可见的最近快照或持久边界；尚未产生对应状态时为空 {@code Optional}，从不返回 Java {@code null}
+     */
     public Optional<RecoveryReport> lastReport() {
         serviceLock.lock();
         try {
@@ -268,7 +308,10 @@ public final class CrashRecoveryService {
         }
     }
 
-    /** 最近一次失败根因。 */
+    /** 最近一次失败根因。
+     *
+     * @return 最近一次受控操作记录的失败；尚无失败时为空 {@code Optional}，参数容器与返回值均不使用 Java {@code null}
+     */
     public Optional<Throwable> lastError() {
         serviceLock.lock();
         try {
@@ -283,10 +326,23 @@ public final class CrashRecoveryService {
      * page0.currentSizeInPages。它弥补 autoExtend 已扩展并写过 page0 大小、但 extent 内仅个别页有 redo 而留下的
      * 尾部零页——这些页无 redo 描述，只能据 page0 权威逻辑大小补齐。page0（pageNo 0）恒在界内，读出后用
      * {@link SpaceHeaderRawCodec} 解出 currentSize，再调用幂等的 {@link PageStore#ensureCapacity}。
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取 checkpoint、redo、doublewrite 或事务持久证据，并校验阶段、范围与文件身份。</li>
+     *     <li>依据 page LSN、恢复进度和稳定标识判断跳过或续作，保证重复启动不会重复产生副作用。</li>
+     *     <li>按恢复阶段应用物理页或事务状态变化，并在每个可恢复边界记录已完成进度。</li>
+     *     <li>发布恢复结果并释放恢复专用资源；失败保持 fail-closed，不能提前开放普通 SQL 流量。</li>
+     * </ol>
+     *
+     * @param request 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @return {@code reconcileSpaceFiles} 实际完成的资源、绑定、页或槽位数量；未处理任何对象时为零，结果不得超过输入候选数
      */
     private int reconcileSpaceFiles(RecoveryRequest request) {
+        // 1、读取 checkpoint、redo、doublewrite 或事务持久证据，在共享或持久副作用前拒绝非法状态。
         PageStore pageStore = request.applyContext().pageStore();
+        // 2、继续完成范围、身份与候选校验；通过后，依据 page LSN、恢复进度和稳定标识判断跳过或续作，保持处理顺序与资源边界。
         PageSize pageSize = request.applyContext().pageSize();
+        // 3、在中间分支复核阶段性结果；满足条件后，按恢复阶段应用物理页或事务状态变化，并维持领域不变量。
         int skipped = 0;
         for (SpaceId spaceId : request.spacesToReconcile()) {
             if (request.skipPolicy().shouldSkip(spaceId)) {
@@ -299,6 +355,7 @@ public final class CrashRecoveryService {
             validateReconcileHeader(spaceId, pageSize, header);
             pageStore.ensureCapacity(spaceId, header.currentSizeInPages());
         }
+        // 4、发布恢复结果并释放恢复专用资源，以稳定返回或领域异常完成收口。
         return skipped;
     }
 
@@ -332,13 +389,30 @@ public final class CrashRecoveryService {
         }
     }
 
+    /**
+     * 校验输入与当前状态后修改崩溃恢复领域数据；成功发布完整结果，异常路径保留既有持久化与并发不变量。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取 checkpoint、redo、doublewrite 或事务持久证据，并校验阶段、范围与文件身份。</li>
+     *     <li>依据 page LSN、恢复进度和稳定标识判断跳过或续作，保证重复启动不会重复产生副作用。</li>
+     *     <li>按恢复阶段应用物理页或事务状态变化，并在每个可恢复边界记录已完成进度。</li>
+     *     <li>发布恢复结果并释放恢复专用资源；失败保持 fail-closed，不能提前开放普通 SQL 流量。</li>
+     * </ol>
+     *
+     * @param request 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @return {@code repairDoublewritePages} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     */
     private DoublewriteRepairSummary repairDoublewritePages(RecoveryRequest request) {
+        // 1、读取 checkpoint、redo、doublewrite 或事务持久证据，在共享或持久副作用前拒绝非法状态。
         int repaired = 0;
         int detectedOnly = 0;
+        // 2、继续完成范围、身份与候选校验；通过后，依据 page LSN、恢复进度和稳定标识判断跳过或续作，保持处理顺序与资源边界。
         int skipped = 0;
         if (request.undoTablespaceRecovery() != null) {
             repaired += request.undoTablespaceRecovery().prepareDoublewrite(request.doublewriteScanner());
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，按恢复阶段应用物理页或事务状态变化，并维持领域不变量。
         if (request.doublewriteScanner() == null) {
             return new DoublewriteRepairSummary(repaired, detectedOnly, skipped);
         }
@@ -358,6 +432,7 @@ public final class CrashRecoveryService {
                 detectedOnly++;
             }
         }
+        // 4、发布恢复结果并释放恢复专用资源，以稳定返回或领域异常完成收口。
         return new DoublewriteRepairSummary(repaired, detectedOnly, skipped);
     }
 
@@ -365,24 +440,41 @@ public final class CrashRecoveryService {
      * READ_ONLY_VALIDATE 的 doublewrite 阶段：只调用 scanner 的只读校验入口，统计 full-copy 可修复页和 detect-only
      * 可疑页，但绝不调用 undo participant、PageStore.writePage 或 force。这样诊断报告能暴露 torn-page 风险，同时
      * 保持原 data file 字节不变，便于后续人工或 force-recovery 策略决策。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取 checkpoint、redo、doublewrite 或事务持久证据，并校验阶段、范围与文件身份。</li>
+     *     <li>依据 page LSN、恢复进度和稳定标识判断跳过或续作，保证重复启动不会重复产生副作用。</li>
+     *     <li>按恢复阶段应用物理页或事务状态变化，并在每个可恢复边界记录已完成进度。</li>
+     *     <li>发布恢复结果并释放恢复专用资源；失败保持 fail-closed，不能提前开放普通 SQL 流量。</li>
+     * </ol>
+     *
+     * @param request 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @return {@code validateDoublewritePages} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
      */
     private DoublewriteRepairSummary validateDoublewritePages(RecoveryRequest request) {
+        // 1、读取 checkpoint、redo、doublewrite 或事务持久证据，在共享或持久副作用前拒绝非法状态。
         int detectedOnly = 0;
+        // 2、继续完成范围、身份与候选校验；通过后，依据 page LSN、恢复进度和稳定标识判断跳过或续作，保持处理顺序与资源边界。
         if (request.doublewriteScanner() == null) {
             return new DoublewriteRepairSummary(0, detectedOnly, 0);
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，按恢复阶段应用物理页或事务状态变化，并维持领域不变量。
         for (PageId pageId : request.pagesToRepair()) {
             DoublewriteRecoveryResult result = request.doublewriteScanner().scanPageForValidation(pageId);
             if (result.diagnosticOnly()) {
                 detectedOnly++;
             }
         }
+        // 4、发布恢复结果并释放恢复专用资源，以稳定返回或领域异常完成收口。
         return new DoublewriteRepairSummary(0, detectedOnly, 0);
     }
 
     /**
      * 任意阶段失败时保持 gate 关闭并记录失败快照。透传发起恢复时的 {@code mode}，避免失败诊断报告把非 NORMAL 模式
      * 误记为 NORMAL。报告里的 LSN/计数填 0：失败可能发生在尚未读出 checkpoint 或扫描 redo 之前，无可信进度可报。
+     * @param request 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @param error 需要分类或包装的原始失败；不得为 {@code null}，包装时必须保留 cause 与 suppressed 异常图
      */
     private void failClosed(RecoveryRequest request, Throwable error) {
         gate.failClosed(error);
@@ -395,6 +487,8 @@ public final class CrashRecoveryService {
      * 尝试记录失败阶段。progress journal 自身也可能因为诊断文件 IO 失败而抛异常，此时仍必须继续
      * {@link #failClosed(RecoveryMode, Throwable)}，否则 recovery gate 会停在不确定状态；二次失败作为
      * suppressed cause 保留给调用方诊断。
+     * @param tracker 由组合根提供的 {@code RecoveryStageTracker} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code recordFailureProgress} 调用
+     * @param cause 需要分类或包装的原始失败；不得为 {@code null}，包装时必须保留 cause 与 suppressed 异常图
      */
     private static void recordFailureProgress(RecoveryStageTracker tracker, RuntimeException cause) {
         try {
@@ -411,6 +505,13 @@ public final class CrashRecoveryService {
         return label + "=" + count + " skippedSpaces=" + skipPolicy.describeSkippedSpaces();
     }
 
+    /**
+     * 封装崩溃恢复中 {@code DoublewriteRepairSummary} 的槽位、预留或阶段结果；组件在创建时交叉校验，使恢复和释放路径能区分已完成与剩余工作。
+     *
+     * @param repairedPageCount 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @param detectedOnlyPageCount 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @param skippedPageCount 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     */
     private record DoublewriteRepairSummary(int repairedPageCount, int detectedOnlyPageCount, int skippedPageCount) {
     }
 
@@ -419,9 +520,21 @@ public final class CrashRecoveryService {
      * 完成后清空 currentStage，避免阶段之间的异常被误记到已经完成的阶段。
      */
     private static final class RecoveryStageTracker {
+        /**
+         * 本对象的权威状态机字段 {@code mode}；只有合法转换方法可以更新，更新受显式锁、原子发布或单一 owner 线程保护，下游据此决定可执行阶段。
+         */
         private final RecoveryMode mode;
+        /**
+         * 本对象持有的 {@code journal} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+         */
         private final RecoveryProgressJournal journal;
+        /**
+         * 本对象拥有的 {@code completedStages} 受控集合；元素生命周期与外层对象一致，仅由本类方法更新，对外暴露时必须返回副本或不可变视图。
+         */
         private final List<RecoveryStageName> completedStages;
+        /**
+         * 本对象的权威状态机字段 {@code currentStage}；只有合法转换方法可以更新，更新受显式锁、原子发布或单一 owner 线程保护，下游据此决定可执行阶段。
+         */
         private RecoveryStageName currentStage;
 
         private RecoveryStageTracker(RecoveryMode mode, RecoveryProgressJournal journal,

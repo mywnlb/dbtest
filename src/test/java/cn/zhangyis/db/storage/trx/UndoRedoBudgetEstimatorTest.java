@@ -10,6 +10,9 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 /** Undo workload 根据首写建段与真实 drop plan 缩放，不再为所有终结固定预留 32 个页 image。 */
 class UndoRedoBudgetEstimatorTest {
 
+    /**
+     * 验证 {@code firstAppendCostsMoreThanExistingSegmentAppend} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void firstAppendCostsMoreThanExistingSegmentAppend() {
         assertTrue(UndoRedoBudgetEstimator.append(true).pageImageEquivalents()
@@ -18,6 +21,9 @@ class UndoRedoBudgetEstimatorTest {
                 .pageImageEquivalents());
     }
 
+    /**
+     * 验证 {@code finalizationScalesWithFragmentsAndExtents} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void finalizationScalesWithFragmentsAndExtents() {
         RedoBudgetWorkload empty = UndoRedoBudgetEstimator.finalization(new UndoSegmentDropPlan(0, 0, 0), true);
@@ -36,6 +42,9 @@ class UndoRedoBudgetEstimatorTest {
         assertTrue(extents.pageImageEquivalents() > fragments.pageImageEquivalents());
     }
 
+    /**
+     * 验证 {@code reusableFinalizationBudgetsCacheAndFreeSeparately} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void reusableFinalizationBudgetsCacheAndFreeSeparately() {
         assertEquals(11L, UndoRedoBudgetEstimator.finalization(java.util.List.of(), 1, 0, false)

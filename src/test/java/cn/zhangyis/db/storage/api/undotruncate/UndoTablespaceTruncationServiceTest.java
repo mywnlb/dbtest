@@ -93,6 +93,9 @@ class UndoTablespaceTruncationServiceTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code truncatesEmptyUndoSpaceBackToInitialExtentAndPublishesActive} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void truncatesEmptyUndoSpaceBackToInitialExtentAndPublishesActive() {
         try (Fixture fixture = new Fixture(dir.resolve("success"))) {
@@ -122,6 +125,9 @@ class UndoTablespaceTruncationServiceTest {
         }
     }
 
+    /**
+     * 验证 {@code rejectsTruncationWhileAnyUndoInodeSlotIsAllocated} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void rejectsTruncationWhileAnyUndoInodeSlotIsAllocated() {
         try (Fixture fixture = new Fixture(dir.resolve("not-empty"))) {
@@ -136,6 +142,9 @@ class UndoTablespaceTruncationServiceTest {
         }
     }
 
+    /**
+     * 验证 {@code resumesAfterCrashPointFollowingPhysicalTruncate} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void resumesAfterCrashPointFollowingPhysicalTruncate() {
         try (Fixture fixture = new Fixture(dir.resolve("resume"))) {
@@ -186,6 +195,9 @@ class UndoTablespaceTruncationServiceTest {
         }
     }
 
+    /**
+     * 验证 {@code rejectsGeneralTablespaceWithoutChangingPhysicalSize} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void rejectsGeneralTablespaceWithoutChangingPhysicalSize() {
         try (Fixture fixture = new Fixture(dir.resolve("general-reject"))) {
@@ -203,6 +215,9 @@ class UndoTablespaceTruncationServiceTest {
         }
     }
 
+    /**
+     * 验证 {@code rejectsLegacyUndoWithoutLifecycleHeader} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void rejectsLegacyUndoWithoutLifecycleHeader() {
         try (Fixture fixture = new Fixture(dir.resolve("legacy-reject"))) {
@@ -226,6 +241,9 @@ class UndoTablespaceTruncationServiceTest {
         }
     }
 
+    /**
+     * 验证 {@code recoveryFailsWhenConfiguredUndoSpaceIsNotOpen} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void recoveryFailsWhenConfiguredUndoSpaceIsNotOpen() {
         try (Fixture fixture = new Fixture(dir.resolve("missing-config"))) {
@@ -373,6 +391,9 @@ class UndoTablespaceTruncationServiceTest {
         }
     }
 
+    /**
+     * 验证 {@code truncateDrainsCachedSegmentsBeforeWritingMarkerAndRebuildsEmptyPage3} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void truncateDrainsCachedSegmentsBeforeWritingMarkerAndRebuildsEmptyPage3() {
         try (Fixture fixture = new Fixture(dir.resolve("cache-drain"))) {
@@ -415,6 +436,9 @@ class UndoTablespaceTruncationServiceTest {
         }
     }
 
+    /**
+     * 验证 {@code activeSlotRejectsTruncateBeforeExistingCacheIsDropped} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void activeSlotRejectsTruncateBeforeExistingCacheIsDropped() {
         try (Fixture fixture = new Fixture(dir.resolve("active-before-cache"))) {
@@ -436,6 +460,9 @@ class UndoTablespaceTruncationServiceTest {
         }
     }
 
+    /**
+     * 验证 {@code persistentHistoryRejectsStableTruncateBeforeAnyDrainOrMarker} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void persistentHistoryRejectsStableTruncateBeforeAnyDrainOrMarker() {
         try (Fixture fixture = new Fixture(dir.resolve("history-before-truncate"))) {
@@ -456,6 +483,9 @@ class UndoTablespaceTruncationServiceTest {
         }
     }
 
+    /**
+     * 验证 {@code runtimeAndPersistentCacheOwnerMismatchRejectsBeforePhysicalDrop} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void runtimeAndPersistentCacheOwnerMismatchRejectsBeforePhysicalDrop() {
         try (Fixture fixture = new Fixture(dir.resolve("cache-owner-mismatch"))) {

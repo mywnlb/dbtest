@@ -22,7 +22,14 @@ import java.util.Optional;
  */
 public final class RecoveredTransactionReconciler {
 
-    /** 合并 page3 证据并返回 rollback/history 分类；任何歧义均抛致命恢复异常。 */
+    /** 合并 page3 证据并返回 rollback/history 分类；任何歧义均抛致命恢复异常。
+     *
+     * @param redoSnapshot 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @param recoveredToLsn redo 日志边界；不得为 {@code null}，必须单调且与调用方已发布的页或事务状态一致
+     * @param page3Slots 参与 {@code reconcile} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @return {@code reconcile} 创建或观察到的事务/锁状态；成功时不为 {@code null}，owner、可见性与生命周期来自当前会话
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public RecoveredTransactionReconciliation reconcile(
             RecoveredTransactionSnapshot redoSnapshot,
             Lsn recoveredToLsn,
@@ -118,12 +125,31 @@ public final class RecoveredTransactionReconciler {
                 slot, RecoveredTransactionState.RECOVERED_ACTIVE, recoveredToLsn));
     }
 
+    /**
+     * 校验当前状态后推进崩溃恢复状态机；成功发布唯一终态，失败保留可回滚或可恢复的原始状态。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取 checkpoint、redo、doublewrite 或事务持久证据，并校验阶段、范围与文件身份。</li>
+     *     <li>依据 page LSN、恢复进度和稳定标识判断跳过或续作，保证重复启动不会重复产生副作用。</li>
+     *     <li>按恢复阶段应用物理页或事务状态变化，并在每个可恢复边界记录已完成进度。</li>
+     *     <li>发布恢复结果并释放恢复专用资源；失败保持 fail-closed，不能提前开放普通 SQL 流量。</li>
+     * </ol>
+     *
+     * @param slot 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param redoEntry 可选的 {@code redoEntry}；参数本身不得为 {@code null}，空 {@code Optional} 明确表示调用方未提供该领域值
+     * @param snapshot 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @param recoveredToLsn redo 日志边界；不得为 {@code null}，必须单调且与调用方已发布的页或事务状态一致
+     * @param merged 参与 {@code reconcileCommitted} 的键值映射；不得为 {@code null}，空映射表示没有条目，键和值均不得包含 Java {@code null}
+     * @throws TransactionRecoveryException 恢复证据、阶段顺序或事务重建无法继续时抛出；owner 应停止恢复并保持普通流量关闭
+     */
     private static void reconcileCommitted(
             RecoveredUndoSlotEvidence slot,
             Optional<RecoveredTransactionEntry> redoEntry,
             RecoveredTransactionSnapshot snapshot,
             Lsn recoveredToLsn,
             Map<TransactionId, RecoveredTransactionEntry> merged) {
+        // 1、读取 checkpoint、redo、doublewrite 或事务持久证据，在共享或持久副作用前拒绝非法状态。
         if (redoEntry.isPresent()) {
             RecoveredTransactionEntry evidence = redoEntry.get();
             if (evidence.state() != RecoveredTransactionState.COMMITTED
@@ -135,8 +161,10 @@ public final class RecoveredTransactionReconciler {
             }
             return;
         }
+        // 2、继续完成范围、身份与候选校验；通过后，依据 page LSN、恢复进度和稳定标识判断跳过或续作，保持处理顺序与资源边界。
         boolean idCovered = slot.creatorTransactionId().value()
                 < snapshot.baselineNextTransactionId().value();
+        // 3、在中间分支复核阶段性结果；满足条件后，按恢复阶段应用物理页或事务状态变化，并维持领域不变量。
         boolean noCovered = slot.transactionNo().value()
                 < snapshot.baselineNextTransactionNo().value();
         if (!idCovered || !noCovered) {
@@ -147,6 +175,7 @@ public final class RecoveredTransactionReconciler {
                             + snapshot.baselineNextTransactionId().value() + ", baselineNextNo="
                             + snapshot.baselineNextTransactionNo().value());
         }
+        // 4、发布恢复结果并释放恢复专用资源，以稳定返回或领域异常完成收口。
         merged.put(slot.creatorTransactionId(), page3Entry(
                 slot, RecoveredTransactionState.COMMITTED, recoveredToLsn));
     }

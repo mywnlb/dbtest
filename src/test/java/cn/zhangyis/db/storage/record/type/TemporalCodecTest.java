@@ -31,6 +31,9 @@ class TemporalCodecTest {
         return FieldSlice.compareUnsigned(new FieldSlice(a, 0, a.length), new FieldSlice(b, 0, b.length));
     }
 
+    /**
+     * 验证 {@code dateRoundTripAndOrder} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void dateRoundTripAndOrder() {
         TemporalCodec c = new TemporalCodec(TemporalKind.DATE);
@@ -44,6 +47,9 @@ class TemporalCodecTest {
         assertTrue(cmp(epoch, after) < 0);
     }
 
+    /**
+     * 验证 {@code datetimeRoundTripAndOrder} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void datetimeRoundTripAndOrder() {
         TemporalCodec c = new TemporalCodec(TemporalKind.DATETIME);
@@ -111,6 +117,9 @@ class TemporalCodecTest {
                 () -> c.validate(new ColumnValue.TemporalValue(TemporalKind.YEAR, 65_536), YEAR));
     }
 
+    /**
+     * 验证 {@code kindAndColumnTypeMismatchRejected} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void kindAndColumnTypeMismatchRejected() {
         TemporalCodec c = new TemporalCodec(TemporalKind.DATE);

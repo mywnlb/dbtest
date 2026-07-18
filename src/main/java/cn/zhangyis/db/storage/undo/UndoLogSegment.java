@@ -93,10 +93,36 @@ public final class UndoLogSegment {
      */
     private PreparedAppend pendingAppend;
 
+    /**
+     * 创建 {@code UndoLogSegment}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝 null、越界和相互矛盾的组合。</li>
+     *     <li>完成跨参数校验并推导不可变配置；若构造过程创建自有资源，后续失败必须在异常路径关闭。</li>
+     *     <li>把已校验协作者与配置绑定到字段，并初始化本对象拥有的状态、显式锁、队列或缓存，不允许 this 提前逃逸。</li>
+     *     <li>构造完成后对象处于类契约声明的初始状态；任一步失败都抛出领域异常且不发布半初始化实例。</li>
+     * </ol>
+     *
+     * @param mtr 调用方拥有的短物理事务；不得为 {@code null}，且必须处于可获取资源或可追加 redo 的合法阶段
+     * @param pageSize 调用方提供的长度或容量值对象；不得为 {@code null}，且必须已通过其构造范围校验
+     * @param allocator 由组合根提供的 {@code UndoSpaceAllocator} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param codec 由组合根提供的 {@code UndoRecordCodec} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param pageAccess 由组合根提供的 {@code UndoPageAccess} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param payloadStorage 由组合根提供的 {@code UndoPayloadStorage} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param storedRecordResolver 参与本次操作的记录或记录集合；不得为 {@code null}，顺序、身份与编码必须满足当前索引或日志格式
+     * @param maxExternalPages 参与 {@code 构造} 的上界或规格值 {@code maxExternalPages}；必须非负且不能使容量、页数或编码长度计算溢出
+     * @param handle 调用方持有的 {@code UndoSegmentHandle} 资源句柄；不得为 {@code null} 且必须处于有效期，方法返回前所有权仍归调用方
+     * @param firstPage 已固定的页面、frame 或页头视图；不得为 {@code null}，必须指向目标 PageId，并在访问期间持有契约要求的 fix/latch
+     * @param current 已固定的页面、frame 或页头视图；不得为 {@code null}，必须指向目标 PageId，并在访问期间持有契约要求的 fix/latch
+     * @param mode 调用方请求的目标状态、阶段或模式；不得为 {@code null}，且必须是当前状态机允许的后继值
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     UndoLogSegment(MiniTransaction mtr, PageSize pageSize, UndoSpaceAllocator allocator, UndoRecordCodec codec,
                    UndoPageAccess pageAccess, UndoPayloadStorage payloadStorage,
                    UndoStoredRecordResolver storedRecordResolver, int maxExternalPages,
                    UndoSegmentHandle handle, UndoPage firstPage, UndoPage current, PageLatchMode mode) {
+        // 1、校验必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝非法组合。
         if (mtr == null || pageSize == null || allocator == null || codec == null || pageAccess == null
                 || payloadStorage == null || storedRecordResolver == null || maxExternalPages <= 0
                 || handle == null || firstPage == null || current == null || mode == null) {
@@ -105,16 +131,19 @@ public final class UndoLogSegment {
         this.mtr = mtr;
         this.pageSize = pageSize;
         this.allocator = allocator;
+        // 2、完成跨参数校验并推导不可变配置；后续失败仍由当前构造路径收口已创建资源。
         this.codec = codec;
         this.pageAccess = pageAccess;
         this.payloadStorage = payloadStorage;
         this.storedRecordResolver = storedRecordResolver;
         this.maxExternalPages = maxExternalPages;
+        // 3、绑定已校验协作者并初始化本对象拥有的状态、显式锁、队列或缓存，不允许半初始化实例逃逸。
         this.handle = handle;
         this.firstPage = firstPage;
         this.current = current;
         this.mode = mode;
         heldPages.put(firstPage.pageId().pageNo().value(), firstPage);
+        // 4、完成初始状态发布；失败以领域异常终止构造，成功对象满足类级生命周期不变量。
         heldPages.put(current.pageId().pageNo().value(), current);
     }
 
@@ -128,6 +157,10 @@ public final class UndoLogSegment {
      *
      * <p>如果 current 页放不下，会先确认一张全新 undo 页能容纳该 record，再分配并 FIL 链入新页。preflight
      * 必须早于任何页修改，否则 MTR rollbackUncommitted 不做 content undo，会留下半生长脏链。
+     * @param rec 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param keyDef 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @param schema 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @return {@code append} 定位或分配的稳定值对象；成功时不为 {@code null}，其身份、范围和特殊值已由构造校验保证
      */
     public RollPointer append(UndoRecord rec, IndexKeyDef keyDef, TableSchema schema) {
         UndoRecordWritePlan plan = UndoRecordWritePlan.create(codec, pageSize, rec, keyDef, schema,
@@ -144,6 +177,9 @@ public final class UndoLogSegment {
     /**
      * 执行 admission 前形成的物理计划。调用方必须已为 {@link #requiredNewPages(UndoRecordWritePlan)} 返回值预留容量；
      * 本方法不会嵌套申请 reservation，确保 external 页链与可能的 descriptor root grow 共用同一额度。
+     * @param plan 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @return {@code appendPlanned} 定位或分配的稳定值对象；成功时不为 {@code null}，其身份、范围和特殊值已由构造校验保证
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public RollPointer appendPlanned(UndoRecordWritePlan plan) {
         if (mode != PageLatchMode.EXCLUSIVE) {
@@ -183,6 +219,8 @@ public final class UndoLogSegment {
      * 固定 deferred append 的全部物理位置但不写 placeholder record。数据流：先执行完整 logical preflight，
      * 再在需要时生长 root chain page，随后为 external payload 分配并 fix 全部新页；记录 slot、payload body 和
      * first-page logical head 都保持未发布。调用方已经按 {@link #requiredNewPages(UndoRecordWritePlan)} 预留容量。
+     * @param placeholderPlan 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public void prepareAppend(UndoRecordWritePlan placeholderPlan) {
         if (mode != PageLatchMode.EXCLUSIVE) {
@@ -208,6 +246,11 @@ public final class UndoLogSegment {
     /**
      * 在已固定位置写入真实 undo。实际计划必须与 placeholder 物理形状相同，且 current 页/offset 未被其它写者推进；
      * external body 先落到不可达 prepared 页，最后才发布 root record slot 和 first-page logical head。
+     *
+     * @param actualPlan 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @return {@code appendPrepared} 定位或分配的稳定值对象；成功时不为 {@code null}，其身份、范围和特殊值已由构造校验保证
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws UndoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public RollPointer appendPrepared(UndoRecordWritePlan actualPlan) {
         if (actualPlan == null || pendingAppend == null) {
@@ -238,7 +281,12 @@ public final class UndoLogSegment {
         return pointer;
     }
 
-    /** external 页数加 descriptor/inline root 是否需要一张普通 UNDO grow 页。 */
+    /** external 页数加 descriptor/inline root 是否需要一张普通 UNDO grow 页。
+     *
+     * @param plan 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @return {@code requiredNewPages} 计算出的非负长度、位置或数量；结果必须落在所属页、集合或持久格式容量内，溢出通过领域异常报告
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public int requiredNewPages(UndoRecordWritePlan plan) {
         if (plan == null) {
             throw new DatabaseValidationException("undo page requirement plan must not be null");
@@ -353,7 +401,14 @@ public final class UndoLogSegment {
         current = newPage;
     }
 
-    /** prepare 阶段冻结的 root 位置、计数与 external payload 页集合。 */
+    /** prepare 阶段冻结的 root 位置、计数与 external payload 页集合。
+     *
+     * @param placeholderPlan 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param rootPageId 目标页的稳定物理标识；必须属于当前已准入表空间，且不得为 {@code null}
+     * @param rootOffset 目标结构内的零基偏移；必须落在当前页、记录或持久槽位的合法范围
+     * @param nextRecordCount 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @param payloadPages 参与 {@code 构造} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     */
     private record PreparedAppend(UndoRecordWritePlan placeholderPlan, PageId rootPageId, int rootOffset,
                                   long nextRecordCount, List<PageId> payloadPages) {
         private PreparedAppend {
@@ -402,19 +457,34 @@ public final class UndoLogSegment {
      * 标记本 undo segment 已提交（R 1.2/R 1.3）：写 first 页 log header {@code STATE=COMMITTED} 与
      * {@code COMMIT_NO}（要求 EXCLUSIVE 会话，redo 保护）。恢复期据此把 ACTIVE 段判为未提交事务回滚，把
      * COMMITTED 段按提交序重建 history 后交给 purge 续作。
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
+     * @param commitNo 参与 {@code markCommitted} 的稳定领域标识 {@code TransactionNo}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws UndoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public void markCommitted(TransactionNo commitNo) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         if (mode != PageLatchMode.EXCLUSIVE) {
             throw new DatabaseValidationException("markCommitted requires an EXCLUSIVE undo log segment session");
         }
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         if (commitNo == null || commitNo.isNone()) {
             throw new DatabaseValidationException("markCommitted commitNo must not be null");
         }
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         if (!isActive() && !isPrepared()) {
             throw new UndoLogFormatException(
                     "markCommitted requires ACTIVE or PREPARED undo log state: " + state());
         }
         firstPage.setLogState(UndoPageLayout.STATE_COMMITTED);
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         firstPage.setCommitNo(commitNo.value()); // R 1.3：与 STATE 同 MTR 写提交序号，供恢复重建 history
     }
 
@@ -471,6 +541,8 @@ public final class UndoLogSegment {
     /**
      * finalization 在 page3 active→cache/free transition 的同一 MTR 内重置首页。调用方必须已由 FSP drop plan
      * 证明该 segment 只占一个 fragment 页；本方法再校验页链与 kind，避免把外部 payload/chain 残留伪装成缓存。
+     *
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public void resetForCache() {
         if (mode != PageLatchMode.EXCLUSIVE) {
@@ -479,12 +551,20 @@ public final class UndoLogSegment {
         firstPage.resetForCache(firstPage.undoKind(), handle);
     }
 
-    /** 校验 shared/exclusive 会话观察到的是指定 kind 的空 CACHED segment。 */
+    /** 校验 shared/exclusive 会话观察到的是指定 kind 的空 CACHED segment。
+     *
+     * @param expectedKind 选择 {@code requireCached} 分支的 {@code UndoLogKind} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     */
     public void requireCached(UndoLogKind expectedKind) {
         firstPage.requireCachedEmpty(expectedKind, handle);
     }
 
-    /** 用新事务激活已校验的 CACHED segment；首条 append 仍由调用方在同一业务 MTR 中完成。 */
+    /** 用新事务激活已校验的 CACHED segment；首条 append 仍由调用方在同一业务 MTR 中完成。
+     *
+     * @param transactionId 事务的稳定标识；不得为 {@code null}，{@code NONE} 只表示尚未绑定事务，不能代替活跃事务身份
+     * @param expectedKind 选择 {@code activateCached} 分支的 {@code UndoLogKind} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public void activateCached(TransactionId transactionId, UndoLogKind expectedKind) {
         if (mode != PageLatchMode.EXCLUSIVE) {
             throw new DatabaseValidationException("cache activation requires an EXCLUSIVE undo segment session");
@@ -492,7 +572,12 @@ public final class UndoLogSegment {
         firstPage.activateCached(expectedKind, transactionId, handle);
     }
 
-    /** finalization 在 active→free owner transition 的同一 MTR 内重置首页及 free 链接。 */
+    /** finalization 在 active→free owner transition 的同一 MTR 内重置首页及 free 链接。
+     *
+     * @param previousFreePageNo 参与 {@code resetForFree} 的原始数值身份 {@code previousFreePageNo}；必须非负，零值仅用于对应格式明确声明的系统或空身份
+     * @param nextFreePageNo 参与 {@code resetForFree} 的原始数值身份 {@code nextFreePageNo}；必须非负，零值仅用于对应格式明确声明的系统或空身份
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public void resetForFree(long previousFreePageNo, long nextFreePageNo) {
         if (mode != PageLatchMode.EXCLUSIVE) {
             throw new DatabaseValidationException("free reset requires an EXCLUSIVE undo segment session");
@@ -505,7 +590,12 @@ public final class UndoLogSegment {
         firstPage.requireFreeEmpty(handle);
     }
 
-    /** 用新事务和 kind 激活已校验的 FREE segment。 */
+    /** 用新事务和 kind 激活已校验的 FREE segment。
+     *
+     * @param transactionId 事务的稳定标识；不得为 {@code null}，{@code NONE} 只表示尚未绑定事务，不能代替活跃事务身份
+     * @param kind 选择 {@code activateFree} 分支的 {@code UndoLogKind} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public void activateFree(TransactionId transactionId, UndoLogKind kind) {
         if (mode != PageLatchMode.EXCLUSIVE) {
             throw new DatabaseValidationException("free activation requires an EXCLUSIVE undo segment session");
@@ -526,8 +616,24 @@ public final class UndoLogSegment {
     /**
      * 按 RollPointer 读回 undo record。先拒绝 NULL 指针，再定位指针页并校验 segmentId/inodeSlot 与本 handle
      * 一致；段不符代表指针指向别的 undo segment 或页内容损坏，不能继续按当前 schema 解码。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
+     * @param rp 参与 {@code readRecord} 的稳定领域标识 {@code RollPointer}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param keyDef 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @param schema 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @return {@code readRecord} 编码、解码或重建的记录数据；成功时不为 {@code null}，字段顺序、隐藏列和字节边界满足当前 schema
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws UndoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public UndoRecord readRecord(RollPointer rp, IndexKeyDef keyDef, TableSchema schema) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         if (rp == null || keyDef == null || schema == null) {
             throw new DatabaseValidationException("undo readRecord roll pointer/keyDef/schema must not be null");
         }
@@ -535,21 +641,37 @@ public final class UndoLogSegment {
             throw new UndoLogFormatException("cannot read undo record from NULL roll pointer");
         }
         UndoPage page = resolvePage(rp.pageNo());
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         requireSameSegment(page, "roll pointer page " + rp.pageNo());
         requireSameKind(page, "roll pointer page " + rp.pageNo());
         byte[] payload = page.recordAt(rp.offset());
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         UndoRecord record = storedRecordResolver.resolve(mtr, handle.spaceId(), segmentIdentity(page),
                 payload, keyDef, schema);
         UndoLogSegmentAccess.requireRecordKind(page.undoKind(), record.type(), "undo segment read");
         requirePointerMatchesRecord(rp, record, keyDef);
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         return record;
     }
 
     /**
      * 不依赖 schema 读取一条 record 的 table/index identity。与 {@link #readRecord} 共用 pointer/segment/kind
      * 校验和 inline/external materialization，供多表 rollback/purge 先解析元数据再完整解码。
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验事务身份、状态、undo 绑定与冻结计划，所有可重试冲突必须发生在物理修改开始之前。</li>
+     *     <li>按既定 lease、MTR、page3 与 undo 页顺序取得资源；进入事务锁等待前不得持有页闩或 buffer fix。</li>
+     *     <li>执行 undo/redo、history 或事务终态更新，使物理证据与内存投影在规定提交边界保持一致。</li>
+     *     <li>发布 live 状态或返回持久结果并逆序释放资源；越过物理边界后的失败按既有策略 fail-stop。</li>
+     * </ol>
+     *
+     * @param rp 参与 {@code readRecordIdentity} 的稳定领域标识 {@code RollPointer}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @return {@code readRecordIdentity} 定位或分配的稳定值对象；成功时不为 {@code null}，其身份、范围和特殊值已由构造校验保证
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws UndoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public UndoRecordIdentity readRecordIdentity(RollPointer rp) {
+        // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
         if (rp == null) {
             throw new DatabaseValidationException("undo identity roll pointer must not be null");
         }
@@ -557,10 +679,12 @@ public final class UndoLogSegment {
             throw new UndoLogFormatException("cannot read undo identity from NULL roll pointer");
         }
         UndoPage page = resolvePage(rp.pageNo());
+        // 2、继续完成范围、身份与候选校验；通过后，按既定 lease、MTR、page3 与 undo 页顺序取得资源，保持处理顺序与资源边界。
         requireSameSegment(page, "identity roll pointer page " + rp.pageNo());
         requireSameKind(page, "identity roll pointer page " + rp.pageNo());
         UndoRecordIdentity identity = storedRecordResolver.identity(mtr, handle.spaceId(), segmentIdentity(page),
                 page.recordAt(rp.offset()));
+        // 3、在中间分支复核阶段性结果；满足条件后，执行 undo/redo、history 或事务终态更新，并维持领域不变量。
         UndoLogSegmentAccess.requireRecordKind(page.undoKind(), identity.type(), "undo identity read");
         if (rp.insert() != (identity.type() == UndoRecordType.INSERT_ROW)) {
             throw new UndoLogFormatException("roll pointer kind does not match undo identity type");
@@ -569,6 +693,7 @@ public final class UndoLogSegment {
             throw new UndoLogFormatException("undo identity transaction " + identity.transactionId().value()
                     + " != segment creator " + firstPage.transactionId().value());
         }
+        // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         return identity;
     }
 
@@ -673,6 +798,10 @@ public final class UndoLogSegment {
      * 中的 {@code [len u16][payload]} 槽顺序解码，
      * 然后沿 FIL NEXT 继续。链上任何页类型或 segment 归属异常都会通过 openUndoPage/requireSameSegment 抛出
      * {@link UndoLogFormatException}。
+     * @param consumer 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param keyDef 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @param schema 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public void forEachRecord(Consumer<UndoRecord> consumer, IndexKeyDef keyDef, TableSchema schema) {
         if (consumer == null) {
@@ -688,6 +817,10 @@ public final class UndoLogSegment {
      *
      * <p>遍历语义与 {@link #forEachRecord} 一致：每页按 record area {@code [len u16][payload]} 槽顺序解码后沿 FIL NEXT
      * 继续；页类型/段归属异常经 openUndoPage/requireSameSegment 抛 {@link UndoLogFormatException}。
+     * @param consumer 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param keyDef 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @param schema 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public void forEachRecordWithPointer(BiConsumer<UndoRecord, RollPointer> consumer,
                                          IndexKeyDef keyDef, TableSchema schema) {
@@ -765,6 +898,14 @@ public final class UndoLogSegment {
                 firstPage.undoKind(), firstPage.logRecordCount(), current.freeOffset());
     }
 
+    /**
+     * 校验 {@code requirePointerMatchesRecord} 涉及的Undo 日志结构、范围与交叉字段；合法输入不修改状态，非法输入在副作用前抛出领域异常。
+     *
+     * @param pointer 参与 {@code requirePointerMatchesRecord} 的稳定领域标识 {@code RollPointer}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param record 参与本次操作的记录或记录集合；不得为 {@code null}，顺序、身份与编码必须满足当前索引或日志格式
+     * @param keyDef 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @throws UndoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     private void requirePointerMatchesRecord(RollPointer pointer, UndoRecord record, IndexKeyDef keyDef) {
         boolean expectedInsert = record.type() == UndoRecordType.INSERT_ROW;
         if (pointer.insert() != expectedInsert) {
@@ -781,6 +922,12 @@ public final class UndoLogSegment {
         }
     }
 
+    /**
+     * 把输入转换为 {@code resolvePage} 对应的Undo 日志结果；转换保持稳定顺序与身份映射，不修改调用方持有的输入对象。
+     *
+     * @param pageNo 参与 {@code resolvePage} 的稳定领域标识 {@code PageNo}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @return {@code resolvePage} 取得或创建的受控存储资源；成功时不为 {@code null}，调用方必须按其 Guard/lease 契约释放
+     */
     private UndoPage resolvePage(PageNo pageNo) {
         UndoPage held = heldPages.get(pageNo.value());
         if (held != null) {

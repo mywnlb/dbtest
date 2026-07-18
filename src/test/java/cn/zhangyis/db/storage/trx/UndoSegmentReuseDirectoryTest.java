@@ -18,6 +18,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /** 统一复用目录的 cache LIFO、free FIFO 与跨物理 MTR lease 状态机测试。 */
 class UndoSegmentReuseDirectoryTest {
 
+    /**
+     * 验证 {@code fullCacheRejectsPushWithoutReplacingPublishedOwner} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void fullCacheRejectsPushWithoutReplacingPublishedOwner() {
         UndoSegmentReuseDirectory directory = new UndoSegmentReuseDirectory(1);
@@ -28,6 +31,9 @@ class UndoSegmentReuseDirectoryTest {
         assertEquals(first, directory.peekCache(UndoLogKind.INSERT).orElseThrow().segment());
     }
 
+    /**
+     * 验证 {@code cacheCandidateHasPriorityAndFreeQueueIsFifoAcrossKinds} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void cacheCandidateHasPriorityAndFreeQueueIsFifoAcrossKinds() {
         UndoSegmentReuseDirectory directory = new UndoSegmentReuseDirectory(1);
@@ -48,6 +54,9 @@ class UndoSegmentReuseDirectoryTest {
         assertEquals(freeSecond, directory.peekFree().orElseThrow().segment());
     }
 
+    /**
+     * 验证 {@code drainUsesCacheTopsThenFreeHeadsInStableBatches} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void drainUsesCacheTopsThenFreeHeadsInStableBatches() {
         UndoSegmentReuseDirectory directory = new UndoSegmentReuseDirectory(2);

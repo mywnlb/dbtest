@@ -35,6 +35,9 @@ public final class AdaptiveFlushPolicy {
     /** HARD 压力下刷出 backlog 的比例（整批 backlog，上限 maxBatch）。 */
     private static final double HARD_FACTOR = 1.0;
 
+    /**
+     * 本对象的权威状态机字段 {@code mode}；只有合法转换方法可以更新，更新受显式锁、原子发布或单一 owner 线程保护，下游据此决定可执行阶段。
+     */
     private final Mode mode;
     /** proportional 的基础刷页数（与 backlog 无关的最小推进量）；discrete 模式忽略。 */
     private final int basePages;
@@ -43,6 +46,14 @@ public final class AdaptiveFlushPolicy {
     /** 单轮最大刷页数（上限）。 */
     private final int maxBatchPages;
 
+    /**
+     * 创建 {@code AdaptiveFlushPolicy}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param mode 调用方请求的目标状态、阶段或模式；不得为 {@code null}，且必须是当前状态机允许的后继值
+     * @param basePages 参与 {@code 构造} 的上界或规格值 {@code basePages}；必须非负且不能使容量、页数或编码长度计算溢出
+     * @param minBatchPages 参与 {@code 构造} 的上界或规格值 {@code minBatchPages}；必须非负且不能使容量、页数或编码长度计算溢出
+     * @param maxBatchPages 参与 {@code 构造} 的上界或规格值 {@code maxBatchPages}；必须非负且不能使容量、页数或编码长度计算溢出
+     */
     private AdaptiveFlushPolicy(Mode mode, int basePages, int minBatchPages, int maxBatchPages) {
         this.mode = mode;
         this.basePages = basePages;
@@ -69,6 +80,7 @@ public final class AdaptiveFlushPolicy {
      * @param minBatchPages 有压力时单轮下限（≥1）。
      * @param maxBatchPages 单轮上限（≥min）。
      * @return 比例策略。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public static AdaptiveFlushPolicy adaptive(int basePages, int minBatchPages, int maxBatchPages) {
         if (basePages < 0) {
@@ -86,6 +98,7 @@ public final class AdaptiveFlushPolicy {
      *                                discrete 模式忽略该值。
      * @param requestMaxPages         调用方允许本轮最多刷出的页数（外层上限）。
      * @return flush advice。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public FlushAdvice plan(RedoCapacityDecision decision, int dirtyPagesBeforeTarget, int requestMaxPages) {
         if (decision == null) {
@@ -105,6 +118,45 @@ public final class AdaptiveFlushPolicy {
         int pages = Math.min(planned, requestMaxPages);
         boolean sync = pressure == RedoCapacityPressure.SYNC_FLUSH || pressure == RedoCapacityPressure.HARD_LIMIT;
         return new FlushAdvice(decision.targetCheckpointLsn(), pages, sync);
+    }
+
+    /** 根据运行时 redo/flush 速率生成 FlushList/LRU 批量分配。
+     *
+     * @param decision redo 收集、定位或重放所需的日志对象；不得为 {@code null}，其 LSN 范围和记录格式必须连续且属于当前恢复或 MTR 上下文
+     * @param dirtyPagesBeforeTarget 参与 {@code planBatches} 的上界或规格值 {@code dirtyPagesBeforeTarget}；必须非负且不能使容量、页数或编码长度计算溢出
+     * @param requestMaxPages 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @param runtime 恢复、checkpoint、doublewrite 或刷脏阶段的协作状态；不得为 {@code null}，阶段和持久化边界必须与当前实例的恢复状态机一致
+     * @param tuning 恢复、checkpoint、doublewrite 或刷脏阶段的协作状态；不得为 {@code null}，阶段和持久化边界必须与当前实例的恢复状态机一致
+     * @return {@code planBatches} 产生的恢复或持久化阶段对象；成功时不为 {@code null}，其中的 durable 边界不超过已安全完成的工作
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
+    public FlushBatchPlan planBatches(RedoCapacityDecision decision, int dirtyPagesBeforeTarget,
+                                      int requestMaxPages, FlushRuntimeSnapshot runtime,
+                                      FlushTuning tuning) {
+        if (runtime == null || tuning == null) {
+            throw new DatabaseValidationException("flush runtime/tuning must not be null");
+        }
+        FlushAdvice base = plan(decision, dirtyPagesBeforeTarget, requestMaxPages);
+        if (!base.shouldFlush()) {
+            return new FlushBatchPlan(base.targetLsn(), 0, 0, base.synchronousPressure());
+        }
+        long redoPages = tuning.pageSizeBytes() == 0 ? 0
+                : (runtime.redoBytesGenerated() + tuning.pageSizeBytes() - 1L) / tuning.pageSizeBytes();
+        long deficit = Math.max(0L, redoPages - runtime.flushedPages());
+        long raw = (long) base.maxPages() + deficit;
+        long ioBudget = runtime.sampleSeconds() <= 0
+                ? tuning.maxBatchPages()
+                : (long) Math.ceil(tuning.ioCapacityPagesPerSecond() * runtime.sampleSeconds()
+                        * (decision.pressure() == RedoCapacityPressure.ASYNC_FLUSH
+                        ? tuning.idleFlushPercent() / 100.0 : 1.0));
+        int total = (int) Math.min(requestMaxPages, Math.min(tuning.maxBatchPages(),
+                Math.max(tuning.minBatchPages(), Math.max(1L, Math.min(raw, Math.max(1L, ioBudget))))));
+        int lru = 0;
+        if (runtime.capacityFrames() > 0
+                && runtime.freeFrames() * 100L <= runtime.capacityFrames() * tuning.lruFreeFrameLowWatermarkPercent()) {
+            lru = Math.min(total, runtime.dirtyPages());
+        }
+        return new FlushBatchPlan(base.targetLsn(), total - lru, lru, base.synchronousPressure());
     }
 
     private int discrete(RedoCapacityPressure pressure) {

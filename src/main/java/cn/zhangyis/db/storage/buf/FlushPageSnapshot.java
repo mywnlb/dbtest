@@ -14,8 +14,14 @@ import java.util.Arrays;
  * @param pageLsn snapshot 时页头中的 pageLSN。
  * @param dirtyVersion BufferFrame 的脏版本，completeFlush 用它判断 snapshot 后页面是否再次变脏。
  * @param pageImage 整页副本；构造和访问都防御性复制，避免外部修改 Buffer Pool 状态。
+ * @param generation 参与 {@code 构造} 的单调版本值 {@code generation}；必须非负，回退或与权威快照冲突时拒绝
  */
-public record FlushPageSnapshot(PageId pageId, Lsn pageLsn, long dirtyVersion, byte[] pageImage) {
+public record FlushPageSnapshot(PageId pageId, Lsn pageLsn, long dirtyVersion, long generation, byte[] pageImage) {
+
+    /** 兼容旧调用方；generation=0 仅用于旧测试构造，生产 snapshot 总是携带真实代数。 */
+    public FlushPageSnapshot(PageId pageId, Lsn pageLsn, long dirtyVersion, byte[] pageImage) {
+        this(pageId, pageLsn, dirtyVersion, 0L, pageImage);
+    }
 
     public FlushPageSnapshot {
         if (pageId == null || pageLsn == null || pageImage == null) {
@@ -23,6 +29,9 @@ public record FlushPageSnapshot(PageId pageId, Lsn pageLsn, long dirtyVersion, b
         }
         if (dirtyVersion < 0) {
             throw new DatabaseValidationException("dirty version must not be negative: " + dirtyVersion);
+        }
+        if (generation < 0) {
+            throw new DatabaseValidationException("frame generation must not be negative: " + generation);
         }
         pageImage = Arrays.copyOf(pageImage, pageImage.length);
     }

@@ -38,7 +38,12 @@ public record RecoveredTransactionSnapshot(Lsn baselineCheckpointLsn,
         entries = Map.copyOf(entries);
     }
 
-    /** 按事务 id 查询证据；缺失表示 checkpoint 后没有 terminal/non-terminal delta。 */
+    /** 按事务 id 查询证据；缺失表示 checkpoint 后没有 terminal/non-terminal delta。
+     *
+     * @param transactionId 事务的稳定标识；不得为 {@code null}，{@code NONE} 只表示尚未绑定事务，不能代替活跃事务身份
+     * @return {@code entry} 按身份或键定位到的对象；未找到、不可见或尚未持久化时为空 {@code Optional}，从不返回 Java {@code null}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public Optional<RecoveredTransactionEntry> entry(TransactionId transactionId) {
         if (transactionId == null) {
             throw new DatabaseValidationException("recovered transaction lookup id must not be null");

@@ -17,6 +17,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class RedoCapacityThrottleTest {
 
+    /**
+     * 验证 {@code asyncPressureRequestsFlushWithoutBlockingForeground} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void asyncPressureRequestsFlushWithoutBlockingForeground() {
         FakeCapacityEnvironment env = new FakeCapacityEnvironment(60, 0);
@@ -32,6 +35,9 @@ class RedoCapacityThrottleTest {
         assertEquals(0, env.checkpointAdvances());
     }
 
+    /**
+     * 验证 {@code syncPressureWaitsUntilCheckpointAdvancesBelowSyncThreshold} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     */
     @Test
     void syncPressureWaitsUntilCheckpointAdvancesBelowSyncThreshold() {
         FakeCapacityEnvironment env = new FakeCapacityEnvironment(80, 0);
@@ -48,6 +54,9 @@ class RedoCapacityThrottleTest {
         assertEquals(Lsn.of(10), env.checkpointLsn());
     }
 
+    /**
+     * 验证 {@code reservationUsesProspectiveAppendBytesWhenEvaluatingPressure} 对应的Redo/WAL行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void reservationUsesProspectiveAppendBytesWhenEvaluatingPressure() {
         FakeCapacityEnvironment env = new FakeCapacityEnvironment(70, 0);
@@ -64,6 +73,9 @@ class RedoCapacityThrottleTest {
         }
     }
 
+    /**
+     * 验证 {@code physicalBudgetLargerThanOneRepositoryBatchFailsBeforeFlush} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void physicalBudgetLargerThanOneRepositoryBatchFailsBeforeFlush() {
         FakeCapacityEnvironment env = new FakeCapacityEnvironment(0, 0);
@@ -79,6 +91,9 @@ class RedoCapacityThrottleTest {
         assertEquals(0, env.asyncRequests());
     }
 
+    /**
+     * 验证 {@code ownershipTransferAndCloseReleaseReservationExactlyOnce} 所描述的组件生命周期，并断言状态转换、后台线程停止和资源恰好释放一次。
+     */
     @Test
     void ownershipTransferAndCloseReleaseReservationExactlyOnce() {
         FakeCapacityEnvironment env = new FakeCapacityEnvironment(50, 0);
@@ -97,6 +112,9 @@ class RedoCapacityThrottleTest {
         }
     }
 
+    /**
+     * 验证 {@code hardPressureReleasesAfterFlushProgress} 所描述的刷脏与持久化协作，并断言 redo durable 边界先覆盖 page LSN、失败后仍保留脏状态。
+     */
     @Test
     void hardPressureReleasesAfterFlushProgress() {
         FakeCapacityEnvironment env = new FakeCapacityEnvironment(95, 0);
@@ -113,6 +131,9 @@ class RedoCapacityThrottleTest {
                 "HARD_LIMIT waiter should be released once checkpoint age falls below SYNC_FLUSH");
     }
 
+    /**
+     * 验证 {@code hardPressureTimesOutFailClosedWhenCheckpointCannotAdvance} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void hardPressureTimesOutFailClosedWhenCheckpointCannotAdvance() {
         FakeCapacityEnvironment env = new FakeCapacityEnvironment(95, 0);

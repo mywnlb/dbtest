@@ -6,7 +6,11 @@ import cn.zhangyis.db.sql.executor.SqlValue;
 
 import java.util.List;
 
-/** 完整聚簇行 INSERT；values 始终按 exact DD column ordinal 排列。 */
+/** 完整聚簇行 INSERT；values 始终按 exact DD column ordinal 排列。
+ *
+ * @param table 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+ * @param values 参与 {@code 构造} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+ */
 public record BoundClusteredInsert(TableDefinition table, List<SqlValue> values) implements BoundStatement {
     public BoundClusteredInsert {
         if (table == null || values == null || values.size() != table.columns().size()

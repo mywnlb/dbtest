@@ -8,7 +8,10 @@ import cn.zhangyis.db.common.exception.DatabaseFatalException;
  */
 public final class RedoBudgetTooLargeException extends DatabaseFatalException {
 
-    /** 创建包含用途、请求物理字节与 repository 上限的诊断。 */
+    /** 创建包含用途、请求物理字节与 repository 上限的诊断。
+     *
+     * @param message 包含领域上下文的诊断信息；不得为空白，也不能替代原始异常原因
+     */
     public RedoBudgetTooLargeException(String message) {
         super(message);
     }

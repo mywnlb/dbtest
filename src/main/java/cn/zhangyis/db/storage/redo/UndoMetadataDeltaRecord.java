@@ -28,7 +28,10 @@ public record UndoMetadataDeltaRecord(
         int offset,
         byte[] afterImage) implements RedoRecord {
 
-    /** tag(1)+pageId(12)+kind(1)+subjectId(8)+subIndex(4)+offset(4)+payloadLen(4)。 */
+    /** tag(1)+pageId(12)+kind(1)+subjectId(8)+subIndex(4)+offset(4)+payloadLen(4)。
+     *
+     * 稳定布局常量，参与页内偏移、长度或位域计算；编解码两端必须保持完全一致。
+     */
     private static final int HEADER_BYTES = 34;
 
     public UndoMetadataDeltaRecord {
@@ -65,6 +68,9 @@ public record UndoMetadataDeltaRecord(
 
     /**
      * record 默认会对数组字段做引用比较；redo payload 是值对象，codec round-trip 后必须按字节内容相等。
+     *
+     * @param obj 待比较对象；允许为 {@code null} 或其他类型，此时按 {@code equals} 契约返回 {@code false}
+     * @return 比较对象类型与全部值语义相等时为 {@code true}；对象为 {@code null}、类型不同或任一组件不等时为 {@code false}
      */
     @Override
     public boolean equals(Object obj) {
@@ -82,6 +88,11 @@ public record UndoMetadataDeltaRecord(
                 && Arrays.equals(afterImage, that.afterImage);
     }
 
+    /**
+     * 实现 {@code hashCode} 的稳定值语义；比较只读取输入与本对象，不改变Redo/WAL状态。
+     *
+     * @return 由参与值语义的全部组件计算出的稳定哈希值；与 {@code equals} 相等的对象必须返回相同结果
+     */
     @Override
     public int hashCode() {
         int result = pageId.hashCode();

@@ -125,6 +125,9 @@ class RecordComparatorTest {
         }
     }
 
+    /**
+     * 验证 {@code singleKeyIntOrderAsc} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void singleKeyIntOrderAsc() {
         onPage((rp, schema) -> {
@@ -139,6 +142,9 @@ class RecordComparatorTest {
         });
     }
 
+    /**
+     * 验证 {@code descReversesOrder} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void descReversesOrder() {
         onPage((rp, schema) -> {
@@ -151,6 +157,9 @@ class RecordComparatorTest {
         });
     }
 
+    /**
+     * 验证 {@code nullOrdersBeforeNonNull} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void nullOrdersBeforeNonNull() {
         onPage((rp, schema) -> {
@@ -170,6 +179,9 @@ class RecordComparatorTest {
         });
     }
 
+    /**
+     * 验证 {@code compositeKeyComparesPartsInOrder} 所描述的值对象语义，并断言相等性、哈希、排序及非法构造边界一致。
+     */
     @Test
     void compositeKeyComparesPartsInOrder() {
         onPage((rp, schema) -> {
@@ -185,6 +197,9 @@ class RecordComparatorTest {
         });
     }
 
+    /**
+     * 验证 {@code prefixKeyMatchesOnProvidedParts} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void prefixKeyMatchesOnProvidedParts() {
         onPage((rp, schema) -> {
@@ -197,6 +212,9 @@ class RecordComparatorTest {
         });
     }
 
+    /**
+     * 验证 {@code prefixIndexComparesOnlyLeadingBytesOfColumn} 所描述的 B+Tree 定位或结构变化，并断言键序、父子链接、页资源和唯一性不变量。
+     */
     @Test
     void prefixIndexComparesOnlyLeadingBytesOfColumn() {
         onPage((rp, schema) -> {
@@ -213,6 +231,9 @@ class RecordComparatorTest {
         });
     }
 
+    /**
+     * 验证 {@code prefixLongerThanValueComparesAvailableBytes} 所描述的值对象语义，并断言相等性、哈希、排序及非法构造边界一致。
+     */
     @Test
     void prefixLongerThanValueComparesAvailableBytes() {
         onPage((rp, schema) -> {
@@ -226,6 +247,9 @@ class RecordComparatorTest {
         });
     }
 
+    /**
+     * 验证 {@code prefixLengthRejectedOnNonByteColumn} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void prefixLengthRejectedOnNonByteColumn() {
         onPage((rp, schema) -> {
@@ -237,6 +261,9 @@ class RecordComparatorTest {
         });
     }
 
+    /**
+     * 验证 {@code varcharLexicographicOrder} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void varcharLexicographicOrder() {
         onPage((rp, schema) -> {
@@ -247,6 +274,9 @@ class RecordComparatorTest {
         });
     }
 
+    /**
+     * 验证 {@code asciiCaseInsensitiveCollationHonorsDirectionAndBytePrefix} 所描述的字典/DDL 协作，并断言版本、对象身份、缓存失效和物理绑定保持一致。
+     */
     @Test
     void asciiCaseInsensitiveCollationHonorsDirectionAndBytePrefix() {
         TableSchema ciSchema = schema(ColumnType.varchar(
@@ -272,6 +302,9 @@ class RecordComparatorTest {
         });
     }
 
+    /**
+     * 验证 {@code infimumAndSupremumAreSentinels} 对应的记录格式与页内组织行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void infimumAndSupremumAreSentinels() {
         onPage((rp, schema) -> {

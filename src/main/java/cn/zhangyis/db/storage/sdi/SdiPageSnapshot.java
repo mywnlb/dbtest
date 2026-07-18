@@ -25,6 +25,12 @@ public record SdiPageSnapshot(long tableId, long dictionaryVersion, byte[] paylo
         return Arrays.copyOf(payload, payload.length);
     }
 
+    /**
+     * 实现 {@code equals} 的稳定值语义；比较只读取输入与本对象，不改变数据库内核状态。
+     *
+     * @param other 待比较对象；允许为 {@code null} 或其他类型，此时按 {@code equals} 契约返回 {@code false}
+     * @return 比较对象类型与全部值语义相等时为 {@code true}；对象为 {@code null}、类型不同或任一组件不等时为 {@code false}
+     */
     @Override
     public boolean equals(Object other) {
         return this == other || other instanceof SdiPageSnapshot that
@@ -33,6 +39,11 @@ public record SdiPageSnapshot(long tableId, long dictionaryVersion, byte[] paylo
                 && Arrays.equals(payload, that.payload);
     }
 
+    /**
+     * 实现 {@code hashCode} 的稳定值语义；比较只读取输入与本对象，不改变数据库内核状态。
+     *
+     * @return 由参与值语义的全部组件计算出的稳定哈希值；与 {@code equals} 相等的对象必须返回相同结果
+     */
     @Override
     public int hashCode() {
         int result = Long.hashCode(tableId);

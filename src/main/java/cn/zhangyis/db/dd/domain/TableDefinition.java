@@ -11,6 +11,15 @@ import java.util.Optional;
 /**
  * Data Dictionary table 聚合根。构造阶段一次性验证列布局、唯一名称和聚簇主键引用，保证进入 cache/catalog
  * 后对象始终可安全映射为 Record/B+Tree schema，不依赖调用方再次补校验。
+ *
+ * @param id 参与 {@code 构造} 的稳定领域标识 {@code TableId}；不得为 {@code null}，并须由对应值对象构造校验产生
+ * @param schemaId 参与 {@code 构造} 的稳定领域标识 {@code SchemaId}；不得为 {@code null}，并须由对应值对象构造校验产生
+ * @param name 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+ * @param version 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+ * @param state 调用方请求的目标状态、阶段或模式；不得为 {@code null}，且必须是当前状态机允许的后继值
+ * @param columns 参与 {@code 构造} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+ * @param indexes 参与 {@code 构造} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+ * @param storageBinding 可选的 {@code storageBinding}；参数本身不得为 {@code null}，空 {@code Optional} 明确表示调用方未提供该领域值
  */
 public record TableDefinition(TableId id, SchemaId schemaId, ObjectName name, DictionaryVersion version,
                               TableState state, List<ColumnDefinition> columns,

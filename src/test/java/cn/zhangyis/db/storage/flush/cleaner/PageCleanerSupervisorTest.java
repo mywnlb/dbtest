@@ -50,6 +50,9 @@ class PageCleanerSupervisorTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code supervisorReportsMetricsAfterSuccessfulCycle} 对应的脏页刷盘与 checkpoint行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void supervisorReportsMetricsAfterSuccessfulCycle() {
         try (PageStore store = new FileChannelPageStore();
@@ -81,6 +84,11 @@ class PageCleanerSupervisorTest {
         }
     }
 
+    /**
+     * 验证 {@code supervisorRestartsFailedWorkerWithinLimit} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void supervisorRestartsFailedWorkerWithinLimit() throws Exception {
         ScriptedWorker failed = ScriptedWorker.failsOnRequest("first failure");
@@ -105,6 +113,11 @@ class PageCleanerSupervisorTest {
         }
     }
 
+    /**
+     * 验证 {@code supervisorMetricsRememberHistoricalLastCycleAfterRestart} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void supervisorMetricsRememberHistoricalLastCycleAfterRestart() throws Exception {
         ScriptedWorker first = ScriptedWorker.succeedsOnRequest();
@@ -132,6 +145,11 @@ class PageCleanerSupervisorTest {
         }
     }
 
+    /**
+     * 验证 {@code supervisorStopsAfterRestartLimitExceeded} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void supervisorStopsAfterRestartLimitExceeded() throws Exception {
         ScriptedWorker first = ScriptedWorker.failsOnRequest("failure-1");

@@ -44,7 +44,10 @@ public final class SecondaryCurrentReadService {
     private final TransactionManager transactionManager;
     /** secondary candidate 短 MTR 工厂。 */
     private final MiniTransactionManager mtrManager;
-    /** including-deleted logical-prefix scan。 */
+    /** including-deleted logical-prefix scan。
+     *
+     * 本对象持有的 {@code btree} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private final SplitCapableBTreeIndexService btree;
     /** 聚簇 current-read record lock 与重定位入口。 */
     private final BTreeCurrentReadService currentRead;
@@ -58,7 +61,21 @@ public final class SecondaryCurrentReadService {
     /**
      * 创建 secondary current-read 服务；所有协作者必须来自同一 StorageEngine 组合根。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝 null、越界和相互矛盾的组合。</li>
+     *     <li>完成跨参数校验并推导不可变配置；若构造过程创建自有资源，后续失败必须在异常路径关闭。</li>
+     *     <li>把已校验协作者与配置绑定到字段，并初始化本对象拥有的状态、显式锁、队列或缓存，不允许 this 提前逃逸。</li>
+     *     <li>构造完成后对象处于类契约声明的初始状态；任一步失败都抛出领域异常且不发布半初始化实例。</li>
+     * </ol>
+     *
      * @throws DatabaseValidationException 任一协作者为空时抛出。
+     * @param transactionManager 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param mtrManager 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param btree 由组合根提供的 {@code SplitCapableBTreeIndexService} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param currentRead 由组合根提供的 {@code BTreeCurrentReadService} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param lockManager 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
+     * @param registry 由组合根提供的 {@code TypeCodecRegistry} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
      */
     public SecondaryCurrentReadService(TransactionManager transactionManager,
                                        MiniTransactionManager mtrManager,
@@ -66,16 +83,20 @@ public final class SecondaryCurrentReadService {
                                        BTreeCurrentReadService currentRead,
                                        LockManager lockManager,
                                        TypeCodecRegistry registry) {
+        // 1、校验必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝非法组合。
         if (transactionManager == null || mtrManager == null || btree == null || currentRead == null
                 || lockManager == null || registry == null) {
             throw new DatabaseValidationException("secondary current-read collaborators must not be null");
         }
         this.transactionManager = transactionManager;
+        // 2、完成跨参数校验并推导不可变配置；后续失败仍由当前构造路径收口已创建资源。
         this.mtrManager = mtrManager;
         this.btree = btree;
+        // 3、绑定已校验协作者并初始化本对象拥有的状态、显式锁、队列或缓存，不允许半初始化实例逃逸。
         this.currentRead = currentRead;
         this.lockManager = lockManager;
         this.tokenFactory = new SecondaryLogicalKeyLockTokenFactory(registry);
+        // 4、完成初始状态发布；失败以领域异常终止构造，成功对象满足类级生命周期不变量。
         this.keyComparator = new SearchKeyComparator(registry);
     }
 
@@ -229,6 +250,9 @@ public final class SecondaryCurrentReadService {
 
     /**
      * 单次 current-read 的 monotonic 绝对等待预算；每一阶段只能消费剩余值，不能重新获得完整 timeout。
+     *
+     * @param startedNanos 参与 {@code 构造} 的时间量 {@code startedNanos}；必须非负，零表示立即检查或尚未累计等待
+     * @param budgetNanos 参与 {@code 构造} 的时间量 {@code budgetNanos}；必须非负，零表示立即检查或尚未累计等待
      */
     private record WaitDeadline(long startedNanos, long budgetNanos) {
         private static WaitDeadline after(Duration timeout) {

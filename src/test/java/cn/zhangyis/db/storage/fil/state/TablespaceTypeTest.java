@@ -11,6 +11,9 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
  */
 class TablespaceTypeTest {
 
+    /**
+     * 验证 {@code codesAreStable} 对应的表空间物理文件行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void codesAreStable() {
         assertEquals(0, TablespaceType.SYSTEM.code());
@@ -20,6 +23,9 @@ class TablespaceTypeTest {
         assertEquals(4, TablespaceType.TEMPORARY.code());
     }
 
+    /**
+     * 验证 {@code fromCodeRoundTrips} 对应的表空间物理文件行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void fromCodeRoundTrips() {
         for (TablespaceType type : TablespaceType.values()) {
@@ -27,6 +33,9 @@ class TablespaceTypeTest {
         }
     }
 
+    /**
+     * 验证 {@code fromCodeRejectsUnknown} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void fromCodeRejectsUnknown() {
         assertThrows(DatabaseValidationException.class, () -> TablespaceType.fromCode(7));

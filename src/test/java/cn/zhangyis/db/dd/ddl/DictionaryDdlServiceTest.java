@@ -408,7 +408,10 @@ class DictionaryDdlServiceTest {
         }
     }
 
-    /** DROP 在真实 history 引用上等待；purge finalization 发布引用减少后唤醒同一 Condition 并继续物理删除。 */
+    /** DROP 在真实 history 引用上等待；purge finalization 发布引用减少后唤醒同一 Condition 并继续物理删除。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void purgeFinalizationWakesWaitingDrop() throws Exception {
         Path tables = directory.resolve("purge-wake-tables");

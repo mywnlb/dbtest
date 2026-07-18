@@ -203,6 +203,14 @@ public final class PersistentHistoryRecovery {
      * 合并 transaction sidecar/redo 恢复出的 nextNo 与 page3 持久高水位。即使 history 已全部 purge，后者也不能
      * 丢失，否则重启会复用旧提交号。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取 checkpoint、redo、doublewrite 或事务持久证据，并校验阶段、范围与文件身份。</li>
+     *     <li>依据 page LSN、恢复进度和稳定标识判断跳过或续作，保证重复启动不会重复产生副作用。</li>
+     *     <li>按恢复阶段应用物理页或事务状态变化，并在每个可恢复边界记录已完成进度。</li>
+     *     <li>发布恢复结果并释放恢复专用资源；失败保持 fail-closed，不能提前开放普通 SQL 流量。</li>
+     * </ol>
+     *
      * @param base                     已完成格式校验的 page3 history base，提供 lastTransactionNo。
      * @param reconciledNextTransactionNo transaction redo/sidecar 已恢复出的正 next transaction number。
      * @return 两个权威来源中较大的安全 next number。
@@ -210,15 +218,19 @@ public final class PersistentHistoryRecovery {
      * @throws TransactionRecoveryException lastTransactionNo 已达长整型上限、无法安全加一时抛出。
      */
     public long nextTransactionNo(RollbackSegmentHistoryBase base, long reconciledNextTransactionNo) {
+        // 1、读取 checkpoint、redo、doublewrite 或事务持久证据，在共享或持久副作用前拒绝非法状态。
         if (base == null || reconciledNextTransactionNo < 1L) {
             throw new DatabaseValidationException("history counter recovery inputs are invalid");
         }
+        // 2、继续完成范围、身份与候选校验；通过后，依据 page LSN、恢复进度和稳定标识判断跳过或续作，保持处理顺序与资源边界。
         final long historyNext;
+        // 3、在中间分支复核阶段性结果；满足条件后，按恢复阶段应用物理页或事务状态变化，并维持领域不变量。
         try {
             historyNext = Math.addExact(base.lastTransactionNo().value(), 1L);
         } catch (ArithmeticException overflow) {
             throw new TransactionRecoveryException("rseg lastTransactionNo cannot advance after recovery", overflow);
         }
+        // 4、发布恢复结果并释放恢复专用资源，以稳定返回或领域异常完成收口。
         return Math.max(reconciledNextTransactionNo, historyNext);
     }
 

@@ -26,6 +26,9 @@ class RandomReadAheadDetectorTest {
         return PageId.of(SPACE, PageNo.of(extent * EXTENT + offset));
     }
 
+    /**
+     * 验证 {@code randomDetectorEmitsExtentWhenEnoughResident} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void randomDetectorEmitsExtentWhenEnoughResident() {
         RandomReadAheadDetector detector = new RandomReadAheadDetector(4);
@@ -38,6 +41,9 @@ class RandomReadAheadDetectorTest {
                 "命中 → 预取被访问页所在整 extent（起始页 64、整 extent 64 页）");
     }
 
+    /**
+     * 验证 {@code belowThresholdNoEmit} 对应的Buffer Pool行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void belowThresholdNoEmit() {
         RandomReadAheadDetector detector = new RandomReadAheadDetector(4);
@@ -45,6 +51,9 @@ class RandomReadAheadDetectorTest {
         assertTrue(detector.record(page(1, 6), 3).isEmpty(), "驻留数不足阈值不触发预取");
     }
 
+    /**
+     * 验证 {@code dedupSameExtent} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void dedupSameExtent() {
         RandomReadAheadDetector detector = new RandomReadAheadDetector(4);
@@ -54,6 +63,9 @@ class RandomReadAheadDetectorTest {
                 "同一 extent 仍在 recent 窗内：即便再次达阈值也不重复提交");
     }
 
+    /**
+     * 验证 {@code canEmitAgainAfterRecentWindowMovesOn} 对应的Buffer Pool行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void canEmitAgainAfterRecentWindowMovesOn() {
         // recent 窗容量 2：发出 extent 0、1、2 后，extent 0 被挤出窗口，可再次触发。
@@ -66,6 +78,9 @@ class RandomReadAheadDetectorTest {
                 "extent 0 已移出 recent 窗：同一 extent 可再次触发（bounded 去重而非永久 set）");
     }
 
+    /**
+     * 验证 {@code rejectsInvalidArguments} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void rejectsInvalidArguments() {
         assertThrows(DatabaseValidationException.class, () -> new RandomReadAheadDetector(0));

@@ -63,6 +63,9 @@ class UndoSegmentCacheIntegrationTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code insertCommitCachesInLifoOrderAndNextFirstWriteReusesTopOwner} 所描述的事务状态与 MVCC 可见性，并断言提交/回滚终态、owner 和资源释放结果。
+     */
     @Test
     void insertCommitCachesInLifoOrderAndNextFirstWriteReusesTopOwner() {
         withHarness(2, h -> {
@@ -163,6 +166,11 @@ class UndoSegmentCacheIntegrationTest {
         });
     }
 
+    /**
+     * 验证 {@code concurrentUpdateCommitsSerializePersistentAppendWithoutLostTail} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void concurrentUpdateCommitsSerializePersistentAppendWithoutLostTail() throws Exception {
         withHarness(0, h -> {
@@ -212,6 +220,9 @@ class UndoSegmentCacheIntegrationTest {
         });
     }
 
+    /**
+     * 验证 {@code fullCacheKeepsExistingTopAndMovesNewlyFinalizedSegmentToFreeFifo} 所描述的返回值或状态会按契约保留，并断言原始信息与领域不变量未丢失。
+     */
     @Test
     void fullCacheKeepsExistingTopAndMovesNewlyFinalizedSegmentToFreeFifo() {
         withHarness(1, h -> {
@@ -235,6 +246,9 @@ class UndoSegmentCacheIntegrationTest {
         });
     }
 
+    /**
+     * 验证 {@code zeroCacheCapacityStillRetainsEligibleSegmentInFreeFifo} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void zeroCacheCapacityStillRetainsEligibleSegmentInFreeFifo() {
         withHarness(0, h -> {
@@ -282,6 +296,9 @@ class UndoSegmentCacheIntegrationTest {
         });
     }
 
+    /**
+     * 验证 {@code multiPageInsertSegmentIsDroppedInsteadOfCached} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void multiPageInsertSegmentIsDroppedInsteadOfCached() {
         withHarness(2, h -> {
@@ -303,6 +320,9 @@ class UndoSegmentCacheIntegrationTest {
         });
     }
 
+    /**
+     * 验证 {@code purgedSinglePageUpdateUsesIndependentUpdateCache} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void purgedSinglePageUpdateUsesIndependentUpdateCache() {
         withHarness(2, h -> {

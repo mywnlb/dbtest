@@ -13,7 +13,12 @@ public final class UndoRedoBudgetEstimator {
     private UndoRedoBudgetEstimator() {
     }
 
-    /** fresh 首写覆盖 FSP create，cached 首写覆盖 page3 owner move/header reset，existing 只覆盖 append/grow。 */
+    /** fresh 首写覆盖 FSP create，cached 首写覆盖 page3 owner move/header reset，existing 只覆盖 append/grow。
+     *
+     * @param acquisition 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @return {@code append} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public static RedoBudgetWorkload append(UndoSegmentAcquisition acquisition) {
         if (acquisition == null) {
             throw new DatabaseValidationException("undo append acquisition must not be null");
@@ -29,13 +34,22 @@ public final class UndoRedoBudgetEstimator {
     /**
      * 兼容只区分首写与追加的预算调用方。生产写路径必须传入明确的 segment 获取方式，
      * 否则无法表达 cached segment 激活所需的 page 3 owner 转移与首页重置开销。
+     *
+     * @param firstUndoWrite 当前对象是否处于首次创建、首次写入或复用分支；该事实决定初始化、redo 和失败补偿路径
+     * @return {@code append} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
      */
     public static RedoBudgetWorkload append(boolean firstUndoWrite) {
         return append(firstUndoWrite ? UndoSegmentAcquisition.ALLOCATE_NEW
                 : UndoSegmentAcquisition.APPEND_EXISTING);
     }
 
-    /** external payload 每页覆盖 FSP allocation、PAGE_INIT 与完整 PAGE_BYTES，按 LOB 同级每页追加 8 份余量。 */
+    /** external payload 每页覆盖 FSP allocation、PAGE_INIT 与完整 PAGE_BYTES，按 LOB 同级每页追加 8 份余量。
+     *
+     * @param acquisition 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param externalPages 参与 {@code append} 的上界或规格值 {@code externalPages}；必须非负且不能使容量、页数或编码长度计算溢出
+     * @return {@code append} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public static RedoBudgetWorkload append(UndoSegmentAcquisition acquisition, int externalPages) {
         if (acquisition == null) {
             throw new DatabaseValidationException("undo append acquisition must not be null");
@@ -59,6 +73,11 @@ public final class UndoRedoBudgetEstimator {
 
     /**
      * drop 固定覆盖 page0/page2/page3、inode/slot 与发布边界；每 fragment 计两份、每 extent 计四份元数据余量。
+     *
+     * @param plan 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param includesTerminalDelta 当前算法是否纳入终态增量、同步压力、磁盘来源、根节点或周期上界校验；用于选择对应的不变量检查分支
+     * @return {@code finalization} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public static RedoBudgetWorkload finalization(UndoSegmentDropPlan plan, boolean includesTerminalDelta) {
         if (plan == null) {
@@ -77,7 +96,13 @@ public final class UndoRedoBudgetEstimator {
         }
     }
 
-    /** 多 segment 原子终结只计算一次 batch/page3/terminal 固定开销，各 drop plan 的动态规模分别累加。 */
+    /** 多 segment 原子终结只计算一次 batch/page3/terminal 固定开销，各 drop plan 的动态规模分别累加。
+     *
+     * @param plans 参与 {@code finalization} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @param includesTerminalDelta 当前算法是否纳入终态增量、同步压力、磁盘来源、根节点或周期上界校验；用于选择对应的不变量检查分支
+     * @return {@code finalization} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public static RedoBudgetWorkload finalization(Collection<UndoSegmentDropPlan> plans,
                                                    boolean includesTerminalDelta) {
         if (plans == null || plans.isEmpty() || plans.stream().anyMatch(java.util.Objects::isNull)) {
@@ -102,6 +127,11 @@ public final class UndoRedoBudgetEstimator {
     /**
      * cache/free/drop 混合终结预算。drop 继续按 fragment/extent 规模计费；每个 reusable segment 额外覆盖 page3 owner
      * transition、首页 header reset 与重复 metadata delta 余量。允许 droppedPlans 为空，但 cachedCount 必须为正。
+     *
+     * @param droppedPlans 参与 {@code finalization} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @param cachedCount 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @param includesTerminalDelta 当前算法是否纳入终态增量、同步压力、磁盘来源、根节点或周期上界校验；用于选择对应的不变量检查分支
+     * @return {@code finalization} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
      */
     public static RedoBudgetWorkload finalization(Collection<UndoSegmentDropPlan> droppedPlans,
                                                    int cachedCount,
@@ -109,7 +139,15 @@ public final class UndoRedoBudgetEstimator {
         return finalization(droppedPlans, cachedCount, 0, includesTerminalDelta);
     }
 
-    /** cache/free/drop 混合终结预算；FREE 每段覆盖 page3 base、首页 reset 与相邻节点 relink。 */
+    /** cache/free/drop 混合终结预算；FREE 每段覆盖 page3 base、首页 reset 与相邻节点 relink。
+     *
+     * @param droppedPlans 参与 {@code finalization} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @param cachedCount 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @param freeCount 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @param includesTerminalDelta 当前算法是否纳入终态增量、同步压力、磁盘来源、根节点或周期上界校验；用于选择对应的不变量检查分支
+     * @return {@code finalization} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public static RedoBudgetWorkload finalization(Collection<UndoSegmentDropPlan> droppedPlans,
                                                    int cachedCount, int freeCount,
                                                    boolean includesTerminalDelta) {
@@ -136,7 +174,11 @@ public final class UndoRedoBudgetEstimator {
         }
     }
 
-    /** UPDATE header 加 terminal delta；mixed commit 再合并 INSERT drop plan。 */
+    /** UPDATE header 加 terminal delta；mixed commit 再合并 INSERT drop plan。
+     *
+     * @param insertDropPlan 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @return {@code commit} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     */
     public static RedoBudgetWorkload commit(UndoSegmentDropPlan insertDropPlan) {
         if (insertDropPlan == null) {
             return RedoBudgetWorkload.pageImages(3L);
@@ -144,12 +186,24 @@ public final class UndoRedoBudgetEstimator {
         return finalization(java.util.List.of(insertDropPlan), true).plus(RedoBudgetWorkload.pageImages(2L));
     }
 
-    /** mixed/INSERT commit 根据最终 disposition 选择 drop 或 cached header reset 上界。 */
+    /** mixed/INSERT commit 根据最终 disposition 选择 drop 或 cached header reset 上界。
+     *
+     * @param insertPlan 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param cacheInsert 既有物理或缓存步骤是否已经发生；该事实用于避免重复修改、重复补偿或错误发布中间状态
+     * @return {@code commit} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     */
     public static RedoBudgetWorkload commit(UndoSegmentDropPlan insertPlan, boolean cacheInsert) {
         return commit(insertPlan, cacheInsert, false);
     }
 
-    /** mixed/INSERT commit 根据最终 cache/free/drop disposition 选择完整终结预算。 */
+    /** mixed/INSERT commit 根据最终 cache/free/drop disposition 选择完整终结预算。
+     *
+     * @param insertPlan 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @param cacheInsert 既有物理或缓存步骤是否已经发生；该事实用于避免重复修改、重复补偿或错误发布中间状态
+     * @param freeInsert 既有物理或缓存步骤是否已经发生；该事实用于避免重复修改、重复补偿或错误发布中间状态
+     * @return {@code commit} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public static RedoBudgetWorkload commit(UndoSegmentDropPlan insertPlan,
                                             boolean cacheInsert, boolean freeInsert) {
         if (insertPlan == null) {
@@ -168,6 +222,7 @@ public final class UndoRedoBudgetEstimator {
      *
      * @param undoLogCount 当前事务普通 INSERT/UPDATE undo log 数量，v1 只允许 1..2
      * @return 覆盖 first-page metadata与 transaction-state logical redo 的保守工作量
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public static RedoBudgetWorkload prepare(int undoLogCount) {
         if (undoLogCount < 1 || undoLogCount > 2) {

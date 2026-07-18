@@ -39,7 +39,10 @@ class MetadataLockManagerTest {
         }
     }
 
-    /** pending X 后到达的 SR 不得插队；释放当前 reader 后必须先授 X，再授后来的 reader。 */
+    /** pending X 后到达的 SR 不得插队；释放当前 reader 后必须先授 X，再授后来的 reader。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void preventsReaderBargingPastPendingExclusiveRequest() throws Exception {
         MetadataLockManager manager = new MetadataLockManager(8, 64);
@@ -64,7 +67,10 @@ class MetadataLockManagerTest {
         }
     }
 
-    /** SU owner 升级 X 时保留原 ticket，等待其它 SW 退出；成功后 ticket mode 原子切换为 X。 */
+    /** SU owner 升级 X 时保留原 ticket，等待其它 SW 退出；成功后 ticket mode 原子切换为 X。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void upgradesSharedUpgradableAfterBlockersLeave() throws Exception {
         MetadataLockManager manager = new MetadataLockManager(8, 64);
@@ -99,7 +105,10 @@ class MetadataLockManagerTest {
         assertTrue(manager.snapshot().waitEdges().isEmpty());
     }
 
-    /** 两个 table key 形成 metadata 环时，最后形成环的当前请求是确定性 victim，行锁图不参与。 */
+    /** 两个 table key 形成 metadata 环时，最后形成环的当前请求是确定性 victim，行锁图不参与。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void detectsCrossKeyMetadataDeadlockAndKeepsOtherWaiterLive() throws Exception {
         MetadataLockManager manager = new MetadataLockManager(8, 64);

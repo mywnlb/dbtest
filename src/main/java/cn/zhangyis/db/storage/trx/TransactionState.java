@@ -29,6 +29,8 @@ public enum TransactionState {
     /**
      * 本状态是否允许转到 {@code target}。非法转换由 {@code TransactionManager} 据此抛
      * {@link TransactionStateException}，把状态约束集中在状态机而非散落的布尔判断。
+     * @param target 选择 {@code canTransitionTo} 分支的 {@code TransactionState} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     * @return {@code canTransitionTo} 命名的领域事实成立时为 {@code true}，否则为 {@code false}；查询本身不改变权威状态
      */
     public boolean canTransitionTo(TransactionState target) {
         return switch (this) {

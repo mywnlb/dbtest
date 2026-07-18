@@ -40,6 +40,9 @@ class BufferPoolPrefetchTest {
         return PageId.of(SPACE, PageNo.of(no));
     }
 
+    /**
+     * 验证 {@code prefetchLoadsPageThenDemandReadHits} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void prefetchLoadsPageThenDemandReadHits() {
         try (CountingPageStore store = openStore(8)) {
@@ -56,6 +59,9 @@ class BufferPoolPrefetchTest {
         }
     }
 
+    /**
+     * 验证 {@code prefetchSkipsAlreadyResidentPage} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void prefetchSkipsAlreadyResidentPage() {
         try (CountingPageStore store = openStore(8)) {
@@ -69,6 +75,9 @@ class BufferPoolPrefetchTest {
         }
     }
 
+    /**
+     * 验证 {@code prefetchDroppedWhenNoFreeFrame} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void prefetchDroppedWhenNoFreeFrame() {
         try (CountingPageStore store = openStore(8)) {
@@ -82,6 +91,9 @@ class BufferPoolPrefetchTest {
         }
     }
 
+    /**
+     * 验证 {@code prefetchedPageIsUnfixedAndEvictedBeforeFixedPage} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void prefetchedPageIsUnfixedAndEvictedBeforeFixedPage() {
         try (CountingPageStore store = openStore(8)) {
@@ -104,6 +116,9 @@ class BufferPoolPrefetchTest {
         }
     }
 
+    /**
+     * 验证 {@code prefetchReclaimsFrameOnIoFailure} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void prefetchReclaimsFrameOnIoFailure() {
         try (CountingPageStore store = openStore(8)) {

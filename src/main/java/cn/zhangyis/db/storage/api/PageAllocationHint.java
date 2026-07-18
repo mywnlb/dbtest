@@ -35,13 +35,23 @@ public record PageAllocationHint(Direction direction, Optional<PageNo> hintPageN
         return new PageAllocationHint(Direction.NO_DIRECTION, Optional.empty(), 1L);
     }
 
-    /** 向更大页号方向增长。 */
+    /** 向更大页号方向增长。
+     *
+     * @param hintPageNo 参与 {@code up} 的稳定领域标识 {@code PageNo}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param pagesNeeded 参与 {@code up} 的上界或规格值 {@code pagesNeeded}；必须非负且不能使容量、页数或编码长度计算溢出
+     * @return {@code up} 取得或创建的受控存储资源；成功时不为 {@code null}，调用方必须按其 Guard/lease 契约释放
+     */
     public static PageAllocationHint up(PageNo hintPageNo, long pagesNeeded) {
         requireHintPage(hintPageNo);
         return new PageAllocationHint(Direction.UP, Optional.of(hintPageNo), pagesNeeded);
     }
 
-    /** 向更小页号方向增长。 */
+    /** 向更小页号方向增长。
+     *
+     * @param hintPageNo 参与 {@code down} 的稳定领域标识 {@code PageNo}；不得为 {@code null}，并须由对应值对象构造校验产生
+     * @param pagesNeeded 参与 {@code down} 的上界或规格值 {@code pagesNeeded}；必须非负且不能使容量、页数或编码长度计算溢出
+     * @return {@code down} 取得或创建的受控存储资源；成功时不为 {@code null}，调用方必须按其 Guard/lease 契约释放
+     */
     public static PageAllocationHint down(PageNo hintPageNo, long pagesNeeded) {
         requireHintPage(hintPageNo);
         return new PageAllocationHint(Direction.DOWN, Optional.of(hintPageNo), pagesNeeded);

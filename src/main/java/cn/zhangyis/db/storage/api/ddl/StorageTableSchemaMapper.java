@@ -22,6 +22,10 @@ final class StorageTableSchemaMapper {
 
     /**
      * DD columnId 只作为稳定身份；Record 层要求 ColumnId==ordinal，因此先建立显式映射，索引键不得直接强转 id。
+     *
+     * @param definition 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @param clustered 索引结构属性；为 {@code true} 时必须执行相应聚簇、唯一性或主键不变量校验
+     * @return {@code tableSchema} 形成的不可变定义、计划或元数据快照；成功时不为 {@code null}，内部身份、版本和范围已完成交叉校验
      */
     TableSchema tableSchema(StorageTableDefinition definition, boolean clustered) {
         List<ColumnDef> columns = definition.columns().stream()
@@ -31,7 +35,12 @@ final class StorageTableSchemaMapper {
         return new TableSchema(definition.schemaVersion(), columns, clustered);
     }
 
-    /** 把 index key 中的 DD columnId 解析为本表物理 ordinal。 */
+    /** 把 index key 中的 DD columnId 解析为本表物理 ordinal。
+     *
+     * @param table 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @param index 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @return {@code indexKey} 形成的不可变定义、计划或元数据快照；成功时不为 {@code null}，内部身份、版本和范围已完成交叉校验
+     */
     IndexKeyDef indexKey(StorageTableDefinition table, StorageIndexDefinition index) {
         Map<Long, Integer> ordinals = new HashMap<>();
         for (StorageColumnDefinition column : table.columns()) {

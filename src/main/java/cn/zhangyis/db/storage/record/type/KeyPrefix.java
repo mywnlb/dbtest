@@ -25,6 +25,14 @@ public final class KeyPrefix {
     /**
      * 按 key part 的 {@code prefixBytes} 截断一个**已编码**字段切片，供 codec 保序比较。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取 checkpoint、redo、doublewrite 或事务持久证据，并校验阶段、范围与文件身份。</li>
+     *     <li>依据 page LSN、恢复进度和稳定标识判断跳过或续作，保证重复启动不会重复产生副作用。</li>
+     *     <li>按恢复阶段应用物理页或事务状态变化，并在每个可恢复边界记录已完成进度。</li>
+     *     <li>发布恢复结果并释放恢复专用资源；失败保持 fail-closed，不能提前开放普通 SQL 流量。</li>
+     * </ol>
+     *
      * @param encoded     列值的保序编码切片（record 侧列切片，或 key 侧临时编码）。
      * @param type        列类型，用于判定是否可前缀。
      * @param prefixBytes key part 的前缀字节数；{@code <=0} 表示整列（原样返回）。
@@ -32,17 +40,20 @@ public final class KeyPrefix {
      * @throws DatabaseValidationException 当 {@code prefixBytes>0} 但列不是字节类型时。
      */
     public static FieldSlice apply(FieldSlice encoded, ColumnType type, int prefixBytes) {
+        // 1、读取 checkpoint、redo、doublewrite 或事务持久证据，在共享或持久副作用前拒绝非法状态。
         if (encoded == null || type == null) {
             throw new DatabaseValidationException("key prefix slice/type must not be null");
         }
         if (prefixBytes <= 0) {
             return encoded;
         }
+        // 2、继续完成范围、身份与候选校验；通过后，依据 page LSN、恢复进度和稳定标识判断跳过或续作，保持处理顺序与资源边界。
         if (!isBytePrefixable(type.typeId())) {
             throw new DatabaseValidationException(
                     "prefix index length only applies to CHAR/VARCHAR/BINARY/VARBINARY, not " + type.typeId());
         }
         int len = Math.min(encoded.length(), prefixBytes);
+        // 3、在中间分支复核阶段性结果；满足条件后，按恢复阶段应用物理页或事务状态变化，并维持领域不变量。
         if ((type.typeId() == TypeId.CHAR || type.typeId() == TypeId.VARCHAR)
                 && type.charset() == CharsetId.UTF8
                 && type.collation() == CollationId.UTF8_UNICODE_CI_V1) {
@@ -51,6 +62,7 @@ public final class KeyPrefix {
         if (len == encoded.length()) {
             return encoded;
         }
+        // 4、发布恢复结果并释放恢复专用资源，以稳定返回或领域异常完成收口。
         return new FieldSlice(encoded.backing(), encoded.offset(), len);
     }
 

@@ -54,6 +54,9 @@ class PageZeroTablespaceMetadataLoaderTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code rebuildsMetadataFromDiskPageZero} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void rebuildsMetadataFromDiskPageZero() {
         Path path = dir.resolve("loader.ibu");
@@ -171,6 +174,9 @@ class PageZeroTablespaceMetadataLoaderTest {
         }
     }
 
+    /**
+     * 验证 {@code returnsEmptyForUnopenedSpace} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void returnsEmptyForUnopenedSpace() {
         try (PageStore store = new FileChannelPageStore()) {
@@ -179,7 +185,10 @@ class PageZeroTablespaceMetadataLoaderTest {
         }
     }
 
-    /** loader 的 raw page0 读取也必须受共享 operation lease 保护，不能跨越 truncate X。 */
+    /** loader 的 raw page0 读取也必须受共享 operation lease 保护，不能跨越 truncate X。
+     *
+     * @throws Exception 底层扩展点报告受检失败时抛出；调用方应保留原始 cause 并终止当前编排步骤
+     */
     @Test
     void loaderWaitsBehindExclusiveTablespaceLease() throws Exception {
         Path path = dir.resolve("lease-loader.ibu");

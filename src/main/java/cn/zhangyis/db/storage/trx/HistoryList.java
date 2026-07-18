@@ -48,10 +48,19 @@ public final class HistoryList {
     /** 当前唯一转换；非 null 时其他 writer 必须等待。 */
     private TransitionLease activeTransition;
 
+    /**
+     * 创建 {@code HistoryList}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     */
     public HistoryList() {
         this(DEFAULT_TRANSITION_TIMEOUT);
     }
 
+    /**
+     * 创建 {@code HistoryList}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param transitionTimeout 本次等待或操作的最大时长；不得为 {@code null} 且必须为正，超时不得留下未释放资源
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public HistoryList(Duration transitionTimeout) {
         if (transitionTimeout == null || transitionTimeout.isZero() || transitionTimeout.isNegative()) {
             throw new DatabaseValidationException("history transition timeout must be positive");
@@ -61,6 +70,9 @@ public final class HistoryList {
 
     /**
      * 预约一次队尾 append。返回前只冻结运行时快照，不产生磁盘或队列副作用；调用方可安全执行只读预检。
+     *
+     * @param entry 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @return {@code beginAppend} 取得或创建的受控存储资源；成功时不为 {@code null}，调用方必须按其 Guard/lease 契约释放
      */
     public AppendLease beginAppend(HistoryEntry entry) {
         requireEntry(entry, "history append");
@@ -77,6 +89,10 @@ public final class HistoryList {
 
     /**
      * 预约一次队首摘除。expected 必须仍是运行时 head；purge 的 B+Tree 任务应在调用本方法前完成，缩短门占用时间。
+     *
+     * @param expected 事务回滚链上的 undo 记录、计划或段访问对象；不得为 {@code null}，其事务身份、roll pointer 和段生命周期必须相互一致
+     * @return {@code beginHeadRemoval} 取得或创建的受控存储资源；成功时不为 {@code null}，调用方必须按其 Guard/lease 契约释放
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public HeadRemovalLease beginHeadRemoval(HistoryEntry expected) {
         requireEntry(expected, "history head removal");
@@ -96,7 +112,10 @@ public final class HistoryList {
         }
     }
 
-    /** 查看物理链首节点，不移除。 */
+    /** 查看物理链首节点，不移除。
+     *
+     * @return {@code peekCommitted} 按身份或键定位到的对象；未找到、不可见或尚未持久化时为空 {@code Optional}，从不返回 Java {@code null}
+     */
     public Optional<HistoryEntry> peekCommitted() {
         lock.lock();
         try {
@@ -317,10 +336,25 @@ public final class HistoryList {
 
     /** 一次跨 IO history 转换的公共生命周期。 */
     public abstract class TransitionLease implements AutoCloseable {
+        /**
+         * 本次事务链路持有的 {@code expectedHead} undo/rollback 状态；事务身份、roll pointer 与段代际必须一致，提交、回滚和 purge 路径依赖它完成收口。
+         */
         private final HistoryEntry expectedHead;
+        /**
+         * 本次事务链路持有的 {@code expectedTail} undo/rollback 状态；事务身份、roll pointer 与段代际必须一致，提交、回滚和 purge 路径依赖它完成收口。
+         */
         private final HistoryEntry expectedTail;
+        /**
+         * 记录 {@code expectedSize} 的非负位置、容量或计数；写入前必须校验所属页/集合上界，溢出会破坏布局或资源记账。
+         */
         private final int expectedSize;
+        /**
+         * 记录 {@code physicalMutationStarted} 生命周期事实是否成立；只由本类状态转换更新，共享访问受所属显式锁、原子发布或单一 owner 线程保护。
+         */
         private boolean physicalMutationStarted;
+        /**
+         * 记录 {@code completed} 生命周期事实是否成立；只由本类状态转换更新，共享访问受所属显式锁、原子发布或单一 owner 线程保护。
+         */
         private boolean completed;
 
         private TransitionLease(HistoryEntry expectedHead, HistoryEntry expectedTail, int expectedSize) {
@@ -347,6 +381,7 @@ public final class HistoryList {
         /**
          * 标记即将进入物理修改阶段。调用前再次复核运行时投影；此后即使 MTR 尚可回滚，也保守视为结果不确定，
          * 未 {@link #complete()} 就关闭会保留 fail-stop fence。
+         * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
          */
         public final void physicalMutationStarted() {
             lock.lock();
@@ -362,7 +397,10 @@ public final class HistoryList {
             }
         }
 
-        /** 磁盘 MTR 已提交后发布队列变更并唤醒下一个转换。 */
+        /** 磁盘 MTR 已提交后发布队列变更并唤醒下一个转换。
+         *
+         * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+         */
         public final void complete() {
             lock.lock();
             try {
@@ -381,6 +419,11 @@ public final class HistoryList {
             }
         }
 
+        /**
+         * 释放本方法拥有的事务、MVCC 与锁资源；遵守既定释放顺序，重复或失败调用不得掩盖原始状态。
+         *
+         * @throws DatabaseFatalException 错误已破坏实例继续运行的安全前提时抛出；owner 应停止接收新请求并关闭实例
+         */
         @Override
         public final void close() {
             lock.lock();
@@ -415,11 +458,17 @@ public final class HistoryList {
             }
         }
 
+        /**
+         * 推进 {@code publish} 对应的事务、MVCC 与锁阶段转换；成功只发布一次目标状态，失败路径保留可取消或可诊断的原状态。
+         */
         abstract void publish();
     }
 
     /** commit append lease；entry 只在 persistent MTR commit 后进入运行时队尾。 */
     public final class AppendLease extends TransitionLease {
+        /**
+         * 本次事务链路持有的 {@code entry} undo/rollback 状态；事务身份、roll pointer 与段代际必须一致，提交、回滚和 purge 路径依赖它完成收口。
+         */
         private final HistoryEntry entry;
 
         private AppendLease(HistoryEntry entry, HistoryEntry expectedHead,
@@ -432,6 +481,9 @@ public final class HistoryList {
             return entry;
         }
 
+        /**
+         * 推进 {@code publish} 对应的事务、MVCC 与锁阶段转换；成功只发布一次目标状态，失败路径保留可取消或可诊断的原状态。
+         */
         @Override
         void publish() {
             committed.addLast(entry);
@@ -441,6 +493,9 @@ public final class HistoryList {
 
     /** purge head-removal lease；expected 只在 persistent unlink commit 后从运行时队首删除。 */
     public final class HeadRemovalLease extends TransitionLease {
+        /**
+         * 本次事务链路持有的 {@code expected} undo/rollback 状态；事务身份、roll pointer 与段代际必须一致，提交、回滚和 purge 路径依赖它完成收口。
+         */
         private final HistoryEntry expected;
 
         private HeadRemovalLease(HistoryEntry expected, HistoryEntry expectedTail, int expectedSize) {
@@ -452,6 +507,11 @@ public final class HistoryList {
             return expected;
         }
 
+        /**
+         * 推进 {@code publish} 对应的事务、MVCC 与锁阶段转换；成功只发布一次目标状态，失败路径保留可取消或可诊断的原状态。
+         *
+         * @throws DatabaseFatalException 错误已破坏实例继续运行的安全前提时抛出；owner 应停止接收新请求并关闭实例
+         */
         @Override
         void publish() {
             HistoryEntry current = committed.peekFirst();

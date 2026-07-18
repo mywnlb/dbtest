@@ -64,6 +64,14 @@ public final class RotatingRedoLogRepository implements RedoLogFileRepository, R
     /** 已持久 checkpoint 允许回收的最高逻辑 LSN，只能单调前进。 */
     private long reclaimBoundary;
 
+    /**
+     * 创建 {@code RotatingRedoLogRepository}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param dir 受控目录内的规范化文件路径；不得为 {@code null}，也不得逃逸所属表空间或日志目录
+     * @param maxBlockBytesPerFile 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @param files 参与 {@code 构造} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @param writable 资源的访问模式；写模式允许受控修改，读模式禁止产生 dirty、redo 或元数据发布副作用
+     */
     private RotatingRedoLogRepository(Path dir, int maxBlockBytesPerFile,
                                       RingFile[] files, boolean writable) {
         this.dir = dir;
@@ -73,12 +81,24 @@ public final class RotatingRedoLogRepository implements RedoLogFileRepository, R
         rebuildState();
     }
 
-    /** 打开或创建 writable ring；目录无任何匹配文件时初始化 fresh v2 文件集合。 */
+    /** 打开或创建 writable ring；目录无任何匹配文件时初始化 fresh v2 文件集合。
+     *
+     * @param dir 受控目录内的规范化文件路径；不得为 {@code null}，也不得逃逸所属表空间或日志目录
+     * @param fileCount 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @param fileBytes 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @return {@code open} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     */
     public static RotatingRedoLogRepository open(Path dir, int fileCount, long fileBytes) {
         return openInternal(dir, fileCount, fileBytes, true);
     }
 
-    /** 只读打开完整的 existing ring；目录或任一预期文件缺失都会失败且不创建。 */
+    /** 只读打开完整的 existing ring；目录或任一预期文件缺失都会失败且不创建。
+     *
+     * @param dir 受控目录内的规范化文件路径；不得为 {@code null}，也不得逃逸所属表空间或日志目录
+     * @param fileCount 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @param fileBytes 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @return {@code openReadOnly} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     */
     public static RotatingRedoLogRepository openReadOnly(Path dir, int fileCount, long fileBytes) {
         return openInternal(dir, fileCount, fileBytes, false);
     }
@@ -87,6 +107,11 @@ public final class RotatingRedoLogRepository implements RedoLogFileRepository, R
      * 只探测目录中是否存在稳定命名的 ring 文件，不创建目录，也不把无关诊断文件视为 existing 实例。
      * StorageEngine 用该事实区分 fresh/existing；只要发现任意匹配文件就返回 true，完整性仍由 open 校验，
      * 因而 partial ring 不会被当作 fresh 后覆盖重建。
+     *
+     * @param dir 受控目录内的规范化文件路径；不得为 {@code null}，也不得逃逸所属表空间或日志目录
+     * @return {@code hasAnyRingFiles} 命名的领域事实成立时为 {@code true}，否则为 {@code false}；查询本身不改变权威状态
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws RedoLogIoException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
      */
     public static boolean hasAnyRingFiles(Path dir) {
         if (dir == null) {
@@ -99,6 +124,16 @@ public final class RotatingRedoLogRepository implements RedoLogFileRepository, R
         }
     }
 
+    /**
+     * 根据调用参数创建或转换 {@code openInternal} 返回的 {@code RotatingRedoLogRepository}；输入先完成领域校验，成功结果不为 {@code null}。
+     *
+     * @param dir 受控目录内的规范化文件路径；不得为 {@code null}，也不得逃逸所属表空间或日志目录
+     * @param fileCount 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @param fileBytes 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @param writable 资源的访问模式；写模式允许受控修改，读模式禁止产生 dirty、redo 或元数据发布副作用
+     * @return {@code openInternal} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     * @throws RedoLogIoException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
+     */
     private static RotatingRedoLogRepository openInternal(
             Path dir, int fileCount, long fileBytes, boolean writable) {
         validateOpenInputs(dir, fileCount, fileBytes);
@@ -135,6 +170,10 @@ public final class RotatingRedoLogRepository implements RedoLogFileRepository, R
     /**
      * 追加完整 batch chain。编码/容量/LSN 校验在文件 mutation 前完成；若 active 尾部有 torn bytes，
      * {@link RingFile#appendBlocks} 才从最后可信 block 边界截断并覆盖。
+     * @param batch redo 收集、定位或重放所需的日志对象；不得为 {@code null}，其 LSN 范围和记录格式必须连续且属于当前恢复或 MTR 上下文
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws RedoLogCorruptedException 检测到不能安全解释的持久数据损坏时抛出；调用方不得继续发布普通服务或覆盖原始证据
+     * @throws RedoLogIoException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
      */
     @Override
     public void append(RedoLogBatch batch) {
@@ -184,7 +223,10 @@ public final class RotatingRedoLogRepository implements RedoLogFileRepository, R
         activeIndex = next;
     }
 
-    /** force 所有 in-use 文件，确保跨文件 write boundary 一次持久。 */
+    /** force 所有 in-use 文件，确保跨文件 write boundary 一次持久。
+     *
+     * @throws RedoLogIoException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
+     */
     @Override
     public void force() {
         requireWritable("force");
@@ -208,7 +250,10 @@ public final class RotatingRedoLogRepository implements RedoLogFileRepository, R
         return readRecoveryScan().batches();
     }
 
-    /** 在同一 ioLock 临界区返回 batches 与 ring header 边界，避免 torn-only 文件的非零起点丢失。 */
+    /** 在同一 ioLock 临界区返回 batches 与 ring header 边界，避免 torn-only 文件的非零起点丢失。
+     *
+     * @return {@code readRecoveryScan} 构造或定位的 redo 日志对象；成功时不为 {@code null}，LSN、预算和批次边界满足 WAL 顺序
+     */
     @Override
     public RedoRecoveryScan readRecoveryScan() {
         ioLock.lock();
@@ -227,7 +272,11 @@ public final class RotatingRedoLogRepository implements RedoLogFileRepository, R
         return RedoLogBlockCodec.FORMAT_VERSION;
     }
 
-    /** 单调推进内存回收边界；只读诊断实例禁止改变后续复用决策。 */
+    /** 单调推进内存回收边界；只读诊断实例禁止改变后续复用决策。
+     *
+     * @param checkpointLsn redo 日志边界；不得为 {@code null}，必须单调且与调用方已发布的页或事务状态一致
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     @Override
     public void advanceReclaimBoundary(Lsn checkpointLsn) {
         if (checkpointLsn == null) {
@@ -244,7 +293,10 @@ public final class RotatingRedoLogRepository implements RedoLogFileRepository, R
         }
     }
 
-    /** 当前 active fileId，供容量/轮转诊断测试读取。 */
+    /** 当前 active fileId，供容量/轮转诊断测试读取。
+     *
+     * @return {@code activeFileId} 返回的稳定数值身份或单调版本；零值仅按对应格式的系统/空身份约定解释，非法回退通过领域异常报告
+     */
     public int activeFileId() {
         ioLock.lock();
         try {
@@ -254,7 +306,10 @@ public final class RotatingRedoLogRepository implements RedoLogFileRepository, R
         }
     }
 
-    /** 关闭全部 channel；多个关闭失败时保留首个 cause 并把其余加入 suppressed。 */
+    /** 关闭全部 channel；多个关闭失败时保留首个 cause 并把其余加入 suppressed。
+     *
+     * @throws RedoLogIoException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
+     */
     @Override
     public void close() {
         ioLock.lock();
@@ -339,6 +394,14 @@ public final class RotatingRedoLogRepository implements RedoLogFileRepository, R
         return List.copyOf(all);
     }
 
+    /**
+     * 校验 {@code validateOpenInputs} 涉及的Redo/WAL结构、范围与交叉字段；合法输入不修改状态，非法输入在副作用前抛出领域异常。
+     *
+     * @param dir 受控目录内的规范化文件路径；不得为 {@code null}，也不得逃逸所属表空间或日志目录
+     * @param fileCount 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @param fileBytes 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     private static void validateOpenInputs(Path dir, int fileCount, long fileBytes) {
         if (dir == null) {
             throw new DatabaseValidationException("redo ring dir must not be null");
@@ -389,6 +452,12 @@ public final class RotatingRedoLogRepository implements RedoLogFileRepository, R
         }
     }
 
+    /**
+     * 释放本方法拥有的Redo/WAL资源；遵守既定释放顺序，重复或失败调用不得掩盖原始状态。
+     *
+     * @param opened 参与 {@code closeAfterOpenFailure} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @param original 需要分类或包装的原始失败；不得为 {@code null}，包装时必须保留 cause 与 suppressed 异常图
+     */
     private static void closeAfterOpenFailure(List<RingFile> opened, Throwable original) {
         for (RingFile file : opened) {
             try {
@@ -450,6 +519,15 @@ public final class RotatingRedoLogRepository implements RedoLogFileRepository, R
             }
         }
 
+        /**
+         * 根据调用参数创建或转换 {@code openExisting} 返回的 {@code RingFile}；输入先完成领域校验，成功结果不为 {@code null}。
+         *
+         * @param path 受控目录内的规范化文件路径；不得为 {@code null}，也不得逃逸所属表空间或日志目录
+         * @param fileId 参与 {@code openExisting} 的原始数值身份 {@code fileId}；必须非负，零值仅用于对应格式明确声明的系统或空身份
+         * @param writable 资源的访问模式；写模式允许受控修改，读模式禁止产生 dirty、redo 或元数据发布副作用
+         * @return {@code openExisting} 准备或解码出的中间领域对象；成功时不为 {@code null}，其边界、资源归属和后续发布阶段已明确
+         * @throws IOException 底层文件读写失败时抛出；调用方不得据此发布持久化成功状态
+         */
         private static RingFile openExisting(Path path, int fileId, boolean writable) throws IOException {
             FileChannel channel = writable
                     ? FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE)
@@ -468,8 +546,22 @@ public final class RotatingRedoLogRepository implements RedoLogFileRepository, R
             }
         }
 
-        /** existing header 任何结构错误都 fail-closed，不再改写为空闲文件。 */
+        /** existing header 任何结构错误都 fail-closed，不再改写为空闲文件。
+         *
+         * <p>数据流：</p>
+         * <ol>
+         *     <li>读取并校验调用参数与当前领域状态，确保失败发生在本方法创建共享或持久副作用之前。</li>
+         *     <li>按类级并发协议取得本阶段所需协作者与 Guard，竞争后重新校验资源身份和生命周期。</li>
+         *     <li>执行核心状态转换与受控 IO，把必要的 redo、dirty 或诊断副作用交给既有下游。</li>
+         *     <li>汇总稳定结果并沿现有 finally/Guard 释放资源；异常不得伪造成功或清除未完成状态。</li>
+         * </ol>
+         *
+         * @throws IOException 底层文件读写失败时抛出；调用方不得据此发布持久化成功状态
+         * @throws RedoLogCorruptedException 检测到不能安全解释的持久数据损坏时抛出；调用方不得继续发布普通服务或覆盖原始证据
+         * @throws RedoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+         */
         private void readHeader() throws IOException {
+            // 1、读取并校验调用参数与当前领域状态，在共享或持久副作用前拒绝非法状态。
             if (channel.size() < FILE_HEADER_BYTES) {
                 throw new RedoLogCorruptedException("redo ring header is truncated: " + path);
             }
@@ -477,11 +569,13 @@ public final class RotatingRedoLogRepository implements RedoLogFileRepository, R
             readFullyAt(0, header);
             header.flip();
             int magic = header.getInt();
+            // 2、继续完成范围、身份与候选校验；通过后，按类级并发协议取得本阶段所需协作者与 Guard，保持处理顺序与资源边界。
             int version = header.getInt();
             int storedFileId = header.getInt();
             int inUseFlag = header.getInt();
             long storedStartLsn = header.getLong();
             int storedCrc = header.getInt();
+            // 3、在中间分支复核阶段性结果；满足条件后，执行核心状态转换与受控 IO，并维持领域不变量。
             if (magic != HEADER_MAGIC) {
                 throw new RedoLogCorruptedException("redo ring header magic mismatch: " + path);
             }
@@ -497,6 +591,7 @@ public final class RotatingRedoLogRepository implements RedoLogFileRepository, R
             if (storedFileId != fileId || (inUseFlag != 0 && inUseFlag != 1)) {
                 throw new RedoLogCorruptedException("redo ring header fields are invalid: " + path);
             }
+            // 4、汇总稳定结果并沿现有 finally/Guard 释放资源，以稳定返回或领域异常完成收口。
             if (inUseFlag == 0) {
                 if (storedStartLsn != 0) {
                     throw new RedoLogCorruptedException("free redo ring file has non-zero start LSN: " + path);
@@ -557,7 +652,13 @@ public final class RotatingRedoLogRepository implements RedoLogFileRepository, R
             blockBytesUsed = 0;
         }
 
-        /** 写入前截掉 scanner 已判定的 torn 后缀；成功返回后才发布 blockBytesUsed/endLsn。 */
+        /** 写入前截掉 scanner 已判定的 torn 后缀；成功返回后才发布 blockBytesUsed/endLsn。
+         *
+         * @param blocks 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+         * @param byteLength 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+         * @param batchEndLsn redo 日志边界；不得为 {@code null}，必须单调且与调用方已发布的页或事务状态一致
+         * @throws IOException 底层文件读写失败时抛出；调用方不得据此发布持久化成功状态
+         */
         private void appendBlocks(ByteBuffer blocks, int byteLength, long batchEndLsn) throws IOException {
             long writeOffset = FILE_HEADER_BYTES + (long) blockBytesUsed;
             if (channel.size() != writeOffset) {
@@ -572,19 +673,41 @@ public final class RotatingRedoLogRepository implements RedoLogFileRepository, R
             channel.force(true);
         }
 
+        /**
+         * 校验输入与当前状态后修改Redo/WAL领域数据；成功发布完整结果，异常路径保留既有持久化与并发不变量。
+         *
+         * <p>数据流：</p>
+         * <ol>
+         *     <li>读取并校验调用参数与当前领域状态，确保失败发生在本方法创建共享或持久副作用之前。</li>
+         *     <li>按类级并发协议取得本阶段所需协作者与 Guard，竞争后重新校验资源身份和生命周期。</li>
+         *     <li>执行核心状态转换或数据变换，并只通过本包稳定协作者发布可观察副作用。</li>
+         *     <li>汇总稳定结果并沿现有 finally/Guard 释放资源；异常不得伪造成功或清除未完成状态。</li>
+         * </ol>
+         *
+         * @param used 既有物理或缓存步骤是否已经发生；该事实用于避免重复修改、重复补偿或错误发布中间状态
+         * @param startLsn redo 日志边界；不得为 {@code null}，必须单调且与调用方已发布的页或事务状态一致
+         * @throws IOException 底层文件读写失败时抛出；调用方不得据此发布持久化成功状态
+         */
         private void writeHeader(boolean used, long startLsn) throws IOException {
+            // 1、读取并校验调用参数与当前领域状态，在共享或持久副作用前拒绝非法状态。
             int flag = used ? 1 : 0;
             ByteBuffer header = ByteBuffer.allocate(FILE_HEADER_BYTES);
             header.putInt(HEADER_MAGIC);
+            // 2、继续完成范围、身份与候选校验；通过后，按类级并发协议取得本阶段所需协作者与 Guard，保持处理顺序与资源边界。
             header.putInt(FILE_FORMAT_VERSION);
             header.putInt(fileId);
             header.putInt(flag);
+            // 3、在中间分支复核阶段性结果；满足条件后，执行核心状态转换或数据变换，并维持领域不变量。
             header.putLong(startLsn);
             header.putInt(headerCrc(HEADER_MAGIC, FILE_FORMAT_VERSION, fileId, flag, startLsn));
             header.flip();
+            // 4、汇总稳定结果并沿现有 finally/Guard 释放资源，以稳定返回或领域异常完成收口。
             writeFullyAt(0, header);
         }
 
+        /**
+         * 更新 {@code markFree} 指定的Redo/WAL局部状态；写入前校验身份和范围，成功后由所属对象维护一致性。
+         */
         private void markFree() {
             inUse = false;
             startLsn = 0;
@@ -596,6 +719,14 @@ public final class RotatingRedoLogRepository implements RedoLogFileRepository, R
             channel.close();
         }
 
+        /**
+         * 定位并读取Redo/WAL领域对象；先校验标识与准入状态，返回值只暴露稳定视图或受控句柄。
+         *
+         * @param offset 目标结构内的零基偏移；必须落在当前页、记录或持久槽位的合法范围
+         * @param destination 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+         * @throws IOException 底层文件读写失败时抛出；调用方不得据此发布持久化成功状态
+         * @throws RedoLogIoException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
+         */
         private void readFullyAt(long offset, ByteBuffer destination) throws IOException {
             long position = offset;
             while (destination.hasRemaining()) {
@@ -610,7 +741,13 @@ public final class RotatingRedoLogRepository implements RedoLogFileRepository, R
             }
         }
 
-        /** positional write 必须持续前进；零进度按 IO 失败处理，避免持 ring ioLock 无限自旋。 */
+        /** positional write 必须持续前进；零进度按 IO 失败处理，避免持 ring ioLock 无限自旋。
+         *
+         * @param offset 目标结构内的零基偏移；必须落在当前页、记录或持久槽位的合法范围
+         * @param source 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+         * @throws IOException 底层文件读写失败时抛出；调用方不得据此发布持久化成功状态
+         * @throws RedoLogIoException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
+         */
         private void writeFullyAt(long offset, ByteBuffer source) throws IOException {
             long position = offset;
             while (source.hasRemaining()) {

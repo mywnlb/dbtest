@@ -28,7 +28,10 @@ final class PageLoadFuture {
         done.complete(null);
     }
 
-    /** IO owner 读盘失败、已在 Buffer Pool 内部短锁下回收 LOADING 占位后调用，以异常唤醒全部等待者（等待者随后重试）。 */
+    /** IO owner 读盘失败、已在 Buffer Pool 内部短锁下回收 LOADING 占位后调用，以异常唤醒全部等待者（等待者随后重试）。
+     *
+     * @param cause 需要分类或包装的原始失败；不得为 {@code null}，包装时必须保留 cause 与 suppressed 异常图
+     */
     void failExceptionally(Throwable cause) {
         done.completeExceptionally(cause);
     }
@@ -39,6 +42,7 @@ final class PageLoadFuture {
      *
      * @param timeoutNanos 最长等待纳秒数（来自池的 load 超时配置）。
      * @param pageId       仅用于异常上下文。
+     * @throws BufferPoolLoadTimeoutException 操作在约定时限内无法完成时抛出；调用方可回滚或稍后重试
      */
     void await(long timeoutNanos, PageId pageId) {
         try {

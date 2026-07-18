@@ -87,6 +87,7 @@ final class TransactionStateRedoDeltas {
      *
      * @param mtr recovery finalization MTR。
      * @param creatorTransactionId 已核对的崩溃事务 creator id。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     static void appendRecoveredRollback(MiniTransaction mtr, TransactionId creatorTransactionId) {
         if (mtr == null || creatorTransactionId == null || creatorTransactionId.isNone()) {
@@ -111,6 +112,13 @@ final class TransactionStateRedoDeltas {
                 MtrRedoCategory.TRX_STATE, "append transaction state logical redo");
     }
 
+    /**
+     * 根据调用参数创建或转换 {@code toRedoState} 返回的 {@code TransactionStateDeltaState}；输入先完成领域校验，成功结果不为 {@code null}。
+     *
+     * @param state 调用方请求的目标状态、阶段或模式；不得为 {@code null}，且必须是当前状态机允许的后继值
+     * @return {@code toRedoState} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     private static TransactionStateDeltaState toRedoState(TransactionState state) {
         if (state == null) {
             throw new DatabaseValidationException("transaction state must not be null");

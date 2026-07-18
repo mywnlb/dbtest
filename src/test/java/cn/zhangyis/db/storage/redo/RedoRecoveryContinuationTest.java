@@ -18,6 +18,9 @@ class RedoRecoveryContinuationTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code appendsAfterRecoveredBoundaryWithoutOverlappingExistingLog} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void appendsAfterRecoveredBoundaryWithoutOverlappingExistingLog() {
         Path path = dir.resolve("redo.log");

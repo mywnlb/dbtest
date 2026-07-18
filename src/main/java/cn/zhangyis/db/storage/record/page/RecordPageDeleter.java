@@ -16,6 +16,8 @@ public final class RecordPageDeleter {
      * 对 {@code recordOffset} 处的用户记录置 delete-mark（要求 X）。
      *
      * @throws DatabaseValidationException 目标为 infimum/supremum 系统记录，或已被 delete-mark（强制 lifecycle，避免重复删除）。
+     * @param page 已固定的页面、frame 或页头视图；不得为 {@code null}，必须指向目标 PageId，并在访问期间持有契约要求的 fix/latch
+     * @param recordOffset 目标结构内的零基偏移；必须落在当前页、记录或持久槽位的合法范围
      */
     public void deleteMark(RecordPage page, int recordOffset) {
         RecordHeader header = page.recordHeaderAt(recordOffset);

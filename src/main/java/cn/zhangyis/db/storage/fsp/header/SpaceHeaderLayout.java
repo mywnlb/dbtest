@@ -16,18 +16,57 @@ public final class SpaceHeaderLayout {
     private SpaceHeaderLayout() {
     }
 
+    /**
+     * 持久结构布局常量；它定义 {@code SpaceHeaderLayout} 中 {@code SPACE_ID} 的固定偏移、槽位或宽度，读写两端必须使用同一数值。
+     */
     public static final int SPACE_ID = PageEnvelopeLayout.FIL_PAGE_HEADER_BYTES; // 38 int
+    /**
+     * 持久结构布局常量；它定义 {@code SpaceHeaderLayout} 中 {@code PAGE_SIZE_BYTES} 的固定偏移、槽位或宽度，读写两端必须使用同一数值。
+     */
     public static final int PAGE_SIZE_BYTES = SPACE_ID + 4;                  // 42 int
+    /**
+     * 持久结构布局常量；它定义 {@code SpaceHeaderLayout} 中 {@code SPACE_FLAGS} 的固定偏移、槽位或宽度，读写两端必须使用同一数值。
+     */
     public static final int SPACE_FLAGS = PAGE_SIZE_BYTES + 4;              // 46 int
+    /**
+     * 持久结构布局常量；它定义 {@code SpaceHeaderLayout} 中 {@code CURRENT_SIZE} 的固定偏移、槽位或宽度，读写两端必须使用同一数值。
+     */
     public static final int CURRENT_SIZE = SPACE_FLAGS + 4;                // 50 long
+    /**
+     * 持久结构布局常量；它定义 {@code SpaceHeaderLayout} 中 {@code FREE_LIMIT} 的固定偏移、槽位或宽度，读写两端必须使用同一数值。
+     */
     public static final int FREE_LIMIT = CURRENT_SIZE + 8;                 // 58 long
+    /**
+     * 持久结构布局常量；它定义 {@code SpaceHeaderLayout} 中 {@code NEXT_SEGMENT_ID} 的固定偏移、槽位或宽度，读写两端必须使用同一数值。
+     */
     public static final int NEXT_SEGMENT_ID = FREE_LIMIT + 8;             // 66 long
+    /**
+     * 持久结构布局常量；它定义 {@code SpaceHeaderLayout} 中 {@code FREE_EXTENT_LIST_BASE} 的固定偏移、槽位或宽度，读写两端必须使用同一数值。
+     */
     public static final int FREE_EXTENT_LIST_BASE = NEXT_SEGMENT_ID + 8;  // 74 FlstBase(32)
+    /**
+     * 持久结构布局常量；它定义 {@code SpaceHeaderLayout} 中 {@code FREE_FRAG_LIST_BASE} 的固定偏移、槽位或宽度，读写两端必须使用同一数值。
+     */
     public static final int FREE_FRAG_LIST_BASE = FREE_EXTENT_LIST_BASE + FlstBaseLayout.SIZE; // 106
+    /**
+     * 持久结构布局常量；它定义 {@code SpaceHeaderLayout} 中 {@code FULL_FRAG_LIST_BASE} 的固定偏移、槽位或宽度，读写两端必须使用同一数值。
+     */
     public static final int FULL_FRAG_LIST_BASE = FREE_FRAG_LIST_BASE + FlstBaseLayout.SIZE;   // 138
+    /**
+     * 持久结构布局常量；它定义 {@code SpaceHeaderLayout} 中 {@code FIRST_INODE_PAGE} 的固定偏移、槽位或宽度，读写两端必须使用同一数值。
+     */
     public static final int FIRST_INODE_PAGE = FULL_FRAG_LIST_BASE + FlstBaseLayout.SIZE;      // 170 long
+    /**
+     * 持久结构布局常量；它定义 {@code SpaceHeaderLayout} 中 {@code SDI_ROOT} 的固定偏移、槽位或宽度，读写两端必须使用同一数值。
+     */
     public static final int SDI_ROOT = FIRST_INODE_PAGE + 8;               // 178 long
+    /**
+     * 持久结构布局常量；它定义 {@code SpaceHeaderLayout} 中 {@code SERVER_VERSION} 的固定偏移、槽位或宽度，读写两端必须使用同一数值。
+     */
     public static final int SERVER_VERSION = SDI_ROOT + 8;                // 186 int
+    /**
+     * 持久结构布局常量；它定义 {@code SpaceHeaderLayout} 中 {@code SPACE_VERSION} 的固定偏移、槽位或宽度，读写两端必须使用同一数值。
+     */
     public static final int SPACE_VERSION = SERVER_VERSION + 4;           // 190 long (ends 198)
 
     /** undo 生命周期头魔数（4B）；为 0 表示旧格式未初始化。 */

@@ -23,6 +23,11 @@ final class ContiguousLsnTracker {
      */
     private final NavigableMap<Long, Long> pending = new TreeMap<>();
 
+    /**
+     * 创建 {@code ContiguousLsnTracker}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param initialBoundary redo 日志边界；不得为 {@code null}，必须单调且与调用方已发布的页或事务状态一致
+     */
     ContiguousLsnTracker(Lsn initialBoundary) {
         reset(initialBoundary);
     }
@@ -37,6 +42,7 @@ final class ContiguousLsnTracker {
      *
      * @param range 已完成的 redo 区间。
      * @return 推进后的连续边界。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     Lsn mark(LogRange range) {
         if (range == null) {
@@ -62,6 +68,9 @@ final class ContiguousLsnTracker {
     /**
      * 恢复或重新初始化 tracker。恢复后的历史 redo 已由 recovery reader 验证完整，closed/flushed/current
      * 都从该边界继续，pending 区间必须清空。
+     *
+     * @param boundary redo 日志边界；不得为 {@code null}，必须单调且与调用方已发布的页或事务状态一致
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     void reset(Lsn boundary) {
         if (boundary == null) {

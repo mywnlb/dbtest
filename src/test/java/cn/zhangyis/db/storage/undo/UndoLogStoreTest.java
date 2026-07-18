@@ -64,6 +64,9 @@ class UndoLogStoreTest {
                 1L, 9L, List.of(new ColumnValue.IntValue(id)), prev);
     }
 
+    /**
+     * 验证 {@code appendReturnsNonNullPointerAndReadsBack} 对应的Undo 日志行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test void appendReturnsNonNullPointerAndReadsBack() {
         onPool((mgr, disk, access) -> {
             MiniTransaction m = mgr.begin();
@@ -78,6 +81,9 @@ class UndoLogStoreTest {
         });
     }
 
+    /**
+     * 验证 {@code prevRollPointerChainsTwoRecords} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test void prevRollPointerChainsTwoRecords() {
         onPool((mgr, disk, access) -> {
             MiniTransaction m = mgr.begin();
@@ -92,6 +98,9 @@ class UndoLogStoreTest {
         });
     }
 
+    /**
+     * 验证 {@code readRecordRejectsPointerFromOtherPage} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test void readRecordRejectsPointerFromOtherPage() {
         onPool((mgr, disk, access) -> {
             MiniTransaction m = mgr.begin();
@@ -104,6 +113,9 @@ class UndoLogStoreTest {
         });
     }
 
+    /**
+     * 验证 {@code doubleNewPageEndsAsUndoAndSurvivesReload} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test void doubleNewPageEndsAsUndoAndSurvivesReload() {
         onPool((mgr, disk, access) -> {
             // 同一 MTR：allocatePage(ALLOCATED) 后 createFirstPage(UNDO)，append 一条，commit。
@@ -124,6 +136,9 @@ class UndoLogStoreTest {
         });
     }
 
+    /**
+     * 验证 {@code appendSurvivesStoreReopen} 对应的Undo 日志行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test void appendSurvivesStoreReopen() {
         Path path = dir.resolve("undo-reopen.ibu");
         UndoRecord expected = rec(1, 100, RollPointer.NULL);

@@ -18,6 +18,14 @@ public final class RedoCapacityPolicy {
     /** 达到该 age 后后续实现应阻止新 redo reservation。 */
     private final long hardThresholdBytes;
 
+    /**
+     * 创建 {@code RedoCapacityPolicy}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param capacityBytes 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     * @param asyncThresholdBytes 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @param syncThresholdBytes 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     * @param hardThresholdBytes 待读取、校验或写入的字节数据；不得为 {@code null}，调用期间由调用方保有所有权且不得越过格式边界
+     */
     private RedoCapacityPolicy(long capacityBytes,
                                long asyncThresholdBytes,
                                long syncThresholdBytes,
@@ -33,6 +41,7 @@ public final class RedoCapacityPolicy {
      *
      * @param capacityBytes redo capacity 字节数，必须为正数。
      * @return 固定阈值策略。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public static RedoCapacityPolicy fixed(long capacityBytes) {
         if (capacityBytes <= 0) {
@@ -50,6 +59,7 @@ public final class RedoCapacityPolicy {
      * @param currentLsn 当前 redo LSN。
      * @param checkpointLsn 最近持久化 checkpoint LSN。
      * @return capacity pressure 判断。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public RedoCapacityDecision evaluate(Lsn currentLsn, Lsn checkpointLsn) {
         if (currentLsn == null || checkpointLsn == null) {

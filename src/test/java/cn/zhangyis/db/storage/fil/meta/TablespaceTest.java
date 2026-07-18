@@ -22,6 +22,9 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
  */
 class TablespaceTest {
 
+    /**
+     * 验证 {@code shouldCreateTablespaceSnapshotFromMetadata} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
+     */
     @Test
     void shouldCreateTablespaceSnapshotFromMetadata() {
         Tablespace tablespace = sampleMetadata().toTablespace();
@@ -35,6 +38,9 @@ class TablespaceTest {
         assertEquals(PageNo.of(128), tablespace.freeLimitPageNo());
     }
 
+    /**
+     * 验证 {@code shouldRejectInvalidTablespaceMetadata} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void shouldRejectInvalidTablespaceMetadata() {
         DataFileDescriptor dataFile = DataFileDescriptor.single(Path.of("t1.ibd"), PageNo.of(0), PageNo.of(64));
@@ -45,6 +51,9 @@ class TablespaceTest {
                 PageSize.ofBytes(16 * 1024), TablespaceState.NORMAL, List.of(dataFile), SpaceFlags.empty(), PageNo.of(64), PageNo.of(64), 1));
     }
 
+    /**
+     * 验证 {@code shouldRejectShrinkingPublishedSize} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void shouldRejectShrinkingPublishedSize() {
         Tablespace tablespace = sampleMetadata().toTablespace();
@@ -52,6 +61,9 @@ class TablespaceTest {
         assertThrows(DatabaseRuntimeException.class, () -> tablespace.publishSize(PageNo.of(64), PageNo.of(64)));
     }
 
+    /**
+     * 验证 {@code shouldRejectInvalidStateTransition} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void shouldRejectInvalidStateTransition() {
         Tablespace corrupted = sampleMetadata().toTablespace().transitTo(TablespaceState.CORRUPTED);

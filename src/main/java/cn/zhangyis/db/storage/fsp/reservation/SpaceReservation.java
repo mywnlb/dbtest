@@ -41,15 +41,38 @@ public final class SpaceReservation implements AutoCloseable {
     /** 是否已释放；try-with-resources 与 MTR memo 兜底释放会并存，必须幂等。 */
     private final AtomicBoolean closed = new AtomicBoolean();
 
+    /**
+     * 创建 {@code SpaceReservation}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝 null、越界和相互矛盾的组合。</li>
+     *     <li>完成跨参数校验并推导不可变配置；若构造过程创建自有资源，后续失败必须在异常路径关闭。</li>
+     *     <li>把已校验协作者与配置绑定到字段，并初始化本对象拥有的状态、显式锁、队列或缓存，不允许 this 提前逃逸。</li>
+     *     <li>构造完成后对象处于类契约声明的初始状态；任一步失败都抛出领域异常且不发布半初始化实例。</li>
+     * </ol>
+     *
+     * @param owner 由组合根提供的 {@code SpaceReservationService} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param mtrId 参与 {@code 构造} 的原始数值身份 {@code mtrId}；必须非负，零值仅用于对应格式明确声明的系统或空身份
+     * @param spaceId 目标表空间的稳定标识；不得为 {@code null}，且必须已注册并满足当前生命周期准入条件
+     * @param kind 选择 {@code 构造} 分支的 {@code SpaceReservationKind} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     * @param requestedPages 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @param requestedExtents 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @param reservedCapacityExtents 调用方请求的长度、数量或容量；必须非负、满足格式上界且不能导致算术溢出
+     */
     SpaceReservation(SpaceReservationService owner, long mtrId, SpaceId spaceId, SpaceReservationKind kind,
                      long requestedPages, long requestedExtents, long reservedCapacityExtents) {
+        // 1、校验必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝非法组合。
         this.owner = owner;
         this.mtrId = mtrId;
+        // 2、完成跨参数校验并推导不可变配置；后续失败仍由当前构造路径收口已创建资源。
         this.spaceId = spaceId;
         this.kind = kind;
+        // 3、绑定已校验协作者并初始化本对象拥有的状态、显式锁、队列或缓存，不允许半初始化实例逃逸。
         this.requestedPages = requestedPages;
         this.requestedExtents = requestedExtents;
         this.reservedCapacityExtents = reservedCapacityExtents;
+        // 4、完成初始状态发布；失败以领域异常终止构造，成功对象满足类级生命周期不变量。
         this.remainingPages = new AtomicLong(requestedPages);
     }
 

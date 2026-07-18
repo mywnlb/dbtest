@@ -29,7 +29,12 @@ public final class TransactionRecoveryContext {
         this.checkpointSource = checkpointSource;
     }
 
-    /** 创建引用指定 sidecar 的恢复上下文；不会提前读取文件或发布 counter。 */
+    /** 创建引用指定 sidecar 的恢复上下文；不会提前读取文件或发布 counter。
+     *
+     * @param checkpointSource 选择 {@code using} 分支的 {@code TransactionRecoveryCheckpointSource} 枚举值；不得为 {@code null}，未知语义不能用默认分支猜测
+     * @return {@code using} 产生的恢复或持久化阶段对象；成功时不为 {@code null}，其中的 durable 边界不超过已安全完成的工作
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public static TransactionRecoveryContext using(TransactionRecoveryCheckpointSource checkpointSource) {
         if (checkpointSource == null) {
             throw new DatabaseValidationException("transaction recovery checkpoint source must not be null");
@@ -44,7 +49,11 @@ public final class TransactionRecoveryContext {
         return deltaSink;
     }
 
-    /** 在 redo replay 前按已持久 redo checkpoint 创建新的恢复表。 */
+    /** 在 redo replay 前按已持久 redo checkpoint 创建新的恢复表。
+     *
+     * @param redoCheckpointLsn redo 日志边界；不得为 {@code null}，必须单调且与调用方已发布的页或事务状态一致
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     void initialize(Lsn redoCheckpointLsn) {
         if (redoCheckpointLsn == null) {
             throw new DatabaseValidationException("transaction recovery redo checkpoint must not be null");
@@ -52,7 +61,11 @@ public final class TransactionRecoveryContext {
         table = RecoveredTransactionTable.open(redoCheckpointLsn, checkpointSource.readLatest());
     }
 
-    /** redo replay 完成后复制不可变 snapshot；未初始化表示 recovery 编排顺序错误。 */
+    /** redo replay 完成后复制不可变 snapshot；未初始化表示 recovery 编排顺序错误。
+     *
+     * @return {@code snapshot} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     * @throws TransactionRecoveryException 恢复证据、阶段顺序或事务重建无法继续时抛出；owner 应停止恢复并保持普通流量关闭
+     */
     RecoveredTransactionSnapshot snapshot() {
         if (table == null) {
             throw new TransactionRecoveryException("transaction recovery context was not initialized");
@@ -63,6 +76,10 @@ public final class TransactionRecoveryContext {
     /**
      * 校验实际扫描到的最后完整 redo 至少覆盖 sidecar LSN。sidecar 领先 redo label 是合法 crash window，
      * 但若 redo 文件尾又被截断到 sidecar 之前，就不能仅凭高估 counter 继续启动。
+     *
+     * @param recoveredToLsn redo 日志边界；不得为 {@code null}，必须单调且与调用方已发布的页或事务状态一致
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws TransactionRecoveryException 恢复证据、阶段顺序或事务重建无法继续时抛出；owner 应停止恢复并保持普通流量关闭
      */
     void verifyRedoCoverage(Lsn recoveredToLsn) {
         if (recoveredToLsn == null) {
@@ -79,6 +96,9 @@ public final class TransactionRecoveryContext {
 
     /**
      * READ_ONLY_VALIDATE 的 scan-only trx 校验：只提取 non-page transaction delta 顺序送表，不调用 page handler。
+     *
+     * @param batches 参与 {@code validateTransactionDeltas} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     void validateTransactionDeltas(List<RedoLogBatch> batches) {
         if (batches == null) {

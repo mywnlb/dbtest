@@ -81,6 +81,9 @@ class UndoLogSegmentTest {
         return leftOffset < rightOffset + rightLength && rightOffset < leftOffset + leftLength;
     }
 
+    /**
+     * 验证 {@code createAppendReadBackSinglePage} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void createAppendReadBackSinglePage() {
         onSegment(seg -> {
@@ -213,6 +216,9 @@ class UndoLogSegmentTest {
         });
     }
 
+    /**
+     * 验证 {@code logHeaderCountsAdvancePerAppend} 对应的Undo 日志行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test
     void logHeaderCountsAdvancePerAppend() {
         onSegment(seg -> {
@@ -224,6 +230,9 @@ class UndoLogSegmentTest {
         });
     }
 
+    /**
+     * 验证 {@code forEachRecordReturnsAllInOrderSinglePage} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void forEachRecordReturnsAllInOrderSinglePage() {
         onSegment(seg -> {
@@ -235,6 +244,9 @@ class UndoLogSegmentTest {
         });
     }
 
+    /**
+     * 验证 {@code readRecordRejectsNullPointer} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void readRecordRejectsNullPointer() {
         onSegment(seg ->
@@ -242,6 +254,9 @@ class UndoLogSegmentTest {
                         () -> seg.readRecord(RollPointer.NULL, keyDef(), schema())));
     }
 
+    /**
+     * 验证 {@code markCommittedWritesStateAndCommitNoForRecoveryHistory} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void markCommittedWritesStateAndCommitNoForRecoveryHistory() {
         onSegment(seg -> {
@@ -292,6 +307,9 @@ class UndoLogSegmentTest {
         });
     }
 
+    /**
+     * 验证 {@code markCommittedAppendsUndoMetadataDeltaRedoForStateAndCommitNo} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void markCommittedAppendsUndoMetadataDeltaRedoForStateAndCommitNo() {
         onAccess((mgr, access) -> {
@@ -317,6 +335,9 @@ class UndoLogSegmentTest {
         });
     }
 
+    /**
+     * 验证 {@code appendRecordPayloadUsesLogicalRedoWithoutPhysicalSlotBytes} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void appendRecordPayloadUsesLogicalRedoWithoutPhysicalSlotBytes() {
         onAccess((mgr, access) -> {
@@ -358,6 +379,9 @@ class UndoLogSegmentTest {
         return String.format("%05d", undoNo) + "x".repeat(4995);
     }
 
+    /**
+     * 验证 {@code growthAllocatesLinksNewPageAndReadsAcross} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void growthAllocatesLinksNewPageAndReadsAcross() {
         onSegment(seg -> {
@@ -468,6 +492,9 @@ class UndoLogSegmentTest {
         }
     }
 
+    /**
+     * 验证 {@code forEachTraversesAllPagesInOrder} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void forEachTraversesAllPagesInOrder() {
         onSegment(seg -> {
@@ -485,6 +512,9 @@ class UndoLogSegmentTest {
         });
     }
 
+    /**
+     * 验证 {@code prevRollPointerChainsAcrossPages} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void prevRollPointerChainsAcrossPages() {
         onSegment(seg -> {
@@ -501,6 +531,9 @@ class UndoLogSegmentTest {
         });
     }
 
+    /**
+     * 验证 {@code oversizedRecordUsesExternalPayloadWithoutGrowingMainUndoChain} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test
     void oversizedRecordUsesExternalPayloadWithoutGrowingMainUndoChain() {
         onSegment(seg -> {
@@ -518,6 +551,9 @@ class UndoLogSegmentTest {
         });
     }
 
+    /**
+     * 验证 {@code readRecordRejectsPointerFromOtherSegment} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void readRecordRejectsPointerFromOtherSegment() {
         onAccess((mgr, access) -> {
@@ -542,6 +578,9 @@ class UndoLogSegmentTest {
                 new cn.zhangyis.db.storage.record.format.HiddenColumns(TransactionId.of(3), prev), prev);
     }
 
+    /**
+     * 验证 {@code readRecordByRollPointerReadsInsertAndUpdate} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void readRecordByRollPointerReadsInsertAndUpdate() {
         onAccess((mgr, access) -> {
@@ -573,6 +612,9 @@ class UndoLogSegmentTest {
         });
     }
 
+    /**
+     * 验证 {@code readRecordByRollPointerRejectsCorruption} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test
     void readRecordByRollPointerRejectsCorruption() {
         onAccess((mgr, access) -> {
@@ -602,6 +644,9 @@ class UndoLogSegmentTest {
         });
     }
 
+    /**
+     * 验证 {@code appendStampsRollPointerInsertFlagByRecordType} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void appendStampsRollPointerInsertFlagByRecordType() {
         onAccess((mgr, access) -> {
@@ -648,6 +693,9 @@ class UndoLogSegmentTest {
         });
     }
 
+    /**
+     * 验证 {@code forEachRecordWithPointerYieldsAddressesThatRoundTrip} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test
     void forEachRecordWithPointerYieldsAddressesThatRoundTrip() {
         onSegment(seg -> {

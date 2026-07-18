@@ -23,18 +23,27 @@ class UndoContextTest {
     private static final UndoSlotId SLOT = UndoSlotId.of(3);
     private static final PageId FIRST = PageId.of(SpaceId.of(77), PageNo.of(65));
 
+    /**
+     * 验证 {@code freshContextHasNoBindingsAndNoneHighWater} 所描述的 SQL 解析或绑定语义，并断言 AST、名称解析、类型推导及错误位置。
+     */
     @Test void freshContextHasNoBindingsAndNoneHighWater() {
         UndoContext context = new UndoContext(RSEG);
         assertTrue(context.bindings().isEmpty());
         assertEquals(UndoNo.NONE, context.lastUndoNo());
     }
 
+    /**
+     * 验证 {@code attachInsertBindingKeepsIdentity} 所描述的返回值或状态会按契约保留，并断言原始信息与领域不变量未丢失。
+     */
     @Test void attachInsertBindingKeepsIdentity() {
         UndoContext context = freshInsert();
         assertEquals(SLOT, context.binding(UndoLogKind.INSERT).slotId());
         assertEquals(FIRST, context.binding(UndoLogKind.INSERT).firstPageId());
     }
 
+    /**
+     * 验证 {@code duplicateKindIsRejected} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test void duplicateKindIsRejected() {
         UndoContext context = freshInsert();
         assertThrows(DatabaseValidationException.class, () -> context.attach(new UndoLogBinding(
@@ -42,6 +51,9 @@ class UndoContextTest {
                 UndoLogicalHead.EMPTY)));
     }
 
+    /**
+     * 验证 {@code globalHighWaterAndLocalHeadAdvanceTogetherAfterAppend} 所描述的页内记录行为，并断言偏移、编码边界、隐藏列及 page-directory 结构保持一致。
+     */
     @Test void globalHighWaterAndLocalHeadAdvanceTogetherAfterAppend() {
         UndoContext context = freshInsert();
         RollPointer pointer = new RollPointer(true, PageNo.of(65), 120);
@@ -50,6 +62,9 @@ class UndoContextTest {
         assertEquals(new UndoLogicalHead(UndoNo.of(1), pointer), context.head(UndoLogKind.INSERT));
     }
 
+    /**
+     * 验证 {@code appendMustAdvanceGlobalUndoNumber} 所描述的恢复场景能够依据持久证据幂等重建状态，且不会重复产生副作用。
+     */
     @Test void appendMustAdvanceGlobalUndoNumber() {
         UndoContext context = freshInsert();
         RollPointer pointer = new RollPointer(true, PageNo.of(65), 120);
@@ -58,6 +73,9 @@ class UndoContextTest {
                 () -> context.publishAppend(UndoLogKind.INSERT, UndoNo.of(1), pointer));
     }
 
+    /**
+     * 验证 {@code savepointCapturesBothHeads} 对应的事务、MVCC 与锁行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test void savepointCapturesBothHeads() {
         Transaction txn = new Transaction(TransactionOptions.defaults(), 1L);
         UndoContext context = freshInsert();
@@ -69,6 +87,9 @@ class UndoContextTest {
         assertEquals(UndoLogicalHead.EMPTY, savepoint.updateHead());
     }
 
+    /**
+     * 验证 {@code rollbackToSavepointDoesNotRewindGlobalHighWater} 所描述的边界场景保持既有领域不变量，不产生方法名明确禁止的副作用。
+     */
     @Test void rollbackToSavepointDoesNotRewindGlobalHighWater() {
         Transaction txn = new Transaction(TransactionOptions.defaults(), 1L);
         UndoContext context = freshInsert();
@@ -83,6 +104,9 @@ class UndoContextTest {
         assertEquals(new UndoLogicalHead(UndoNo.of(1), first), context.head(UndoLogKind.INSERT));
     }
 
+    /**
+     * 验证 {@code emptyBoundaryClearsEveryExistingLocalHead} 对应的事务、MVCC 与锁行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test void emptyBoundaryClearsEveryExistingLocalHead() {
         UndoContext context = freshInsert();
         context.publishAppend(UndoLogKind.INSERT, UndoNo.of(1),
@@ -110,6 +134,9 @@ class UndoContextTest {
         assertTrue(context.affectedTableIds().isEmpty());
     }
 
+    /**
+     * 验证 {@code releaseSavepointRemovesNestedRange} 对应的事务、MVCC 与锁行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     */
     @Test void releaseSavepointRemovesNestedRange() {
         Transaction txn = new Transaction(TransactionOptions.defaults(), 1L);
         UndoContext context = freshInsert();
@@ -120,11 +147,17 @@ class UndoContextTest {
         assertEquals(0, context.savepointCount());
     }
 
+    /**
+     * 验证 {@code temporaryBindingIsRejected} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test void temporaryBindingIsRejected() {
         assertThrows(DatabaseValidationException.class, () -> new UndoLogBinding(
                 UndoLogKind.TEMPORARY, SLOT, FIRST, UndoLogicalHead.EMPTY));
     }
 
+    /**
+     * 验证 {@code nonEmptyBindingHeadMustMatchPersistentLogKind} 所描述的 SQL 解析或绑定语义，并断言 AST、名称解析、类型推导及错误位置。
+     */
     @Test void nonEmptyBindingHeadMustMatchPersistentLogKind() {
         assertThrows(DatabaseValidationException.class, () -> new UndoLogBinding(
                 UndoLogKind.INSERT, SLOT, FIRST,
@@ -134,6 +167,9 @@ class UndoContextTest {
                 new UndoLogicalHead(UndoNo.of(1), new RollPointer(true, PageNo.of(65), 120))));
     }
 
+    /**
+     * 验证 {@code nullRollbackSegmentIsRejected} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     */
     @Test void nullRollbackSegmentIsRejected() {
         assertThrows(DatabaseValidationException.class, () -> new UndoContext(null));
         assertFalse(RSEG.value() < 0);

@@ -46,7 +46,10 @@ public final class RandomReadAheadDetector {
     /** recent 窗口成员集合，O(1) 判定某 extent 是否近期已发过（去重）。 */
     private final Set<ExtentKey> recentSet = new HashSet<>();
 
-    /** 默认窗口构造。 */
+    /** 默认窗口构造。
+     *
+     * @param threshold 控制 {@code 构造} 触发边界的阈值 {@code threshold}；必须非负，百分比不得超过 100，计数阈值不得超过所属资源容量
+     */
     public RandomReadAheadDetector(int threshold) {
         this(threshold, DEFAULT_RECENT_WINDOW);
     }
@@ -54,6 +57,7 @@ public final class RandomReadAheadDetector {
     /**
      * @param threshold    同一 extent 驻留页数触发阈值（1..64）。
      * @param recentWindow recent 去重窗口容量（≥1）；测试可注入小窗口验证窗口前移后可再次触发。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public RandomReadAheadDetector(int threshold, int recentWindow) {
         if (threshold < 1 || threshold > PAGES_PER_EXTENT) {
@@ -74,27 +78,40 @@ public final class RandomReadAheadDetector {
      * 连同 pageId 传入。本方法判定驻留数是否达阈值→若达阈值且该 extent 不在 recent 去重窗内，则把它登记入窗
      * （窗满挤出最旧）并产出对整 extent 的请求；否则返回 empty。
      *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>按 PageId 路由分片并读取 page hash、frame 代际与生命周期状态，过期映射在返回前拒绝。</li>
+     *     <li>遵守 pageHashLock、frameMutex、列表锁与 page latch 顺序固定 frame，慢 IO 或条件等待移到内部锁外。</li>
+     *     <li>完成页载入、替换、dirty snapshot 或状态转换，并向等待者发布唯一完成或失败信号。</li>
+     *     <li>返回受控 Guard/快照或释放 fix；失败回收占位且不错误清除并发产生的 dirty 状态。</li>
+     * </ol>
+     *
      * @param pageId           被访问的页（其 extent 即预取目标）。
      * @param residentInExtent 该页所在 extent 当前在 Buffer Pool 内的驻留页数（0..64），由调用方查得。
      * @return 若应预取整 extent，则为对应请求；否则 empty。
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public Optional<ReadAheadRequest> record(PageId pageId, int residentInExtent) {
+        // 1、按 PageId 路由分片并读取 page hash、frame 代际与生命周期状态，在共享或持久副作用前拒绝非法状态。
         if (pageId == null) {
             throw new DatabaseValidationException("random read-ahead access pageId must not be null");
         }
         if (residentInExtent < 0) {
             throw new DatabaseValidationException("random read-ahead resident count must be >= 0: " + residentInExtent);
         }
+        // 2、继续完成范围、身份与候选校验；通过后，遵守 pageHashLock、frameMutex、列表锁与 page latch 顺序固定 frame，保持处理顺序与资源边界。
         if (residentInExtent < threshold) {
             return Optional.empty();
         }
         SpaceId space = pageId.spaceId();
         long extent = pageId.pageNo().value() / PAGES_PER_EXTENT;
+        // 3、在中间分支复核阶段性结果；满足条件后，完成页载入、替换、dirty snapshot 或状态转换，并维持领域不变量。
         ExtentKey key = new ExtentKey(space.value(), extent);
         if (recentSet.contains(key)) {
             return Optional.empty(); // 仍在 bounded recent 窗内：去重，不重复提交。
         }
         rememberEmitted(key);
+        // 4、返回受控 Guard/快照或释放 fix，以稳定返回或领域异常完成收口。
         return Optional.of(new ReadAheadRequest(space, extent * PAGES_PER_EXTENT, PAGES_PER_EXTENT));
     }
 
@@ -108,7 +125,11 @@ public final class RandomReadAheadDetector {
         }
     }
 
-    /** recent 去重窗口的键：(spaceId, extentNo)。record 默认 equals/hashCode 提供值语义，供 set/deque 成员判定。 */
+    /** recent 去重窗口的键：(spaceId, extentNo)。record 默认 equals/hashCode 提供值语义，供 set/deque 成员判定。
+     *
+     * @param spaceId 目标表空间的原始数值标识；必须非负、已注册并满足当前生命周期准入条件
+     * @param extent 参与 {@code 构造} 的 extent 原始编号；必须非负并能映射到当前表空间的有效 extent
+     */
     private record ExtentKey(int spaceId, long extent) {
     }
 }

@@ -31,6 +31,9 @@ class RecordPageFormatTest {
     @TempDir
     Path dir;
 
+    /**
+     * 验证 {@code formatBuildsEmptyIndexPage} 所描述的 B+Tree 定位或结构变化，并断言键序、父子链接、页资源和唯一性不变量。
+     */
     @Test
     void formatBuildsEmptyIndexPage() {
         PageStore store = new FileChannelPageStore();

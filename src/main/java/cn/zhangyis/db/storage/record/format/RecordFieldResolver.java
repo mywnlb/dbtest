@@ -20,8 +20,17 @@ import java.util.List;
  */
 public final class RecordFieldResolver {
 
+    /**
+     * 本对象持有的 {@code registry} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+     */
     private final TypeCodecRegistry registry;
 
+    /**
+     * 创建 {@code RecordFieldResolver}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+     *
+     * @param registry 由组合根提供的 {@code TypeCodecRegistry} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     */
     public RecordFieldResolver(TypeCodecRegistry registry) {
         if (registry == null) {
             throw new DatabaseValidationException("type codec registry must not be null");
@@ -34,6 +43,9 @@ public final class RecordFieldResolver {
      *
      * @param recordBytes 完整一条记录的字节（从 RecordHeader 起，长度 = header.recordLength）。
      * @param schema      权威列序与类型来源。
+     * @return {@code resolve} 准备或解码出的中间领域对象；成功时不为 {@code null}，其边界、资源归属和后续发布阶段已明确
+     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+     * @throws RecordFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public Resolved resolve(byte[] recordBytes, TableSchema schema) {
         if (recordBytes == null || schema == null) {
@@ -120,14 +132,39 @@ public final class RecordFieldResolver {
      */
     public static final class Resolved {
 
+        /**
+         * 本对象持有的 {@code schema} 页面、记录或布局状态；身份与 schema 必须匹配，访问期间遵守 fix/latch 和字节边界，不能泄漏未发布修改。
+         */
         private final TableSchema schema;
+        /**
+         * 本对象持有的 {@code header} 页面、记录或布局状态；身份与 schema 必须匹配，访问期间遵守 fix/latch 和字节边界，不能泄漏未发布修改。
+         */
         private final RecordHeader header;
+        /**
+         * 构造时冻结的 {@code isNull} 布局或分片数组；元素顺序和长度具有领域含义，构造时必须防御性复制，之后不得替换或越界访问。
+         */
         private final boolean[] isNull;
+        /**
+         * 本对象持有的 {@code slices} 页面、记录或布局状态；身份与 schema 必须匹配，访问期间遵守 fix/latch 和字节边界，不能泄漏未发布修改。
+         */
         private final FieldSlice[] slices;
+        /**
+         * 本对象持有的 {@code registry} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
+         */
         private final TypeCodecRegistry registry;
         /** 聚簇记录隐藏列（DB_TRX_ID + DB_ROLL_PTR）；非聚簇为 null。 */
         private final HiddenColumns hidden;
 
+        /**
+         * 创建 {@code Resolved}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
+         *
+         * @param schema 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+         * @param header 记录格式使用的 header、隐藏列或键布局；不得为 {@code null}，偏移、字段顺序和编码宽度必须与当前页格式一致
+         * @param isNull 参与 {@code 构造} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+         * @param slices 参与 {@code 构造} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+         * @param registry 由组合根提供的 {@code TypeCodecRegistry} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+         * @param hidden 记录格式使用的 header、隐藏列或键布局；不得为 {@code null}，偏移、字段顺序和编码宽度必须与当前页格式一致
+         */
         Resolved(TableSchema schema, RecordHeader header, boolean[] isNull, FieldSlice[] slices,
                  TypeCodecRegistry registry, HiddenColumns hidden) {
             this.schema = schema;
@@ -148,13 +185,21 @@ public final class RecordFieldResolver {
             return hidden;
         }
 
-        /** 第 ordinal 列是否 NULL。 */
+        /** 第 ordinal 列是否 NULL。
+         *
+         * @param ordinal 参与 {@code isNull} 的零基位置 {@code ordinal}；必须非负且小于所属页面、集合或持久结构的容量
+         * @return {@code isNull} 命名的领域事实成立时为 {@code true}，否则为 {@code false}；查询本身不改变权威状态
+         */
         public boolean isNull(int ordinal) {
             check(ordinal);
             return isNull[ordinal];
         }
 
-        /** 第 ordinal 列的编码切片；NULL 列无切片，抛 {@link RecordFormatException}。 */
+        /** 第 ordinal 列的编码切片；NULL 列无切片，抛 {@link RecordFormatException}。
+         * @param ordinal 参与 {@code slice} 的零基位置 {@code ordinal}；必须非负且小于所属页面、集合或持久结构的容量
+         * @return {@code slice} 编码、解码或重建的记录数据；成功时不为 {@code null}，字段顺序、隐藏列和字节边界满足当前 schema
+         * @throws RecordFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
+         */
         public FieldSlice slice(int ordinal) {
             check(ordinal);
             if (isNull[ordinal]) {
@@ -163,7 +208,11 @@ public final class RecordFieldResolver {
             return slices[ordinal];
         }
 
-        /** 第 ordinal 列的逻辑值（NULL→NullValue，否则按列类型 codec 解码）。 */
+        /** 第 ordinal 列的逻辑值（NULL→NullValue，否则按列类型 codec 解码）。
+         *
+         * @param ordinal 参与 {@code value} 的零基位置 {@code ordinal}；必须非负且小于所属页面、集合或持久结构的容量
+         * @return {@code value} 编码、解码或重建的记录数据；成功时不为 {@code null}，字段顺序、隐藏列和字节边界满足当前 schema
+         */
         public ColumnValue value(int ordinal) {
             check(ordinal);
             if (isNull[ordinal]) {
@@ -173,7 +222,10 @@ public final class RecordFieldResolver {
             return registry.codecFor(ct).decode(slices[ordinal], ct);
         }
 
-        /** 物化为逻辑记录（用户列 + 头的 deleted/recordType + 隐藏列；隐藏列不混入 columnValues）。 */
+        /** 物化为逻辑记录（用户列 + 头的 deleted/recordType + 隐藏列；隐藏列不混入 columnValues）。
+         *
+         * @return {@code materialize} 编码、解码或重建的记录数据；成功时不为 {@code null}，字段顺序、隐藏列和字节边界满足当前 schema
+         */
         public LogicalRecord materialize() {
             List<ColumnValue> values = new ArrayList<>(schema.columnCount());
             for (int i = 0; i < schema.columnCount(); i++) {

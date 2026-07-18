@@ -134,6 +134,32 @@ class PersistentHistoryRecoveryTest {
                         nonUpdate.nodes()::get));
     }
 
+    /**
+     * PREPARED owner 与 ACTIVE 一样必须留在 history 链外，但 header 必须保持 PREPARED、creator/kind 一致且无提交号。
+     */
+    @Test
+    void acceptsUnlinkedPreparedOwnerAndRejectsPreparedHeaderDrift() {
+        PersistentHistoryRecovery recovery = new PersistentHistoryRecovery();
+        List<RecoveredUndoSlotEvidence> evidence = List.of(
+                RecoveredUndoSlotEvidence.prepared(
+                        UndoSlotId.of(0), P1, UndoLogKind.UPDATE, TransactionId.of(101)));
+
+        List<?> rebuilt = recovery.rebuild(
+                RollbackSegmentHistoryBase.empty(),
+                Map.of(UndoSlotId.of(0), P1),
+                evidence,
+                pageId -> node(pageId, UndoLogState.PREPARED, UndoLogKind.UPDATE,
+                        101, 0, Optional.empty(), Optional.empty()));
+
+        assertEquals(List.of(), rebuilt);
+        assertThrows(TransactionRecoveryException.class, () -> recovery.rebuild(
+                RollbackSegmentHistoryBase.empty(),
+                Map.of(UndoSlotId.of(0), P1),
+                evidence,
+                pageId -> node(pageId, UndoLogState.ACTIVE, UndoLogKind.UPDATE,
+                        101, 0, Optional.empty(), Optional.empty())));
+    }
+
     @Test
     void rejectsDuplicateCreatorDuplicateCommitNumberAndLowHighWater() {
         PersistentHistoryRecovery recovery = new PersistentHistoryRecovery();

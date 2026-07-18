@@ -124,6 +124,29 @@ class LockManagerCoreTest {
         assertEquals(1, manager.releaseAll(t3));
     }
 
+    /** logical secondary prefix 共享读可共存；DML/UPDATE 的 X 必须等待所有共享 reader 终态释放。 */
+    @Test
+    void secondaryLogicalPrefixSupportsSharedAndExclusiveCompatibility() {
+        LockManager manager = new LockManager(4, 16);
+        SecondaryLogicalKeyLockKey prefix = new SecondaryLogicalKeyLockKey(9, "normalized-team");
+        TransactionId firstReader = TransactionId.of(34);
+        TransactionId secondReader = TransactionId.of(35);
+        TransactionId writer = TransactionId.of(36);
+
+        manager.acquire(firstReader, prefix, TransactionLockMode.REC_S, TEST_TIMEOUT);
+        manager.acquire(secondReader, prefix, TransactionLockMode.REC_S, TEST_TIMEOUT);
+        CompletableFuture<LockHandle> waitingWriter = CompletableFuture.supplyAsync(
+                () -> manager.acquire(writer, prefix, TransactionLockMode.REC_X, TEST_TIMEOUT));
+        awaitUntil(() -> hasWaitEdge(manager, writer, firstReader)
+                && hasWaitEdge(manager, writer, secondReader));
+
+        assertEquals(1, manager.releaseAll(firstReader));
+        assertFalse(waitingWriter.isDone());
+        assertEquals(1, manager.releaseAll(secondReader));
+        assertEquals(TransactionLockMode.REC_X, join(waitingWriter).mode());
+        assertEquals(1, manager.releaseAll(writer));
+    }
+
     @Test
     void lockWaitTimeoutRemovesWaitingRequestAndWaitForEdge() {
         LockManager manager = new LockManager(4, 16);

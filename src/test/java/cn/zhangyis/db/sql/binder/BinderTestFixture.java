@@ -48,12 +48,17 @@ final class BinderTestFixture implements AutoCloseable {
                 new ColumnDefinition(1, ObjectName.of("id"), ColumnTypeDefinition.bigint(false, false), 0),
                 new ColumnDefinition(2, ObjectName.of("tenant"), ColumnTypeDefinition.integer(false, false), 1),
                 new ColumnDefinition(3, ObjectName.of("note"), new ColumnTypeDefinition(DictionaryTypeId.VARCHAR,
-                        false, true, 128, 0, 1, 1, List.of()), 2));
+                        false, true, 128, 0, 1, 1, List.of()), 2),
+                new ColumnDefinition(4, ObjectName.of("status"), new ColumnTypeDefinition(DictionaryTypeId.VARCHAR,
+                        false, false, 32, 0, 1, 1, List.of()), 3));
         IndexDefinition primary = new IndexDefinition(IndexId.of(3), ObjectName.of("PRIMARY"), true, true,
                 List.of(new IndexKeyPart(1, IndexOrder.ASC, 0), new IndexKeyPart(2, IndexOrder.ASC, 0)));
         IndexDefinition note = new IndexDefinition(IndexId.of(4), ObjectName.of("uq_note"), true, false,
                 List.of(new IndexKeyPart(3, IndexOrder.ASC, 0)));
-        return table(2, "orders", columns, List.of(primary, note), directory, Optional.of(segment(5, 30, 30)));
+        IndexDefinition status = new IndexDefinition(IndexId.of(5), ObjectName.of("idx_status"), false, false,
+                List.of(new IndexKeyPart(4, IndexOrder.ASC, 0)));
+        return table(2, "orders", columns, List.of(primary, note, status), directory,
+                Optional.of(segment(5, 30, 30)));
     }
 
     private static TableDefinition prefixPrimary(Path directory) {

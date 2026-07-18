@@ -19,6 +19,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.time.ZoneId;
 import java.util.Optional;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -50,6 +51,27 @@ class DefaultSqlSessionTest {
             assertEquals(SessionTransactionMode.IMPLICIT, session.snapshot().transactionMode());
             session.execute("SET autocommit=1");
             assertFalse(session.snapshot().transactionActive());
+            session.close();
+        }
+    }
+
+    /** autocommit consistent range 可用 RO handle；FOR SHARE/UPDATE 必须创建 RW handle 并在语句 commit 后释放锁。 */
+    @Test
+    void routesLockingSelectThroughReadWriteTransaction() {
+        try (SessionTestDictionary dictionary = new SessionTestDictionary(directory)) {
+            SessionTransactionPolicyTest.RecordingGateway gateway =
+                    new SessionTransactionPolicyTest.RecordingGateway();
+            DefaultSqlSession session = session(dictionary, gateway, options(Duration.ofSeconds(1)), () -> { });
+
+            assertInstanceOf(QueryResult.class,
+                    session.execute("SELECT id FROM range_orders WHERE category='a'"));
+            assertEquals(List.of("begin:RO", "range", "commit"), gateway.events);
+
+            gateway.events.clear();
+            assertInstanceOf(QueryResult.class,
+                    session.execute("SELECT id FROM range_orders WHERE category='a' FOR SHARE"));
+            assertEquals(List.of("begin:RW", "range", "commit"), gateway.events);
+            assertEquals(SessionTransactionMode.NONE, session.snapshot().transactionMode());
             session.close();
         }
     }

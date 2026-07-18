@@ -29,6 +29,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
 import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -254,6 +255,38 @@ class LobStorageTest {
             MiniTransaction cleanup = fixture.manager.begin();
             fixture.storage.free(cleanup, segment, ColumnType.longBlob(false), allocation.value());
             fixture.manager.commit(cleanup);
+        }
+    }
+
+    /** rollback/purge 必须先校验整批链再修改 FSP，并拒绝同一页链被两个 ownership 重复释放。 */
+    @Test
+    void plannedBatchFreeReleasesAllChainsAndRejectsDuplicateOwnership() {
+        try (Fixture fixture = new Fixture(dir.resolve("batch-free.ibd"))) {
+            SegmentRef segment = fixture.createSegment(SegmentPurpose.LOB);
+            MiniTransaction write = fixture.manager.begin();
+            ColumnValue.ExternalValue first = fixture.storage.write(write, segment,
+                    ColumnType.longBlob(false), new ColumnValue.BinaryValue(new byte[20_000]));
+            ColumnValue.ExternalValue second = fixture.storage.write(write, segment,
+                    ColumnType.longBlob(false), new ColumnValue.BinaryValue(new byte[30_000]));
+            fixture.manager.commit(write);
+
+            LobFreeBatchPlan plan = fixture.storage.planFreeBatch(segment, List.of(
+                    new LobFreeTarget(1, ColumnType.longBlob(false), first),
+                    new LobFreeTarget(2, ColumnType.longBlob(false), second)));
+            MiniTransaction free = fixture.manager.begin();
+            fixture.storage.freePlannedBatch(free, plan);
+            fixture.manager.commit(free);
+
+            for (ColumnValue.ExternalValue stale : List.of(first, second)) {
+                MiniTransaction read = fixture.manager.beginReadOnly();
+                assertThrows(LobPageCorruptedException.class,
+                        () -> fixture.storage.read(read, ColumnType.longBlob(false), stale));
+                fixture.manager.rollbackUncommitted(read);
+            }
+
+            assertThrows(DatabaseValidationException.class, () -> fixture.storage.planFreeBatch(segment, List.of(
+                    new LobFreeTarget(1, ColumnType.longBlob(false), first),
+                    new LobFreeTarget(2, ColumnType.longBlob(false), first))));
         }
     }
 

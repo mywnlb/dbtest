@@ -30,6 +30,7 @@ import cn.zhangyis.db.storage.redo.RedoBudgetWorkload;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -202,28 +203,123 @@ public final class LobStorage {
     /**
      * 校验后释放整条页链。先完成所有只读校验并释放 S latch，再修改 FSP；这样损坏链不会造成部分回收。
      * 释放页在同一 MTR 重新 PAGE_INIT(ALLOCATED)，使旧引用立即因 page type 不匹配而失败。
+     *
+     * @param mtr      已按 {@link #freeWorkload(int)} 完成 admission 的 ACTIVE 写 MTR。
+     * @param segment  exact DD binding 提供的 authoritative LOB segment。
+     * @param type     解释 external envelope 与 payload 的 TEXT/BLOB/JSON 列类型。
+     * @param external 待释放的单条 external ownership；方法返回后该引用不能再次读取或释放。
+     * @throws DatabaseValidationException 参数缺失、类型不支持或 MTR 状态不允许写入时抛出。
+     * @throws LobSegmentMismatchException reference 与 authoritative segment/purpose 不一致时抛出。
+     * @throws LobPageCorruptedException 链、页信封、owner、长度或 CRC 损坏时抛出；失败发生在 FSP 修改前。
      */
     public void free(MiniTransaction mtr, SegmentRef segment, ColumnType type,
                      ColumnValue.ExternalValue external) {
-        requireArguments(mtr, segment, type);
-        if (external == null) {
-            throw new DatabaseValidationException("external LOB value must not be null");
+        freePlannedBatch(mtr, planFreeBatch(segment,
+                List.of(new LobFreeTarget(0, type, external))));
+    }
+
+    /**
+     * 无 IO 地冻结同一 authoritative segment 下的一批 LOB free target，并拒绝重复 physical reference。
+     * 完整链/CRC/页集合验证留给 {@link #freePlannedBatch(MiniTransaction, LobFreeBatchPlan)}，但 redo admission
+     * 所需精确 page count 在 begin 前即可由 external envelope 冻结。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 segment/target 容器并按 first-page/ordinal 建立确定顺序。</li>
+     *     <li>逐 target 校验列 codec、reference→segment 归属和重复 physical identity。</li>
+     *     <li>汇总精确 page count，冻结一次 segment 固定成本加全部 page free 的 redo workload。</li>
+     * </ol>
+     *
+     * @param segment exact DD table binding 提供的 LOB segment。
+     * @param targets 待释放 ownership；不能为空、不能包含重复 reference。
+     * @return 按 first-page/ordinal 稳定排序且带动态 redo workload 的不可变计划。
+     * @throws DatabaseValidationException 字段缺失、列表为空、reference 重复或页数求和溢出时抛出。
+     * @throws LobSegmentMismatchException reference 不属于 authoritative segment 时抛出。
+     */
+    public LobFreeBatchPlan planFreeBatch(SegmentRef segment, List<LobFreeTarget> targets) {
+        // 1. 容器校验和稳定排序均为纯内存操作，不读取 inode/FSP 或 LOB 页。
+        if (segment == null || targets == null || targets.isEmpty()
+                || targets.stream().anyMatch(java.util.Objects::isNull)) {
+            throw new DatabaseValidationException("LOB free batch requires segment and non-empty targets");
         }
-        LobCodec codec = requireLobCodec(type);
-        codec.validate(external, type);
-        LobReference reference = external.reference();
-        if (!reference.spaceId().equals(segment.spaceId())
-                || !reference.segmentId().equals(segment.segmentId())
-                || reference.inodeSlot() != segment.inodeSlot()) {
-            throw new LobSegmentMismatchException("LOB reference does not belong to supplied segment");
+        List<LobFreeTarget> ordered = targets.stream()
+                .sorted(Comparator.comparingLong((LobFreeTarget target) ->
+                                target.externalValue().reference().firstPageNo().value())
+                        .thenComparingInt(LobFreeTarget::columnOrdinal))
+                .toList();
+        // 2. reference identity 必须属于 authoritative segment，重复引用会导致非幂等 double-free。
+        Set<LobReference> references = new HashSet<>();
+        int totalPages = 0;
+        for (LobFreeTarget target : ordered) {
+            LobCodec codec = requireLobCodec(target.columnType());
+            codec.validate(target.externalValue(), target.columnType());
+            LobReference reference = target.externalValue().reference();
+            requireReferenceSegment(segment, reference);
+            if (!references.add(reference)) {
+                throw new DatabaseValidationException(
+                        "LOB free batch contains duplicate physical reference: " + reference);
+            }
+            try {
+                totalPages = Math.addExact(totalPages, reference.pageCount());
+            } catch (ArithmeticException overflow) {
+                throw new DatabaseValidationException("LOB free batch page count overflows", overflow);
+            }
         }
-        LoadedChain chain = loadChain(mtr, reference);
-        requireLobSegment(mtr, segment);
-        try (MtrLatchOrderScope ignored = mtr.allowOutOfOrderPageLatch(
-                "LOB free follows a fully validated acyclic reference chain; FSP page0/page2 are already ordered")) {
+        // 3. 一 segment 批次只计一次固定 FSP/segment 成本；所有页数来自已验证 external envelope。
+        return new LobFreeBatchPlan(segment, ordered, freeBatchWorkload(totalPages));
+    }
+
+    /**
+     * 校验整批链和全局页集合后再执行第一次 FSP free，避免后一 ownership 损坏时前一链已经被部分回收。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>重算计划排序、identity 与 redo workload，拒绝陈旧或伪造计划。</li>
+     *     <li>逐链完整读取并释放 S latch，校验 CRC 后把页集合加入全局去重集合。</li>
+     *     <li>复核 authoritative segment purpose；到此为止没有任何 FSP/page 内容修改。</li>
+     *     <li>在显式 latch-order scope 内释放所有页并 PAGE_INIT(ALLOCATED)，成功返回时整批旧引用均失效。</li>
+     * </ol>
+     *
+     * @param mtr 具备动态 redo admission 的 ACTIVE 写 MTR。
+     * @param plan 由本实例冻结的一 segment 批量计划。
+     * @throws DatabaseRuntimeException 计划、链、segment、FSP 或页重初始化失败时抛出；调用方必须按物理边界分类。
+     */
+    public void freePlannedBatch(MiniTransaction mtr, LobFreeBatchPlan plan) {
+        // 1. admission 后仍重算计划，禁止损坏/陈旧对象改变 target 顺序、identity 或预算。
+        if (mtr == null || plan == null) {
+            throw new DatabaseValidationException("planned LOB free arguments must not be null");
+        }
+        if (mtr.state() != MiniTransactionState.ACTIVE) {
+            throw new LobAllocationStateException("planned LOB free requires ACTIVE MTR: " + mtr.state());
+        }
+        LobFreeBatchPlan recalculated = planFreeBatch(plan.segment(), plan.targets());
+        if (!recalculated.targets().equals(plan.targets()) || !recalculated.workload().equals(plan.workload())) {
+            throw new LobAllocationStateException("frozen LOB free batch consistency check failed");
+        }
+
+        // 2. 全部链先只读验证并释放 S latch；全局页去重完成前不触碰 FSP bitmap 或页内容。
+        List<LoadedChain> chains = new ArrayList<>(plan.targets().size());
+        Set<PageId> allPages = new HashSet<>();
+        for (LobFreeTarget target : plan.targets()) {
+            LoadedChain chain = loadChain(mtr, target.externalValue().reference());
             for (PageId pageId : chain.pageIds()) {
-                diskSpace.freePage(mtr, segment, pageId);
-                reinitializeFreedPage(mtr, pageId);
+                if (!allPages.add(pageId)) {
+                    throw new LobPageCorruptedException(
+                            "LOB free batch contains overlapping page ownership: " + pageId);
+                }
+            }
+            chains.add(chain);
+        }
+        // 3. 链验证完成后再读取 segment purpose，错误 binding 仍不会产生任何 free/PAGE_INIT。
+        requireLobSegment(mtr, plan.segment());
+        // 4. 从第一张页起已越过无 content-undo 的物理边界；调用方必须把后续失败升级为 fatal。
+        try (MtrLatchOrderScope ignored = mtr.allowOutOfOrderPageLatch(
+                "LOB batch free validates all chains before FSP mutation; FSP never waits for undo pages")) {
+            for (LoadedChain chain : chains) {
+                for (PageId pageId : chain.pageIds()) {
+                    diskSpace.freePage(mtr, plan.segment(), pageId);
+                    reinitializeFreedPage(mtr, pageId);
+                }
             }
         }
     }
@@ -240,6 +336,17 @@ public final class LobStorage {
             throw new DatabaseValidationException("LOB free page count must be positive");
         }
         return RedoBudgetWorkload.pageImages(checkedWorkload(8L + pageCount * 6L));
+    }
+
+    /**
+     * 计算同一 segment 批量 free 的 redo 上界，只计一次固定 FSP/segment 余量。
+     *
+     * @param pageCount 整批 external reference 声明的正页数总和。
+     * @return 覆盖全部 FSP free 与 PAGE_INIT 的动态 workload。
+     * @throws DatabaseValidationException 页数非正或计算溢出时由 {@link #freeWorkload(int)} 抛出。
+     */
+    private RedoBudgetWorkload freeBatchWorkload(int pageCount) {
+        return freeWorkload(pageCount);
     }
 
     /** 沿 reference 精确页数读取，逐页释放 S latch，并在返回前验证整值长度/CRC。 */
@@ -311,6 +418,21 @@ public final class LobStorage {
             diskSpace.requireSegmentPurposeForWrite(mtr, segment, SegmentPurpose.LOB);
         } catch (FspMetadataException mismatch) {
             throw new LobSegmentMismatchException("LOB operation requires matching LOB segment: " + segment, mismatch);
+        }
+    }
+
+    /**
+     * 将 reference 自带 identity 与 authoritative DD binding 交叉校验；reference 本身不授予释放权限。
+     *
+     * @param segment   exact DD table binding 提供的 LOB segment。
+     * @param reference undo/record external envelope 中的物理 identity。
+     * @throws LobSegmentMismatchException space、segment id 或 inode slot 任一不一致时抛出。
+     */
+    private static void requireReferenceSegment(SegmentRef segment, LobReference reference) {
+        if (!reference.spaceId().equals(segment.spaceId())
+                || !reference.segmentId().equals(segment.segmentId())
+                || reference.inodeSlot() != segment.inodeSlot()) {
+            throw new LobSegmentMismatchException("LOB reference does not belong to supplied segment");
         }
     }
 

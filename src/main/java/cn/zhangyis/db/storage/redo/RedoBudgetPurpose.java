@@ -19,6 +19,8 @@ public enum RedoBudgetPurpose {
     SECONDARY_INDEX,
     /** purge 对聚簇索引执行物理删除。 */
     PURGE_INDEX,
+    /** purge 原子消费一条 undo record 的旧 LOB ownership 并推进持久 logical head。 */
+    PURGE_RECORD_PROGRESS,
     /** rollback 应用一条 inverse record。 */
     ROLLBACK_INVERSE,
     /** rollback 推进 undo logical head。 */
@@ -41,6 +43,10 @@ public enum RedoBudgetPurpose {
     DDL_TABLE_CREATE,
     /** DROP TABLE 写 page0 DISCARDED lifecycle marker。 */
     DDL_TABLE_DROP,
+    /** 写或修复 GENERAL 表空间 page0/page3 SDI 快照。 */
+    DDL_SDI_WRITE,
+    /** 回收未发布 CREATE INDEX 的两个 segment，并清空 page3 build descriptor。 */
+    DDL_INDEX_DROP,
     /** 仅供 no-op manager 的页原语测试；生产 capacity-aware manager 禁止隐式使用。 */
     TEST_UNBOUNDED
 }

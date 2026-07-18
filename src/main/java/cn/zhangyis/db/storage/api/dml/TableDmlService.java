@@ -191,13 +191,36 @@ public final class TableDmlService {
      * @throws DatabaseRuntimeException 锁等待、row guard、undo、MTR、B+Tree 或 redo 发布失败时抛出。
      */
     public DmlWriteResult update(TableUpdateCommand command) {
-        // 1. 聚簇 FOR_UPDATE 在 row guard 之前完成可能阻塞的事务锁等待，并物化旧行作为后续 exact-version 投影来源。
         requireActive(command == null ? null : command.transaction());
-        TableIndexMetadata metadata = command.metadata();
-        Transaction txn = command.transaction();
+        return updateInternal(command.transaction(), command.metadata(), command.clusterKey(),
+                ignored -> command.newRecord(), command.lobSegment(), command.lockWaitTimeout());
+    }
+
+    /**
+     * 在同一次 FOR_UPDATE current-read 物化的旧行上应用列 patch。未赋值列直接复制锁定版本，
+     * 因而 external LOB 引用不会被 gateway hydrate 后重写，且读取与更新之间不存在竞态窗口。
+     */
+    public DmlWriteResult update(TableUpdatePatchCommand command) {
+        requireActive(command == null ? null : command.transaction());
+        return updateInternal(command.transaction(), command.metadata(), command.clusterKey(), oldRow -> {
+            ArrayList<cn.zhangyis.db.storage.record.type.ColumnValue> values =
+                    new ArrayList<>(oldRow.columnValues());
+            for (TableColumnAssignment assignment : command.assignments()) {
+                values.set(assignment.ordinal(), assignment.value());
+            }
+            return new LogicalRecord(oldRow.schemaVersion(), values, false,
+                    cn.zhangyis.db.storage.record.format.RecordType.CONVENTIONAL);
+        }, command.lobSegment(), command.lockWaitTimeout());
+    }
+
+    private DmlWriteResult updateInternal(Transaction txn, TableIndexMetadata metadata, SearchKey clusterKey,
+                                          java.util.function.Function<LogicalRecord, LogicalRecord> rowFactory,
+                                          Optional<cn.zhangyis.db.storage.api.SegmentRef> lobSegment,
+                                          Duration lockWaitTimeout) {
+        // 1. 聚簇 FOR_UPDATE 在 row guard 之前完成可能阻塞的事务锁等待，并物化旧行作为后续 exact-version 投影来源。
         TransactionId txnId = transactionManager.assignWriteId(txn);
-        BTreeCurrentReadRequest request = request(txnId, txn, command.lockWaitTimeout());
-        Optional<BTreeLookupResult> locked = currentRead.lockPoint(metadata.clusteredIndex(), command.clusterKey(),
+        BTreeCurrentReadRequest request = request(txnId, txn, lockWaitTimeout);
+        Optional<BTreeLookupResult> locked = currentRead.lockPoint(metadata.clusteredIndex(), clusterKey,
                 request, BTreeCurrentReadMode.FOR_UPDATE);
         if (locked.isEmpty()) {
             return new DmlWriteResult(false, 0, redo.currentLsn(), txnId);
@@ -206,19 +229,27 @@ public final class TableDmlService {
         // 2. 命令主键必须与锁定行一致；只记录 comparator 判断发生 logical key 变化的二级 mutation。
         LogicalRecord oldRow = locked.orElseThrow().record();
         SearchKey actualClusterKey = keyFromRow(oldRow, metadata.clusteredIndex());
-        if (!actualClusterKey.equals(command.clusterKey())) {
+        if (!actualClusterKey.equals(clusterKey)) {
             throw new DatabaseValidationException("table update cluster key must match materialized row");
+        }
+        LogicalRecord newRecord = rowFactory.apply(oldRow);
+        if (newRecord == null || newRecord.schemaVersion() != metadata.schemaVersion()
+                || newRecord.columnValues().size() != metadata.clusteredIndex().schema().columnCount()
+                || newRecord.hiddenColumns() != null) {
+            throw new DatabaseValidationException("materialized table update row does not match metadata");
         }
 
         List<SecondaryPlan> changed = new ArrayList<>();
         List<SecondaryUndoMutation> mutations = new ArrayList<>();
         for (SecondaryIndexMetadata secondary : metadata.secondaryIndexes()) {
             LogicalRecord oldEntry = secondary.layout().toEntry(oldRow, false);
-            LogicalRecord newEntry = secondary.layout().toEntry(command.newRecord(), false);
+            LogicalRecord newEntry = secondary.layout().toEntry(newRecord, false);
             if (sameLogicalKey(secondary, oldEntry, newEntry)) {
                 continue;
             }
-            SecondaryUniqueCheckResult checked = uniqueCheck.check(secondary, command.newRecord(), request);
+            // locking range 先保护旧 prefix，防止本事务在读者持 S/X 时把仍属于范围的 entry 标删。
+            uniqueCheck.lockLogicalKey(secondary, secondary.layout().logicalKey(oldEntry), request);
+            SecondaryUniqueCheckResult checked = uniqueCheck.check(secondary, newRecord, request);
             if (checked.duplicate()) {
                 throw new DmlDuplicateKeyException("duplicate secondary key for index "
                         + secondary.index().indexId());
@@ -231,9 +262,9 @@ public final class TableDmlService {
 
         // 3. 所有 unique/record lock 等待已经结束；row guard 只覆盖聚簇和二级的若干短物理 MTR。
         try (PurgeDmlRowGuard ignored = rowGuards.acquireForDml(metadata.tableId(), actualClusterKey,
-                command.lockWaitTimeout())) {
+                lockWaitTimeout)) {
             ClusteredUpdateCommand clusterCommand = new ClusteredUpdateCommand(txn, metadata.clusteredIndex(),
-                    command.clusterKey(), command.newRecord(), metadata.tableId(), command.lockWaitTimeout());
+                    clusterKey, newRecord, metadata.tableId(), lobSegment, lockWaitTimeout);
             DmlWriteResult result = clustered.update(clusterCommand, mutations);
 
             // 4. new-before-old 顺序保证回表不会因先删旧 entry 而出现瞬时断链；undo 前态使异常后 inverse 可判定。
@@ -283,6 +314,11 @@ public final class TableDmlService {
                 .map(secondary -> new SecondaryPlan(secondary,
                         secondary.layout().toEntry(oldRow, false), null, SecondaryPublishState.DELETE_MARKED))
                 .toList();
+        // 所有 logical-prefix X 等待必须发生在 row guard/page MTR 之前；锁保持到 DELETE 事务终态。
+        for (SecondaryPlan plan : plans) {
+            uniqueCheck.lockLogicalKey(plan.secondary(),
+                    plan.secondary().layout().logicalKey(plan.entry()), request);
+        }
         List<SecondaryUndoMutation> mutations = metadata.secondaryIndexes().stream()
                 .map(secondary -> SecondaryUndoMutation.deleteMarkEntry(secondary.index().indexId()))
                 .toList();
@@ -291,7 +327,7 @@ public final class TableDmlService {
         try (PurgeDmlRowGuard ignored = rowGuards.acquireForDml(metadata.tableId(), actualClusterKey,
                 command.lockWaitTimeout())) {
             ClusteredDeleteCommand clusterCommand = new ClusteredDeleteCommand(txn, metadata.clusteredIndex(),
-                    command.clusterKey(), metadata.tableId(), command.lockWaitTimeout());
+                    command.clusterKey(), metadata.tableId(), command.lobSegment(), command.lockWaitTimeout());
             DmlWriteResult result = clustered.delete(clusterCommand, mutations);
 
             // 4. 二级仅翻转 delete 位，不做结构删除；purge horizon 未满足前必须保留旧版本导航入口。

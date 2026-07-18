@@ -358,11 +358,19 @@ insert undo 与 update undo 区别：
 
 ### 7.4 Prepared
 
-MiniMySQL 第一阶段可不实现完整 XA，但设计保留：
+当前 storage resource-manager participant v1 已实现：
 
-- `PREPARED` 状态。
-- prepared undo state。
-- recovery 阶段可恢复 prepared transaction 并等待上层决定 commit/rollback。
+- `ACTIVE -> PREPARED -> COMMITTED` 与 `ACTIVE -> PREPARED -> PREPARED_ROLLING_BACK -> ROLLED_BACK`。
+- INSERT/UPDATE first-page 使用稳定 prepared undo state；同一事务的两个 owner 在一个 MTR 中原子 prepare。
+- `storage.api.trx.PreparedTransactionService` 提供 phase one、commit prepared 和 legacy/DD-resolved rollback
+  prepared；phase one/terminal redo 均固定 fsync。
+- PREPARED 保留 write id、active table membership 与 row locks，但释放事务级 ReadView并拒绝普通 DML、
+  savepoint、commit/rollback。
+- recovery 从 redo + page3 + first-page 重建最小事务/UndoContext，在 traffic gate 关闭期消费
+  `PreparedTransactionDecisionProvider` 的 COMMIT/ROLLBACK；默认 UNRESOLVED fail-closed。
+
+完整 SQL XA 仍属于 server/session 后续：当前 storage 不保存 XID、不解析 XA grammar，也不提供长期悬挂
+recovered participant 的锁重建。
 
 ## 8. ReadView 与可见性
 
@@ -580,9 +588,10 @@ purge 安全条件：
 3. 从 page3 history base 沿 UPDATE first-page 双向链按物理顺序重建 history，并与 occupied slots、
    undo header 状态及 transaction counter 证据交叉校验后，再发布 rollback segment 内存态。
 4. 对 recovered active transaction 执行 rollback。
-5. 对 prepared transaction 保留 `PREPARED`，等待上层事务协调器决定。
-6. 初始化 ReadViewManager，启动时没有用户 ReadView。
-7. 启动 purge，从恢复出的 history list 继续清理。
+5. 对 prepared transaction 查询上层持久决议：COMMIT/ROLLBACK 在 gate 关闭期执行，UNRESOLVED 阻止 OPEN。
+6. rollback recovered active transaction。
+7. 初始化 ReadViewManager，启动时没有用户 ReadView。
+8. 启动 purge，从恢复出的 history list 继续清理。
 
 恢复原则：
 
@@ -603,6 +612,8 @@ purge 安全条件：
 - `setSavepoint(String)`
 - `rollbackToSavepoint(String)`
 - `markRollbackOnly(Transaction, Throwable)`
+- `finishPrepare(Transaction)` / `prepareCommitPrepared(Transaction)` / `commitPrepared(Transaction)`（只供
+  `storage.api.trx` 与 recovery 组合，不替代稳定 facade）
 - `withTransaction(TransactionOptions, TransactionCallback)`
 
 返回值是 `TransactionContext`，不暴露内部活跃事务表或锁队列。

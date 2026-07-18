@@ -17,16 +17,24 @@ import cn.zhangyis.db.storage.record.type.TypeCodecRegistry;
 
 import java.util.List;
 import java.util.Optional;
+import java.util.ArrayList;
 
 /**
- * logical unique 二级索引的一致性点读服务。secondary entry 不含 DB_TRX_ID/DB_ROLL_PTR，因此本类只把它当作候选：
- * 先在独立短 MTR 中物化并释放二级页，再逐候选调用 {@link MvccReader} 回到聚簇版本链，最后从可见完整行重算
- * logical key。任何路径都不会同时持有 secondary、clustered 或 undo page latch。
+ * 二级索引回表一致性读服务，覆盖 logical-unique point 与 non-unique logical-prefix range。secondary entry
+ * 不含 DB_TRX_ID/DB_ROLL_PTR，因此本类只把它当作候选：先在独立短 MTR 中物化并释放二级页，再逐候选调用
+ * {@link MvccReader} 回到聚簇版本链，最后从可见完整行重算 logical key。任何路径都不会同时持有
+ * secondary、clustered 或 undo page latch。
  */
 public final class SecondaryMvccReader {
 
     /** 单次 unique 点查允许物化的最大历史候选；多一个用于显式发现异常膨胀，避免损坏树导致无界内存。 */
     private static final int MAX_UNIQUE_CANDIDATES = 1024;
+
+    /**
+     * non-unique range 单批最大物化候选。当前 SQL port 尚无长期 cursor，因此多取一个用于显式报溢出，
+     * 绝不把 limit 当成 SQL LIMIT 静默截断。
+     */
+    private static final int MAX_RANGE_CANDIDATES = 4096;
 
     /** secondary scan 短 MTR 来源。 */
     private final MiniTransactionManager mtrManager;
@@ -132,6 +140,76 @@ public final class SecondaryMvccReader {
     }
 
     /**
+     * 读取完整 non-unique logical key 对应的物理 prefix range，并返回给定 ReadView 可见的全部聚簇行。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 exact-version non-unique metadata 与完整 logical key；NULL equality 直接返回空。</li>
+     *     <li>在独立短 MTR 中扫描包括 delete-marked 的 prefix candidates，提交后释放全部 secondary 页资源。</li>
+     *     <li>逐候选回聚簇版本链选择可见完整行；secondary、clustered、undo latch 不发生重叠。</li>
+     *     <li>从可见行重算 logical key，用共享 comparator 复核 SQL 等值谓词，拒绝历史新/旧 key 假命中。</li>
+     *     <li>按聚簇 key comparator 去重并保持首次有效物理 suffix 顺序；溢出时 fail-closed，不返回截断列表。</li>
+     * </ol>
+     *
+     * @param readView   覆盖 candidate scan、聚簇/undo 遍历以及调用方 LOB hydration 的活跃快照。
+     * @param table      exact-version 全索引聚合。
+     * @param secondary  属于 table 的普通 non-unique secondary metadata。
+     * @param logicalKey 覆盖全部声明 logical parts 的等值 key；当前 SQL Binder 只发布单 part。
+     * @return 不可变、按 secondary physical suffix 稳定排列且聚簇 identity 去重的可见完整行列表。
+     * @throws DatabaseValidationException metadata 归属、索引属性或 key 形状无效时抛出。
+     * @throws SecondaryRangeCapacityException 候选超过批量安全上限时抛出；调用方不得使用部分结果。
+     */
+    public List<LogicalRecord> readRange(ReadView readView, TableIndexMetadata table,
+                                         SecondaryIndexMetadata secondary, SearchKey logicalKey) {
+        // 1. SQL '=' 遇 NULL 是 UNKNOWN；无需扫描、回表或让 purge low-water 之外产生额外副作用。
+        validateRange(readView, table, secondary, logicalKey);
+        if (logicalKey.values().stream().anyMatch(ColumnValue.NullValue.class::isInstance)) {
+            return List.of();
+        }
+
+        // 2. 多取一个 candidate 仅用于发现溢出；短 MTR 已在返回前释放全部 secondary fix/latch。
+        List<BTreeLookupResult> candidates = scanRangeCandidates(secondary, logicalKey);
+        if (candidates.size() > MAX_RANGE_CANDIDATES) {
+            throw new SecondaryRangeCapacityException(
+                    "secondary range candidate limit exceeded: table=" + table.tableId()
+                            + " index=" + secondary.index().indexId() + " key=" + logicalKey
+                            + " limit=" + MAX_RANGE_CANDIDATES);
+        }
+
+        IndexKeyDef logicalKeyDef = logicalKeyDefinition(secondary);
+        List<SearchKey> identities = new ArrayList<>();
+        List<LogicalRecord> rows = new ArrayList<>();
+        for (BTreeLookupResult candidate : candidates) {
+            // 3. candidate 只是导航证据；真正可见性必须由聚簇 DB_TRX_ID/DB_ROLL_PTR 与 undo 链决定。
+            SearchKey clusterKey = secondary.layout().clusterKey(candidate.record());
+            Optional<LogicalRecord> visible = clusteredReader.read(
+                    readView, table.clusteredIndex(), clusterKey);
+            if (visible.isEmpty()) {
+                continue;
+            }
+
+            // 4. marked old entry 或不可见 new entry 回表后可能得到另一个 logical key，必须重投影复核。
+            LogicalRecord row = visible.orElseThrow();
+            SearchKey visibleLogicalKey = secondary.layout().logicalKey(
+                    secondary.layout().toEntry(row, false));
+            if (keyComparator.compare(visibleLogicalKey, logicalKey, logicalKeyDef,
+                    secondary.index().schema()) != 0) {
+                continue;
+            }
+
+            // 5. A→B→A 或损坏/重试可能让多个 candidate 指向同一聚簇 identity；按聚簇比较语义稳定去重。
+            boolean duplicate = identities.stream().anyMatch(existing -> keyComparator.compare(
+                    existing, clusterKey, table.clusteredIndex().keyDef(),
+                    table.clusteredIndex().schema()) == 0);
+            if (!duplicate) {
+                identities.add(clusterKey);
+                rows.add(row);
+            }
+        }
+        return List.copyOf(rows);
+    }
+
+    /**
      * 在独立短 MTR 中物化包括 delete-marked 的 logical-prefix 候选，并在返回前释放全部 secondary 页资源。
      *
      * <p>数据流：</p>
@@ -165,6 +243,40 @@ public final class SecondaryMvccReader {
     }
 
     /**
+     * 在独立短 MTR 中物化 non-unique prefix candidate；返回前必须释放 secondary page 资源。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>创建只读 MTR，把 secondary page fix/latch 生命周期限定在候选物化阶段。</li>
+     *     <li>扫描包括 delete-marked 的物理前缀并多取一个候选，使调用方可以拒绝超限而非静默截断。</li>
+     *     <li>提交并释放全部 secondary 资源后返回；失败时仅回滚仍 ACTIVE 的读 MTR，
+     *         ReadView 仍由上层 gateway 按隔离级别关闭。</li>
+     * </ol>
+     *
+     * @param secondary exact-version 普通二级 metadata。
+     * @param logicalKey 完整非 NULL logical key。
+     * @return 最多安全上限加一个 candidate，用于调用方检测溢出。
+     * @throws RuntimeException 页读取、记录解码或 MTR 提交失败时抛出并保留原始领域异常。
+     */
+    private List<BTreeLookupResult> scanRangeCandidates(SecondaryIndexMetadata secondary, SearchKey logicalKey) {
+        // 1. 只读 MTR 的生命周期严格止于 candidate materialization。
+        MiniTransaction read = mtrManager.beginReadOnly();
+        try {
+            // 2. including-deleted 是旧 ReadView 通过历史 entry 回聚簇版本链的必要条件。
+            List<BTreeLookupResult> candidates = btree.scanSecondaryPrefixIncludingDeleted(
+                    read, secondary, logicalKey, MAX_RANGE_CANDIDATES + 1);
+            // 3. commit 后才允许调用方访问 clustered/undo，维持 release-before-cross-tree 不变量。
+            mtrManager.commit(read);
+            return candidates;
+        } catch (RuntimeException error) {
+            if (read.state() == MiniTransactionState.ACTIVE) {
+                mtrManager.rollbackUncommitted(read);
+            }
+            throw error;
+        }
+    }
+
+    /**
      * 在任何页访问前校验 logical unique reader 的 ReadView、exact-version table/index 归属与完整 key 形状。
      *
      * @param readView  调用方仍持有的可见性快照，不能为 {@code null}。
@@ -185,6 +297,31 @@ public final class SecondaryMvccReader {
         }
         if (logicalKey.size() != secondary.layout().logicalKeyPartCount()) {
             throw new DatabaseValidationException("secondary MVCC logical key part count mismatch: expected="
+                    + secondary.layout().logicalKeyPartCount() + " actual=" + logicalKey.size());
+        }
+    }
+
+    /**
+     * 校验 non-unique range reader 的 exact-version 归属和 logical key 形状。
+     *
+     * @param readView   调用方持有的活跃快照。
+     * @param table      exact-version 表索引聚合。
+     * @param secondary  必须由 table 精确解析且声明为 non-unique。
+     * @param logicalKey part 数必须与 layout 声明一致。
+     * @throws DatabaseValidationException 字段、归属、unique 属性或 key 形状不匹配时抛出。
+     */
+    private static void validateRange(ReadView readView, TableIndexMetadata table,
+                                      SecondaryIndexMetadata secondary, SearchKey logicalKey) {
+        if (readView == null || table == null || secondary == null || logicalKey == null) {
+            throw new DatabaseValidationException("secondary MVCC range args must not be null");
+        }
+        SecondaryIndexMetadata mapped = table.requireSecondary(secondary.index().indexId());
+        if (!mapped.equals(secondary) || secondary.logicalUnique()) {
+            throw new DatabaseValidationException(
+                    "secondary MVCC range requires exact table-owned non-unique metadata");
+        }
+        if (logicalKey.size() != secondary.layout().logicalKeyPartCount()) {
+            throw new DatabaseValidationException("secondary MVCC range logical key part count mismatch: expected="
                     + secondary.layout().logicalKeyPartCount() + " actual=" + logicalKey.size());
         }
     }

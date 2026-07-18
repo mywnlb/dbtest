@@ -162,4 +162,18 @@ public final class UndoRedoBudgetEstimator {
                 cacheInsert ? 1 : 0, freeInsert ? 1 : 0, true)
                 .plus(RedoBudgetWorkload.pageImages(2L));
     }
+
+    /**
+     * XA phase one 只修改一或两个 first-page state并追加一个逻辑事务 delta；每页保留一份完整 image 余量。
+     *
+     * @param undoLogCount 当前事务普通 INSERT/UPDATE undo log 数量，v1 只允许 1..2
+     * @return 覆盖 first-page metadata与 transaction-state logical redo 的保守工作量
+     */
+    public static RedoBudgetWorkload prepare(int undoLogCount) {
+        if (undoLogCount < 1 || undoLogCount > 2) {
+            throw new DatabaseValidationException(
+                    "XA prepare ordinary undo log count must be between 1 and 2: " + undoLogCount);
+        }
+        return RedoBudgetWorkload.pageImages(undoLogCount + 2L);
+    }
 }

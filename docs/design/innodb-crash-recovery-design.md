@@ -133,6 +133,12 @@
 | `RESUME_PURGE` | history list、oldest view boundary | purge cursor | transaction no、history list pointer |
 | `OPEN_TRAFFIC` | all stage results | engine ready | gate state |
 
+当前实现落点（2026-07-17）：公共组合根在 storage 的 doublewrite/redo/undo rollback/RESUME_PURGE 完成后，
+调用 DD 层 `DictionaryDdlRecoveryService` 消费独立 CREATE/DROP TABLE DDL log。恢复以 committed DD +
+`DdlUndoMarker` 的 ddl id/phase/object version/space/exact path 联合裁决 rollback 或 finish，再逐张校验
+ACTIVE 表固定 page3 SDI；root=0、空页、逻辑 CRC/版本/内容错配按 committed DD 重写，未知 root 或物理页损坏
+阻止 Session OPEN。无 marker 的旧 DROP_PENDING/orphan cleanup 保留兼容路径。
+
 ### 6.2 逻辑与物理边界
 
 | 层面 | 对象 | 所属模块 | Recovery 模块职责 |
@@ -211,6 +217,8 @@ DDL recovery 在 redo replay 后运行：
 - `DdlRecoveryService` 扫描 `dd_ddl_log`，按 ddl id 和 phase 分组。
 - 对 `COMMITTED`：确认字典对象、storage binding、SDI、cache publish 结果。
 - 对 `PREPARE/ENGINE_DONE`：根据 DDL operation policy finish 或 rollback。
+- 对最终 ACTIVE snapshot：比较 SDI identity/version/payload；committed DD 是唯一逻辑真相，可覆盖 root=0、
+  空页和逻辑损坏，但不能猜测未知 root 或绕过页 checksum/envelope。
 - 对 orphan tablespace/root page：quarantine 后 cleanup，不能直接开放给 SQL。
 - DDL recovery 不能重新执行 SQL parser，只解释持久化 DDL log 和字典事务状态。
 
@@ -228,10 +236,12 @@ DDL recovery 在 redo replay 后运行：
 | `COMMITTED` | 保留已提交修改，update undo 进入 history list，等待 purge |
 | `ACTIVE` / `RECOVERED_ACTIVE` | 通过 undo command 反向回滚，回滚修改自身写 redo |
 | `ROLLING_BACK` | 从记录的 undo no 继续回滚 |
-| `PREPARED` | 保留 prepared 状态，等待上层协调器或管理命令决定 |
+| `PREPARED` | 以 redo/page3/first-page 同态证据重建最小 participant；调用 `PreparedTransactionDecisionProvider`，COMMIT/ROLLBACK 在 gate 关闭期完成，UNRESOLVED fail-closed |
 | `CORRUPTED` | 根据 error policy 失败或进入只读诊断 |
 
-Recovery rollback 不进入普通用户事务死锁图。启动阶段没有并发用户事务；多个 recovered active transaction 的 rollback 按 `TransactionId` 或 rollback segment 顺序执行，避免互相等待。prepared transaction 不作为死锁 victim。
+Recovery rollback 不进入普通用户事务死锁图。启动阶段没有并发用户事务；多个 recovered active/prepared
+transaction 按 `TransactionId` 顺序处理，避免互相等待。recovered prepared 不重建已丢失的 row-lock handle，
+因此 v1 必须在开放流量前取得权威决议；它不作为死锁 victim，也不能由存储层超时猜测结果。
 
 ### 7.7 Purge Resume
 

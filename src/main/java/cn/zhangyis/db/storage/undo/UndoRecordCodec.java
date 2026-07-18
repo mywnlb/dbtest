@@ -20,6 +20,7 @@ import cn.zhangyis.db.storage.record.type.TypeCodecRegistry;
 import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 
 /**
  * undo record 编解码（设计 §5.5/§6.5）。布局（big-endian），公共前缀 + 类型相关尾部：
@@ -27,6 +28,7 @@ import java.util.List;
  * 公共：[type u8][undoNo u64][transactionId u64][tableId u64][indexId u64][prevRollPointer 7B][keyColCount u8]
  *       后跟每个 key 列：[nullFlag u8]（非 null 再 [len u16][bytes]）
  * UPDATE_ROW 追加尾部：[oldDbTrxId u64][oldDbRollPtr 7B][rowColCount u8] 后跟每个 row 列（同 framing，按 schema 全列序）
+ * UPDATE/DELETE 可选 LV 尾部：[magic "LV" u16][version u8][count u16]，逐项保存 ordinal/flags/可选新 external。
  * 可选 secondary 尾部：[magic "SI" u16][version u8][count u16]，每项 [indexId u64][action u8][beforeState u8]
  * </pre>
  * INSERT_ROW 可先带既有 LOB ownership 尾部，再带 secondary 尾部；两者都为空时编码与旧版本逐字节一致。
@@ -45,6 +47,18 @@ public final class UndoRecordCodec {
 
     /** ownership 尾部首版；未来扩展必须追加版本并保留 v1 decoder，不能静默重解释。 */
     private static final int INSERT_LOB_TAIL_VERSION = 1;
+
+    /** UPDATE/DELETE LOB version ownership 尾部 magic：ASCII "LV"。 */
+    private static final int LOB_VERSION_TAIL_MAGIC = 0x4C56;
+
+    /** LOB version ownership 首版。 */
+    private static final int LOB_VERSION_TAIL_VERSION = 1;
+
+    /** committed purge 释放 old image external chain。 */
+    private static final int LOB_VERSION_PURGE_OLD = 0x01;
+
+    /** rollback marker 释放前向 UPDATE 新建的 external chain。 */
+    private static final int LOB_VERSION_ROLLBACK_NEW = 0x02;
 
     /** secondary mutation 尾部 magic：ASCII "SI"；与 INSERT 的 "LO" 区分，便于旧 EOF 与双尾顺序判定。 */
     private static final int SECONDARY_TAIL_MAGIC = 0x5349;
@@ -75,7 +89,7 @@ public final class UndoRecordCodec {
      * <ol>
      *     <li>校验 record、key definition、schema 和聚簇 key part 数，任何错误在创建输出前失败。</li>
      *     <li>写固定 identity/链前缀，再按 key part 对应列类型写带 null/length framing 的完整聚簇键。</li>
-     *     <li>INSERT 先写可选 LOB ownership；UPDATE/DELETE 写旧隐藏列与全量旧 image。</li>
+     *     <li>INSERT 写可选 LO；UPDATE/DELETE 写旧隐藏列、全量旧 image 和可选 LV ownership。</li>
      *     <li>最后写可选 secondary mutation tail，并返回独立字节数组；尾部顺序固定，不能按调用方列表动态互换。</li>
      * </ol>
      *
@@ -122,6 +136,9 @@ public final class UndoRecordCodec {
             for (int i = 0; i < row.size(); i++) {
                 writeFramedColumn(out, row.get(i), schema.column(i).type());
             }
+            if (!rec.lobVersionOwnerships().isEmpty()) {
+                writeLobVersionTail(out, rec.lobVersionOwnerships(), rec.oldColumnValues(), schema);
+            }
         }
         // 4. secondary tail 始终位于记录末尾；空列表不写 magic，旧 decoder/旧记录都以 EOF 保持兼容。
         if (!rec.secondaryMutations().isEmpty()) {
@@ -155,7 +172,7 @@ public final class UndoRecordCodec {
      *     <li>按 exact key definition/schema 解码带 framing 的完整聚簇键，并核对落盘 key part 数。</li>
      *     <li>INSERT 按固定顺序识别可选 LOB tail 与 secondary tail，要求消费到 EOF 后构造 INSERT_ROW record。</li>
      *     <li>UPDATE/DELETE 解码旧隐藏列和全量旧 image，列数必须等于 exact-version schema。</li>
-     *     <li>解码可选 secondary tail，要求 action 与主 type 一致且消费到 EOF，再构造对应领域 record。</li>
+     *     <li>依次解码可选 LV 与 SI tail，要求 ownership/action 与主 type 一致且消费到 EOF，再构造领域 record。</li>
      * </ol>
      *
      * @param buf    包含一条完整 undo record 的字节数组。
@@ -228,17 +245,21 @@ public final class UndoRecordCodec {
         for (int i = 0; i < rowColCount; i++) {
             oldRow.add(readFramedColumn(buf, c, schema.column(i).type(), "old row col " + i));
         }
-        // 5. secondary tail 位于 UPDATE/DELETE 旧 image 后；action 必须由主 record type 唯一决定。
+        // 5. UPDATE/DELETE 可先带 LV tail，再带 secondary tail；旧记录允许直接 EOF 或 SI。
         UndoRecordType recordType = UndoRecordType.fromCode(typeCode);
+        List<LobVersionOwnership> lobVersions = List.of();
+        if (c[0] < buf.length && peekU16(buf, c[0]) == LOB_VERSION_TAIL_MAGIC) {
+            lobVersions = readLobVersionTail(buf, c, recordType, oldRow, schema);
+        }
         List<SecondaryUndoMutation> mutations = c[0] == buf.length
                 ? List.of() : readSecondaryTail(buf, c, recordType);
         requireFullyConsumed(buf, c[0]);
         if (typeCode == UndoRecordType.UPDATE_ROW.code()) {
             return UndoRecord.update(UndoNo.of(undoNo), TransactionId.of(txn), tableId, indexId, key,
-                    oldRow, oldHidden, mutations, prev);
+                    oldRow, oldHidden, lobVersions, mutations, prev);
         }
         return UndoRecord.deleteMark(UndoNo.of(undoNo), TransactionId.of(txn), tableId, indexId, key,
-                oldRow, oldHidden, mutations, prev);
+                oldRow, oldHidden, lobVersions, mutations, prev);
     }
 
     /**
@@ -370,6 +391,165 @@ public final class UndoRecordCodec {
         if (columnType.storageKind() != StorageKind.OVERFLOW_CAPABLE) {
             throw new DatabaseValidationException("inserted LOB ownership targets non-LOB column: " + ordinal);
         }
+    }
+
+    /**
+     * 在 old image 后编码 UPDATE/DELETE 的 LOB version ownership。旧链 envelope 已存在 old image，只在
+     * rollback-new flag 存在时追加新 external envelope，避免重复持久化 purge 输入。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>在写 magic 前校验非空 count，防止失败留下可被误识别的半个 tail。</li>
+     *     <li>逐 ordinal 解析 exact schema 列，并核对 purge-old 动作确实指向 external old image。</li>
+     *     <li>写 ordinal/flags；rollback-new 存在时复用列 LobCodec 编码完整 external envelope。</li>
+     * </ol>
+     *
+     * @param out        已写完 fixed body 与 old image 的目标输出；方法不关闭它。
+     * @param ownerships 按 ordinal 严格递增的非空 LOB version ownership。
+     * @param oldRow     UPDATE/DELETE 全量旧 image；purge-old 动作必须在同 ordinal 命中 external value。
+     * @param schema     解释 ordinal 和 external envelope 的 exact-version schema。
+     * @throws DatabaseValidationException count、ordinal、列类型、旧 image 或 external 编码无效时抛出。
+     */
+    private void writeLobVersionTail(ByteArrayOutputStream out, List<LobVersionOwnership> ownerships,
+                                     List<ColumnValue> oldRow, TableSchema schema) {
+        // 1. 先验证 framing 上限，失败不向输出写入 magic/version。
+        if (ownerships.isEmpty() || ownerships.size() > 0xFFFF) {
+            throw new DatabaseValidationException(
+                    "LOB version tail count must be between 1 and 65535: " + ownerships.size());
+        }
+        writeU16(out, LOB_VERSION_TAIL_MAGIC);
+        out.write(LOB_VERSION_TAIL_VERSION);
+        writeU16(out, ownerships.size());
+        // 2. exact schema 与 old image 是 purge-old 的权威类型/引用来源。
+        for (LobVersionOwnership ownership : ownerships) {
+            int ordinal = ownership.columnOrdinal();
+            if (ordinal > 0xFFFF || ordinal >= schema.columnCount()) {
+                throw new DatabaseValidationException("LOB version ordinal exceeds schema/u16: " + ordinal);
+            }
+            ColumnType columnType = schema.column(ordinal).type();
+            requireLobColumnForEncode(ordinal, columnType);
+            if (ownership.purgeOldValue()
+                    && !(oldRow.get(ordinal) instanceof ColumnValue.ExternalValue)) {
+                throw new DatabaseValidationException(
+                        "purge-old LOB ownership requires external old image: " + ordinal);
+            }
+            // 3. 新 external envelope 只在 rollback-new 动作存在时编码；旧 envelope 不重复保存。
+            int flags = (ownership.purgeOldValue() ? LOB_VERSION_PURGE_OLD : 0)
+                    | (ownership.rollbackNewValue().isPresent() ? LOB_VERSION_ROLLBACK_NEW : 0);
+            writeU16(out, ordinal);
+            out.write(flags);
+            if (ownership.rollbackNewValue().isPresent()) {
+                ColumnValue.ExternalValue external = ownership.rollbackNewValue().orElseThrow();
+                TypeCodec codec = registry.codecFor(columnType);
+                int encodedLength = codec.encodedLength(external, columnType);
+                if (encodedLength <= 0 || encodedLength > 0xFFFF) {
+                    throw new DatabaseValidationException(
+                            "rollback-new LOB envelope length exceeds u16: " + encodedLength);
+                }
+                byte[] encoded = new byte[encodedLength];
+                codec.encode(external, columnType, new FieldWriter(encoded, 0));
+                writeU16(out, encodedLength);
+                out.writeBytes(encoded);
+            }
+        }
+    }
+
+    /**
+     * 解码 LV/v1，并用 exact schema 与 old image 复核 purge/rollback ownership。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 magic/version/count，未知协议或显式空 tail 立即 fail-closed。</li>
+     *     <li>逐项校验 ordinal 顺序、LOB 列类型、flags 和 purge-old 的旧 image 证据。</li>
+     *     <li>按 rollback-new flag 解码 external envelope，并拒绝 DELETE 携带新链 ownership。</li>
+     *     <li>构造领域对象并冻结列表；cursor 停在 LV 末尾，由调用方继续识别 SI 或 EOF。</li>
+     * </ol>
+     *
+     * @param buf        包含完整 undo record 的稳定字节数组。
+     * @param cursor     单元素可变偏移；输入指向 LV magic，成功后推进到 tail 末尾。
+     * @param recordType 公共前缀已验证的 UPDATE_ROW 或 DELETE_MARK 类型。
+     * @param oldRow     已按 exact schema 解码的全量旧 image。
+     * @param schema     解析 ordinal、列类型和 external envelope 的 exact-version schema。
+     * @return 按 ordinal 严格递增的不可变 LOB version ownership；tail 非空时返回值也非空。
+     * @throws UndoLogFormatException 协议、排序、flags、old image、类型或 external envelope 损坏时抛出。
+     */
+    private List<LobVersionOwnership> readLobVersionTail(byte[] buf, int[] cursor,
+                                                          UndoRecordType recordType,
+                                                          List<ColumnValue> oldRow,
+                                                          TableSchema schema) {
+        // 1. framing 决定后续每一项边界；未知值不能按当前版本猜测。
+        int magic = readU16(buf, cursor);
+        if (magic != LOB_VERSION_TAIL_MAGIC) {
+            throw new UndoLogFormatException("unknown LOB version tail magic: " + magic);
+        }
+        int version = readU8(buf, cursor);
+        if (version != LOB_VERSION_TAIL_VERSION) {
+            throw new UndoLogFormatException("unknown LOB version tail version: " + version);
+        }
+        int count = readU16(buf, cursor);
+        if (count == 0) {
+            throw new UndoLogFormatException("LOB version tail must not encode an empty list");
+        }
+        // 2. ordinal/type/old image 校验先于领域对象发布。
+        List<LobVersionOwnership> ownerships = new ArrayList<>(count);
+        int previousOrdinal = -1;
+        for (int i = 0; i < count; i++) {
+            int ordinal = readU16(buf, cursor);
+            if (ordinal <= previousOrdinal || ordinal >= schema.columnCount()) {
+                throw new UndoLogFormatException(
+                        "LOB version ordinal is duplicate/out-of-order/out-of-range: " + ordinal);
+            }
+            previousOrdinal = ordinal;
+            ColumnType columnType = schema.column(ordinal).type();
+            if (columnType.storageKind() != StorageKind.OVERFLOW_CAPABLE) {
+                throw new UndoLogFormatException("LOB version ownership targets non-LOB column: " + ordinal);
+            }
+            int flags = readU8(buf, cursor);
+            if (flags == 0 || (flags & ~(LOB_VERSION_PURGE_OLD | LOB_VERSION_ROLLBACK_NEW)) != 0) {
+                throw new UndoLogFormatException("unknown/empty LOB version flags: " + flags);
+            }
+            boolean purgeOld = (flags & LOB_VERSION_PURGE_OLD) != 0;
+            boolean rollbackNew = (flags & LOB_VERSION_ROLLBACK_NEW) != 0;
+            if (purgeOld && !(oldRow.get(ordinal) instanceof ColumnValue.ExternalValue)) {
+                throw new UndoLogFormatException(
+                        "purge-old LOB ownership has no external old image: " + ordinal);
+            }
+            if (recordType == UndoRecordType.DELETE_MARK && rollbackNew) {
+                throw new UndoLogFormatException("DELETE_MARK LV tail cannot carry rollback-new ownership");
+            }
+            // 3. DELETE 没有新链；UPDATE 的新 envelope 继续复用 exact column LobCodec。
+            Optional<ColumnValue.ExternalValue> newValue = Optional.empty();
+            if (rollbackNew) {
+                int encodedLength = readU16(buf, cursor);
+                if (encodedLength <= 0 || cursor[0] + encodedLength > buf.length) {
+                    throw new UndoLogFormatException(
+                            "rollback-new LOB envelope is truncated/empty: " + encodedLength);
+                }
+                try {
+                    ColumnValue decoded = registry.codecFor(columnType).decode(
+                            new FieldSlice(buf, cursor[0], encodedLength), columnType);
+                    if (!(decoded instanceof ColumnValue.ExternalValue external)) {
+                        throw new UndoLogFormatException(
+                                "rollback-new LOB ownership contains inline value: " + ordinal);
+                    }
+                    newValue = Optional.of(external);
+                } catch (UndoLogFormatException formatFailure) {
+                    throw formatFailure;
+                } catch (DatabaseRuntimeException invalidEnvelope) {
+                    throw new UndoLogFormatException(
+                            "invalid rollback-new LOB envelope at ordinal " + ordinal, invalidEnvelope);
+                }
+                cursor[0] += encodedLength;
+            }
+            // 4. 领域构造器再次守住动作非空不变量，异常统一包装成磁盘格式损坏。
+            try {
+                ownerships.add(new LobVersionOwnership(ordinal, purgeOld, newValue));
+            } catch (DatabaseRuntimeException invalidOwnership) {
+                throw new UndoLogFormatException(
+                        "invalid LOB version ownership at position " + i, invalidOwnership);
+            }
+        }
+        return List.copyOf(ownerships);
     }
 
     /**

@@ -13,9 +13,29 @@ import java.util.List;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
 /** 物理 DDL DTO 不变量测试：损坏 DD 不得把重复 index 或跨 space segment 传入 B+Tree。 */
 class StorageDdlDomainTest {
+
+    /**
+     * metadata-only CREATE INDEX 可以推进字典版本，但必须保留聚簇记录编码时使用的物理行格式版本。
+     */
+    @Test
+    void keepsPhysicalRowFormatVersionIndependentFromDictionaryVersion() {
+        SpaceId tableSpace = SpaceId.of(1024);
+        IndexStorageBinding index = new IndexStorageBinding(3,
+                PageId.of(tableSpace, PageNo.of(8)), 0,
+                new SegmentRef(tableSpace, 1, SegmentId.of(11)),
+                new SegmentRef(tableSpace, 2, SegmentId.of(12)));
+
+        TableStorageBinding binding = new TableStorageBinding(
+                2, tableSpace, Path.of("table.ibd"), 7, List.of(index), Optional.empty());
+
+        assertEquals(7, binding.rowFormatVersion());
+        assertThrows(DatabaseValidationException.class, () -> new TableStorageBinding(
+                2, tableSpace, Path.of("table.ibd"), 0, List.of(index), Optional.empty()));
+    }
 
     /** 稳定 indexId 不可因名称不同而在同一建表请求内重复。 */
     @Test

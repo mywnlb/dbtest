@@ -204,6 +204,57 @@ public final class UndoLogSegmentAccess {
     }
 
     /**
+     * 在一个 phase-one MTR 中原子标记同一事务的全部普通 undo first page。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验目标非空、PageId 唯一，并按 PageId 稳定排序后固定全部 first-page X latch。</li>
+     *     <li>先全量核对 creator、kind、ACTIVE、NONE commit no和空 history links；任一冲突时尚未写页。</li>
+     *     <li>全部证据闭合后逐页写 PREPARED state；page3 owner与 logical head保持不变。</li>
+     * </ol>
+     *
+     * @param mtr phase-one 写 MTR；调用方负责在同一批次追加 transaction-state prepare redo并提交
+     * @param creatorTransactionId 全部目标共享的已分配 write transaction id
+     * @param targets 同一事务的一或两条 INSERT/UPDATE first-page 目标
+     * @throws DatabaseValidationException 输入缺失、重复页或临时 undo target 时抛出，页面不改变
+     * @throws UndoLogFormatException first-page identity/state与冻结目标不一致时抛出，页面不改变
+     */
+    public void markPreparedFirstPages(MiniTransaction mtr, TransactionId creatorTransactionId,
+                                       List<UndoPrepareTarget> targets) {
+        // 1、批次不能为空且不得重复；排序由 first-page-only helper 统一完成。
+        if (mtr == null || creatorTransactionId == null || creatorTransactionId.isNone()
+                || targets == null || targets.isEmpty()
+                || targets.stream().anyMatch(java.util.Objects::isNull)) {
+            throw new DatabaseValidationException("undo prepare batch arguments are invalid");
+        }
+        List<PageId> pageIds = targets.stream().map(UndoPrepareTarget::firstPageId).toList();
+        if (pageIds.stream().distinct().count() != pageIds.size()) {
+            throw new DatabaseValidationException("undo prepare first pages must be distinct");
+        }
+        Map<PageId, UndoPage> pages = openFirstPagesSorted(mtr, pageIds);
+
+        // 2、写前完成全量校验，防止 mixed transaction 只留下一个 PREPARED first page。
+        for (UndoPrepareTarget target : targets) {
+            UndoPage page = pages.get(target.firstPageId());
+            requireHistoryFirstPage(page, target.firstPageId());
+            if (page.state() != UndoPageLayout.STATE_ACTIVE
+                    || page.undoKind() != target.kind()
+                    || !page.transactionId().equals(creatorTransactionId)
+                    || page.commitNo() != 0L
+                    || page.historyPrevPageNo() != FilePageHeader.FIL_NULL
+                    || page.historyNextPageNo() != FilePageHeader.FIL_NULL) {
+                throw new UndoLogFormatException(
+                        "undo prepare target identity/state changed: " + target.firstPageId());
+            }
+        }
+
+        // 3、同一 MTR 内只改稳定 state byte；logical head和 page3 owner继续为 phase-two 提供权威入口。
+        for (UndoPrepareTarget target : targets) {
+            pages.get(target.firstPageId()).setLogState(UndoPageLayout.STATE_PREPARED);
+        }
+    }
+
+    /**
      * commit 最终 MTR 的 first-page-only 批处理：按 pageNo 升序获取旧 tail 与新 UPDATE 首页，避免普通
      * {@link #open} 因跟随新节点 LAST_PAGE_NO 而越过另一 first page。全部状态校验先完成，之后才写双向链接和提交头。
      */
@@ -234,6 +285,35 @@ public final class UndoLogSegmentAccess {
                                   TransactionNo transactionNo, List<CachedUndoSegmentRef> cacheResets,
                                   List<FreeUndoSegmentRef> freeResets,
                                   Optional<FreeUndoSegmentRef> oldFreeTail) {
+        appendHistoryNodeFromState(mtr, oldTailPageId, newTailPageId, creatorTransactionId,
+                transactionNo, cacheResets, freeResets, oldFreeTail, UndoPageLayout.STATE_ACTIVE);
+    }
+
+    /**
+     * prepared commit 变体：新 UPDATE tail 必须仍为 PREPARED，提交批次把它直接转成 COMMITTED并挂 history。
+     * prepared INSERT owner由上层先 drop，不允许借此入口进入 cache/free reuse。
+     *
+     * @param mtr 当前 phase-two commit MTR
+     * @param oldTailPageId history append lease冻结的旧尾
+     * @param newTailPageId 当前 PREPARED UPDATE undo first page
+     * @param creatorTransactionId prepared creator write id
+     * @param transactionNo phase two 新分配的提交号
+     */
+    public void appendPreparedHistoryNode(MiniTransaction mtr, Optional<PageId> oldTailPageId,
+                                          PageId newTailPageId, TransactionId creatorTransactionId,
+                                          TransactionNo transactionNo) {
+        appendHistoryNodeFromState(mtr, oldTailPageId, newTailPageId, creatorTransactionId,
+                transactionNo, List.of(), List.of(), Optional.empty(),
+                UndoPageLayout.STATE_PREPARED);
+    }
+
+    /** ACTIVE/PREPARED history append 共用的 first-page-only 原子实现。 */
+    private void appendHistoryNodeFromState(
+            MiniTransaction mtr, Optional<PageId> oldTailPageId,
+            PageId newTailPageId, TransactionId creatorTransactionId,
+            TransactionNo transactionNo, List<CachedUndoSegmentRef> cacheResets,
+            List<FreeUndoSegmentRef> freeResets,
+            Optional<FreeUndoSegmentRef> oldFreeTail, int expectedNewTailState) {
         if (mtr == null || oldTailPageId == null || newTailPageId == null
                 || creatorTransactionId == null || creatorTransactionId.isNone()
                 || transactionNo == null || transactionNo.isNone() || cacheResets == null
@@ -241,6 +321,16 @@ public final class UndoLogSegmentAccess {
                 || cacheResets.stream().anyMatch(java.util.Objects::isNull)
                 || freeResets.stream().anyMatch(java.util.Objects::isNull)) {
             throw new DatabaseValidationException("undo history append batch arguments are invalid");
+        }
+        if (expectedNewTailState != UndoPageLayout.STATE_ACTIVE
+                && expectedNewTailState != UndoPageLayout.STATE_PREPARED) {
+            throw new DatabaseValidationException(
+                    "history append expected state must be ACTIVE or PREPARED");
+        }
+        if (expectedNewTailState == UndoPageLayout.STATE_PREPARED
+                && (!cacheResets.isEmpty() || !freeResets.isEmpty() || oldFreeTail.isPresent())) {
+            throw new DatabaseValidationException(
+                    "prepared history append cannot reuse INSERT undo pages");
         }
         oldTailPageId.ifPresent(old -> requireSameHistorySpace(old, newTailPageId));
         if (oldTailPageId.equals(Optional.of(newTailPageId))) {
@@ -258,11 +348,12 @@ public final class UndoLogSegmentAccess {
         Map<PageId, UndoPage> pages = openFirstPagesSorted(mtr, pageIds);
         UndoPage newTail = pages.get(newTailPageId);
         requireHistoryFirstPage(newTail, newTailPageId);
-        if (newTail.undoKind() != UndoLogKind.UPDATE || newTail.state() != UndoPageLayout.STATE_ACTIVE
+        if (newTail.undoKind() != UndoLogKind.UPDATE || newTail.state() != expectedNewTailState
                 || !newTail.transactionId().equals(creatorTransactionId) || newTail.commitNo() != 0L
                 || newTail.historyPrevPageNo() != FilePageHeader.FIL_NULL
                 || newTail.historyNextPageNo() != FilePageHeader.FIL_NULL) {
-            throw new UndoLogFormatException("new history tail must be an unlinked ACTIVE UPDATE undo page: "
+            throw new UndoLogFormatException("new history tail must be an unlinked "
+                    + UndoLogState.fromPhysical(expectedNewTailState) + " UPDATE undo page: "
                     + newTailPageId);
         }
         if (oldTailPageId.isPresent()) {

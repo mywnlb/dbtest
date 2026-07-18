@@ -20,8 +20,8 @@ import java.util.Set;
  * page3 history base、occupied slot 证据与 undo first-page 双向链的恢复闭包校验器。
  *
  * <p>本类只编排不可变快照；每个节点如何在短 MTR 中读取由 {@link NodeReader} 注入。成功结果严格保持物理链顺序，
- * 不按 TransactionNo 排序。任何 cycle、断链、orphan COMMITTED、linked ACTIVE、重复 identity 或提交号高水位回退
- * 都是恢复安全性损坏，必须在开放流量前 fail-closed。
+ * 不按 TransactionNo 排序。任何 cycle、断链、orphan COMMITTED、linked ACTIVE/PREPARED、重复 identity
+ * 或提交号高水位回退都是恢复安全性损坏，必须在开放流量前 fail-closed。
  */
 public final class PersistentHistoryRecovery {
 
@@ -78,7 +78,8 @@ public final class PersistentHistoryRecovery {
      *     <li>校验输入 cardinality，并把 recovered slot evidence 建成 first-page 唯一索引。</li>
      *     <li>严格按 base.head→next 遍历声明长度，逐节点核对 slot、COMMITTED UPDATE、双向链接、creator/commit identity，
      *         再读取 logical chain 的 affected-table 集合。</li>
-     *     <li>核对 tail/length 闭包，并扫描全部 occupied evidence：COMMITTED 不得 orphan，ACTIVE 必须未链接且 header 状态一致。</li>
+     *     <li>核对 tail/length 闭包，并扫描全部 occupied evidence：COMMITTED 不得 orphan，ACTIVE/PREPARED
+     *         必须未链接且 header 状态一致。</li>
      *     <li>确认 page3 lastTransactionNo 不低于 live history 最大提交号，最后发布保持物理顺序的不可变结果。</li>
      * </ol>
      *
@@ -89,7 +90,8 @@ public final class PersistentHistoryRecovery {
      * @param affectedTableReader 从节点 logical head 投影 committed UPDATE 链表集合的读取器。
      * @return head→tail 物理顺序的不可变 {@link HistoryEntry} 列表，可直接交给 {@code HistoryList.restore}。
      * @throws DatabaseValidationException 任一输入/读取器缺失或 cardinality 基础字段非法时抛出。
-     * @throws TransactionRecoveryException 链中断/成环、owner/状态/链接/identity 错配、orphan COMMITTED、linked ACTIVE，
+     * @throws TransactionRecoveryException 链中断/成环、owner/状态/链接/identity 错配、orphan COMMITTED、
+     *                                      linked ACTIVE/PREPARED，
      *                                      affected-table 读取返回 null 或提交号高水位回退时抛出。
      */
     public List<HistoryEntry> rebuild(RollbackSegmentHistoryBase base,
@@ -162,7 +164,7 @@ public final class PersistentHistoryRecovery {
             previous = Optional.of(pageId);
             current = node.nextHistoryPageId();
         }
-        // 3. 声明长度结束后必须精确落在 tail；随后核对所有 slot，禁止 committed orphan 或 active linked node。
+        // 3. 声明长度结束后必须精确落在 tail；随后核对所有 slot，禁止 committed orphan 或未决 owner 进入 history。
         if (current.isPresent() || !previous.equals(base.tailPageId())) {
             throw new TransactionRecoveryException("persistent history tail/declared length mismatch: base=" + base);
         }
@@ -172,15 +174,20 @@ public final class PersistentHistoryRecovery {
                 throw new TransactionRecoveryException("COMMITTED occupied slot is omitted from history: "
                         + evidence.firstPageId());
             }
-            if (evidence.state() == RecoveredUndoState.ACTIVE) {
-                UndoHistoryNodeSnapshot active = requireNode(nodeReader.read(evidence.firstPageId()),
+            if (evidence.state() == RecoveredUndoState.ACTIVE
+                    || evidence.state() == RecoveredUndoState.PREPARED) {
+                UndoHistoryNodeSnapshot owner = requireNode(nodeReader.read(evidence.firstPageId()),
                         evidence.firstPageId());
-                if (linked || !active.isActive() || active.kind() != evidence.kind()
-                        || !active.creatorTransactionId().equals(evidence.creatorTransactionId())
-                        || !active.committedTransactionNo().isNone()
-                        || active.previousHistoryPageId().isPresent() || active.nextHistoryPageId().isPresent()) {
-                    throw new TransactionRecoveryException("ACTIVE undo slot header/state must match evidence and "
-                            + "remain unlinked: " + evidence.firstPageId());
+                boolean expectedState = evidence.state() == RecoveredUndoState.ACTIVE
+                        ? owner.isActive()
+                        : owner.isPrepared();
+                if (linked || !expectedState || owner.kind() != evidence.kind()
+                        || !owner.creatorTransactionId().equals(evidence.creatorTransactionId())
+                        || !owner.committedTransactionNo().isNone()
+                        || owner.previousHistoryPageId().isPresent() || owner.nextHistoryPageId().isPresent()) {
+                    throw new TransactionRecoveryException(
+                            evidence.state() + " undo slot header/state must match evidence and remain unlinked: "
+                                    + evidence.firstPageId());
                 }
             }
         }

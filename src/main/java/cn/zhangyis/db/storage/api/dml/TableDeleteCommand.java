@@ -1,11 +1,13 @@
 package cn.zhangyis.db.storage.api.dml;
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
+import cn.zhangyis.db.storage.api.SegmentRef;
 import cn.zhangyis.db.storage.btree.TableIndexMetadata;
 import cn.zhangyis.db.storage.record.page.SearchKey;
 import cn.zhangyis.db.storage.trx.Transaction;
 
 import java.time.Duration;
+import java.util.Optional;
 
 /**
  * 表级 DELETE 命令；聚簇记录先 delete-mark，二级 entry 同步 mark，物理回收留给 purge。
@@ -16,7 +18,8 @@ import java.time.Duration;
  * @param lockWaitTimeout 聚簇行锁与短物理 row guard 的最大等待时长；必须为正值。
  */
 public record TableDeleteCommand(Transaction transaction, TableIndexMetadata metadata,
-                                 SearchKey clusterKey, Duration lockWaitTimeout) {
+                                 SearchKey clusterKey, Optional<SegmentRef> lobSegment,
+                                 Duration lockWaitTimeout) {
 
     /**
      * 校验删除命令在进入任何事务锁或页访问前具备完整上下文。
@@ -28,9 +31,17 @@ public record TableDeleteCommand(Transaction transaction, TableIndexMetadata met
      * @throws DatabaseValidationException 任一字段缺失或等待时长无效时抛出；失败不产生锁、MTR 或 redo 副作用。
      */
     public TableDeleteCommand {
-        if (transaction == null || metadata == null || clusterKey == null
+        if (transaction == null || metadata == null || clusterKey == null || lobSegment == null
                 || lockWaitTimeout == null || lockWaitTimeout.isZero() || lockWaitTimeout.isNegative()) {
             throw new DatabaseValidationException("table delete command fields are invalid");
         }
+        if (clusterKey.size() != metadata.clusteredIndex().keyDef().parts().size()) {
+            throw new DatabaseValidationException("table delete command requires a complete clustered key");
+        }
+    }
+
+    public TableDeleteCommand(Transaction transaction, TableIndexMetadata metadata,
+                              SearchKey clusterKey, Duration lockWaitTimeout) {
+        this(transaction, metadata, clusterKey, Optional.empty(), lockWaitTimeout);
     }
 }

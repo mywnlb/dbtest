@@ -2,6 +2,7 @@ package cn.zhangyis.db.storage.trx;
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageId;
+import cn.zhangyis.db.domain.Lsn;
 import cn.zhangyis.db.domain.RollPointer;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.domain.TransactionId;
@@ -16,6 +17,7 @@ import cn.zhangyis.db.storage.record.schema.TableSchema;
 import cn.zhangyis.db.storage.record.type.ColumnValue;
 import cn.zhangyis.db.storage.undo.RollbackSegmentHeaderRepository;
 import cn.zhangyis.db.storage.undo.InsertedLobOwnership;
+import cn.zhangyis.db.storage.undo.LobVersionOwnership;
 import cn.zhangyis.db.storage.undo.SecondaryUndoMutation;
 import cn.zhangyis.db.storage.undo.RollbackSegmentFreeListBase;
 import cn.zhangyis.db.storage.undo.UndoAppendSnapshot;
@@ -45,7 +47,7 @@ import java.util.ArrayList;
  * <p><b>当前范围</b>：生产 DML 与测试协作者统一通过
  * {@code planInsert/planUpdate/planDelete + appendPlanned} 在业务 MTR admission 前冻结目标 kind、持久头快照、
  * inline/external 编码、精确 reservation 与 redo workload。INSERT/UPDATE 首写分别惰性创建独立 slot/segment；
- * prepared transaction 与多 rseg 调度仍留后续切片。
+ * XA phase one/phase two 复用相同普通 undo owner；多 rseg 调度仍留后续切片。
  *
  * <p><b>WAL/失败边界</b>（§7.2）：生产 append 与聚簇修改仍在同一 MTR，undo root/payload redo 与 index redo
  * 同批提交。stale/编码/配置错误在 reservation 前拒绝；进入 segment/payload 物理修改后，或 undo 已写而聚簇修改
@@ -226,8 +228,41 @@ public final class UndoLogManager {
      * 在同一业务 MTR 中先固定 undo owner/root/payload 页而不发布 placeholder。调用顺序必须位于 B+Tree prepare 与
      * LOB allocation 之前；返回 guard 后任何未发布退出均属于 fail-stop 边界。
      */
-    public PreparedUndoAppend prepareUndoAppend(Transaction txn, MiniTransaction mtr,
-                                                DeferredInsertUndoPlan deferred) {
+    public PreparedUndoAppend<InsertedLobOwnership> prepareUndoAppend(Transaction txn, MiniTransaction mtr,
+                                                                      DeferredInsertUndoPlan deferred) {
+        return prepareDeferredUndoAppend(txn, mtr, deferred);
+    }
+
+    /**
+     * 在同一 UPDATE 业务 MTR 中 prepare placeholder undo，但只允许稍后发布形状等价的真实 LV ownership。
+     *
+     * @param txn      当前 ACTIVE 写事务，必须与 deferred placeholder owner 一致。
+     * @param mtr      已覆盖 undo+B+Tree+LOB workload 的 ACTIVE 业务 MTR。
+     * @param deferred LOB replacement 规划阶段冻结的 deferred UPDATE undo。
+     * @return 恰好一次接收真实 {@link LobVersionOwnership} 列表的 prepared append guard。
+     * @throws TransactionStateException 参数缺失或事务不再 ACTIVE 时抛出。
+     * @throws UndoWriteStalePlanException 事务 logical head、slot owner 或持久 append snapshot 已变化时抛出。
+     * @throws UndoWriteFatalException prepare 已越过物理 owner/page 边界后失败时抛出。
+     */
+    public PreparedUndoAppend<LobVersionOwnership> prepareUndoAppend(Transaction txn, MiniTransaction mtr,
+                                                                     DeferredUpdateUndoPlan deferred) {
+        return prepareDeferredUndoAppend(txn, mtr, deferred);
+    }
+
+    /**
+     * 根据冻结 acquisition 分派共享的 deferred owner/root/payload prepare 协议。
+     *
+     * @param txn      当前 ACTIVE 写事务。
+     * @param mtr      已完成组合 redo admission 的业务 MTR。
+     * @param deferred INSERT/UPDATE 对应的 placeholder 物理形状计划。
+     * @param <T>      actual ownership 元素类型。
+     * @return 与 acquisition 对应、恰好一次发布 actual record 的 prepared guard。
+     * @throws TransactionStateException 参数缺失或事务状态无效时抛出。
+     * @throws UndoWriteStalePlanException 事务 context 或持久 append snapshot 已变化时抛出。
+     * @throws UndoWriteFatalException owner/page prepare 越过物理边界后失败时抛出。
+     */
+    private <T> PreparedUndoAppend<T> prepareDeferredUndoAppend(Transaction txn, MiniTransaction mtr,
+                                                                DeferredUndoPlan<T> deferred) {
         if (txn == null || mtr == null || deferred == null) {
             throw new TransactionStateException("prepareUndoAppend txn/mtr/plan must not be null");
         }
@@ -262,7 +297,7 @@ public final class UndoLogManager {
                                     List<ColumnValue> clusterKey, List<ColumnValue> oldColumnValues,
                                     HiddenColumns oldHiddenColumns, IndexKeyDef keyDef, TableSchema schema) {
         return planUpdate(txn, tableId, indexId, clusterKey, oldColumnValues, oldHiddenColumns,
-                List.of(), keyDef, schema);
+                List.of(), List.of(), keyDef, schema);
     }
 
     /**
@@ -293,9 +328,43 @@ public final class UndoLogManager {
                                     HiddenColumns oldHiddenColumns,
                                     List<SecondaryUndoMutation> secondaryMutations,
                                     IndexKeyDef keyDef, TableSchema schema) {
+        return planUpdate(txn, tableId, indexId, clusterKey, oldColumnValues, oldHiddenColumns,
+                List.of(), secondaryMutations, keyDef, schema);
+    }
+
+    /**
+     * 在写 MTR admission 前规划携带完整 LOB version ownership 与 secondary 证据的 UPDATE undo。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验旧 image、LOB ownership、secondary mutation 和 exact codec metadata，失败不推进 undo number。</li>
+     *     <li>读取 UPDATE-kind planning context，冻结 next undoNo、owner 和 logical predecessor。</li>
+     *     <li>把 old image、LV 与 SI tail 同时编码，冻结 root/payload 页数和 redo workload。</li>
+     * </ol>
+     *
+     * @param txn                  当前 ACTIVE 写事务。
+     * @param tableId              undo target 稳定表 id。
+     * @param indexId              聚簇索引稳定 id。
+     * @param clusterKey           被更新行的完整聚簇主键。
+     * @param oldColumnValues      更新前全量用户列。
+     * @param oldHiddenColumns     更新前 DB_TRX_ID/DB_ROLL_PTR。
+     * @param lobVersionOwnerships 按 ordinal 递增的旧链 purge/new 链 rollback ownership。
+     * @param secondaryMutations   按 index id 递增的 CHANGE_KEY 证据。
+     * @param keyDef               exact-version 聚簇 key definition。
+     * @param schema               exact-version 完整表 schema。
+     * @return 编码形状、页 reservation 和 redo workload 已冻结的 UPDATE undo 写计划。
+     * @throws TransactionStateException 参数缺失、事务非 ACTIVE 或 planning context 不可用时抛出。
+     * @throws DatabaseValidationException old image、LV/SI action 或排序不满足恢复不变量时抛出。
+     */
+    public UndoWritePlan planUpdate(Transaction txn, long tableId, long indexId,
+                                    List<ColumnValue> clusterKey, List<ColumnValue> oldColumnValues,
+                                    HiddenColumns oldHiddenColumns,
+                                    List<LobVersionOwnership> lobVersionOwnerships,
+                                    List<SecondaryUndoMutation> secondaryMutations,
+                                    IndexKeyDef keyDef, TableSchema schema) {
         // 1. 输入校验先于事务 context 访问，失败不会推进 undo number。
         if (clusterKey == null || oldColumnValues == null || oldHiddenColumns == null
-                || secondaryMutations == null
+                || lobVersionOwnerships == null || secondaryMutations == null
                 || keyDef == null || schema == null) {
             throw new TransactionStateException("planUpdate old image/key/schema args must not be null");
         }
@@ -304,9 +373,57 @@ public final class UndoLogManager {
 
         // 3. 全量旧 image 与二级 mutation 同时进入 codec workload，begin MTR 后不可追加。
         UndoRecord record = UndoRecord.update(context.nextUndoNo(), context.transactionId(), tableId, indexId,
-                clusterKey, oldColumnValues, oldHiddenColumns, secondaryMutations,
+                clusterKey, oldColumnValues, oldHiddenColumns, lobVersionOwnerships, secondaryMutations,
                 context.logicalHead().rollPointer());
         return buildPlan(context, record, keyDef, schema);
+    }
+
+    /**
+     * 为包含新 external allocation 的 UPDATE 冻结 placeholder LV tail。actual ownership 只允许替换新链首页号，
+     * old image、purge flag、secondary tail 和物理编码长度均不能变化。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 old image、placeholder LV、secondary tail 和 exact codec metadata。</li>
+     *     <li>读取 UPDATE-kind planning context，冻结 owner、acquisition、next undoNo 和 predecessor。</li>
+     *     <li>编码 placeholder record 并冻结 root/payload 页数、redo workload 和 actual shape validator。</li>
+     * </ol>
+     *
+     * @param txn                   当前 ACTIVE 写事务。
+     * @param tableId               undo target 稳定表 id。
+     * @param indexId               聚簇索引稳定 id。
+     * @param clusterKey            被更新行的完整聚簇主键。
+     * @param oldColumnValues       更新前全量用户列。
+     * @param oldHiddenColumns      更新前隐藏列。
+     * @param placeholderOwnerships 按 ordinal 递增的 LV placeholder ownership。
+     * @param secondaryMutations    按 index id 递增的 CHANGE_KEY 证据。
+     * @param keyDef                exact-version 聚簇 key definition。
+     * @param schema                exact-version 完整表 schema。
+     * @return actual 新 LOB 分配前可用于 admission/prepare 的 deferred UPDATE undo 计划。
+     * @throws TransactionStateException 参数缺失或事务无法规划 UPDATE-kind undo 时抛出。
+     * @throws DatabaseValidationException placeholder LV/SI 或旧 image 无效时抛出。
+     */
+    public DeferredUpdateUndoPlan planDeferredUpdate(Transaction txn, long tableId, long indexId,
+                                                       List<ColumnValue> clusterKey,
+                                                       List<ColumnValue> oldColumnValues,
+                                                       HiddenColumns oldHiddenColumns,
+                                                       List<LobVersionOwnership> placeholderOwnerships,
+                                                       List<SecondaryUndoMutation> secondaryMutations,
+                                                       IndexKeyDef keyDef, TableSchema schema) {
+        // 1. 全部可变输入在访问事务 context 前校验，失败不推进 undoNo 或占用 slot。
+        if (clusterKey == null || oldColumnValues == null || oldHiddenColumns == null
+                || placeholderOwnerships == null || secondaryMutations == null
+                || keyDef == null || schema == null) {
+            throw new TransactionStateException("deferred UPDATE undo planning args must not be null");
+        }
+        // 2. UPDATE-kind context 冻结 owner、acquisition、global undoNo 与 logical predecessor。
+        PlanningContext context = planningContext(txn, UndoLogKind.UPDATE);
+        // 3. placeholder LV 与 SI 一起进入 codec；actual 只可替换定宽 firstPageNo。
+        UndoRecord record = UndoRecord.update(context.nextUndoNo(), context.transactionId(), tableId, indexId,
+                clusterKey, oldColumnValues, oldHiddenColumns, placeholderOwnerships, secondaryMutations,
+                context.logicalHead().rollPointer());
+        return new DeferredUpdateUndoPlan(buildPlan(context, record, keyDef, schema), keyDef, schema,
+                placeholderOwnerships);
     }
 
     /**
@@ -327,7 +444,7 @@ public final class UndoLogManager {
                                     List<ColumnValue> clusterKey, List<ColumnValue> oldColumnValues,
                                     HiddenColumns oldHiddenColumns, IndexKeyDef keyDef, TableSchema schema) {
         return planDelete(txn, tableId, indexId, clusterKey, oldColumnValues, oldHiddenColumns,
-                List.of(), keyDef, schema);
+                List.of(), List.of(), keyDef, schema);
     }
 
     /**
@@ -358,9 +475,43 @@ public final class UndoLogManager {
                                     HiddenColumns oldHiddenColumns,
                                     List<SecondaryUndoMutation> secondaryMutations,
                                     IndexKeyDef keyDef, TableSchema schema) {
+        return planDelete(txn, tableId, indexId, clusterKey, oldColumnValues, oldHiddenColumns,
+                List.of(), secondaryMutations, keyDef, schema);
+    }
+
+    /**
+     * 规划携带旧 LOB purge ownership 的 DELETE_MARK undo；DELETE 不允许 rollback-new ownership。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验旧 image、LV/SI 列表和 exact codec metadata，失败不访问事务 undo context。</li>
+     *     <li>读取 UPDATE-kind planning context，冻结 owner、next undoNo 和 logical predecessor。</li>
+     *     <li>编码 DELETE old image、purge-only LV 和 secondary tail，冻结页数与 redo workload。</li>
+     * </ol>
+     *
+     * @param txn                  当前 ACTIVE 写事务。
+     * @param tableId              undo target 稳定表 id。
+     * @param indexId              聚簇索引稳定 id。
+     * @param clusterKey           被删除行的完整聚簇主键。
+     * @param oldColumnValues      删除前存活版本全量用户列。
+     * @param oldHiddenColumns     删除前隐藏列。
+     * @param lobVersionOwnerships 按 ordinal 递增且只含 purge-old 动作的 ownership。
+     * @param secondaryMutations   按 index id 递增的 DELETE_MARK_ENTRY 证据。
+     * @param keyDef               exact-version 聚簇 key definition。
+     * @param schema               exact-version 完整表 schema。
+     * @return 编码形状、页 reservation 和 redo workload 已冻结的 DELETE undo 写计划。
+     * @throws TransactionStateException 参数缺失或事务不能规划 UPDATE-kind undo 时抛出。
+     * @throws DatabaseValidationException ownership/old image/secondary action 不满足恢复不变量时抛出。
+     */
+    public UndoWritePlan planDelete(Transaction txn, long tableId, long indexId,
+                                    List<ColumnValue> clusterKey, List<ColumnValue> oldColumnValues,
+                                    HiddenColumns oldHiddenColumns,
+                                    List<LobVersionOwnership> lobVersionOwnerships,
+                                    List<SecondaryUndoMutation> secondaryMutations,
+                                    IndexKeyDef keyDef, TableSchema schema) {
         // 1. 输入校验先于事务 context 访问，失败不分配或推进 undo 状态。
         if (clusterKey == null || oldColumnValues == null || oldHiddenColumns == null
-                || secondaryMutations == null
+                || lobVersionOwnerships == null || secondaryMutations == null
                 || keyDef == null || schema == null) {
             throw new TransactionStateException("planDelete old image/key/schema args must not be null");
         }
@@ -369,7 +520,7 @@ public final class UndoLogManager {
 
         // 3. 删除前存活版本与全部二级 revive 证据同时进入最终 codec workload。
         UndoRecord record = UndoRecord.deleteMark(context.nextUndoNo(), context.transactionId(), tableId, indexId,
-                clusterKey, oldColumnValues, oldHiddenColumns, secondaryMutations,
+                clusterKey, oldColumnValues, oldHiddenColumns, lobVersionOwnerships, secondaryMutations,
                 context.logicalHead().rollPointer());
         return buildPlan(context, record, keyDef, schema);
     }
@@ -409,8 +560,8 @@ public final class UndoLogManager {
     }
 
     /** fresh INSERT log 的 owner/root prepare；segment 首页和 page3 slot 在 actual record 之前先成为稳定 owner。 */
-    private PreparedUndoAppend prepareAllocatedLog(Transaction txn, MiniTransaction mtr,
-                                                   DeferredInsertUndoPlan deferred) {
+    private <T> PreparedUndoAppend<T> prepareAllocatedLog(Transaction txn, MiniTransaction mtr,
+                                                          DeferredUndoPlan<T> deferred) {
         UndoWritePlan plan = deferred.placeholderPlan();
         UndoContext current = txn.undoContext();
         UndoNo currentGlobal = current == null ? UndoNo.NONE : current.lastUndoNo();
@@ -448,8 +599,8 @@ public final class UndoLogManager {
     }
 
     /** cached owner transition 与首页激活均在 actual record 之前完成；失败保留 transition fence。 */
-    private PreparedUndoAppend prepareCachedLog(Transaction txn, MiniTransaction mtr,
-                                                DeferredInsertUndoPlan deferred) {
+    private <T> PreparedUndoAppend<T> prepareCachedLog(Transaction txn, MiniTransaction mtr,
+                                                       DeferredUndoPlan<T> deferred) {
         UndoWritePlan plan = deferred.placeholderPlan();
         UndoContext current = requireNoKindBinding(txn, plan, "cached deferred undo");
         PreparedResources resources = new PreparedResources();
@@ -489,8 +640,8 @@ public final class UndoLogManager {
     }
 
     /** free FIFO owner transition 的 deferred prepare，锁序与普通 free reuse 首写保持一致。 */
-    private PreparedUndoAppend prepareFreeLog(Transaction txn, MiniTransaction mtr,
-                                              DeferredInsertUndoPlan deferred) {
+    private <T> PreparedUndoAppend<T> prepareFreeLog(Transaction txn, MiniTransaction mtr,
+                                                     DeferredUndoPlan<T> deferred) {
         UndoWritePlan plan = deferred.placeholderPlan();
         UndoContext current = requireNoKindBinding(txn, plan, "free deferred undo");
         PreparedResources resources = new PreparedResources();
@@ -535,8 +686,8 @@ public final class UndoLogManager {
     }
 
     /** existing log 先 reserve 低位 FSP，再固定 first/current X 与可能的 grow/payload 页。 */
-    private PreparedUndoAppend prepareExistingLog(Transaction txn, MiniTransaction mtr,
-                                                  DeferredInsertUndoPlan deferred) {
+    private <T> PreparedUndoAppend<T> prepareExistingLog(Transaction txn, MiniTransaction mtr,
+                                                         DeferredUndoPlan<T> deferred) {
         UndoWritePlan plan = deferred.placeholderPlan();
         UndoContext context = txn.undoContext();
         requireMatchingContext(context, plan);
@@ -566,11 +717,11 @@ public final class UndoLogManager {
     }
 
     /** 构造 actual append 闭包；先做 ownership/codec shape 校验，再写 prepared 页并发布内存 logical head。 */
-    private PreparedUndoAppend preparedHandle(Transaction txn, MiniTransaction mtr,
-                                              DeferredInsertUndoPlan deferred, UndoWritePlan plan,
-                                              UndoLogSegment segment, UndoContext context,
-                                              PreparedResources resources) {
-        return new PreparedUndoAppend(mtr, actualOwnerships -> {
+    private <T> PreparedUndoAppend<T> preparedHandle(Transaction txn, MiniTransaction mtr,
+                                                     DeferredUndoPlan<T> deferred, UndoWritePlan plan,
+                                                     UndoLogSegment segment, UndoContext context,
+                                                     PreparedResources resources) {
+        return new PreparedUndoAppend<>(mtr, actualOwnerships -> {
             UndoRecord actualRecord = deferred.actualRecord(actualOwnerships);
             UndoRecordWritePlan actualPlan = access.planRecord(actualRecord, deferred.keyDef(), deferred.schema());
             deferred.requireSamePhysicalShape(actualPlan);
@@ -914,6 +1065,94 @@ public final class UndoLogManager {
         // transition 在任何 page/FSP 写前取得；timeout/interrupt 不会留下半持久 commit，可由上层重试。
         try (HistoryList.AppendLease lease = history.beginAppend(entry)) {
             finalizer.finalizeCommit(txn, ctx, lease);
+        }
+    }
+
+    /**
+     * 持久化 XA phase one。该入口不改变 live 状态、不等待 redo fsync；稳定 storage API 必须在返回后先调用
+     * {@link TransactionManager#finishPrepare(Transaction)} 发布 PREPARED，再以返回 LSN执行强制 durability wait。
+     *
+     * @param txn 当前可提交 ACTIVE 写事务；必须已产生至少一条普通 undo log
+     * @return 覆盖全部 first-page PREPARED状态与 transaction prepare delta 的 end LSN
+     * @throws TransactionStateException 无 undo、状态非法、rollback-only或提交号已经分配时抛出
+     * @throws UndoFinalizationException page3/first-page证据冲突或 phase-one MTR失败时抛出
+     */
+    public Lsn onPrepare(Transaction txn) {
+        if (txn == null) {
+            throw new TransactionStateException("onPrepare transaction must not be null");
+        }
+        UndoContext context = txn.undoContext();
+        if (context == null || context.bindings().isEmpty()) {
+            throw new TransactionStateException(
+                    "onPrepare requires at least one ordinary undo log");
+        }
+        if (txn.rollbackOnly()) {
+            throw new TransactionStateException(
+                    "rollback-only transaction cannot prepare: " + txn.rollbackOnlyReason());
+        }
+        return finalizer.prepareTransaction(txn, context);
+    }
+
+    /**
+     * 持久化 live prepared transaction 的 commit 决议。调用前必须通过
+     * {@link TransactionManager#prepareCommitPrepared(Transaction)} 分配提交号；本方法成功后由 stable API
+     * 调用 {@link TransactionManager#commitPrepared(Transaction)} 发布内存终态。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 PREPARED、undo context和已分配提交号，不接受普通 ACTIVE 事务。</li>
+     *     <li>UPDATE binding 存在时构造 affected-table history entry并取得有界 append lease。</li>
+     *     <li>委托 finalizer 原子 drop prepared INSERT、挂接 prepared UPDATE并写 phase-two redo。</li>
+     *     <li>finalizer commit 后 lease发布 history；本方法仍不移出 active table或释放 row locks。</li>
+     * </ol>
+     *
+     * @param txn 已完成 phase one并预留提交号的 live PREPARED 事务
+     * @throws TransactionStateException 状态、undo context或提交号不满足 phase-two commit条件时抛出
+     * @throws UndoFinalizationException owner/history证据冲突或最终 MTR失败时抛出
+     */
+    public void onCommitPrepared(Transaction txn) {
+        if (txn == null || txn.state() != TransactionState.PREPARED) {
+            throw new TransactionStateException(
+                    "onCommitPrepared requires PREPARED transaction");
+        }
+        UndoContext context = txn.undoContext();
+        if (context == null || context.bindings().isEmpty()
+                || txn.transactionNo().isNone()) {
+            throw new TransactionStateException(
+                    "onCommitPrepared requires ordinary undo and assigned transaction number");
+        }
+        onCommitPrepared(txn, context.affectedTableIds());
+    }
+
+    /**
+     * 恢复期 prepared commit 变体：affected-table 集合从持久 UPDATE logical chain重建，而非依赖已丢失的
+     * live side projection。live 入口也复用本方法。
+     *
+     * @param txn live 或 recovery 重建的 PREPARED transaction aggregate
+     * @param affectedTableIds 当前 UPDATE logical chain涉及的稳定表 id；INSERT-only 可为空
+     */
+    public void onCommitPrepared(Transaction txn, java.util.Set<Long> affectedTableIds) {
+        if (txn == null || txn.state() != TransactionState.PREPARED
+                || txn.undoContext() == null || txn.transactionNo().isNone()
+                || affectedTableIds == null) {
+            throw new TransactionStateException(
+                    "prepared commit fields/state are invalid");
+        }
+        UndoContext context = txn.undoContext();
+        UndoLogBinding update = context.binding(UndoLogKind.UPDATE);
+        if (update == null) {
+            if (!affectedTableIds.isEmpty()) {
+                throw new TransactionStateException(
+                        "INSERT-only prepared commit cannot publish affected history tables");
+            }
+            finalizer.finalizePreparedCommit(txn, context, affectedTableIds, null);
+            return;
+        }
+        HistoryEntry entry = new HistoryEntry(
+                txn.transactionNo(), txn.transactionId(), undoSpace,
+                update.firstPageId(), update.slotId(), affectedTableIds);
+        try (HistoryList.AppendLease lease = history.beginAppend(entry)) {
+            finalizer.finalizePreparedCommit(txn, context, affectedTableIds, lease);
         }
     }
 

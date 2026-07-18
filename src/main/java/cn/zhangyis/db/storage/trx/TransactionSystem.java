@@ -65,6 +65,31 @@ public final class TransactionSystem {
     }
 
     /**
+     * 恢复期登记一个已经持久化的 PREPARED creator。调用方必须先恢复 next-counter，且 recovery gate 仍关闭；
+     * 本方法只在短锁内更新 active table，不访问 undo/page/redo。重复 creator 由 active table 以领域异常拒绝，
+     * 避免两个运行时聚合共同拥有同一持久事务。
+     *
+     * @param transactionId page3/undo/redo 已交叉校验的正事务 id
+     * @throws TransactionStateException id 缺失、NONE 或重复登记时抛出，恢复必须 fail-closed
+     */
+    void restorePreparedActive(TransactionId transactionId) {
+        if (transactionId == null || transactionId.isNone()) {
+            throw new TransactionStateException("recovered prepared transaction id must be assigned");
+        }
+        lock.lock();
+        try {
+            if (active.contains(transactionId.value())) {
+                throw new TransactionStateException(
+                        "recovered prepared transaction is already active: "
+                                + transactionId.value());
+            }
+            active.register(transactionId.value());
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
      * 恢复期复位 id/no 计数器（R 1.3，单调只前进）。崩溃后由 restored undo 段算出的高水位驱动：
      * {@code nextTransactionId = max(creator TRANSACTION_ID)+1}、{@code nextTransactionNo = max(COMMIT_NO)+1}。
      * 使恢复后新事务 id/no 不与 pre-crash 已提交事务重复，且 {@link #purgeLowWaterNo}（= nextTransactionNo）覆盖

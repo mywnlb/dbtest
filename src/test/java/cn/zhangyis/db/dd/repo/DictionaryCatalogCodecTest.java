@@ -58,8 +58,8 @@ class DictionaryCatalogCodecTest {
         byte[] independentGolden = legacyTablePayload(legacy);
         byte[] newPayload = encoded.getFirst().payload();
 
-        assertArrayEquals(independentGolden, Arrays.copyOf(newPayload, newPayload.length - 1),
-                "新 codec 只能在旧 table payload 尾部追加能力位");
+        assertArrayEquals(independentGolden, Arrays.copyOf(newPayload, independentGolden.length),
+                "新 codec 只能在旧 table payload 尾部追加能力位与物理行格式版本");
         DictionaryCatalogCodec.DecodedMutation decoded = codec.decode(batchWithTablePayload(
                 encoded, independentGolden)).orElseThrow();
 
@@ -80,6 +80,31 @@ class DictionaryCatalogCodecTest {
                 .lobSegment().orElseThrow());
     }
 
+    /**
+     * 新 catalog 尾部必须持久化物理行格式版本；旧 payload 没有该字段时只能从当时 table version 派生。
+     */
+    @Test
+    void roundTripsRowFormatVersionAndDerivesItForLegacyPayload() {
+        TableDefinition current = table(Optional.empty());
+        TableStorageBinding oldBinding = current.storageBinding().orElseThrow();
+        TableStorageBinding metadataOnlyBinding = new TableStorageBinding(
+                oldBinding.tableId(), oldBinding.spaceId(), oldBinding.path(), 1,
+                oldBinding.indexes(), oldBinding.lobSegment());
+        TableDefinition metadataOnly = new TableDefinition(
+                current.id(), current.schemaId(), current.name(), current.version(), current.state(),
+                current.columns(), current.indexes(), Optional.of(metadataOnlyBinding));
+        DictionaryCatalogCodec codec = new DictionaryCatalogCodec();
+
+        TableDefinition decodedCurrent = codec.decode(new CatalogBatch(1,
+                codec.encode(VERSION, List.of(), List.of(metadataOnly)))).orElseThrow().tables().getFirst();
+        List<CatalogRecord> encoded = codec.encode(VERSION, List.of(), List.of(current));
+        TableDefinition decodedLegacy = codec.decode(
+                batchWithTablePayload(encoded, legacyTablePayload(current))).orElseThrow().tables().getFirst();
+
+        assertEquals(1, decodedCurrent.storageBinding().orElseThrow().rowFormatVersion());
+        assertEquals(VERSION.value(), decodedLegacy.storageBinding().orElseThrow().rowFormatVersion());
+    }
+
     /** 尾部不是可跳过扩展：未知 flag、截断 segment 和额外字节都表示 catalog 损坏。 */
     @Test
     void rejectsUnknownTruncatedAndTrailingLobTail() {
@@ -87,7 +112,7 @@ class DictionaryCatalogCodecTest {
         List<CatalogRecord> encoded = codec.encode(VERSION, List.of(), List.of(table(Optional.of(
                 new SegmentRef(SpaceId.of(1024), 3, SegmentId.of(13))))));
         byte[] payload = encoded.getFirst().payload();
-        int tailOffset = payload.length - (1 + Integer.BYTES + Long.BYTES);
+        int tailOffset = payload.length - (1 + Integer.BYTES + Long.BYTES + Long.BYTES);
 
         byte[] unknown = Arrays.copyOf(payload, payload.length);
         unknown[tailOffset] = 2;
@@ -114,6 +139,7 @@ class DictionaryCatalogCodecTest {
         SegmentRef leaf = new SegmentRef(spaceId, 1, SegmentId.of(11));
         SegmentRef nonLeaf = new SegmentRef(spaceId, 2, SegmentId.of(12));
         TableStorageBinding binding = new TableStorageBinding(2, spaceId, Path.of("catalog_lob_1024.ibd"),
+                VERSION.value(),
                 List.of(new IndexStorageBinding(3, PageId.of(spaceId, PageNo.of(64)), 0, leaf, nonLeaf)), lob);
         return new TableDefinition(TableId.of(2), SchemaId.of(1), ObjectName.of("orders"), VERSION,
                 TableState.ACTIVE, List.of(id, body), List.of(primary), Optional.of(binding));

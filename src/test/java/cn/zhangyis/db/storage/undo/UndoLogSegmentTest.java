@@ -257,6 +257,41 @@ class UndoLogSegmentTest {
         });
     }
 
+    /** phase one 只写 PREPARED 状态，提交号必须保持 NONE，供上层 phase-two 决议后再分配。 */
+    @Test
+    void markPreparedWritesStableStateWithoutCommitNumber() {
+        onSegment(segment -> {
+            assertTrue(segment.isActive());
+
+            segment.markPrepared();
+
+            assertFalse(segment.isActive());
+            assertTrue(segment.isPrepared());
+            assertEquals(TransactionNo.NONE, segment.committedTransactionNo());
+        });
+    }
+
+    /** PREPARED 使用现有 state u8 的追加 code，并由 undo metadata delta redo 精确覆盖。 */
+    @Test
+    void markPreparedAppendsUndoMetadataDeltaRedo() {
+        onAccess((manager, access) -> {
+            MiniTransaction mtr = manager.begin();
+            UndoLogSegment segment = access.create(
+                    mtr, UNDO_SPACE, TransactionId.of(7), UndoLogKind.INSERT);
+            segment.markPrepared();
+            manager.commit(mtr);
+
+            assertTrue(manager.redoLogManager().bufferedRecords().stream()
+                            .anyMatch(record -> record instanceof UndoMetadataDeltaRecord delta
+                                    && delta.pageId().equals(segment.firstPageId())
+                                    && delta.kind() == UndoMetadataDeltaKind.UNDO_LOG_HEADER_FIELD
+                                    && delta.offset() == UndoPageLayout.STATE
+                                    && Arrays.equals(new byte[]{UndoPageLayout.STATE_PREPARED},
+                                    delta.afterImage())),
+                    "STATE=PREPARED must use the stable undo metadata redo path");
+        });
+    }
+
     @Test
     void markCommittedAppendsUndoMetadataDeltaRedoForStateAndCommitNo() {
         onAccess((mgr, access) -> {

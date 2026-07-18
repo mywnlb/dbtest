@@ -409,7 +409,7 @@ public final class UndoPage {
         return all[idx];
     }
 
-    /** first 页 log header 中的 undo log 状态（ACTIVE/COMMITTED/CACHED）。 */
+    /** first 页 log header 中的 undo log 状态（ACTIVE/PREPARED/COMMITTED/CACHED/FREE）。 */
     int state() {
         requireFirstPage();
         return getU8(UndoPageLayout.STATE);
@@ -419,7 +419,8 @@ public final class UndoPage {
     void setLogState(int state) {
         requireFirstPage();
         if (state != UndoPageLayout.STATE_ACTIVE && state != UndoPageLayout.STATE_COMMITTED
-                && state != UndoPageLayout.STATE_CACHED && state != UndoPageLayout.STATE_FREE) {
+                && state != UndoPageLayout.STATE_CACHED && state != UndoPageLayout.STATE_FREE
+                && state != UndoPageLayout.STATE_PREPARED) {
             throw new DatabaseValidationException("unknown undo log state: " + state);
         }
         writeLogHeaderU8(UndoPageLayout.STATE, state, "write undo log state");

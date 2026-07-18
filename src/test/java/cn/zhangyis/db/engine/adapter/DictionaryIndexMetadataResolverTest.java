@@ -69,7 +69,7 @@ class DictionaryIndexMetadataResolverTest {
         SegmentRef leaf = new SegmentRef(SpaceId.of(1024), 1, SegmentId.of(11));
         SegmentRef nonLeaf = new SegmentRef(SpaceId.of(1024), 2, SegmentId.of(12));
         TableStorageBinding binding = new TableStorageBinding(2, SpaceId.of(1024),
-                directory.resolve("tables/table_2_space_1024.ibd"), List.of(new IndexStorageBinding(3,
+                directory.resolve("tables/table_2_space_1024.ibd"), 2, List.of(new IndexStorageBinding(3,
                 PageId.of(SpaceId.of(1024), PageNo.of(64)), 0, leaf, nonLeaf)), Optional.empty());
         return new TableDefinition(TableId.of(2), SchemaId.of(1), ObjectName.of("orders"),
                 DictionaryVersion.of(2), TableState.ACTIVE, List.of(id), List.of(primary), Optional.of(binding));

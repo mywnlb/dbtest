@@ -1,21 +1,28 @@
 package cn.zhangyis.db.storage.trx;
 
 /**
- * 数据库事务状态机（innodb-transaction-mvcc-design §5.1、§7）。本片仅 5 个流转态；
- * {@code PREPARED}/{@code RECOVERED_ACTIVE} 待事务恢复片再加，避免暗示尚未实现的恢复语义。
+ * 数据库事务状态机（innodb-transaction-mvcc-design §5.1、§7）。
  *
- * <p>合法转换：{@code ACTIVE→COMMITTING→COMMITTED}、{@code ACTIVE→ROLLING_BACK→ROLLED_BACK}。
+ * <p>普通事务合法转换为 {@code ACTIVE→COMMITTING→COMMITTED}、
+ * {@code ACTIVE→ROLLING_BACK→ROLLED_BACK}。XA participant 另有
+ * {@code ACTIVE→PREPARED→COMMITTING→COMMITTED} 和
+ * {@code PREPARED→PREPARED_ROLLING_BACK→ROLLED_BACK}；独立 prepared rollback 重试态保证失败后仍能
+ * 要求物理 undo header 保持 PREPARED，不会误走普通 ACTIVE finalization。
  * 其余皆非法，由 {@code TransactionManager} 经 {@link #canTransitionTo} 校验后抛 {@link TransactionStateException}。
  */
 public enum TransactionState {
     /** 活跃：可写入、可获取 id。 */
     ACTIVE,
+    /** XA phase one 已持久化；保留 active-table 身份和事务锁，只接受显式 phase-two 决议。 */
+    PREPARED,
     /** 提交中：已禁止新操作，正在分配提交序号、收尾。 */
     COMMITTING,
     /** 已提交。 */
     COMMITTED,
     /** 回滚中。 */
     ROLLING_BACK,
+    /** prepared 分支回滚中；失败重试仍以 PREPARED first-page 状态为物理前置条件。 */
+    PREPARED_ROLLING_BACK,
     /** 已回滚。 */
     ROLLED_BACK;
 
@@ -25,9 +32,11 @@ public enum TransactionState {
      */
     public boolean canTransitionTo(TransactionState target) {
         return switch (this) {
-            case ACTIVE -> target == COMMITTING || target == ROLLING_BACK;
+            case ACTIVE -> target == PREPARED || target == COMMITTING || target == ROLLING_BACK;
+            case PREPARED -> target == COMMITTING || target == PREPARED_ROLLING_BACK;
             case COMMITTING -> target == COMMITTED;
             case ROLLING_BACK -> target == ROLLED_BACK;
+            case PREPARED_ROLLING_BACK -> target == ROLLED_BACK;
             case COMMITTED, ROLLED_BACK -> false;
         };
     }

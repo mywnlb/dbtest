@@ -37,6 +37,8 @@ public final class DefaultSqlSession implements SqlSession {
     private final DefaultSqlBinder binder;
     private final DefaultSqlExecutor executor;
     private final SessionTransactionPolicy transactions;
+    /** DDL 使用独立 MDL owner 的 DD coordinator port，不能复用普通 transaction gateway。 */
+    private final cn.zhangyis.db.sql.executor.storage.SqlDdlGateway ddlGateway;
     private final Runnable onClose;
     /** DatabaseEngine 用户语句 gate；permit 覆盖完整 execute 与失败 cleanup。 */
     private final SessionExecutionAdmission executionAdmission;
@@ -49,6 +51,7 @@ public final class DefaultSqlSession implements SqlSession {
                              DefaultSqlParser parser, DefaultSqlBinder binder, DefaultSqlExecutor executor,
                              SqlStorageGateway gateway, Runnable onClose) {
         this(id, options, dictionary, parser, binder, executor, gateway,
+                cn.zhangyis.db.sql.executor.storage.SqlDdlGateway.UNSUPPORTED,
                 SessionExecutionAdmission.unrestricted(), onClose);
     }
 
@@ -57,8 +60,21 @@ public final class DefaultSqlSession implements SqlSession {
                              DefaultSqlParser parser, DefaultSqlBinder binder, DefaultSqlExecutor executor,
                              SqlStorageGateway gateway, SessionExecutionAdmission executionAdmission,
                              Runnable onClose) {
+        this(id, options, dictionary, parser, binder, executor, gateway,
+                cn.zhangyis.db.sql.executor.storage.SqlDdlGateway.UNSUPPORTED,
+                executionAdmission, onClose);
+    }
+
+    /** DatabaseEngine 完整组合根构造入口；DDL port 与 DML transaction port 显式分离。 */
+    public DefaultSqlSession(SessionId id, SessionOptions options, DataDictionaryService dictionary,
+                             DefaultSqlParser parser, DefaultSqlBinder binder, DefaultSqlExecutor executor,
+                             SqlStorageGateway gateway,
+                             cn.zhangyis.db.sql.executor.storage.SqlDdlGateway ddlGateway,
+                             SessionExecutionAdmission executionAdmission,
+                             Runnable onClose) {
         if (id == null || options == null || dictionary == null || parser == null || binder == null
-                || executor == null || gateway == null || executionAdmission == null || onClose == null) {
+                || executor == null || gateway == null || ddlGateway == null
+                || executionAdmission == null || onClose == null) {
             throw new DatabaseValidationException("session collaborators must not be null");
         }
         this.id = id;
@@ -66,6 +82,7 @@ public final class DefaultSqlSession implements SqlSession {
         this.parser = parser;
         this.binder = binder;
         this.executor = executor;
+        this.ddlGateway = ddlGateway;
         this.onClose = onClose;
         this.executionAdmission = executionAdmission;
         this.transactions = new SessionTransactionPolicy(options, gateway, dictionary,
@@ -108,7 +125,11 @@ public final class DefaultSqlSession implements SqlSession {
                 case SetAutocommitNode set -> executeSet(set, deadline);
                 case TransactionControlNode control -> executeControl(control, deadline);
                 case InsertStatementNode ignored -> executeData(statement, false, deadline);
-                case SelectStatementNode ignored -> executeData(statement, true, deadline);
+                case SelectStatementNode select -> executeData(
+                        statement, select.lockingClause() == SelectLockingClause.NONE, deadline);
+                case UpdateStatementNode ignored -> executeData(statement, false, deadline);
+                case DeleteStatementNode ignored -> executeData(statement, false, deadline);
+                case CreateIndexStatementNode createIndex -> executeCreateIndex(createIndex, deadline);
             };
             state = SessionState.OPEN;
             return result;
@@ -178,6 +199,35 @@ public final class DefaultSqlSession implements SqlSession {
             }
             throw statementFailure;
         }
+    }
+
+    /**
+     * 绑定并执行 CREATE INDEX / ALTER ADD INDEX。语法绑定先于 implicit commit，避免纯名称错误意外提交事务；
+     * DD coordinator 随后使用独立 owner 获取 table X。
+     */
+    private CommandResult executeCreateIndex(CreateIndexStatementNode syntax,
+                                             SqlStatementDeadline deadline) {
+        Optional<ObjectName> schema = options.currentSchema().map(ObjectName::of);
+        var bound = binder.bindDdl(syntax, schema);
+        transactions.prepareDdl(deadline.remaining("DDL implicit commit"));
+        RuntimeException failure = null;
+        try {
+            ddlGateway.createSecondaryIndex(
+                    bound, deadline.remaining("CREATE INDEX coordinator"));
+        } catch (RuntimeException ddlFailure) {
+            failure = ddlFailure;
+            throw ddlFailure;
+        } finally {
+            try {
+                transactions.resumeAfterDdl();
+            } catch (RuntimeException resumeFailure) {
+                if (failure == null) {
+                    throw resumeFailure;
+                }
+                failure.addSuppressed(resumeFailure);
+            }
+        }
+        return new CommandResult(transactions.status());
     }
 
     private CommandResult executeSet(SetAutocommitNode set, SqlStatementDeadline deadline) {

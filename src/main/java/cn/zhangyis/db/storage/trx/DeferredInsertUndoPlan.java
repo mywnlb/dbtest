@@ -16,7 +16,7 @@ import java.util.List;
  * 业务 MTR 中真正分配 LOB 后，只允许替换 reference 的首页号，不能改变列序、类型、长度、页数、segment identity、
  * CRC 或 inline prefix。这样 undo root/payload 页可先固定，而 placeholder 永远不会作为可见 undo record 落盘。
  */
-public final class DeferredInsertUndoPlan {
+public final class DeferredInsertUndoPlan implements DeferredUndoPlan<InsertedLobOwnership> {
 
     /** 冻结 acquisition、事务逻辑头、持久页头及 placeholder 物理编码的普通 undo 计划。 */
     private final UndoWritePlan placeholderPlan;
@@ -48,15 +48,18 @@ public final class DeferredInsertUndoPlan {
         return placeholderPlan.pagesToReserve();
     }
 
-    UndoWritePlan placeholderPlan() {
+    @Override
+    public UndoWritePlan placeholderPlan() {
         return placeholderPlan;
     }
 
-    IndexKeyDef keyDef() {
+    @Override
+    public IndexKeyDef keyDef() {
         return keyDef;
     }
 
-    TableSchema schema() {
+    @Override
+    public TableSchema schema() {
         return schema;
     }
 
@@ -64,7 +67,8 @@ public final class DeferredInsertUndoPlan {
      * 用真实 LOB ownership 构造逻辑 undo，并逐字段复核冻结形状。允许变化的唯一字段是 reference.firstPageNo；
      * 该字段固定宽度，不改变普通 undo slot 或 external undo payload 的页数。
      */
-    UndoRecord actualRecord(List<InsertedLobOwnership> actualOwnerships) {
+    @Override
+    public UndoRecord actualRecord(List<InsertedLobOwnership> actualOwnerships) {
         if (actualOwnerships == null || actualOwnerships.size() != placeholderOwnerships.size()) {
             throw new UndoWriteStalePlanException("deferred INSERT LOB ownership count changed");
         }
@@ -78,7 +82,8 @@ public final class DeferredInsertUndoPlan {
     }
 
     /** 实际编码必须与 placeholder 走相同 inline/external 分支并占用完全相同的字节数和页数。 */
-    void requireSamePhysicalShape(UndoRecordWritePlan actual) {
+    @Override
+    public void requireSamePhysicalShape(UndoRecordWritePlan actual) {
         UndoRecordWritePlan placeholder = placeholderPlan.recordPlan();
         if (!placeholder.samePhysicalShape(actual)) {
             throw new UndoWriteStalePlanException("deferred INSERT undo physical encoding shape changed");

@@ -7,6 +7,7 @@ import cn.zhangyis.db.storage.redo.RedoBudgetWorkload;
 import cn.zhangyis.db.storage.trx.UndoRedoBudgetEstimator;
 import cn.zhangyis.db.storage.trx.UndoWritePlan;
 import cn.zhangyis.db.storage.trx.DeferredInsertUndoPlan;
+import cn.zhangyis.db.storage.trx.DeferredUpdateUndoPlan;
 import cn.zhangyis.db.storage.api.lob.LobWritePlan;
 
 import java.util.List;
@@ -54,6 +55,31 @@ final class DmlRedoBudgetEstimator {
         requirePlan(undoPlan);
         return BTreeRedoBudgetEstimator.pointRewrite()
                 .plus(undoPlan.redoWorkload());
+    }
+
+    /**
+     * 合并 LOB-aware UPDATE 的 leaf rewrite、deferred undo 和全部新 LOB allocation workload。
+     *
+     * @param index    exact-version 聚簇索引；root level 不参与 point rewrite，但用于统一 descriptor 校验。
+     * @param undoPlan placeholder/actual 物理形状一致的 deferred UPDATE undo。
+     * @param lobPlans 本次 UPDATE 新建 external chain 的逐列计划；可以为空但不能为 {@code null}。
+     * @return 在业务 MTR begin 前冻结的组合 redo workload。
+     * @throws DatabaseValidationException index/plan 缺失或列表包含 {@code null} 时抛出。
+     */
+    static RedoBudgetWorkload pointRewrite(BTreeIndex index, DeferredUpdateUndoPlan undoPlan,
+                                            List<LobWritePlan> lobPlans) {
+        requireIndex(index);
+        if (undoPlan == null || lobPlans == null) {
+            throw new DatabaseValidationException("deferred UPDATE redo plans must not be null");
+        }
+        RedoBudgetWorkload workload = BTreeRedoBudgetEstimator.pointRewrite().plus(undoPlan.redoWorkload());
+        for (LobWritePlan lobPlan : lobPlans) {
+            if (lobPlan == null) {
+                throw new DatabaseValidationException("UPDATE LOB redo plan list must not contain null");
+            }
+            workload = workload.plus(lobPlan.workload());
+        }
+        return workload;
     }
 
     /** 兼容既有 estimator 单元测试；不用于 external-aware 生产 admission。 */

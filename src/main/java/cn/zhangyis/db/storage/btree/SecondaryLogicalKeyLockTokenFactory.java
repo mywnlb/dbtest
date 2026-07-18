@@ -50,7 +50,7 @@ public final class SecondaryLogicalKeyLockTokenFactory {
      *
      * @param metadata   目标二级索引 exact-version metadata，提供 logical part、类型、prefix 与 collation。
      * @param logicalKey 仅含声明二级 part 的完整物化 key；不得附带聚簇主键后缀。
-     * @return 可作为 {@link cn.zhangyis.db.storage.trx.lock.SecondaryUniqueKeyLockKey} identity 的稳定 Base64 token。
+     * @return 可作为 {@link cn.zhangyis.db.storage.trx.lock.SecondaryLogicalKeyLockKey} identity 的稳定 Base64 token。
      * @throws DatabaseValidationException metadata/key 缺失、part 数错配或列值不符合声明类型时抛出。
      */
     public String create(SecondaryIndexMetadata metadata, SearchKey logicalKey) {

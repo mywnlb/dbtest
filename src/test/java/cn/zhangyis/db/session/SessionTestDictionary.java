@@ -28,10 +28,35 @@ final class SessionTestDictionary implements AutoCloseable {
             transaction.createSchema(new SchemaDefinition(SchemaId.of(1), ObjectName.of("app"), 1, 1,
                     DictionaryVersion.of(2)));
             transaction.createTable(table(directory));
+            transaction.createTable(rangeTable(directory));
             transaction.commit();
         }
         service = new DataDictionaryService(repository, new DictionaryObjectCache(8),
                 new MetadataLockManager(4, 64));
+    }
+
+    /** Session locking-range 测试表；ordinary secondary equality 会绑定为多行 physical prefix range。 */
+    private static TableDefinition rangeTable(Path directory) {
+        ColumnDefinition id = new ColumnDefinition(11, ObjectName.of("id"),
+                ColumnTypeDefinition.bigint(false, false), 0);
+        ColumnDefinition category = new ColumnDefinition(12, ObjectName.of("category"),
+                new ColumnTypeDefinition(DictionaryTypeId.VARCHAR, false, false,
+                        32, 0, 1, 1, List.of()), 1);
+        IndexDefinition primary = new IndexDefinition(IndexId.of(13), ObjectName.of("PRIMARY"), true, true,
+                List.of(new IndexKeyPart(11, IndexOrder.ASC, 0)));
+        IndexDefinition categoryIndex = new IndexDefinition(IndexId.of(14), ObjectName.of("idx_category"),
+                false, false, List.of(new IndexKeyPart(12, IndexOrder.ASC, 0)));
+        SpaceId space = SpaceId.of(15);
+        TableStorageBinding binding = new TableStorageBinding(12, space,
+                directory.resolve("range_orders.ibd"), List.of(
+                new IndexStorageBinding(13, PageId.of(space, PageNo.of(10)), 0,
+                        new SegmentRef(space, 1, SegmentId.of(11)), new SegmentRef(space, 2, SegmentId.of(12))),
+                new IndexStorageBinding(14, PageId.of(space, PageNo.of(11)), 0,
+                        new SegmentRef(space, 3, SegmentId.of(13)), new SegmentRef(space, 4, SegmentId.of(14)))),
+                Optional.empty());
+        return new TableDefinition(TableId.of(12), SchemaId.of(1), ObjectName.of("range_orders"),
+                DictionaryVersion.of(2), TableState.ACTIVE, List.of(id, category),
+                List.of(primary, categoryIndex), Optional.of(binding));
     }
 
     private static TableDefinition table(Path directory) {

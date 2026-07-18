@@ -41,6 +41,10 @@ public final class DefaultSqlParser {
         private StatementNode parse() {
             StatementNode statement;
             if (keyword("INSERT")) statement = insert();
+            else if (keyword("CREATE")) statement = createIndex();
+            else if (keyword("ALTER")) statement = alterAddIndex();
+            else if (keyword("UPDATE")) statement = update();
+            else if (keyword("DELETE")) statement = delete();
             else if (keyword("SELECT")) statement = select();
             else if (keyword("SET")) statement = set();
             else if (keyword("BEGIN")) { take(); statement = new TransactionControlNode(TransactionControlNode.Kind.BEGIN); }
@@ -52,7 +56,8 @@ public final class DefaultSqlParser {
             } else if (keyword("ROLLBACK")) {
                 take(); statement = new TransactionControlNode(TransactionControlNode.Kind.ROLLBACK);
             } else {
-                throw syntax("expected INSERT, SELECT, SET, BEGIN, START, COMMIT or ROLLBACK", current());
+                throw syntax("expected INSERT, CREATE, ALTER, UPDATE, DELETE, SELECT, SET, BEGIN, START, COMMIT or ROLLBACK",
+                        current());
             }
             if (match(TokenType.SEMICOLON)) take();
             require(TokenType.EOF, "end of statement");
@@ -71,6 +76,83 @@ public final class DefaultSqlParser {
             return new InsertStatementNode(table, columns, values);
         }
 
+        /** 解析独立 CREATE [UNIQUE] INDEX，并直接归一为共享 index AST。 */
+        private CreateIndexStatementNode createIndex() {
+            requireKeyword("CREATE");
+            boolean unique = false;
+            if (keyword("UNIQUE")) {
+                take();
+                unique = true;
+            }
+            requireKeyword("INDEX");
+            IdentifierNode indexName = identifier();
+            requireKeyword("ON");
+            QualifiedNameNode table = qualifiedName();
+            return new CreateIndexStatementNode(table, indexName, unique, indexKeyParts());
+        }
+
+        /** v1 ALTER 只接受 TABLE ... ADD [UNIQUE] INDEX，并与独立语法产生同一 AST 类型。 */
+        private CreateIndexStatementNode alterAddIndex() {
+            requireKeyword("ALTER");
+            requireKeyword("TABLE");
+            QualifiedNameNode table = qualifiedName();
+            requireKeyword("ADD");
+            boolean unique = false;
+            if (keyword("UNIQUE")) {
+                take();
+                unique = true;
+            }
+            requireKeyword("INDEX");
+            IdentifierNode indexName = identifier();
+            return new CreateIndexStatementNode(table, indexName, unique, indexKeyParts());
+        }
+
+        /** key part v1 仅允许完整列与可选 ASC/DESC，不把前缀长度或表达式静默吞掉。 */
+        private List<IndexKeyPartNode> indexKeyParts() {
+            require(TokenType.LPAREN, "'('");
+            List<IndexKeyPartNode> parts = new ArrayList<>();
+            parts.add(indexKeyPart());
+            while (match(TokenType.COMMA)) {
+                take();
+                parts.add(indexKeyPart());
+            }
+            require(TokenType.RPAREN, "')'");
+            return List.copyOf(parts);
+        }
+
+        private IndexKeyPartNode indexKeyPart() {
+            IdentifierNode column = identifier();
+            IndexKeyOrderNode order = IndexKeyOrderNode.ASC;
+            if (keyword("ASC")) {
+                take();
+            } else if (keyword("DESC")) {
+                take();
+                order = IndexKeyOrderNode.DESC;
+            }
+            return new IndexKeyPartNode(column, order);
+        }
+
+        private UpdateStatementNode update() {
+            requireKeyword("UPDATE"); QualifiedNameNode table = qualifiedName(); requireKeyword("SET");
+            List<AssignmentNode> assignments = new ArrayList<>();
+            assignments.add(assignment());
+            while (match(TokenType.COMMA)) { take(); assignments.add(assignment()); }
+            requireKeyword("WHERE"); return new UpdateStatementNode(table, assignments, predicates());
+        }
+
+        private AssignmentNode assignment() { return new AssignmentNode(identifier(), equalsLiteral()); }
+        private LiteralNode equalsLiteral() { require(TokenType.EQUALS, "'='"); return literal(); }
+
+        private DeleteStatementNode delete() {
+            requireKeyword("DELETE"); requireKeyword("FROM"); QualifiedNameNode table = qualifiedName();
+            requireKeyword("WHERE"); return new DeleteStatementNode(table, predicates());
+        }
+
+        private List<EqualityPredicateNode> predicates() {
+            List<EqualityPredicateNode> result = new ArrayList<>(); result.add(predicate());
+            while (keyword("AND")) { take(); result.add(predicate()); } return List.copyOf(result);
+        }
+
         private SelectStatementNode select() {
             requireKeyword("SELECT");
             boolean star = false;
@@ -83,7 +165,20 @@ public final class DefaultSqlParser {
             List<EqualityPredicateNode> predicates = new ArrayList<>();
             predicates.add(predicate());
             while (keyword("AND")) { take(); predicates.add(predicate()); }
-            return new SelectStatementNode(star, projections, table, predicates);
+            SelectLockingClause lockingClause = SelectLockingClause.NONE;
+            if (keyword("FOR")) {
+                take();
+                if (keyword("SHARE")) {
+                    take();
+                    lockingClause = SelectLockingClause.FOR_SHARE;
+                } else if (keyword("UPDATE")) {
+                    take();
+                    lockingClause = SelectLockingClause.FOR_UPDATE;
+                } else {
+                    throw syntax("expected SHARE or UPDATE after FOR", current());
+                }
+            }
+            return new SelectStatementNode(star, projections, table, predicates, lockingClause);
         }
 
         private EqualityPredicateNode predicate() {

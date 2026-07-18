@@ -14,6 +14,7 @@ import cn.zhangyis.db.server.lockobs.api.SnapshotRequest;
 import cn.zhangyis.db.server.lockobs.snapshot.LockDiagnosticSnapshot;
 import cn.zhangyis.db.storage.api.DiskSpaceManager;
 import cn.zhangyis.db.storage.api.SegmentRef;
+import cn.zhangyis.db.storage.api.trx.PrepareTransactionCommand;
 import cn.zhangyis.db.storage.btree.BTreeIndex;
 import cn.zhangyis.db.storage.btree.BTreeLookupResult;
 import cn.zhangyis.db.storage.btree.BTreeRedoBudgetEstimator;
@@ -34,6 +35,7 @@ import cn.zhangyis.db.storage.recovery.RecoveryStageName;
 import cn.zhangyis.db.storage.recovery.RecoveryState;
 import cn.zhangyis.db.storage.recovery.RecoveryStartupException;
 import cn.zhangyis.db.storage.recovery.RecoveryTrafficGate;
+import cn.zhangyis.db.storage.recovery.PreparedTransactionDecision;
 import cn.zhangyis.db.storage.redo.LogRange;
 import cn.zhangyis.db.storage.redo.PageBytesRecord;
 import cn.zhangyis.db.storage.redo.RedoCheckpointLabel;
@@ -288,6 +290,91 @@ class StorageEngineTest {
         assertEquals("v2", payloadOf(e3.btreeService().lookup(r, index, search(2)).orElseThrow()));
         e3.miniTransactionManager().commit(r);
         e3.close();
+    }
+
+    /**
+     * 重启发现 PREPARED 后必须在 traffic gate 关闭期间消费外部 commit 决议；INSERT undo owner 被回收，
+     * 聚簇行保留，恢复完成后事务 creator 不再位于 active table。
+     */
+    @Test
+    void restartCommitsPreparedTransactionFromDecisionProvider() {
+        Path dataPath = dir.resolve("prepared-recovery-commit.ibd");
+        EngineConfig cfg = configWithRecoveryTablespace(dataPath);
+        StorageEngine first = new StorageEngine(cfg);
+        first.open();
+        BTreeIndex index = createClusteredIndex(first, dataPath);
+        Transaction prepared = insertPreparedRow(first, index, 41, "commit");
+        TransactionId creator = prepared.transactionId();
+        first.close();
+
+        StorageEngine recovered = new StorageEngine(
+                cfg, transactionId -> transactionId.equals(creator)
+                        ? PreparedTransactionDecision.COMMIT
+                        : PreparedTransactionDecision.UNRESOLVED);
+        recovered.configureClusteredIndex(index);
+        recovered.open();
+        try {
+            MiniTransaction read = recovered.miniTransactionManager().beginReadOnly();
+            BTreeLookupResult found = recovered.btreeService().lookup(
+                    read, index, search(41)).orElseThrow();
+            recovered.miniTransactionManager().commit(read);
+            assertEquals("commit", payloadOf(found));
+            assertFalse(recovered.transactionManager().system()
+                    .snapshotActiveReadWriteIds().contains(creator.value()));
+        } finally {
+            recovered.close();
+        }
+    }
+
+    /**
+     * restart rollback 决议必须重建 transaction/undo context，复用 live prepared rollback 逐条反向应用，
+     * 并在开放流量前清除聚簇行与 page3 owner。
+     */
+    @Test
+    void restartRollsBackPreparedTransactionFromDecisionProvider() {
+        Path dataPath = dir.resolve("prepared-recovery-rollback.ibd");
+        EngineConfig cfg = configWithRecoveryTablespace(dataPath);
+        StorageEngine first = new StorageEngine(cfg);
+        first.open();
+        BTreeIndex index = createClusteredIndex(first, dataPath);
+        Transaction prepared = insertPreparedRow(first, index, 42, "rollback");
+        TransactionId creator = prepared.transactionId();
+        first.close();
+
+        StorageEngine recovered = new StorageEngine(
+                cfg, transactionId -> transactionId.equals(creator)
+                        ? PreparedTransactionDecision.ROLLBACK
+                        : PreparedTransactionDecision.UNRESOLVED);
+        recovered.configureClusteredIndex(index);
+        recovered.open();
+        try {
+            MiniTransaction read = recovered.miniTransactionManager().beginReadOnly();
+            assertTrue(recovered.btreeService().lookupIncludingDeleted(
+                    read, index, search(42)).isEmpty());
+            recovered.miniTransactionManager().commit(read);
+            assertEquals(0, recovered.rollbackSegmentSlotManager().activeSlotCount());
+        } finally {
+            recovered.close();
+        }
+    }
+
+    /**
+     * 未决 PREPARED 不能被默认猜测为 commit 或 rollback；provider 返回 UNRESOLVED 时启动必须 fail-closed。
+     */
+    @Test
+    void restartFailsClosedWhenPreparedDecisionIsUnresolved() {
+        Path dataPath = dir.resolve("prepared-recovery-unresolved.ibd");
+        EngineConfig cfg = configWithRecoveryTablespace(dataPath);
+        StorageEngine first = new StorageEngine(cfg);
+        first.open();
+        BTreeIndex index = createClusteredIndex(first, dataPath);
+        insertPreparedRow(first, index, 43, "unresolved");
+        first.close();
+
+        StorageEngine recovered = new StorageEngine(cfg);
+        recovered.configureClusteredIndex(index);
+        assertThrows(RecoveryStartupException.class, recovered::open);
+        assertEquals(RecoveryState.FAILED, recovered.recoveryState());
     }
 
     @Test
@@ -1146,6 +1233,29 @@ class StorageEngineTest {
         txnMgr.prepareCommit(txn);
         undoMgr.onCommit(txn);
         txnMgr.commit(txn);
+    }
+
+    /**
+     * 写入一条 INSERT undo/聚簇行并走稳定 phase-one API，返回仍持有 active membership 的 PREPARED 聚合。
+     */
+    private Transaction insertPreparedRow(StorageEngine engine, BTreeIndex index, long id, String payload) {
+        TransactionManager transactionManager = engine.transactionManager();
+        Transaction transaction = transactionManager.begin(TransactionOptions.defaults());
+        transactionManager.assignWriteId(transaction);
+        MiniTransaction write = engine.miniTransactionManager().begin(
+                engine.miniTransactionManager().budgetFor(
+                        RedoBudgetPurpose.CLUSTERED_INSERT,
+                        BTreeRedoBudgetEstimator.insert(index.rootLevel())
+                                .plus(UndoRedoBudgetEstimator.append(true))));
+        RollPointer rollPointer = UndoTestWrites.insert(
+                engine.undoLogManager(), transaction, write, TABLE_ID, INDEX_ID,
+                List.of(new ColumnValue.IntValue(id)), index.keyDef(), index.schema());
+        engine.btreeService().insertClustered(
+                write, index, row(id, payload), transaction.transactionId(), rollPointer);
+        engine.miniTransactionManager().commit(write);
+        engine.preparedTransactionService().prepare(
+                new PrepareTransactionCommand(transaction, Duration.ofSeconds(2)));
+        return transaction;
     }
 
     private static String payloadOf(BTreeLookupResult r) {

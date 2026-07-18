@@ -277,9 +277,9 @@ public final class LockManager {
     /**
      * 校验锁模式是否属于资源键允许的语义集合。
      *
-     * @param key  record/gap/next-key/insert-intention 或 logical-secondary-unique 资源键。
+     * @param key  record/gap/next-key/insert-intention 或 logical-secondary-prefix 资源键。
      * @param mode 调用方请求的锁模式。
-     * @return 模式与 key 类型匹配时返回 {@code true}；logical secondary unique 只允许 REC_X。
+     * @return 模式与 key 类型匹配时返回 {@code true}；logical secondary prefix 允许 REC_S/REC_X。
      */
     private static boolean modeMatchesKey(TransactionLockKey key, TransactionLockMode mode) {
         if (key instanceof RecordLockKey) {
@@ -294,8 +294,8 @@ public final class LockManager {
         if (key instanceof InsertIntentionLockKey) {
             return mode == TransactionLockMode.INSERT_INTENTION;
         }
-        if (key instanceof SecondaryUniqueKeyLockKey) {
-            return mode == TransactionLockMode.REC_X;
+        if (key instanceof SecondaryLogicalKeyLockKey) {
+            return mode == TransactionLockMode.REC_S || mode == TransactionLockMode.REC_X;
         }
         return false;
     }
@@ -346,7 +346,7 @@ public final class LockManager {
      *
      * <p>数据流：</p>
      * <ol>
-     *     <li>logical secondary unique 使用完整归一化 key 相等判定；同一资源始终 X/X 冲突。</li>
+     *     <li>logical secondary prefix 使用完整归一化 key 相等判定，并复用 record S/X 兼容矩阵。</li>
      *     <li>record/next-key 的 record 部分按既有 S/X 兼容矩阵判断。</li>
      *     <li>gap/next-key/insert-intention 的 gap 部分保持“意向之间兼容、意向与 gap 锁冲突”语义。</li>
      * </ol>
@@ -359,11 +359,11 @@ public final class LockManager {
      */
     private static boolean conflicts(TransactionLockKey heldKey, TransactionLockMode heldMode,
                                      TransactionLockKey requestedKey, TransactionLockMode requestedMode) {
-        // 1. logical secondary unique token 已吸收 type/prefix/collation 等价语义，同 identity 只能串行化检查+发布。
-        if (heldKey instanceof SecondaryUniqueKeyLockKey heldUnique
-                && requestedKey instanceof SecondaryUniqueKeyLockKey requestedUnique
-                && heldUnique.equals(requestedUnique)) {
-            return true;
+        // 1. logical secondary token 已吸收 type/prefix/collation 等价语义；同 identity 按 S/X 矩阵判冲突。
+        if (heldKey instanceof SecondaryLogicalKeyLockKey heldLogical
+                && requestedKey instanceof SecondaryLogicalKeyLockKey requestedLogical
+                && heldLogical.equals(requestedLogical)) {
+            return recordModesConflict(recordMode(heldMode), recordMode(requestedMode));
         }
         // 2. 普通 record 与 next-key 的 record 部分继续使用既有 S/X 兼容矩阵。
         RecordLockKey heldRecord = recordPart(heldKey);

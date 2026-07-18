@@ -8,6 +8,7 @@ import cn.zhangyis.db.sql.executor.QueryResult;
 import cn.zhangyis.db.sql.executor.SqlValue;
 import cn.zhangyis.db.sql.executor.UpdateResult;
 import cn.zhangyis.db.sql.executor.storage.SqlIsolationLevel;
+import cn.zhangyis.db.sql.executor.storage.exception.SqlStorageException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -71,6 +72,51 @@ class SqlSessionEndToEndTest {
         }
     }
 
+    /**
+     * 真实 Session 链路返回 non-unique prefix 多行并 hydrate LOB；显式 FOR UPDATE 持 logical/clustered 锁，
+     * 同 prefix INSERT 超时，COMMIT 后同一 Session 可重试成功。
+     */
+    @Test
+    void executesNonUniqueRangeAndHoldsLockingReadUntilCommit() {
+        try (DatabaseEngine database = new DatabaseEngine(SqlSessionTestSupport.config(directory))) {
+            database.open();
+            SqlSessionTestSupport.createSchema(database);
+            createRangeTable(database);
+            String firstBody = "一".repeat(300);
+            String secondBody = "二".repeat(320);
+            try (SqlSession seed = database.openSession(SqlSessionTestSupport.options(true,
+                    SqlIsolationLevel.REPEATABLE_READ, Duration.ofSeconds(2)))) {
+                seed.execute("INSERT INTO range_docs (id,category,body) VALUES "
+                        + "(1,'team','" + firstBody + "')");
+                seed.execute("INSERT INTO range_docs (id,category,body) VALUES "
+                        + "(2,'TEAM','" + secondBody + "')");
+                QueryResult range = assertInstanceOf(QueryResult.class,
+                        seed.execute("SELECT body,id FROM range_docs WHERE category='team'"));
+                assertEquals(2, range.rows().size());
+                assertEquals(new SqlValue.StringValue(firstBody), range.rows().get(0).values().get(0));
+                assertEquals(new SqlValue.StringValue(secondBody), range.rows().get(1).values().get(0));
+            }
+
+            try (SqlSession locker = database.openSession(SqlSessionTestSupport.options(true,
+                    SqlIsolationLevel.REPEATABLE_READ, Duration.ofSeconds(2)));
+                 SqlSession writer = database.openSession(SqlSessionTestSupport.options(true,
+                         SqlIsolationLevel.REPEATABLE_READ, Duration.ofMillis(100)))) {
+                locker.execute("BEGIN");
+                QueryResult locked = assertInstanceOf(QueryResult.class,
+                        locker.execute("SELECT id FROM range_docs WHERE category='TEAM' FOR UPDATE"));
+                assertEquals(2, locked.rows().size());
+
+                assertThrows(SqlStorageException.class, () -> writer.execute(
+                        "INSERT INTO range_docs (id,category,body) VALUES (3,'team','blocked')"));
+                locker.execute("COMMIT");
+                assertEquals(1, assertInstanceOf(UpdateResult.class, writer.execute(
+                        "INSERT INTO range_docs (id,category,body) VALUES (3,'team','released')")).affectedRows());
+                assertEquals(3, assertInstanceOf(QueryResult.class,
+                        writer.execute("SELECT id FROM range_docs WHERE category='team'")).rows().size());
+            }
+        }
+    }
+
     private static QueryResult query(SqlSession session, String table, long id) {
         return assertInstanceOf(QueryResult.class,
                 session.execute("SELECT * FROM " + table + " WHERE id=" + id));
@@ -111,6 +157,26 @@ class SqlSessionEndToEndTest {
                 List.of(new CreateIndexSpec(ObjectName.of("PRIMARY"), true, true, List.of(
                         new CreateIndexKeyPartSpec(ObjectName.of("c_bigint"), IndexOrder.ASC, 0),
                         new CreateIndexKeyPartSpec(ObjectName.of("c_int"), IndexOrder.ASC, 0))))),
+                Duration.ofSeconds(5));
+    }
+
+    /** 创建单列 ordinary secondary + external TEXT，供 range MVCC、locking 与 LOB 同链验收。 */
+    private static void createRangeTable(DatabaseEngine database) {
+        database.ddl().createTable(MdlOwnerId.of(10_020), new CreateTableCommand(
+                QualifiedTableName.of("app", "range_docs"), PageNo.of(384),
+                List.of(
+                        new CreateColumnSpec(ObjectName.of("id"), ColumnTypeDefinition.bigint(false, false)),
+                        new CreateColumnSpec(ObjectName.of("category"), new ColumnTypeDefinition(
+                                DictionaryTypeId.VARCHAR, false, false, 32, 0, 1, 2, List.of())),
+                        new CreateColumnSpec(ObjectName.of("body"), type(DictionaryTypeId.TEXT,
+                                65_535, 0, List.of()))),
+                List.of(
+                        new CreateIndexSpec(ObjectName.of("PRIMARY"), true, true,
+                                List.of(new CreateIndexKeyPartSpec(
+                                        ObjectName.of("id"), IndexOrder.ASC, 0))),
+                        new CreateIndexSpec(ObjectName.of("idx_category"), false, false,
+                                List.of(new CreateIndexKeyPartSpec(
+                                        ObjectName.of("category"), IndexOrder.ASC, 0))))),
                 Duration.ofSeconds(5));
     }
 

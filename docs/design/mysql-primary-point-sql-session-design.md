@@ -624,6 +624,10 @@ OPEN → CLOSING → reject new sessions/statements
 
 ## 22. 与 backlog 2.2、2.3 的关系
 
+> 当前状态补注（2026-07-17）：本节保留下述实现前的依赖判断；2.2 secondary closure 与 2.3
+> CREATE/DROP TABLE DDL undo marker + 独立 DDL_LOG v1 均已落地，temporary undo 仍等待临时表
+> owner/lifecycle 与独立 temporary tablespace。
+
 - 2.2 仍需先增加二级索引 DML/undo producer；当前切片只建立真实用户聚簇入口，不把 secondary purge 伪装成已接。
 - 2.3 的 DDL undo marker 依赖独立 DDL_LOG，可作为并行支线；temporary undo 依赖本设计建立的 Session 生命周期，放在本切片之后。
 - 本设计完成后推荐主线为：二级索引同步写入与 undo → 2.2 secondary purge/回表 MVCC → temporary undo。

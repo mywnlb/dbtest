@@ -207,6 +207,21 @@ public final class SpaceHeaderRepository {
                 "set first inode page");
     }
 
+    /**
+     * 设置 GENERAL 表空间的 SDI 根页。当前 v1 只由 SDI page repository 写入固定 page3；
+     * 本仓储只维护 page0 字段和 redo，不解释 SDI payload。
+     *
+     * @param mtr 当前活动 MTR，必须已经遵守 page0 优先的 latch 顺序
+     * @param spaceId 目标表空间 identity
+     * @param pageNo SDI 根页号；0 表示 legacy/未启用，v1 生产写入使用 3
+     */
+    public void setSdiRootPageNo(MiniTransaction mtr, SpaceId spaceId, long pageNo) {
+        if (pageNo < 0) {
+            throw new DatabaseValidationException("SDI root page no must not be negative");
+        }
+        writeLongField(mtr, spaceId, SpaceHeaderLayout.SDI_ROOT, pageNo, "set SDI root page");
+    }
+
     /** FSP_FREE 链 base 地址（page0 内固定偏移），供 Flst/2b 维护链。 */
     public FileAddress freeExtentListBaseAddr(SpaceId spaceId) {
         requireSpace(spaceId);

@@ -2,6 +2,7 @@ package cn.zhangyis.db.storage.trx;
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageId;
+import cn.zhangyis.db.domain.Lsn;
 import cn.zhangyis.db.domain.TransactionId;
 import cn.zhangyis.db.domain.UndoSlotId;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
@@ -19,6 +20,8 @@ import cn.zhangyis.db.storage.undo.UndoLogFormatException;
 import cn.zhangyis.db.storage.undo.UndoLogSegment;
 import cn.zhangyis.db.storage.undo.UndoLogSegmentAccess;
 import cn.zhangyis.db.storage.undo.UndoLogKind;
+import cn.zhangyis.db.storage.undo.UndoLogState;
+import cn.zhangyis.db.storage.undo.UndoPrepareTarget;
 import cn.zhangyis.db.storage.undo.UndoHistoryNodeSnapshot;
 import cn.zhangyis.db.storage.undo.UndoSegmentHandle;
 import cn.zhangyis.db.storage.undo.UndoSegmentDropPlan;
@@ -99,6 +102,61 @@ public final class UndoSegmentFinalizer {
     }
 
     /**
+     * 原子持久化 XA phase one；本方法只处理物理 first-page 与 redo，不发布 live Transaction 状态。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 ACTIVE 写事务、NONE commit no与一或两条普通 undo binding。</li>
+     *     <li>逐 binding 短读核对内存 slot、page3 owner和 ACTIVE first-page，返回前释放全部 latch。</li>
+     *     <li>一个写 MTR 按 PageId 固定全部 first page，统一写 PREPARED并追加 ACTIVE→PREPARED redo。</li>
+     *     <li>提交并返回 phase-one end LSN；失败保持内存事务 ACTIVE，调用方按 fail-stop 关闭实例。</li>
+     * </ol>
+     *
+     * @param transaction 当前仍为 ACTIVE、已分配 write id且至少写过一条 ordinary undo 的事务
+     * @param context transaction 唯一拥有的 undo context
+     * @return 同时覆盖全部 PREPARED first-page after-image与 phase-one delta 的 MTR end LSN
+     * @throws TransactionStateException 状态、身份、提交号或 undo context 不满足 phase-one 条件时抛出
+     * @throws UndoFinalizationException 最终物理 MTR 修改或提交失败时抛出；调用方不得继续普通 DML
+     */
+    Lsn prepareTransaction(Transaction transaction, UndoContext context) {
+        // 1、v1 只接受已经产生普通 undo 的真实写分支。
+        if (transaction == null || context == null
+                || transaction.state() != TransactionState.ACTIVE
+                || transaction.transactionId().isNone()
+                || !transaction.transactionNo().isNone()
+                || transaction.undoContext() != context
+                || context.bindings().isEmpty()) {
+            throw new TransactionStateException(
+                    "undo prepare requires ACTIVE write transaction with ordinary undo and no commit number");
+        }
+        List<UndoLogBinding> ordered = context.bindings().stream()
+                .sorted(Comparator.comparingInt((UndoLogBinding binding) ->
+                                binding.firstPageId().spaceId().value())
+                        .thenComparingLong(binding -> binding.firstPageId().pageNo().value()))
+                .toList();
+
+        // 2、慢速 page3/first-page 预检分散到短只读 MTR，不把 latch带进 redo admission。
+        for (UndoLogBinding binding : ordered) {
+            prepareActive(binding, transaction.transactionId(), false);
+        }
+
+        // 3、first-page-only 批次先全量复核再写 state，防止 mixed transaction 半 prepared。
+        MiniTransaction mtr = mtrManager.begin(mtrManager.budgetFor(
+                RedoBudgetPurpose.UNDO_FINALIZATION, UndoRedoBudgetEstimator.prepare(ordered.size())));
+        try {
+            undoAccess.markPreparedFirstPages(mtr, transaction.transactionId(),
+                    ordered.stream().map(binding ->
+                            new UndoPrepareTarget(binding.firstPageId(), binding.kind())).toList());
+            TransactionStateRedoDeltas.appendPrepare(mtr, transaction);
+            // 4、返回值是 phase-one durable wait 的精确目标；内存状态由上层在本 commit 返回后发布。
+            return mtrManager.commit(mtr);
+        } catch (RuntimeException error) {
+            rollbackActiveMtr(mtr, error);
+            throw new UndoFinalizationException("XA prepare first-page batch failed", error);
+        }
+    }
+
+    /**
      * 原子提交事务拥有的独立 undo logs。INSERT-only 按 eligibility cache/free/drop；UPDATE-only 只写 COMMITTED
      * header；mixed 在同一 MTR 中先终结 INSERT owner，再写 UPDATE header，最后只追加一次事务 commit delta。
      */
@@ -116,7 +174,8 @@ public final class UndoSegmentFinalizer {
             throw new TransactionStateException("UPDATE undo commit requires exactly one history append lease");
         }
         PreparedHistoryAppend historyAppend = update == null ? null
-                : prepareHistoryAppend(update, transaction, historyLease);
+                : prepareHistoryAppend(update, transaction, context.affectedTableIds(),
+                historyLease, UndoLogState.ACTIVE);
         if (insert == null) {
             commitUpdateOnly(transaction, historyAppend, historyLease);
             return;
@@ -213,6 +272,137 @@ public final class UndoSegmentFinalizer {
     }
 
     /**
+     * 原子提交 PREPARED 事务的 undo owner。prepared INSERT segment 一律 drop；UPDATE segment 直接从
+     * PREPARED 转为 COMMITTED并挂 history，避免普通 ACTIVE cache/free 路径放宽物理前置状态。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 PREPARED、提交号、undo binding与 history lease/affected-table identity。</li>
+     *     <li>分别短读核对 UPDATE history append和可选 INSERT page3/PREPARED owner，再读取 INSERT drop plan。</li>
+     *     <li>最终 MTR 先 drop INSERT FSP segment并 clear slot，再挂 UPDATE history，最后追加 prepared commit redo。</li>
+     *     <li>MTR commit 后发布 slot/history内存投影；失败时事务保持 PREPARED且 row locks不释放。</li>
+     * </ol>
+     *
+     * @param transaction 已由 phase two 预留提交号的 PREPARED 事务
+     * @param context transaction 持有的一或两条普通 undo binding
+     * @param affectedTableIds 当前 UPDATE logical chain 的去重稳定表集合
+     * @param historyLease UPDATE 存在时必须提供的 history append lease；INSERT-only 必须为 null
+     * @throws TransactionStateException 状态、提交号、binding或 lease组合非法时抛出
+     * @throws UndoFinalizationException 物理 phase-two批次或内存 owner发布失败时抛出
+     */
+    void finalizePreparedCommit(Transaction transaction, UndoContext context,
+                                java.util.Set<Long> affectedTableIds,
+                                HistoryList.AppendLease historyLease) {
+        // 1、phase-two commit 不能复用普通 ACTIVE finalizer。
+        if (transaction == null || context == null || affectedTableIds == null
+                || transaction.state() != TransactionState.PREPARED
+                || transaction.transactionId().isNone() || transaction.transactionNo().isNone()
+                || transaction.undoContext() != context) {
+            throw new TransactionStateException(
+                    "prepared undo commit requires PREPARED write transaction and commit number");
+        }
+        UndoLogBinding insert = context.binding(UndoLogKind.INSERT);
+        UndoLogBinding update = context.binding(UndoLogKind.UPDATE);
+        if (insert == null && update == null) {
+            throw new TransactionStateException("prepared commit requires at least one undo log");
+        }
+        if ((update == null) != (historyLease == null)) {
+            throw new TransactionStateException(
+                    "prepared UPDATE commit requires exactly one history append lease");
+        }
+
+        // 2、所有读预检都在最终写 MTR 前完成，不跨 FSP drop/history append持有 first-page latch。
+        PreparedHistoryAppend historyAppend = update == null ? null
+                : prepareHistoryAppend(update, transaction, affectedTableIds,
+                historyLease, UndoLogState.PREPARED);
+        if (insert == null) {
+            commitPreparedUpdateOnly(transaction, historyAppend, historyLease);
+            return;
+        }
+        try (RollbackSegmentSlotManager.BatchFinalizationLease slotLease =
+                     slotManager.beginBatchFinalization(List.of(insert))) {
+            PreparedActive preparedInsert = prepareOwned(
+                    insert, transaction.transactionId(), false, UndoLogState.PREPARED);
+            UndoSegmentDropPlan insertDrop = inspectDropPlan(preparedInsert.handle());
+
+            // 3、prepared INSERT 不进入 reuse directory；drop+slot clear与可选 UPDATE history同批。
+            MiniTransaction mtr = mtrManager.begin(mtrManager.budgetFor(
+                    RedoBudgetPurpose.UNDO_COMMIT, UndoRedoBudgetEstimator.commit(insertDrop)));
+            try {
+                if (historyLease != null) {
+                    historyLease.physicalMutationStarted();
+                }
+                slotLease.physicalMutationStarted();
+                undoAllocator.dropUndoSegment(mtr, preparedInsert.handle());
+                publishFinalizationOwners(mtr, List.of(
+                        new FinalizationDisposition(preparedInsert, insertDrop, null, false)));
+                if (historyAppend != null) {
+                    UndoLogBinding updateBinding = historyAppend.update().binding();
+                    headerRepository.appendHistory(mtr, updateBinding.firstPageId().spaceId(),
+                            historyAppend.base(), updateBinding.slotId(), updateBinding.firstPageId(),
+                            transaction.transactionNo());
+                    undoAccess.appendPreparedHistoryNode(mtr,
+                            historyAppend.oldTail().map(UndoHistoryNodeSnapshot::firstPageId),
+                            updateBinding.firstPageId(), transaction.transactionId(),
+                            transaction.transactionNo());
+                }
+                TransactionStateRedoDeltas.appendPreparedCommit(mtr, transaction);
+                mtrManager.commit(mtr);
+            } catch (RuntimeException error) {
+                rollbackActiveMtr(mtr, error);
+                throw new UndoFinalizationException(
+                        "prepared mixed/INSERT commit finalization failed", error);
+            }
+
+            // 4、持久 owner先完成，内存 slot/history后发布；发布失败由重启重新恢复。
+            UndoLogBinding diagnostic = update == null ? insert : update;
+            faultInjector.afterCommit(
+                    UndoFinalizationKind.PREPARED_COMMIT,
+                    diagnostic.slotId(), diagnostic.firstPageId());
+            try {
+                slotLease.complete();
+                if (historyLease != null) {
+                    historyLease.complete();
+                }
+            } catch (RuntimeException error) {
+                throw new UndoFinalizationException(
+                        "prepared commit persisted but memory publication failed", error);
+            }
+        }
+    }
+
+    /** UPDATE-only prepared commit；没有需要转移的 INSERT slot owner。 */
+    private void commitPreparedUpdateOnly(Transaction transaction, PreparedHistoryAppend prepared,
+                                          HistoryList.AppendLease historyLease) {
+        MiniTransaction mtr = mtrManager.begin(mtrManager.budgetFor(
+                RedoBudgetPurpose.UNDO_COMMIT, UndoRedoBudgetEstimator.commit(null)));
+        try {
+            historyLease.physicalMutationStarted();
+            UndoLogBinding update = prepared.update().binding();
+            headerRepository.appendHistory(mtr, update.firstPageId().spaceId(), prepared.base(),
+                    update.slotId(), update.firstPageId(), transaction.transactionNo());
+            undoAccess.appendPreparedHistoryNode(mtr,
+                    prepared.oldTail().map(UndoHistoryNodeSnapshot::firstPageId),
+                    update.firstPageId(), transaction.transactionId(), transaction.transactionNo());
+            TransactionStateRedoDeltas.appendPreparedCommit(mtr, transaction);
+            mtrManager.commit(mtr);
+        } catch (RuntimeException error) {
+            rollbackActiveMtr(mtr, error);
+            throw new UndoFinalizationException(
+                    "prepared UPDATE commit finalization failed", error);
+        }
+        UndoLogBinding update = prepared.update().binding();
+        faultInjector.afterCommit(
+                UndoFinalizationKind.PREPARED_COMMIT, update.slotId(), update.firstPageId());
+        try {
+            historyLease.complete();
+        } catch (RuntimeException error) {
+            throw new UndoFinalizationException(
+                    "prepared UPDATE commit persisted but history publication failed", error);
+        }
+    }
+
+    /**
      * live full rollback：只允许回收 ACTIVE 且持久/内存 logical head 都为 EMPTY 的 segment。
      *
      * @param transaction 正处于 ROLLING_BACK 的 live 事务。
@@ -228,6 +418,86 @@ public final class UndoSegmentFinalizer {
         }
         finalizeActiveBatch(UndoFinalizationKind.LIVE_ROLLBACK, context.bindings(),
                 transaction.transactionId(), transaction);
+    }
+
+    /**
+     * prepared rollback 到双 EMPTY 后原子 drop全部 segment并清 page3 owner。prepared owner 不进入 cache/free，
+     * 因而不会放宽普通 ACTIVE reusable-page helper 的状态前置条件。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验运行时 PREPARED_ROLLING_BACK 与全部内存 logical head=EMPTY。</li>
+     *     <li>取得全部 slot finalization lease，逐 owner短读核对 PREPARED状态并读取 FSP drop plan。</li>
+     *     <li>单 MTR drop全部 segment、clear全部 page3 slots并追加 PREPARED→ROLLED_BACK redo。</li>
+     *     <li>物理提交后发布内存 slot释放；失败时不允许事务 manager发布终态。</li>
+     * </ol>
+     *
+     * @param transaction 正处于 prepared rollback 重试态的 live/rebuilt事务
+     * @param context 已经把一或两条 logical head持久推进到 EMPTY 的 undo context
+     * @throws TransactionStateException 状态、owner或 logical head不满足终结条件时抛出
+     * @throws UndoFinalizationException drop/page3/redo批次或内存发布失败时抛出
+     */
+    void finalizePreparedRollback(Transaction transaction, UndoContext context) {
+        // 1、prepared rollback 的磁盘 owner仍是 PREPARED，不能交给普通 ACTIVE batch。
+        if (transaction == null || context == null
+                || transaction.state() != TransactionState.PREPARED_ROLLING_BACK
+                || transaction.undoContext() != context
+                || context.bindings().isEmpty()
+                || context.bindings().stream().anyMatch(
+                binding -> !binding.logicalHead().isEmpty())) {
+            throw new TransactionStateException(
+                    "prepared rollback finalization requires PREPARED_ROLLING_BACK and EMPTY heads");
+        }
+        List<UndoLogBinding> ordered = context.bindings().stream()
+                .sorted(Comparator.comparingInt((UndoLogBinding binding) ->
+                                binding.firstPageId().spaceId().value())
+                        .thenComparingLong(binding -> binding.firstPageId().pageNo().value()))
+                .toList();
+        try (RollbackSegmentSlotManager.BatchFinalizationLease lease =
+                     slotManager.beginBatchFinalization(ordered)) {
+            // 2、只读预检与 FSP plan读取均在最终写 MTR前完成。
+            List<PreparedActive> prepared = ordered.stream()
+                    .map(binding -> prepareOwned(binding, transaction.transactionId(),
+                            true, UndoLogState.PREPARED))
+                    .toList();
+            List<UndoSegmentDropPlan> plans = prepared.stream()
+                    .map(item -> inspectDropPlan(item.handle()))
+                    .toList();
+
+            // 3、prepared owner全部 drop；不触碰 reuse directory或 first-page reset。
+            MiniTransaction mtr = mtrManager.begin(mtrManager.budgetFor(
+                    RedoBudgetPurpose.UNDO_FINALIZATION,
+                    UndoRedoBudgetEstimator.finalization(plans, true)));
+            try {
+                lease.physicalMutationStarted();
+                for (PreparedActive item : prepared) {
+                    undoAllocator.dropUndoSegment(mtr, item.handle());
+                }
+                List<FinalizationDisposition> dispositions = new ArrayList<>(prepared.size());
+                for (int index = 0; index < prepared.size(); index++) {
+                    dispositions.add(new FinalizationDisposition(
+                            prepared.get(index), plans.get(index), null, false));
+                }
+                publishFinalizationOwners(mtr, dispositions);
+                TransactionStateRedoDeltas.appendPreparedRollback(mtr, transaction);
+                mtrManager.commit(mtr);
+            } catch (RuntimeException error) {
+                rollbackActiveMtr(mtr, error);
+                throw new UndoFinalizationException(
+                        "prepared rollback finalization failed", error);
+            }
+
+            // 4、slot runtime projection 只能落后、不能领先物理 page3 clear。
+            UndoLogBinding diagnostic = ordered.getFirst();
+            faultInjector.afterCommit(UndoFinalizationKind.PREPARED_ROLLBACK,
+                    diagnostic.slotId(), diagnostic.firstPageId());
+            try {
+                lease.complete();
+            } catch (RuntimeException error) {
+                throw new UndoFinalizationException(
+                        "prepared rollback persisted but slot publication failed", error);
+            }
+        }
     }
 
     /** recovery 对同一 creator 的 INSERT/UPDATE slots 做一次原子 cache/free/drop owner 终结与 terminal delta。 */
@@ -310,6 +580,16 @@ public final class UndoSegmentFinalizer {
 
     private PreparedActive prepareActive(UndoLogBinding binding, TransactionId creator,
                                          boolean requireEmptyHead) {
+        return prepareOwned(binding, creator, requireEmptyHead, UndoLogState.ACTIVE);
+    }
+
+    /** 核对 ACTIVE 或 PREPARED page3 owner；调用点必须显式传入期望态，禁止宽松二选一。 */
+    private PreparedActive prepareOwned(UndoLogBinding binding, TransactionId creator,
+                                        boolean requireEmptyHead, UndoLogState expectedState) {
+        if (expectedState != UndoLogState.ACTIVE && expectedState != UndoLogState.PREPARED) {
+            throw new DatabaseValidationException(
+                    "undo owner preflight expected state must be ACTIVE or PREPARED");
+        }
         PageId memoryOwner = slotManager.undoFirstPageId(binding.slotId());
         if (!memoryOwner.equals(binding.firstPageId())) {
             throw new UndoLogFormatException("memory rseg slot owner mismatch: expected="
@@ -325,8 +605,10 @@ public final class UndoSegmentFinalizer {
             }
             UndoLogSegment segment = undoAccess.open(read, binding.firstPageId(), PageLatchMode.SHARED);
             if (!segment.creatorTransactionId().equals(creator) || segment.undoKind() != binding.kind()
-                    || !segment.isActive()) {
-                throw new UndoLogFormatException("active undo binding identity/state mismatch for " + binding.kind());
+                    || expectedState == UndoLogState.ACTIVE && !segment.isActive()
+                    || expectedState == UndoLogState.PREPARED && !segment.isPrepared()) {
+                throw new UndoLogFormatException(expectedState
+                        + " undo binding identity/state mismatch for " + binding.kind());
             }
             if (requireEmptyHead && (!segment.logicalHead().isEmpty() || !binding.logicalHead().isEmpty())) {
                 throw new UndoLogFormatException("rollback finalization requires EMPTY " + binding.kind() + " head");
@@ -344,14 +626,17 @@ public final class UndoSegmentFinalizer {
      * UPDATE commit 的全量只读预检。page3、new node、old tail 分属独立短 MTR，返回后只保留不可变快照；
      * history transition 已阻止其它 append/unlink 改变运行时链端点，但不持 Java lock 跨 IO。
      */
-    private PreparedHistoryAppend prepareHistoryAppend(UndoLogBinding update, Transaction transaction,
-                                                        HistoryList.AppendLease lease) {
-        if (update == null || update.kind() != UndoLogKind.UPDATE || transaction == null || lease == null) {
+    private PreparedHistoryAppend prepareHistoryAppend(
+            UndoLogBinding update, Transaction transaction, java.util.Set<Long> affectedTableIds,
+            HistoryList.AppendLease lease, UndoLogState expectedState) {
+        if (update == null || update.kind() != UndoLogKind.UPDATE || transaction == null
+                || affectedTableIds == null || lease == null
+                || expectedState != UndoLogState.ACTIVE && expectedState != UndoLogState.PREPARED) {
             throw new DatabaseValidationException("history append preparation requires UPDATE binding/lease");
         }
         HistoryEntry expectedEntry = new HistoryEntry(transaction.transactionNo(), transaction.transactionId(),
                 update.firstPageId().spaceId(), update.firstPageId(), update.slotId(),
-                transaction.undoContext().affectedTableIds());
+                affectedTableIds);
         if (!expectedEntry.equals(lease.entry())) {
             throw new TransactionStateException("history append lease identity differs from UPDATE binding");
         }
@@ -376,11 +661,14 @@ public final class UndoSegmentFinalizer {
         requireHistoryBaseMatchesLease(header.historyBase(), lease);
 
         UndoHistoryNodeSnapshot newNode = inspectHistoryNode(update.firstPageId());
-        if (!newNode.isActive() || newNode.kind() != UndoLogKind.UPDATE
+        boolean stateMatches = expectedState == UndoLogState.ACTIVE
+                ? newNode.isActive() : newNode.isPrepared();
+        if (!stateMatches || newNode.kind() != UndoLogKind.UPDATE
                 || !newNode.creatorTransactionId().equals(transaction.transactionId())
                 || !newNode.committedTransactionNo().isNone()
                 || newNode.previousHistoryPageId().isPresent() || newNode.nextHistoryPageId().isPresent()) {
-            throw new UndoLogFormatException("new history node must be an unlinked ACTIVE UPDATE undo first page");
+            throw new UndoLogFormatException(
+                    "new history node must be an unlinked " + expectedState + " UPDATE undo first page");
         }
         Optional<UndoHistoryNodeSnapshot> oldTail = lease.expectedTail()
                 .map(entry -> inspectHistoryNode(entry.undoFirstPageId()));
@@ -482,12 +770,32 @@ public final class UndoSegmentFinalizer {
         }
     }
 
-    /** purge unlink 前精确核对 page3 base、removed head 与可选 successor 的双向链接。 */
+    /**
+     * purge unlink 前只读核对运行时 lease、page3 owner、undo history node 和可选 successor。记录级 purge 必须已经
+     * 把 removed node 的 logical head 推进到 EMPTY；否则终结 segment 会让尚未消费的 secondary/LOB ownership 永久丢失。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>核对运行时 slot owner 仍指向当前 history entry，拒绝陈旧内存投影。</li>
+     *     <li>短读 page3 header，校验 history base 与 removal lease 快照一致。</li>
+     *     <li>核对 page3 队首、slot owner 和当前 entry first page 三者相同。</li>
+     *     <li>读取 removed node，校验 committed UPDATE identity、队首链接和 EMPTY logical head。</li>
+     *     <li>读取可选 successor 并校验 history length 与双向链接，冻结最终写批次输入。</li>
+     * </ol>
+     *
+     * @param entry 当前运行时 committed history 队首；其 slot/first-page/creator/transactionNo 必须仍为权威 owner。
+     * @param lease 由 {@link HistoryList#beginHeadRemoval(HistoryEntry)} 取得的队首转换 lease，阻止并发摘链。
+     * @return 包含 page3 base、removed node 和可选 successor 的不可变 purge 预检结果。
+     * @throws UndoLogFormatException slot/page3/history identity、EMPTY head、长度或双向链接任一不一致时抛出。
+     * @throws RuntimeException page3/undo node 读取或短 MTR 提交失败时抛出；未发生 owner 转移或 segment drop。
+     */
     private PreparedPurge preparePurge(HistoryEntry entry, HistoryList.HeadRemovalLease lease) {
+        // 1. 内存 slot 投影必须仍属于当前 entry，避免用陈旧 lease 终结已复用的 undo segment。
         PageId memoryOwner = slotManager.undoFirstPageId(entry.slotId());
         if (!memoryOwner.equals(entry.undoFirstPageId())) {
             throw new UndoLogFormatException("memory rseg slot owner mismatch before purge unlink");
         }
+        // 2. page3 只读快照提供持久 slot/history base；读 MTR 返回后不携带 page3 latch/fix。
         RollbackSegmentHeaderSnapshot header;
         MiniTransaction page3Read = mtrManager.beginReadOnly();
         try {
@@ -499,17 +807,21 @@ public final class UndoSegmentFinalizer {
             throw error;
         }
         requireHistoryBaseMatchesLease(header.historyBase(), lease);
+        // 3. page3 队首和 slot owner 必须同时指向 removed first page，不能只匹配其中一项。
         if (!entry.undoFirstPageId().equals(header.occupiedSlots().get(entry.slotId()))
                 || !header.historyBase().headPageId().equals(Optional.of(entry.undoFirstPageId()))) {
             throw new UndoLogFormatException("persistent purge head/slot owner differs from runtime entry");
         }
+        // 4. 只有逻辑链已完全消费的 committed UPDATE head 才能回收；非空 head 表示仍有记录级 purge 工作。
         UndoHistoryNodeSnapshot removed = inspectHistoryNode(entry.undoFirstPageId());
         if (!removed.isCommitted() || removed.kind() != UndoLogKind.UPDATE
                 || !removed.creatorTransactionId().equals(entry.creatorTrxId())
                 || !removed.committedTransactionNo().equals(entry.transactionNo())
-                || removed.previousHistoryPageId().isPresent()) {
+                || removed.previousHistoryPageId().isPresent()
+                || !removed.logicalHead().isEmpty()) {
             throw new UndoLogFormatException("persistent purge head identity/state mismatch");
         }
+        // 5. successor 存在性必须与持久 length 一致，其 previous link 必须反向指回 removed head。
         Optional<UndoHistoryNodeSnapshot> newHead = removed.nextHistoryPageId().map(this::inspectHistoryNode);
         if ((header.historyBase().length() == 1L) != newHead.isEmpty()) {
             throw new UndoLogFormatException("persistent purge head successor disagrees with history length");

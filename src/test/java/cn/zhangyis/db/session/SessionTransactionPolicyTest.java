@@ -3,6 +3,9 @@ package cn.zhangyis.db.session;
 import cn.zhangyis.db.dd.domain.MdlOwnerId;
 import cn.zhangyis.db.sql.binder.bound.BoundClusteredInsert;
 import cn.zhangyis.db.sql.binder.bound.BoundPointSelect;
+import cn.zhangyis.db.sql.binder.bound.BoundSecondaryRangeSelect;
+import cn.zhangyis.db.sql.binder.bound.BoundUpdate;
+import cn.zhangyis.db.sql.binder.bound.BoundDelete;
 import cn.zhangyis.db.sql.executor.SqlRow;
 import cn.zhangyis.db.sql.executor.storage.*;
 import org.junit.jupiter.api.Test;
@@ -87,6 +90,19 @@ class SessionTransactionPolicyTest {
                                                      BoundPointSelect statement,
                                                      SqlStatementDeadline deadline) {
             events.add("select"); return Optional.empty();
+        }
+        @Override public List<SqlRow> selectRange(SqlTransactionHandle transaction,
+                                                 BoundSecondaryRangeSelect statement,
+                                                 SqlStatementDeadline deadline) {
+            events.add("range"); return List.of();
+        }
+        @Override public SqlWriteOutcome update(SqlTransactionHandle transaction, BoundUpdate statement,
+                                                SqlStatementDeadline deadline) {
+            events.add("update"); return new SqlWriteOutcome(1, false);
+        }
+        @Override public SqlWriteOutcome delete(SqlTransactionHandle transaction, BoundDelete statement,
+                                                SqlStatementDeadline deadline) {
+            events.add("delete"); return new SqlWriteOutcome(1, false);
         }
         @Override public SqlCommitOutcome commit(SqlTransactionHandle transaction, SqlCommitRequest request) {
             events.add("commit"); return new SqlCommitOutcome(0, true, 0);

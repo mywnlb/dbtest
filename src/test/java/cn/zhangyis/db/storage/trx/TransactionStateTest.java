@@ -20,6 +20,17 @@ class TransactionStateTest {
         assertTrue(TransactionState.ROLLING_BACK.canTransitionTo(TransactionState.ROLLED_BACK));
     }
 
+    /** XA participant 使用独立 PREPARED 与 prepared rollback 重试态，不能借用普通回滚状态。 */
+    @Test
+    void legalPreparedPaths() {
+        assertTrue(TransactionState.ACTIVE.canTransitionTo(TransactionState.PREPARED));
+        assertTrue(TransactionState.PREPARED.canTransitionTo(TransactionState.COMMITTING));
+        assertTrue(TransactionState.PREPARED.canTransitionTo(TransactionState.PREPARED_ROLLING_BACK));
+        assertTrue(TransactionState.PREPARED_ROLLING_BACK.canTransitionTo(TransactionState.ROLLED_BACK));
+        assertFalse(TransactionState.PREPARED.canTransitionTo(TransactionState.ACTIVE));
+        assertFalse(TransactionState.PREPARED_ROLLING_BACK.canTransitionTo(TransactionState.ROLLING_BACK));
+    }
+
     @Test
     void illegalTransitionsRejected() {
         assertFalse(TransactionState.COMMITTED.canTransitionTo(TransactionState.ACTIVE));

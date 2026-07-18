@@ -126,6 +126,36 @@ class RollbackServiceTest {
         });
     }
 
+    /**
+     * phase-two rollback 必须从独立 PREPARED_ROLLING_BACK 重试态走链，并在终结 MTR 写 prepared rollback delta。
+     */
+    @Test
+    void preparedRollbackRemovesRowsAndReleasesPreparedOwners() {
+        onPool(ctx -> {
+            ctx.boot();
+            RollbackFixture fixture = insertRows(ctx, 2);
+            Transaction transaction = fixture.transaction();
+            TransactionId creator = transaction.transactionId();
+            ctx.undoMgr.onPrepare(transaction);
+            ctx.txnMgr.finishPrepare(transaction);
+
+            RollbackSummary summary = ctx.rollbackService.rollbackPrepared(
+                    transaction, fixture.index());
+
+            assertEquals(2, summary.undoRecordsApplied());
+            assertEquals(TransactionState.ROLLED_BACK, transaction.state());
+            assertEquals(0, ctx.slots.activeSlotCount());
+            assertRowsPresent(ctx, fixture.index(), false, false);
+            assertTrue(ctx.mgr.redoLogManager().bufferedRecords().stream()
+                    .anyMatch(record -> record instanceof TransactionStateDeltaRecord delta
+                            && delta.transactionId().equals(creator)
+                            && delta.fromState() == TransactionStateDeltaState.PREPARED
+                            && delta.toState() == TransactionStateDeltaState.ROLLED_BACK
+                            && delta.transactionNo().isNone()
+                            && delta.reason() == TransactionStateDeltaReason.PREPARED_ROLLBACK));
+        });
+    }
+
     /** DD 模式必须从 undo 固定前缀把真实 table/index identity 交给 resolver，而不是盲用 fallback。 */
     @Test
     void rollbackResolvesIndexFromEachUndoIdentity() {

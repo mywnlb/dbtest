@@ -7,6 +7,10 @@ import cn.zhangyis.db.dd.domain.ColumnTypeDefinition;
 import cn.zhangyis.db.dd.domain.DictionaryTypeId;
 import cn.zhangyis.db.sql.binder.bound.BoundClusteredInsert;
 import cn.zhangyis.db.sql.binder.bound.BoundPointSelect;
+import cn.zhangyis.db.sql.binder.bound.BoundUpdate;
+import cn.zhangyis.db.sql.binder.bound.BoundDelete;
+import cn.zhangyis.db.sql.binder.bound.BoundSecondaryRangeSelect;
+import cn.zhangyis.db.sql.binder.bound.SelectLockMode;
 import cn.zhangyis.db.sql.binder.bound.PointAccessKind;
 import cn.zhangyis.db.sql.executor.SqlRow;
 import cn.zhangyis.db.sql.executor.SqlValue;
@@ -14,6 +18,7 @@ import cn.zhangyis.db.sql.executor.storage.*;
 import cn.zhangyis.db.sql.executor.storage.exception.*;
 import cn.zhangyis.db.storage.api.dml.*;
 import cn.zhangyis.db.storage.btree.BTreeIndex;
+import cn.zhangyis.db.storage.btree.BTreeCurrentReadMode;
 import cn.zhangyis.db.storage.engine.EngineState;
 import cn.zhangyis.db.storage.engine.StorageEngine;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
@@ -122,6 +127,78 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
         });
     }
 
+    /** 主键点 UPDATE：在 storage 的 FOR_UPDATE 锁定版本上应用 typed patch，避免 gateway 先读后写竞态。 */
+    @Override
+    public SqlWriteOutcome update(SqlTransactionHandle transaction, BoundUpdate statement,
+                                  SqlStatementDeadline deadline) {
+        if (statement == null || deadline == null) {
+            throw new DatabaseValidationException("bound UPDATE/deadline must not be null");
+        }
+        return withActive(transaction, deadline, handle -> {
+            MappedTableStorage mapped = mapper.map(statement.table());
+            BTreeIndex index = mapped.clusteredIndex();
+            SearchKey key = new SearchKey(toKeyValues(statement.primaryKeyValues(), index));
+            ArrayList<TableColumnAssignment> assignments = new ArrayList<>(statement.assignmentOrdinals().size());
+            for (int i = 0; i < statement.assignmentOrdinals().size(); i++) {
+                int ordinal = statement.assignmentOrdinals().get(i);
+                assignments.add(new TableColumnAssignment(ordinal,
+                        toColumnValue(statement.assignmentValues().get(i), index.schema().column(ordinal).type())));
+            }
+            DmlStatementGuard guard = engine.dmlService().beginStatement(handle.transaction, index);
+            try {
+                DmlWriteResult result = engine.tableDmlService().update(new TableUpdatePatchCommand(
+                        handle.transaction, mapped.tableIndexes(), key, assignments, mapped.lobSegment(),
+                        deadline.cap(operationTimeout, "point UPDATE row-lock wait")));
+                guard.close();
+                handle.wrote |= result.changed();
+                return new SqlWriteOutcome(result.affectedRows(), handle.transaction.rollbackOnly());
+            } catch (RuntimeException writeFailure) {
+                try {
+                    guard.rollback();
+                } catch (RuntimeException rollbackFailure) {
+                    writeFailure.addSuppressed(rollbackFailure);
+                    throw new SqlStatementRollbackException(
+                            "UPDATE failed and statement rollback was not confirmed",
+                            handle.transaction.rollbackOnly(), writeFailure);
+                }
+                throw adapt("point UPDATE failed after confirmed statement rollback", writeFailure);
+            }
+        });
+    }
+
+    /** 主键点 DELETE：LOB binding 与 exact-version 多索引 metadata 一并交给表级 DML。 */
+    @Override
+    public SqlWriteOutcome delete(SqlTransactionHandle transaction, BoundDelete statement,
+                                  SqlStatementDeadline deadline) {
+        if (statement == null || deadline == null) {
+            throw new DatabaseValidationException("bound DELETE/deadline must not be null");
+        }
+        return withActive(transaction, deadline, handle -> {
+            MappedTableStorage mapped = mapper.map(statement.table());
+            BTreeIndex index = mapped.clusteredIndex();
+            SearchKey key = new SearchKey(toKeyValues(statement.primaryKeyValues(), index));
+            DmlStatementGuard guard = engine.dmlService().beginStatement(handle.transaction, index);
+            try {
+                DmlWriteResult result = engine.tableDmlService().delete(new TableDeleteCommand(
+                        handle.transaction, mapped.tableIndexes(), key, mapped.lobSegment(),
+                        deadline.cap(operationTimeout, "point DELETE row-lock wait")));
+                guard.close();
+                handle.wrote |= result.changed();
+                return new SqlWriteOutcome(result.affectedRows(), handle.transaction.rollbackOnly());
+            } catch (RuntimeException writeFailure) {
+                try {
+                    guard.rollback();
+                } catch (RuntimeException rollbackFailure) {
+                    writeFailure.addSuppressed(rollbackFailure);
+                    throw new SqlStatementRollbackException(
+                            "DELETE failed and statement rollback was not confirmed",
+                            handle.transaction.rollbackOnly(), writeFailure);
+                }
+                throw adapt("point DELETE failed after confirmed statement rollback", writeFailure);
+            }
+        });
+    }
+
     /**
      * 聚簇主键点查：RR 复用事务 ReadView，RC 每语句 finally 注销；整行 LOB hydrate 完成后才投影。
      * <ol>
@@ -180,6 +257,90 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
                     } catch (RuntimeException closeFailure) {
                         RuntimeException adapted = adapt("close READ COMMITTED ReadView failed", closeFailure);
                         if (failure == null) throw adapted;
+                        failure.addSuppressed(adapted);
+                    }
+                }
+            }
+        });
+    }
+
+    /**
+     * 执行 non-unique secondary logical-prefix range read。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>在 statement deadline 内进入 opaque handle，并从 exact DD version 映射 secondary layout/key。</li>
+     *     <li>consistent 模式创建 RC/RR ReadView，扫描 marked candidates 后回聚簇 MVCC；locking 模式改走
+     *         logical-prefix S/X 与聚簇 current-read，不创建历史快照。</li>
+     *     <li>对每条完整聚簇结果 hydrate external LOB，再按 Binder ordinal 构造公开 SqlRow。</li>
+     *     <li>任何 candidate/LOB 失败都不发布 partial list；locking locks 保持到事务终态。</li>
+     *     <li>RC 在全部行 hydration/投影后 finally 注销 ReadView；关闭失败保留主异常与 fatal 严重度。</li>
+     * </ol>
+     *
+     * @param transaction 本 gateway 创建的 ACTIVE opaque handle。
+     * @param statement   exact-version non-unique secondary range plan。
+     * @param deadline    覆盖 handle、predicate/row lock 与 LOB hydration 的绝对语句期限。
+     * @return 完整、不可变的多行公开结果；SQL NULL equality 返回空列表。
+     * @throws DatabaseValidationException statement/deadline 缺失时抛出。
+     * @throws SqlStorageException metadata 映射、MVCC/current-read、容量或 LOB 阶段失败时抛出并保留 cause。
+     */
+    @Override
+    public List<SqlRow> selectRange(SqlTransactionHandle transaction, BoundSecondaryRangeSelect statement,
+                                    SqlStatementDeadline deadline) {
+        if (statement == null || deadline == null) {
+            throw new DatabaseValidationException("bound range SELECT/deadline must not be null");
+        }
+        return withActive(transaction, deadline, handle -> {
+            // 1. mapper 只消费 Binder 固定的 exact table version；logical key 不包含 storage clustered suffix。
+            MappedTableStorage mapped = mapper.map(statement.table());
+            BTreeIndex clusteredIndex = mapped.clusteredIndex();
+            BTreeIndex accessIndex = mapped.index(statement.accessIndexId());
+            var secondary = mapped.tableIndexes().requireSecondary(statement.accessIndexId());
+            SearchKey logicalKey = new SearchKey(toKeyValues(statement.logicalKeyValues(), accessIndex));
+            if (statement.logicalKeyValues().stream().anyMatch(SqlValue.NullValue.class::isInstance)) {
+                return List.of();
+            }
+
+            if (statement.lockMode() != SelectLockMode.CONSISTENT) {
+                try {
+                    // 2. locking read 只读当前版本；同一 absolute deadline 的剩余量成为 storage 内部共享等待预算。
+                    List<LogicalRecord> records = engine.secondaryCurrentReadService().readRange(
+                            handle.transaction, mapped.tableIndexes(), secondary, logicalKey,
+                            statement.lockMode() == SelectLockMode.FOR_SHARE
+                                    ? BTreeCurrentReadMode.FOR_SHARE : BTreeCurrentReadMode.FOR_UPDATE,
+                            deadline.cap(operationTimeout, "secondary locking range"));
+                    // 3/4. 全部行依次 hydrate/project；异常直接抛出，不返回已构造前缀。
+                    return projectRows(records, statement.projectionOrdinals(), statement.table(),
+                            clusteredIndex, deadline);
+                } catch (RuntimeException readFailure) {
+                    throw adapt("secondary locking range/LOB read failed", readFailure);
+                }
+            }
+
+            ReadViewManager views = engine.transactionManager().readViewManager();
+            deadline.remaining("secondary range ReadView creation");
+            // 2. consistent range 的一个 view 覆盖 secondary scan、逐候选 clustered/undo 与全部 LOB hydration。
+            ReadView view = views.openReadView(handle.transaction);
+            RuntimeException failure = null;
+            try {
+                List<LogicalRecord> records = engine.secondaryMvccReader().readRange(
+                        view, mapped.tableIndexes(), secondary, logicalKey);
+                // 3/4. projection 只有在每条 external value hydrate 完整后才创建，Storage reference 不越过 port。
+                return projectRows(records, statement.projectionOrdinals(), statement.table(),
+                        clusteredIndex, deadline);
+            } catch (RuntimeException readFailure) {
+                failure = adapt("secondary range MVCC/LOB read failed", readFailure);
+                throw failure;
+            } finally {
+                // 5. RR view 由事务终态释放；RC 必须在最后一行投影完成后注销，且关闭失败不能覆盖主失败。
+                if (handle.transaction.isolationLevel() == IsolationLevel.READ_COMMITTED) {
+                    try {
+                        views.closeReadView(view);
+                    } catch (RuntimeException closeFailure) {
+                        RuntimeException adapted = adapt("close READ COMMITTED range ReadView failed", closeFailure);
+                        if (failure == null) {
+                            throw adapted;
+                        }
                         failure.addSuppressed(adapted);
                     }
                 }
@@ -335,6 +496,32 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
             }
         }
         return List.copyOf(result);
+    }
+
+    /**
+     * 对完整 storage rows 执行 LOB hydration 与 exact-DD projection；任一失败时不返回 partial row list。
+     *
+     * @param records            已由 MVCC/current-read 选出的完整聚簇行。
+     * @param projectionOrdinals Binder 验证的公开列顺序。
+     * @param table              exact DD table version，提供 SQL 类型解释。
+     * @param clusteredIndex     与 records schema 匹配的聚簇 descriptor。
+     * @param deadline           每个 LOB chain 继续消费的 statement absolute deadline。
+     * @return 完整不可变 SqlRow 列表。
+     */
+    private List<SqlRow> projectRows(List<LogicalRecord> records, List<Integer> projectionOrdinals,
+                                     cn.zhangyis.db.dd.domain.TableDefinition table,
+                                     BTreeIndex clusteredIndex, SqlStatementDeadline deadline) {
+        ArrayList<SqlRow> rows = new ArrayList<>(records.size());
+        for (LogicalRecord record : records) {
+            List<ColumnValue> hydrated = hydrateExternalValues(
+                    record.columnValues(), clusteredIndex, deadline);
+            ArrayList<SqlValue> projected = new ArrayList<>(projectionOrdinals.size());
+            for (int ordinal : projectionOrdinals) {
+                projected.add(toSqlValue(hydrated.get(ordinal), table.columns().get(ordinal).type()));
+            }
+            rows.add(new SqlRow(projected));
+        }
+        return List.copyOf(rows);
     }
 
     private void rollbackMtr(MiniTransaction mtr, RuntimeException original) {

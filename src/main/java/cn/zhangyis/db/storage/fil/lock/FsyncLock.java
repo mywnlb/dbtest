@@ -7,23 +7,34 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.Semaphore;
 
 /**
- * #5 data-file fsync 限流锁。它是每个 {@code DataFileHandle} 内部的物理文件锁，用来限制同一数据文件上并发
- * {@code FileChannel.force(true)} 的线程数为 1，避免 page cleaner、前台 flush 或 shutdown flush 重复推动同一文件
- * 的 fsync。该锁不进入事务 Wait-For Graph，只保护物理 IO；调用方必须按 Lifecycle/FileSize 之后的顺序获取。
+ * 单个数据文件的 fsync 串行化锁。
+ *
+ * <p>每个 {@code DataFileHandle} 独立持有一个实例，把同一文件上的并发
+ * {@code FileChannel.force(true)} 限制为一次，避免 page cleaner、显式 flush、truncate 或 shutdown
+ * 同时推动相同 channel 的持久化。不同数据文件仍可并发 force。</p>
+ *
+ * <p>该锁只保护物理 force 调用，不证明 page LSN 已通过 WAL gate，也不推进 checkpoint。它不进入
+ * 事务 Wait-For Graph；调用方先取得 lifecycle 锁，truncate 路径还会先取得 file-size 锁，然后才能
+ * 获取本 permit，且持有期间不得等待 page latch 或事务锁。</p>
  */
 public final class FsyncLock {
 
     /**
-     * 单文件 fsync permit。公平信号量让后台/前台 force 请求按等待顺序推进；选择 Semaphore 而非 ReentrantLock，
-     * 是为了表达“一个 data file 同时只有一个 fsync permit”，即使同一线程误入嵌套 force 也不能绕过限流。
+     * 单文件 fsync 的唯一 permit，是本锁的权威占用状态。公平信号量使已经排队的后台/前台 force
+     * 按等待顺序竞争；它不可重入，同线程嵌套获取也必须等待前一个 permit 释放。
+     *
+     * <p>Semaphore 不强制 owner 线程释放，因此正确性依赖 guard 的词法作用域：每个成功获取返回的
+     * guard 必须且只能关闭一次，否则重复 release 会破坏“并发数为 1”的不变量。</p>
      */
     private final Semaphore permit = new Semaphore(1, true);
 
     /**
-     * 获取 fsync permit。用于确定会短促完成的 {@code force(true)} 路径；如需给外部调用方提供明确超时，
-     * 可使用 {@link #tryAcquire(Duration)}。
+     * 不可中断地等待并取得 fsync permit。
      *
-     * @return 关闭时释放 permit 的 RAII guard。
+     * <p>{@code DataFileHandle.force/truncateTo} 在已持有相应前置物理锁后使用该入口，并把返回值放入
+     * try-with-resources。等待期间收到中断不会提前退出；成功返回时线程的中断状态仍由并发工具保留。</p>
+     *
+     * @return 关闭时释放唯一 permit 的一次性 guard；不会返回 {@code null}
      */
     public ResourceGuard acquire() {
         permit.acquireUninterruptibly();
@@ -31,10 +42,15 @@ public final class FsyncLock {
     }
 
     /**
-     * 限时获取 fsync permit。物理文件锁不参与死锁检测，因此测试、诊断或未来可取消 IO 路径必须能选择超时失败。
+     * 在指定上界内可中断地尝试取得 fsync permit。
      *
-     * @param timeout 等待上限，不能为 null 或负数。
-     * @return 成功返回释放 guard；超时或中断返回 null，中断会恢复线程中断标志。
+     * <p>超时与中断都返回 {@code null}，中断路径同时恢复线程中断标记；两种失败均没有取得 permit。
+     * 返回 guard 后必须恰好关闭一次。</p>
+     *
+     * @param timeout 等待上限；不能为空、不能为负数，并且必须可换算为 {@code long} 纳秒；
+     *                零表示只尝试立即获取
+     * @return 成功返回释放 permit 的 guard；超时或中断返回 {@code null}
+     * @throws DatabaseValidationException timeout 为空或为负数时抛出；permit 状态不变
      */
     public ResourceGuard tryAcquire(Duration timeout) {
         if (timeout == null || timeout.isNegative()) {

@@ -174,6 +174,58 @@ class PersistentDictionaryRepositoryTest {
         }
     }
 
+    /**
+     * repository 只允许 ACTIVE→ACTIVE 精确追加一个二级索引及对应 binding；列、聚簇索引和既有物理绑定必须不变。
+     */
+    @Test
+    void persistsExactSecondaryIndexAdditionAndRejectsUnrelatedReplacement() {
+        Path path = directory.resolve("create-index-mysql.ibd");
+        try (FileInternalCatalogStore store = FileInternalCatalogStore.openOrCreate(path)) {
+            PersistentDictionaryRepository repository = new PersistentDictionaryRepository(store);
+            try (DictionaryTransaction create = repository.begin(DictionaryVersion.of(2))) {
+                create.createSchema(schema(2));
+                create.createTable(table(2));
+                create.commit();
+            }
+            TableDefinition before = repository.findTable(TableId.of(2)).orElseThrow();
+            IndexDefinition secondary = new IndexDefinition(
+                    IndexId.of(4), ObjectName.of("idx_body"), false, false,
+                    List.of(new IndexKeyPart(2, IndexOrder.ASC, 0)));
+            TableStorageBinding oldBinding = before.storageBinding().orElseThrow();
+            SpaceId space = oldBinding.spaceId();
+            IndexStorageBinding secondaryBinding = new IndexStorageBinding(
+                    4, PageId.of(space, PageNo.of(65)), 0,
+                    new SegmentRef(space, 4, SegmentId.of(14)),
+                    new SegmentRef(space, 5, SegmentId.of(15)));
+            TableStorageBinding newBinding = new TableStorageBinding(
+                    oldBinding.tableId(), space, oldBinding.path(), oldBinding.rowFormatVersion(),
+                    java.util.stream.Stream.concat(oldBinding.indexes().stream(),
+                            java.util.stream.Stream.of(secondaryBinding)).toList(),
+                    oldBinding.lobSegment());
+            TableDefinition after = new TableDefinition(
+                    before.id(), before.schemaId(), before.name(), DictionaryVersion.of(3), TableState.ACTIVE,
+                    before.columns(),
+                    java.util.stream.Stream.concat(before.indexes().stream(),
+                            java.util.stream.Stream.of(secondary)).toList(),
+                    Optional.of(newBinding));
+
+            try (DictionaryTransaction addIndex = repository.begin(DictionaryVersion.of(3))) {
+                addIndex.updateTable(after);
+                addIndex.commit();
+            }
+
+            assertEquals(IndexId.of(4), repository.findIndex(IndexId.of(4)).orElseThrow().id());
+            TableDefinition committed = repository.findTable(TableId.of(2)).orElseThrow();
+            TableDefinition illegal = new TableDefinition(
+                    committed.id(), committed.schemaId(), ObjectName.of("renamed"), DictionaryVersion.of(4),
+                    TableState.ACTIVE, committed.columns(), committed.indexes(), committed.storageBinding());
+            try (DictionaryTransaction rename = repository.begin(DictionaryVersion.of(4))) {
+                rename.updateTable(illegal);
+                assertThrows(cn.zhangyis.db.dd.exception.DictionaryVersionConflictException.class, rename::commit);
+            }
+        }
+    }
+
     private static SchemaDefinition schema(long version) {
         return new SchemaDefinition(SchemaId.of(1), ObjectName.of("app"), 1, 1,
                 DictionaryVersion.of(version));
@@ -190,7 +242,7 @@ class PersistentDictionaryRepositoryTest {
         SegmentRef nonLeaf = new SegmentRef(SpaceId.of(1024), 2, SegmentId.of(12));
         SegmentRef lob = new SegmentRef(SpaceId.of(1024), 3, SegmentId.of(13));
         TableStorageBinding binding = new TableStorageBinding(2, SpaceId.of(1024),
-                Path.of("app_orders_1024.ibd"), List.of(new IndexStorageBinding(3,
+                Path.of("app_orders_1024.ibd"), version, List.of(new IndexStorageBinding(3,
                 PageId.of(SpaceId.of(1024), PageNo.of(64)), 0, leaf, nonLeaf)), Optional.of(lob));
         return new TableDefinition(TableId.of(2), SchemaId.of(1), ObjectName.of("orders"),
                 DictionaryVersion.of(version), TableState.ACTIVE, List.of(id, body), List.of(primary),

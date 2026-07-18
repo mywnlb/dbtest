@@ -9,12 +9,14 @@ import cn.zhangyis.db.domain.RollbackSegmentId;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.domain.TransactionId;
 import cn.zhangyis.db.domain.TransactionNo;
+import cn.zhangyis.db.domain.UndoNo;
 import cn.zhangyis.db.domain.UndoSlotId;
 import cn.zhangyis.db.server.lockobs.api.DefaultLockObservationService;
 import cn.zhangyis.db.server.lockobs.api.LockObservationService;
 import cn.zhangyis.db.server.lockobs.api.SnapshotRequest;
 import cn.zhangyis.db.server.lockobs.snapshot.LockDiagnosticSnapshot;
 import cn.zhangyis.db.storage.api.DiskSpaceManager;
+import cn.zhangyis.db.storage.api.trx.PreparedTransactionService;
 import cn.zhangyis.db.storage.api.DiskSpaceUndoAllocator;
 import cn.zhangyis.db.storage.api.TablePurgeBarrier;
 import cn.zhangyis.db.storage.api.ddl.TableDdlStorageService;
@@ -68,6 +70,8 @@ import cn.zhangyis.db.storage.recovery.RecoveredUndoSlotEvidence;
 import cn.zhangyis.db.storage.recovery.RecoveryDiagnosticsSnapshot;
 import cn.zhangyis.db.storage.recovery.RecoveryProgressJournal;
 import cn.zhangyis.db.storage.recovery.PersistentHistoryRecovery;
+import cn.zhangyis.db.storage.recovery.PreparedTransactionDecision;
+import cn.zhangyis.db.storage.recovery.PreparedTransactionDecisionProvider;
 import cn.zhangyis.db.storage.recovery.RecoveryReport;
 import cn.zhangyis.db.storage.recovery.RecoveryRequest;
 import cn.zhangyis.db.storage.recovery.RecoveryState;
@@ -101,14 +105,17 @@ import cn.zhangyis.db.storage.trx.PurgeSummary;
 import cn.zhangyis.db.storage.trx.SecondaryPurgeSafetyChecker;
 import cn.zhangyis.db.storage.trx.MvccReader;
 import cn.zhangyis.db.storage.trx.SecondaryMvccReader;
+import cn.zhangyis.db.storage.trx.SecondaryCurrentReadService;
 import cn.zhangyis.db.storage.trx.RollbackSegmentSlotManager;
 import cn.zhangyis.db.storage.trx.RollbackService;
 import cn.zhangyis.db.storage.trx.RecoveredUndoLogIdentity;
+import cn.zhangyis.db.storage.trx.Transaction;
 import cn.zhangyis.db.storage.trx.TransactionManager;
 import cn.zhangyis.db.storage.trx.TransactionCounterSnapshot;
 import cn.zhangyis.db.storage.trx.TransactionSystem;
 import cn.zhangyis.db.storage.trx.UndoTargetMetadataResolver;
 import cn.zhangyis.db.storage.trx.UndoLogManager;
+import cn.zhangyis.db.storage.trx.UndoLogBinding;
 import cn.zhangyis.db.storage.trx.UndoSegmentFinalizer;
 import cn.zhangyis.db.storage.trx.UndoSegmentReuseDirectory;
 import cn.zhangyis.db.storage.trx.lock.LockManager;
@@ -136,6 +143,7 @@ import java.nio.file.Files;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.LinkedHashMap;
@@ -156,7 +164,8 @@ import java.util.Set;
  *
  * <p><b>当前限制</b>：启动后已有后台 redo flusher、单线程 page cleaner；配置 legacy 单聚簇索引或 DD resolver 时会启动
  * {@code PurgeCoordinator} + purge driver。事务 UNDO_ROLLBACK / RESUME_PURGE 已作为正式 recovery stage 接入；
- * DD 表级 resolver 模式支持多索引 rollback、secondary purge 与 affected-table barrier，prepared transaction 尚未实现；DDL 收敛由上层
+ * DD 表级 resolver 模式支持多索引 rollback、secondary purge、affected-table barrier 与 prepared transaction
+ * 外部决议恢复；DDL 收敛由上层
  * DatabaseEngine 在本存储恢复成功后执行。doublewrite 已常开为 {@link RecoverableDoublewriteStrategy}，但恢复页列表来自 doublewrite 文件有效 slot 并
  * 过滤到 recovery 已打开空间，仍没有全空间 checksum discovery。
  *
@@ -166,6 +175,8 @@ import java.util.Set;
 public final class StorageEngine {
 
     private final EngineConfig config;
+    /** 恢复 PREPARED 的外部权威决议源；默认 unresolved，绝不由存储层猜测全局事务结果。 */
+    private final PreparedTransactionDecisionProvider preparedDecisionProvider;
     private EngineState state = EngineState.NEW;
 
     // AutoCloseable 句柄（close 时关闭）
@@ -197,7 +208,7 @@ public final class StorageEngine {
     private TransactionManager transactionManager;
     private UndoLogManager undoLogManager;
     private SplitCapableBTreeIndexService btreeService;
-    /** 0.17 事务锁内核；聚簇 current-read、secondary logical unique 与事务终态共享这一实例。 */
+    /** 0.17 事务锁内核；聚簇 current-read、secondary logical-prefix S/X 与事务终态共享这一实例。 */
     private LockManager lockManager;
     /** server.lockobs row-lock 观测服务；只读消费 LockManager 事实，不参与授锁或 rollback。 */
     private LockObservationService lockObservationService;
@@ -217,9 +228,13 @@ public final class StorageEngine {
     /** DD/DDL 上层唯一可调用的物理 CREATE/DROP TABLE facade。 */
     private TableDdlStorageService tableDdlStorageService;
     private MvccReader mvccReader;
-    /** logical unique secondary 候选回表并复核聚簇可见版本的读服务。 */
+    /** unique point/non-unique logical-prefix 候选回表并复核聚簇可见版本的 MVCC 读服务。 */
     private SecondaryMvccReader secondaryMvccReader;
+    /** non-unique logical-prefix 锁定读；predicate 与 clustered 锁保持到事务终态。 */
+    private SecondaryCurrentReadService secondaryCurrentReadService;
     private RollbackService rollbackService;
+    /** phase-one/phase-two 强持久边界与事务锁收尾的稳定 storage resource-manager facade。 */
+    private PreparedTransactionService preparedTransactionService;
     /** 内存 rseg slot 目录；0.3 起 claim/release 持久化到 page3，恢复期扫描重建。 */
     private RollbackSegmentSlotManager rollbackSlots;
     /** page3 cache/free owner 的统一运行期投影。 */
@@ -273,19 +288,40 @@ public final class StorageEngine {
     private RecoveryReport lastRecoveryReport;
 
     public StorageEngine(EngineConfig config) {
-        this(config, new RecoveryTrafficGate(), defaultRecoveryProgressJournal(config));
+        this(config, PreparedTransactionDecisionProvider.unresolved());
+    }
+
+    /**
+     * 构造带 prepared recovery 决议源的存储引擎。provider 只在 existing-open 且发现 PREPARED owner 时调用。
+     *
+     * @param config 引擎物理与恢复配置
+     * @param preparedDecisionProvider 上层协调器持久决议查询端口；不能为 null
+     */
+    public StorageEngine(EngineConfig config,
+                         PreparedTransactionDecisionProvider preparedDecisionProvider) {
+        this(config, new RecoveryTrafficGate(), defaultRecoveryProgressJournal(config),
+                preparedDecisionProvider);
     }
 
     StorageEngine(EngineConfig config, RecoveryTrafficGate recoveryGate, RecoveryProgressJournal recoveryProgressJournal) {
+        this(config, recoveryGate, recoveryProgressJournal,
+                PreparedTransactionDecisionProvider.unresolved());
+    }
+
+    StorageEngine(EngineConfig config, RecoveryTrafficGate recoveryGate,
+                  RecoveryProgressJournal recoveryProgressJournal,
+                  PreparedTransactionDecisionProvider preparedDecisionProvider) {
         if (config == null) {
             throw new DatabaseValidationException("engine config must not be null");
         }
-        if (recoveryGate == null || recoveryProgressJournal == null) {
-            throw new DatabaseValidationException("engine recovery gate/journal must not be null");
+        if (recoveryGate == null || recoveryProgressJournal == null || preparedDecisionProvider == null) {
+            throw new DatabaseValidationException(
+                    "engine recovery gate/journal/prepared decision provider must not be null");
         }
         this.config = config;
         this.recoveryGate = recoveryGate;
         this.recoveryProgressJournal = recoveryProgressJournal;
+        this.preparedDecisionProvider = preparedDecisionProvider;
     }
 
     private static RecoveryProgressJournal defaultRecoveryProgressJournal(EngineConfig config) {
@@ -421,7 +457,8 @@ public final class StorageEngine {
         this.btreeRootSnapshots = new BTreeRootSnapshotService(indexPageAccess);
         this.purgeDmlRowGuards = new PurgeDmlRowGuardManager();
         this.tableDdlStorageService = new TableDdlStorageService(miniTransactionManager, diskSpaceManager,
-                indexPageAccess, pool, store, flushService, accessController);
+                indexPageAccess, pool, store, flushService, accessController, config.pageSize(),
+                btreeService, btreeRootSnapshots);
         this.lockObservationService = new DefaultLockObservationService();
         this.lockManager = new LockManager(lockObservationService);
         this.btreeCurrentReadService =
@@ -430,6 +467,9 @@ public final class StorageEngine {
                 config.undoSpaceId(), config.maxVersionHops());
         this.secondaryMvccReader = new SecondaryMvccReader(
                 miniTransactionManager, btreeService, mvccReader, typeRegistry);
+        this.secondaryCurrentReadService = new SecondaryCurrentReadService(
+                transactionManager, miniTransactionManager, btreeService,
+                btreeCurrentReadService, lockManager, typeRegistry);
         this.rollbackService = indexMetadataResolver instanceof UndoTargetMetadataResolver targetResolver
                 ? new RollbackService(btreeService, undoAccess, transactionManager,
                         miniTransactionManager, undoSegmentFinalizer, lobStorage, targetResolver,
@@ -439,6 +479,8 @@ public final class StorageEngine {
                                 miniTransactionManager, undoSegmentFinalizer)
                         : new RollbackService(btreeService, undoAccess, transactionManager,
                                 miniTransactionManager, undoSegmentFinalizer, indexMetadataResolver);
+        this.preparedTransactionService = new PreparedTransactionService(
+                transactionManager, undoLogManager, rollbackService, redo, recoveryGate, lockManager);
         this.dmlService = new ClusteredDmlService(transactionManager, undoLogManager, miniTransactionManager,
                 btreeService, btreeCurrentReadService, rollbackService, lockManager, redo, recoveryGate,
                 lobStorage);
@@ -450,7 +492,7 @@ public final class StorageEngine {
                         undoSegmentFinalizer, btreeService, targetResolver, btreeRootSnapshots,
                         purgeDmlRowGuards, new SecondaryPurgeSafetyChecker(miniTransactionManager,
                                 btreeService, undoAccess, config.undoSpaceId(),
-                                config.maxVersionHops(), typeRegistry))
+                                config.maxVersionHops(), typeRegistry), lobStorage)
                 : indexMetadataResolver != null
                         ? new PurgeCoordinator(miniTransactionManager, txnSystem, history, undoAccess,
                                 undoSegmentFinalizer, btreeService, indexMetadataResolver)
@@ -688,8 +730,8 @@ public final class StorageEngine {
     /**
      * 正式 UNDO_ROLLBACK / RESUME_PURGE 阶段参与者。redo 重放和 UNDO tablespace 续作完成后，page3 与 undo first
      * 页已经恢复到物理一致状态；本方法扫描 rseg header 重建内存 slot 目录，再逐 slot 读取 undo first 页 header。
-     * ACTIVE 段在配置 legacy 单索引或 DD resolver 时执行恢复期 rollback；COMMITTED 段按 {@code COMMIT_NO} 重建 committed history，
-     * 并复位事务 id/no 高水位，供启动后的后台 purge driver 续作。
+     * PREPARED 段在 gate 关闭期消费外部决议；ACTIVE 段在配置 legacy 单索引或 DD resolver 时执行恢复期 rollback；
+     * COMMITTED 段按 {@code COMMIT_NO} 重建 committed history，并复位事务 id/no 高水位，供启动后的后台 purge driver 续作。
      *
      * <p>简化点：未引入独立 {@code UndoRecoveryService} 类；当前仍由 engine 组合根作为
      * {@code TransactionUndoRecoveryParticipant} 实现阶段端口。若发现 ACTIVE 但既无 legacy 索引也无 DD resolver，
@@ -727,9 +769,9 @@ public final class StorageEngine {
 
     /**
      * R 1.2/R 1.3 恢复 rseg slot 的事务状态。数据流：每个 page3 restored slot 只读打开 undo first 页，读取
-     * {@code STATE}/{@code TRANSACTION_ID}/{@code COMMIT_NO} 后立即提交 MTR 释放 undo latch；随后 ACTIVE 才进入
-     * rollback，COMMITTED 只重建 history，不在恢复线程中执行 purge。这样不会在 undo latch 下访问 B+Tree，也避免
-     * recovery 抢跑后台 purge 的批次边界。
+     * {@code STATE}/{@code TRANSACTION_ID}/{@code COMMIT_NO} 后立即提交 MTR 释放 undo latch；随后先重建 COMMITTED
+     * history，按外部决议完成 PREPARED，再 rollback ACTIVE，purge 留给独立恢复阶段。这样不会在 undo latch 下访问
+     * B+Tree，也避免 recovery 抢跑 history/phase-two 的物理顺序。
      *
      * @param occupiedSlots page3 扫描得到的 slot->undo first page 映射。
      */
@@ -758,19 +800,39 @@ public final class StorageEngine {
                             + "cannot skip undo rollback before opening traffic: activeSlots="
                             + reconciliation.activeSlots().size());
         }
+        Map<TransactionId, List<RecoveredUndoSlotEvidence>> preparedGroups = groupByCreator(
+                reconciliation.preparedSlots());
+        Map<TransactionId, PreparedTransactionDecision> preparedDecisions = new LinkedHashMap<>();
+        for (TransactionId transactionId : preparedGroups.keySet()) {
+            PreparedTransactionDecision decision = preparedDecisionProvider.decisionFor(transactionId);
+            if (decision == null || decision == PreparedTransactionDecision.UNRESOLVED) {
+                throw new TransactionRecoveryException(
+                        "recovered PREPARED transaction has no authoritative decision: transaction="
+                                + transactionId.value());
+            }
+            if (decision == PreparedTransactionDecision.ROLLBACK
+                    && clusteredIndex == null
+                    && !(indexMetadataResolver instanceof UndoTargetMetadataResolver)) {
+                throw new TransactionRecoveryException(
+                        "recovered PREPARED rollback requires clustered index or exact undo target resolver: "
+                                + transactionId.value());
+            }
+            preparedDecisions.put(transactionId, decision);
+        }
         // page3 active/cache、undo 首页和 FSP inode 已全部交叉校验后才发布内存投影；失败启动不会留下半个缓存栈。
         undoSegmentReuse.restore(cachedInsert, cachedUpdate, free);
         txnSystem.restoreCounters(reconciliation.snapshot().nextTransactionId().value(),
                 historyRecovery.nextTransactionNo(historyBase,
                         reconciliation.snapshot().nextTransactionNo().value()));
         occupiedSlots.forEach(rollbackSlots::restore);
+        // 已有 physical history 必须先恢复，prepared UPDATE commit 的 append lease 才能与 page3 tail 精确衔接。
+        history.restore(committed);
+        int resolvedPreparedSlots = resolveRecoveredPreparedTransactions(
+                preparedGroups, preparedDecisions);
         int rolledBackActiveSlots = 0;
 
-        Map<TransactionId, List<RecoveredUndoSlotEvidence>> activeGroups = new LinkedHashMap<>();
-        for (RecoveredUndoSlotEvidence recovered : reconciliation.activeSlots()) {
-            activeGroups.computeIfAbsent(recovered.creatorTransactionId(), ignored -> new ArrayList<>())
-                    .add(recovered);
-        }
+        Map<TransactionId, List<RecoveredUndoSlotEvidence>> activeGroups =
+                groupByCreator(reconciliation.activeSlots());
         for (Map.Entry<TransactionId, List<RecoveredUndoSlotEvidence>> group : activeGroups.entrySet()) {
             List<RecoveredUndoLogIdentity> logs = group.getValue().stream()
                     .map(recovered -> new RecoveredUndoLogIdentity(
@@ -779,9 +841,119 @@ public final class StorageEngine {
             rollbackService.rollbackRecovered(logs, group.getKey(), clusteredIndex);
             rolledBackActiveSlots += logs.size();
         }
-        history.restore(committed);
+        // prepared/active phase-two MTR 产生了新的 terminal redo；开放流量前至少先使 redo durable，
+        // 即使数据/undo dirty page 尚未落盘，下一次崩溃也能幂等重放到相同终态。
+        if (resolvedPreparedSlots > 0 || rolledBackActiveSlots > 0) {
+            redo.flush();
+        }
         return new TransactionUndoRecoveryResult(occupiedSlots.size(), rolledBackActiveSlots,
                 0, committed.size());
+    }
+
+    /** 按 creator 保持 page3 扫描顺序分组；返回集合只含恢复值对象，不持有任何 page latch。 */
+    private static Map<TransactionId, List<RecoveredUndoSlotEvidence>> groupByCreator(
+            List<RecoveredUndoSlotEvidence> slots) {
+        Map<TransactionId, List<RecoveredUndoSlotEvidence>> groups = new LinkedHashMap<>();
+        for (RecoveredUndoSlotEvidence recovered : slots.stream()
+                .sorted(Comparator.comparingLong(
+                        slot -> slot.creatorTransactionId().value()))
+                .toList()) {
+            groups.computeIfAbsent(recovered.creatorTransactionId(), ignored -> new ArrayList<>())
+                    .add(recovered);
+        }
+        return groups;
+    }
+
+    /**
+     * 在 recovery gate 关闭期间重建并完成全部 PREPARED participant。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>按 creator 逐 first-page 短读 logical head/LAST_UNDO_NO，构造不持 latch 的 binding。</li>
+     *     <li>由 TransactionManager 恢复 PREPARED 聚合与 active membership，保持 purge owner 不提前消失。</li>
+     *     <li>COMMIT 先从 UPDATE logical chain 投影 affected tables，再复用 live prepared finalizer；ROLLBACK
+     *         复用逐记录 inverse 与 prepared owner drop。</li>
+     *     <li>每个 participant 只有在物理 terminal MTR 成功后才移出 active table；任一失败让整个启动 fail-closed。</li>
+     * </ol>
+     *
+     * @param groups 已通过 redo/page3/header 状态闭包校验的 PREPARED slots
+     * @param decisions 每个 creator 的外部权威 COMMIT/ROLLBACK 决议
+     * @return 已完成 phase-two 的 slot 数量
+     * @throws TransactionRecoveryException binding、决议、metadata 或 phase-two 失败时抛出
+     */
+    private int resolveRecoveredPreparedTransactions(
+            Map<TransactionId, List<RecoveredUndoSlotEvidence>> groups,
+            Map<TransactionId, PreparedTransactionDecision> decisions) {
+        int resolvedSlots = 0;
+        for (Map.Entry<TransactionId, List<RecoveredUndoSlotEvidence>> group : groups.entrySet()) {
+            // 1、每条 first page 单独读取并释放 S latch；global high-water 取两种 log 的最大物理值。
+            List<RecoveredPreparedBinding> recoveredBindings = group.getValue().stream()
+                    .map(this::readRecoveredPreparedBinding)
+                    .toList();
+            long highWater = 0L;
+            for (RecoveredPreparedBinding recovered : recoveredBindings) {
+                highWater = Math.max(highWater, recovered.lastUndoNo().value());
+            }
+            List<UndoLogBinding> bindings = recoveredBindings.stream()
+                    .map(RecoveredPreparedBinding::binding)
+                    .toList();
+            // 2、运行态 PREPARED 登记后，phase-two manager/finalizer 可以复用 live 不变量。
+            Transaction transaction = transactionManager.restorePrepared(
+                    group.getKey(), rollbackSlots.rollbackSegmentId(), bindings, UndoNo.of(highWater));
+            PreparedTransactionDecision decision = decisions.get(group.getKey());
+            // 3、commit 的 affected-table side projection 已在崩溃中丢失，只能从持久 logical chain 重建。
+            if (decision == PreparedTransactionDecision.COMMIT) {
+                transactionManager.prepareCommitPrepared(transaction);
+                UndoLogBinding update = transaction.undoContext().binding(UndoLogKind.UPDATE);
+                Set<Long> affectedTables = update == null
+                        ? Set.of()
+                        : readRecoveredHistoryAffectedTables(
+                                update.firstPageId(), update.logicalHead());
+                undoLogManager.onCommitPrepared(transaction, affectedTables);
+                transactionManager.commitPrepared(transaction);
+            } else if (decision == PreparedTransactionDecision.ROLLBACK) {
+                if (clusteredIndex != null) {
+                    rollbackService.rollbackPrepared(transaction, clusteredIndex);
+                } else {
+                    rollbackService.rollbackPrepared(transaction);
+                }
+            } else {
+                throw new TransactionRecoveryException(
+                        "invalid prepared recovery decision after preflight: transaction="
+                                + group.getKey().value() + ", decision=" + decision);
+            }
+            // 4、成功终态已经由 manager 移出 active table；slot 数按物理 participant owner 计数。
+            resolvedSlots += group.getValue().size();
+        }
+        return resolvedSlots;
+    }
+
+    /**
+     * 从 PREPARED first page 复制运行时 binding 所需字段。读取完成前不访问 B+Tree、决议 provider 或 active table。
+     */
+    private RecoveredPreparedBinding readRecoveredPreparedBinding(
+            RecoveredUndoSlotEvidence evidence) {
+        MiniTransaction read = miniTransactionManager.beginReadOnly();
+        try {
+            UndoLogSegment segment = undoAccess.open(
+                    read, evidence.firstPageId(), PageLatchMode.SHARED);
+            if (!segment.isPrepared()
+                    || segment.undoKind() != evidence.kind()
+                    || !segment.creatorTransactionId().equals(evidence.creatorTransactionId())) {
+                throw new TransactionRecoveryException(
+                        "prepared undo binding drifted after reconciliation: "
+                                + evidence.firstPageId());
+            }
+            RecoveredPreparedBinding recovered = new RecoveredPreparedBinding(
+                    new UndoLogBinding(evidence.kind(), evidence.slotId(),
+                            evidence.firstPageId(), segment.logicalHead()),
+                    segment.logLastUndoNo());
+            miniTransactionManager.commit(read);
+            return recovered;
+        } catch (RuntimeException error) {
+            rollbackRecoveryScanMtr(read, error);
+            throw error;
+        }
     }
 
     /** history recovery 每个 first page 使用独立短 MTR，返回后不保留 latch/fix。 */
@@ -1009,17 +1181,24 @@ public final class StorageEngine {
         try {
             UndoLogSegment segment = undoAccess.open(stateMtr, firstPageId, PageLatchMode.SHARED);
             boolean active = segment.isActive();
+            boolean prepared = segment.isPrepared();
             boolean committed = segment.isCommitted();
-            if (!active && !committed) {
+            if (!active && !prepared && !committed) {
                 throw new UndoLogFormatException("undo slot " + slotId + " first page " + firstPageId
                         + " has unknown state " + segment.state());
             }
-            RecoveredUndoSlotEvidence recovered = active
-                    ? RecoveredUndoSlotEvidence.active(
-                            slotId, firstPageId, segment.undoKind(), segment.creatorTransactionId())
-                    : RecoveredUndoSlotEvidence.committed(
-                            slotId, firstPageId, segment.undoKind(), segment.creatorTransactionId(),
-                            segment.committedTransactionNo());
+            RecoveredUndoSlotEvidence recovered;
+            if (active) {
+                recovered = RecoveredUndoSlotEvidence.active(
+                        slotId, firstPageId, segment.undoKind(), segment.creatorTransactionId());
+            } else if (prepared) {
+                recovered = RecoveredUndoSlotEvidence.prepared(
+                        slotId, firstPageId, segment.undoKind(), segment.creatorTransactionId());
+            } else {
+                recovered = RecoveredUndoSlotEvidence.committed(
+                        slotId, firstPageId, segment.undoKind(), segment.creatorTransactionId(),
+                        segment.committedTransactionNo());
+            }
             miniTransactionManager.commit(stateMtr);
             return recovered;
         } catch (RuntimeException e) {
@@ -1034,6 +1213,16 @@ public final class StorageEngine {
             miniTransactionManager.rollbackUncommitted(mtr);
         } catch (RuntimeException cleanupFailure) {
             original.addSuppressed(cleanupFailure);
+        }
+    }
+
+    /** 恢复 PREPARED 聚合所需的无 latch binding 与物理 undoNo 高水位。 */
+    private record RecoveredPreparedBinding(UndoLogBinding binding, UndoNo lastUndoNo) {
+        private RecoveredPreparedBinding {
+            if (binding == null || lastUndoNo == null) {
+                throw new DatabaseValidationException(
+                        "recovered prepared binding fields must not be null");
+            }
         }
     }
 
@@ -1406,7 +1595,8 @@ public final class StorageEngine {
     }
 
     /**
-     * 返回组合根持有的 logical unique 二级回表 MVCC 服务；调用方必须保持 ReadView 覆盖结果 hydration/投影。
+     * 返回组合根持有的 unique point/non-unique logical-prefix 二级回表 MVCC 服务；
+     * 调用方必须保持 ReadView 覆盖结果 hydration/投影。
      *
      * @return 与本引擎 B+Tree、MvccReader 和 type registry 共用协作者的读服务。
      */
@@ -1415,9 +1605,30 @@ public final class StorageEngine {
         return secondaryMvccReader;
     }
 
+    /**
+     * 返回 non-unique secondary logical-prefix current-read 服务；调用方必须以事务终态释放其 predicate/row 锁。
+     *
+     * @return 与本引擎 TransactionManager、B+Tree、LockManager 和 type registry 共用协作者的锁定读入口。
+     */
+    public SecondaryCurrentReadService secondaryCurrentReadService() {
+        requireOpen();
+        return secondaryCurrentReadService;
+    }
+
     public RollbackService rollbackService() {
         requireOpen();
         return rollbackService;
+    }
+
+    /**
+     * 返回与 DML、undo、redo、事务锁和 recovery gate 共用组合根的 prepared transaction facade。
+     *
+     * @return storage resource-manager phase-one/phase-two 稳定入口
+     * @throws EngineStateException 引擎尚未完成打开或已经关闭时抛出
+     */
+    public PreparedTransactionService preparedTransactionService() {
+        requireOpen();
+        return preparedTransactionService;
     }
 
     /** 返回与后台 driver/recovery 共用的 purge 协调器；只有配置可解析索引 metadata 时可用。 */

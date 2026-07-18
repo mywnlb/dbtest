@@ -6,6 +6,7 @@ import cn.zhangyis.db.dd.cache.DictionaryObjectCache;
 import cn.zhangyis.db.engine.adapter.DictionaryIndexMetadataResolver;
 import cn.zhangyis.db.engine.adapter.DictionaryStorageMetadataMapper;
 import cn.zhangyis.db.engine.adapter.DefaultSqlStorageGateway;
+import cn.zhangyis.db.engine.adapter.DefaultSqlDdlGateway;
 import cn.zhangyis.db.dd.ddl.DictionaryDdlService;
 import cn.zhangyis.db.dd.mdl.MetadataLockManager;
 import cn.zhangyis.db.dd.recovery.DictionaryDdlRecoveryService;
@@ -20,6 +21,7 @@ import cn.zhangyis.db.storage.engine.EngineConfig;
 import cn.zhangyis.db.storage.engine.EngineTablespaceConfig;
 import cn.zhangyis.db.storage.engine.StorageEngine;
 import cn.zhangyis.db.storage.fil.catalog.FileInternalCatalogStore;
+import cn.zhangyis.db.storage.recovery.PreparedTransactionDecisionProvider;
 import lombok.extern.slf4j.Slf4j;
 import cn.zhangyis.db.session.DefaultSqlSession;
 import cn.zhangyis.db.session.SessionId;
@@ -63,6 +65,8 @@ public final class DatabaseEngine implements AutoCloseable {
     /** 序列化可能跨 lifecycle lock 外等待 Session 的 close 尝试；使用有界 tryLock。 */
     private final ReentrantLock closeWorkLock = new ReentrantLock(true);
     private final EngineConfig baseConfig;
+    /** 上层协调器持久 XA 决议端口；默认 unresolved，使未知 PREPARED 启动 fail-closed。 */
+    private final PreparedTransactionDecisionProvider preparedDecisionProvider;
     /** 用户语句并发 read / shutdown write gate；不串行不同 Session。 */
     private final EngineSessionExecutionGate sessionExecutionGate;
 
@@ -81,13 +85,30 @@ public final class DatabaseEngine implements AutoCloseable {
     private SessionRegistry sessions;
 
     public DatabaseEngine(EngineConfig config) {
+        this(config, PreparedTransactionDecisionProvider.unresolved());
+    }
+
+    /**
+     * 构造可消费持久 prepared transaction 决议的公共数据库组合根。
+     *
+     * @param config 数据库与底层存储配置
+     * @param preparedDecisionProvider 上层 XID registry 的只读决议端口；不能为 null
+     * @throws DatabaseValidationException 配置、provider 缺失或 undo/dictionary space 冲突时抛出
+     */
+    public DatabaseEngine(EngineConfig config,
+                          PreparedTransactionDecisionProvider preparedDecisionProvider) {
         if (config == null) {
             throw new DatabaseValidationException("database engine config must not be null");
+        }
+        if (preparedDecisionProvider == null) {
+            throw new DatabaseValidationException(
+                    "database engine prepared decision provider must not be null");
         }
         if (config.undoSpaceId().equals(DICTIONARY_SPACE_ID)) {
             throw new DatabaseValidationException("undo space id conflicts with dictionary space id");
         }
         this.baseConfig = config;
+        this.preparedDecisionProvider = preparedDecisionProvider;
         this.sessionExecutionGate = new EngineSessionExecutionGate(this::state, this::failClosed);
     }
 
@@ -117,7 +138,8 @@ public final class DatabaseEngine implements AutoCloseable {
                 List<EngineTablespaceConfig> tablespaces = discovery.discover().stream()
                         .map(binding -> new EngineTablespaceConfig(binding.spaceId(), binding.path()))
                         .toList();
-                storage = new StorageEngine(baseConfig.withRecoveryTablespaces(tablespaces));
+                storage = new StorageEngine(
+                        baseConfig.withRecoveryTablespaces(tablespaces), preparedDecisionProvider);
                 storage.configureIndexMetadataResolver(new DictionaryIndexMetadataResolver(repository));
                 storage.open();
 
@@ -178,7 +200,8 @@ public final class DatabaseEngine implements AutoCloseable {
             DefaultSqlStorageGateway gateway = new DefaultSqlStorageGateway(storage, sqlMetadataMapper,
                     options.rowLockTimeout());
             DefaultSqlSession session = new DefaultSqlSession(id, options, dictionary, sqlParser, sqlBinder,
-                    new DefaultSqlExecutor(gateway), gateway, sessionExecutionGate,
+                    new DefaultSqlExecutor(gateway), gateway, new DefaultSqlDdlGateway(ddl),
+                    sessionExecutionGate,
                     () -> sessions.deregister(id));
             sessions.register(session);
             return session;
@@ -367,8 +390,9 @@ public final class DatabaseEngine implements AutoCloseable {
 
     /**
      * 双槽 control 若因 latest 槽损坏回退到上一代，committed catalog 可能已经引用更高身份。启动时把各 next-counter
-     * 单调推进到 catalog 最大值之后，随后才允许 recovery/DDL reserve，避免 ID/version 重用。DDL id 当前无持久行，
-     * 只保持 control 自身高水位，不从 catalog 推断。
+     * 单调推进到 catalog 最大值之后，随后才允许 recovery/DDL reserve，避免 ID/version 重用。DDL id 从独立
+     * durable DDL log 的最大 marker 反推。v1 尚未记录 CREATE SCHEMA，因此再用 committed dictionary version-1
+     * 作为保守下界；恢复版本或 DROP 双版本只会制造安全空洞，不会让已分配 DDL identity 被复用。
      */
     private void reconcileControlHighWater() {
         DictionaryControlSnapshot control = controlStore.snapshot();
@@ -382,15 +406,19 @@ public final class DatabaseEngine implements AutoCloseable {
         long nextSpace = nextAfter(snapshot.tables().values().stream()
                 .flatMap(table -> table.storageBinding().stream())
                 .mapToLong(binding -> binding.spaceId().value()).max().orElse(FIRST_USER_SPACE_ID - 1L), "space");
+        long ddlEvidence = Math.max(repository.ddlLog().highestDdlId(),
+                snapshot.publishedVersion().value() - 1L);
+        long nextDdl = nextAfter(ddlEvidence, "ddl");
         long nextVersion = nextAfter(snapshot.publishedVersion().value(), "version");
         int schemaCount = advanceCount(control.nextSchemaId(), nextSchema, "schema");
         int tableCount = advanceCount(control.nextTableId(), nextTable, "table");
         int indexCount = advanceCount(control.nextIndexId(), nextIndex, "index");
         int spaceCount = advanceCount(control.nextSpaceId(), nextSpace, "space");
+        int ddlCount = advanceCount(control.nextDdlId(), nextDdl, "ddl");
         int versionCount = advanceCount(control.nextDictionaryVersion(), nextVersion, "version");
-        if ((long) schemaCount + tableCount + indexCount + spaceCount + versionCount > 0) {
+        if ((long) schemaCount + tableCount + indexCount + spaceCount + ddlCount + versionCount > 0) {
             controlStore.reserve(new DictionaryIdRequest(schemaCount, tableCount, indexCount, spaceCount,
-                    0, versionCount));
+                    ddlCount, versionCount));
         }
     }
 

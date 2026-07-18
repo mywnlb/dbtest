@@ -31,6 +31,43 @@ final class TransactionStateRedoDeltas {
     }
 
     /**
+     * 在 undo first-page state 批次中追加 phase-one 证据。调用时 live state 仍是 ACTIVE；只有 MTR 提交后
+     * TransactionManager 才发布 PREPARED。
+     *
+     * @param mtr 同时持有全部 first-page PREPARED after-image 的写 MTR
+     * @param txn 已分配 write id、尚未分配提交号的 ACTIVE 事务
+     */
+    static void appendPrepare(MiniTransaction mtr, Transaction txn) {
+        append(mtr, txn, TransactionStateDeltaState.ACTIVE, TransactionStateDeltaState.PREPARED,
+                TransactionNo.NONE, TransactionStateDeltaReason.PREPARE);
+    }
+
+    /**
+     * 在 prepared commit finalization MTR 中追加 phase-two 终态。
+     *
+     * @param mtr 同时提交 page3/undo history 物理终态的 MTR
+     * @param txn 状态仍为 PREPARED且已分配 transaction number 的 live/rebuilt transaction
+     */
+    static void appendPreparedCommit(MiniTransaction mtr, Transaction txn) {
+        append(mtr, txn, TransactionStateDeltaState.PREPARED,
+                TransactionStateDeltaState.COMMITTED, txn.transactionNo(),
+                TransactionStateDeltaReason.PREPARED_COMMIT);
+    }
+
+    /**
+     * 在 prepared rollback finalization MTR 中追加 phase-two 回滚终态。运行时虽然已进入
+     * PREPARED_ROLLING_BACK，磁盘前置状态仍是 PREPARED，因此 redo tuple 必须从稳定 PREPARED 开始。
+     *
+     * @param mtr 同时 drop全部 prepared undo owner 的最终 MTR
+     * @param txn 正处于 PREPARED_ROLLING_BACK且已走到 EMPTY logical heads 的事务
+     */
+    static void appendPreparedRollback(MiniTransaction mtr, Transaction txn) {
+        append(mtr, txn, TransactionStateDeltaState.PREPARED,
+                TransactionStateDeltaState.ROLLED_BACK, TransactionNo.NONE,
+                TransactionStateDeltaReason.PREPARED_ROLLBACK);
+    }
+
+    /**
      * 在 finishRollback 前追加回滚完成 redo。调用点必须已经完整走完 undo 链；有 undo 段时该 record 与
      * segment drop + page3 clear 位于同一 finalization MTR，内存 slot 在该 MTR 提交后才释放。恢复期不能仅凭
      * 本 record 跳过 undo/rseg 状态检查。
@@ -80,9 +117,11 @@ final class TransactionStateRedoDeltas {
         }
         return switch (state) {
             case ACTIVE -> TransactionStateDeltaState.ACTIVE;
+            case PREPARED -> TransactionStateDeltaState.PREPARED;
             case COMMITTING -> TransactionStateDeltaState.COMMITTING;
             case COMMITTED -> TransactionStateDeltaState.COMMITTED;
             case ROLLING_BACK -> TransactionStateDeltaState.ROLLING_BACK;
+            case PREPARED_ROLLING_BACK -> TransactionStateDeltaState.ROLLING_BACK;
             case ROLLED_BACK -> TransactionStateDeltaState.ROLLED_BACK;
         };
     }

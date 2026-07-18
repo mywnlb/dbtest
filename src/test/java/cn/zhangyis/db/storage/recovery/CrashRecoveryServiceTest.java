@@ -602,14 +602,14 @@ class CrashRecoveryServiceTest {
         }
     }
 
-    /** READ_ONLY_VALIDATE 必须扫描 trx delta 并报告 PREPARED，而不是因为不 apply page redo 就漏诊断。 */
+    /** READ_ONLY_VALIDATE 必须接受并保留合法 PREPARE 证据；诊断模式不消费外部决议，也不修改文件。 */
     @Test
-    void readOnlyValidateRejectsPreparedTransactionDelta() {
+    void readOnlyValidateAcceptsPreparedTransactionDeltaWithoutResolvingIt() {
         Path redoPath = dir.resolve("readonly-prepared-redo.log");
         TransactionStateDeltaRecord prepared = new TransactionStateDeltaRecord(
                 TransactionId.of(7), TransactionStateDeltaState.ACTIVE,
                 TransactionStateDeltaState.PREPARED, TransactionNo.NONE,
-                TransactionStateDeltaReason.COMMIT);
+                TransactionStateDeltaReason.PREPARE);
         try (RedoLogFileRepository redoRepo = RedoLogFileRepository.open(redoPath)) {
             RedoLogManager redo = RedoLogManager.durable(redoRepo);
             redo.append(List.of(prepared));
@@ -627,9 +627,10 @@ class CrashRecoveryServiceTest {
                             new RedoApplyContext(store, PS))
                     .withTransactionRecoveryValidation(context);
 
-            assertThrows(RecoveryStartupException.class,
-                    () -> new CrashRecoveryService(gate).recover(request));
-            assertEquals(RecoveryState.FAILED, gate.state());
+            RecoveryReport report = new CrashRecoveryService(gate).recover(request);
+
+            assertEquals(RecoveryState.READ_ONLY, gate.state());
+            assertEquals(RecoveryState.READ_ONLY, report.state());
         }
     }
 

@@ -118,6 +118,32 @@ public final class SessionTransactionPolicy implements AutoCloseable {
         if (!autocommit) active = begin(false, SessionTransactionMode.IMPLICIT);
     }
 
+    /**
+     * DDL 前执行 MySQL 风格 implicit commit。storage 终态确认后 metadata scope 才关闭，因此 table X
+     * 不会与 Session 自身 transaction-duration MDL 形成自锁。
+     *
+     * @param remaining 当前 statement deadline 剩余预算，用于可能发生的 commit durability
+     */
+    public void prepareDdl(Duration remaining) {
+        ensureOpen();
+        if (rollbackOnly) {
+            throw new SessionStateException("rollback-only transaction cannot execute DDL");
+        }
+        if (active != null) {
+            finishCommit(remaining);
+        }
+    }
+
+    /**
+     * DDL 结束后恢复 autocommit=0 的隐式事务语义；DDL 自身不属于该新事务。
+     */
+    public void resumeAfterDdl() {
+        ensureOpen();
+        if (!autocommit && active == null) {
+            active = begin(false, SessionTransactionMode.IMPLICIT);
+        }
+    }
+
     /** statement rollback 未确认时发布本地白名单状态；真实事务 rollback-only 由 gateway/storage 维护。 */
     public void markRollbackOnly() {
         requireActive();

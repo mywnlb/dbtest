@@ -41,7 +41,7 @@ final class UndoPageLayout {
     static final int TRANSACTION_ID = PAGE_HEADER_END;                       // 63
     /** UndoLogKind ordinal（u8）；v3 在 first/chain 页都有效，ordinal 顺序不可改变。 */
     static final int UNDO_KIND = TRANSACTION_ID + 8;                         // 71
-    /** undo log 状态（u8）：ACTIVE/COMMITTED/CACHED/FREE，恢复期据此区分事务与可复用 owner。 */
+    /** undo log 状态（u8）：ACTIVE/PREPARED/COMMITTED/CACHED/FREE，恢复期据此区分事务与可复用 owner。 */
     static final int STATE = UNDO_KIND + 1;                                  // 72
     /** 链首页号（u32），first 页上等于自身页号。 */
     static final int FIRST_PAGE_NO = STATE + 1;                              // 73
@@ -75,6 +75,8 @@ final class UndoPageLayout {
     static final int STATE_CACHED = 2;
     /** undo log 状态：FREE（无事务 owner，由 page3 free FIFO 持久拥有，可跨 kind 复用）。 */
     static final int STATE_FREE = 3;
+    /** undo log 状态：PREPARED（XA phase one 已持久化，page3 slot 仍由事务拥有）。 */
+    static final int STATE_PREPARED = 4;
     /** {@link #PAGE_FLAGS} bit0：first page 标志。 */
     static final int FLAG_FIRST_PAGE = 0x01;
     /** {@link #PAGE_FLAGS} 中格式版本的最低 bit。 */

@@ -8,6 +8,9 @@ import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.session.SessionOptions;
 import cn.zhangyis.db.session.SessionState;
 import cn.zhangyis.db.sql.executor.QueryResult;
+import cn.zhangyis.db.sql.executor.UpdateResult;
+import cn.zhangyis.db.sql.executor.CommandResult;
+import cn.zhangyis.db.sql.executor.SqlValue;
 import cn.zhangyis.db.sql.executor.storage.SqlDurabilityMode;
 import cn.zhangyis.db.sql.executor.storage.SqlIsolationLevel;
 import cn.zhangyis.db.storage.engine.EngineConfig;
@@ -72,6 +75,118 @@ class DatabaseEngineSessionIntegrationTest {
         }
     }
 
+    /**
+     * SQL CREATE INDEX 与 ALTER TABLE ADD INDEX 必须共享真实回填链；autocommit=0 在 DDL 前隐式提交，
+     * 完成后重新建立 implicit transaction，重启后新索引仍可访问既有行。
+     */
+    @Test
+    void sqlCreatesAndAltersSecondaryIndexesWithImplicitCommit() {
+        EngineConfig config = config();
+        try (DatabaseEngine database = new DatabaseEngine(config)) {
+            database.open();
+            createIndexBuildTable(database);
+            try (var session = database.openSession(options(false))) {
+                session.execute("INSERT INTO index_docs (id, category) VALUES (1, 7)");
+                session.execute("INSERT INTO index_docs (id, category) VALUES (2, 7)");
+
+                assertInstanceOf(CommandResult.class,
+                        session.execute("CREATE INDEX idx_category ON index_docs (category DESC)"));
+                assertTrue(session.snapshot().transactionActive(),
+                        "autocommit=0 的 DDL 结束后必须恢复新的 implicit transaction");
+                QueryResult byCategory = assertInstanceOf(QueryResult.class,
+                        session.execute("SELECT id FROM index_docs WHERE category=7"));
+                assertEquals(2, byCategory.rows().size(),
+                        "DDL 前 implicit commit 的两行必须被 backfill 并对当前 Session 可见");
+
+                assertInstanceOf(CommandResult.class, session.execute(
+                        "ALTER TABLE index_docs ADD UNIQUE INDEX uk_id_desc (id DESC)"));
+            }
+            try (var lease = database.dictionary().openTable(
+                    MdlOwnerId.of(902), QualifiedTableName.of("app", "index_docs"),
+                    cn.zhangyis.db.dd.service.TableAccessIntent.READ, Duration.ofSeconds(2))) {
+                assertEquals(3, lease.table().indexes().size());
+                assertEquals("uk_id_desc", lease.table().indexes().getLast().name().canonicalName());
+            }
+        }
+
+        try (DatabaseEngine reopened = new DatabaseEngine(config)) {
+            reopened.open();
+            try (var reader = reopened.openSession(options(true))) {
+                QueryResult result = assertInstanceOf(QueryResult.class,
+                        reader.execute("SELECT id FROM index_docs WHERE category=7"));
+                assertEquals(2, result.rows().size());
+            }
+        }
+    }
+
+    /** autocommit 点 UPDATE/DELETE 从公开 SQL 维护 secondary，并完成 external LOB replacement。 */
+    @Test
+    void autocommitUpdateAndDeleteMaintainSecondaryAndReplacementLob() {
+        try (DatabaseEngine database = new DatabaseEngine(config())) {
+            database.open();
+            createTable(database);
+            String before = "旧值".repeat(240);
+            String after = "新值".repeat(260);
+            try (var session = database.openSession(options(true))) {
+                session.execute("INSERT INTO docs (id, email, body) VALUES (11, 'before@example.test', '"
+                        + before + "')");
+                UpdateResult updated = assertInstanceOf(UpdateResult.class, session.execute(
+                        "UPDATE docs SET email='after@example.test', body='" + after + "' WHERE id=11"));
+                assertEquals(1, updated.affectedRows());
+                assertTrue(queryByEmail(session, "BEFORE@example.test").rows().isEmpty());
+                QueryResult current = queryByEmail(session, "AFTER@example.test");
+                assertEquals(after, assertInstanceOf(SqlValue.StringValue.class,
+                        current.rows().getFirst().values().getFirst()).value());
+
+                UpdateResult deleted = assertInstanceOf(UpdateResult.class,
+                        session.execute("DELETE FROM docs WHERE id=11"));
+                assertEquals(1, deleted.affectedRows());
+                assertTrue(queryByEmail(session, "AFTER@example.test").rows().isEmpty());
+            }
+        }
+    }
+
+    /** full rollback 恢复 UPDATE/DELETE 前的 secondary identity 与旧 external LOB。 */
+    @Test
+    void rollbackRestoresSecondaryAndExternalLobAcrossUpdateAndDelete() {
+        try (DatabaseEngine database = new DatabaseEngine(config())) {
+            database.open();
+            createTable(database);
+            String before = "原始".repeat(240);
+            String replacement = "替换".repeat(260);
+            try (var seed = database.openSession(options(true))) {
+                seed.execute("INSERT INTO docs (id, email, body) VALUES (12, 'original@example.test', '"
+                        + before + "')");
+            }
+            try (var session = database.openSession(options(false))) {
+                assertEquals(1, assertInstanceOf(UpdateResult.class, session.execute(
+                        "UPDATE docs SET email='replacement@example.test', body='" + replacement
+                                + "' WHERE id=12")).affectedRows());
+                assertEquals(replacement, assertInstanceOf(SqlValue.StringValue.class,
+                        queryByEmail(session, "REPLACEMENT@example.test")
+                                .rows().getFirst().values().getFirst()).value());
+                session.execute("ROLLBACK");
+                assertTrue(queryByEmail(session, "REPLACEMENT@example.test").rows().isEmpty());
+                assertEquals(before, assertInstanceOf(SqlValue.StringValue.class,
+                        queryByEmail(session, "ORIGINAL@example.test")
+                                .rows().getFirst().values().getFirst()).value());
+
+                assertEquals(1, assertInstanceOf(UpdateResult.class,
+                        session.execute("DELETE FROM docs WHERE id=12")).affectedRows());
+                assertTrue(queryByEmail(session, "ORIGINAL@example.test").rows().isEmpty());
+                session.execute("ROLLBACK");
+                assertEquals(before, assertInstanceOf(SqlValue.StringValue.class,
+                        queryByEmail(session, "ORIGINAL@example.test")
+                                .rows().getFirst().values().getFirst()).value());
+            }
+        }
+    }
+
+    private static QueryResult queryByEmail(cn.zhangyis.db.session.SqlSession session, String email) {
+        return assertInstanceOf(QueryResult.class,
+                session.execute("SELECT body, id FROM docs WHERE email='" + email + "'"));
+    }
+
     private static void createTable(DatabaseEngine database) {
         database.ddl().createSchema(MdlOwnerId.of(900), ObjectName.of("app"), 1, 1, Duration.ofSeconds(2));
         database.ddl().createTable(MdlOwnerId.of(900), new CreateTableCommand(
@@ -85,6 +200,21 @@ class DatabaseEngineSessionIntegrationTest {
                                 List.of(new CreateIndexKeyPartSpec(ObjectName.of("id"), IndexOrder.ASC, 0))),
                         new CreateIndexSpec(ObjectName.of("uq_email"), true, false,
                                 List.of(new CreateIndexKeyPartSpec(ObjectName.of("email"), IndexOrder.ASC, 0))))),
+                Duration.ofSeconds(5));
+    }
+
+    private static void createIndexBuildTable(DatabaseEngine database) {
+        database.ddl().createSchema(MdlOwnerId.of(901), ObjectName.of("app"), 1, 1,
+                Duration.ofSeconds(2));
+        database.ddl().createTable(MdlOwnerId.of(901), new CreateTableCommand(
+                QualifiedTableName.of("app", "index_docs"), PageNo.of(128),
+                List.of(new CreateColumnSpec(ObjectName.of("id"),
+                                ColumnTypeDefinition.bigint(false, false)),
+                        new CreateColumnSpec(ObjectName.of("category"),
+                                ColumnTypeDefinition.integer(false, false))),
+                List.of(new CreateIndexSpec(ObjectName.of("PRIMARY"), true, true,
+                        List.of(new CreateIndexKeyPartSpec(
+                                ObjectName.of("id"), IndexOrder.ASC, 0))))),
                 Duration.ofSeconds(5));
     }
 

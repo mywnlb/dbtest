@@ -407,14 +407,38 @@ public final class UndoLogSegment {
         if (mode != PageLatchMode.EXCLUSIVE) {
             throw new DatabaseValidationException("markCommitted requires an EXCLUSIVE undo log segment session");
         }
-        if (commitNo == null) {
+        if (commitNo == null || commitNo.isNone()) {
             throw new DatabaseValidationException("markCommitted commitNo must not be null");
+        }
+        if (!isActive() && !isPrepared()) {
+            throw new UndoLogFormatException(
+                    "markCommitted requires ACTIVE or PREPARED undo log state: " + state());
         }
         firstPage.setLogState(UndoPageLayout.STATE_COMMITTED);
         firstPage.setCommitNo(commitNo.value()); // R 1.3：与 STATE 同 MTR 写提交序号，供恢复重建 history
     }
 
-    /** first 页 log header 中的 undo log 状态原始值（{@code STATE_ACTIVE}/{@code STATE_COMMITTED}）。 */
+    /**
+     * 把 ACTIVE first-page 持久化为 PREPARED。phase one 不写提交号、不改 page3 owner或 history links；
+     * 多 log 原子性由上层在同一 MTR 中调用所有 segment 的本方法保证。
+     *
+     * @throws DatabaseValidationException 当前会话不是 EXCLUSIVE 时抛出，调用方可在未修改页时重试
+     * @throws UndoLogFormatException 当前状态、提交号或 history links 已不满足 ACTIVE owner 不变量时抛出
+     */
+    public void markPrepared() {
+        if (mode != PageLatchMode.EXCLUSIVE) {
+            throw new DatabaseValidationException("markPrepared requires an EXCLUSIVE undo log segment session");
+        }
+        if (!isActive() || firstPage.commitNo() != 0L
+                || firstPage.historyPrevPageNo() != FilePageHeader.FIL_NULL
+                || firstPage.historyNextPageNo() != FilePageHeader.FIL_NULL) {
+            throw new UndoLogFormatException(
+                    "markPrepared requires an unlinked ACTIVE undo log with no commit number");
+        }
+        firstPage.setLogState(UndoPageLayout.STATE_PREPARED);
+    }
+
+    /** first 页 log header 中的 undo log 状态原始值；稳定物理码定义在 {@link UndoPageLayout}。 */
     public int state() {
         return firstPage.state();
     }
@@ -422,6 +446,11 @@ public final class UndoLogSegment {
     /** 是否 ACTIVE（未提交）；恢复期 ACTIVE 段需回滚。 */
     public boolean isActive() {
         return firstPage.state() == UndoPageLayout.STATE_ACTIVE;
+    }
+
+    /** 是否 PREPARED；恢复期必须交由上层 XA 决议，不能按 ACTIVE 自动回滚。 */
+    public boolean isPrepared() {
+        return firstPage.state() == UndoPageLayout.STATE_PREPARED;
     }
 
     /** 是否 COMMITTED；恢复期 COMMITTED 段不回滚，而是重建 history 交给 purge 后台续作。 */
@@ -552,22 +581,29 @@ public final class UndoLogSegment {
     }
 
     /**
-     * 以 compare-and-set 语义持久化部分回滚边界。所有可预见校验均发生在 15B header 写入之前：会话必须可写、
-     * 页内当前头等于 expected、目标不能向前推进或越过物理高水位，且非空 target 必须解析到本 segment 中 undoNo
-     * 和 pointer 类型一致的真实 record。这样 stale context 或损坏 target 不会在 MTR 无 content undo 的前提下留下
-     * 半完成 header。
+     * 在不修改 first-page header 的前提下，验证一次 logical-head compare-and-set 能否安全执行。该方法供
+     * rollback/purge 在释放 LOB 页链等无 content-undo 的物理修改之前完成全部可预见检查；调用方必须继续持有
+     * 同一个 EXCLUSIVE segment session，并在同一 MTR 中调用 {@link #updateLogicalHead}，否则验证结果会失去锁保护。
      *
-     * <p><b>调用前置条件</b>：本方法为物理 CAS，不在一个长 MTR 内遍历 expected→target 的完整祖先链，避免
-     * 大事务把所有 undo 页同时 fixed。生产调用方 {@code RollbackService} 必须先用逐 pointer 短 MTR 精确证明
-     * target 可达；本方法再校验 target 自身 record 与高水位并完成最终 CAS。
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>确认当前 session 持有 undo first page 的 EXCLUSIVE latch，并校验四个领域参数完整。</li>
+     *     <li>读取持久 logical head，按 expected 做 CAS 比对，拒绝陈旧 rollback/purge 上下文。</li>
+     *     <li>校验 target 只能向逻辑前驱移动且不越过物理 append 高水位，保护 undoNo 单调性。</li>
+     *     <li>非空 target 必须解码为本 segment 中 undoNo 与 pointer 类型一致的真实 record；全过程不写 header。</li>
+     * </ol>
      *
-     * @param expected 调用方开始 partial rollback 时看到的旧逻辑头。
-     * @param target   已成功完成所有逆操作后要持久化的 savepoint/空边界。
-     * @param keyDef   解码目标 undo record 的聚簇索引 key 定义。
-     * @param schema   解码目标 undo record 的表 schema。
+     * @param expected 调用方开始记录级 rollback/purge 时读取的持久逻辑头；必须仍与 first-page header 完全相等。
+     * @param target   当前记录逆操作或 purge ownership 消费完成后要发布的前驱边界；可为 {@link UndoLogicalHead#EMPTY}。
+     * @param keyDef   target 非空时解码其聚簇主键使用的 exact-version key 定义；空 target 仍必须提供当前记录定义。
+     * @param schema   target 非空时解码其旧 image 使用的 exact-version schema；空 target 仍必须提供当前记录 schema。
+     * @throws DatabaseValidationException session 非 EXCLUSIVE、参数缺失、target 前移或越过物理高水位时抛出；未修改页面。
+     * @throws UndoLogicalHeadConflictException 当前持久头不等于 expected 时抛出；调用方应重新读取链头而非继续释放资源。
+     * @throws UndoLogFormatException target pointer 不属于本段或解析出的 undoNo/record 类型不一致时抛出；未修改页面。
      */
-    public void updateLogicalHead(UndoLogicalHead expected, UndoLogicalHead target,
-                                  IndexKeyDef keyDef, TableSchema schema) {
+    public void validateLogicalHeadUpdate(UndoLogicalHead expected, UndoLogicalHead target,
+                                          IndexKeyDef keyDef, TableSchema schema) {
+        // 1. 写权限和解码上下文必须在读取 CAS 权威状态前完整，失败不访问其它 undo 页。
         if (mode != PageLatchMode.EXCLUSIVE) {
             throw new DatabaseValidationException(
                     "updateLogicalHead requires an EXCLUSIVE undo log segment session");
@@ -575,11 +611,13 @@ public final class UndoLogSegment {
         if (expected == null || target == null || keyDef == null || schema == null) {
             throw new DatabaseValidationException("logical head update args must not be null");
         }
+        // 2. first-page header 是当前 logical branch 的唯一持久权威；陈旧 expected 不能继续物理清理。
         UndoLogicalHead currentHead = firstPage.logicalHead();
         if (!currentHead.equals(expected)) {
             throw new UndoLogicalHeadConflictException("persistent logical undo head changed: expected="
                     + expected + ", actual=" + currentHead);
         }
+        // 3. target 只允许回退且不得超过物理 append 高水位，避免发布不存在或未来的 undoNo。
         if (target.undoNo().value() > expected.undoNo().value()) {
             throw new DatabaseValidationException("partial rollback target cannot advance logical undo head: "
                     + target.undoNo().value() + " > " + expected.undoNo().value());
@@ -589,6 +627,7 @@ public final class UndoLogSegment {
             throw new DatabaseValidationException("logical undo head exceeds physical high-water: "
                     + target.undoNo().value() + " > " + physicalHighWater.value());
         }
+        // 4. 非空 target 的 pointer 必须实际解析到声明 undoNo；这里只读验证，不产生 header/redo/dirty 副作用。
         if (!target.isEmpty()) {
             UndoRecord targetRecord = readRecord(target.rollPointer(), keyDef, schema);
             if (!targetRecord.undoNo().equals(target.undoNo())) {
@@ -596,6 +635,33 @@ public final class UndoLogSegment {
                         + targetRecord.undoNo().value() + " instead of " + target.undoNo().value());
             }
         }
+    }
+
+    /**
+     * 以 compare-and-set 语义持久化 rollback/purge 已完成的 logical-head 边界。方法先复用
+     * {@link #validateLogicalHeadUpdate} 完成全部可预见校验，再只修改 first-page header；MTR 提交会为该 header
+     * 变化收集 redo 并发布 pageLSN/dirty。调用方不得在本方法成功前发布内存 head，也不得在失败后假定物理修改已撤销。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>在当前 EXCLUSIVE session 中重新验证 expected、target 与 target record，防止调用方遗漏预检。</li>
+     *     <li>仅当当前头与 target 不同时写入 15B logical-head header；相等时保持幂等且不产生无意义页修改。</li>
+     * </ol>
+     *
+     * @param expected 调用方开始 rollback/purge 时看到的旧逻辑头；必须仍与持久 header 相等。
+     * @param target   所有当前记录逆操作、LOB free 等副作用完成后要持久化的前驱或空边界。
+     * @param keyDef   非空 target record 的 exact-version 聚簇 key 定义。
+     * @param schema   非空 target record 的 exact-version 表 schema。
+     * @throws DatabaseValidationException session、参数或 target 单调性无效时抛出；调用方不得发布内存进度。
+     * @throws UndoLogicalHeadConflictException expected 已陈旧时抛出；调用方必须重新读取持久链头。
+     * @throws UndoLogFormatException target record 损坏或 identity 错配时抛出；header 不会被修改。
+     */
+    public void updateLogicalHead(UndoLogicalHead expected, UndoLogicalHead target,
+                                  IndexKeyDef keyDef, TableSchema schema) {
+        // 1. 即使调用方已经显式预检，这里仍在实际写入点复核 CAS 与 target record 不变量。
+        validateLogicalHeadUpdate(expected, target, keyDef, schema);
+        // 2. 相同 target 是恢复重试的幂等 no-op；不同 target 才写 first-page header 并由 MTR 收集 redo。
+        UndoLogicalHead currentHead = firstPage.logicalHead();
         if (!currentHead.equals(target)) {
             firstPage.setLogicalHead(target);
         }

@@ -9,10 +9,14 @@ enum UndoFinalizationKind {
     INSERT_COMMIT,
     /** 含 UPDATE undo 的提交已原子挂入持久 history 链。 */
     UPDATE_COMMIT,
+    /** XA phase-two commit 已清理 INSERT owner并把可选 UPDATE undo挂入 history。 */
+    PREPARED_COMMIT,
     /** live 事务完整回滚到 EMPTY 后回收。 */
     LIVE_ROLLBACK,
     /** crash recovery 把 ACTIVE undo 回滚到 EMPTY 后回收。 */
     RECOVERY_ROLLBACK,
+    /** live/recovery XA rollback 已把 PREPARED undo回滚到 EMPTY 后回收。 */
+    PREPARED_ROLLBACK,
     /** purge 已清理 committed update/delete undo 对应记录后回收。 */
     PURGE
 }

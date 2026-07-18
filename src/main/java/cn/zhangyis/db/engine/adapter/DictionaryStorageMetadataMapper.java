@@ -50,7 +50,7 @@ public final class DictionaryStorageMetadataMapper {
                         + table.id().value()));
         try {
             StorageTableDefinition storageTable = new StorageTableDefinition(table.id().value(), binding.spaceId(),
-                    binding.path(), table.version().value(), RUNTIME_MAPPING_INITIAL_SIZE,
+                    binding.path(), binding.rowFormatVersion(), RUNTIME_MAPPING_INITIAL_SIZE,
                     columns(table), indexes(table));
             var tableIndexes = factory.createTable(storageTable, binding);
             return new MappedTableStorage(table, storageTable, binding, binding.lobSegment(), tableIndexes);

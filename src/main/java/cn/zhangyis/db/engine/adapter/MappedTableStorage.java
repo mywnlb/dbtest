@@ -23,7 +23,7 @@ public final class MappedTableStorage {
     /** 调用方持有 lease 时看到的精确 DD aggregate；版本和生命周期身份的权威来源。 */
     private final TableDefinition table;
 
-    /** 由同一 aggregate 派生的 storage schema DTO；schemaVersion 必须等于 table.version。 */
+    /** 由同一 aggregate 派生的 storage schema DTO；schemaVersion 必须等于 binding 的物理行格式版本。 */
     private final StorageTableDefinition storageTable;
 
     /** 同一 aggregate 持久化的物理表绑定；后续 LOB 扩展也只能从这里取得 segment。 */
@@ -60,7 +60,7 @@ public final class MappedTableStorage {
             throw new DatabaseValidationException("mapped table storage fields/indexes must not be null or empty");
         }
         if (table.id().value() != storageTable.tableId() || table.id().value() != binding.tableId()
-                || table.version().value() != storageTable.schemaVersion()
+                || binding.rowFormatVersion() != storageTable.schemaVersion()
                 || !storageTable.spaceId().equals(binding.spaceId())
                 || !binding.lobSegment().equals(lobSegment)) {
             throw new DatabaseValidationException("mapped table storage identity/version mismatch");

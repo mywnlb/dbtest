@@ -2,7 +2,9 @@ package cn.zhangyis.db.storage.api.ddl;
 
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
+import cn.zhangyis.db.domain.RollPointer;
 import cn.zhangyis.db.domain.SpaceId;
+import cn.zhangyis.db.domain.TransactionId;
 import cn.zhangyis.db.storage.api.SegmentRef;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
 import cn.zhangyis.db.storage.engine.EngineConfig;
@@ -11,6 +13,15 @@ import cn.zhangyis.db.storage.fil.state.TablespaceState;
 import cn.zhangyis.db.storage.fsp.segment.SegmentPurpose;
 import cn.zhangyis.db.storage.fsp.lifecycle.TablespaceLifecycleRawCodec;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
+import cn.zhangyis.db.storage.page.PageEnvelopeLayout;
+import cn.zhangyis.db.storage.page.PageType;
+import cn.zhangyis.db.storage.fsp.header.SpaceHeaderLayout;
+import cn.zhangyis.db.storage.sdi.SdiPageLayout;
+import cn.zhangyis.db.storage.btree.BTreeRedoBudgetEstimator;
+import cn.zhangyis.db.storage.record.format.LogicalRecord;
+import cn.zhangyis.db.storage.record.format.RecordType;
+import cn.zhangyis.db.storage.record.type.ColumnValue;
+import cn.zhangyis.db.storage.redo.RedoBudgetPurpose;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -22,8 +33,10 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.util.List;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -68,6 +81,209 @@ class TableDdlStorageServiceTest {
             engine.tableDdlStorageService().dropTable(binding, Duration.ofSeconds(5));
 
             assertFalse(Files.exists(tableFile));
+        } finally {
+            engine.close();
+        }
+    }
+
+    /**
+     * 物理 CREATE 必须格式化固定 page3 并让 page0 root 指向它；DD 通过 opaque storage API 写入后，
+     * table/version/payload 必须 durable 可读，不能把 DD 类型泄漏到 storage 页仓储。
+     */
+    @Test
+    void persistsSerializedDictionaryInformationOnFixedPageThree() {
+        StorageEngine engine = new StorageEngine(config());
+        engine.open();
+        Path tableFile = directory.resolve("sdi_1028.ibd");
+        try {
+            TableStorageBinding binding = engine.tableDdlStorageService().createTable(definition(
+                    8, SpaceId.of(1028), tableFile));
+            assertTrue(engine.tableDdlStorageService().readSerializedDictionaryInfo(binding).isEmpty(),
+                    "物理 CREATE 只格式化 SDI 页，ACTIVE DD 发布前不能伪造快照");
+
+            byte[] payload = "complete-dd-table-payload".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            SerializedDictionaryInfo expected = new SerializedDictionaryInfo(8, 11, payload);
+            engine.tableDdlStorageService().writeSerializedDictionaryInfo(
+                    binding, expected, Duration.ofSeconds(5));
+            SerializedDictionaryInfo actual = engine.tableDdlStorageService()
+                    .readSerializedDictionaryInfo(binding).orElseThrow();
+
+            assertEquals(expected.tableId(), actual.tableId());
+            assertEquals(expected.dictionaryVersion(), actual.dictionaryVersion());
+            assertArrayEquals(expected.payload(), actual.payload());
+            ByteBuffer page0 = readPage(tableFile, 0);
+            ByteBuffer page3 = readPage(tableFile, SdiPageLayout.PAGE_NO);
+            assertEquals(SdiPageLayout.PAGE_NO, page0.getLong(SpaceHeaderLayout.SDI_ROOT));
+            assertEquals(PageType.SDI.code(), page3.getInt(PageEnvelopeLayout.PAGE_TYPE));
+            assertEquals(SdiPageLayout.MAGIC, page3.getInt(SdiPageLayout.MAGIC_OFFSET));
+            assertEquals(SdiPageLayout.FORMAT_VERSION, page3.getInt(SdiPageLayout.FORMAT_OFFSET));
+        } finally {
+            engine.close();
+        }
+    }
+
+    /**
+     * 新索引的 segment/root 与 page3 build descriptor 必须在同一物理提交中出现；后续 SDI 覆盖不能
+     * 擦除 descriptor，只有显式 clear 才能结束 recovery 对 staged 资源的所有权。
+     */
+    @Test
+    void persistsSecondaryIndexBuildDescriptorAcrossSdiRewriteUntilExplicitClear() {
+        StorageEngine engine = new StorageEngine(config());
+        engine.open();
+        Path tableFile = directory.resolve("index_build_1029.ibd");
+        try {
+            TableStorageBinding table = engine.tableDdlStorageService().createTable(definition(
+                    9, SpaceId.of(1029), tableFile));
+
+            SecondaryIndexBuildDescriptor staged = engine.tableDdlStorageService().beginSecondaryIndexBuild(
+                    table, 41, 12, new StorageIndexDefinition(
+                            23, "idx_id", false, false,
+                            List.of(new StorageIndexKeyPart(1, StorageIndexOrder.ASC, 0))),
+                    Duration.ofSeconds(5));
+
+            assertEquals(41, staged.ddlOperationId());
+            assertEquals(12, staged.dictionaryVersion());
+            assertEquals(9, staged.tableId());
+            assertEquals(23, staged.indexBinding().indexId());
+            assertEquals(Optional.of(staged),
+                    engine.tableDdlStorageService().readSecondaryIndexBuild(table));
+            MiniTransaction inspect = engine.miniTransactionManager().beginReadOnly();
+            assertEquals(23, engine.indexPageAccess().openIndexPage(
+                    inspect, staged.indexBinding().rootPageId(), PageLatchMode.SHARED).header().indexId());
+            engine.miniTransactionManager().commit(inspect);
+
+            engine.tableDdlStorageService().writeSerializedDictionaryInfo(
+                    table, new SerializedDictionaryInfo(9, 12, new byte[]{1, 2, 3}),
+                    Duration.ofSeconds(5));
+            assertEquals(Optional.of(staged),
+                    engine.tableDdlStorageService().readSecondaryIndexBuild(table),
+                    "SDI publish 早于 DD commit，不能丢失崩溃回收证据");
+
+            engine.tableDdlStorageService().clearSecondaryIndexBuild(table, staged, Duration.ofSeconds(5));
+            assertTrue(engine.tableDdlStorageService().readSecondaryIndexBuild(table).isEmpty());
+        } finally {
+            engine.close();
+        }
+    }
+
+    /**
+     * backfill 必须从聚簇 live rows 投影真实紧凑 entry，并返回实际 root level；不能只创建一棵空树后发布 DD。
+     */
+    @Test
+    void backfillsSecondaryTreeFromExistingClusteredRows() {
+        StorageEngine engine = new StorageEngine(config());
+        engine.open();
+        Path tableFile = directory.resolve("index_backfill_1030.ibd");
+        try {
+            StorageIndexDefinition primary = new StorageIndexDefinition(
+                    31, "PRIMARY", true, true,
+                    List.of(new StorageIndexKeyPart(1, StorageIndexOrder.ASC, 0)));
+            StorageIndexDefinition secondary = new StorageIndexDefinition(
+                    32, "idx_tenant", false, false,
+                    List.of(new StorageIndexKeyPart(2, StorageIndexOrder.ASC, 0)));
+            List<StorageColumnDefinition> columns = List.of(
+                    new StorageColumnDefinition(1, "id", 0,
+                            StorageColumnType.bigint(false, false)),
+                    new StorageColumnDefinition(2, "tenant", 1,
+                            StorageColumnType.bigint(false, false)));
+            StorageTableDefinition before = new StorageTableDefinition(
+                    10, SpaceId.of(1030), tableFile, 2, PageNo.of(128), columns, List.of(primary));
+            TableStorageBinding binding = engine.tableDdlStorageService().createTable(before);
+            var primaryIndex = new BTreeIndexMetadataFactory().createTable(before, binding).clusteredIndex();
+            for (long id = 1; id <= 3; id++) {
+                MiniTransaction insert = engine.miniTransactionManager().begin(
+                        engine.miniTransactionManager().budgetFor(
+                                RedoBudgetPurpose.CLUSTERED_INSERT,
+                                BTreeRedoBudgetEstimator.insert(primaryIndex.rootLevel())));
+                engine.btreeService().insertClustered(insert, primaryIndex,
+                        new LogicalRecord(2, List.of(
+                                new ColumnValue.IntValue(id),
+                                new ColumnValue.IntValue(id == 3 ? 8 : 7)),
+                                false, RecordType.CONVENTIONAL),
+                        TransactionId.of(id), RollPointer.NULL);
+                engine.miniTransactionManager().commit(insert);
+            }
+            SecondaryIndexBuildDescriptor staged = engine.tableDdlStorageService().beginSecondaryIndexBuild(
+                    binding, 51, 13, secondary, Duration.ofSeconds(5));
+            StorageTableDefinition during = new StorageTableDefinition(
+                    10, SpaceId.of(1030), tableFile, 2, PageNo.of(128),
+                    columns, List.of(primary, secondary));
+
+            IndexStorageBinding completed = engine.tableDdlStorageService().backfillSecondaryIndex(
+                    during, binding, staged, Duration.ofSeconds(5));
+
+            TableStorageBinding finalBinding = new TableStorageBinding(
+                    binding.tableId(), binding.spaceId(), binding.path(), binding.rowFormatVersion(),
+                    List.of(binding.indexes().getFirst(), completed), binding.lobSegment());
+            var secondaryMetadata = new BTreeIndexMetadataFactory()
+                    .createTable(during, finalBinding).requireSecondary(32);
+            MiniTransaction read = engine.miniTransactionManager().beginReadOnly();
+            List<LogicalRecord> entries = engine.btreeService()
+                    .scanAll(read, secondaryMetadata.index(), 10).stream()
+                    .map(result -> result.record()).toList();
+            engine.miniTransactionManager().commit(read);
+
+            assertEquals(3, entries.size());
+            assertEquals(List.of(7L, 7L, 8L), entries.stream()
+                    .map(entry -> ((ColumnValue.IntValue) entry.columnValues().getFirst()).value())
+                    .toList());
+        } finally {
+            engine.close();
+        }
+    }
+
+    /**
+     * UNIQUE backfill 遇到重复非 NULL logical key 时不得发布成功；descriptor 必须保留到显式物理回滚完成。
+     */
+    @Test
+    void rejectsDuplicateUniqueBackfillAndRollsBackStagedSegments() {
+        StorageEngine engine = new StorageEngine(config());
+        engine.open();
+        Path tableFile = directory.resolve("unique_index_backfill_1031.ibd");
+        try {
+            StorageIndexDefinition primary = new StorageIndexDefinition(
+                    41, "PRIMARY", true, true,
+                    List.of(new StorageIndexKeyPart(1, StorageIndexOrder.ASC, 0)));
+            StorageIndexDefinition unique = new StorageIndexDefinition(
+                    42, "uk_tenant", true, false,
+                    List.of(new StorageIndexKeyPart(2, StorageIndexOrder.ASC, 0)));
+            List<StorageColumnDefinition> columns = List.of(
+                    new StorageColumnDefinition(1, "id", 0,
+                            StorageColumnType.bigint(false, false)),
+                    new StorageColumnDefinition(2, "tenant", 1,
+                            StorageColumnType.bigint(false, false)));
+            StorageTableDefinition before = new StorageTableDefinition(
+                    11, SpaceId.of(1031), tableFile, 2, PageNo.of(128), columns, List.of(primary));
+            TableStorageBinding binding = engine.tableDdlStorageService().createTable(before);
+            var primaryIndex = new BTreeIndexMetadataFactory().createTable(before, binding).clusteredIndex();
+            for (long id = 1; id <= 2; id++) {
+                MiniTransaction insert = engine.miniTransactionManager().begin(
+                        engine.miniTransactionManager().budgetFor(
+                                RedoBudgetPurpose.CLUSTERED_INSERT,
+                                BTreeRedoBudgetEstimator.insert(primaryIndex.rootLevel())));
+                engine.btreeService().insertClustered(insert, primaryIndex,
+                        new LogicalRecord(2, List.of(
+                                new ColumnValue.IntValue(id), new ColumnValue.IntValue(7)),
+                                false, RecordType.CONVENTIONAL),
+                        TransactionId.of(id), RollPointer.NULL);
+                engine.miniTransactionManager().commit(insert);
+            }
+            SecondaryIndexBuildDescriptor staged = engine.tableDdlStorageService().beginSecondaryIndexBuild(
+                    binding, 61, 14, unique, Duration.ofSeconds(5));
+            StorageTableDefinition during = new StorageTableDefinition(
+                    11, SpaceId.of(1031), tableFile, 2, PageNo.of(128),
+                    columns, List.of(primary, unique));
+
+            assertThrows(SecondaryIndexBuildDuplicateKeyException.class,
+                    () -> engine.tableDdlStorageService().backfillSecondaryIndex(
+                            during, binding, staged, Duration.ofSeconds(5)));
+            assertEquals(Optional.of(staged),
+                    engine.tableDdlStorageService().readSecondaryIndexBuild(binding));
+
+            engine.tableDdlStorageService().rollbackSecondaryIndexBuild(
+                    binding, staged, Duration.ofSeconds(5));
+
+            assertTrue(engine.tableDdlStorageService().readSecondaryIndexBuild(binding).isEmpty());
         } finally {
             engine.close();
         }
@@ -143,10 +359,17 @@ class TableDdlStorageServiceTest {
             TableStorageBinding binding = engine.tableDdlStorageService().createTable(definition(
                     6, SpaceId.of(1026), tableFile));
             TableStorageBinding mismatched = new TableStorageBinding(binding.tableId(), binding.spaceId(),
-                    directory.resolve("other_1026.ibd"), binding.indexes(), binding.lobSegment());
+                    directory.resolve("other_1026.ibd"), binding.rowFormatVersion(),
+                    binding.indexes(), binding.lobSegment());
 
             assertThrows(TableDdlStorageException.class, () -> engine.tableDdlStorageService()
                     .dropTable(mismatched, Duration.ofSeconds(5)));
+            assertThrows(TableDdlStorageException.class, () -> engine.tableDdlStorageService()
+                    .readSerializedDictionaryInfo(mismatched));
+            assertThrows(TableDdlStorageException.class, () -> engine.tableDdlStorageService()
+                    .writeSerializedDictionaryInfo(mismatched,
+                            new SerializedDictionaryInfo(binding.tableId(), 3, new byte[]{1}),
+                            Duration.ofSeconds(5)));
             assertTrue(Files.exists(tableFile));
 
             engine.tableDdlStorageService().dropTable(binding, Duration.ofSeconds(5));
@@ -169,20 +392,26 @@ class TableDdlStorageServiceTest {
     }
 
     private static cn.zhangyis.db.storage.fsp.lifecycle.TablespaceLifecycleHeader lifecycle(Path path) {
+        ByteBuffer page = readPage(path, 0);
+        return TablespaceLifecycleRawCodec.read(page).orElseThrow();
+    }
+
+    /** 从已 force 的测试表空间完整读取一页，用于核对稳定物理字段而不借用待测 buffer 状态。 */
+    private static ByteBuffer readPage(Path path, long pageNo) {
         ByteBuffer page = ByteBuffer.allocate(16 * 1024);
         try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
-            long position = 0;
+            long position = pageNo * page.capacity();
             while (page.hasRemaining()) {
                 int read = channel.read(page, position);
                 if (read < 0) {
-                    throw new AssertionError("unexpected EOF while reading discarded page0");
+                    throw new AssertionError("unexpected EOF while reading tablespace page " + pageNo);
                 }
                 position += read;
             }
         } catch (IOException e) {
             throw new AssertionError(e);
         }
-        return TablespaceLifecycleRawCodec.read(page).orElseThrow();
+        return page;
     }
 
     private EngineConfig config() {

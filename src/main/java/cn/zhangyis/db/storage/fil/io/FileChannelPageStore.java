@@ -48,7 +48,8 @@ public final class FileChannelPageStore implements PageStore {
 
     /**
      * 单次 {@link #extend(SpaceId)} 的增长量策略；只决定新增页数，不执行 IO、不持锁，也不发布文件大小。
-     * 默认构造器使用 MySQL 8.0 file-per-table 风格边界。
+     * 默认构造器使用 MySQL 8.0 file-per-table 风格边界；本 store 不读取表空间类型，所以该实例管理的
+     * UNDO/GENERAL 文件共享同一策略。
      */
     private final AutoExtendPolicy autoExtendPolicy;
 
@@ -200,9 +201,12 @@ public final class FileChannelPageStore implements PageStore {
     /**
      * 把一个完整物理页读取到调用方缓冲区，不改变任何 registry、Buffer Pool 或 page checksum 状态。
      *
-     * <p>主要逻辑：校验 PageId，从句柄 map 获取已打开文件，再由 DataFileHandle 在 Lifecycle(S) 下校验页号边界并执行
-     * positional read，直至填满 {@code dst.remaining()}。成功后 dst position 前进一个 pageSize，limit 不变；调用方负责
-     * 在需要解析前执行 flip/rewind 或使用约定好的 buffer 视图。</p>
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>先校验 PageId；buffer 非空/整页契约由目标 handle 按其 PageSize 校验。</li>
+     *     <li>从路由表取得当前 handle，再由它在 Lifecycle(S) 下校验页边界并执行 positional read。
+     *     成功后 dst position 前进一个 pageSize，limit 不变；调用方负责 flip/rewind。</li>
+     * </ol>
      *
      * @param pageId 由 SpaceId 与表空间内 PageNo 组成的物理定位键；不能为 {@code null}
      * @param dst 可写目标缓冲区；不能为 {@code null}，调用时 remaining 必须严格等于该文件 pageSize
@@ -213,16 +217,22 @@ public final class FileChannelPageStore implements PageStore {
      */
     @Override
     public void readPage(PageId pageId, ByteBuffer dst) {
+        // 1. 物理路由 identity 在访问并发 map 前必须存在。
         validatePageId(pageId);
+
+        // 2. handle 负责 pageSize buffer 契约、lifecycle/size 检查与完整 positional read。
         require(pageId.spaceId()).readPage(pageId.pageNo(), dst);
     }
 
     /**
      * 将调用方提供的完整页镜像写入指定物理页，不负责 WAL、doublewrite、checksum 或 dirty 状态管理。
      *
-     * <p>主要逻辑：校验 PageId 并路由已打开句柄，DataFileHandle 在 Lifecycle(S) 下检查已发布 size 后执行 positional
-     * write，直至消费 {@code src.remaining()}。成功后 src position 前进一个 pageSize。调用方必须在进入本方法前持有
-     * page latch 或稳定 flush snapshot，并确保对应 pageLSN 的 redo 已 durable；否则物理写成功也会破坏恢复语义。</p>
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>先校验 PageId；src 非空/整页契约由目标 handle 按其 PageSize 校验。</li>
+     *     <li>路由当前 handle，由它在 Lifecycle(S) 下检查发布 size 并完成 positional write。成功后
+     *     src position 前进一个 pageSize。调用方必须已持 page latch/稳定 snapshot，并满足 WAL gate。</li>
+     * </ol>
      *
      * @param pageId 目标物理页定位键；不能为 {@code null}
      * @param src 完整页镜像；不能为 {@code null}，调用时 remaining 必须严格等于该文件 pageSize
@@ -233,15 +243,24 @@ public final class FileChannelPageStore implements PageStore {
      */
     @Override
     public void writePage(PageId pageId, ByteBuffer src) {
+        // 1. 无 PageId 时不能选择 data file 或页偏移。
         validatePageId(pageId);
+
+        // 2. handle 完成整页 buffer、生命周期、边界与 positional write；上层继续拥有 WAL/dirty 语义。
         require(pageId.spaceId()).writePage(pageId.pageNo(), src);
     }
 
     /**
      * 按注入策略对单文件表空间执行一次自动扩展，并返回扩展后的已发布页数。
      *
-     * <p>DataFileHandle 按 Lifecycle(S)→FileSize(X) 串行化 size 变化：读取旧大小、计算正增量、初始化新增范围，最后用
-     * volatile 发布新页数。方法不 force；范围初始化中途失败时文件可能物理增长，但逻辑 size 保持旧值，新尾部对 read
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 SpaceId 并要求路由表已登记 handle。</li>
+     *     <li>把策略交给 handle；handle 按 Lifecycle(S)→FileSize(X) 读取旧大小、计算正增量、初始化尾部，
+     *     最后 volatile 发布新页数，返回值再包装为 PageNo。</li>
+     * </ol>
+     *
+     * <p>方法不 force；范围初始化中途失败时文件可能物理增长，但发布 size 保持旧值，新尾部对 read
      * 不可见，后续 retry/recovery 可重复初始化并收敛。</p>
      *
      * @param spaceId 已打开且允许上层执行 autoextend 的表空间标识；不能为 {@code null}
@@ -252,15 +271,22 @@ public final class FileChannelPageStore implements PageStore {
      */
     @Override
     public PageNo extend(SpaceId spaceId) {
+        // 1. 先验证路由键，再取得当前已登记 handle。
         validateSpaceId(spaceId);
+
+        // 2. handle 串行执行一次策略增长；成功页数转换为领域值返回。
         return PageNo.of(require(spaceId).autoExtend(autoExtendPolicy));
     }
 
     /**
      * 返回目标句柄当前已发布的页数快照，供物理越界检查和上层容量诊断使用。
      *
-     * <p>返回值来自 volatile size，调用返回后可能被并发 extend/ensureCapacity 增大，或被上层独占 truncate 缩小；
-     * 它不是跨多个 IO 的锁定快照，也不读取 page0 的逻辑 FSP 容量。</p>
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验并路由 SpaceId。</li>
+     *     <li>读取 handle volatile size 并包装为 PageNo。返回后可能被 extend/ensureCapacity 增大或
+     *     被独占 truncate 缩小；它不是锁定快照，也不读取 page0 FSP 容量。</li>
+     * </ol>
      *
      * @param spaceId 已登记表空间标识；不能为 {@code null}
      * @return 当前句柄允许 read/write 的物理页数边界快照
@@ -269,12 +295,21 @@ public final class FileChannelPageStore implements PageStore {
      */
     @Override
     public PageNo currentSizeInPages(SpaceId spaceId) {
+        // 1. 查询只接受有效且已登记的空间身份。
         validateSpaceId(spaceId);
+
+        // 2. 单次 volatile 读取转换为不可变 PageNo，不锁定后续尺寸变化。
         return PageNo.of(require(spaceId).currentSizeInPages());
     }
 
     /**
      * 返回 create/open 时绑定到句柄的数据文件路径，不访问文件系统也不触发 metadata loader。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 SpaceId 并要求 handle 已登记。</li>
+     *     <li>返回 handle 的不可变路径字段；不重新打开或检查文件。</li>
+     * </ol>
      *
      * @param spaceId 已登记表空间标识；不能为 {@code null}
      * @return 句柄生命周期内保持不变的路径对象；仅用于 metadata/discovery/诊断，实际 IO 仍走已打开 FileChannel
@@ -283,15 +318,22 @@ public final class FileChannelPageStore implements PageStore {
      */
     @Override
     public Path pathOf(SpaceId spaceId) {
+        // 1. 无效或未登记 identity 不能产生可信 metadata 路径。
         validateSpaceId(spaceId);
+
+        // 2. 直接返回 handle 绑定路径，不执行文件系统 IO。
         return require(spaceId).path();
     }
 
     /**
      * 对一个已打开数据文件执行 {@code FileChannel.force(true)}，建立数据与文件 metadata 的明确持久化边界。
      *
-     * <p>DataFileHandle 持 Lifecycle(S) 并用 per-file FsyncLock 把同一文件的并发 force 限制为一个；close/truncate 的
-     * Lifecycle(X) 会等待 force 离开。本方法不检查 WAL，也不推进 checkpoint，调用方必须先保证 redo durable 和待刷页镜像稳定。</p>
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验并路由 SpaceId。</li>
+     *     <li>handle 持 Lifecycle(S) 与 per-file FsyncLock 执行 force；close/truncate 的 X 闩会等待。
+     *     本方法不检查 WAL 或推进 checkpoint，调用方必须先保证 redo durable 和镜像稳定。</li>
+     * </ol>
      *
      * @param spaceId 待强制持久化的已登记表空间；不能为 {@code null}
      * @throws DatabaseValidationException SpaceId 为空时抛出
@@ -300,7 +342,10 @@ public final class FileChannelPageStore implements PageStore {
      */
     @Override
     public void force(SpaceId spaceId) {
+        // 1. 只允许对有效且已登记的物理文件建立 durable 边界。
         validateSpaceId(spaceId);
+
+        // 2. handle 负责生命周期与同文件 fsync 串行化。
         require(spaceId).force();
     }
 
@@ -345,9 +390,12 @@ public final class FileChannelPageStore implements PageStore {
     /**
      * 将经过上层 lifecycle/WAL/Buffer Pool 排空校验的单文件缩短请求路由到目标句柄。
      *
-     * <p>DataFileHandle 固定按 Lifecycle(X)→FileSize(X)→FsyncLock 获取资源，drain 普通 IO 后执行 truncate，立即收紧
-     * 已发布页数并 force。若 force 失败，物理缩短已不可逆，逻辑页数保持目标值，调用方必须保留 TRUNCATING/DISCARDED
-     * 等 fail-closed marker 交 recovery 续作。</p>
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验并路由 SpaceId；目标页数交给 handle 校验。</li>
+     *     <li>handle 按 Lifecycle(X)→FileSize(X)→FsyncLock drain 普通 IO 后 truncate，立即收紧发布页数并
+     *     force。force 失败时保留目标边界，上层 marker/recovery 必须续作。</li>
+     * </ol>
      *
      * @param spaceId 已完成上层独占准入和 dirty/fixed frame 排空的表空间；不能为 {@code null}
      * @param targetSizeInPages 严格小于当前大小的正目标页数；不能为 {@code null}
@@ -357,15 +405,22 @@ public final class FileChannelPageStore implements PageStore {
      */
     @Override
     public void truncate(SpaceId spaceId, PageNo targetSizeInPages) {
+        // 1. 表空间 identity 在进入可能 drain 的 handle 路径前校验。
         validateSpaceId(spaceId);
+
+        // 2. handle 负责目标范围、锁序、物理 truncate、size 发布与 force。
         require(spaceId).truncateTo(targetSizeInPages);
     }
 
     /**
      * 幂等地把单文件物理容量扩到至少指定页数，只增不减，主要供 recovery 对齐 page0 恢复出的逻辑大小。
      *
-     * <p>目标不大于当前已发布 size 时直接 no-op；否则 DataFileHandle 持 Lifecycle(S)+FileSize(X) 初始化
-     * {@code [current,target)} 后再发布新 size。本方法不 force，重复调用会安全重写零范围并最终收敛。</p>
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验并路由 SpaceId；最小页数交由 handle 做正数校验。</li>
+     *     <li>handle 在目标不大于当前 size 时 no-op，否则持 Lifecycle(S)+FileSize(X) 初始化
+     *     {@code [current,target)} 后发布新 size。本方法不 force。</li>
+     * </ol>
      *
      * @param spaceId 待扩容的已登记表空间；不能为 {@code null}
      * @param minSizeInPages 期望的最小物理页数，必须为正；小于等于当前大小表示 no-op
@@ -375,7 +430,10 @@ public final class FileChannelPageStore implements PageStore {
      */
     @Override
     public void ensureCapacity(SpaceId spaceId, PageNo minSizeInPages) {
+        // 1. 先确保容量协调请求绑定有效且已登记表空间。
         validateSpaceId(spaceId);
+
+        // 2. handle 串行检查/建立尾部，失败时不会推进发布 size。
         require(spaceId).ensureCapacity(minSizeInPages);
     }
 

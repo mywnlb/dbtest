@@ -1,12 +1,14 @@
 package cn.zhangyis.db.storage.api.dml;
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
+import cn.zhangyis.db.storage.api.SegmentRef;
 import cn.zhangyis.db.storage.btree.TableIndexMetadata;
 import cn.zhangyis.db.storage.record.format.LogicalRecord;
 import cn.zhangyis.db.storage.record.page.SearchKey;
 import cn.zhangyis.db.storage.trx.Transaction;
 
 import java.time.Duration;
+import java.util.Optional;
 
 /**
  * 表级 UPDATE 命令；聚簇主键 v1 不允许变化，服务会用 current-read 物化旧行后再次核对主键。
@@ -19,6 +21,7 @@ import java.time.Duration;
  */
 public record TableUpdateCommand(Transaction transaction, TableIndexMetadata metadata,
                                  SearchKey clusterKey, LogicalRecord newRecord,
+                                 Optional<SegmentRef> lobSegment,
                                  Duration lockWaitTimeout) {
 
     /**
@@ -33,6 +36,7 @@ public record TableUpdateCommand(Transaction transaction, TableIndexMetadata met
      */
     public TableUpdateCommand {
         if (transaction == null || metadata == null || clusterKey == null || newRecord == null
+                || lobSegment == null
                 || lockWaitTimeout == null || lockWaitTimeout.isZero() || lockWaitTimeout.isNegative()) {
             throw new DatabaseValidationException("table update command fields are invalid");
         }
@@ -41,5 +45,11 @@ public record TableUpdateCommand(Transaction transaction, TableIndexMetadata met
                 || newRecord.hiddenColumns() != null) {
             throw new DatabaseValidationException("table update record does not match table metadata");
         }
+    }
+
+    public TableUpdateCommand(Transaction transaction, TableIndexMetadata metadata,
+                              SearchKey clusterKey, LogicalRecord newRecord,
+                              Duration lockWaitTimeout) {
+        this(transaction, metadata, clusterKey, newRecord, Optional.empty(), lockWaitTimeout);
     }
 }

@@ -15,6 +15,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.List;
 import java.util.ArrayList;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -126,6 +127,42 @@ class UndoRecordTest {
         assertThrows(DatabaseValidationException.class, () -> new UndoRecord(UndoRecordType.DELETE_MARK,
                 UndoNo.of(2), TXN, 1L, 9L, KEY, OLD_ROW, OLD_HIDDEN,
                 List.of(ownership(1, TypeId.TEXT, 64)), PREV));
+    }
+
+    /** UPDATE ownership 同时表达“回滚释放新链”和“提交后 purge 释放旧链”，两者不能再由 old image 猜测。 */
+    @Test
+    void updateCarriesOrderedLobVersionOwnership() {
+        ColumnValue.ExternalValue oldExternal = external(TypeId.TEXT, 64);
+        ColumnValue.ExternalValue newExternal = external(TypeId.TEXT, 96);
+        List<ColumnValue> oldRow = List.of(new ColumnValue.IntValue(100), oldExternal);
+        LobVersionOwnership ownership = new LobVersionOwnership(1, true, Optional.of(newExternal));
+
+        UndoRecord record = UndoRecord.update(UndoNo.of(2), TXN, 1L, 9L, KEY, oldRow, OLD_HIDDEN,
+                List.of(ownership), List.of(), PREV);
+
+        assertEquals(List.of(ownership), record.lobVersionOwnerships());
+        assertThrows(UnsupportedOperationException.class, () -> record.lobVersionOwnerships().clear());
+    }
+
+    /** INSERT 不能携带 version ownership；DELETE 只能声明 purge 旧链，不能产生 rollback-new owner。 */
+    @Test
+    void rejectsInvalidLobVersionOwnershipByUndoType() {
+        ColumnValue.ExternalValue external = external(TypeId.TEXT, 64);
+        LobVersionOwnership rollbackAndPurge = new LobVersionOwnership(1, true, Optional.of(external));
+        LobVersionOwnership purgeOnly = new LobVersionOwnership(1, true, Optional.empty());
+
+        assertThrows(DatabaseValidationException.class, () -> new UndoRecord(
+                UndoRecordType.INSERT_ROW, UndoNo.of(1), TXN, 1L, 9L, KEY, null, null,
+                List.of(), List.of(rollbackAndPurge), List.of(), RollPointer.NULL));
+        assertThrows(DatabaseValidationException.class, () -> UndoRecord.deleteMark(
+                UndoNo.of(3), TXN, 1L, 9L, KEY,
+                List.of(new ColumnValue.IntValue(100), external), OLD_HIDDEN,
+                List.of(rollbackAndPurge), List.of(), PREV));
+
+        UndoRecord delete = UndoRecord.deleteMark(UndoNo.of(3), TXN, 1L, 9L, KEY,
+                List.of(new ColumnValue.IntValue(100), external), OLD_HIDDEN,
+                List.of(purgeOnly), List.of(), PREV);
+        assertEquals(List.of(purgeOnly), delete.lobVersionOwnerships());
     }
 
     private static InsertedLobOwnership ownership(int ordinal, TypeId typeId, long pageNo) {

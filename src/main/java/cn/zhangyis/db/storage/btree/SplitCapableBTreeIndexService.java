@@ -295,6 +295,86 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
     }
 
     /**
+     * 为 LOB-aware UPDATE 固定目标 leaf、旧版本 CAS 证据和 placeholder 物理形状，但不写 placeholder row。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验聚簇 descriptor、write id、旧隐藏列和 placeholder，盖 NULL roll pointer 后冻结 key/encoded length。</li>
+     *     <li>以 X latch 定位目标 leaf，确认记录仍存在且隐藏列等于 current-read 证据；未命中按 stale 计划失败。</li>
+     *     <li>进入 index→LOB/FSP 显式锁序 scope，返回只允许一次 actual publish 的 guard。</li>
+     *     <li>publish 重算 actual key/length，盖真实隐藏列并在已固定 leaf 上执行所有权校验和整记录替换。</li>
+     * </ol>
+     *
+     * @param mtr           覆盖 undo+B+Tree+LOB workload 的 ACTIVE 业务 MTR。
+     * @param index         exact-version 聚簇索引 descriptor。
+     * @param key           current-read 已锁定行的完整聚簇主键。
+     * @param placeholder   新 LOB 首页号尚未知时的目标完整用户行。
+     * @param transactionId 前向 UPDATE 的稳定 write id。
+     * @param oldHidden     current-read 物化的旧 DB_TRX_ID/DB_ROLL_PTR CAS 证据。
+     * @return 固定目标 leaf 和形状、等待 actual undo/row 发布的 guard。
+     * @throws DatabaseValidationException 参数、descriptor、write id 或 placeholder 形状无效时抛出。
+     * @throws PreparedUpdateStateException 目标记录在 prepare 前已消失、版本不匹配或 actual 形状漂移时抛出。
+     */
+    public PreparedClusteredUpdate prepareClusteredUpdate(MiniTransaction mtr, BTreeIndex index,
+                                                          SearchKey key, LogicalRecord placeholder,
+                                                          TransactionId transactionId,
+                                                          HiddenColumns oldHidden) {
+        // 1. 所有纯值校验先于页导航；placeholder 隐藏列由本方法统一生成。
+        if (mtr == null || index == null || key == null || placeholder == null
+                || transactionId == null || oldHidden == null) {
+            throw new DatabaseValidationException("prepare clustered update args must not be null");
+        }
+        if (!index.clustered() || transactionId.isNone() || placeholder.hiddenColumns() != null) {
+            throw new DatabaseValidationException(
+                    "prepare clustered update requires clustered index/write id/user row without hidden columns");
+        }
+        LogicalRecord stampedPlaceholder = new LogicalRecord(placeholder.schemaVersion(),
+                placeholder.columnValues(), false, placeholder.recordType(),
+                new HiddenColumns(transactionId, RollPointer.NULL));
+        SearchKey expectedKey = keyOf(stampedPlaceholder, index);
+        int expectedLength = recordEncoder.encode(stampedPlaceholder, index.schema()).length;
+        if (!expectedKey.equals(key)) {
+            throw new BTreeUnsupportedStructureException("prepared UPDATE cannot change clustered key");
+        }
+
+        // 2. 目标 leaf X latch 保持到 actual publish；事务行锁保证没有合法并发 writer 改写该版本。
+        LeafLocation location = findLeaf(mtr, index, key, PageLatchMode.EXCLUSIVE);
+        RecordPage leaf = location.page();
+        validateLeafPage(leaf, index, location.pageId());
+        OptionalInt found = search.findEqual(leaf, key, index.keyDef(), index.schema());
+        if (found.isEmpty()) {
+            throw new PreparedUpdateStateException("prepared clustered update target disappeared before publish");
+        }
+        RecordCursor cursor = new RecordCursor(leaf, found.getAsInt(), index.schema(), registry);
+        if (!oldHidden.dbTrxId().equals(cursor.dbTrxId())
+                || !oldHidden.dbRollPtr().equals(cursor.dbRollPtr())) {
+            throw new PreparedUpdateStateException("prepared clustered update target version changed");
+        }
+
+        // 3. 后续 LOB/FSP 只能沿 index→LOB 单向获取；scope 在 publish/close 中恰好释放一次。
+        var scope = mtr.allowOutOfOrderPageLatch(
+                "prepared clustered update: index latch precedes LOB/FSP and LOB/FSP never waits for index");
+        try {
+            return new PreparedClusteredUpdate(mtr, scope, (actual, rollPointer) -> {
+                // 4. actual 只允许替换定宽 LOB 首页号；key/encoded length 漂移说明 deferred 计划失效。
+                LogicalRecord stampedActual = new LogicalRecord(actual.schemaVersion(), actual.columnValues(),
+                        false, actual.recordType(), new HiddenColumns(transactionId, rollPointer));
+                SearchKey actualKey = keyOf(stampedActual, index);
+                int actualLength = recordEncoder.encode(stampedActual, index.schema()).length;
+                if (!actualKey.equals(expectedKey) || actualLength != expectedLength) {
+                    throw new PreparedUpdateStateException(
+                            "actual clustered UPDATE changed key or encoded length after prepare");
+                }
+                return replaceInLeaf(leaf, location.pageId(), index, key, stampedActual,
+                        oldHidden.dbTrxId(), oldHidden.dbRollPtr());
+            });
+        } catch (RuntimeException error) {
+            scope.close();
+            throw error;
+        }
+    }
+
+    /**
      * 聚簇记录物理删除（T1.3d，rollback 反向走链消费 INSERT undo 的删除原语）。数据流：导航到目标 leaf（level 0=root
      * leaf / level 1=chooseChild，X）→ {@code findEqual} 定位 → **所有权校验**（命中记录的 {@code DB_TRX_ID}/
      * {@code DB_ROLL_PTR} 必须同时等于调用方期望值）→ 未标记则 {@code deleteMark} 后 {@code purge}，已标记则跳过
@@ -1116,6 +1196,63 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
                                                         BTreeScanRange range) {
         requireSecondaryIndex(index, "scanIncludingDeleted");
         return doScan(mtr, index, range, true);
+    }
+
+    /**
+     * 从最左 leaf 开始物化整棵树的 live record，供持 table MDL X 的离线 CREATE INDEX backfill 使用。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 MTR、descriptor 与正 limit；非法调用不取得 root/leaf 资源。</li>
+     *     <li>使用 S-crab 下降到最左 leaf，取得 child 后立即释放 parent，避免保留整条祖先路径。</li>
+     *     <li>按页内物理顺序物化 live record，delete-marked 记录跳过；达到 limit 时立即返回。</li>
+     *     <li>沿 sibling 链 hand-over-hand 前进，链尾返回不可变结果且不泄露 page handle。</li>
+     * </ol>
+     *
+     * <p>v1 简化：返回值在内存中完整物化，调用方应为教学实例配置受控表规模；后续 online/大型构建应改为
+     * continuation batch cursor，不能把 page latch 跨写 MTR 持有。</p>
+     *
+     * @param mtr 调用方短只读 MTR；方法不提交
+     * @param index 待扫描的 exact-version B+Tree descriptor
+     * @param limit 最大 live record 数，必须为正
+     * @return 从最左 leaf 开始按完整物理 key 排序的 live record
+     * @throws DatabaseValidationException 参数缺失或 limit 非正时抛出
+     * @throws DatabaseRuntimeException 页导航、物化或 sibling latch 失败时抛出
+     */
+    public List<BTreeLookupResult> scanAll(MiniTransaction mtr, BTreeIndex index, int limit) {
+        // 1. 入口拒绝无效上限，避免 Integer.MAX_VALUE 之外的隐式“无限”语义。
+        if (mtr == null || index == null || limit <= 0) {
+            throw new DatabaseValidationException("BTree full scan requires mtr/index/positive limit");
+        }
+
+        // 2. 只保留最左 leaf S latch；祖先随 crab 下降提前释放。
+        IndexPageHandle leafHandle = descendLeftmostSharedCrab(mtr, index);
+        List<BTreeLookupResult> results = new ArrayList<>();
+        while (true) {
+            // 3. 页内顺序与 B+Tree comparator 一致，DDL backfill 只复制 live 聚簇版本。
+            RecordPage leaf = leafHandle.recordPage();
+            validateLeafPage(leaf, index, leafHandle.pageId());
+            for (int offset : leaf.recordOffsetsInOrder()) {
+                RecordCursor cursor = new RecordCursor(leaf, offset, index.schema(), registry);
+                if (!cursor.materialize().deleted()) {
+                    results.add(materialize(index, leafHandle.pageId(), cursor));
+                    if (results.size() >= limit) {
+                        return List.copyOf(results);
+                    }
+                }
+            }
+
+            // 4. sibling hand-over-hand 保证前驱释放前后继已固定；链尾完成全树物化。
+            long next = leafHandle.fileHeader().nextPageNo();
+            if (next == FilePageHeader.FIL_NULL) {
+                return List.copyOf(results);
+            }
+            PageId nextId = PageId.of(index.rootPageId().spaceId(), PageNo.of(next));
+            IndexPageHandle nextHandle = openBTreePageOutOfOrder(mtr, nextId, index, PageLatchMode.SHARED,
+                    "DDL full clustered scan sibling hand-over-hand");
+            pageAccess.releaseHandle(mtr, leafHandle);
+            leafHandle = nextHandle;
+        }
     }
 
     /**

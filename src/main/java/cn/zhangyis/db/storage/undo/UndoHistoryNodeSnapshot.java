@@ -36,6 +36,11 @@ public record UndoHistoryNodeSnapshot(PageId firstPageId, UndoSegmentHandle hand
         return state == UndoLogState.ACTIVE;
     }
 
+    /** 当前 first page 是否是未决 XA participant，且仍不得进入 history。 */
+    public boolean isPrepared() {
+        return state == UndoLogState.PREPARED;
+    }
+
     public boolean isCommitted() {
         return state == UndoLogState.COMMITTED;
     }

@@ -12,9 +12,13 @@ import cn.zhangyis.db.storage.btree.SecondaryIndexMetadata;
 import cn.zhangyis.db.storage.btree.SplitCapableBTreeIndexService;
 import cn.zhangyis.db.storage.btree.IndexMetadataResolver;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
+import cn.zhangyis.db.storage.api.lob.LobFreeBatchPlan;
+import cn.zhangyis.db.storage.api.lob.LobFreeTarget;
+import cn.zhangyis.db.storage.api.lob.LobStorage;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
 import cn.zhangyis.db.storage.redo.RedoBudgetPurpose;
+import cn.zhangyis.db.storage.redo.RedoBudgetWorkload;
 import cn.zhangyis.db.storage.btree.BTreeRedoBudgetEstimator;
 import cn.zhangyis.db.storage.mtr.MiniTransactionState;
 import cn.zhangyis.db.storage.record.format.LogicalRecord;
@@ -27,6 +31,7 @@ import cn.zhangyis.db.storage.undo.UndoLogicalHead;
 import cn.zhangyis.db.storage.undo.UndoRecord;
 import cn.zhangyis.db.storage.undo.UndoRecordType;
 import cn.zhangyis.db.storage.undo.SecondaryUndoMutation;
+import cn.zhangyis.db.storage.record.type.ColumnValue;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -76,6 +81,8 @@ public final class PurgeCoordinator implements PurgeTarget {
     private final PurgeDmlRowGuardManager rowGuards;
     /** 从当前聚簇版本到目标 undo 的较新版本引用证明器；legacy 单聚簇模式允许为空。 */
     private final SecondaryPurgeSafetyChecker secondarySafety;
+    /** 消费 LV purge-old ownership 的页链服务；legacy/无 LOB binding 模式允许为空，但遇 ownership 必须 fail-closed。 */
+    private final LobStorage lobStorage;
     /** 仅包内测试可替换的 task-commit 故障接缝；生产始终为 no-op。 */
     private PurgeProgressFaultInjector faultInjector = PurgeProgressFaultInjector.NO_OP;
 
@@ -96,7 +103,7 @@ public final class PurgeCoordinator implements PurgeTarget {
                             SplitCapableBTreeIndexService btree,
                             BTreeIndex clusteredIndex) {
         this(mgr, system, history, undoAccess, finalizer, btree,
-                targetResolver(legacyResolver(clusteredIndex)), null, null, null);
+                targetResolver(legacyResolver(clusteredIndex)), null, null, null, null);
     }
 
     /**
@@ -116,7 +123,7 @@ public final class PurgeCoordinator implements PurgeTarget {
                             SplitCapableBTreeIndexService btree,
                             IndexMetadataResolver indexResolver) {
         this(mgr, system, history, undoAccess, finalizer, btree,
-                targetResolver(indexResolver), null, null, null);
+                targetResolver(indexResolver), null, null, null, null);
     }
 
     /**
@@ -141,6 +148,36 @@ public final class PurgeCoordinator implements PurgeTarget {
                             BTreeRootSnapshotService rootSnapshots,
                             PurgeDmlRowGuardManager rowGuards,
                             SecondaryPurgeSafetyChecker secondarySafety) {
+        this(mgr, system, history, undoAccess, finalizer, btree, targetResolver, rootSnapshots,
+                rowGuards, secondarySafety, null);
+    }
+
+    /**
+     * 构造完整生产 purge 协调器，使 secondary 清理、聚簇物理删除、LOB ownership 消费和 undo 进度持久化
+     * 共享同一 exact-version metadata 与 row guard 边界。{@code lobStorage} 可以为空以兼容没有 LOB 功能的旧装配；
+     * 但只要 undo LV tail 出现 purge-old ownership，执行期就会 fail-closed，绝不会静默泄漏页链。
+     *
+     * @param mgr             undo/index/记录进度短 MTR 的统一工厂和 redo admission 入口。
+     * @param system          active transaction 与 live ReadView 共同形成的 purge boundary 权威来源。
+     * @param history         page3 committed history 的运行时 FIFO 投影和 affected-table barrier owner。
+     * @param undoAccess      按 first-page/logical pointer 读取或 EXCLUSIVE 更新 undo segment 的访问端口。
+     * @param finalizer       logical head 已为空后原子摘除 history、释放 slot/segment owner 的终结器。
+     * @param btree           secondary/clustered 精确物理删除服务；每棵树使用独立短 MTR。
+     * @param targetResolver  按 undo 固定 table/index identity 返回 exact-version 索引与 LOB binding 的端口。
+     * @param rootSnapshots   结构删除前读取 root level 的服务；必须与 rowGuards、secondarySafety 同时配置或同时为空。
+     * @param rowGuards       与前台 DML/rollback 共享的行 guard；purge 只零等待，busy 时保留当前持久 head。
+     * @param secondarySafety 二级旧 identity 删除前沿聚簇版本链证明不再被较新版本使用的协作者。
+     * @param lobStorage      执行计划化批量 LOB free 的服务；无 LOB 功能时可为空，遇 LV ownership 时拒绝执行。
+     * @throws DatabaseValidationException 必需协作者缺失，或 secondary 三项只配置部分时抛出；不访问 history/页面。
+     */
+    public PurgeCoordinator(MiniTransactionManager mgr, TransactionSystem system, HistoryList history,
+                            UndoLogSegmentAccess undoAccess, UndoSegmentFinalizer finalizer,
+                            SplitCapableBTreeIndexService btree,
+                            UndoTargetMetadataResolver targetResolver,
+                            BTreeRootSnapshotService rootSnapshots,
+                            PurgeDmlRowGuardManager rowGuards,
+                            SecondaryPurgeSafetyChecker secondarySafety,
+                            LobStorage lobStorage) {
         if (mgr == null || system == null || history == null || undoAccess == null || finalizer == null
                 || btree == null || targetResolver == null) {
             throw new DatabaseValidationException("purge coordinator collaborators must not be null");
@@ -160,6 +197,7 @@ public final class PurgeCoordinator implements PurgeTarget {
         this.rootSnapshots = rootSnapshots;
         this.rowGuards = rowGuards;
         this.secondarySafety = secondarySafety;
+        this.lobStorage = lobStorage;
     }
 
     /**
@@ -212,61 +250,51 @@ public final class PurgeCoordinator implements PurgeTarget {
     }
 
     /**
-     * 处理一条 committed update undo log。
+     * 逐条处理一条 committed UPDATE undo log。每条记录的 secondary/clustered 清理完成后，旧 LOB ownership 与
+     * logical-head 前移在同一 MTR 中提交；因此 crash 重启只会从仍持久可达的 head 继续，不会再次释放已消费链。
      *
      * <p>数据流：</p>
      * <ol>
-     *     <li>短读并校验 first-page committed logical head，返回前释放 undo page latch。</li>
-     *     <li>沿 logical predecessor 链收集 exact-version record task；不扫描 detached 物理分支。</li>
-     *     <li>每条 record 零等待取得共享 row guard；busy 立即延后整条 log，history head 保持不变。</li>
-     *     <li>UPDATE/DELETE 的 secondary task 先做版本链安全判断并按需物理删除；DELETE clustered task 固定最后。</li>
-     *     <li>全部任务完成后才取得 history removal lease，由 finalizer 原子回收 undo owner 并发布 head removal。</li>
+     *     <li>循环短读 first-page 的 committed logical head；空头表示全部记录进度已持久化，可进入 finalization。</li>
+     *     <li>只物化当前 head record 及其直接前驱，冻结 exact-version secondary、LOB 和下一 logical-head 计划。</li>
+     *     <li>表级模式零等待取得共享 row guard，在 guard 内按 secondary、clustered 顺序执行幂等单树物理任务。</li>
+     *     <li>在独立记录进度 MTR 中先预检 logical-head CAS，再批量释放 purge-old LOB，最后写入前驱 head 并提交。</li>
+     *     <li>持久 head 为空后取得 history removal lease，由 finalizer 原子回收 undo owner 并发布队首摘除。</li>
      * </ol>
      *
-     * @param entry 当前物理 history 队首；creator/slot/first-page identity 必须与 persistent owner 一致。
-     * @return completed 时携带本 log 实际删除计数；row guard busy 时返回 deferred 且不摘除 history。
-     * @throws RuntimeException undo 链损坏、metadata 解析失败、版本链无法证明、物理状态冲突或 finalization 失败时抛出。
+     * @param entry 当前物理 history 队首；creator、slot、first-page identity 必须与 page3/undo owner 一致。
+     * @return completed 时携带本 log 实际删除计数；row guard busy 时返回 deferred，已提交的记录级进度不会回退。
+     * @throws DatabaseValidationException LV ownership 缺少 LOB wiring/binding 或表级任务缺共享 row guard 时抛出。
+     * @throws UndoLogFormatException undo state、creator、head、前驱单调性、metadata 或 old image 损坏时抛出。
+     * @throws PurgeProgressException LOB free 或 logical-head 写入已越过无 content-undo 边界后失败时抛出，worker 必须停止。
      */
     private PurgeLogOutcome purgeCommittedLog(HistoryEntry entry) {
-        // 1. 首个短 MTR 只取 logical head；不能用物理 slot/FIL NEXT 遍历，否则会重新消费 rolled-back 分支。
-        LogicalChainStart start;
-        MiniTransaction read = mgr.beginReadOnly();
-        try {
-            UndoLogSegment seg = undoAccess.open(read, entry.undoFirstPageId(), PageLatchMode.SHARED);
-            if (!seg.creatorTransactionId().equals(entry.creatorTrxId())) {
-                throw new UndoLogFormatException("purge history creator transaction "
-                        + entry.creatorTrxId().value() + " != undo segment creator "
-                        + seg.creatorTransactionId().value());
-            }
-            if (seg.undoKind() != UndoLogKind.UPDATE || !seg.isCommitted()) {
-                throw new UndoLogFormatException("purge history must reference a COMMITTED UPDATE undo log");
-            }
-            start = new LogicalChainStart(seg.logicalHead());
-            mgr.commit(read);
-        } catch (RuntimeException e) {
-            rollbackReadMtr(read, e);
-            throw e;
-        }
-
-        // 2. 全链先物化为不带页句柄的 exact-version task，随后才开始索引写。
-        List<PurgeRecordTask> tasks = collectTasks(entry, start.head());
-
         int removedClustered = 0;
         int removedSecondary = 0;
-        // 3. 每条业务记录独立零等待取得共享 row guard；busy 保留当前 log 的 history owner。
-        for (PurgeRecordTask task : tasks) {
-            if (task.secondaryTasks().isEmpty() && rowGuards == null) {
+        while (true) {
+            // 1. 每轮重新读取持久 head，使 crash 重试和本轮已提交 progress 使用完全相同的权威入口。
+            UndoLogicalHead head = readLogicalChainStart(entry).head();
+            if (head.isEmpty()) {
+                break;
+            }
+
+            // 2. 单条 task 冻结当前 record、直接前驱和所有 ownership；不把整条大事务 undo 链装入内存。
+            PurgeRecordTask task = buildHeadTask(entry, head);
+            if (rowGuards == null) {
+                requireLegacyTaskIsSelfContained(task);
                 removedClustered += purgeClustered(entry, task);
+                persistRecordProgress(entry, head, task);
                 continue;
             }
-            requireSecondaryWiring(task);
+
+            // 3. purge 不等待前台 DML/rollback；busy 时保留当前持久 head，下一批从同一 record 继续。
+            requireTableLevelWiring(task);
             Optional<PurgeDmlRowGuard> guard = rowGuards.tryAcquireForPurge(
                     task.record().tableId(), task.clusterKey());
             if (guard.isEmpty()) {
                 return PurgeLogOutcome.deferred(removedClustered, removedSecondary);
             }
             try (PurgeDmlRowGuard ignored = guard.orElseThrow()) {
-                // 4. 同一行 guard 内按 secondary 在前、clustered 在后的顺序执行多个独立短 MTR。
                 for (SecondaryTask secondaryTask : task.secondaryTasks()) {
                     SecondaryPurgeDecision decision = secondarySafety.evaluate(task.record(), task.rollPointer(),
                             task.target().tableIndexes(), secondaryTask.metadata());
@@ -277,10 +305,12 @@ public final class PurgeCoordinator implements PurgeTarget {
                 if (task.deleteClustered()) {
                     removedClustered += purgeClustered(entry, task);
                 }
+                // 4. row guard 覆盖索引清理到 head progress，防止同一主键在 ownership 交接窗口被前台重写。
+                persistRecordProgress(entry, head, task);
             }
         }
 
-        // 5. B+Tree 任务全部完成后才占用跨 IO history transition，避免慢索引清理阻塞其它 commit append。
+        // 5. finalizer 只接收 EMPTY logical head；记录级进度未完全持久化时不得释放 undo segment/slot。
         try (HistoryList.HeadRemovalLease lease = history.beginHeadRemoval(entry)) {
             finalizer.finalizePurgedHistory(entry, lease);
         }
@@ -288,69 +318,216 @@ public final class PurgeCoordinator implements PurgeTarget {
     }
 
     /**
-     * 沿持久 logical head 反向收集 UPDATE 旧 secondary key 与 DELETE 全 secondary+clustered 任务。
+     * 短读并校验 committed history entry 当前持久 logical head；返回对象不持有 page guard 或 latch。
      *
      * <p>数据流：</p>
      * <ol>
-     *     <li>从 header logical head 初始化 pointer 与严格下降的 undoNo 校验状态。</li>
-     *     <li>每跳用独立短 MTR 读取 record 和 exact-version target，校验首条 head undoNo、后续单调性与 creator identity。</li>
-     *     <li>对 UPDATE/DELETE 从 old image 按 mutation index-id 顺序重建 secondary physical key，并冻结 clustered 删除标志。</li>
-     *     <li>沿 prevRollPointer 前进直到 NULL；收集阶段不访问 B+Tree，不持有跨记录 undo latch。</li>
+     *     <li>创建只读 MTR，以 SHARED 模式打开 history first page。</li>
+     *     <li>核对 creator、UPDATE kind 与 COMMITTED 状态，拒绝 slot/history 指向错误 owner。</li>
+     *     <li>复制 logical head 后提交读 MTR，释放全部 undo page 资源。</li>
      * </ol>
      *
-     * @param entry history 队首，提供 first-page 与 creator identity。
-     * @param head  first-page header 中已校验的持久 logical chain 入口。
-     * @return 按 undo logical chain 新→旧顺序排列的不带页资源任务列表。
-     * @throws RuntimeException undo 链读失败、head/undoNo/creator 错配、metadata 无法 exact-version 解析或 old image 损坏时抛出。
+     * @param entry 当前 history 队首，提供 first page 与 creator identity。
+     * @return 当前持久 logical head 的不可变快照；可以是 {@link UndoLogicalHead#EMPTY}。
+     * @throws UndoLogFormatException segment owner、kind 或 state 与 committed history 不一致时抛出。
+     * @throws RuntimeException undo page 读取或只读 MTR 提交失败时抛出；释放失败保留为 suppressed。
      */
-    private List<PurgeRecordTask> collectTasks(HistoryEntry entry, UndoLogicalHead head) {
-        // 1. logical head 是唯一入口；previousUndoNo 只用于本次链内严格下降证明。
-        List<PurgeRecordTask> tasks = new ArrayList<>();
-        RollPointer pointer = head.rollPointer();
-        long previousUndoNo = 0L;
-        boolean first = true;
-        while (!pointer.isNull()) {
-            // 2. 每条 record 在独立读 MTR 中完全物化并解析 exact-version target。
-            ResolvedUndo recordAt = readLogicalRecord(entry.undoFirstPageId(), pointer);
-            UndoRecord record = recordAt.record();
-            long undoNo = record.undoNo().value();
-            if (first) {
-                if (undoNo != head.undoNo().value()) {
-                    throw new UndoLogFormatException("persistent purge head undoNo " + head.undoNo().value()
-                            + " resolves to " + undoNo);
-                }
-            } else if (undoNo >= previousUndoNo) {
-                throw new UndoLogFormatException("purge undo logical chain is not strictly descending: "
-                        + undoNo + " after " + previousUndoNo);
+    private LogicalChainStart readLogicalChainStart(HistoryEntry entry) {
+        // 1. 只读 MTR 不跨越 record/index/LOB 操作，确保 undo latch 生命周期最短。
+        MiniTransaction read = mgr.beginReadOnly();
+        try {
+            UndoLogSegment segment = undoAccess.open(read, entry.undoFirstPageId(), PageLatchMode.SHARED);
+            // 2. history/page3 的 creator 与 undo first-page state 必须描述同一个 committed UPDATE owner。
+            if (!segment.creatorTransactionId().equals(entry.creatorTrxId())) {
+                throw new UndoLogFormatException("purge history creator transaction "
+                        + entry.creatorTrxId().value() + " != undo segment creator "
+                        + segment.creatorTransactionId().value());
             }
-            if (!record.transactionId().equals(entry.creatorTrxId())) {
-                throw new UndoLogFormatException("purge undo record transaction "
-                        + record.transactionId().value() + " != history creator " + entry.creatorTrxId().value());
+            if (segment.undoKind() != UndoLogKind.UPDATE || !segment.isCommitted()) {
+                throw new UndoLogFormatException("purge history must reference a COMMITTED UPDATE undo log");
             }
-            // 3. 只有 UPDATE/DELETE 进入 committed history 物理清理；mutation 顺序由 codec/领域对象保证按 index id 递增。
-            if (record.type() == UndoRecordType.UPDATE_ROW || record.type() == UndoRecordType.DELETE_MARK) {
-                List<SecondaryTask> secondaryTasks = new ArrayList<>();
-                for (SecondaryUndoMutation mutation : record.secondaryMutations()) {
-                    SecondaryIndexMetadata metadata = recordAt.target().tableIndexes()
-                            .requireSecondary(mutation.indexId());
-                    LogicalRecord oldRow = new LogicalRecord(recordAt.target().tableIndexes().schemaVersion(),
-                            record.oldColumnValues(), false,
-                            cn.zhangyis.db.storage.record.format.RecordType.CONVENTIONAL,
-                            record.oldHiddenColumns());
-                    SearchKey physicalKey = metadata.layout().physicalKey(
-                            metadata.layout().toEntry(oldRow, true));
-                    secondaryTasks.add(new SecondaryTask(metadata, physicalKey));
-                }
-                tasks.add(new PurgeRecordTask(record, pointer, recordAt.target(),
-                        new SearchKey(record.clusterKey()), List.copyOf(secondaryTasks),
-                        record.type() == UndoRecordType.DELETE_MARK));
-            }
-            // 4. pointer 前进前保存本条 undoNo，下一跳必须严格更小；NULL 表示 logical chain 完整结束。
-            first = false;
-            previousUndoNo = undoNo;
-            pointer = record.prevRollPointer();
+            // 3. 提交后只返回值对象，禁止后续 B+Tree/LOB 工作继承 undo page latch/fix。
+            LogicalChainStart result = new LogicalChainStart(segment.logicalHead());
+            mgr.commit(read);
+            return result;
+        } catch (RuntimeException error) {
+            rollbackReadMtr(read, error);
+            throw error;
         }
-        return tasks;
+    }
+
+    /**
+     * 从持久 head 构造一条可执行 purge task，并只读取直接前驱来冻结下一 logical-head 的 exact-version 解码上下文。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>按 head pointer 读取当前 record/target，核对 undoNo、creator 和 UPDATE/DELETE 类型。</li>
+     *     <li>从旧 image 与 secondary mutation 构造按 index id 排序的完整二级 physical key。</li>
+     *     <li>从 LV purge-old ownership 和 authoritative table LOB binding 构造批量 free plan。</li>
+     *     <li>读取直接前驱并校验 undoNo 严格下降，冻结下一 head 及其 key/schema；NULL 前驱映射为空头。</li>
+     * </ol>
+     *
+     * @param entry 当前 history owner，提供 first page 和 creator identity。
+     * @param head  first-page header 中刚读取的非空持久 logical head。
+     * @return 不持有页资源的单记录 purge 任务，包含所有索引、LOB 与 head-progress 输入。
+     * @throws DatabaseValidationException head 为空、LV 缺 LOB wiring/binding 或 ownership ordinal/type 无效时抛出。
+     * @throws UndoLogFormatException head pointer、creator、record type 或前驱 undoNo 不满足逻辑链不变量时抛出。
+     */
+    private PurgeRecordTask buildHeadTask(HistoryEntry entry, UndoLogicalHead head) {
+        // 1. 当前 record 必须与 first-page 公开的 undoNo/pointer 和 history creator 完全一致。
+        if (head.isEmpty()) {
+            throw new DatabaseValidationException("purge head task requires a non-empty logical head");
+        }
+        ResolvedUndo current = readLogicalRecord(entry.undoFirstPageId(), head.rollPointer());
+        UndoRecord record = current.record();
+        if (!record.undoNo().equals(head.undoNo())) {
+            throw new UndoLogFormatException("persistent purge head undoNo " + head.undoNo().value()
+                    + " resolves to " + record.undoNo().value());
+        }
+        if (!record.transactionId().equals(entry.creatorTrxId())) {
+            throw new UndoLogFormatException("purge undo record transaction "
+                    + record.transactionId().value() + " != history creator " + entry.creatorTrxId().value());
+        }
+        if (record.type() != UndoRecordType.UPDATE_ROW && record.type() != UndoRecordType.DELETE_MARK) {
+            throw new UndoLogFormatException("committed UPDATE undo segment contains unsupported purge record: "
+                    + record.type());
+        }
+
+        // 2. old image 与 exact-version secondary layout 共同产生完整 physical identity；这里只冻结值，不改树。
+        List<SecondaryTask> secondaryTasks = new ArrayList<>();
+        for (SecondaryUndoMutation mutation : record.secondaryMutations()) {
+            SecondaryIndexMetadata metadata = current.target().tableIndexes().requireSecondary(mutation.indexId());
+            LogicalRecord oldRow = new LogicalRecord(current.target().tableIndexes().schemaVersion(),
+                    record.oldColumnValues(), false,
+                    cn.zhangyis.db.storage.record.format.RecordType.CONVENTIONAL,
+                    record.oldHiddenColumns());
+            SearchKey physicalKey = metadata.layout().physicalKey(metadata.layout().toEntry(oldRow, true));
+            secondaryTasks.add(new SecondaryTask(metadata, physicalKey));
+        }
+
+        // 3. LV 只授权 purge-old；reference identity 必须与 exact table LOB segment 交叉校验并冻结 redo workload。
+        Optional<LobFreeBatchPlan> lobFreePlan = planPurgeLobFree(record, current.target());
+
+        // 4. 直接前驱决定本条记录完成后的持久 head；跨表事务必须使用前驱自身 exact-version key/schema 校验。
+        UndoLogicalHead targetHead = UndoLogicalHead.EMPTY;
+        BTreeIndex targetHeadIndex = current.target().clusteredIndex();
+        if (!record.prevRollPointer().isNull()) {
+            ResolvedUndo predecessor = readLogicalRecord(entry.undoFirstPageId(), record.prevRollPointer());
+            if (!predecessor.record().transactionId().equals(entry.creatorTrxId())
+                    || predecessor.record().undoNo().value() >= record.undoNo().value()) {
+                throw new UndoLogFormatException("purge undo predecessor is not owned by creator or strictly older: current="
+                        + record.undoNo().value() + ", predecessor=" + predecessor.record().undoNo().value());
+            }
+            targetHead = new UndoLogicalHead(predecessor.record().undoNo(), record.prevRollPointer());
+            targetHeadIndex = predecessor.target().clusteredIndex();
+        }
+        return new PurgeRecordTask(record, head.rollPointer(), current.target(),
+                new SearchKey(record.clusterKey()), List.copyOf(secondaryTasks),
+                record.type() == UndoRecordType.DELETE_MARK, lobFreePlan, targetHead, targetHeadIndex);
+    }
+
+    /**
+     * 把单条 undo record 的 purge-old LV ownership 投影为 authoritative segment 下的批量 LOB free 计划。
+     * rollback-new ownership 属于事务回滚路径，committed purge 必须忽略；没有 purge-old ownership 时不要求接线 LOB。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>筛选声明 purge-old 的 LV 条目；空集合返回空计划且不访问 schema/segment。</li>
+     *     <li>要求生产已注入 LobStorage 且 exact-version target 提供 LOB segment，拒绝从 reference 猜授权。</li>
+     *     <li>按 ordinal 从 exact schema 取得列类型，并从 old image 取得 external envelope。</li>
+     *     <li>交给 LobStorage 校验类型、segment identity、重复 reference 并冻结动态 redo workload。</li>
+     * </ol>
+     *
+     * @param record 当前 UPDATE/DELETE undo record；old image 与 LV 已通过领域对象基本形状校验。
+     * @param target record 固定 table/index identity 解析出的 exact-version 索引与 LOB binding。
+     * @return 无 purge-old ownership 时为空；否则返回同一 authoritative segment 的不可变批量计划。
+     * @throws DatabaseValidationException 缺 LOB storage/binding、ordinal 越界或 old image 不是 external 时抛出。
+     * @throws RuntimeException external envelope 类型、segment identity 或重复 ownership 校验失败时由 LobStorage 抛出。
+     */
+    private Optional<LobFreeBatchPlan> planPurgeLobFree(UndoRecord record, UndoTargetMetadata target) {
+        // 1. committed purge 只消费旧版本 ownership；新版本 ownership 在提交后仍由当前聚簇记录持有。
+        List<cn.zhangyis.db.storage.undo.LobVersionOwnership> ownerships = record.lobVersionOwnerships().stream()
+                .filter(cn.zhangyis.db.storage.undo.LobVersionOwnership::purgeOldValue)
+                .toList();
+        if (ownerships.isEmpty()) {
+            return Optional.empty();
+        }
+        // 2. 物理释放授权只能来自 exact DD/table binding；legacy 无接线实例必须显式失败而不是泄漏。
+        if (lobStorage == null || target.lobSegment().isEmpty()) {
+            throw new DatabaseValidationException(
+                    "purge-old LOB ownership requires LobStorage and exact table LOB segment binding");
+        }
+        // 3. ordinal 同时定位 exact 列类型和 old image envelope；任何形状漂移都在写 MTR 前终止。
+        List<LobFreeTarget> targets = new ArrayList<>(ownerships.size());
+        for (var ownership : ownerships) {
+            int ordinal = ownership.columnOrdinal();
+            if (ordinal >= target.clusteredIndex().schema().columns().size()
+                    || ordinal >= record.oldColumnValues().size()
+                    || !(record.oldColumnValues().get(ordinal) instanceof ColumnValue.ExternalValue external)) {
+                throw new DatabaseValidationException(
+                        "purge-old LOB ownership does not match exact schema/old image at ordinal " + ordinal);
+            }
+            targets.add(new LobFreeTarget(ordinal,
+                    target.clusteredIndex().schema().column(ordinal).type(), external));
+        }
+        // 4. LobStorage 冻结稳定顺序、segment 交叉校验和整批 redo 上界；此阶段仍不读取或修改 LOB 页。
+        return Optional.of(lobStorage.planFreeBatch(target.lobSegment().orElseThrow(), targets));
+    }
+
+    /**
+     * 在单个记录级 MTR 中消费 purge-old LOB ownership，并把持久 logical head 从 expected 推进到直接前驱。
+     * 所有可预见 CAS/target 校验都在第一次 LOB/FSP 修改前完成；一旦越过物理边界，任何失败均升级为致命异常。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>按固定 header 余量与可选 LOB 批量计划申请动态 redo admission，创建独立写 MTR。</li>
+     *     <li>EXCLUSIVE 打开 undo first page，并预检 expected→target CAS 与 target record，不修改 header。</li>
+     *     <li>进入显式 latch-order scope，先释放全部 purge-old LOB 页链，再写 logical-head header。</li>
+     *     <li>提交 redo/pageLSN/dirty 后触发稳定故障接缝；重启将从新 head 继续，不会重复释放旧链。</li>
+     * </ol>
+     *
+     * @param entry    当前 committed history owner，用于定位 undo first page 和致命异常诊断。
+     * @param expected 当前 task 开始时读取的非空持久 logical head。
+     * @param task     已完成 exact metadata、LOB plan 和直接前驱冻结的单记录任务。
+     * @throws UndoLogicalHeadConflictException 预检发现 expected 已陈旧时抛出；没有发生 LOB/header 修改。
+     * @throws PurgeProgressException 第一次 LOB free/header 写开始后任一步失败时抛出；同进程不得普通重试。
+     * @throws RuntimeException redo admission、undo 打开或预检在物理边界前失败时原样抛出，MTR 资源会被释放。
+     */
+    private void persistRecordProgress(HistoryEntry entry, UndoLogicalHead expected, PurgeRecordTask task) {
+        // 1. progress 固定覆盖 first-page/target-record/header 余量；LOB 计划追加其精确 FSP/page workload。
+        RedoBudgetWorkload workload = RedoBudgetWorkload.pageImages(6L);
+        if (task.lobFreePlan().isPresent()) {
+            workload = workload.plus(task.lobFreePlan().orElseThrow().workload());
+        }
+        MiniTransaction progress = mgr.begin(mgr.budgetFor(RedoBudgetPurpose.PURGE_RECORD_PROGRESS, workload));
+        boolean physicalMutationStarted = false;
+        try {
+            // 2. first-page X latch 保护预检结果直至 header 提交；target page 也在同一 MTR 中完成真实性校验。
+            UndoLogSegment writable = undoAccess.open(progress, entry.undoFirstPageId(), PageLatchMode.EXCLUSIVE);
+            writable.validateLogicalHeadUpdate(expected, task.targetHead(),
+                    task.targetHeadIndex().keyDef(), task.targetHeadIndex().schema());
+            try (var ignored = progress.allowOutOfOrderPageLatch(
+                    "purge progress owns undo first-page before LOB/FSP; LOB/FSP never waits for undo pages")) {
+                // 3. 从这里开始页面内容没有 Java content undo：旧链 free 必须先于 head 发布，header 永不领先 ownership。
+                physicalMutationStarted = true;
+                if (task.lobFreePlan().isPresent()) {
+                    lobStorage.freePlannedBatch(progress, task.lobFreePlan().orElseThrow());
+                }
+                writable.updateLogicalHead(expected, task.targetHead(),
+                        task.targetHeadIndex().keyDef(), task.targetHeadIndex().schema());
+            }
+            // 4. commit 返回后新 head 是 crash recovery 的权威入口；故障接缝位于提交之外，模拟真正进程中断。
+            mgr.commit(progress);
+        } catch (RuntimeException error) {
+            rollbackReadMtr(progress, error);
+            if (physicalMutationStarted) {
+                throw new PurgeProgressException("purge record progress failed after physical mutation began: firstPage="
+                        + entry.undoFirstPageId() + ", undoNo=" + expected.undoNo().value(), error);
+            }
+            throw error;
+        }
+        faultInjector.onBoundary(PurgeProgressPhase.AFTER_RECORD_PROGRESS_COMMIT,
+                task.target().clusteredIndex().indexId());
     }
 
     /**
@@ -566,12 +743,12 @@ public final class PurgeCoordinator implements PurgeTarget {
     }
 
     /**
-     * 校验当前 task 需要的 secondary purge 协作者已经整体接线；legacy resolver 不得静默跳过 mutation。
+     * 校验表级 task 所需的 root snapshot、版本链证明和共享 row guard 已整体接线。
      *
-     * @param task 从 undo logical chain 收集的 record task。
-     * @throws DatabaseValidationException task 含 secondary mutation 但缺少 root/guard/safety，或表级 task 缺 row guard 时抛出。
+     * @param task 当前 exact-version undo record task；secondary 列表为空时仍要求 row guard 保护 LOB/head 交接窗口。
+     * @throws DatabaseValidationException secondary 协作者只配置部分，或当前协调器没有 row guard 时抛出。
      */
-    private void requireSecondaryWiring(PurgeRecordTask task) {
+    private void requireTableLevelWiring(PurgeRecordTask task) {
         if (!task.secondaryTasks().isEmpty()
                 && (rootSnapshots == null || rowGuards == null || secondarySafety == null)) {
             throw new DatabaseValidationException(
@@ -579,6 +756,20 @@ public final class PurgeCoordinator implements PurgeTarget {
         }
         if (rowGuards == null) {
             throw new DatabaseValidationException("table-level purge task requires shared row guards");
+        }
+    }
+
+    /**
+     * 限制旧单聚簇构造器只能处理不含 secondary/LOB ownership 的兼容记录。legacy 模式没有共享 row guard、
+     * exact LOB binding 或版本链证明，因此任何新尾部都必须 fail-closed，不能以“无需删除聚簇记录”为由跳过进度。
+     *
+     * @param task 从当前持久 head 构造的单记录任务。
+     * @throws DatabaseValidationException task 含 secondary 或 purge-old LOB 计划时抛出；history head 保持不变。
+     */
+    private void requireLegacyTaskIsSelfContained(PurgeRecordTask task) {
+        if (!task.secondaryTasks().isEmpty() || task.lobFreePlan().isPresent()) {
+            throw new DatabaseValidationException(
+                    "legacy purge wiring cannot consume secondary or LOB ownership");
         }
     }
 
@@ -626,10 +817,14 @@ public final class PurgeCoordinator implements PurgeTarget {
      * @param clusterKey      undo 固定前缀中的完整物化聚簇主键。
      * @param secondaryTasks  按 mutation index id 排序的二级物理任务。
      * @param deleteClustered DELETE_MARK 时为 true，UPDATE_ROW 时为 false。
+     * @param lobFreePlan     LV purge-old ownership 派生的可选批量释放计划。
+     * @param targetHead      当前记录完成后要发布的直接前驱或空 logical head。
+     * @param targetHeadIndex 非空 target record 的 exact-version 聚簇定义；空 target 使用当前 record 定义。
      */
     private record PurgeRecordTask(UndoRecord record, RollPointer rollPointer, UndoTargetMetadata target,
                                    SearchKey clusterKey, List<SecondaryTask> secondaryTasks,
-                                   boolean deleteClustered) {
+                                   boolean deleteClustered, Optional<LobFreeBatchPlan> lobFreePlan,
+                                   UndoLogicalHead targetHead, BTreeIndex targetHeadIndex) {
     }
 
     /**

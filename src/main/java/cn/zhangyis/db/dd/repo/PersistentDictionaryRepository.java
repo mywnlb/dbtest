@@ -33,6 +33,8 @@ public final class PersistentDictionaryRepository {
 
     private final InternalCatalogStore store;
     private final DictionaryCatalogCodec codec = new DictionaryCatalogCodec();
+    /** 与字典 mutation 共享物理 catalog、但独立解释 DDL_LOG batches 的阶段仓储。 */
+    private final PersistentDdlLogRepository ddlLog;
 
     /** 字典版本唯一 writer 临界区，不能跨出本 repository。 */
     private final ReentrantLock writerLock = new ReentrantLock();
@@ -45,7 +47,17 @@ public final class PersistentDictionaryRepository {
             throw new DatabaseValidationException("internal catalog store must not be null");
         }
         this.store = store;
+        this.ddlLog = new PersistentDdlLogRepository(store);
         this.snapshot = rebuild(store.readCommittedBatches());
+    }
+
+    /**
+     * 返回与本 repository 共享同一 durable catalog 的 DDL log 仓储。
+     *
+     * @return 单实例 phase CAS、跨重启重建且不把普通 DD batch 当 marker 的仓储。
+     */
+    public PersistentDdlLogRepository ddlLog() {
+        return ddlLog;
     }
 
     /** 创建指定 next version 的内部 Unit of Work；实际冲突在 commit 时重新验证。 */
@@ -168,19 +180,48 @@ public final class PersistentDictionaryRepository {
 
     private static void validateTableReplacement(TableDefinition before, TableDefinition after) {
         if (!before.schemaId().equals(after.schemaId()) || !before.name().equals(after.name())
-                || !before.columns().equals(after.columns()) || !before.indexes().equals(after.indexes())
-                || !before.storageBinding().equals(after.storageBinding())) {
+                || !before.columns().equals(after.columns())) {
             throw new DictionaryVersionConflictException(
-                    "table lifecycle replacement cannot change identity/schema/storage binding");
+                    "table replacement cannot change identity or columns");
         }
-        boolean valid = before.state() == cn.zhangyis.db.dd.domain.TableState.ACTIVE
+        boolean lifecycle = before.indexes().equals(after.indexes())
+                && before.storageBinding().equals(after.storageBinding())
+                && (before.state() == cn.zhangyis.db.dd.domain.TableState.ACTIVE
                 && after.state() == cn.zhangyis.db.dd.domain.TableState.DROP_PENDING
                 || before.state() == cn.zhangyis.db.dd.domain.TableState.DROP_PENDING
-                && after.state() == cn.zhangyis.db.dd.domain.TableState.DROPPED;
-        if (!valid) {
+                && after.state() == cn.zhangyis.db.dd.domain.TableState.DROPPED);
+        boolean addSecondaryIndex = exactSecondaryIndexAddition(before, after);
+        if (!lifecycle && !addSecondaryIndex) {
             throw new DictionaryVersionConflictException("invalid table lifecycle transition: "
                     + before.state() + " -> " + after.state());
         }
+    }
+
+    /**
+     * 精确识别 CREATE INDEX 的 ACTIVE→ACTIVE aggregate 替换。已有逻辑/物理索引必须保持顺序与 identity，
+     * 只允许在尾部追加一个非聚簇索引及同 id binding，且 row format、space、path、LOB 均不得改变。
+     */
+    private static boolean exactSecondaryIndexAddition(TableDefinition before, TableDefinition after) {
+        if (before.state() != cn.zhangyis.db.dd.domain.TableState.ACTIVE
+                || after.state() != cn.zhangyis.db.dd.domain.TableState.ACTIVE
+                || after.indexes().size() != before.indexes().size() + 1
+                || !after.indexes().subList(0, before.indexes().size()).equals(before.indexes())
+                || after.indexes().getLast().clustered()
+                || before.storageBinding().isEmpty() || after.storageBinding().isEmpty()) {
+            return false;
+        }
+        var oldBinding = before.storageBinding().orElseThrow();
+        var newBinding = after.storageBinding().orElseThrow();
+        if (oldBinding.tableId() != newBinding.tableId()
+                || !oldBinding.spaceId().equals(newBinding.spaceId())
+                || !oldBinding.path().equals(newBinding.path())
+                || oldBinding.rowFormatVersion() != newBinding.rowFormatVersion()
+                || !oldBinding.lobSegment().equals(newBinding.lobSegment())
+                || newBinding.indexes().size() != oldBinding.indexes().size() + 1
+                || !newBinding.indexes().subList(0, oldBinding.indexes().size()).equals(oldBinding.indexes())) {
+            return false;
+        }
+        return after.indexes().getLast().id().value() == newBinding.indexes().getLast().indexId();
     }
 
     private DictionarySnapshot rebuild(List<CatalogBatch> batches) {

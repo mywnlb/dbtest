@@ -275,6 +275,8 @@ final class DictionaryCatalogCodec {
                     writeSegment(out, binding.lobSegment().orElseThrow(() ->
                             new DictionaryCatalogCorruptionException("present LOB segment unexpectedly missing")));
                 }
+                // metadata-only DDL 必须保留物理 record schema version，不能再从新 DD version 推导。
+                out.writeLong(binding.rowFormatVersion());
             }
         });
     }
@@ -312,6 +314,7 @@ final class DictionaryCatalogCodec {
                 }
                 // 扩展前的 catalog 在最后一个 index binding 后立即 EOF；这是唯一兼容判据，不能按 DD version 猜测。
                 Optional<SegmentRef> lobSegment = Optional.empty();
+                long rowFormatVersion = version.value();
                 if (in.available() > 0) {
                     int hasLobSegment = in.readUnsignedByte();
                     if (hasLobSegment > 1) {
@@ -321,8 +324,16 @@ final class DictionaryCatalogCodec {
                     if (hasLobSegment == 1) {
                         lobSegment = Optional.of(readSegment(in, spaceId));
                     }
+                    // LOB 扩展版 payload 到此 EOF；新版本再追加固定 long，形状之外的尾部一律视为损坏。
+                    if (in.available() == Long.BYTES) {
+                        rowFormatVersion = in.readLong();
+                    } else if (in.available() != 0) {
+                        throw new DictionaryCatalogCorruptionException(
+                                "invalid table row-format version tail length: " + in.available());
+                    }
                 }
-                binding = Optional.of(new TableStorageBinding(id.value(), spaceId, path, bindings, lobSegment));
+                binding = Optional.of(new TableStorageBinding(
+                        id.value(), spaceId, path, rowFormatVersion, bindings, lobSegment));
             }
             return new TableRoot(id, schemaId, name, version, TableState.values()[stateCode],
                     columnCount, indexCount, binding);

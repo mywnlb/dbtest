@@ -13,15 +13,15 @@ import cn.zhangyis.db.storage.record.page.SearchKey;
 import cn.zhangyis.db.storage.record.type.ColumnValue;
 import cn.zhangyis.db.storage.record.type.TypeCodecRegistry;
 import cn.zhangyis.db.storage.trx.lock.LockManager;
-import cn.zhangyis.db.storage.trx.lock.SecondaryUniqueKeyLockKey;
+import cn.zhangyis.db.storage.trx.lock.SecondaryLogicalKeyLockKey;
 import cn.zhangyis.db.storage.trx.lock.TransactionLockMode;
 
 import java.util.List;
 
 /**
- * 二级 entry 发布前的事务锁与物理候选检查。logical unique 非 NULL key 先取得 collation/prefix 归一化的
- * {@link SecondaryUniqueKeyLockKey} X 锁并持有到事务终态，再扫描包括 delete-marked 的 logical prefix；
- * 非唯一或含 NULL 的 key 只检查同一完整物理 identity，以支持 A->B->A 的 revive。
+ * 二级 entry 发布前的事务锁与物理候选检查。所有非 NULL logical key 先取得 collation/prefix 归一化的
+ * {@link SecondaryLogicalKeyLockKey} X 锁并持有到事务终态，使 non-unique locking range 与 DML 使用同一稳定资源；
+ * logical unique 再扫描完整 prefix，非唯一或含 NULL 的 key 只检查同一完整物理 identity。
  *
  * <p>该 logical-key 锁是教学实现对 InnoDB unique-prefix next-key/gap 锁的稳定等价抽象：它不依赖瞬时 page/heapNo，
  * 但仍进入同一个 LockManager/Wait-For Graph，并由事务终态统一释放。</p>
@@ -44,7 +44,7 @@ public final class SecondaryUniqueCheckService {
      *
      * @param mtrManager 短只读 MTR 的唯一工厂，负责页 fix/latch memo 的提交或异常释放。
      * @param btree      执行 including-deleted exact lookup 与 logical-prefix scan 的 B+Tree 服务。
-     * @param lockManager 保存 logical unique X 锁直到事务终态的统一锁目录。
+     * @param lockManager 保存 logical-prefix S/X 锁直到事务终态的统一锁目录。
      * @param registry   与目标 B+Tree comparator 一致的类型 codec/collation 注册表。
      * @throws DatabaseValidationException 任一协作者为空时抛出，防止锁判等和页比较使用不同配置。
      */
@@ -68,7 +68,7 @@ public final class SecondaryUniqueCheckService {
      * <p>数据流：</p>
      * <ol>
      *     <li>由 exact-version layout 投影 entry/logical/physical key，校验请求与行 schema。</li>
-     *     <li>logical unique 且所有 part 非 NULL 时，先取得归一化 logical-key REC_X；等待期间不持 page latch/MTR。</li>
+     *     <li>所有非 NULL logical key 先取得归一化 REC_X；等待期间不持 page latch/MTR，并与 locking range 共用资源。</li>
      *     <li>用短只读 MTR 扫描 logical prefix（unique）或 exact physical key（非 unique/NULL），包含 marked 候选。</li>
      *     <li>其它主键或同物理 key live 均返回 duplicate；同物理 key marked 返回 DELETE_MARKED，否则 ABSENT。</li>
      * </ol>
@@ -92,13 +92,8 @@ public final class SecondaryUniqueCheckService {
         SearchKey physicalKey = metadata.layout().physicalKey(targetEntry);
         boolean containsNull = logicalKey.values().stream().anyMatch(ColumnValue.NullValue.class::isInstance);
 
-        // 2. 非 NULL logical unique key 先取事务级等价锁；成功 handle 留在 LockManager，随事务 commit/rollback 释放。
-        if (metadata.logicalUnique() && !containsNull) {
-            String token = tokenFactory.create(metadata, logicalKey);
-            lockManager.acquire(request.owner(),
-                    new SecondaryUniqueKeyLockKey(metadata.index().indexId(), token),
-                    TransactionLockMode.REC_X, request.lockWaitTimeout());
-        }
+        // 2. 所有非 NULL logical key 都与 range locking read 共用稳定 X 资源；NULL 不参与 SQL '=' 范围。
+        lockLogicalKey(metadata, logicalKey, request);
 
         // 3. 页读取只存在于独立只读 MTR；异常时显式 rollback 释放 fix/latch。
         MiniTransaction read = mtrManager.beginReadOnly();
@@ -130,5 +125,40 @@ public final class SecondaryUniqueCheckService {
             }
             throw error;
         }
+    }
+
+    /**
+     * 为 DML 即将发布或标记的 non-NULL logical secondary key 申请事务级 X 锁。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 metadata、logical key 与 current-read request，且 part 数与 layout 完全一致。</li>
+     *     <li>若任一 part 为 SQL NULL，直接返回；NULL equality 不形成可读取 prefix range。</li>
+     *     <li>按 type/prefix/collation 生成稳定 token，在不持 page latch/MTR 时向 LockManager 申请 REC_X。</li>
+     *     <li>成功锁保持到事务终态；timeout/deadlock 由 LockManager 清理等待状态并抛出领域异常。</li>
+     * </ol>
+     *
+     * @param metadata   exact-version secondary metadata。
+     * @param logicalKey 从完整行按 layout 投影出的 logical key。
+     * @param request    真实事务 owner 与有界等待参数。
+     * @throws DatabaseValidationException 参数缺失或 key part 数与 metadata 不一致时抛出。
+     */
+    public void lockLogicalKey(SecondaryIndexMetadata metadata, SearchKey logicalKey,
+                               cn.zhangyis.db.storage.btree.BTreeCurrentReadRequest request) {
+        // 1. identity 必须来自同一 exact layout，不能让部分 key 获得错误的粗粒度资源。
+        if (metadata == null || logicalKey == null || request == null
+                || logicalKey.size() != metadata.layout().logicalKeyPartCount()) {
+            throw new DatabaseValidationException("secondary logical lock metadata/key/request mismatch");
+        }
+        // 2. SQL NULL equality 为空；DML 对含 NULL unique key 仍允许多行，不制造错误冲突。
+        if (logicalKey.values().stream().anyMatch(ColumnValue.NullValue.class::isInstance)) {
+            return;
+        }
+        // 3. token 与 B+Tree comparator 共享 registry，大小写/前缀等价值必定落到同一锁 identity。
+        String token = tokenFactory.create(metadata, logicalKey);
+        lockManager.acquire(request.owner(),
+                new SecondaryLogicalKeyLockKey(metadata.index().indexId(), token),
+                TransactionLockMode.REC_X, request.lockWaitTimeout());
+        // 4. 不关闭 handle；事务 commit/rollback 的 releaseAll 是唯一成功释放边界。
     }
 }

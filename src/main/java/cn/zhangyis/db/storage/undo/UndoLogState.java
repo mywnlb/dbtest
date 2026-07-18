@@ -4,6 +4,8 @@ package cn.zhangyis.db.storage.undo;
 public enum UndoLogState {
     /** 事务仍可能回滚，history links 必须为空。 */
     ACTIVE,
+    /** XA phase one 已持久化，仍有事务 owner且不得进入 history/purge。 */
+    PREPARED,
     /** UPDATE undo 已提交并且必须出现在持久 history 链中。 */
     COMMITTED,
     /** 无事务 owner、由 page3 cache stack 持有的空单页 segment。 */
@@ -14,6 +16,7 @@ public enum UndoLogState {
     static UndoLogState fromPhysical(int state) {
         return switch (state) {
             case UndoPageLayout.STATE_ACTIVE -> ACTIVE;
+            case UndoPageLayout.STATE_PREPARED -> PREPARED;
             case UndoPageLayout.STATE_COMMITTED -> COMMITTED;
             case UndoPageLayout.STATE_CACHED -> CACHED;
             case UndoPageLayout.STATE_FREE -> FREE;

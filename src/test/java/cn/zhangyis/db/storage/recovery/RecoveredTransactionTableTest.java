@@ -102,17 +102,68 @@ class RecoveredTransactionTableTest {
                 () -> table.accept(range(120, 140), rolledBack));
     }
 
-    /** PREPARED 有稳定磁盘 code，但 v1 没有 XA 决议器，不能猜测 commit/rollback。 */
+    /** phase-one redo 必须发布可继续决议的 PREPARED 恢复状态，而不是在证据收集阶段提前 fail closed。 */
     @Test
-    void preparedEvidenceIsFatalWithoutXaCoordinator() {
+    void preparedEvidenceIsRetainedForXaDecision() {
         RecoveredTransactionTable table = table();
         TransactionStateDeltaRecord prepared = new TransactionStateDeltaRecord(
+                TransactionId.of(7), TransactionStateDeltaState.ACTIVE,
+                TransactionStateDeltaState.PREPARED, TransactionNo.NONE,
+                TransactionStateDeltaReason.PREPARE);
+
+        table.accept(range(100, 120), prepared);
+
+        RecoveredTransactionEntry entry = table.snapshot()
+                .entry(TransactionId.of(7)).orElseThrow();
+        assertEquals(RecoveredTransactionState.PREPARED, entry.state());
+        assertEquals(TransactionNo.NONE, entry.transactionNo());
+        assertEquals(TransactionStateDeltaReason.PREPARE, entry.terminalReason().orElseThrow());
+    }
+
+    /** PREPARED 不是 terminal；相邻 phase-two commit 必须推进为带提交号的 COMMITTED。 */
+    @Test
+    void preparedMayAdvanceToCommitted() {
+        RecoveredTransactionTable table = table();
+        table.accept(range(100, 120), prepared(7));
+        table.accept(range(120, 140), new TransactionStateDeltaRecord(
+                TransactionId.of(7), TransactionStateDeltaState.PREPARED,
+                TransactionStateDeltaState.COMMITTED, TransactionNo.of(3),
+                TransactionStateDeltaReason.PREPARED_COMMIT));
+
+        RecoveredTransactionEntry entry = table.snapshot()
+                .entry(TransactionId.of(7)).orElseThrow();
+        assertEquals(RecoveredTransactionState.COMMITTED, entry.state());
+        assertEquals(TransactionNo.of(3), entry.transactionNo());
+    }
+
+    /** PREPARED rollback 不携带提交号，并产生可幂等重放的 ROLLED_BACK 终态。 */
+    @Test
+    void preparedMayAdvanceToRolledBack() {
+        RecoveredTransactionTable table = table();
+        table.accept(range(100, 120), prepared(7));
+        TransactionStateDeltaRecord rolledBack = new TransactionStateDeltaRecord(
+                TransactionId.of(7), TransactionStateDeltaState.PREPARED,
+                TransactionStateDeltaState.ROLLED_BACK, TransactionNo.NONE,
+                TransactionStateDeltaReason.PREPARED_ROLLBACK);
+
+        table.accept(range(120, 140), rolledBack);
+        table.accept(range(140, 160), rolledBack);
+
+        assertEquals(RecoveredTransactionState.ROLLED_BACK,
+                table.snapshot().entry(TransactionId.of(7)).orElseThrow().state());
+    }
+
+    /** PREPARED tuple 使用普通 COMMIT reason 会混淆 phase one/phase two，CRC 合法也必须拒绝。 */
+    @Test
+    void preparedWithOrdinaryCommitReasonIsFatal() {
+        RecoveredTransactionTable table = table();
+        TransactionStateDeltaRecord invalid = new TransactionStateDeltaRecord(
                 TransactionId.of(7), TransactionStateDeltaState.ACTIVE,
                 TransactionStateDeltaState.PREPARED, TransactionNo.NONE,
                 TransactionStateDeltaReason.COMMIT);
 
         assertThrows(TransactionRecoveryException.class,
-                () -> table.accept(range(100, 120), prepared));
+                () -> table.accept(range(100, 120), invalid));
     }
 
     /** CRC 合法不等于状态机合法；v1 只接受实际 producer 会写出的 terminal tuple。 */
@@ -168,6 +219,13 @@ class RecoveredTransactionTableTest {
                 TransactionId.of(transactionId), TransactionStateDeltaState.ACTIVE,
                 TransactionStateDeltaState.COMMITTED, TransactionNo.of(transactionNo),
                 TransactionStateDeltaReason.COMMIT);
+    }
+
+    private static TransactionStateDeltaRecord prepared(long transactionId) {
+        return new TransactionStateDeltaRecord(
+                TransactionId.of(transactionId), TransactionStateDeltaState.ACTIVE,
+                TransactionStateDeltaState.PREPARED, TransactionNo.NONE,
+                TransactionStateDeltaReason.PREPARE);
     }
 
     private static LogRange range(long start, long end) {

@@ -786,6 +786,105 @@ class UndoLogManagerTest {
         });
     }
 
+    /**
+     * mixed transaction 的两个 first page 必须在一个 phase-one MTR 中一起进入 PREPARED，slot owner保持不变。
+     */
+    @Test
+    void onPrepareMarksAllUndoLogsAndWritesOnePhaseOneDelta() {
+        onPool(h -> {
+            Transaction transaction = h.txnMgr.begin(TransactionOptions.defaults());
+            TransactionId creator = h.txnMgr.assignWriteId(transaction);
+            MiniTransaction write = h.mgr.begin();
+            RollPointer insert = UndoTestWrites.insert(
+                    h.undoMgr, transaction, write, TABLE_ID, INDEX_ID, keyOf(100), keyDef(), schema());
+            UndoTestWrites.update(h.undoMgr, transaction, write, TABLE_ID, INDEX_ID, keyOf(100),
+                    List.of(new ColumnValue.IntValue(100)), new HiddenColumns(creator, insert),
+                    keyDef(), schema());
+            h.mgr.commit(write);
+
+            Lsn preparedTo = h.undoMgr.onPrepare(transaction);
+
+            assertTrue(preparedTo.value() > 0L);
+            assertEquals(2, h.slots.activeSlotCount(), "prepare must retain both page3 owners");
+            for (UndoLogBinding binding : transaction.undoContext().bindings()) {
+                MiniTransaction read = h.mgr.beginReadOnly();
+                UndoLogSegment segment = h.access.open(read, binding.firstPageId(), PageLatchMode.SHARED);
+                assertTrue(segment.isPrepared());
+                assertEquals(cn.zhangyis.db.domain.TransactionNo.NONE,
+                        segment.committedTransactionNo());
+                h.mgr.commit(read);
+            }
+            List<TransactionStateDeltaRecord> phaseOne = h.mgr.redoLogManager().bufferedRecords().stream()
+                    .filter(TransactionStateDeltaRecord.class::isInstance)
+                    .map(TransactionStateDeltaRecord.class::cast)
+                    .filter(delta -> delta.transactionId().equals(creator)
+                            && delta.toState() == TransactionStateDeltaState.PREPARED)
+                    .toList();
+            assertEquals(1, phaseOne.size());
+            assertEquals(TransactionStateDeltaReason.PREPARE, phaseOne.getFirst().reason());
+        });
+    }
+
+    /** v1 只 prepare 已有普通 undo 的写分支；无 undo 分支应由上层按 read-only/one-phase 完成。 */
+    @Test
+    void onPrepareRejectsWriteIdWithoutUndoContext() {
+        onPool(h -> {
+            Transaction transaction = h.txnMgr.begin(TransactionOptions.defaults());
+            h.txnMgr.assignWriteId(transaction);
+
+            assertThrows(TransactionStateException.class,
+                    () -> h.undoMgr.onPrepare(transaction));
+            assertEquals(TransactionState.ACTIVE, transaction.state());
+        });
+    }
+
+    /**
+     * prepared mixed commit 必须同批 drop INSERT owner、把 UPDATE 挂入 history，并写独立 phase-two terminal delta。
+     */
+    @Test
+    void onCommitPreparedFinalizesMixedUndoAndPublishesHistory() {
+        onPool(h -> {
+            Transaction transaction = h.txnMgr.begin(TransactionOptions.defaults());
+            TransactionId creator = h.txnMgr.assignWriteId(transaction);
+            MiniTransaction write = h.mgr.begin();
+            RollPointer insert = UndoTestWrites.insert(
+                    h.undoMgr, transaction, write, TABLE_ID, INDEX_ID, keyOf(100), keyDef(), schema());
+            UndoTestWrites.update(h.undoMgr, transaction, write, TABLE_ID, INDEX_ID, keyOf(100),
+                    List.of(new ColumnValue.IntValue(100)), new HiddenColumns(creator, insert),
+                    keyDef(), schema());
+            h.mgr.commit(write);
+
+            h.undoMgr.onPrepare(transaction);
+            h.txnMgr.finishPrepare(transaction);
+            h.txnMgr.prepareCommitPrepared(transaction);
+            UndoLogBinding update = transaction.undoContext().binding(UndoLogKind.UPDATE);
+
+            h.undoMgr.onCommitPrepared(transaction);
+
+            assertEquals(TransactionState.PREPARED, transaction.state(),
+                    "physical phase two must not publish live terminal state");
+            assertEquals(1, h.slots.activeSlotCount(),
+                    "prepared INSERT owner is dropped while UPDATE remains a committed history owner");
+            assertEquals(1, h.history.committedSize());
+            assertEquals(update.firstPageId(), h.history.snapshot().getFirst().undoFirstPageId());
+            MiniTransaction read = h.mgr.beginReadOnly();
+            UndoLogSegment committed = h.access.open(read, update.firstPageId(), PageLatchMode.SHARED);
+            assertTrue(committed.isCommitted());
+            assertEquals(transaction.transactionNo(), committed.committedTransactionNo());
+            h.mgr.commit(read);
+            assertTrue(h.mgr.redoLogManager().bufferedRecords().stream()
+                    .anyMatch(record -> record instanceof TransactionStateDeltaRecord delta
+                            && delta.transactionId().equals(creator)
+                            && delta.fromState() == TransactionStateDeltaState.PREPARED
+                            && delta.toState() == TransactionStateDeltaState.COMMITTED
+                            && delta.transactionNo().equals(transaction.transactionNo())
+                            && delta.reason() == TransactionStateDeltaReason.PREPARED_COMMIT));
+
+            h.txnMgr.commitPrepared(transaction);
+            assertEquals(TransactionState.COMMITTED, transaction.state());
+        });
+    }
+
     @Test
     void onCommitWritesTransactionStateRedoInCommitMtr() {
         onPool(h -> {

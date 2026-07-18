@@ -1,5 +1,9 @@
 # Data Dictionary + Physical DDL v1
 
+> Historical slice boundary: 本片在 2026-07-15 完成。其当时列出的 `DdlId/DDL_LOG` gap 已于
+> 2026-07-17 由 `mysql-ddl-log-undo-marker-design.md` 落地；当前事实以源码和
+> `current-implementation-map.md` 为准。
+
 ## Goal
 
 - 提供可持久化、可恢复的 schema/table/index 字典最小闭环。

@@ -16,8 +16,9 @@ import java.util.Optional;
 /**
  * checkpoint/redo snapshot 与 page3 undo slot 的纯内存交叉校验器。
  *
- * <p>COMMITTED 无 post-checkpoint redo 时，仅 baseline 已覆盖 creator id 与 commit no 才接受；ACTIVE 只要与
- * terminal/PREPARED 证据冲突就拒绝。该对象无共享状态，所有 page latch 已由调用方在进入本方法前释放。
+ * <p>COMMITTED 无 post-checkpoint redo 时，仅 baseline 已覆盖 creator id 与 commit no 才接受；PREPARED
+ * 在 baseline 覆盖 creator id 时可由 checksum-protected first-page 恢复。ACTIVE 与任何 terminal/PREPARED
+ * 证据冲突都拒绝。该对象无共享状态，所有 page latch 已由调用方在进入本方法前释放。
  */
 public final class RecoveredTransactionReconciler {
 
@@ -32,6 +33,7 @@ public final class RecoveredTransactionReconciler {
         Map<TransactionId, RecoveredTransactionEntry> merged =
                 new LinkedHashMap<>(redoSnapshot.entries());
         List<RecoveredUndoSlotEvidence> active = new ArrayList<>();
+        List<RecoveredUndoSlotEvidence> prepared = new ArrayList<>();
         List<RecoveredUndoSlotEvidence> committed = new ArrayList<>();
         validateCreatorGroups(page3Slots);
         long nextId = redoSnapshot.nextTransactionId().value();
@@ -44,13 +46,20 @@ public final class RecoveredTransactionReconciler {
             nextId = Math.max(nextId, increment(slot.creatorTransactionId().value(), "transaction id"));
             Optional<RecoveredTransactionEntry> redoEntry =
                     Optional.ofNullable(merged.get(slot.creatorTransactionId()));
-            if (slot.state() == RecoveredUndoState.ACTIVE) {
-                reconcileActive(slot, redoEntry, recoveredToLsn, merged);
-                active.add(slot);
-            } else {
-                reconcileCommitted(slot, redoEntry, redoSnapshot, recoveredToLsn, merged);
-                nextNo = Math.max(nextNo, increment(slot.transactionNo().value(), "transaction no"));
-                committed.add(slot);
+            switch (slot.state()) {
+                case ACTIVE -> {
+                    reconcileActive(slot, redoEntry, recoveredToLsn, merged);
+                    active.add(slot);
+                }
+                case PREPARED -> {
+                    reconcilePrepared(slot, redoEntry, redoSnapshot, recoveredToLsn, merged);
+                    prepared.add(slot);
+                }
+                case COMMITTED -> {
+                    reconcileCommitted(slot, redoEntry, redoSnapshot, recoveredToLsn, merged);
+                    nextNo = Math.max(nextNo, increment(slot.transactionNo().value(), "transaction no"));
+                    committed.add(slot);
+                }
             }
         }
 
@@ -58,7 +67,7 @@ public final class RecoveredTransactionReconciler {
                 redoSnapshot.baselineCheckpointLsn(),
                 redoSnapshot.baselineNextTransactionId(), redoSnapshot.baselineNextTransactionNo(),
                 TransactionId.of(nextId), TransactionNo.of(nextNo), merged);
-        return new RecoveredTransactionReconciliation(snapshot, active, committed);
+        return new RecoveredTransactionReconciliation(snapshot, active, prepared, committed);
     }
 
     /** 一个 creator 最多各有一条 INSERT/UPDATE ACTIVE log；COMMITTED 只能是单独的 UPDATE log。 */
@@ -80,8 +89,12 @@ public final class RecoveredTransactionReconciler {
                     .anyMatch(slot -> slot.state() == RecoveredUndoState.ACTIVE);
             boolean hasCommitted = group.getValue().values().stream()
                     .anyMatch(slot -> slot.state() == RecoveredUndoState.COMMITTED);
-            if (hasActive && hasCommitted) {
-                throw new TransactionRecoveryException("recovered transaction mixes ACTIVE and COMMITTED undo: "
+            boolean hasPrepared = group.getValue().values().stream()
+                    .anyMatch(slot -> slot.state() == RecoveredUndoState.PREPARED);
+            int stateCount = (hasActive ? 1 : 0) + (hasPrepared ? 1 : 0) + (hasCommitted ? 1 : 0);
+            if (stateCount > 1) {
+                throw new TransactionRecoveryException(
+                        "recovered transaction mixes ACTIVE/PREPARED/COMMITTED undo: "
                         + group.getKey().value());
             }
             if (hasCommitted && group.getValue().size() != 1) {
@@ -136,6 +149,36 @@ public final class RecoveredTransactionReconciler {
         }
         merged.put(slot.creatorTransactionId(), page3Entry(
                 slot, RecoveredTransactionState.COMMITTED, recoveredToLsn));
+    }
+
+    /**
+     * 合并 PREPARED first-page 证据。post-checkpoint redo 存在时必须精确同态；redo 已被 checkpoint 回收时，
+     * baseline 必须覆盖 creator id，避免把 checkpoint 之后凭空出现的损坏 header 当作合法 phase one。
+     */
+    private static void reconcilePrepared(
+            RecoveredUndoSlotEvidence slot,
+            Optional<RecoveredTransactionEntry> redoEntry,
+            RecoveredTransactionSnapshot snapshot,
+            Lsn recoveredToLsn,
+            Map<TransactionId, RecoveredTransactionEntry> merged) {
+        if (redoEntry.isPresent()) {
+            RecoveredTransactionEntry evidence = redoEntry.orElseThrow();
+            if (evidence.state() != RecoveredTransactionState.PREPARED
+                    || !evidence.transactionNo().isNone()) {
+                throw new TransactionRecoveryException(
+                        "PREPARED page3 slot conflicts with redo evidence: transaction="
+                                + slot.creatorTransactionId().value() + ", redo=" + evidence);
+            }
+            return;
+        }
+        if (slot.creatorTransactionId().value() >= snapshot.baselineNextTransactionId().value()) {
+            throw new TransactionRecoveryException(
+                    "PREPARED page3 slot has no redo phase-one evidence and is not covered by checkpoint baseline: "
+                            + "transaction=" + slot.creatorTransactionId().value()
+                            + ", baselineNextId=" + snapshot.baselineNextTransactionId().value());
+        }
+        merged.put(slot.creatorTransactionId(), page3Entry(
+                slot, RecoveredTransactionState.PREPARED, recoveredToLsn));
     }
 
     private static RecoveredTransactionEntry page3Entry(

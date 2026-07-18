@@ -16,7 +16,7 @@ public enum PageType {
     IBUF_BITMAP(2),
     /** page 2：segment inode array。 */
     INODE(3),
-    /** page 3：序列化数据字典（保留）。 */
+    /** GENERAL 表空间 page 3：序列化数据字典 v1；UNDO 表空间 page3 另用 RSEG_HEADER。 */
     SDI(4),
     /** B+Tree 索引页。 */
     INDEX(5),

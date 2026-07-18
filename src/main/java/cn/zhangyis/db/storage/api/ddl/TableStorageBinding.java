@@ -11,13 +11,31 @@ import java.util.Optional;
 import java.util.Set;
 
 /**
- * DD catalog 持久化的 table→tablespace/index/LOB 物理绑定。LOB segment 是表级共享资源：只有 LOB-capable 表的新
- * catalog 才携带；旧 catalog 允许为空，但普通 DML 不得在缺失时临时创建 segment。
+ * DD catalog 持久化的 table→tablespace/index/LOB 物理绑定。{@code rowFormatVersion} 是聚簇记录编码格式，
+ * metadata-only CREATE INDEX 推进字典版本时必须保持它不变。LOB segment 是表级共享资源：只有 LOB-capable
+ * 表的新 catalog 才携带；旧 catalog 允许为空，但普通 DML 不得在缺失时临时创建 segment。
  */
-public record TableStorageBinding(long tableId, SpaceId spaceId, Path path, List<IndexStorageBinding> indexes,
-                                  Optional<SegmentRef> lobSegment) {
+public record TableStorageBinding(long tableId, SpaceId spaceId, Path path, long rowFormatVersion,
+                                  List<IndexStorageBinding> indexes, Optional<SegmentRef> lobSegment) {
+
+    /**
+     * 源码兼容入口。只用于尚未携带独立格式版本的 bootstrap/测试调用；生产 CREATE、catalog 和 SDI
+     * 必须使用六参数构造器显式保存真实版本。
+     *
+     * @param tableId 表的稳定字典 identity
+     * @param spaceId 表空间 identity
+     * @param path 表空间规范路径
+     * @param indexes 全部逻辑索引的一一对应物理绑定
+     * @param lobSegment 可选的表级 LOB segment
+     */
+    public TableStorageBinding(long tableId, SpaceId spaceId, Path path,
+                               List<IndexStorageBinding> indexes, Optional<SegmentRef> lobSegment) {
+        this(tableId, spaceId, path, 1L, indexes, lobSegment);
+    }
+
     public TableStorageBinding {
-        if (tableId <= 0 || spaceId == null || path == null || indexes == null || indexes.isEmpty()
+        if (tableId <= 0 || spaceId == null || path == null || rowFormatVersion <= 0
+                || indexes == null || indexes.isEmpty()
                 || lobSegment == null) {
             throw new DatabaseValidationException("invalid table storage binding");
         }

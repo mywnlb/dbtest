@@ -91,12 +91,35 @@ class DictionaryStorageMetadataMapperTest {
         assertEquals(1, secondary.layout().logicalKeyPartCount());
     }
 
+    /**
+     * CREATE INDEX 只改变 DD aggregate 版本；mapper 必须继续使用 binding 中的物理行格式版本，
+     * 否则既有聚簇记录会因 schema version 不匹配而全部不可读。
+     */
+    @Test
+    void mapsMetadataOnlyIndexVersionWithPreservedPhysicalRowFormat() {
+        TableDefinition version5 = tableWithSecondary();
+        TableStorageBinding before = version5.storageBinding().orElseThrow();
+        TableStorageBinding physicalVersion2 = new TableStorageBinding(
+                before.tableId(), before.spaceId(), before.path(), 2, before.indexes(), before.lobSegment());
+        TableDefinition metadataVersion5 = new TableDefinition(
+                version5.id(), version5.schemaId(), version5.name(), DictionaryVersion.of(5),
+                version5.state(), version5.columns(), version5.indexes(), Optional.of(physicalVersion2));
+
+        MappedTableStorage mapped = new DictionaryStorageMetadataMapper().map(metadataVersion5);
+
+        assertEquals(5, mapped.table().version().value());
+        assertEquals(2, mapped.storageTable().schemaVersion());
+        assertEquals(2, mapped.tableIndexes().clusteredIndex().schema().schemaVersion());
+        assertEquals(2, mapped.tableIndexes().secondaryIndexes().getFirst()
+                .index().schema().schemaVersion());
+    }
+
     private TableDefinition table(DictionaryVersion version, TableState state, long rootPageNo) {
         TableDefinition logical = logicalTable(state);
         SegmentRef leaf = new SegmentRef(SpaceId.of(1024), 1, SegmentId.of(11));
         SegmentRef nonLeaf = new SegmentRef(SpaceId.of(1024), 2, SegmentId.of(12));
         TableStorageBinding binding = new TableStorageBinding(2, SpaceId.of(1024),
-                directory.resolve("tables/table_2_space_1024.ibd"), List.of(new IndexStorageBinding(3,
+                directory.resolve("tables/table_2_space_1024.ibd"), version.value(), List.of(new IndexStorageBinding(3,
                 PageId.of(SpaceId.of(1024), PageNo.of(rootPageNo)), 0, leaf, nonLeaf)), Optional.empty());
         return new TableDefinition(logical.id(), logical.schemaId(), logical.name(), version, state,
                 logical.columns(), logical.indexes(), Optional.of(binding));
@@ -126,7 +149,7 @@ class DictionaryStorageMetadataMapperTest {
         SegmentRef secondaryLeaf = new SegmentRef(SpaceId.of(1024), 3, SegmentId.of(13));
         SegmentRef secondaryNonLeaf = new SegmentRef(SpaceId.of(1024), 4, SegmentId.of(14));
         TableStorageBinding binding = new TableStorageBinding(2, SpaceId.of(1024),
-                directory.resolve("tables/table_2_space_1024.ibd"), List.of(
+                directory.resolve("tables/table_2_space_1024.ibd"), 5, List.of(
                 new IndexStorageBinding(3, PageId.of(SpaceId.of(1024), PageNo.of(64)), 0,
                         primaryLeaf, primaryNonLeaf),
                 new IndexStorageBinding(4, PageId.of(SpaceId.of(1024), PageNo.of(65)), 0,

@@ -16,6 +16,8 @@ import cn.zhangyis.db.storage.btree.BTreeLookupResult;
 import cn.zhangyis.db.storage.btree.BTreeUpdateResult;
 import cn.zhangyis.db.storage.btree.BTreeUniqueCheckResult;
 import cn.zhangyis.db.storage.btree.PreparedClusteredInsert;
+import cn.zhangyis.db.storage.btree.PreparedClusteredUpdate;
+import cn.zhangyis.db.storage.btree.PreparedUpdateStateException;
 import cn.zhangyis.db.storage.btree.SplitCapableBTreeIndexService;
 import cn.zhangyis.db.storage.api.lob.LobStorage;
 import cn.zhangyis.db.storage.api.lob.LobWriteAllocation;
@@ -37,6 +39,7 @@ import cn.zhangyis.db.storage.trx.RollbackSummary;
 import cn.zhangyis.db.storage.trx.Transaction;
 import cn.zhangyis.db.storage.trx.TransactionManager;
 import cn.zhangyis.db.storage.trx.DeferredInsertUndoPlan;
+import cn.zhangyis.db.storage.trx.DeferredUpdateUndoPlan;
 import cn.zhangyis.db.storage.trx.PreparedUndoAppend;
 import cn.zhangyis.db.storage.trx.UndoWriteFatalException;
 import cn.zhangyis.db.storage.trx.UndoWritePlan;
@@ -46,10 +49,13 @@ import cn.zhangyis.db.storage.trx.TransactionStateException;
 import cn.zhangyis.db.storage.trx.UndoLogManager;
 import cn.zhangyis.db.storage.trx.lock.LockManager;
 import cn.zhangyis.db.storage.undo.InsertedLobOwnership;
+import cn.zhangyis.db.storage.undo.LobVersionOwnership;
 import cn.zhangyis.db.storage.undo.SecondaryUndoMutation;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -199,14 +205,14 @@ public final class ClusteredDmlService {
 
         // 2. 冻结 LOB、undo secondary tail 与总 redo workload，admission 成功后才接触可写页。
         PlannedInsertLobs plannedLobs = planInsertLobs(command);
-        preflightLobSegment(plannedLobs);
+        preflightLobSegment(command.lobSegment(), !plannedLobs.values().isEmpty());
         DeferredInsertUndoPlan undoPlan = undoLogManager.planDeferredInsert(txn, command.tableId(),
                 command.index().indexId(), command.key().values(), plannedLobs.placeholderOwnerships(),
                 secondaryMutations, command.index().keyDef(), command.index().schema());
         MiniTransaction mtr = mtrManager.begin(mtrManager.budgetFor(
                 RedoBudgetPurpose.CLUSTERED_INSERT,
                 DmlRedoBudgetEstimator.insert(command.index(), undoPlan, plannedLobs.writePlans())));
-        PreparedUndoAppend preparedUndo = null;
+        PreparedUndoAppend<InsertedLobOwnership> preparedUndo = null;
         PreparedClusteredInsert preparedInsert = null;
         List<LobWriteAllocation> allocations = new ArrayList<>(plannedLobs.values().size());
         boolean preparedBoundary = false;
@@ -305,13 +311,19 @@ public final class ClusteredDmlService {
         if (locked.isEmpty()) {
             return new DmlWriteResult(false, 0, redo.currentLsn(), txnId);
         }
-        // 2. 旧隐藏列是版本 CAS 与 undo 链前驱；secondary tail 与旧 image 一起冻结后再申请 redo admission。
+        // 2. 旧隐藏列是版本 CAS 与 undo 链前驱；同时冻结 LOB replacement ownership、secondary tail 与 redo 上界。
         BTreeLookupResult old = locked.orElseThrow();
         HiddenColumns oldHidden = requireHiddenColumns(old.record(), "update");
+        PlannedUpdateLobs plannedLobs = planUpdateLobs(command, old.record());
+        preflightLobSegment(command.lobSegment(), plannedLobs.requiresLobSegment());
+        if (!plannedLobs.values().isEmpty()) {
+            return updateWithExternalLobs(command, secondaryMutations, txnId, old, oldHidden, plannedLobs);
+        }
 
         UndoWritePlan undoPlan = undoLogManager.planUpdate(txn, command.tableId(), command.index().indexId(),
                 command.key().values(), old.record().columnValues(), oldHidden,
-                secondaryMutations, command.index().keyDef(), command.index().schema());
+                plannedLobs.placeholderOwnerships(), secondaryMutations,
+                command.index().keyDef(), command.index().schema());
         MiniTransaction mtr = mtrManager.begin(mtrManager.budgetFor(
                 RedoBudgetPurpose.CLUSTERED_UPDATE,
                 DmlRedoBudgetEstimator.pointRewrite(command.index(), undoPlan)));
@@ -320,7 +332,7 @@ public final class ClusteredDmlService {
             // 3. undo 必须先于新聚簇版本发布，roll pointer 将两者连接成可恢复版本链。
             RollPointer rollPointer = undoLogManager.appendPlanned(txn, mtr, undoPlan);
             undoWritten = true;
-            LogicalRecord stamped = stampedRecord(command.newRecord(), false,
+            LogicalRecord stamped = stampedRecord(plannedLobs.placeholderRecord(), false,
                     new HiddenColumns(txnId, rollPointer));
             BTreeUpdateResult replaced = btree.replaceClustered(mtr, command.index(), command.key(),
                     stamped, oldHidden.dbTrxId(), oldHidden.dbRollPtr());
@@ -337,6 +349,97 @@ public final class ClusteredDmlService {
                 throw databaseError;
             }
             throw new DmlOperationException("clustered update failed", e);
+        }
+    }
+
+    /**
+     * 执行至少包含一个新 external allocation 的聚簇 UPDATE prepared 协议。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>用 placeholder LV tail 冻结 deferred undo，并合并 point rewrite、undo 和全部 LOB write workload。</li>
+     *     <li>依次 prepare undo append 与目标 clustered leaf，形成 index→LOB/FSP 的单向资源边界。</li>
+     *     <li>写出所有新链，把真实 external envelope 同时替换进目标行和 rollback-new ownership。</li>
+     *     <li>先发布 actual undo，再发布聚簇新版本，随后转移 allocation ownership 并关闭两个 prepared guard。</li>
+     *     <li>提交业务 MTR；异常时按 allocation→clustered→undo 逆序补偿，prepare 后失败统一 fail-stop。</li>
+     * </ol>
+     *
+     * @param command            当前 UPDATE 命令及 authoritative LOB segment。
+     * @param secondaryMutations 表级调用冻结的 CHANGE_KEY 证据。
+     * @param txnId              已分配的稳定 write id。
+     * @param old                FOR_UPDATE current-read 物化的旧版本。
+     * @param oldHidden          旧版本 CAS 与记录版本链证据。
+     * @param plannedLobs        placeholder row、逐列 write plan 和 LV ownership 聚合。
+     * @return 成功替换一行的 DML 结果。
+     * @throws UndoWriteFatalException prepared owner/page、actual undo 或聚簇发布边界失败时抛出。
+     * @throws DatabaseRuntimeException LOB allocation、redo、B+Tree 或 MTR 提交失败时抛出并保留 cause。
+     */
+    private DmlWriteResult updateWithExternalLobs(ClusteredUpdateCommand command,
+                                                  List<SecondaryUndoMutation> secondaryMutations,
+                                                  TransactionId txnId, BTreeLookupResult old,
+                                                  HiddenColumns oldHidden,
+                                                  PlannedUpdateLobs plannedLobs) {
+        // 1. placeholder 的 external envelope 与 actual 仅首页号不同，因此可在 begin 前冻结全部物理上界。
+        DeferredUpdateUndoPlan undoPlan = undoLogManager.planDeferredUpdate(command.transaction(),
+                command.tableId(), command.index().indexId(), command.key().values(),
+                old.record().columnValues(), oldHidden, plannedLobs.placeholderOwnerships(),
+                secondaryMutations, command.index().keyDef(), command.index().schema());
+        MiniTransaction mtr = mtrManager.begin(mtrManager.budgetFor(RedoBudgetPurpose.CLUSTERED_UPDATE,
+                DmlRedoBudgetEstimator.pointRewrite(command.index(), undoPlan, plannedLobs.writePlans())));
+        PreparedUndoAppend<LobVersionOwnership> preparedUndo = null;
+        PreparedClusteredUpdate preparedUpdate = null;
+        List<LobWriteAllocation> allocations = new ArrayList<>(plannedLobs.values().size());
+        boolean preparedBoundary = false;
+        try {
+            // 2. undo owner/root 先于 index leaf prepare；两者固定后才允许访问 LOB/FSP。
+            preparedUndo = undoLogManager.prepareUndoAppend(command.transaction(), mtr, undoPlan);
+            preparedBoundary = true;
+            preparedUpdate = btree.prepareClusteredUpdate(mtr, command.index(), command.key(),
+                    plannedLobs.placeholderRecord(), txnId, oldHidden);
+
+            // 3. 所有新链在同一 MTR 写出；actual external 同时进入目标行和 rollback ownership。
+            List<ColumnValue> actualValues = new ArrayList<>(plannedLobs.placeholderRecord().columnValues());
+            Map<Integer, ColumnValue.ExternalValue> actualByOrdinal = new HashMap<>();
+            for (PlannedLobValue planned : plannedLobs.values()) {
+                LobWriteAllocation allocation = lobStorage.writePlanned(mtr, planned.plan());
+                allocations.add(allocation);
+                actualValues.set(planned.columnOrdinal(), allocation.value());
+                actualByOrdinal.put(planned.columnOrdinal(), allocation.value());
+            }
+            List<LobVersionOwnership> actualOwnerships = plannedLobs.placeholderOwnerships().stream()
+                    .map(ownership -> ownership.rollbackNewValue().isEmpty() ? ownership
+                            : new LobVersionOwnership(ownership.columnOrdinal(), ownership.purgeOldValue(),
+                            Optional.of(actualByOrdinal.get(ownership.columnOrdinal()))))
+                    .toList();
+            LogicalRecord actualRecord = new LogicalRecord(command.newRecord().schemaVersion(), actualValues,
+                    false, command.newRecord().recordType(), null);
+
+            // 4. undo 必须先于行版本发布；allocation 只有在行和 undo 都可达后才转移 owner。
+            RollPointer rollPointer = preparedUndo.appendActual(actualOwnerships);
+            BTreeUpdateResult replaced = preparedUpdate.publish(actualRecord, rollPointer);
+            if (!replaced.replaced()) {
+                throw new PreparedUpdateStateException(
+                        "prepared clustered UPDATE lost its target version before publication");
+            }
+            for (LobWriteAllocation allocation : allocations) allocation.transferOwnership();
+            preparedUpdate.close();
+            preparedUpdate = null;
+            preparedUndo.close();
+            preparedUndo = null;
+
+            // 5. commit 返回后 redo/pageLSN/dirty 与 LOB/undo/row 形成同一 durable 原子组。
+            Lsn endLsn = mtrManager.commit(mtr);
+            return new DmlWriteResult(true, 1, endLsn, txnId);
+        } catch (RuntimeException error) {
+            RuntimeException failure = compensateAndClosePreparedUpdate(
+                    allocations, preparedUpdate, preparedUndo, error);
+            rollbackActiveMtr(mtr, failure);
+            if (preparedBoundary && !(failure instanceof UndoWriteFatalException)) {
+                throw new UndoWriteFatalException(
+                        "clustered UPDATE failed after deferred prepare physical boundary", failure);
+            }
+            if (failure instanceof DatabaseRuntimeException databaseError) throw databaseError;
+            throw new DmlOperationException("clustered LOB UPDATE failed", failure);
         }
     }
 
@@ -393,9 +496,11 @@ public final class ClusteredDmlService {
         BTreeLookupResult old = locked.orElseThrow();
         HiddenColumns oldHidden = requireHiddenColumns(old.record(), "delete");
 
+        List<LobVersionOwnership> lobOwnerships = planDeleteLobOwnerships(command, old.record());
+        preflightLobSegment(command.lobSegment(), !lobOwnerships.isEmpty());
         UndoWritePlan undoPlan = undoLogManager.planDelete(txn, command.tableId(), command.index().indexId(),
                 command.key().values(), old.record().columnValues(), oldHidden,
-                secondaryMutations, command.index().keyDef(), command.index().schema());
+                lobOwnerships, secondaryMutations, command.index().keyDef(), command.index().schema());
         MiniTransaction mtr = mtrManager.begin(mtrManager.budgetFor(
                 RedoBudgetPurpose.CLUSTERED_DELETE,
                 DmlRedoBudgetEstimator.pointRewrite(command.index(), undoPlan)));
@@ -575,15 +680,115 @@ public final class ClusteredDmlService {
         return new PlannedInsertLobs(placeholderRecord, values, ownerships);
     }
 
-    /** 错误 purpose/binding 在业务写 MTR 与 undo plan execution 前由独立短 MTR fail-closed。 */
-    private void preflightLobSegment(PlannedInsertLobs planned) {
-        if (planned.values().isEmpty()) {
+    /**
+     * 对比 current old row 与目标完整行，冻结 UPDATE 的 placeholder record、新 LOB write plans 和版本 ownership。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验新旧行宽度与 exact schema 一致；普通列直接保留目标值。</li>
+     *     <li>未变化的 external envelope 原样复用，拒绝调用方注入另一条物理 external reference。</li>
+     *     <li>对 raw LOB 判断 inline/external；新 external 生成 placeholder/write plan，旧 external 生成 purge-old 动作。</li>
+     *     <li>按 ordinal 发布不可变 placeholder row、write plan 和 LV ownership 聚合。</li>
+     * </ol>
+     *
+     * @param command UPDATE 命令，提供目标完整行和可选 authoritative LOB segment。
+     * @param oldRow  FOR_UPDATE current-read 物化的旧完整聚簇记录。
+     * @return 可在 undo admission 和业务 MTR 中复用的不可变 UPDATE LOB 计划。
+     * @throws DatabaseValidationException 行宽、external 注入或目标列值不满足 schema/LOB 约束时抛出。
+     * @throws DmlLobBindingException 需要写/回收 external chain 但命令缺少 LOB segment 时抛出。
+     */
+    private PlannedUpdateLobs planUpdateLobs(ClusteredUpdateCommand command, LogicalRecord oldRow) {
+        // 1. UPDATE old/new image 必须属于同一 exact schema，避免 ownership ordinal 指向不同列。
+        List<ColumnValue> oldValues = oldRow.columnValues();
+        List<ColumnValue> targetValues = command.newRecord().columnValues();
+        if (oldValues.size() != command.index().schema().columnCount()
+                || targetValues.size() != oldValues.size()) {
+            throw new DatabaseValidationException("clustered UPDATE old/new row width differs from schema");
+        }
+        List<ColumnValue> placeholders = new ArrayList<>(targetValues);
+        List<PlannedLobValue> plannedValues = new ArrayList<>();
+        List<LobVersionOwnership> ownerships = new ArrayList<>();
+        for (int ordinal = 0; ordinal < targetValues.size(); ordinal++) {
+            var column = command.index().schema().column(ordinal);
+            if (column.type().storageKind() != StorageKind.OVERFLOW_CAPABLE) continue;
+            ColumnValue oldValue = oldValues.get(ordinal);
+            ColumnValue targetValue = targetValues.get(ordinal);
+
+            // 2. 只有锁定旧行已经持有的同一 external envelope 可以跨版本复用；其它 physical reference 没有授权来源。
+            if (targetValue instanceof ColumnValue.ExternalValue targetExternal) {
+                if (!targetExternal.equals(oldValue)) {
+                    throw new DatabaseValidationException(
+                            "clustered UPDATE cannot inject a new external LOB reference at ordinal " + ordinal);
+                }
+                continue;
+            }
+
+            // 3. raw 值先由 LobCodec 完整校验；超过 inline 阈值时冻结 placeholder 和真实 write plan。
+            boolean externalize = !(targetValue instanceof ColumnValue.NullValue)
+                    && lobStorage.requiresExternalization(column.type(), targetValue);
+            boolean purgeOld = oldValue instanceof ColumnValue.ExternalValue;
+            if (externalize) {
+                var segment = command.lobSegment().orElseThrow(() -> new DmlLobBindingException(
+                        "LOB replacement requires table LOB segment: " + column.name()));
+                LobWritePlan plan = lobStorage.planWrite(segment, column.type(), targetValue);
+                LobReference placeholderReference = new LobReference(segment.spaceId(), PageNo.of(4L + ordinal),
+                        plan.totalLength(), plan.pageCount(), segment.segmentId(), segment.inodeSlot(), plan.crc32());
+                ColumnValue.ExternalValue placeholder = new ColumnValue.ExternalValue(column.type().typeId(),
+                        placeholderReference, plan.inlinePrefix());
+                placeholders.set(ordinal, placeholder);
+                plannedValues.add(new PlannedLobValue(ordinal, plan));
+                ownerships.add(new LobVersionOwnership(ordinal, purgeOld, Optional.of(placeholder)));
+            } else if (purgeOld) {
+                ownerships.add(new LobVersionOwnership(ordinal, true, Optional.empty()));
+            }
+        }
+        // 4. schema 顺序循环天然保证 ownership ordinal 递增；构造器防御性冻结所有集合。
+        LogicalRecord placeholderRecord = new LogicalRecord(command.newRecord().schemaVersion(), placeholders,
+                false, command.newRecord().recordType(), null);
+        return new PlannedUpdateLobs(placeholderRecord, plannedValues, ownerships);
+    }
+
+    /**
+     * 从 DELETE 的锁定旧行提取全部 external old-chain purge ownership。
+     *
+     * @param command DELETE 命令；旧行含 external value 时必须携带 authoritative LOB segment。
+     * @param oldRow  删除前存活版本的完整聚簇记录。
+     * @return 按 schema ordinal 递增、只含 purge-old 动作的不可变 ownership 列表。
+     * @throws DmlLobBindingException 旧行含 external value但命令没有 LOB segment 时抛出。
+     */
+    private List<LobVersionOwnership> planDeleteLobOwnerships(ClusteredDeleteCommand command,
+                                                               LogicalRecord oldRow) {
+        List<LobVersionOwnership> ownerships = new ArrayList<>();
+        for (int ordinal = 0; ordinal < oldRow.columnValues().size(); ordinal++) {
+            if (oldRow.columnValues().get(ordinal) instanceof ColumnValue.ExternalValue) {
+                int columnOrdinal = ordinal;
+                command.lobSegment().orElseThrow(() -> new DmlLobBindingException(
+                        "DELETE old external LOB requires table LOB segment at ordinal " + columnOrdinal));
+                ownerships.add(new LobVersionOwnership(ordinal, true, Optional.empty()));
+            }
+        }
+        return List.copyOf(ownerships);
+    }
+
+    /**
+     * 用独立短读 MTR 在业务 undo/B+Tree 写之前验证 authoritative LOB segment identity 和 purpose。
+     *
+     * @param segment  exact DD binding 的可选 segment 容器。
+     * @param required 本次 INSERT/UPDATE/DELETE 是否会写新链或持久化旧链 purge ownership。
+     * @throws DmlLobBindingException required 但 binding 缺失，或 segment purpose/identity 预检失败时抛出。
+     * @throws DatabaseRuntimeException 只读 MTR、FSP metadata 或资源释放失败时抛出并保留 cause。
+     */
+    private void preflightLobSegment(Optional<cn.zhangyis.db.storage.api.SegmentRef> segment,
+                                     boolean required) {
+        if (!required) {
             return;
         }
+        var authoritative = segment.orElseThrow(() -> new DmlLobBindingException(
+                "LOB operation requires authoritative table LOB segment"));
         MiniTransaction check = mtrManager.beginReadOnly();
         try {
             // 每张表只有一个 LOB segment；多列计划复用同一 identity，复核一次即可。
-            lobStorage.preflightSegment(check, planned.values().getFirst().plan().segment());
+            lobStorage.preflightSegment(check, authoritative);
             mtrManager.commit(check);
         } catch (RuntimeException error) {
             rollbackActiveMtr(check, error);
@@ -597,10 +802,16 @@ public final class ClusteredDmlService {
     /**
      * 失败收尾顺序：先反序补偿尚未转移的 LOB allocation，再关闭 index prepare scope，最后关闭 undo prepare。
      * 每个 close 失败作为 suppressed 保留；上层随后 rollback MTR memo，但不会误称页内容已撤销。
+     *
+     * @param allocations   已写出但尚未全部转移 ownership 的 INSERT LOB guards。
+     * @param preparedInsert 已固定聚簇插入路径/slot 的 guard；可为 {@code null}。
+     * @param preparedUndo  已固定 INSERT undo owner/root 的 guard；可为 {@code null}。
+     * @param primary       触发收尾的原始异常。
+     * @return 附带全部 cleanup suppressed 异常的原始失败对象。
      */
     private static RuntimeException compensateAndClosePrepared(List<LobWriteAllocation> allocations,
                                                                PreparedClusteredInsert preparedInsert,
-                                                               PreparedUndoAppend preparedUndo,
+                                                               PreparedUndoAppend<InsertedLobOwnership> preparedUndo,
                                                                RuntimeException primary) {
         for (int i = allocations.size() - 1; i >= 0; i--) {
             try {
@@ -626,16 +837,56 @@ public final class ClusteredDmlService {
         return primary;
     }
 
-    /** 单列需要 externalization 的冻结计划。 */
+    /**
+     * LOB-aware UPDATE 失败时按 ownership 获取逆序补偿；每个 cleanup 异常都压入主失败，不能覆盖原始根因。
+     *
+     * @param allocations    已写出但尚未全部转移 ownership 的新 LOB guards。
+     * @param preparedUpdate 已固定目标 leaf 的聚簇 UPDATE guard；可为 {@code null}。
+     * @param preparedUndo   已固定 undo owner/root 的 deferred UPDATE guard；可为 {@code null}。
+     * @param primary        触发收尾的原始异常。
+     * @return 附带全部 cleanup suppressed 异常的原始失败对象。
+     */
+    private static RuntimeException compensateAndClosePreparedUpdate(
+            List<LobWriteAllocation> allocations,
+            PreparedClusteredUpdate preparedUpdate,
+            PreparedUndoAppend<LobVersionOwnership> preparedUndo,
+            RuntimeException primary) {
+        for (int i = allocations.size() - 1; i >= 0; i--) {
+            try { allocations.get(i).close(); }
+            catch (RuntimeException cleanup) { primary.addSuppressed(cleanup); }
+        }
+        if (preparedUpdate != null) {
+            try { preparedUpdate.close(); }
+            catch (RuntimeException cleanup) { primary.addSuppressed(cleanup); }
+        }
+        if (preparedUndo != null) {
+            try { preparedUndo.close(); }
+            catch (RuntimeException cleanup) { primary.addSuppressed(cleanup); }
+        }
+        return primary;
+    }
+
+    /**
+     * 单列需要 externalization 的冻结计划；同时用于 INSERT 和 UPDATE。
+     *
+     * @param columnOrdinal exact-version schema ordinal；决定 placeholder/actual 替换位置。
+     * @param plan          已冻结 payload、segment、页数、CRC、prefix 和 redo workload 的写计划。
+     */
     private record PlannedLobValue(int columnOrdinal, LobWritePlan plan) {
         private PlannedLobValue {
             if (columnOrdinal < 0 || plan == null) {
-                throw new DatabaseValidationException("invalid planned INSERT LOB value");
+                throw new DatabaseValidationException("invalid planned LOB value");
             }
         }
     }
 
-    /** 一行 INSERT 的 placeholder、逐列 LOB 计划和 placeholder undo ownership。 */
+    /**
+     * 一行 INSERT 的 placeholder、逐列 LOB 计划和 placeholder undo ownership。
+     *
+     * @param placeholderRecord     所有新 external 列已替换为等长 placeholder 的完整用户行。
+     * @param values                按 ordinal 递增的新链写计划。
+     * @param placeholderOwnerships 与 values 一一对应、进入 deferred INSERT undo 的 ownership。
+     */
     private record PlannedInsertLobs(LogicalRecord placeholderRecord, List<PlannedLobValue> values,
                                      List<InsertedLobOwnership> placeholderOwnerships) {
         private PlannedInsertLobs {
@@ -645,6 +896,32 @@ public final class ClusteredDmlService {
             }
             values = List.copyOf(values);
             placeholderOwnerships = List.copyOf(placeholderOwnerships);
+        }
+
+        private List<LobWritePlan> writePlans() {
+            return values.stream().map(PlannedLobValue::plan).toList();
+        }
+    }
+
+    /**
+     * 一行 UPDATE 的 placeholder、逐列新链计划和完整 LV ownership。
+     *
+     * @param placeholderRecord     新 external 列使用定长 placeholder、未变化 external 原样复用的目标行。
+     * @param values                本次前向 UPDATE 真正需要创建的新链计划。
+     * @param placeholderOwnerships rollback-new placeholder 与 purge-old 动作的完整 LV 列表。
+     */
+    private record PlannedUpdateLobs(LogicalRecord placeholderRecord, List<PlannedLobValue> values,
+                                     List<LobVersionOwnership> placeholderOwnerships) {
+        private PlannedUpdateLobs {
+            if (placeholderRecord == null || values == null || placeholderOwnerships == null) {
+                throw new DatabaseValidationException("invalid planned UPDATE LOB aggregate");
+            }
+            values = List.copyOf(values);
+            placeholderOwnerships = List.copyOf(placeholderOwnerships);
+        }
+
+        private boolean requiresLobSegment() {
+            return !values.isEmpty() || !placeholderOwnerships.isEmpty();
         }
 
         private List<LobWritePlan> writePlans() {

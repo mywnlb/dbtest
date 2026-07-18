@@ -109,12 +109,12 @@ public final class RecoveredTransactionTable implements TransactionStateDeltaSin
 
     private void mergeWithPrevious(Evidence previous, TransactionStateDeltaRecord next, Lsn endLsn) {
         TransactionStateDeltaRecord prior = previous.record();
-        if (isTerminal(prior.toState())) {
-            if (!prior.equals(next)) {
-                throw conflict(prior, next);
-            }
+        if (prior.equals(next)) {
             evidenceByTransaction.put(next.transactionId(), new Evidence(next, endLsn));
             return;
+        }
+        if (isTerminal(prior.toState())) {
+            throw conflict(prior, next);
         }
         if (prior.toState() != next.fromState()) {
             throw conflict(prior, next);
@@ -125,12 +125,6 @@ public final class RecoveredTransactionTable implements TransactionStateDeltaSin
     private static void validateRecord(TransactionStateDeltaRecord record) {
         if (record.transactionId().isNone()) {
             throw new TransactionRecoveryException("transaction state redo has NONE transaction id");
-        }
-        if (record.fromState() == TransactionStateDeltaState.PREPARED
-                || record.toState() == TransactionStateDeltaState.PREPARED) {
-            throw new TransactionRecoveryException(
-                    "PREPARED transaction requires an XA recovery coordinator: transaction="
-                            + record.transactionId().value());
         }
         boolean commit = (record.fromState() == TransactionStateDeltaState.ACTIVE
                 || record.fromState() == TransactionStateDeltaState.COMMITTING)
@@ -145,16 +139,28 @@ public final class RecoveredTransactionTable implements TransactionStateDeltaSin
                 && record.toState() == TransactionStateDeltaState.ROLLED_BACK
                 && record.reason() == TransactionStateDeltaReason.RECOVERY_ROLLBACK
                 && record.transactionNo().isNone();
-        if (!commit && !liveRollback && !recoveryRollback) {
+        boolean prepare = record.fromState() == TransactionStateDeltaState.ACTIVE
+                && record.toState() == TransactionStateDeltaState.PREPARED
+                && record.reason() == TransactionStateDeltaReason.PREPARE
+                && record.transactionNo().isNone();
+        boolean preparedCommit = record.fromState() == TransactionStateDeltaState.PREPARED
+                && record.toState() == TransactionStateDeltaState.COMMITTED
+                && record.reason() == TransactionStateDeltaReason.PREPARED_COMMIT
+                && !record.transactionNo().isNone();
+        boolean preparedRollback = record.fromState() == TransactionStateDeltaState.PREPARED
+                && record.toState() == TransactionStateDeltaState.ROLLED_BACK
+                && record.reason() == TransactionStateDeltaReason.PREPARED_ROLLBACK
+                && record.transactionNo().isNone();
+        if (!commit && !liveRollback && !recoveryRollback
+                && !prepare && !preparedCommit && !preparedRollback) {
             throw new TransactionRecoveryException(
-                    "unsupported transaction state delta tuple in recovery v1: " + record);
+                    "unsupported transaction state delta tuple: " + record);
         }
     }
 
     private static boolean isTerminal(TransactionStateDeltaState state) {
         return state == TransactionStateDeltaState.COMMITTED
-                || state == TransactionStateDeltaState.ROLLED_BACK
-                || state == TransactionStateDeltaState.PREPARED;
+                || state == TransactionStateDeltaState.ROLLED_BACK;
     }
 
     private static TransactionRecoveryException conflict(

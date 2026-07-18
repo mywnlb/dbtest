@@ -191,7 +191,7 @@ segment 内 extent list：
 | page 0 | `FSP_HDR`，并内嵌首 256MB 范围的 XDES entries | 表空间总入口、大小、Space ID、extent free list、inode page list、首批 extent descriptor |
 | page 1 | `IBUF_BITMAP` | 保留 change buffer bitmap 扩展点；MiniMySQL 可先不启用 change buffer |
 | page 2 | `INODE` | segment inode array；每个 segment 一条 entry，记录 fragment pages 与 FREE/NOT_FULL/FULL extent list |
-| page 3 | `SDI` | MySQL 8.0 起的序列化数据字典页；MiniMySQL 可用于保存表结构快照或保留 |
+| page 3 | `SDI` | GENERAL 表空间保存单页 SDI v1 完整表聚合快照；UNDO 表空间在同一固定页使用 `RSEG_HEADER`，由 tablespace type 区分 |
 | page 4+ | `INDEX` / `BLOB` | 聚簇索引、二级索引 B+Tree 页，以及大字段溢出页 |
 
 超过首 256MB 后，每隔固定范围会出现新的 extent descriptor 管理区域。本设计由 `ExtentDescriptorRepository` 屏蔽“XDES entries 在 page 0 内嵌还是在独立管理页中”的差异。

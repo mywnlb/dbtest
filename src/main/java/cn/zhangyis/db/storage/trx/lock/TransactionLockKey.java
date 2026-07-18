@@ -5,7 +5,7 @@ package cn.zhangyis.db.storage.trx.lock;
  * 保证同一索引上的 record/gap/next-key/insert-intention 关系在同一分片内判断兼容性。
  */
 public sealed interface TransactionLockKey
-        permits RecordLockKey, GapLockKey, NextKeyLockKey, InsertIntentionLockKey, SecondaryUniqueKeyLockKey {
+        permits RecordLockKey, GapLockKey, NextKeyLockKey, InsertIntentionLockKey, SecondaryLogicalKeyLockKey {
 
     /**
      * 返回锁资源所属索引。该值是锁分片路由的基础；若调用方给出错误 indexId，会导致同一索引内冲突锁被拆到

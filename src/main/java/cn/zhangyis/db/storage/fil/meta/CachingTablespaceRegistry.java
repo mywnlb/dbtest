@@ -17,42 +17,41 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
 /**
- * 运行时表空间注册表的缓存实现。它只做两件事：缓存 SpaceId 到运行时句柄的映射、把权威元数据的获取委托给
- * 注入的 {@link TablespaceMetadataLoader}。它本身不绑定任何具体存储介质——loader 可以来自磁盘 page 0
- * FSP_HDR、数据字典或启动配置，因此命名为 Caching 而非 DiskBacked，避免类名 over-commit 到单一来源。
+ * 基于并发映射的表空间运行期 metadata registry。
  *
- * <p>并发：handles 用 ConcurrentHashMap 只保护映射本身；require/requireForRecovery 用 computeIfAbsent 保证
- * “至多加载一次”，markCorrupted/markDiscarded 用 compute 保证“读当前快照 -> 状态机切换 -> 发布”这一读改写
- * 在桶级原子内完成。Registry 只保护逻辑 metadata/state；物理文件生命周期锁已经属于 PageStore/DataFileHandle，
- * 后续若需要跨普通 IO 与 discard/truncate 的逻辑 lease，应在 Registry/上层 facade 增加独立准入令牌，而不是让
- * Registry 直接持有 FileChannel。
+ * <p>本类缓存 {@link SpaceId} 到不可变 {@link TablespaceHandle} 的映射，并把 cache miss/reload
+ * 委托给 {@link TablespaceMetadataLoader}。当前生产 loader 从已经打开的 {@link PageStore} 读取 page0；
+ * registry 本身不持 {@code FileChannel}，也不拥有物理文件生命周期。</p>
  *
- * <p>首版简化点（与设计文档差异，后续补齐）：
- * <ul>
- *   <li>单一 loader 走 load(SpaceId)：假设某一个源已产出对账好的完整元数据，未做 DD↔FSP_HDR 跨源对账
- *       （真实 InnoDB 会在 space_id/flags 不一致时拒绝启动）。后续可引入 CompositeTablespaceMetadataLoader
- *       按 TablespaceType 路由（config 管 SYSTEM/UNDO/TEMPORARY，DD+disk 管 FILE_PER_TABLE/GENERAL）。</li>
- *   <li>只支持 open-by-id：未建模“扫描全部 .ibd / 枚举数据字典发现 space_id 并批量注册”的 discovery 路径
- *       （loader 缺 loadAll）。</li>
- * </ul>
+ * <p>并发边界：{@link ConcurrentHashMap#compute(Object, java.util.function.BiFunction)} 只保证单次
+ * mark 方法内部的“读当前值—派生状态—写回”对同一 key 原子；{@code open/refresh/replace} 使用独立
+ * {@code put}，可以在没有外层协调时与 mark 相互覆盖。生产生命周期路径必须先用
+ * {@code TablespaceAccessController} 的同空间 lease 串行化持久状态、物理文件和 registry 发布，再调用本类。
+ * {@code computeIfAbsent} 只对一次成功映射计算提供并发合并；加载抛异常、cache remove 或 refresh 后仍可再次加载。</p>
+ *
+ * <p>registry 只实施运行期状态白名单，不验证 {@link TablespaceType} 专属状态、不持久化 lifecycle，
+ * 也不执行文件 discovery；这些责任位于 page0 loader、DiskSpaceManager、DDL/recovery 编排层。</p>
  */
 @Slf4j
 public final class CachingTablespaceRegistry implements TablespaceRegistry {
 
     /**
-     * 表空间权威元数据加载入口。它代表磁盘 FSP_HDR、数据字典或启动配置，Registry 不能自行伪造权威状态。
+     * cache miss 与显式 reload 的唯一 metadata 来源。实现必须返回与请求 SpaceId 一致且已经完成自身
+     * 物理校验的快照；本字段构造后不可替换。
      */
     private final TablespaceMetadataLoader metadataLoader;
 
     /**
-     * 运行时打开表空间 cache。ConcurrentHashMap 只保护逻辑句柄映射，文件句柄和物理生命周期锁由 PageStore/DataFileHandle 管理。
+     * 运行期逻辑句柄 cache。并发映射安全发布不可变 handle，但不把多个 registry 方法、page0 写入或
+     * PageStore 操作组合成原子事务；跨模块顺序由外层 access lease 保护。
      */
     private final ConcurrentMap<SpaceId, TablespaceHandle> handles = new ConcurrentHashMap<>();
 
     /**
-     * 创建运行时表空间注册表。
+     * 创建使用指定加载端口的空 registry。
      *
-     * @param metadataLoader 表空间权威元数据加载器。
+     * @param metadataLoader 非空 metadata 加载端口，供 cache miss/open/refresh 使用
+     * @throws DatabaseValidationException metadataLoader 为空时抛出；registry 不会被创建
      */
     public CachingTablespaceRegistry(TablespaceMetadataLoader metadataLoader) {
         if (metadataLoader == null) {
@@ -62,25 +61,39 @@ public final class CachingTablespaceRegistry implements TablespaceRegistry {
     }
 
     /**
-     * 打开表空间并建立运行时句柄。数据流为 SpaceId 进入，直接调用 loader 获取权威元数据，然后替换缓存中的句柄。
-     * 文件打开/关闭由 DiskSpaceManager 编排 PageStore 完成；Registry 不直接打开 FileChannel，只发布逻辑 metadata 快照。
+     * 无条件加载并发布指定表空间的逻辑句柄。
      *
-     * @param spaceId 表空间编号。
-     * @return 打开后的运行时句柄。
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>拒绝空 SpaceId，避免 loader/cache 使用无身份键。</li>
+     *     <li>调用 loader 并核对返回 metadata identity；未找到或不一致时不修改 cache。</li>
+     *     <li>用 {@code put} 替换同键句柄并返回；不执行普通状态白名单，也不打开/关闭 PageStore。</li>
+     * </ol>
+     *
+     * @param spaceId 待逻辑打开的非空表空间标识；物理 handle 应已由外层打开
+     * @return 本次加载并写入 cache 的新句柄
+     * @throws DatabaseValidationException spaceId 为空或 loader identity 不一致时抛出
+     * @throws TablespaceNotFoundException loader 没有该空间时抛出
      */
     @Override
     public TablespaceHandle open(SpaceId spaceId) {
+        // 1. cache 与 loader 都只能使用具有领域身份的 SpaceId。
         validateSpaceId(spaceId);
+
+        // 2. 完整加载和 identity 校验先成功，避免失败时覆盖仍可诊断的旧 cache。
         TablespaceHandle handle = loadHandle(spaceId);
+
+        // 3. 逻辑发布不隐式执行普通状态准入或物理 open。
         handles.put(spaceId, handle);
         return handle;
     }
 
     /**
-     * 查找运行时缓存中的句柄，不触发 loader。诊断、DDL 状态判断和测试可用它避免隐式打开表空间。
+     * 查找运行时 cache，不触发 loader 或状态白名单。
      *
-     * @param spaceId 表空间编号。
-     * @return 已缓存时返回句柄，否则返回空。
+     * @param spaceId 待查询的非空表空间标识
+     * @return cache 命中时返回任意生命周期状态的句柄，否则返回空
+     * @throws DatabaseValidationException spaceId 为空时抛出
      */
     @Override
     public Optional<TablespaceHandle> find(SpaceId spaceId) {
@@ -89,135 +102,224 @@ public final class CachingTablespaceRegistry implements TablespaceRegistry {
     }
 
     /**
-     * 获取普通 IO 路径可用的表空间句柄。数据流为 SpaceId 进入，先查运行时缓存；未命中时调用 loader
-     * 从磁盘/DD/配置加载元数据，转换为 TablespaceHandle 后缓存；随后按白名单校验状态是否允许普通访问。
+     * 获取通过普通运行期状态准入的句柄。
      *
-     * @param spaceId 表空间编号。
-     * @return 可供普通 PageStore 路径使用的表空间句柄。
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 SpaceId，保证 cache key 与异常上下文有效。</li>
+     *     <li>cache miss 时在同键的 {@code computeIfAbsent} 内调用 loader；成功值安全发布，失败不留半句柄。</li>
+     *     <li>对命中/新加载快照统一执行 {@code NORMAL/ACTIVE} 白名单，按损坏、丢弃或暂不可用分类失败。</li>
+     * </ol>
+     *
+     * @param spaceId 目标非空表空间标识
+     * @return 当前 cache 中通过普通状态白名单的句柄
+     * @throws DatabaseValidationException spaceId 为空或 loader identity 不一致时抛出
+     * @throws TablespaceNotFoundException loader 未找到或状态为 DISCARDED 时抛出
+     * @throws TablespaceCorruptedException 状态为 CORRUPTED 时抛出
+     * @throws TablespaceUnavailableException 状态为其它非服务状态时抛出
      */
     @Override
     public TablespaceHandle require(SpaceId spaceId) {
+        // 1. 无效 cache key 在触发加载之前失败。
         validateSpaceId(spaceId);
+
+        // 2. 同键 cache miss 的成功加载由 ConcurrentHashMap 发布；异常不会写入映射。
         TablespaceHandle handle = handles.computeIfAbsent(spaceId, this::loadHandle);
+
+        // 3. 即使 cache 命中也重新复核状态，禁止返回已 mark 的非服务句柄。
         ensureOrdinaryAccessAllowed(handle.tablespace());
         return handle;
     }
 
     /**
-     * 获取恢复路径句柄。数据流与普通 require 相同，但不执行状态白名单阻断；恢复流程需要读取损坏/未初始化状态以决定修复策略。
+     * 获取恢复路径句柄，cache miss 时加载，但不执行普通状态白名单。
      *
-     * @param spaceId 表空间编号。
-     * @return 恢复路径可用句柄。
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>先校验 SpaceId，拒绝无身份恢复请求。</li>
+     *     <li>cache miss 时加载并发布；命中时原样返回，不过滤状态。返回非服务状态只是让
+     *     recovery/诊断层裁决后续动作，不授予普通 PageStore 访问权限。</li>
+     * </ol>
+     *
+     * @param spaceId 目标非空表空间标识
+     * @return 任意生命周期状态的缓存或新加载句柄
+     * @throws DatabaseValidationException spaceId 为空或 loader identity 不一致时抛出
+     * @throws TablespaceNotFoundException loader 没有该空间时抛出
      */
     @Override
     public TablespaceHandle requireForRecovery(SpaceId spaceId) {
+        // 1. 恢复映射同样必须使用稳定 SpaceId。
         validateSpaceId(spaceId);
+
+        // 2. 只确保句柄存在，不套用普通状态白名单。
         return handles.computeIfAbsent(spaceId, this::loadHandle);
     }
 
     /**
-     * 重新加载权威元数据并替换运行时句柄。用于 DDL、恢复或启动扫描发现磁盘状态变化后的快照发布。
+     * 无条件重新加载 metadata 并替换逻辑 cache。
      *
-     * @param spaceId 表空间编号。
-     * @return 刷新后的句柄。
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 SpaceId。</li>
+     *     <li>从 loader 完整读取并核对 identity；失败时保留旧 cache。</li>
+     *     <li>用 {@code put} 发布新 handle。方法不比较旧新 version，也不会自动与并发 mark 合并；
+     *     生命周期调用方必须持外层 lease。</li>
+     * </ol>
+     *
+     * @param spaceId 待刷新的非空表空间标识
+     * @return 本次 loader 结果转换出的新句柄
+     * @throws DatabaseValidationException spaceId 为空或 loader identity 不一致时抛出
+     * @throws TablespaceNotFoundException loader 没有该空间时抛出
      */
     @Override
     public TablespaceHandle refresh(SpaceId spaceId) {
+        // 1. 无效键在 loader IO 前失败。
         validateSpaceId(spaceId);
+
+        // 2. 新快照完整构造成功前不触碰旧 cache。
         TablespaceHandle handle = loadHandle(spaceId);
+
+        // 3. 直接替换逻辑值；外层 lease 负责与状态发布串行化。
         handles.put(spaceId, handle);
         return handle;
     }
 
     /**
-     * 用调用方提供的新元数据替换运行时句柄。数据通常来自 recovery 或 DDL 已校验的权威元数据快照。
+     * 把调用方提供的 metadata 直接转换并发布到逻辑 cache。
      *
-     * @param metadata 新表空间元数据。
-     * @return 替换后的句柄。
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>拒绝空 metadata，避免发布无 identity 快照。</li>
+     *     <li>转换为不持物理资源的运行时 handle；构造过程复用字段结构校验。</li>
+     *     <li>按 metadata 自身 SpaceId 直接覆盖旧值；不调用 loader、不写 page0，也不校验 version 单调或状态迁移。</li>
+     * </ol>
+     *
+     * @param metadata 上层已完成持久化顺序和跨源校验的非空快照
+     * @return 写入 cache 的新句柄
+     * @throws DatabaseValidationException metadata 或其结构字段非法时抛出；cache 保持原值
      */
     @Override
     public TablespaceHandle replace(TablespaceMetadata metadata) {
+        // 1. 无 metadata 就没有可发布的 registry identity/state。
         if (metadata == null) {
             throw new DatabaseValidationException("tablespace metadata must not be null");
         }
+
+        // 2. 在改映射前完成运行时 record/handle 构造，失败不会污染旧 cache。
         TablespaceHandle handle = new TablespaceHandle(metadata.toTablespace());
+
+        // 3. 直接发布调用方给出的代次；持久化和并发覆盖裁决属于外层 lifecycle lease。
         handles.put(metadata.spaceId(), handle);
         return handle;
     }
 
     /**
-     * 标记表空间损坏并阻断普通 IO 路径。
+     * 原子派生并发布 {@code CORRUPTED} 运行期状态。
      *
-     * <p>数据流：SpaceId 进入，在 ConcurrentHashMap 桶级原子内完成“读当前快照（缺失则按权威来源加载）->
-     * 状态机切到 CORRUPTED -> 发布新句柄”的读改写，避免与并发 refresh/replace/markDiscarded 互相覆盖造成
-     * 丢更新。该操作只改变逻辑状态；若未来 discard/truncate 需要等待普通 page IO drain，应由上层 lease 或
-     * DataFileHandle 的物理生命周期闩协作完成。
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 SpaceId 与非空白诊断原因；失败不读取 loader 或修改 cache。</li>
+     *     <li>在同键 {@code compute} 内读取已有 handle，缺失时加载，然后通过状态图派生 corrupted 快照。</li>
+     *     <li>compute 成功后记录包含 SpaceId/reason 的 WARN；reason 不进入 handle/page0，方法也不关闭物理文件。</li>
+     * </ol>
      *
-     * @param spaceId 表空间编号。
-     * @param reason 损坏原因，进入日志诊断；首版不持久化，后续会进入恢复诊断上下文。
-     * @return 损坏状态句柄。
+     * <p>compute 只与同键其它 compute 原子；无外层 lease 时，独立 put 的 open/refresh/replace 仍可能随后覆盖结果。</p>
+     *
+     * @param spaceId 目标非空表空间标识
+     * @param reason 非空白损坏诊断，只写运行日志
+     * @return 新发布的 corrupted 句柄
+     * @throws DatabaseValidationException 参数非法、loader identity 不一致或当前状态不允许迁移时抛出
+     * @throws TablespaceNotFoundException cache 缺失且 loader 未找到时抛出
      */
     @Override
     public TablespaceHandle markCorrupted(SpaceId spaceId, String reason) {
+        // 1. 在进入映射原子区前完成参数检查，避免非法 reason 触发不必要加载。
         validateSpaceId(spaceId);
         if (reason == null || reason.isBlank()) {
             throw new DatabaseValidationException("tablespace corrupted reason must not be blank");
         }
+
+        // 2. 同键 compute 内读取/加载当前代次并执行状态机迁移，失败不会写入半成品。
         TablespaceHandle corrupted = handles.compute(spaceId, (id, existing) -> {
             Tablespace current = (existing != null ? existing : loadHandle(id)).tablespace();
             return new TablespaceHandle(current.transitTo(TablespaceState.CORRUPTED));
         });
-        // 标记损坏属于关键生命周期/不可恢复诊断事件，必须留痕：带上 spaceId 与原因，供恢复和人工排查。
+
+        // 3. 状态发布后再留诊断日志；日志不替代 durable lifecycle marker。
         log.warn("tablespace {} marked corrupted: {}", spaceId.value(), reason);
         return corrupted;
     }
 
     /**
-     * 标记表空间 INACTIVE。典型语义是 undo 待截断或生命周期转换中：普通 require 必须阻断，recovery 仍需能读取状态。
+     * 原子派生并发布 {@code INACTIVE} 运行期状态。
      *
-     * <p>与 markCorrupted/markDiscarded 一样，数据流在 ConcurrentHashMap 桶级原子内完成：SpaceId 进入，
-     * 缺失时先从 loader 重建当前快照，再经状态机转到 INACTIVE，最后发布新句柄。该状态不持久化到 page0。
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 SpaceId，避免无身份状态更新。</li>
+     *     <li>在同键 compute 内读取/加载当前快照，经通用状态图派生 INACTIVE 并发布新 handle。</li>
+     *     <li>成功后记录低频生命周期 INFO；本方法不校验 UNDO 类型、不写 page0，也不取得 access lease。</li>
+     * </ol>
      *
-     * @param spaceId 表空间编号。
-     * @return inactive 状态句柄。
+     * @param spaceId 目标非空表空间标识
+     * @return 新发布的 inactive 句柄
+     * @throws DatabaseValidationException 参数非法、loader identity 不一致或当前状态不能迁移时抛出
+     * @throws TablespaceNotFoundException cache 缺失且 loader 未找到时抛出
      */
     @Override
     public TablespaceHandle markInactive(SpaceId spaceId) {
+        // 1. 生命周期更新必须有稳定 cache key。
         validateSpaceId(spaceId);
+
+        // 2. 同键原子读改写；类型专属状态校验由外层 UNDO 编排负责。
         TablespaceHandle inactive = handles.compute(spaceId, (id, existing) -> {
             Tablespace current = (existing != null ? existing : loadHandle(id)).tablespace();
             return new TablespaceHandle(current.transitTo(TablespaceState.INACTIVE));
         });
-        // INACTIVE 是显式生命周期转换，非高频路径；记录空间编号便于定位普通准入失败的原因。
+
+        // 3. 只记录运行期发布事件，不能替代 page0 durable lifecycle。
         log.info("tablespace {} marked inactive", spaceId.value());
         return inactive;
     }
 
     /**
-     * 标记表空间已 discard。该操作只更新运行时快照；真实 discard 的文件关闭和 Buffer Pool stale 后续由生命周期服务补充。
+     * 原子派生并发布 {@code DISCARDED} 运行期状态。
      *
-     * <p>与 markCorrupted 一致，状态读改写在桶级原子内完成，避免与并发状态发布丢更新。
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 SpaceId。</li>
+     *     <li>在同键 compute 内读取/加载当前快照，经状态图迁移为 DISCARDED 并发布。</li>
+     *     <li>成功后记录 INFO；本方法不写 durable discard marker、不失效 Buffer Pool、不关闭或删除文件。</li>
+     * </ol>
      *
-     * @param spaceId 表空间编号。
-     * @return discarded 状态句柄。
+     * @param spaceId 目标非空表空间标识
+     * @return 新发布的 discarded 句柄；后续普通 require 会按 NotFound 拒绝
+     * @throws DatabaseValidationException 参数非法、loader identity 不一致或当前状态不能迁移时抛出
+     * @throws TablespaceNotFoundException cache 缺失且 loader 未找到时抛出
      */
     @Override
     public TablespaceHandle markDiscarded(SpaceId spaceId) {
+        // 1. discard 更新必须绑定稳定 SpaceId。
         validateSpaceId(spaceId);
+
+        // 2. 同键原子派生终态；物理 drain 和持久 marker 必须已由外层协议协调。
         TablespaceHandle discarded = handles.compute(spaceId, (id, existing) -> {
             Tablespace current = (existing != null ? existing : loadHandle(id)).tablespace();
             return new TablespaceHandle(current.transitTo(TablespaceState.DISCARDED));
         });
-        // discard 是显式 DDL 生命周期转换，记录一条便于追踪表空间下线；非高频路径，不会刷屏。
+
+        // 3. 日志只记录运行期状态发布，不证明文件删除已经完成。
         log.info("tablespace {} marked discarded", spaceId.value());
         return discarded;
     }
 
     /**
-     * 关闭运行时表空间句柄。这里仅移除 Registry 的逻辑 cache；物理文件关闭由 PageStore.close 在 DataFileHandle
-     * 生命周期闩保护下完成，避免 Registry 混入 FileChannel 所有权。
+     * 幂等移除指定逻辑 cache 项。
      *
-     * @param spaceId 表空间编号。
+     * <p>不调用 {@link PageStore#close(SpaceId)}，也不等待普通 IO；外层 lifecycle 编排负责物理 close 顺序。
+     * 已经返回给其它线程的旧 handle 仍是可读不可变值，所以普通路径还必须依赖 access lease 后重新 require。</p>
+     *
+     * @param spaceId 待移除的非空表空间标识；cache 未命中时无操作
+     * @throws DatabaseValidationException spaceId 为空时抛出
      */
     @Override
     public void close(SpaceId spaceId) {
@@ -226,9 +328,10 @@ public final class CachingTablespaceRegistry implements TablespaceRegistry {
     }
 
     /**
-     * 移除运行时句柄。语义上用于 drop 完成后的 registry 清理，首版与 close 相同但保留不同方法名表达业务阶段。
+     * 在 drop 清理阶段移除逻辑 cache；当前委托 {@link #close(SpaceId)}，无额外物理副作用。
      *
-     * @param spaceId 表空间编号。
+     * @param spaceId 待移除的非空表空间标识；cache 未命中时无操作
+     * @throws DatabaseValidationException spaceId 为空时抛出
      */
     @Override
     public void remove(SpaceId spaceId) {
@@ -236,9 +339,12 @@ public final class CachingTablespaceRegistry implements TablespaceRegistry {
     }
 
     /**
-     * 返回已打开表空间句柄快照。返回 List.copyOf 结果，避免调用方修改 registry 内部 cache。
+     * 复制并返回当前可遍历到的逻辑句柄集合。
      *
-     * @return 已打开句柄列表。
+     * <p>结果列表不可修改，但 ConcurrentHashMap 遍历是弱一致的：并发 replace/remove 时不保证所有元素
+     * 来自同一个全局瞬间，也不保证 SpaceId 排序。</p>
+     *
+     * @return 不可变、无顺序保证的句柄列表；cache 为空时返回空列表
      */
     @Override
     public List<TablespaceHandle> listOpenTablespaces() {
@@ -246,10 +352,11 @@ public final class CachingTablespaceRegistry implements TablespaceRegistry {
     }
 
     /**
-     * 判断运行时 cache 中是否存在指定表空间句柄，不触发 loader。
+     * 判断逻辑 cache 是否包含指定 SpaceId，不触发 loader 或状态白名单。
      *
-     * @param spaceId 表空间编号。
-     * @return 存在句柄返回 true。
+     * @param spaceId 待查询的非空表空间标识
+     * @return 存在任意生命周期状态的 handle 时返回 {@code true}
+     * @throws DatabaseValidationException spaceId 为空时抛出
      */
     @Override
     public boolean isOpen(SpaceId spaceId) {
@@ -257,21 +364,46 @@ public final class CachingTablespaceRegistry implements TablespaceRegistry {
         return handles.containsKey(spaceId);
     }
 
+    /**
+     * 调用 loader，核对 identity，并转换为不持物理资源的运行时 handle。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>按请求 SpaceId 调用 loader；空结果转换为明确 NotFound。</li>
+     *     <li>比较 metadata 自带 SpaceId，拒绝把其它空间的 page0 快照缓存到当前 key。</li>
+     *     <li>转换为 Tablespace/Handle；成功仅返回候选值，是否写 cache 由调用方法决定。</li>
+     * </ol>
+     *
+     * @param spaceId 已通过非空校验的请求标识
+     * @return 与请求 identity 一致的新运行时 handle
+     * @throws TablespaceNotFoundException loader 返回空时抛出
+     * @throws DatabaseValidationException loader 返回其它 SpaceId 或 metadata 结构非法时抛出
+     */
     private TablespaceHandle loadHandle(SpaceId spaceId) {
+        // 1. 未找到的 loader 结果不能用空 handle 污染 cache。
         TablespaceMetadata metadata = metadataLoader.load(spaceId)
                 .orElseThrow(() -> new TablespaceNotFoundException("tablespace not found: " + spaceId.value()));
+
+        // 2. cache key 必须与 page0/metadata identity 精确一致。
         if (!metadata.spaceId().equals(spaceId)) {
             throw new DatabaseValidationException("loaded tablespace metadata space id mismatch");
         }
+
+        // 3. 转换只创建不可变逻辑值；物理 handle ownership 仍在 PageStore。
         return new TablespaceHandle(metadata.toTablespace());
     }
 
     /**
-     * 普通 PageStore 路径的状态白名单校验：仅 NORMAL/ACTIVE 允许（与 {@link TablespaceState} 注释和设计 §5.2 一致）。
-     * EMPTY(未初始化)、INACTIVE(如 undo 待截断)、DISCARDED、CORRUPTED 都不能走普通 IO，否则可能读到未初始化页、
-     * 正在截断的 undo 或损坏数据。CORRUPTED/DISCARDED 给出更具体的领域异常，其余不可用状态给 TablespaceUnavailableException。
+     * 对运行期快照实施普通操作状态白名单。
      *
-     * @param tablespace 当前运行时快照。
+     * <p>{@code NORMAL/ACTIVE} 直接通过；{@code CORRUPTED} 与 {@code DISCARDED} 分别映射为损坏和
+     * 不存在异常；{@code EMPTY/INACTIVE/TRUNCATING} 映射为暂不可用。方法只读不可变快照，不访问
+     * PageStore，也不尝试修复或迁移状态。</p>
+     *
+     * @param tablespace 待准入的非空当前运行时快照
+     * @throws TablespaceCorruptedException 状态为 CORRUPTED 时抛出
+     * @throws TablespaceNotFoundException 状态为 DISCARDED 时抛出
+     * @throws TablespaceUnavailableException 状态为其它非服务状态时抛出
      */
     private void ensureOrdinaryAccessAllowed(Tablespace tablespace) {
         TablespaceState state = tablespace.state();
@@ -288,6 +420,12 @@ public final class CachingTablespaceRegistry implements TablespaceRegistry {
         }
     }
 
+    /**
+     * 在访问 loader/cache 前拒绝空 SpaceId。
+     *
+     * @param spaceId registry 操作的目标标识
+     * @throws DatabaseValidationException spaceId 为空时抛出
+     */
     private void validateSpaceId(SpaceId spaceId) {
         if (spaceId == null) {
             throw new DatabaseValidationException("tablespace space id must not be null");

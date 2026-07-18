@@ -19,6 +19,9 @@ import cn.zhangyis.db.storage.btree.TableIndexMetadata;
 import cn.zhangyis.db.storage.btree.SplitCapableBTreeIndexService;
 import cn.zhangyis.db.storage.btree.IndexMetadataResolver;
 import cn.zhangyis.db.storage.api.lob.LobStorage;
+import cn.zhangyis.db.storage.api.lob.LobFreeBatchPlan;
+import cn.zhangyis.db.storage.api.lob.LobFreeTarget;
+import cn.zhangyis.db.storage.api.SegmentRef;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
@@ -43,6 +46,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.EnumMap;
 import java.util.List;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Collection;
 import java.util.Optional;
@@ -262,28 +266,7 @@ public final class RollbackService {
             txnMgr.beginRollback(txn);
         }
 
-        int applied = 0;
-        if (ctx != null) {
-            while (true) {
-                UndoLogBinding binding = newestBinding(ctx, emptyTargets());
-                if (binding == null) {
-                    break;
-                }
-                UndoLogicalHead expectedHead = binding.logicalHead();
-                RecordAt current = readUndoRecord(
-                        binding.firstPageId(), clusteredIndex, expectedHead.rollPointer());
-                UndoLogicalHead targetHead = derivePredecessorHead(
-                        binding.firstPageId(), clusteredIndex, expectedHead, current);
-                applyUndoRecordInOwnMtr(current, clusteredIndex);
-                applied++;
-                progressFaultInjector.after(RollbackProgressPhase.AFTER_INVERSE_COMMIT, expectedHead);
-                persistLogicalHead(binding.firstPageId(), expectedHead, targetHead, current,
-                        clusteredIndex);
-                // marker 已提交后只发布无 IO 的内存 pair；测试 hook 放在发布之后，异常也不会制造持久/内存撕裂。
-                ctx.publishRollbackProgress(binding.kind(), targetHead);
-                progressFaultInjector.after(RollbackProgressPhase.AFTER_PROGRESS_COMMIT, targetHead);
-            }
-        }
+        int applied = ctx == null ? 0 : rollbackAllBindings(ctx, clusteredIndex);
         if (ctx != null) {
             finalizer.finalizeLiveRollback(txn, ctx);
         } else {
@@ -292,6 +275,99 @@ public final class RollbackService {
         }
         txnMgr.finishRollback(txn);
         return new RollbackSummary(applied);
+    }
+
+    /**
+     * 显式回滚 prepared transaction。该入口与普通 rollback 分离，确保 first-page 期望状态和 redo reason
+     * 始终保持 PREPARED 语义。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>要求 PREPARED 或可重试 PREPARED_ROLLING_BACK，并预检全部持久 logical chain。</li>
+     *     <li>首次调用发布 PREPARED_ROLLING_BACK，但保留 active-table身份和事务锁。</li>
+     *     <li>复用逐条 inverse + marker 流程，把一或两条 logical head幂等推进到 EMPTY。</li>
+     *     <li>prepared finalizer同批 drop owner、clear page3并写终态 redo，随后 manager移出 active table。</li>
+     * </ol>
+     *
+     * @param txn 待决议的 PREPARED 或失败重试 PREPARED_ROLLING_BACK 事务
+     * @param clusteredIndex legacy 单聚簇 metadata；DD resolver模式仍会按每条 undo identity解析
+     * @return 本次实际应用的 undo record数量
+     * @throws TransactionStateException 事务状态或 undo context不符合 prepared rollback条件时抛出
+     */
+    public RollbackSummary rollbackPrepared(Transaction txn, BTreeIndex clusteredIndex) {
+        if (txn == null || clusteredIndex == null) {
+            throw new DatabaseValidationException(
+                    "prepared rollback transaction/index must not be null");
+        }
+        return rollbackPreparedInternal(txn, clusteredIndex);
+    }
+
+    /**
+     * DD resolver 模式 prepared rollback；同一事务可跨多表，不接受 last-index fallback。
+     *
+     * @param txn 待决议 prepared transaction
+     * @return 本次应用的 undo record数量
+     */
+    public RollbackSummary rollbackPrepared(Transaction txn) {
+        if (txn == null) {
+            throw new DatabaseValidationException(
+                    "resolved prepared rollback transaction must not be null");
+        }
+        if (targetResolver == null) {
+            throw new DatabaseValidationException(
+                    "resolved prepared rollback requires UndoTargetMetadataResolver");
+        }
+        return rollbackPreparedInternal(txn, null);
+    }
+
+    /** prepared rollback 两种 metadata入口共用实现。 */
+    private RollbackSummary rollbackPreparedInternal(Transaction txn, BTreeIndex clusteredIndex) {
+        // 1、重试态显式保留 prepared origin；普通 ROLLING_BACK 不能进入。
+        TransactionState initialState = txn.state();
+        if (initialState != TransactionState.PREPARED
+                && initialState != TransactionState.PREPARED_ROLLING_BACK) {
+            throw new TransactionStateException(
+                    "prepared rollback requires PREPARED or PREPARED_ROLLING_BACK: " + initialState);
+        }
+        UndoContext context = txn.undoContext();
+        if (context == null || context.bindings().isEmpty()) {
+            throw new TransactionStateException(
+                    "prepared rollback requires ordinary undo context");
+        }
+        preflightAllBindings(clusteredIndex, context, emptyTargets());
+        // 2、只在首次决议时推进运行态；失败重试保持原态。
+        if (initialState == TransactionState.PREPARED) {
+            txnMgr.beginPreparedRollback(txn);
+        }
+        // 3、marker 更新不依赖 ACTIVE/PREPARED状态，只对持久 logical head做CAS。
+        int applied = rollbackAllBindings(context, clusteredIndex);
+        // 4、物理 owner终结成功后才允许 manager发布 ROLLED_BACK。
+        finalizer.finalizePreparedRollback(txn, context);
+        txnMgr.finishPreparedRollback(txn);
+        return new RollbackSummary(applied);
+    }
+
+    /** 普通与 prepared full rollback 共用的逐条 inverse/marker 循环；终结状态由各自调用方处理。 */
+    private int rollbackAllBindings(UndoContext context, BTreeIndex clusteredIndex) {
+        int applied = 0;
+        while (true) {
+            UndoLogBinding binding = newestBinding(context, emptyTargets());
+            if (binding == null) {
+                return applied;
+            }
+            UndoLogicalHead expectedHead = binding.logicalHead();
+            RecordAt current = readUndoRecord(
+                    binding.firstPageId(), clusteredIndex, expectedHead.rollPointer());
+            UndoLogicalHead targetHead = derivePredecessorHead(
+                    binding.firstPageId(), clusteredIndex, expectedHead, current);
+            applyUndoRecordInOwnMtr(current, clusteredIndex);
+            applied++;
+            progressFaultInjector.after(RollbackProgressPhase.AFTER_INVERSE_COMMIT, expectedHead);
+            persistLogicalHead(binding.firstPageId(), expectedHead, targetHead, current,
+                    clusteredIndex);
+            context.publishRollbackProgress(binding.kind(), targetHead);
+            progressFaultInjector.after(RollbackProgressPhase.AFTER_PROGRESS_COMMIT, targetHead);
+        }
     }
 
     /**
@@ -933,7 +1009,8 @@ public final class RollbackService {
         BTreeIndex markerIndex = targetHead.isEmpty()
                 ? current.index()
                 : resolveIndexAt(firstPageId, targetHead.rollPointer(), clusteredIndex);
-        RedoBudgetWorkload markerWorkload = rollbackMarkerWorkload(List.of(current));
+        List<LobFreeBatchPlan> lobFreePlans = planRollbackLobFrees(List.of(current));
+        RedoBudgetWorkload markerWorkload = rollbackMarkerWorkload(lobFreePlans);
         MiniTransaction markerMtr = mtrMgr.begin(
                 mtrMgr.budgetFor(RedoBudgetPurpose.ROLLBACK_MARKER, markerWorkload));
         try {
@@ -941,7 +1018,7 @@ public final class RollbackService {
                     markerMtr, firstPageId, PageLatchMode.EXCLUSIVE);
             try (var ignored = markerMtr.allowOutOfOrderPageLatch(
                     "rollback marker owns undo first-page before LOB/FSP; LOB/FSP never waits for undo pages")) {
-                freeInsertedLobs(markerMtr, current);
+                freeRollbackLobs(markerMtr, lobFreePlans);
                 writable.updateLogicalHead(expectedHead, targetHead,
                         markerIndex.keyDef(), markerIndex.schema());
             }
@@ -968,8 +1045,9 @@ public final class RollbackService {
                 .sorted(Comparator.comparingInt((ResolvedHeadUpdate item) -> item.firstPageId().spaceId().value())
                         .thenComparingLong(item -> item.firstPageId().pageNo().value()))
                 .toList();
+        List<LobFreeBatchPlan> lobFreePlans = planRollbackLobFrees(appliedRecords);
         MiniTransaction marker = mtrMgr.begin(mtrMgr.budgetFor(
-                RedoBudgetPurpose.ROLLBACK_MARKER, rollbackMarkerWorkload(appliedRecords)));
+                RedoBudgetPurpose.ROLLBACK_MARKER, rollbackMarkerWorkload(lobFreePlans)));
         try {
             try (var ignored = marker.allowOutOfOrderPageLatch(
                     "dual undo marker: target records may live on non-monotonic chain pages after sorted first pages")) {
@@ -978,9 +1056,7 @@ public final class RollbackService {
                 for (ResolvedHeadUpdate resolved : ordered) {
                     writableSegments.add(undoAccess.open(marker, resolved.firstPageId(), PageLatchMode.EXCLUSIVE));
                 }
-                for (RecordAt applied : appliedRecords) {
-                    freeInsertedLobs(marker, applied);
-                }
+                freeRollbackLobs(marker, lobFreePlans);
                 for (int i = 0; i < ordered.size(); i++) {
                     ResolvedHeadUpdate resolved = ordered.get(i);
                     HeadUpdate update = resolved.update();
@@ -995,47 +1071,102 @@ public final class RollbackService {
         }
     }
 
-    /** marker 固定 6 个页像预算，加每条 INSERT ownership 的 FSP free/PAGE_INIT 上界。 */
-    private RedoBudgetWorkload rollbackMarkerWorkload(List<RecordAt> records) {
-        if (records == null) {
-            throw new DatabaseValidationException("rollback marker records must not be null");
+    /**
+     * 合并 marker 固定 first-page/header 余量与全部 authoritative LOB 批量 free workload。
+     *
+     * @param plans 已按 segment 稳定排序且完成 reference/segment 基本校验的释放计划。
+     * @return 覆盖 logical-head CAS 和所有 FSP free/PAGE_INIT 的动态 redo workload。
+     * @throws DatabaseValidationException 计划容器缺失或包含 {@code null} 时抛出。
+     */
+    private RedoBudgetWorkload rollbackMarkerWorkload(List<LobFreeBatchPlan> plans) {
+        if (plans == null || plans.stream().anyMatch(java.util.Objects::isNull)) {
+            throw new DatabaseValidationException("rollback marker LOB free plans must not contain null");
         }
         RedoBudgetWorkload workload = RedoBudgetWorkload.pageImages(6L);
-        for (RecordAt at : records) {
-            if (at == null) {
-                throw new DatabaseValidationException("rollback marker record list contains null");
-            }
-            for (var ownership : at.record().insertedLobs()) {
-                if (lobStorage == null || at.target().lobSegment().isEmpty()) {
-                    throw new UndoLogFormatException(
-                            "INSERT LOB ownership requires authoritative DD LOB segment during rollback");
-                }
-                workload = workload.plus(lobStorage.freeWorkload(ownership.value().reference().pageCount()));
-            }
-        }
+        for (LobFreeBatchPlan plan : plans) workload = workload.plus(plan.workload());
         return workload;
     }
 
     /**
-     * 在 marker MTR 中用权威 table binding 校验并释放一条 INSERT undo 的全部 LOB ownership。segment mismatch、
-     * schema ordinal/type 漂移或链损坏都会在 logical head 写入前失败，绝不跳过损坏 ownership。
+     * 从已完成 inverse 的 undo records 投影 rollback-owned LOB，并按 authoritative segment 聚合为批量计划。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>逐 record 校验 exact schema ordinal 和 LOB storage wiring。</li>
+     *     <li>INSERT 收集 inserted ownership；UPDATE 只收集 LV 中的 rollback-new ownership。</li>
+     *     <li>按 authoritative segment 分组并调用 LobStorage 拒绝重复 physical reference。</li>
+     *     <li>按 space/inode/segment identity 稳定排序，供 marker 维持确定 FSP 访问顺序。</li>
+     * </ol>
+     *
+     * @param records 当前 marker 即将越过的 undo records；不能为空容器或包含 {@code null}。
+     * @return 按 authoritative segment 排序的不可变批量 free plans；无 ownership 时为空列表。
+     * @throws UndoLogFormatException metadata/ordinal/segment 缺失或 rollback 未配置 LobStorage 时抛出。
      */
-    private void freeInsertedLobs(MiniTransaction marker, RecordAt at) {
-        if (at.record().insertedLobs().isEmpty()) {
-            return;
+    private List<LobFreeBatchPlan> planRollbackLobFrees(List<RecordAt> records) {
+        if (records == null || records.stream().anyMatch(java.util.Objects::isNull)) {
+            throw new DatabaseValidationException("rollback marker records must not contain null");
         }
-        if (lobStorage == null) {
-            throw new UndoLogFormatException("LOB rollback storage is not configured");
-        }
-        var segment = at.target().lobSegment().orElseThrow(() -> new UndoLogFormatException(
-                "undo target lacks authoritative LOB segment"));
-        for (var ownership : at.record().insertedLobs()) {
-            int ordinal = ownership.columnOrdinal();
-            if (ordinal < 0 || ordinal >= at.index().schema().columns().size()) {
-                throw new UndoLogFormatException("INSERT LOB ownership column ordinal out of schema: " + ordinal);
+        // 1. 分组前先验证每条 record 的 exact schema/target；legacy 无 LOB 路径保持空结果。
+        Map<SegmentRef, List<LobFreeTarget>> targetsBySegment = new LinkedHashMap<>();
+        for (RecordAt at : records) {
+            List<LobFreeTarget> targets = new ArrayList<>();
+            for (var ownership : at.record().insertedLobs()) {
+                targets.add(rollbackFreeTarget(at, ownership.columnOrdinal(), ownership.value(), "INSERT"));
             }
-            lobStorage.free(marker, segment, at.index().schema().column(ordinal).type(), ownership.value());
+            // 2. purge-old ownership 在 rollback 必须保留；这里只消费前向 UPDATE 新链。
+            for (var ownership : at.record().lobVersionOwnerships()) {
+                ownership.rollbackNewValue().ifPresent(external -> targets.add(
+                        rollbackFreeTarget(at, ownership.columnOrdinal(), external, "UPDATE")));
+            }
+            if (targets.isEmpty()) continue;
+            if (lobStorage == null) {
+                throw new UndoLogFormatException("LOB rollback storage is not configured");
+            }
+            SegmentRef segment = at.target().lobSegment().orElseThrow(() -> new UndoLogFormatException(
+                    "undo target lacks authoritative LOB segment"));
+            targetsBySegment.computeIfAbsent(segment, ignored -> new ArrayList<>()).addAll(targets);
         }
+        // 3. LobStorage 统一校验 reference→segment identity 和批内重复 ownership。
+        List<LobFreeBatchPlan> plans = new ArrayList<>(targetsBySegment.size());
+        targetsBySegment.forEach((segment, targets) -> plans.add(lobStorage.planFreeBatch(segment, targets)));
+        // 4. 多表/多 segment marker 采用稳定物理顺序，避免 FSP latch 获取顺序随 Hash/undo 组合漂移。
+        plans.sort(Comparator.comparingInt((LobFreeBatchPlan plan) -> plan.segment().spaceId().value())
+                .thenComparingInt(plan -> plan.segment().inodeSlot())
+                .thenComparingLong(plan -> plan.segment().segmentId().value()));
+        return List.copyOf(plans);
+    }
+
+    /**
+     * 将单条 undo ownership 转换为带 exact schema 类型的 LOB free target。
+     *
+     * @param at       已解析 exact-version target 的 undo record。
+     * @param ordinal  ownership 声明的 schema ordinal。
+     * @param external 待 rollback 释放的新 external envelope。
+     * @param kind     INSERT/UPDATE 诊断标签。
+     * @return 交给 LobStorage 批量校验/释放的不可变 target。
+     * @throws UndoLogFormatException ordinal 越界或 authoritative LOB segment 缺失时抛出。
+     */
+    private LobFreeTarget rollbackFreeTarget(RecordAt at, int ordinal,
+                                             cn.zhangyis.db.storage.record.type.ColumnValue.ExternalValue external,
+                                             String kind) {
+        if (ordinal < 0 || ordinal >= at.index().schema().columns().size()) {
+            throw new UndoLogFormatException(kind + " LOB ownership column ordinal out of schema: " + ordinal);
+        }
+        if (at.target().lobSegment().isEmpty()) {
+            throw new UndoLogFormatException(kind + " LOB ownership requires authoritative DD LOB segment");
+        }
+        return new LobFreeTarget(ordinal, at.index().schema().column(ordinal).type(), external);
+    }
+
+    /**
+     * 在已固定 undo first-page X latch 的 marker MTR 中执行全部批量 free；调用方随后才允许写 logical head。
+     *
+     * @param marker ACTIVE marker MTR，redo budget 已覆盖全部计划。
+     * @param plans  按 authoritative segment 稳定排序的批量 free plans。
+     * @throws DatabaseRuntimeException 链校验、FSP free 或 PAGE_INIT 失败时抛出；调用方必须保留 fail-stop 严重度。
+     */
+    private void freeRollbackLobs(MiniTransaction marker, List<LobFreeBatchPlan> plans) {
+        for (LobFreeBatchPlan plan : plans) lobStorage.freePlannedBatch(marker, plan);
     }
 
     /**

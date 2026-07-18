@@ -144,7 +144,7 @@ public final class CrashRecoveryService {
                 }
 
                 if (request.transactionUndoRecovery() != null) {
-                    // 4、先回滚 ACTIVE 并恢复 committed history；返回时所有 undo/page latch 已释放。
+                    // 4、恢复 committed history、决议 PREPARED、再回滚 ACTIVE；返回时所有 undo/page latch 已释放。
                     tracker.begin(RecoveryStageName.UNDO_ROLLBACK);
                     RecoveredTransactionSnapshot transactionSnapshot =
                             request.transactionRecoveryContext().snapshot();

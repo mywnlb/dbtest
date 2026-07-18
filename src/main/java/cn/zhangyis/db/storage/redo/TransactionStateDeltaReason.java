@@ -11,7 +11,13 @@ public enum TransactionStateDeltaReason {
     /** 回滚路径产生的状态变化。 */
     ROLLBACK((byte) 2),
     /** crash recovery 完成 recovered-active 回滚后产生的终态证据。 */
-    RECOVERY_ROLLBACK((byte) 3);
+    RECOVERY_ROLLBACK((byte) 3),
+    /** XA phase one 把 ACTIVE 写分支持久化为 PREPARED。 */
+    PREPARE((byte) 4),
+    /** XA coordinator 决议提交 PREPARED 分支。 */
+    PREPARED_COMMIT((byte) 5),
+    /** XA coordinator 决议回滚 PREPARED 分支。 */
+    PREPARED_ROLLBACK((byte) 6);
 
     /** redo 文件中的稳定 1 字节原因码；只能追加，不能重排。 */
     private final byte code;

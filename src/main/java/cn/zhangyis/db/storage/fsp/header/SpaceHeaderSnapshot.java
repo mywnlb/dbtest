@@ -23,7 +23,7 @@ import cn.zhangyis.db.domain.SpaceId;
  * @param freeFragExtentList 全局 FSP_FREE_FRAG extent 链 base。
  * @param fullFragExtentList 全局 FSP_FULL_FRAG extent 链 base。
  * @param firstInodePageNo   首个 INODE 页页号（首版固定 page 2）。
- * @param sdiRootPageNo      SDI 根页号，保留扩展（0 未启用）。
+ * @param sdiRootPageNo      GENERAL 表空间的 SDI 根页号；0 表示 legacy/未启用，v1 使用固定 page 3。
  * @param serverVersion      写入该表空间的 server 版本号。
  * @param spaceVersion       表空间格式版本号。
  */

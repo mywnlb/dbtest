@@ -15,9 +15,11 @@ import cn.zhangyis.db.storage.api.ddl.StorageTableDefinition;
 import cn.zhangyis.db.storage.api.ddl.TableStorageBinding;
 import cn.zhangyis.db.storage.api.dml.DmlCommitCommand;
 import cn.zhangyis.db.storage.api.dml.ResolvedDmlRollbackCommand;
+import cn.zhangyis.db.storage.api.dml.TableDeleteCommand;
 import cn.zhangyis.db.storage.api.dml.TableInsertCommand;
 import cn.zhangyis.db.storage.api.dml.TableUpdateCommand;
 import cn.zhangyis.db.storage.btree.BTreeIndex;
+import cn.zhangyis.db.storage.btree.BTreeCurrentReadMode;
 import cn.zhangyis.db.storage.btree.IndexMetadataResolver;
 import cn.zhangyis.db.storage.btree.SecondaryIndexMetadata;
 import cn.zhangyis.db.storage.btree.TableIndexMetadata;
@@ -36,6 +38,8 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -255,6 +259,160 @@ class SecondaryMvccReaderTest {
         }
     }
 
+    /**
+     * non-unique logical key 是 physical prefix range：同 key 多行必须全部回表；key-changing UPDATE 后，旧
+     * ReadView 仍由 marked 候选恢复两行，新 ReadView 只返回仍匹配的一行。
+     */
+    @Test
+    @DisplayName("non-unique secondary range returns every visible clustered identity")
+    void readsNonUniqueLogicalPrefixRangeAcrossVersions() {
+        MutableTargetResolver resolver = new MutableTargetResolver();
+        StorageEngine engine = new StorageEngine(config());
+        engine.configureIndexMetadataResolver(resolver);
+        engine.open();
+        try {
+            TableIndexMetadata table = createTable(engine, "secondary-range.ibd", false);
+            resolver.install(new UndoTargetMetadata(table, Optional.empty()));
+            SecondaryIndexMetadata email = table.requireSecondary(EMAIL_ID);
+            LogicalRecord first = row(1, "team@example.test");
+            LogicalRecord second = row(2, "TEAM@example.test");
+
+            Transaction firstInsert = transaction(engine);
+            engine.tableDmlService().insert(new TableInsertCommand(firstInsert, table, first,
+                    Optional.empty(), TIMEOUT));
+            commit(engine, firstInsert);
+            Transaction secondInsert = transaction(engine);
+            engine.tableDmlService().insert(new TableInsertCommand(secondInsert, table, second,
+                    Optional.empty(), TIMEOUT));
+            commit(engine, secondInsert);
+
+            Transaction oldReader = transaction(engine);
+            ReadView oldView = engine.transactionManager().readViewManager().openReadView(oldReader);
+            Transaction update = transaction(engine);
+            engine.tableDmlService().update(new TableUpdateCommand(update, table, primaryKey(2),
+                    row(2, "other@example.test"), TIMEOUT));
+
+            assertEquals(List.of(1L, 2L), ids(engine.secondaryMvccReader()
+                    .readRange(oldView, table, email, emailKey("team@example.test"))));
+            commit(engine, update);
+            assertEquals(List.of(1L, 2L), ids(engine.secondaryMvccReader()
+                    .readRange(oldView, table, email, emailKey("TEAM@example.test"))));
+
+            Transaction newReader = transaction(engine);
+            ReadView newView = engine.transactionManager().readViewManager().openReadView(newReader);
+            assertEquals(List.of(1L), ids(engine.secondaryMvccReader()
+                    .readRange(newView, table, email, emailKey("team@example.test"))));
+            engine.tableDmlService().rollback(new ResolvedDmlRollbackCommand(oldReader));
+            engine.tableDmlService().rollback(new ResolvedDmlRollbackCommand(newReader));
+        } finally {
+            engine.close();
+        }
+    }
+
+    /**
+     * FOR SHARE 先取得稳定 logical-prefix S，再锁聚簇当前行；同 prefix INSERT 的 X 必须等待 reader 事务终态，
+     * 且等待路径不能依赖瞬时 secondary page/heapNo。
+     */
+    @Test
+    @DisplayName("secondary locking range blocks same-prefix DML until transaction end")
+    void lockingRangeBlocksSamePrefixInsertUntilRelease() throws Exception {
+        MutableTargetResolver resolver = new MutableTargetResolver();
+        StorageEngine engine = new StorageEngine(config());
+        engine.configureIndexMetadataResolver(resolver);
+        engine.open();
+        try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            TableIndexMetadata table = createTable(engine, "secondary-locking-range.ibd", false);
+            resolver.install(new UndoTargetMetadata(table, Optional.empty()));
+            SecondaryIndexMetadata email = table.requireSecondary(EMAIL_ID);
+            Transaction seed = transaction(engine);
+            engine.tableDmlService().insert(new TableInsertCommand(seed, table,
+                    row(1, "locked@example.test"), Optional.empty(), TIMEOUT));
+            commit(engine, seed);
+
+            Transaction reader = transaction(engine);
+            assertEquals(List.of(1L), ids(engine.secondaryCurrentReadService().readRange(
+                    reader, table, email, emailKey("LOCKED@example.test"),
+                    BTreeCurrentReadMode.FOR_SHARE, TIMEOUT)));
+
+            Transaction writer = transaction(engine);
+            var blockedInsert = executor.submit(() -> {
+                engine.tableDmlService().insert(new TableInsertCommand(writer, table,
+                        row(2, "locked@example.test"), Optional.empty(), TIMEOUT));
+                commit(engine, writer);
+                return null;
+            });
+            awaitWaitEdge(engine, writer, reader);
+            assertTrue(!blockedInsert.isDone(), "same-prefix INSERT must wait for locking range reader");
+
+            engine.transactionManager().commit(reader);
+            assertTrue(engine.lockManager().releaseAll(reader.transactionId()) >= 2,
+                    "reader must hold logical-prefix plus clustered record lock");
+            blockedInsert.get(5, TimeUnit.SECONDS);
+        } finally {
+            engine.close();
+        }
+    }
+
+    /**
+     * 空 prefix 的 FOR SHARE 仍保护 predicate，key-changing UPDATE 不能制造 phantom；已有行的 FOR SHARE
+     * 同时持 prefix 与 clustered S，DELETE 必须等待读事务终态后才能标删二级和聚簇记录。
+     */
+    @Test
+    @DisplayName("secondary locking range blocks key-changing update and delete")
+    void lockingRangeBlocksKeyChangingUpdateAndDelete() throws Exception {
+        MutableTargetResolver resolver = new MutableTargetResolver();
+        StorageEngine engine = new StorageEngine(config());
+        engine.configureIndexMetadataResolver(resolver);
+        engine.open();
+        try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            TableIndexMetadata table = createTable(engine, "secondary-locking-update-delete.ibd", false);
+            resolver.install(new UndoTargetMetadata(table, Optional.empty()));
+            SecondaryIndexMetadata email = table.requireSecondary(EMAIL_ID);
+            Transaction seed = transaction(engine);
+            engine.tableDmlService().insert(new TableInsertCommand(seed, table,
+                    row(1, "source@example.test"), Optional.empty(), TIMEOUT));
+            commit(engine, seed);
+
+            // 1. 空结果仍持 target logical-prefix S；UPDATE 已锁聚簇行后会在发布 target entry 前等待该资源。
+            Transaction emptyRangeReader = transaction(engine);
+            assertEquals(List.of(), engine.secondaryCurrentReadService().readRange(
+                    emptyRangeReader, table, email, emailKey("target@example.test"),
+                    BTreeCurrentReadMode.FOR_SHARE, TIMEOUT));
+            Transaction updater = transaction(engine);
+            var blockedUpdate = executor.submit(() -> {
+                engine.tableDmlService().update(new TableUpdateCommand(updater, table, primaryKey(1),
+                        row(1, "target@example.test"), TIMEOUT));
+                commit(engine, updater);
+                return null;
+            });
+            awaitWaitEdge(engine, updater, emptyRangeReader);
+            assertTrue(!blockedUpdate.isDone(), "key-changing UPDATE must wait for empty locking predicate");
+            engine.transactionManager().commit(emptyRangeReader);
+            assertTrue(engine.lockManager().releaseAll(emptyRangeReader.transactionId()) >= 1);
+            blockedUpdate.get(5, TimeUnit.SECONDS);
+
+            // 2. 非空 range 还持 clustered S；DELETE 无论阻塞在 row 还是 prefix 锁，都不能提前发布 delete-mark。
+            Transaction rowReader = transaction(engine);
+            assertEquals(List.of(1L), ids(engine.secondaryCurrentReadService().readRange(
+                    rowReader, table, email, emailKey("TARGET@example.test"),
+                    BTreeCurrentReadMode.FOR_SHARE, TIMEOUT)));
+            Transaction deleter = transaction(engine);
+            var blockedDelete = executor.submit(() -> {
+                engine.tableDmlService().delete(new TableDeleteCommand(
+                        deleter, table, primaryKey(1), TIMEOUT));
+                commit(engine, deleter);
+                return null;
+            });
+            awaitWaitEdge(engine, deleter, rowReader);
+            assertTrue(!blockedDelete.isDone(), "DELETE must wait for locking range reader");
+            engine.transactionManager().commit(rowReader);
+            assertTrue(engine.lockManager().releaseAll(rowReader.transactionId()) >= 2);
+            blockedDelete.get(5, TimeUnit.SECONDS);
+        } finally {
+            engine.close();
+        }
+    }
+
     /** 创建包含聚簇主键和大小写不敏感 unique email 的真实表。 */
     private TableIndexMetadata createTable(StorageEngine engine) {
         return createTable(engine, "secondary-mvcc.ibd", true);
@@ -298,6 +456,25 @@ class SecondaryMvccReaderTest {
     /** 构造聚簇主键。 */
     private static SearchKey primaryKey(long id) {
         return new SearchKey(List.of(new ColumnValue.IntValue(id)));
+    }
+
+    /** 从 range 结果提取稳定聚簇 id，便于同时验证数量、去重和物理 suffix 顺序。 */
+    private static List<Long> ids(List<LogicalRecord> rows) {
+        return rows.stream().map(row -> ((ColumnValue.IntValue) row.columnValues().getFirst()).value()).toList();
+    }
+
+    /** 等待 LockManager 发布 writer→reader 边，避免用固定 sleep 掩盖未真正进入锁等待的假阳性。 */
+    private static void awaitWaitEdge(StorageEngine engine, Transaction writer, Transaction reader) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        while (System.nanoTime() < deadline) {
+            if (engine.lockManager().snapshot().waitEdges().stream().anyMatch(edge ->
+                    edge.waitingTransactionId().equals(writer.transactionId())
+                            && edge.blockingTransactionId().equals(reader.transactionId()))) {
+                return;
+            }
+            Thread.onSpinWait();
+        }
+        throw new AssertionError("same-prefix DML did not enter logical range lock wait");
     }
 
     /** 构造 logical unique email key；大小写等价性由索引 collation 处理。 */

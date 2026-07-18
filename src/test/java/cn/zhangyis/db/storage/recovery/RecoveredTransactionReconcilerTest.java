@@ -124,6 +124,53 @@ class RecoveredTransactionReconcilerTest {
                 TransactionId.of(7), TransactionNo.of(3)));
     }
 
+    /** PREPARED page3 与相同 redo phase-one 证据闭合后进入独立集合，不被当作 recovered-active 回滚。 */
+    @Test
+    void preparedPage3MatchingRedoIsAccepted() {
+        RecoveredTransactionTable table = table(0, 3, 2);
+        table.accept(range(), prepared(7));
+        RecoveredUndoSlotEvidence prepared = preparedSlot(0, 7, UndoLogKind.INSERT);
+
+        RecoveredTransactionReconciliation result = new RecoveredTransactionReconciler()
+                .reconcile(table.snapshot(), Lsn.of(120), List.of(prepared));
+
+        assertEquals(List.of(prepared), result.preparedSlots());
+        assertEquals(List.of(), result.activeSlots());
+        assertEquals(RecoveredTransactionState.PREPARED,
+                result.snapshot().entry(TransactionId.of(7)).orElseThrow().state());
+    }
+
+    /** prepare redo 被 checkpoint 回收时，baseline 覆盖 creator 后可由 checksum-protected first page 恢复。 */
+    @Test
+    void preparedPage3WithoutRedoRequiresCoveringBaseline() {
+        RecoveredUndoSlotEvidence prepared = preparedSlot(0, 7, UndoLogKind.UPDATE);
+
+        RecoveredTransactionReconciliation accepted = new RecoveredTransactionReconciler()
+                .reconcile(baseline(10, 8, 4), Lsn.of(120), List.of(prepared));
+        assertEquals(List.of(prepared), accepted.preparedSlots());
+
+        assertThrows(TransactionRecoveryException.class,
+                () -> new RecoveredTransactionReconciler()
+                        .reconcile(baseline(10, 7, 4), Lsn.of(120), List.of(prepared)));
+    }
+
+    /** 同一 creator 的 INSERT/UPDATE 可以同时 PREPARED，但不能混入 ACTIVE。 */
+    @Test
+    void preparedTransactionMayOwnTwoLogsButCannotMixStates() {
+        RecoveredTransactionTable table = table(0, 3, 2);
+        table.accept(range(), prepared(7));
+        RecoveredUndoSlotEvidence insert = preparedSlot(0, 7, UndoLogKind.INSERT);
+        RecoveredUndoSlotEvidence update = preparedSlot(1, 7, UndoLogKind.UPDATE);
+
+        RecoveredTransactionReconciliation result = new RecoveredTransactionReconciler()
+                .reconcile(table.snapshot(), Lsn.of(120), List.of(insert, update));
+        assertEquals(List.of(insert, update), result.preparedSlots());
+
+        assertThrows(TransactionRecoveryException.class,
+                () -> new RecoveredTransactionReconciler()
+                        .reconcile(table.snapshot(), Lsn.of(120), List.of(insert, active(1, 7))));
+    }
+
     private static RecoveredTransactionSnapshot baseline(long lsn, long nextId, long nextNo) {
         return table(lsn, nextId, nextNo).snapshot();
     }
@@ -147,11 +194,25 @@ class RecoveredTransactionReconcilerTest {
                 TransactionNo.of(transactionNo));
     }
 
+    private static RecoveredUndoSlotEvidence preparedSlot(
+            int slot, long transactionId, UndoLogKind kind) {
+        return RecoveredUndoSlotEvidence.prepared(
+                UndoSlotId.of(slot), PageId.of(UNDO_SPACE, PageNo.of(10 + slot)),
+                kind, TransactionId.of(transactionId));
+    }
+
     private static TransactionStateDeltaRecord committed(long transactionId, long transactionNo) {
         return new TransactionStateDeltaRecord(
                 TransactionId.of(transactionId), TransactionStateDeltaState.ACTIVE,
                 TransactionStateDeltaState.COMMITTED, TransactionNo.of(transactionNo),
                 TransactionStateDeltaReason.COMMIT);
+    }
+
+    private static TransactionStateDeltaRecord prepared(long transactionId) {
+        return new TransactionStateDeltaRecord(
+                TransactionId.of(transactionId), TransactionStateDeltaState.ACTIVE,
+                TransactionStateDeltaState.PREPARED, TransactionNo.NONE,
+                TransactionStateDeltaReason.PREPARE);
     }
 
     private static LogRange range() {

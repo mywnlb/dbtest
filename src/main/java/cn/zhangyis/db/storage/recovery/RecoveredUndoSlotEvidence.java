@@ -15,7 +15,7 @@ import cn.zhangyis.db.storage.undo.UndoLogKind;
  *
  * @param slotId page3 slot。
  * @param firstPageId undo segment first page。
- * @param state first-page ACTIVE/COMMITTED 状态。
+ * @param state first-page ACTIVE/PREPARED/COMMITTED 状态。
  * @param creatorTransactionId first-page creator 写事务 id。
  * @param transactionNo COMMITTED 的提交号；ACTIVE 为 NONE。
  */
@@ -38,9 +38,10 @@ public record RecoveredUndoSlotEvidence(UndoSlotId slotId,
         if (kind == UndoLogKind.TEMPORARY) {
             throw new TransactionRecoveryException("ordinary page3 slot cannot contain TEMPORARY undo");
         }
-        if (state == RecoveredUndoState.ACTIVE && !transactionNo.isNone()) {
+        if ((state == RecoveredUndoState.ACTIVE || state == RecoveredUndoState.PREPARED)
+                && !transactionNo.isNone()) {
             throw new TransactionRecoveryException(
-                    "ACTIVE recovered undo slot has commit number: slot=" + slotId.value());
+                    state + " recovered undo slot has commit number: slot=" + slotId.value());
         }
         if (state == RecoveredUndoState.COMMITTED && transactionNo.isNone()) {
             throw new TransactionRecoveryException(
@@ -56,6 +57,13 @@ public record RecoveredUndoSlotEvidence(UndoSlotId slotId,
     public static RecoveredUndoSlotEvidence active(
             UndoSlotId slotId, PageId firstPageId, UndoLogKind kind, TransactionId creatorTransactionId) {
         return new RecoveredUndoSlotEvidence(slotId, firstPageId, kind, RecoveredUndoState.ACTIVE,
+                creatorTransactionId, TransactionNo.NONE);
+    }
+
+    /** 构造已完成 phase one、尚待上层决议的 PREPARED slot 证据。 */
+    public static RecoveredUndoSlotEvidence prepared(
+            UndoSlotId slotId, PageId firstPageId, UndoLogKind kind, TransactionId creatorTransactionId) {
+        return new RecoveredUndoSlotEvidence(slotId, firstPageId, kind, RecoveredUndoState.PREPARED,
                 creatorTransactionId, TransactionNo.NONE);
     }
 

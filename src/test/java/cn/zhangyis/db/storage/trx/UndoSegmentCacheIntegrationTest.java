@@ -31,6 +31,7 @@ import cn.zhangyis.db.storage.undo.UndoLogKind;
 import cn.zhangyis.db.storage.undo.UndoHistoryNodeSnapshot;
 import cn.zhangyis.db.storage.undo.UndoLogSegment;
 import cn.zhangyis.db.storage.undo.UndoLogSegmentAccess;
+import cn.zhangyis.db.storage.undo.UndoLogicalHead;
 import cn.zhangyis.db.storage.undo.UndoSegmentHandle;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -138,6 +139,7 @@ class UndoSegmentCacheIntegrationTest {
             assertTrue(secondNode.nextHistoryPageId().isEmpty());
 
             HistoryEntry firstEntry = h.history.peekCommitted().orElseThrow();
+            h.consumeLogicalHead(firstEntry);
             try (HistoryList.HeadRemovalLease lease = h.history.beginHeadRemoval(firstEntry)) {
                 h.finalization.finalizer().finalizePurgedHistory(firstEntry, lease);
             }
@@ -149,6 +151,7 @@ class UndoSegmentCacheIntegrationTest {
             assertTrue(h.historyNode(secondPage).previousHistoryPageId().isEmpty());
 
             HistoryEntry secondEntry = h.history.peekCommitted().orElseThrow();
+            h.consumeLogicalHead(secondEntry);
             try (HistoryList.HeadRemovalLease lease = h.history.beginHeadRemoval(secondEntry)) {
                 h.finalization.finalizer().finalizePurgedHistory(secondEntry, lease);
             }
@@ -312,6 +315,7 @@ class UndoSegmentCacheIntegrationTest {
 
             h.commit(transaction);
             HistoryEntry entry = h.history.peekCommitted().orElseThrow();
+            h.consumeLogicalHead(entry);
             try (HistoryList.HeadRemovalLease lease = h.history.beginHeadRemoval(entry)) {
                 h.finalization.finalizer().finalizePurgedHistory(entry, lease);
             }
@@ -342,6 +346,7 @@ class UndoSegmentCacheIntegrationTest {
 
             h.commit(reused);
             HistoryEntry grown = h.history.peekCommitted().orElseThrow();
+            h.consumeLogicalHead(grown);
             try (HistoryList.HeadRemovalLease lease = h.history.beginHeadRemoval(grown)) {
                 h.finalization.finalizer().finalizePurgedHistory(grown, lease);
             }
@@ -448,6 +453,15 @@ class UndoSegmentCacheIntegrationTest {
             UndoHistoryNodeSnapshot snapshot = undoAccess.inspectHistoryNode(read, firstPageId);
             mtrManager.commit(read);
             return snapshot;
+        }
+
+        /** 本类只测 finalization/cache；模拟记录级 purge 已把持久 logical head 消费为空。 */
+        void consumeLogicalHead(HistoryEntry entry) {
+            MiniTransaction progress = mtrManager.begin();
+            UndoLogSegment segment = undoAccess.open(
+                    progress, entry.undoFirstPageId(), PageLatchMode.EXCLUSIVE);
+            segment.updateLogicalHead(segment.logicalHead(), UndoLogicalHead.EMPTY, keyDef(), schema());
+            mtrManager.commit(progress);
         }
     }
 }

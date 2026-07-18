@@ -25,6 +25,7 @@ import org.junit.jupiter.api.Test;
 import java.io.ByteArrayOutputStream;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -360,6 +361,46 @@ class UndoRecordCodecTest {
 
         assertArrayEquals(legacyOldImageBytes(UndoRecordType.UPDATE_ROW), codec.encode(update, key, schema));
         assertArrayEquals(legacyOldImageBytes(UndoRecordType.DELETE_MARK), codec.encode(delete, key, schema));
+    }
+
+    /** LV tail 位于旧 image 与 SI tail 之间，必须同时往返旧链 purge owner、新链 rollback owner 和二级证据。 */
+    @Test
+    void roundTripsUpdateLobVersionOwnershipBeforeSecondaryTail() {
+        ColumnValue.ExternalValue oldExternal = ownership(1, TypeId.TEXT, 64,
+                "old".getBytes()).value();
+        ColumnValue.ExternalValue newExternal = ownership(1, TypeId.TEXT, 96,
+                "new".getBytes()).value();
+        LobVersionOwnership lob = new LobVersionOwnership(1, true, Optional.of(newExternal));
+        UndoRecord expected = UndoRecord.update(UndoNo.of(9), TransactionId.of(0x99), 7, 9,
+                List.of(new ColumnValue.IntValue(42)),
+                List.of(new ColumnValue.IntValue(42), oldExternal, ColumnValue.NullValue.INSTANCE),
+                OLD_HIDDEN, List.of(lob),
+                List.of(SecondaryUndoMutation.changeKey(10, SecondaryEntryBeforeState.ABSENT)),
+                RollPointer.NULL);
+        UndoRecordCodec codec = new UndoRecordCodec(registry);
+
+        byte[] encoded = codec.encode(expected, lobKey(), lobSchema());
+        UndoRecord decoded = codec.decode(encoded, 0, lobKey(), lobSchema());
+
+        assertEquals(expected, decoded);
+        assertEquals(List.of(lob), decoded.lobVersionOwnerships());
+        assertEquals(1, decoded.secondaryMutations().size());
+    }
+
+    /** DELETE 只编码 purge-old flag；空 LV 的 UPDATE/DELETE 字节必须继续保持旧 golden。 */
+    @Test
+    void roundTripsDeletePurgeOnlyLobOwnership() {
+        ColumnValue.ExternalValue oldExternal = ownership(1, TypeId.TEXT, 64,
+                "old".getBytes()).value();
+        LobVersionOwnership lob = new LobVersionOwnership(1, true, Optional.empty());
+        UndoRecord expected = UndoRecord.deleteMark(UndoNo.of(10), TransactionId.of(0x99), 7, 9,
+                List.of(new ColumnValue.IntValue(42)),
+                List.of(new ColumnValue.IntValue(42), oldExternal, ColumnValue.NullValue.INSTANCE),
+                OLD_HIDDEN, List.of(lob), List.of(), RollPointer.NULL);
+        UndoRecordCodec codec = new UndoRecordCodec(registry);
+
+        assertEquals(expected, codec.decode(codec.encode(expected, lobKey(), lobSchema()), 0,
+                lobKey(), lobSchema()));
     }
 
     private static TableSchema lobSchema() {

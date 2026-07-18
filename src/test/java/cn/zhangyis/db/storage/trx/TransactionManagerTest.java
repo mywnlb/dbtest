@@ -54,6 +54,62 @@ class TransactionManagerTest {
         assertFalse(mgr.system().snapshotActiveReadWriteIds().contains(id.value()));
     }
 
+    /** phase one 释放 ReadView但保留 active 身份；phase two commit 才分配提交号并移除。 */
+    @Test
+    void preparedCommitRetainsActiveMembershipUntilDecision() {
+        TransactionManager manager = newManager();
+        Transaction transaction = manager.begin(TransactionOptions.defaults());
+        TransactionId id = manager.assignWriteId(transaction);
+        manager.readViewManager().openReadView(transaction);
+
+        manager.finishPrepare(transaction);
+
+        assertEquals(TransactionState.PREPARED, transaction.state());
+        assertNull(transaction.readView());
+        assertTrue(manager.system().snapshotActiveReadWriteIds().contains(id.value()));
+
+        manager.prepareCommitPrepared(transaction);
+        assertFalse(transaction.transactionNo().isNone());
+        assertEquals(TransactionState.PREPARED, transaction.state());
+
+        manager.commitPrepared(transaction);
+
+        assertEquals(TransactionState.COMMITTED, transaction.state());
+        assertFalse(manager.system().snapshotActiveReadWriteIds().contains(id.value()));
+    }
+
+    /** prepared rollback 在 inverse/finalization 完成前保留独立重试态与 active 身份。 */
+    @Test
+    void preparedRollbackRetainsActiveMembershipUntilFinished() {
+        TransactionManager manager = newManager();
+        Transaction transaction = manager.begin(TransactionOptions.defaults());
+        TransactionId id = manager.assignWriteId(transaction);
+
+        manager.finishPrepare(transaction);
+        manager.beginPreparedRollback(transaction);
+
+        assertEquals(TransactionState.PREPARED_ROLLING_BACK, transaction.state());
+        assertTrue(manager.system().snapshotActiveReadWriteIds().contains(id.value()));
+
+        manager.finishPreparedRollback(transaction);
+
+        assertEquals(TransactionState.ROLLED_BACK, transaction.state());
+        assertFalse(manager.system().snapshotActiveReadWriteIds().contains(id.value()));
+    }
+
+    /** 普通终态 API 不能替 XA coordinator 对 PREPARED 分支作隐式决议。 */
+    @Test
+    void ordinaryCommitAndRollbackRejectPreparedTransaction() {
+        TransactionManager manager = newManager();
+        Transaction transaction = manager.begin(TransactionOptions.defaults());
+        manager.assignWriteId(transaction);
+        manager.finishPrepare(transaction);
+
+        assertThrows(TransactionStateException.class, () -> manager.commit(transaction));
+        assertThrows(TransactionStateException.class, () -> manager.rollback(transaction));
+        assertEquals(TransactionState.PREPARED, transaction.state());
+    }
+
     @Test
     void readOnlyCommitAssignsNoTransactionNo() {
         TransactionManager mgr = newManager();

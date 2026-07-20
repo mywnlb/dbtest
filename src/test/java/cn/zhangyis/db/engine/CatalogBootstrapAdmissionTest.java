@@ -67,6 +67,8 @@ class CatalogBootstrapAdmissionTest {
     void rejectsMissingCatalogForEveryAuthoritativeArtifactKind() throws Exception {
         List<ArtifactCase> cases = List.of(
                 new ArtifactCase("dictionary-control", "mysql.dd.ctrl", "DICTIONARY_CONTROL"),
+                new ArtifactCase("dictionary-recovery-manifest", "mysql.dd.manifest",
+                        "DICTIONARY_RECOVERY_MANIFEST"),
                 new ArtifactCase("single-redo", "redo.log", "SINGLE_FILE_REDO"),
                 new ArtifactCase("partial-ring", "redo/redo-000000.log", "REDO_RING"),
                 new ArtifactCase("redo-control", "redo-control", "REDO_CONTROL"),

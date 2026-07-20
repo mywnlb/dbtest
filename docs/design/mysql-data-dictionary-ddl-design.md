@@ -600,7 +600,10 @@ Atomic DDL recovery 流程见 [atomic-ddl-recovery-flow.mmd](diagrams/atomic-ddl
 
 明确保留的差异：
 
-- SDI 仍是单页 v1，不支持多页/B+Tree、schema 级冗余或 `mysql.ibd` 丢失后的 catalog rebuild；当前只以 admission guard 保护原文件和恢复证据，不能把它描述为重建能力。binlog participant、online DDL row log、除 ADD/DROP INDEX 外的 ALTER TABLE 和 foreign key 未实现。
+- SDI 仍是单页 v1，不支持多页/B+Tree 或在单表 payload 内保存 schema 默认属性。`mysql.ibd` 丢失后的
+  catalog rebuild 已由独立 clean manifest + full-page scrub + 显式隔离/重建 API 闭环；普通启动仍只做
+  admission fail-closed，绝不自动采用 SDI。binlog participant、online DDL row log、除 ADD/DROP INDEX
+  外的 ALTER TABLE 和 foreign key 未实现。
 - CREATE INDEX v1 全程持有 table X，并把聚簇扫描结果暂存在内存后逐条插入，不支持并发 DML、并行/外排 build、prefix key part、FULLTEXT/SPATIAL；这是教学版 blocking inplace build，不等同于 MySQL 8.0 online DDL。
 - 独立 DDL log v3 覆盖 CREATE/DROP TABLE、CREATE/DROP INDEX 与 DISCARD/IMPORT TABLESPACE；CREATE SCHEMA 尚无 marker，因此 control reconciliation 用 committed dictionary version 提供保守下界。temporary undo 也未接，在临时表 owner/lifecycle 与独立 temporary tablespace 完成前继续拒绝进入普通 undo。
 - DROP barrier 不持久化独立计数；恢复从 page3/undo first-page persistent history 重建 affected-table 引用。该简化保持单一恢复真相，但当前仍是单 rseg、单线程 purge。

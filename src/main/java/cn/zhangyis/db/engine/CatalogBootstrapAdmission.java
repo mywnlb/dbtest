@@ -21,11 +21,12 @@ import java.util.regex.Pattern;
  * 公共数据库组合根的 catalog 启动准入 Guard。
  *
  * <p>{@code mysql.ibd} 非空时，本类只允许按 existing catalog 打开；缺失或零长度时，则先检查
- * DD control、redo、undo、doublewrite 和受控用户表空间。只有完全没有权威持久痕迹时才允许初始化
+ * DD control/recovery manifest、redo、undo、doublewrite 和受控用户表空间。只有完全没有权威持久痕迹时才允许初始化
  * 空 catalog，避免空字典驱动 orphan cleanup 删除仍有价值的表空间。</p>
  *
  * <p>该 Guard 只执行元数据级文件存在性扫描，不打开数据页、不修改文件，也不持有任何句柄进入后续
- * storage recovery。当前教学实现仍假设单进程独占实例目录；跨进程 instance lock 留给后续切片。</p>
+ * storage recovery。调用方 {@link DatabaseEngine} 在进入本 Guard 前已持有跨进程 instance file lock，
+ * 因此状态判定到 catalog 打开之间不会与另一个合规引擎或离线 recovery 并发。</p>
  */
 final class CatalogBootstrapAdmission {
 
@@ -84,7 +85,7 @@ final class CatalogBootstrapAdmission {
             throw new DictionaryCatalogAdmissionException(
                     "refuse to initialize " + catalogState + " dictionary catalog: catalog="
                             + normalizedCatalog + " existingArtifacts=" + evidence
-                            + "; automatic catalog rebuild is not supported; restore mysql.ibd before retrying");
+                            + "; ordinary startup never rebuilds catalog; use the explicit offline recovery service");
         }
 
         // 4、只有完全无证据的 missing/empty 状态才是可初始化的 fresh catalog。
@@ -100,8 +101,9 @@ final class CatalogBootstrapAdmission {
      */
     private static CatalogState inspectCatalogState(Path catalogPath) {
         try {
-            BasicFileAttributes attributes = Files.readAttributes(catalogPath, BasicFileAttributes.class);
-            if (!attributes.isRegularFile()) {
+            BasicFileAttributes attributes = Files.readAttributes(
+                    catalogPath, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            if (attributes.isSymbolicLink() || !attributes.isRegularFile()) {
                 throw new DictionaryCatalogAdmissionException(
                         "dictionary catalog path is not a regular file: " + catalogPath);
             }
@@ -133,6 +135,9 @@ final class CatalogBootstrapAdmission {
         try {
             if (pathExists(controlPath)) {
                 evidence.add(PersistentArtifact.DICTIONARY_CONTROL);
+            }
+            if (pathExists(config.baseDir().resolve("mysql.dd.manifest"))) {
+                evidence.add(PersistentArtifact.DICTIONARY_RECOVERY_MANIFEST);
             }
             if (pathExists(config.redoFile())) {
                 evidence.add(PersistentArtifact.SINGLE_FILE_REDO);
@@ -232,6 +237,8 @@ final class CatalogBootstrapAdmission {
     private enum PersistentArtifact {
         /** DD ID/version high-water control，存在即表明公共字典曾启动。 */
         DICTIONARY_CONTROL,
+        /** 独立 clean snapshot/witness journal；catalog 缺失时本身就是 existing 实例证据。 */
+        DICTIONARY_RECOVERY_MANIFEST,
         /** 兼容配置留下的单文件 redo；即使当前启用 ring 也不能忽略。 */
         SINGLE_FILE_REDO,
         /** 任一稳定命名 ring 文件，包括 partial ring。 */

@@ -36,6 +36,9 @@ flowchart TD
   Handle --> Gateway["fil.io DataFileGateway (create/extend range allocation)"]
   Handle --> DataFile["tablespace data file"]
 
+  OfflineRecovery["engine.recovery CatalogRecoveryService"] --> Scrubber["api.tablespace TablespaceFullScrubber"]
+  Scrubber -->|"NOFOLLOW read-only full scan"| DataFile
+
   Truncate["api.undotruncate UndoTablespaceTruncationService (test-wired)"] --> Access
   Truncate --> UndoCache["UndoReusableSegmentTruncationCoordinator"]
   UndoCache --> RsegPage3["RollbackSegmentHeaderRepository page3 v4"]
@@ -51,9 +54,10 @@ flowchart TD
 
 | Flow | Current production chain | Current state |
 | --- | --- | --- |
-| Create tablespace | `DiskSpaceManager.createTablespace` -> `PageStore.create` -> `DataFileHandle.create`; then `SpaceHeaderRepository.initialize`（含 page0 FSP_HDR 信封盖戳）; GENERAL writes `TablespaceLifecycleHeader(NORMAL,currentSize,epoch=0)`; UNDO writes `TablespaceLifecycleHeader(ACTIVE,initialSize,epoch=0)`; reserve extent0 and `TablespaceRegistry.replace` | Implemented; GENERAL publishes/persists NORMAL，UNDO publishes/persists ACTIVE；4-arg overload仍默认 GENERAL；page0 现携带统一 FSP_HDR FilePageHeader 信封 |
+| Create tablespace | `DiskSpaceManager.createTablespace` -> `PageStore.create` -> `DataFileHandle.create`; then `SpaceHeaderRepository.initialize` + page1 IBUF_BITMAP/page2 INODE 信封初始化；GENERAL writes `TablespaceLifecycleHeader(NORMAL,currentSize,epoch=0)`; UNDO writes `TablespaceLifecycleHeader(ACTIVE,initialSize,epoch=0)`; reserve extent0 and `TablespaceRegistry.replace`（`DiskSpaceManager.java:267`） | Implemented; GENERAL publishes/persists NORMAL，UNDO publishes/persists ACTIVE；4-arg overload仍默认 GENERAL；page0/page1/page2 均携带固定物理信封，历史全零 page1 只由离线 scrub 保留窄兼容 |
 | Open tablespace | `DiskSpaceManager.openTablespace` -> `PageStore.open`; `TablespaceRegistry.open` -> `api.tablespace.PageZeroTablespaceMetadataLoader` 持 S lease raw 读 page0 -> FSP_HDR 信封校验(pageType==FSP_HDR/pageNo==0，否则 `TablespaceCorruptedException`) -> checksum/trailer 校验（新盖戳页严格校验；历史 header/trailer checksum 同为 0 的 page0 兼容）-> physical/lifecycle codecs | Implemented for already-known path；GENERAL 从 page0 恢复 NORMAL/CORRUPTED，普通访问继续拒绝 CORRUPTED；新 UNDO 恢复持久 ACTIVE/INACTIVE/TRUNCATING，旧 UNDO 无 lifecycle header 时按 NORMAL 打开但禁止 truncate |
 | Recovery open | `DiskSpaceManager.openTablespaceForRecovery` -> `PageStore.open` -> `TablespaceRegistry.requireForRecovery` -> page0 loader（同样做 FSP_HDR 信封 + checksum/trailer 校验） | Implemented；允许加载 GENERAL CORRUPTED 与 UNDO TRUNCATING，供启动恢复、诊断和续作 |
+| Catalog-loss full-page scrub | 显式 `CatalogRecoveryService.inspect/rebuild` -> `TablespaceFullScrubber.scrub`（`TablespaceFullScrubber.java:89`）-> NOFOLLOW 属性 + NOFOLLOW channel/页对齐 -> page0 FSP/lifecycle -> XDES state/owner/双向 list/bitmap -> 每页 checksum/trailer/spaceId/pageNo/type -> page3 SDI/footer -> scan 后 regular type/size/mtime/fileKey + 全文件 SHA-256 | Implemented for manifest-declared file-per-table candidates；只读且不挂载 PageStore/registry、不做 redo/doublewrite 修复；expected 损坏阻止重建，不能隔离绕过；这不是每次启动的全实例 scrub |
 | Space-management admission | `DiskSpaceManager.createSegment/allocatePage/freePage/dropSegment/usage` -> `MiniTransaction.acquireTablespaceLease(S)` (`MiniTransaction.java:108`) -> `TablespaceRegistry.require`（lease 后复核）-> FSP | Implemented；拒绝 CORRUPTED/INACTIVE/TRUNCATING/DISCARDED，消除状态先检后等待竞态 |
 | Segment drop plan | `UndoSegmentFinalizer` 独立只读 MTR -> `UndoSpaceAllocator.inspectDropPlan` -> `DiskSpaceUndoAllocator` -> `DiskSpaceManager.inspectDropSegmentPlan` -> inode page2 identity + 32 fragment slots + 三条 extent list length | Implemented；plan MTR 在 finalization 写 MTR 前提交，只返回不可变 fragment/extent/used-page 快照；identity/计数损坏 fail-closed，不跨返回持 page2 latch/fix |
 | Space reservation | `DiskSpaceManager.reserveSpace` -> ordinary access lease + Registry require -> `SpaceReservationService.reserve` -> page0/FLST 容量快照（不持账本锁）-> `PageStore.ensureCapacity` + `SpaceHeaderRepository.setCurrentSizeInPages` if needed -> capacity counter publish -> `MiniTransaction.enlistResource` | Implemented core + consumers（0.14a/0.14b/1.6 extern undo）；per-process in-memory capacity counters + `SpaceReservationKind`；capacity counter lock 只保护内存承诺计数，不包住 Buffer Pool/page latch/file extend；B+Tree split/root split 以 `NORMAL` 预算调用，Undo 主链 grow 与 external payload 按预规划精确页数以 `UNDO` 预算调用，失败发生在真正 page allocation 和页内容修改前 |
@@ -70,7 +74,7 @@ flowchart TD
 | `storage.api` disk facade | `DiskSpaceManager`, `PageAllocationHint`, `SegmentRef`, `SpaceUsage`, `DiskSpaceUndoAllocator` | Implemented | DiskSpaceManager 管普通 FSP；`PageAllocationHint` 是上层页分配方向/邻近页/页需求的稳定 API，DiskSpaceManager 转换为 FSP 内部方向；SegmentRef/SpaceUsage 是门面值对象；undo allocator 是 undo 端口适配器 |
 | `storage.api.undotruncate` lifecycle orchestration | `UndoTablespaceTruncationService`, `UndoTablespaceTruncationRecovery`, `UndoReusableSegmentTruncationCoordinator` | Implemented; recovery wired by `StorageEngine` E2 | 可恢复 UNDO 物理收缩与 cache/free owner 排空；E2 existing open 构造恢复参与者用于 TRUNCATING 续作；主动 truncate 仍待 purge/DML 调度 |
 | `storage.api.index` typed index page entry | `IndexPageAccess`, `IndexPageHandle` | Implemented | Bridges B+Tree/record code to `MiniTransaction`-owned page guards；生产三参构造注入 registry 后先 lease+require 再 fix/new page |
-| `storage.api.tablespace` metadata adapter | `PageZeroTablespaceMetadataLoader` | Implemented | Registry 懒加载协作者；留在 api 侧以避免 `fil` 直接编排 `fsp` page0/lifecycle codec；打开/恢复时先做 page0 FSP_HDR 信封校验(pageType/pageNo)，再做 checksum/trailer 校验；GENERAL marker 接受 NORMAL/CORRUPTED/DISCARDED，UNDO marker 只接受 ACTIVE/INACTIVE/TRUNCATING；历史未盖 checksum 的 page0 仅在两个 checksum 字段同为 0 时兼容 |
+| `storage.api.tablespace` metadata/scrub adapter | `PageZeroTablespaceMetadataLoader`, `TablespaceFullScrubber`, `TablespaceFullScrubRequest/Result` | Implemented | Loader 服务普通已知路径准入；scrubber 服务显式 catalog-loss 离线工具，以 NOFOLLOW channel 顺序读取全部页，在消费 bitmap 前校验 XDES state/owner/双向链地址，并只向 DD recovery 返回 opaque SDI 与文件指纹。两者都不让 `fil` 反向理解 DD；历史 page0 legacy-zero 只在普通 loader 兼容，灾难重建严格拒绝 |
 | `storage.api.dml` table/clustered DML facades | `TableDmlService`, `ClusteredDmlService`, `TableUpdatePatchCommand`, table/clustered commands, `DmlStatementGuard`, terminal commands/results | Implemented; production-wired by `StorageEngine` and SQL gateway | `TableDmlService` 以聚簇 undo 为逻辑 anchor，按 index id 用独立短 MTR 维护全部 secondary；point UPDATE 在同一次 FOR_UPDATE 锁定旧行后应用 typed patch，未赋值 external 引用原样保留；SQL INSERT/UPDATE/DELETE 均经 statement guard 与 exact-version LOB binding 进入表级服务 |
 | `storage.fsp.flst` file-list primitives | `FileAddress`, `Flst`, `FlstBase`, `FlstNode` | Implemented | FSP/XDES/INODE 链表指针与 base/node 编解码；不接触文件 IO；0.19c 起 FLST base/node 写入经 `FspRedoDeltas` 追加 metadata delta，0.19d 起对应物理 `PAGE_BYTES` 被提交过滤器替代 |
 | `storage.fsp.header` space header | `SpaceHeaderRepository`, `SpaceHeaderSnapshot`, `SpaceHeaderRawCodec`, `SpaceHeaderPhysical` | Implemented | page0 header 读写与 raw metadata 加载；`initialize` 盖 page0 FSP_HDR FilePageHeader 信封头；layout 常量供 extent/lifecycle codec 共享；0.19c 起 space header 字段写入追加 `FspMetadataDeltaRecord`，0.19d 起被 delta 覆盖的字段字节不再持久化 `PAGE_BYTES`；lifecycle truncate marker 和 page0 信封仍走物理 `PAGE_BYTES` |
@@ -531,7 +535,7 @@ flowchart TD
 
 | Flow | Current production chain | Current state |
 | --- | --- | --- |
-| Recovery orchestration | `DatabaseEngine(config, preparedDecisionProvider)` -> `CatalogBootstrapAdmission.openCatalog` 以 DD control/redo/undo/doublewrite/受控表空间证据阻止 missing/empty catalog 误建 -> rebuild DD + DDL log并校正 control high-water -> DD discovery -> `StorageEngine(config, provider).open(existing)` doublewrite/redo/undo resume/reconcile -> `PersistentHistoryRecovery.rebuild` 重建 affected-table history -> provider 对每个 PREPARED 给 COMMIT/ROLLBACK（UNRESOLVED fail-closed）-> ACTIVE multi-index rollback -> `StorageEngine.resumePurgeAfterRedo` 独立运行真实 `RESUME_PURGE` -> redo flush/force/open -> `DictionaryDdlRecoveryService` 按 ddl id 收敛 CREATE/DROP marker、兼容续作 legacy DROP_PENDING、对账/修复 ACTIVE 表 SDI，最后执行 orphan cleanup -> public OPEN | Implemented production path；catalog admission 失败早于 control/storage/recovery 创建且不修改证据；现有单参构造安装默认 unresolved provider；PREPARED 在 gate 关闭期重建最小 transaction/undo context并复用 live phase-two；CREATE/DROP TABLE 与 CREATE/DROP INDEX recovery 均已接；仍缺 server XID/SQL XA、catalog-loss 场景的 SDI 发现/重建与对象级 force recovery |
+| Recovery orchestration | `DatabaseEngine(config, preparedDecisionProvider)` -> instance lock -> `CatalogBootstrapAdmission.openCatalog` 以 DD control/manifest/redo/undo/doublewrite/受控表空间证据阻止 missing/empty catalog 误建 -> 严格打开 manifest/control/catalog并校正 high-water -> DD discovery -> `StorageEngine(config, provider).open(existing)` doublewrite/redo/undo resume/reconcile -> PREPARED decision + ACTIVE rollback + `RESUME_PURGE` -> redo flush/force/open -> `DictionaryDdlRecoveryService` 收敛 marker/legacy pending、对账 SDI与 orphan -> clean manifest publish -> public OPEN | Implemented production path；普通启动绝不自动 rebuild。显式离线 `CatalogRecoveryService` 是独立前置工具，只有它可在 instance lock 下 inspect/quarantine/rebuild；重建后仍须回到本启动链。仍缺 server XID/SQL XA、对象级 force recovery与更丰富 worker/lock diagnostics |
 | Space file reconcile (autoextend crash-safety) | undo resume 后若 `spacesToReconcile()` 非空：`reconcileSpaceFiles` 逐空间 `PageStore.readPage(page0)` -> `SpaceHeaderRawCodec.readPhysical` -> `validateReconcileHeader`（spaceId/pageSize 一致、size>0、偏移不溢出，否则 `TablespaceCorruptedException`）-> 幂等 `PageStore.ensureCapacity`；replay 期 `PageRedoApplyHandler` 仅对 PAGE_INIT extend-on-demand，首触越界 PAGE_BYTES 判 `RedoLogCorruptedException` | Implemented; `StorageEngine` E2 对系统 UNDO + 显式配置数据表空间执行；只恢复物理文件长度，不重建 FSP bitmap；弥补 autoExtend 不 fsync 在崩溃后留下的"物理短于 page0 逻辑"背离 |
 | Failure path | any `DatabaseRuntimeException` / `RuntimeException` inside an active stage -> `RecoveryProgressJournal.stageFailed`（memory + JSONL sink）-> `failClosed(mode, e)` -> `gate.failClosed(error)` -> state `FAILED` -> FAILED `RecoveryReport` with zeroed LSNs/counts -> throw `RecoveryStartupException` | Implemented; gate stays closed on failure; failed stage is visible through `StorageEngine.recoveryDiagnostics()` and `EngineConfig.recoveryProgressFile()`；若 failure progress 本身写文件失败，会作为 suppressed cause 保留但仍继续 fail-closed；`RecoveryStartupException` extends `DatabaseFatalException` |
 
@@ -634,11 +638,18 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-  Engine["DatabaseEngine"] --> Control["DictionaryControlStore mysql.dd.ctrl"]
+  Admin["explicit offline admin caller"] --> RecoverySvc["CatalogRecoveryService inspect/quarantine/rebuild"]
+  Engine["DatabaseEngine"] --> InstanceLock["DatabaseInstanceFileLock mysql.instance.lock"]
+  RecoverySvc --> InstanceLock
+  Engine --> Control["DictionaryControlStore mysql.dd.ctrl"]
   Engine --> Admission["CatalogBootstrapAdmission"]
   Admission -->|"existing open / proven-fresh create"| Catalog["FileInternalCatalogStore mysql.ibd"]
-  Admission -->|"read-only presence probe"| Evidence["DD control / redo / undo / doublewrite / controlled tablespace"]
+  Admission -->|"read-only presence probe"| Evidence["DD control / manifest / redo / undo / doublewrite / controlled tablespace"]
   Catalog --> Repo["PersistentDictionaryRepository"]
+  Engine --> Manifest["DictionaryRecoveryManifestRepository"]
+  Manifest --> ManifestStore["FileDictionaryRecoveryManifestStore mysql.dd.manifest"]
+  Control -->|"before reservation (:290)"| Manifest
+  Repo -->|"before mutation (:241)"| Manifest
   Repo -->|"constructs (:50)"| DdlLog["PersistentDdlLogRepository"]
   DdlLog -->|"append/read DDL_LOG(7) (:137/:145)"| Catalog
   Engine --> Discovery["DictionaryTablespaceDiscovery"]
@@ -652,6 +663,8 @@ flowchart TD
   Cache --> Repo
   Ddl["DictionaryDdlService"] --> Mdl
   Ddl --> Repo
+  Ddl --> Publisher["DictionaryRecoverySnapshotPublisher"]
+  Publisher -->|"writer-fenced clean snapshot"| Manifest
   Ddl -->|"prepare/transition (:241-363)"| DdlLog
   Ddl --> Barrier["storage.api TablePurgeBarrier"]
   Ddl --> Sdi
@@ -663,13 +676,20 @@ flowchart TD
   Mapper --> Factory["BTreeIndexMetadataFactory"]
   Storage -->|rollback / purge identity| Resolver
   Storage -->|persistent history table refs| Barrier
+  RecoverySvc -->|"strict committed events"| ManifestStore
+  RecoverySvc -->|"full-page scrub + opaque SDI"| FullScrub["TablespaceFullScrubber"]
+  RecoverySvc -->|"safe control / verified baseline"| Control
+  RecoverySvc --> Catalog
 ```
 
 ### Current Data Chains
 
 | Flow | Current production chain | Current state |
 | --- | --- | --- |
-| Public bootstrap | `DatabaseEngine.open` -> `CatalogBootstrapAdmission` 判定 catalog non-empty existing 或 missing/empty proven-fresh -> open control/catalog并分别重建 DD snapshot 与 DDL log latest phases -> 以对象/space/version、最大 DDL marker及 version-1 保守下界校正 control -> DD discovery 返回稳定 API binding -> `StorageEngine.open` -> logged table/index DDL recovery -> legacy pending -> 逐张 ACTIVE 表 SDI reconcile -> orphan cleanup -> publish OPEN | Implemented；missing/empty `mysql.ibd` 遇到任一 DD control、稳定 redo/undo/doublewrite 或 `table_*_space_*.ibd` 证据即抛 `DictionaryCatalogAdmissionException`，不创建空 catalog、不进入 cleanup；非空 catalog 只走 existing 格式校验。ACTIVE binding、marker/path、catalog/control/DDL history 与 SDI 物理损坏继续 fail-closed |
+| Public bootstrap | `DatabaseEngine.open`（`DatabaseEngine.java:200`）先取得 `DatabaseInstanceFileLock` -> `CatalogBootstrapAdmission` 判定 catalog non-empty existing 或 missing/empty proven-fresh -> 严格打开/必要时保留并再生 manifest -> 以 manifest witness 打开 control/repository -> DD discovery + `StorageEngine.open` -> logged/legacy DDL recovery + ACTIVE SDI reconcile + orphan cleanup -> `DictionaryRecoverySnapshotPublisher.publish` -> publish OPEN | Implemented；普通启动从不触发 catalog rebuild。missing/empty `mysql.ibd` 遇到 DD control/manifest/redo/undo/doublewrite/受控表空间即 fail-closed；健康 catalog 才允许把损坏 manifest 原子保留到 evidence 后再生 clean；`initializeRecoveryManifest`（`:576`）只在明确 missing 时 create，已存在零长度 manifest 走 strict existing-open 并保留证据；instance lock 持有到 storage/control/catalog/manifest 全关闭 |
+| Recovery manifest / mutation fence | `DictionaryControlStore.reserve` -> `beforeControlReservation`（`DictionaryControlStore.java:290`）-> manifest durable event；`PersistentDictionaryRepository.commit`（`PersistentDictionaryRepository.java:241`）-> `beforeCatalogMutation` -> manifest durable intent -> catalog append；DDL 稳定终点 -> `DictionaryRecoverySnapshotPublisher.publish`（`:81`）在 repository writer fence 内发布 full clean baseline | Implemented v1；三类 event 使用独立 magic、双 header、frame CRC/batch SHA/body SHA/chunk 校验；safe control 按分量最大；并发临时 DDL 保留 unresolved intent，不用旧 clean 越过新 mutation；clean 失败建立后续 DDL fence |
+| Explicit catalog-loss recovery | admin -> `CatalogRecoveryService.inspect`（`CatalogRecoveryService.java:122`）完整枚举/scrub并签发 token -> 可选 `quarantine`（`:148`）显式原子隔离 extra 或坏 catalog/control -> 再 inspect -> `rebuild`（`:232`）先发布 safe control，再按 clean manifest digest 写/重开验证稳定 baseline temp，复扫 expected 后 atomic publish `mysql.ibd` -> 普通 `DatabaseEngine.open` 再验证并服务 | Implemented offline API；missing manifest、dirty intent、missing/invalid expected、SDI/archive 不一致均阻塞；token 绑定 manifest 最新 sequence、catalog/control、所有 raw/scrub 指纹和 conflicts；control 推进造成新 token 时，同一 clean digest 仍定位并严格复用已验证 temp；实例 busy、timeout/interruption、stale token 与非原子文件系统均拒绝 |
+| Catalog baseline batch | clean archive -> `DictionaryCatalogArchiveCodec` -> `CATALOG_BASELINE_META(8)` + schema/table/column/index records + `CATALOG_BASELINE_COMMIT(126)` -> `FileInternalCatalogStore.append` -> `PersistentDictionaryRepository.rebuild`（`PersistentDictionaryRepository.java:413`） | Implemented；baseline 只能是首个且最多一次，保留对象 version 与 index ordinal，严格校验 map key、父子、identity/name、稳定状态与 aggregate counts；旧 catalog 无 baseline 保持兼容，baseline 后允许正常 mutation |
 | Statement metadata lease | `DataDictionaryService.openTable(owner,name,TableAccessIntent,timeout)` -> schema MDL(SR) -> READ/table SR 或 WRITE/table SW -> cache single-flight load + pin -> `TableMetadataLease`；close 逆序 pin→table→schema | Implemented；访问意图无隐式默认值；DDL publish 后旧 pinned 版本可保持 stale，DROP_PENDING/DROPPED 不再由普通 lookup 打开 |
 | CREATE TABLE | schema IX -> table X -> reserve object/space/ddl/version -> DDL log `PREPARED` -> `TableDdlStorageService.createTable` schema/LOB/redo admission + 单 MTR 创建 GENERAL/FSP、index segments/root、可选 LOB segment及空 SDI page3 -> redo durable -> `ENGINE_DONE` -> `SerializedDictionaryInfoService.write` 完整 table/binding snapshot durable -> repository ACTIVE commit -> `DICTIONARY_COMMITTED` -> cache publish -> `COMMITTED` | Implemented for file-per-table + exactly one clustered primary index；SDI 超出单页或持久化失败时不发布 ACTIVE，ENGINE_DONE orphan 由 recovery 删除；append outcome 不确定时停止当前 DDL且不猜补偿；startup 对无 DD 的 PREPARED/ENGINE_DONE 只删除 marker exact path并写 ROLLED_BACK，对匹配 ACTIVE 补齐提交；错绑或 ACTIVE 缺文件 fail-closed |
 | DROP TABLE | schema IX/table X resolve ACTIVE/binding -> `TablePurgeBarrier.awaitUnreferenced` -> DDL log `PREPARED` -> cache version barrier + repository `DROP_PENDING` -> `DICTIONARY_COMMITTED` -> await pins -> physical DISCARDED/flush/invalidate/delete -> `ENGINE_DONE` -> repository `DROPPED` -> `COMMITTED` | Implemented；barrier timeout 发生在 marker/cache/catalog 修改前，表保持 ACTIVE；recovery 对 ACTIVE+PREPARED 写 ROLLED_BACK，对 DROP_PENDING 再次过 barrier并前滚，对 DROPPED 补 terminal；无 marker 的旧 pending/orphan 路径仍兼容 |
@@ -683,12 +703,12 @@ flowchart TD
 
 | Package area | Representative classes | Current state | Notes |
 | --- | --- | --- | --- |
-| `engine` catalog bootstrap | `CatalogBootstrapAdmission`, `DictionaryCatalogAdmissionException` | Implemented; production-wired | guard 只读判定 catalog 三态并收集有界证据类别；诊断/progress/warmup 与近似文件名不制造 existing 假阳性；失败保持 public engine `FAILED` 且早于 orphan cleanup；不实现 SDI 反向 catalog rebuild |
-| `dd.domain/repo/tx` | immutable schema/table/index definitions, `DictionaryControlStore`, `PersistentDictionaryRepository`, `PersistentDdlLogRepository`, `DictionaryTransaction` | Implemented v1 catalog + DDL log v3 | control 双槽 CRC；catalog page-aligned append frame + batch manifest；binding tail 显式保存 row-format version并兼容旧 EOF；普通 DD 与 DDL_LOG 共享物理 store但各自忽略对方 batch；DDL log v3 保存 CREATE/DROP INDEX identity并兼容读 v1 |
+| `engine` catalog bootstrap/recovery | `CatalogBootstrapAdmission`, `DatabaseInstanceFileLock`, `CatalogRecoveryService` 及 inspection/token/conflict/result 类型 | Implemented; public composition + explicit offline API | 普通启动仅 fail-closed guard；离线门面才允许 inspect/quarantine/rebuild。两者共用有界跨进程实例锁；没有 CLI/SQL 自动触发、没有 force/bypass |
+| `dd.domain/repo/tx` | immutable schema/table/index definitions, `DictionaryControlStore`, `PersistentDictionaryRepository`, `PersistentDdlLogRepository`, `DictionaryCatalogArchiveCodec`, `DictionaryDurabilityWitness` | Implemented v1 catalog/baseline + DDL log v3 | control/catalog 写前接 manifest witness；catalog 支持首批全量 baseline并兼容旧 mutation-only 文件；普通 DD 与 DDL_LOG 共享 catalog physical store但各自忽略对方 batch |
 | `dd.cache/mdl/service` | `DictionaryObjectCache`, `MetadataLockManager`, `DataDictionaryService`, `TableAccessIntent`, `TableMetadataLease` | Implemented | cache single-flight/pin/stale + DROP version barrier；显式 READ→table SR、WRITE→table SW，schema 恒 SR；MDL 六模式矩阵、FIFO、upgrade、timeout、deadlock wait graph；schema→table 锁序 |
-| `dd.ddl/recovery` | `DictionaryDdlService`, `CreateSecondaryIndexCommand`, `DropSecondaryIndexCommand`, `DdlLogRecord/Operation/Phase`, `DictionaryTablespaceDiscovery`, `DictionaryDdlRecoveryService` | Production-wired blocking v1; feature-partial | CREATE/DROP TABLE 与 CREATE/DROP INDEX atomic DDL log、purge-aware barrier、stage rollback/finish、legacy lifecycle recovery 与 ACTIVE SDI reconcile 已接；其余 ALTER、binlog/online DDL 未接 |
+| `dd.ddl/recovery` | `DictionaryDdlService`, `DictionaryRecoveryManifestRepository`, `DictionaryRecoverySnapshotPublisher`, DDL commands/log/recovery/discovery | Production-wired blocking v1 + catalog-loss manifest v1; feature-partial | 全部现有 DDL 在副作用前检查 manifest fence、稳定终点发布 clean；manifest 保存 ACTIVE/DISCARDED 完整 archive、ACTIVE 目录/SDI 摘要与 safe control。其余 ALTER、binlog/online DDL 未接 |
 | `dd.sdi` | `DictionarySdiCodec`, `SerializedDictionaryInfoService`, `DictionarySdiCorruptionException` | Implemented v1; production-wired | DD 拥有完整 table 聚合确定性编码；CREATE 在 ACTIVE publish 前写，recovery 只以 committed DD 比较/重写；不接 page/BufferFrame，也不把 SDI 反向发布进 repository |
-| `storage.api.catalog` / `storage.fil.catalog` | `InternalCatalogStore`, catalog records/exceptions, `FileInternalCatalogStore` | Implemented v1 | 稳定 storage API 与 file backend；物理实现只依赖 common + storage API，不反向 import DD 异常或 repository |
+| `storage.api.catalog` / `storage.fil.catalog` | `InternalCatalogStore`, catalog records/exceptions, `FileInternalCatalogStore`, `FileDictionaryRecoveryManifestStore` | Implemented v1 | catalog 与 manifest 复用同一 durable batch 物理协议但使用不同 8-byte magic，互相不能误开；existing manifest（含零长度）永不由 open-or-create 原地初始化；底层 channel 使用 NOFOLLOW；物理实现只依赖 common + storage API，不反向 import DD |
 | `storage.api.ddl` + `storage.sdi` | storage schema DTO/binding/mapper, `TableDdlStorageService`, `SecondaryIndexBuildDescriptor`, `SecondaryIndexDropDescriptor`, `DdlUndoMarker`, `SerializedDictionaryInfo`, `SdiPageRepository/Layout/Snapshot` | Implemented v1 + blocking index create/drop | physical create/drop/index stage/backfill/build rollback/drop finish、redo durability、DISCARDED marker与固定 page3 SDI/footer；footer v2 action 区分 BUILD/DROP，segment drop plan 在只读 MTR 冻结后以动态预算单写 MTR回收；storage 只解释数值 identity/version/opaque payload 和页完整性，不反向依赖 DD |
 | `engine` | `DatabaseEngine`, execution gate, DD metadata resolver/mapper, `MappedTableStorage`, `DefaultSqlStorageGateway`, `DefaultSqlDdlGateway` | Implemented public composition root | DD resolver 同时实现 index 与 table target；StorageEngine 的 table purge barrier 注入普通 DDL 和 DDL recovery；DML 与 DDL 各走稳定 outbound gateway，生命周期 gate/关闭顺序不变 |
 
@@ -825,7 +845,7 @@ flowchart TD
 
 | Type | Current caller | Why it exists | Next action |
 | --- | --- | --- | --- |
-| recovery service/request/gate/progress + transaction recovery context/table/snapshot/reconciler/evidence + `PersistentHistoryRecovery` | `StorageEngine.open(existing)` + public `DatabaseEngine` + session integration tests | public engine 先以 catalog admission 阻止空字典误开，再执行 doublewrite→redo + trx sink→undo resume/reconcile→PREPARED外部决议→DD-resolved ACTIVE rollback/purge→force/open；随后 DD 层按独立 DDL log 收敛 CREATE/DROP并校验/修复 ACTIVE SDI，成功后才构造 Session registry；engine close 先 rollback Session | server XID/SQL XA、catalog-loss SDI discovery/rebuild、对象级 force recovery 与更丰富 Session gate diagnostics |
+| recovery service/request/gate/progress + transaction recovery context/table/snapshot/reconciler/evidence + `PersistentHistoryRecovery` | `StorageEngine.open(existing)` + public `DatabaseEngine` + session integration tests | public engine 先以 catalog/manifest admission 阻止空字典误开，再执行 doublewrite→redo + trx sink→undo resume/reconcile→PREPARED外部决议→DD-resolved ACTIVE rollback/purge→force/open；随后 DD 层收敛 DDL/SDI、发布 clean manifest，成功后才构造 Session registry；engine close 先 rollback Session | server XID/SQL XA、对象级 force recovery 与更丰富 Session gate diagnostics；catalog-loss 显式恢复类型已在 DD/engine 表列为 production-wired，不属于本表 Reserved |
 
 ### undo 层底层类型生产入口
 
@@ -845,7 +865,7 @@ flowchart TD
 | --- | --- | --- |
 | 公共 DD+storage+SQL Session 组合根已接 | `DatabaseEngine` 先打开 control/catalog并重建 DD+DDL log，从 DD 发现 recovery spaces并注入表级 resolver；storage PREPARED决议、ACTIVE rollback/RESUME_PURGE、table/index atomic DDL recovery 与 ACTIVE SDI reconcile 全成功后才开放 Session | SQL v1 含表级 DML、point/prefix read 与 blocking CREATE/ALTER ADD/DROP INDEX；仍缺 comparison/composite range、其余 ALTER、online DDL 与 server XID/SQL XA |
 | 后台 redo flush + recent tracker/closedLsn + DurabilityPolicy 已接；Session commit 已消费 | `SessionTransactionPolicy` 把 durability mode 经 gateway 传入 `ClusteredDmlService.commit`，在 `UndoLogManager.onCommit` 后按 FLUSH/WRITE/BACKGROUND 等待；`MiniTransaction.commit`/`TransactionManager.commit` 本身仍不携带上层 durability 语义 | 后续协议层只映射 Session option，不绕过该 gateway/DML 终态链 |
-| public recovery 已从 DD 发现表空间，低层入口仍接受显式列表 | `DatabaseEngine` 用字典 binding 生成 `EngineConfig.recoveryTablespaces`；`StorageEngine` 保留显式列表作为稳定低层 API。doublewrite 页仍来自 doublewrite repository 枚举并过滤到已打开空间，不是全 data-dir checksum scan | 保持该分层；如需离线损坏扫描，单独实现全空间 checksum discovery，不让 fil 反向读 DD |
+| public recovery 已从 DD 发现表空间，低层入口仍接受显式列表 | `DatabaseEngine` 用字典 binding 生成 `EngineConfig.recoveryTablespaces`；`StorageEngine` 保留显式列表作为稳定低层 API。2.9 离线 scanner 只校验 clean manifest 的 ACTIVE file-per-table，doublewrite 页仍来自 repository 枚举并过滤到已打开空间 | 保持该分层；若扩展全实例离线校验，由 engine/DD 编排系统、undo 与其它空间，仍不让 fil 反向读 DD |
 | Recovery/closing gate 已覆盖 Session admission 与 DML | `DatabaseEngine` 仅在 recovery + DDL recovery 后发布 OPEN；`openSession` 要求 OPEN，CLOSING 先拒绝新流量；普通 storage accessor 和 DML facade 仍要求 recovery gate OPEN（含拒绝 READ_ONLY diagnostic） | 补 worker resume 结果、恢复锁/等待快照和更丰富 Session diagnostics |
 
 ### Disk Manager 缺口
@@ -927,9 +947,9 @@ flowchart TD
 
 | Gap | Current consequence | Preferred resolution |
 | --- | --- | --- |
-| catalog-loss admission + atomic DDL_RECOVERY/discovery/PREPARED decision/multi-index rollback+purge+DROP barrier+SDI reconcile 已接 | missing/empty catalog 只有在无 DD control、redo、undo、doublewrite 与受控表空间证据时才可初始化；否则 public engine 在 recovery/cleanup 前失败并保留文件。catalog 完整时继续恢复 ACTIVE/DROP_PENDING space、决议 PREPARED、rollback/purge，再以 marker + committed DD 收敛 DDL 与 SDI | 补 schema/目录 manifest、冲突隔离与 catalog-loss SDI discovery/rebuild；另补 server XID/SQL XA、object-level force recovery 与其余 ALTER 的 operation-specific phase |
+| catalog-loss admission + clean manifest/full-page candidate scrub/显式隔离与 baseline rebuild 已接 | 普通启动仍在 recovery/cleanup 前 fail-closed；离线 inspect 只接受 manifest 完整目录，expected 候选逐页 checksum/identity/SDI/footer 全部通过且无 dirty intent 才签发 token，rebuild 后回到普通链验证 | 不自动恢复、不从无 manifest 的散落 SDI 猜 schema；补 server XID/SQL XA、object-level force recovery 与其余 ALTER 的 operation-specific phase |
 | `RecoveryMode.FORCE_SKIP_CORRUPT_TABLESPACE` 仍只支持显式 SpaceId 集合 | DD 发现已接，但 public engine 尚未把 skipped space 发布为字典对象不可用状态；`CrashRecoveryService` 仍按 per-space 过滤 doublewrite/redo/reconcile，且系统 undo 不可 skip | 补 object-level unavailable lifecycle、DDL recovery 与多索引 transaction undo skip 语义 |
-| DD tablespace discovery 已接，doublewrite 仍不做全 data-dir checksum discovery | public engine 用 catalog binding 填充 recovery spaces；doublewrite repair 仍从 `dwRepo.pageIds()` 枚举候选并过滤到已打开空间，不主动扫描所有数据页 | 若需离线全库校验，新建明确的 scrubber，不把高成本扫描混入每次 startup |
+| DD tablespace discovery 与 catalog-loss ACTIVE candidate scrub 已接，doublewrite 仍不做全 data-dir checksum discovery | public engine 用 catalog binding 填充 recovery spaces；离线 2.9 scrubber 只扫描 clean manifest 声明的 file-per-table 文件；doublewrite repair 仍从 `dwRepo.pageIds()` 枚举候选并过滤到已打开空间 | 若需全实例校验，扩展独立 scrub orchestration 覆盖系统/undo/未受 manifest 管理空间，不把高成本扫描混入每次 startup |
 | Recovery control-plane/observability 不完整 | gate/status/report/progress events 已可诊断；Session 只在 public engine OPEN 后创建，CLOSING 拒绝新请求，active Session 先 rollback；仍无恢复后 worker resume 诊断、恢复期锁/等待快照 | 补 worker resume 结果、恢复锁快照与 Session/statement 关联诊断 |
 
 ### Undo 缺口
@@ -948,7 +968,38 @@ flowchart TD
 | Extern undo record payload 已接；仍无改聚簇 PK | 1.6 起过大完整 `UndoRecordCodec` 字节由普通 root 槽中的 `0x7F/v1` descriptor 指向同 segment `UNDO_PAYLOAD=9` 页链；统一 resolver 校验 link/owner/identity/count/length/CRC，MVCC/rollback/purge/recovery 无旁路；DML begin 前冻结计划并精确 admission。Record LOB reference 与该链仍是两套 ownership | 改聚簇 PK update 仍需 delete+insert、多索引与锁语义；不要把业务 LOB chain 和 undo payload chain 合并 |
 | 单 writer 假设 | `UndoLogSegment` 假设同一事务/同 kind 单 EXCLUSIVE append 会话 | 实现并发 multi-writer 锁序 / rseg slot 选择 |
 | 单 undo 表空间假设 | `RollPointer` 只编 pageNo+offset；T1.3c 固定单一默认 rseg，rseg/slot 存 `UndoContext` + 内存目录不进指针 | 扩展多 rseg/多 undo 表空间编码 |
-| recovery 已接 catalog-loss admission / DD discovery / table target resolver / transaction PREPARED provider / atomic DDL log / purge-aware DROP / ACTIVE SDI reconcile | public engine 先阻止 existing 痕迹下误建空 catalog，再恢复多表空间、多索引 ACTIVE rollback/PREPARED决议、affected-table history、real RESUME_PURGE，随后按 DDL marker 收敛 CREATE/DROP TABLE 与 CREATE/DROP INDEX并以 committed DD 修复 page3；非法组合/root/action/未决事务均 fail-closed | 接 server XID/SQL XA、schema/目录 manifest + catalog-loss SDI discovery/rebuild、object-level force recovery 与其余 ALTER |
+| recovery 已接 catalog-loss admission/manifest/显式 rebuild、DD discovery、table target resolver、transaction PREPARED provider、atomic DDL log、purge-aware DROP 与 ACTIVE SDI reconcile | public engine 阻止 existing 痕迹下误建空 catalog；离线工具只从 clean manifest + scrubbed SDI 重建 baseline；普通链再恢复 ACTIVE rollback/PREPARED 决议、history/purge、DDL marker 与 page3，非法组合/root/action/未决事务均 fail-closed | 接 server XID/SQL XA、object-level force recovery、全实例离线 scrub orchestration 与其余 ALTER |
+
+## 2026-07-20 Catalog Loss Recovery v1 Corrective 5-Pass Review Log
+
+再次从源码独立复审时发现：首次检查没有实际覆盖 NOFOLLOW channel 边界、control 推进后 token 变化的
+temp 重试、零长度 manifest 证据、XDES state/owner/list 语义，以及一个裸 `RuntimeException` 内部控制流。
+这些问题已修复；本日志取代下方首次记录作为当前结论，未使用 GitNexus。
+
+| Pass | Result | Evidence / correction |
+| --- | --- | --- |
+| 1. 路径身份与 TOCTOU | PASS | `TablespaceFullScrubber`、raw fingerprint、catalog/manifest/control 与 instance-lock 的相关 channel 均用 `NOFOLLOW_LINKS`；scrub 结束再次要求 regular 非 symlink 并比较 size/mtime/fileKey；测试在 channel 打开后改变 mtime，证明混合扫描不会返回结果；manifest 非常规目录项/可用时 symlink 均被拒绝 |
+| 2. 持久证据与 crash 幂等 | PASS | rebuild temp 从 state `scanId` 改为 clean manifest digest 前缀；故障测试删除 control 后 inspect，在第一次 rebuild 创建 control、final move 失败并导致新 token 的情况下，第二次 inspect 仍定位并严格复用同一 temp；`FileDictionaryRecoveryManifestStore.openOrCreate` 只创建明确 missing 文件，零长度 existing 严格失败，普通引擎先原子保留 evidence 再再生 clean |
+| 3. XDES 与异常层次 | PASS | full scrub 在消费 bitmap 前逐 extent 校验持久 state ordinal、extent0 system state、owner sentinel、page0 FLST 地址范围/自引用/双向互指、FREE/FULL_FRAG 与 EOF bitmap；测试在重算 page0 checksum 后分别注入 invalid state、owner 和单边 list pointer；`NoSuchManifestException extends RuntimeException` 已移除，missing 改用 `Optional` 控制流 |
+| 4. 冲突与故障矩阵 | PASS | 新增/复核零长度 manifest、非空损坏 catalog/control、duplicate table/space identity、NOFOLLOW 非常规 entry、扫描中变化、control-advance + final rename failure、XDES 语义损坏；既有 missing/dirty/expected invalid、partial quarantine、stale token、instance busy、SDI/footer/checksum、baseline/manifest 格式与普通重开测试继续通过 |
+| 5. 地图、静态与全量 | PASS | current map 受影响实线、Package Status、backlog 2.9 与厚设计已同步；生产源码扫描无新增 executable monitor、直接抛裸 `IllegalArgumentException/RuntimeException`、storage→DD/engine/sql/session 或 DD→engine/sql/session 反向 import；`git diff --check` 无 whitespace error（仅 CRLF 提示）；固定 JDK 25.0.2 + Gradle 9.5.1 多次 `test --rerun-tasks --no-daemon` 最终为 288 suites / **1624 tests**，0 failure/error/skip |
+
+## 2026-07-20 Catalog Loss Recovery v1 Initial 5-Pass Review Log（已由纠正日志取代）
+
+本轮以 [2026-07-20-catalog-loss-rebuild.md](slices/2026-07-20-catalog-loss-rebuild.md) 为瘦切片、
+[mysql-catalog-loss-rebuild-design.md](mysql-catalog-loss-rebuild-design.md) 为完整设计依据；implementation
+plan 只保留在 agent todo。五遍结论均重新从生产源码、持久格式、故障测试和最终 Gradle 报告核对，
+未使用 GitNexus。
+
+> 该首次记录保留为审计历史，但其 PASS 对上述五个边界判断过早，不能再作为当前验收结论。
+
+| Pass | Result | Evidence / correction |
+| --- | --- | --- |
+| 1. 生产调用链与范围 | PASS | 源码重核 `DatabaseEngine.open -> instance lock -> admission -> manifest/control/repository -> storage/DDL recovery -> clean publisher -> Session OPEN`；离线入口只由 public `CatalogRecoveryService` 暴露，普通启动无自动 rebuild 分支；scrubber 只返回 storage API opaque SDI，storage 不反向 import DD/engine；新增类型都是入口、运行时协作者或 API DTO，无 Reserved/Unwired 遗漏 |
+| 2. 持久格式、兼容与 crash window | PASS | manifest 使用独立 `MINIDDRM` magic、双 4KiB header、frame CRC/batch SHA/body SHA/chunk；catalog baseline 稳定码 8/126 已由测试钉死，旧 mutation-only catalog 保持兼容；baseline 保留对象 version/index ordinal并双向校验 binding、父子、聚合计数及 control high-water；control 先发布，已验证 temp 可复用，损坏 temp 保留 evidence，final atomic move 失败可重试 |
+| 3. 并发、资源与 token | PASS | instance `FileLock` 使用有界 tryLock/中断并修正饱和 deadline；锁序固定 repository writer -> control snapshot -> manifest，不持 page latch/MDL/事务锁；clean 不越过并发 intent，临时 DDL 状态跳过发布；raw fingerprint + full scrub + 前后属性 + 全文件 SHA-256 与 manifest/control/conflict 一并进入 token，quarantine/rebuild 锁内重扫 |
+| 4. 冲突矩阵、scrub 与故障测试 | PASS | 测试覆盖无 manifest、dirty intent、expected missing/损坏、extra、显式隔离、部分 quarantine 失败、stale token、instance busy、control 丢失、损坏 manifest 保留、page checksum/identity/page2 type/SDI footer/timeout、baseline/manifest 格式、写前 witness、writer-fence、invalid/reusable temp 与 final move retry；唯一 expected 永不可隔离，重建后由普通引擎按 schema/table 名重新打开 |
+| 5. 地图、静态与全量 | PASS | current map 10 项清单复核：新增实线均有源码入口和行号、无 planned 边伪装、依赖方向/PageStore 边界未变、Package Status/Reserved/Gaps 一致、backlog 2.9 与 DD/SDI/disk/recovery 厚设计同步；35 个变更生产文件无 executable monitor、裸 `IllegalArgumentException/RuntimeException`、TODO/TBD/FIXME 或越层 import；`git diff --check` 无 whitespace error（仅 CRLF 提示）；固定 JDK 25.0.2 + Gradle 9.5.1 `test --rerun-tasks --no-daemon`：288 suites / **1617 tests**，0 failure/error/skip |
 
 ## 2026-07-20 Catalog Loss Admission Guard 5-Pass Review Log
 

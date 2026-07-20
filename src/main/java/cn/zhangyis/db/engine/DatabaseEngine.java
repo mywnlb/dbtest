@@ -10,6 +10,8 @@ import cn.zhangyis.db.engine.adapter.DefaultSqlDdlGateway;
 import cn.zhangyis.db.dd.ddl.DictionaryDdlService;
 import cn.zhangyis.db.dd.mdl.MetadataLockManager;
 import cn.zhangyis.db.dd.recovery.DictionaryDdlRecoveryService;
+import cn.zhangyis.db.dd.recovery.DictionaryRecoveryManifestRepository;
+import cn.zhangyis.db.dd.recovery.DictionaryRecoverySnapshotPublisher;
 import cn.zhangyis.db.dd.recovery.DictionaryTablespaceDiscovery;
 import cn.zhangyis.db.dd.repo.DictionaryControlStore;
 import cn.zhangyis.db.dd.repo.DictionaryControlSnapshot;
@@ -21,6 +23,8 @@ import cn.zhangyis.db.storage.engine.EngineConfig;
 import cn.zhangyis.db.storage.engine.EngineTablespaceConfig;
 import cn.zhangyis.db.storage.engine.StorageEngine;
 import cn.zhangyis.db.storage.fil.catalog.FileInternalCatalogStore;
+import cn.zhangyis.db.storage.fil.catalog.FileDictionaryRecoveryManifestStore;
+import cn.zhangyis.db.engine.recovery.DatabaseInstanceFileLock;
 import cn.zhangyis.db.storage.recovery.PreparedTransactionDecisionProvider;
 import lombok.extern.slf4j.Slf4j;
 import cn.zhangyis.db.session.DefaultSqlSession;
@@ -35,7 +39,12 @@ import cn.zhangyis.db.sql.parser.DefaultSqlParser;
 
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.List;
 import java.util.ArrayList;
 import java.util.concurrent.ExecutionException;
@@ -90,6 +99,12 @@ public final class DatabaseEngine implements AutoCloseable {
      * 本对象持有的 {@code catalogStore} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
      */
     private FileInternalCatalogStore catalogStore;
+    /** 与 catalog 独立 magic 的恢复 manifest journal；必须晚于 control/catalog 关闭。 */
+    private FileDictionaryRecoveryManifestStore manifestStore;
+    /** manifest 事件语义与 durability witness；生命周期由 manifestStore 支撑。 */
+    private DictionaryRecoveryManifestRepository manifestRepository;
+    /** 从 open 前持有到全部资源关闭后的跨进程实例独占锁。 */
+    private DatabaseInstanceFileLock instanceFileLock;
     /**
      * 本对象持有的 {@code controlStore} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
      */
@@ -169,10 +184,18 @@ public final class DatabaseEngine implements AutoCloseable {
     }
 
     /**
-     * 启动顺序：catalog-loss 准入 → 打开 DD catalog/control → 从 committed binding discovery
-     * → StorageEngine recovery → 构造 facade → 续作 DROP_PENDING/清 orphan → 发布 OPEN。
-     * catalog 缺失或为空但存在任一持久证据时，准入会在创建空 catalog 和 orphan cleanup 前 fail-closed；
-     * 任一失败都关闭已创建资源并保持 FAILED。
+     * 取得实例独占权后完成 catalog/manifest、storage recovery、DDL recovery 与 Session 门面的统一启动。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>创建实例目录并取得跨进程 instance lock；失败时尚未打开任何数据库持久文件。</li>
+     *     <li>执行 catalog-loss admission，严格打开 catalog/manifest/control，注入写前 witness 并校正
+     *     identity high-water；missing/empty catalog 有持久证据时在创建空字典前 fail-closed。</li>
+     *     <li>从 committed DD binding discovery 表空间，启动 StorageEngine 完成 doublewrite、redo、undo、
+     *     PREPARED 决议与 purge resume；失败时普通流量 gate 尚未发布。</li>
+     *     <li>恢复 DDL marker、SDI 与 orphan，随后在 repository writer fence 内发布 clean manifest。</li>
+     *     <li>最后构造 DDL/SQL/Session facade 并发布 OPEN；任一异常逆序关闭已创建资源，instance lock 最后释放。</li>
+     * </ol>
      *
      * @throws DatabaseRuntimeException 可恢复的数据库运行期协作失败时抛出；调用方应依据当前事务状态选择回滚、重试或关闭资源
      */
@@ -184,16 +207,23 @@ public final class DatabaseEngine implements AutoCloseable {
             }
             state = DatabaseEngineState.OPENING;
             try {
+                // 1. instance lock 覆盖本次启动和后续完整服务期，阻止离线 recovery 与普通引擎并发。
                 ensureBaseDirectory();
+                instanceFileLock = DatabaseInstanceFileLock.acquire(
+                        baseConfig.baseDir(), baseConfig.flushTimeout());
+                // 2. 只有 catalog admission 成功后才允许打开/修复 manifest，并把它注入 control/repository。
                 Path catalogPath = baseConfig.baseDir().resolve("mysql.ibd");
                 Path controlPath = baseConfig.baseDir().resolve("mysql.dd.ctrl");
+                Path manifestPath = baseConfig.baseDir().resolve("mysql.dd.manifest");
                 Path tablesDirectory = baseConfig.baseDir().resolve("tables");
                 catalogStore = CatalogBootstrapAdmission.openCatalog(
                         baseConfig, catalogPath, controlPath, tablesDirectory);
+                initializeRecoveryManifest(manifestPath);
                 controlStore = DictionaryControlStore.openOrCreate(controlPath, DICTIONARY_SPACE_ID,
-                        FIRST_USER_SPACE_ID);
-                repository = new PersistentDictionaryRepository(catalogStore);
+                        FIRST_USER_SPACE_ID, manifestRepository);
+                repository = new PersistentDictionaryRepository(catalogStore, manifestRepository);
                 reconcileControlHighWater();
+                // 3. discovery 只消费 committed binding；StorageEngine recovery 完成前不创建 Session。
                 DictionaryTablespaceDiscovery discovery =
                         new DictionaryTablespaceDiscovery(repository, tablesDirectory);
                 List<EngineTablespaceConfig> tablespaces = discovery.discover().stream()
@@ -207,12 +237,20 @@ public final class DatabaseEngine implements AutoCloseable {
                 cache = new DictionaryObjectCache(DICTIONARY_CACHE_CAPACITY);
                 metadataLocks = new MetadataLockManager();
                 dictionary = new DataDictionaryService(repository, cache, metadataLocks);
-                ddl = new DictionaryDdlService(controlStore, repository, cache, metadataLocks,
-                        storage.tableDdlStorageService(), tablesDirectory, storage.tablePurgeBarrier());
+                // 4. DDL/SDI/orphan 收敛后才允许 clean 覆盖此前 mutation intent。
                 new DictionaryDdlRecoveryService(controlStore, repository, cache,
                         storage.tableDdlStorageService(), tablesDirectory, storage.tablePurgeBarrier())
                         .recover(baseConfig.flushTimeout());
-                // SQL/session 只能在 storage recovery 与 DDL recovery 都成功后发布，避免半恢复实例接受用户语句。
+                DictionaryRecoverySnapshotPublisher cleanSnapshotPublisher =
+                        new DictionaryRecoverySnapshotPublisher(
+                                repository, controlStore, manifestRepository, tablesDirectory);
+                // 旧健康实例首次升级在 DDL/SDI/orphan 全部收敛后生成首个 clean snapshot。
+                cleanSnapshotPublisher.publish();
+                ddl = new DictionaryDdlService(controlStore, repository, cache, metadataLocks,
+                        storage.tableDdlStorageService(), tablesDirectory, storage.tablePurgeBarrier(),
+                        cn.zhangyis.db.dd.ddl.DictionaryDdlFaultInjector.NO_OP,
+                        cleanSnapshotPublisher);
+                // 5. SQL/session 是最后发布的用户入口，避免半恢复实例接受语句。
                 sqlMetadataMapper = new DictionaryStorageMetadataMapper();
                 sqlParser = new DefaultSqlParser();
                 sqlBinder = new DefaultSqlBinder(new SqlTypeCoercion());
@@ -406,21 +444,21 @@ public final class DatabaseEngine implements AutoCloseable {
     }
 
     /**
-     * 释放本方法拥有的数据库引擎组合根资源；遵守既定释放顺序，重复或失败调用不得掩盖原始状态。
+     * 逆序释放组合根资源，并把关闭失败追加到原始异常。
      *
      * <p>数据流：</p>
      * <ol>
-     *     <li>校验语法/命令、会话状态与元数据身份，构造统一 deadline，纯输入错误在事务或持久副作用前失败。</li>
-     *     <li>按 session、transaction、MDL 与 metadata scope 顺序取得受控资源，并在等待后复核版本与状态。</li>
-     *     <li>调用 binder、executor、字典或 storage 稳定接口完成领域动作，成功后才发布缓存、事务或结果状态。</li>
-     *     <li>关闭 scope 并返回不可变结果；异常保留 cause/suppressed 图，按 autocommit 或显式事务边界回滚。</li>
+     *     <li>先关闭 storage，使后台 worker、page IO 与持久事务协作全部停止。</li>
+     *     <li>清除只引用下游资源的 SQL/Session facade 字段，避免失败状态下重新暴露入口。</li>
+     *     <li>依次关闭 control、catalog 与 manifest channel；每个失败都进入同一 suppressed 异常图。</li>
+     *     <li>所有数据库文件句柄释放后最后关闭 instance lock，随后返回聚合异常或 {@code null}。</li>
      * </ol>
      *
-     * @param primary 需要分类或包装的原始失败；不得为 {@code null}，包装时必须保留 cause 与 suppressed 异常图
-     * @return {@code closeResources} 分类或包装后的领域异常；成功时不为 {@code null}，原始 cause 与 suppressed 异常关系保持不变
+     * @param primary 触发清理的原始失败；正常 close 可为 {@code null}
+     * @return 原始/首个关闭异常及其 suppressed 图；全部成功时为 {@code null}
      */
     private RuntimeException closeResources(RuntimeException primary) {
-        // 1、校验语法/命令、会话状态与元数据身份，在共享或持久副作用前拒绝非法状态。
+        // 1. 先停 storage，防止其后台任务在 DD 文件关闭后继续回调元数据。
         RuntimeException failure = primary;
         if (storage != null) {
             try {
@@ -430,17 +468,22 @@ public final class DatabaseEngine implements AutoCloseable {
             }
         }
         storage = null;
-        // 2、继续完成范围、身份与候选校验；通过后，按 session、transaction、MDL 与 metadata scope 顺序取得受控资源，保持处理顺序与资源边界。
+        // 2. 用户入口不拥有独立资源，但必须在下层 close 后清除引用。
         sqlMetadataMapper = null;
         sqlParser = null;
         sqlBinder = null;
         sessions = null;
-        // 3、在中间分支复核阶段性结果；满足条件后，调用 binder、executor、字典或 storage 稳定接口完成领域动作，并维持领域不变量。
+        // 3. witness 的调用方已经停止，按 control/catalog/manifest 顺序关闭持久 DD 文件。
         failure = closeOne(controlStore, failure);
         controlStore = null;
         failure = closeOne(catalogStore, failure);
         catalogStore = null;
-        // 4、关闭 scope 并返回不可变结果，以稳定返回或领域异常完成收口。
+        failure = closeOne(manifestStore, failure);
+        manifestStore = null;
+        manifestRepository = null;
+        failure = closeOne(instanceFileLock, failure);
+        instanceFileLock = null;
+        // 4. instance lock 必须最后释放，避免离线工具观察到半关闭的数据库文件集合。
         return failure;
     }
 
@@ -511,6 +554,89 @@ public final class DatabaseEngine implements AutoCloseable {
             Files.createDirectories(baseConfig.baseDir());
         } catch (IOException e) {
             throw new DatabaseRuntimeException("create database base directory failed: " + baseConfig.baseDir(), e);
+        }
+    }
+
+    /**
+     * 从独立文件打开 recovery manifest；仅当 catalog 已经严格打开为权威真相时，允许把损坏 manifest
+     * 原子移入 evidence 目录并创建新 journal。catalog 丢失路径在本方法前已由 admission 拒绝，绝不会
+     * 用新空 manifest 掩盖恢复证据缺口。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>尝试恢复物理 journal 和全部逻辑 event；成功直接发布 store/repository 字段。</li>
+     *     <li>失败先关闭可能已打开的 store，保持 catalog/control/用户文件不变。</li>
+     *     <li>将原 manifest 以同盘 ATOMIC_MOVE 保留到唯一 evidence 路径；不支持原子移动则停止启动。</li>
+     *     <li>创建全新独立 journal；后续 DDL recovery 完成后才发布首个 clean snapshot。</li>
+     * </ol>
+     *
+     * @param manifestPath 固定 {@code mysql.dd.manifest} 路径
+     * @throws DatabaseRuntimeException manifest 证据无法保留或新 journal 无法创建时抛出
+     */
+    private void initializeRecoveryManifest(Path manifestPath) {
+        // 1. 同时验证物理 frame 与逻辑 event，避免只修一半格式。
+        try {
+            manifestStore = manifestExistsNoFollow(manifestPath)
+                    ? FileDictionaryRecoveryManifestStore.openExisting(manifestPath)
+                    : FileDictionaryRecoveryManifestStore.openOrCreate(manifestPath);
+            manifestRepository = new DictionaryRecoveryManifestRepository(manifestStore);
+            return;
+        } catch (RuntimeException corruption) {
+            // 2. 物理 store 可能已成功打开但逻辑 event 解码失败，先释放句柄才能在 Windows 移动。
+            RuntimeException closeFailure = closeOne(manifestStore, null);
+            manifestStore = null;
+            manifestRepository = null;
+            if (closeFailure != null) {
+                corruption.addSuppressed(closeFailure);
+            }
+            if (!Files.exists(manifestPath, LinkOption.NOFOLLOW_LINKS)) {
+                throw corruption;
+            }
+
+            // 3. 有效 catalog 是重建依据；损坏 sidecar 仍保留为独立 evidence，禁止覆盖。
+            Path evidenceDirectory = baseConfig.baseDir().resolve("catalog-recovery").resolve("evidence");
+            Path evidence = evidenceDirectory.resolve(
+                    "mysql.dd.manifest.corrupt." + Long.toUnsignedString(System.nanoTime()));
+            try {
+                Files.createDirectories(evidenceDirectory);
+                Files.move(manifestPath, evidence, StandardCopyOption.ATOMIC_MOVE);
+                log.warn("preserved corrupt dictionary recovery manifest before rebuilding: source={} evidence={}",
+                        manifestPath, evidence, corruption);
+            } catch (AtomicMoveNotSupportedException failure) {
+                corruption.addSuppressed(failure);
+                throw new DatabaseRuntimeException(
+                        "preserving corrupt dictionary recovery manifest requires atomic move", corruption);
+            } catch (IOException failure) {
+                corruption.addSuppressed(failure);
+                throw new DatabaseRuntimeException(
+                        "preserve corrupt dictionary recovery manifest failed: " + manifestPath, corruption);
+            }
+
+            // 4. 新 journal 此刻仍无 clean；只有后续 recovery 完成后的 publisher 能授权灾难重建。
+            manifestStore = FileDictionaryRecoveryManifestStore.openOrCreate(manifestPath);
+            manifestRepository = new DictionaryRecoveryManifestRepository(manifestStore);
+        }
+    }
+
+    /**
+     * 用 NOFOLLOW 属性读取区分“缺失”与“已经存在但损坏”的 manifest 目录项。
+     *
+     * <p>零长度、symlink 和非常规文件都返回存在，随后必须进入严格 existing-open 与证据保留路径；
+     * 只有明确 {@link NoSuchFileException} 才允许创建新 journal。</p>
+     *
+     * @param manifestPath 固定恢复 manifest 路径
+     * @return 目录项存在时为 {@code true}，明确缺失时为 {@code false}
+     * @throws DatabaseRuntimeException 属性读取失败、无法安全裁决是否允许创建时抛出
+     */
+    private static boolean manifestExistsNoFollow(Path manifestPath) {
+        try {
+            Files.readAttributes(manifestPath, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            return true;
+        } catch (NoSuchFileException missing) {
+            return false;
+        } catch (IOException failure) {
+            throw new DatabaseRuntimeException(
+                    "inspect dictionary recovery manifest path failed: " + manifestPath, failure);
         }
     }
 

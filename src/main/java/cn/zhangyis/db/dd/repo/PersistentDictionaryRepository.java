@@ -24,10 +24,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Function;
 
 /**
  * append-only catalog 的 Repository。writerLock 只保护 expected-version 校验、单批 append 和新 snapshot 发布；
- * lookup 读取 volatile immutable snapshot，不拿锁。锁内不获取 MDL/page latch，也不等待其它数据库资源。
+ * lookup 读取 volatile immutable snapshot，不拿锁。锁内不获取 MDL/page latch 或用户表文件锁；唯一允许的外部
+ * durable 协作是按 {@code writerLock -> manifest eventLock} 固定顺序写恢复见证。
  */
 public final class PersistentDictionaryRepository {
 
@@ -39,6 +41,8 @@ public final class PersistentDictionaryRepository {
      * 本对象持有的 {@code codec} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
      */
     private final DictionaryCatalogCodec codec = new DictionaryCatalogCodec();
+    /** catalog append 前的 durable witness；生产使用 recovery manifest，兼容构造使用 no-op。 */
+    private final DictionaryDurabilityWitness witness;
     /** 与字典 mutation 共享物理 catalog、但独立解释 DDL_LOG batches 的阶段仓储。 */
     private final PersistentDdlLogRepository ddlLog;
 
@@ -55,10 +59,24 @@ public final class PersistentDictionaryRepository {
      * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public PersistentDictionaryRepository(InternalCatalogStore store) {
+        this(store, DictionaryDurabilityWitness.noOp());
+    }
+
+    /**
+     * 创建带 catalog mutation 写前 witness 的持久 repository。
+     *
+     * @param store catalog durable batch store
+     * @param witness 每次 mutation append 前必须 durable 返回的 recovery witness
+     */
+    public PersistentDictionaryRepository(InternalCatalogStore store, DictionaryDurabilityWitness witness) {
         if (store == null) {
             throw new DatabaseValidationException("internal catalog store must not be null");
         }
+        if (witness == null) {
+            throw new DatabaseValidationException("dictionary durability witness must not be null");
+        }
         this.store = store;
+        this.witness = witness;
         this.ddlLog = new PersistentDdlLogRepository(store);
         this.snapshot = rebuild(store.readCommittedBatches());
     }
@@ -178,8 +196,40 @@ public final class PersistentDictionaryRepository {
     }
 
     /**
-     * DictionaryTransaction 的唯一提交入口。先在当前 snapshot 上完成版本、名称和父对象校验，再编码/append；
-     * append durable 后从 committed batches 重建并发布，任何前置失败都不会写 catalog。
+     * 在 catalog writer fence 内读取当前不可变快照并执行一个短协调动作。
+     *
+     * <p>该入口用于 clean recovery manifest：调用方可在同一临界区内按
+     * {@code repository writer lock -> manifest event lock} 顺序发布快照，从而保证 mutation intent
+     * 不能夹在 snapshot 读取与 clean append 之间。回调只允许执行该 manifest durable append，
+     * 禁止等待 MDL、page latch、文件生命周期锁或访问用户数据文件。</p>
+     *
+     * @param action 只读消费当前 snapshot 的短动作；不得保存锁所有权或反向调用字典 mutation
+     * @param <T> 协调动作返回值类型
+     * @return action 在稳定 writer fence 内产生的结果；空值语义由 action 自身定义
+     * @throws DatabaseValidationException action 为空时抛出，未取得 writer lock
+     */
+    public <T> T withSnapshotWriterFence(Function<DictionarySnapshot, T> action) {
+        if (action == null) {
+            throw new DatabaseValidationException("dictionary snapshot writer-fence action must not be null");
+        }
+        writerLock.lock();
+        try {
+            return action.apply(snapshot);
+        } finally {
+            writerLock.unlock();
+        }
+    }
+
+    /**
+     * DictionaryTransaction 的唯一提交入口，按 witness -> catalog -> snapshot 顺序发布 mutation。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>在 writer lock 内复核版本严格递增以及 schema/table 名称、父子和状态约束。</li>
+     *     <li>把 mutation 编码为带 commit manifest 的确定性 records；编码失败不产生持久副作用。</li>
+     *     <li>先 durable 追加 catalog mutation intent，再把同一 records append 到权威 catalog。</li>
+     *     <li>从 committed batches 完整重建并核对目标版本后发布 volatile snapshot；失败不伪造内存提交。</li>
+     * </ol>
      *
      * @param version 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
      * @param schemas 参与 {@code commit} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
@@ -189,6 +239,7 @@ public final class PersistentDictionaryRepository {
      * @throws DictionaryCatalogCorruptionException 检测到不能安全解释的持久数据损坏时抛出；调用方不得继续发布普通服务或覆盖原始证据
      */
     public void commit(DictionaryVersion version, List<SchemaDefinition> schemas, List<TableDefinition> tables) {
+        // 1. writer lock 同时保护 expected-version 校验和最终 snapshot 发布。
         if (version == null || schemas == null || tables == null || schemas.isEmpty() && tables.isEmpty()) {
             throw new DatabaseValidationException("dictionary commit version/mutations must not be null or empty");
         }
@@ -200,8 +251,12 @@ public final class PersistentDictionaryRepository {
                         + before.publishedVersion().value() + ", actual=" + version.value());
             }
             validateMutation(before, version, schemas, tables);
+            // 2. codec 输出正是 witness 摘要和 catalog append 共用的 immutable records。
             List<CatalogRecord> records = codec.encode(version, schemas, tables);
+            // 3. catalog append 是逻辑真相提交点；intent 必须先 durable，避免 sidecar 静默落后。
+            witness.beforeCatalogMutation(version, records);
             store.append(records);
+            // 4. 只信任从 committed 物理批次重建的快照，不直接套用调用方对象。
             DictionarySnapshot rebuilt = rebuild(store.readCommittedBatches());
             if (!rebuilt.publishedVersion().equals(version)) {
                 throw new DictionaryCatalogCorruptionException("dictionary append did not publish requested version: "
@@ -357,11 +412,24 @@ public final class PersistentDictionaryRepository {
 
     private DictionarySnapshot rebuild(List<CatalogBatch> batches) {
         DictionarySnapshot current = DictionarySnapshot.emptyBootstrap();
+        boolean baselineSeen = false;
+        boolean mutationSeen = false;
         for (CatalogBatch batch : batches) {
+            Optional<DictionarySnapshot> baseline = codec.decodeBaseline(batch);
+            if (baseline.isPresent()) {
+                if (baselineSeen || mutationSeen || !current.equals(DictionarySnapshot.emptyBootstrap())) {
+                    throw new DictionaryCatalogCorruptionException(
+                            "dictionary baseline must be the first and only baseline batch");
+                }
+                current = baseline.orElseThrow();
+                baselineSeen = true;
+                continue;
+            }
             Optional<DictionaryCatalogCodec.DecodedMutation> decoded = codec.decode(batch);
             if (decoded.isEmpty()) {
                 continue;
             }
+            mutationSeen = true;
             DictionaryCatalogCodec.DecodedMutation mutation = decoded.get();
             if (mutation.version().compareTo(current.publishedVersion()) <= 0) {
                 throw new DictionaryCatalogCorruptionException("dictionary committed versions are not monotonic: before="

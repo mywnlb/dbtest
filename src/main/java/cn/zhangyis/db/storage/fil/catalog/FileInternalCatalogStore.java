@@ -12,6 +12,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
@@ -95,6 +96,12 @@ public final class FileInternalCatalogStore implements InternalCatalogStore {
     private final Path path;
 
     /**
+     * 当前物理 journal 的文件类型魔数。普通 catalog 使用 {@code MINIDDIB}；灾难恢复 manifest
+     * 通过 package 内适配器使用独立魔数，避免两个同形 journal 被错误互换。
+     */
+    private final long headerMagic;
+
+    /**
      * 最近成功发布的 header 内存镜像，是 append 起点和 committed length 查询的权威状态；
      * 构造后只在 {@link #ioLock} 下替换。
      */
@@ -114,11 +121,13 @@ public final class FileInternalCatalogStore implements InternalCatalogStore {
      * @param current 已通过双槽选择和边界校验的最新 header
      * @param batches 从该 header 的 committed 区域恢复出的完整批次
      */
-    private FileInternalCatalogStore(Path path, FileChannel channel, Header current, List<CatalogBatch> batches) {
+    private FileInternalCatalogStore(Path path, FileChannel channel, Header current, List<CatalogBatch> batches,
+                                     long headerMagic) {
         this.path = path;
         this.channel = channel;
         this.current = current;
         this.batches = new ArrayList<>(batches);
+        this.headerMagic = headerMagic;
     }
 
     /**
@@ -140,6 +149,14 @@ public final class FileInternalCatalogStore implements InternalCatalogStore {
      * @throws InternalCatalogPersistenceException 创建目录、打开、初始化或 force 文件失败时抛出
      */
     public static FileInternalCatalogStore openOrCreate(Path path) {
+        return openOrCreate(path, HEADER_MAGIC);
+    }
+
+    /**
+     * 以调用方专用魔数打开同一 durable-batch 物理协议。只允许同 package 的语义适配器调用，
+     * 公开 catalog API 始终固定使用 {@code MINIDDIB}。
+     */
+    static FileInternalCatalogStore openOrCreate(Path path, long headerMagic) {
         // 1. 在接触文件系统前拒绝空路径，并保证目标父目录存在。
         validatePath(path);
         try {
@@ -149,19 +166,19 @@ public final class FileInternalCatalogStore implements InternalCatalogStore {
             }
 
             // 2. 已有非空文件必须走恢复校验，不能因 CREATE 选项而覆盖 durable catalog。
-            boolean exists = Files.exists(path);
+            boolean exists = Files.exists(path, LinkOption.NOFOLLOW_LINKS);
             FileChannel channel = FileChannel.open(path, StandardOpenOption.CREATE, StandardOpenOption.READ,
-                    StandardOpenOption.WRITE);
+                    StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS);
             if (exists && channel.size() > 0) {
-                return openValidated(path, channel);
+                return openValidated(path, channel, headerMagic);
             }
 
             // 3. 空 catalog 先建立双槽物理边界，再 durable 首个 header，最后发布内存实例。
             channel.truncate(DATA_START);
             Header initial = new Header(1, DATA_START, 1);
-            writeHeader(channel, initial);
+            writeHeader(channel, initial, headerMagic);
             channel.force(true);
-            return new FileInternalCatalogStore(path, channel, initial, List.of());
+            return new FileInternalCatalogStore(path, channel, initial, List.of(), headerMagic);
         } catch (IOException e) {
             // 4. 文件系统失败保留根因；调用方不能把该路径当作已经成功打开的 catalog。
             throw new InternalCatalogPersistenceException("open/create internal catalog failed: " + path, e);
@@ -181,9 +198,16 @@ public final class FileInternalCatalogStore implements InternalCatalogStore {
      * @throws InternalCatalogPersistenceException 文件不存在、无法打开或读取失败时抛出
      */
     public static FileInternalCatalogStore openExisting(Path path) {
+        return openExisting(path, HEADER_MAGIC);
+    }
+
+    /** 使用专用魔数严格打开已有 durable-batch journal。 */
+    static FileInternalCatalogStore openExisting(Path path, long headerMagic) {
         validatePath(path);
         try {
-            return openValidated(path, FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE));
+            return openValidated(path, FileChannel.open(
+                            path, StandardOpenOption.READ, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS),
+                    headerMagic);
         } catch (IOException e) {
             throw new InternalCatalogPersistenceException("open internal catalog failed: " + path, e);
         }
@@ -207,12 +231,12 @@ public final class FileInternalCatalogStore implements InternalCatalogStore {
      * @throws InternalCatalogCorruptionException header、边界或 committed frame 不满足 v1 格式时抛出
      * @throws InternalCatalogPersistenceException 扫描发生底层 IO 失败时抛出
      */
-    private static FileInternalCatalogStore openValidated(Path path, FileChannel channel) {
+    private static FileInternalCatalogStore openValidated(Path path, FileChannel channel, long headerMagic) {
         try {
             // 1. 独立校验双槽；坏槽不遮蔽仍然有效的另一 generation。
             List<Header> headers = new ArrayList<>(2);
-            decodeHeader(channel, 0).ifPresent(headers::add);
-            decodeHeader(channel, 1).ifPresent(headers::add);
+            decodeHeader(channel, 0, headerMagic).ifPresent(headers::add);
+            decodeHeader(channel, 1, headerMagic).ifPresent(headers::add);
             Header latest = headers.stream().max(Comparator.comparingLong(Header::generation))
                     .orElseThrow(() -> new InternalCatalogCorruptionException(
                             "both internal catalog headers are invalid: " + path));
@@ -225,7 +249,7 @@ public final class FileInternalCatalogStore implements InternalCatalogStore {
 
             // 3. 只信任最新 header 的 committed 区间；尾部 crash 数据不参与恢复。
             List<CatalogBatch> batches = scanCommitted(channel, latest);
-            return new FileInternalCatalogStore(path, channel, latest, batches);
+            return new FileInternalCatalogStore(path, channel, latest, batches, headerMagic);
         } catch (RuntimeException | IOException failure) {
             // 4. 构造失败由本方法回收尚未转交的 channel，并保留 cleanup 失败供诊断。
             try {
@@ -289,7 +313,7 @@ public final class FileInternalCatalogStore implements InternalCatalogStore {
                 channel.force(false);
                 Header next = new Header(Math.addExact(current.generation, 1), position,
                         Math.addExact(sequence, 1));
-                writeHeader(channel, next);
+                writeHeader(channel, next, headerMagic);
                 channel.force(true);
 
                 // 5. 持久发布成功后再更新内存权威视图；外部读取不会观察到半批次。
@@ -540,9 +564,9 @@ public final class FileInternalCatalogStore implements InternalCatalogStore {
      * @param header 待发布的 generation、committed 边界与下一 batch sequence
      * @throws IOException slot 的 positional write 失败时抛出
      */
-    private static void writeHeader(FileChannel channel, Header header) throws IOException {
+    private static void writeHeader(FileChannel channel, Header header, long headerMagic) throws IOException {
         ByteBuffer buffer = ByteBuffer.allocate(HEADER_SLOT_BYTES).order(ByteOrder.BIG_ENDIAN);
-        buffer.putLong(HEADER_MAGIC).putInt(FORMAT_VERSION).putLong(header.generation)
+        buffer.putLong(headerMagic).putInt(FORMAT_VERSION).putLong(header.generation)
                 .putLong(header.committedLength).putLong(header.nextBatchSequence);
         buffer.position(HEADER_CRC_OFFSET);
         buffer.putInt(crc(buffer.array(), HEADER_CRC_OFFSET));
@@ -568,7 +592,7 @@ public final class FileInternalCatalogStore implements InternalCatalogStore {
      * @param slot header 槽号，只应为 0 或 1
      * @return 有效 header；槽不可用时返回 {@link Optional#empty()}
      */
-    private static Optional<Header> decodeHeader(FileChannel channel, int slot) {
+    private static Optional<Header> decodeHeader(FileChannel channel, int slot, long headerMagic) {
         try {
             // 1、读取输入长度、游标边界与必要标识，在共享或持久副作用前拒绝非法状态。
             if (channel.size() < (slot + 1L) * HEADER_SLOT_BYTES) {
@@ -584,7 +608,7 @@ public final class FileInternalCatalogStore implements InternalCatalogStore {
             }
             buffer.flip();
             // 3、在中间分支复核阶段性结果；满足条件后，交叉校验聚合计数、类型、校验值和剩余输入，并维持领域不变量。
-            if (buffer.getLong() != HEADER_MAGIC || buffer.getInt() != FORMAT_VERSION) {
+            if (buffer.getLong() != headerMagic || buffer.getInt() != FORMAT_VERSION) {
                 return Optional.empty();
             }
             Header header = new Header(buffer.getLong(), buffer.getLong(), buffer.getLong());

@@ -194,6 +194,13 @@ segment 内 extent list：
 | page 3 | `SDI` | GENERAL 表空间保存单页 SDI v1 完整表聚合快照；UNDO 表空间在同一固定页使用 `RSEG_HEADER`，由 tablespace type 区分 |
 | page 4+ | `INDEX` / `BLOB` | 聚簇索引、二级索引 B+Tree 页，以及大字段溢出页 |
 
+当前创建路径在同一 MTR 中为 page0、page1、page2 写入 FSP_HDR、IBUF_BITMAP、INODE 物理信封；
+catalog-loss 离线 scrub 因此可验证固定管理页 identity/type。仅历史教学文件允许“extent0 已保留但
+page1 仍全零”的窄兼容；当前新文件不会再生成该形状。scrubber 只顺序读取 manifest 声明的 GENERAL
+file-per-table，属性探测与 channel 打开都使用 NOFOLLOW；在消费 bitmap 前先校验 XDES state、owner、
+同状态/同 owner 双向 list 地址和 EOF 分配边界。不挂载 registry、不修改页面，也不扩张为
+系统/undo/全 data-dir 自动校验。
+
 超过首 256MB 后，每隔固定范围会出现新的 extent descriptor 管理区域。本设计由 `ExtentDescriptorRepository` 屏蔽“XDES entries 在 page 0 内嵌还是在独立管理页中”的差异。
 
 物理定位公式：

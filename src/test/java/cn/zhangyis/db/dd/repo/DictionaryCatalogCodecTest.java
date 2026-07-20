@@ -10,6 +10,7 @@ import cn.zhangyis.db.dd.domain.IndexKeyPart;
 import cn.zhangyis.db.dd.domain.IndexOrder;
 import cn.zhangyis.db.dd.domain.ObjectName;
 import cn.zhangyis.db.dd.domain.SchemaId;
+import cn.zhangyis.db.dd.domain.SchemaDefinition;
 import cn.zhangyis.db.dd.domain.TableDefinition;
 import cn.zhangyis.db.dd.domain.TableId;
 import cn.zhangyis.db.dd.domain.TableState;
@@ -37,6 +38,7 @@ import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -126,6 +128,59 @@ class DictionaryCatalogCodecTest {
                 () -> codec.decode(batchWithTablePayload(encoded, truncated)));
         assertThrows(DictionaryCatalogCorruptionException.class,
                 () -> codec.decode(batchWithTablePayload(encoded, trailing)));
+    }
+
+    /**
+     * baseline 必须保留表定义中的 index ordinal，不能按 indexId 重排；否则 PRIMARY 与 storage binding
+     * 的同 ordinal 对应关系会在 catalog-loss rebuild 后被破坏。
+     */
+    @Test
+    void baselineRoundTripPreservesIndexOrdinalAndCompleteSnapshot() {
+        assertEquals(8, CatalogEntityKind.CATALOG_BASELINE_META.stableCode());
+        assertEquals(126, CatalogEntityKind.CATALOG_BASELINE_COMMIT.stableCode());
+        assertEquals(127, CatalogEntityKind.CATALOG_COMMIT.stableCode());
+        TableDefinition oneIndex = table(Optional.empty());
+        IndexDefinition secondary = new IndexDefinition(
+                IndexId.of(1), ObjectName.of("idx_body"), false, false,
+                List.of(new IndexKeyPart(2, IndexOrder.ASC, 0)));
+        TableStorageBinding old = oneIndex.storageBinding().orElseThrow();
+        IndexStorageBinding secondaryBinding = new IndexStorageBinding(
+                1, PageId.of(old.spaceId(), PageNo.of(65)), 0,
+                new SegmentRef(old.spaceId(), 4, SegmentId.of(14)),
+                new SegmentRef(old.spaceId(), 5, SegmentId.of(15)));
+        TableDefinition expectedTable = new TableDefinition(
+                oneIndex.id(), oneIndex.schemaId(), oneIndex.name(), oneIndex.version(), TableState.ACTIVE,
+                oneIndex.columns(), List.of(oneIndex.indexes().getFirst(), secondary),
+                Optional.of(new TableStorageBinding(
+                        old.tableId(), old.spaceId(), old.path(), old.rowFormatVersion(),
+                        List.of(old.indexes().getFirst(), secondaryBinding), old.lobSegment())));
+        SchemaDefinition schema = new SchemaDefinition(
+                SchemaId.of(1), ObjectName.of("app"), 1, 1, VERSION);
+        DictionarySnapshot expected = new DictionarySnapshot(VERSION,
+                Map.of(schema.id(), schema), Map.of(expectedTable.id(), expectedTable),
+                Map.of(expectedTable.indexes().get(0).id(), expectedTable.indexes().get(0),
+                        secondary.id(), secondary));
+
+        DictionarySnapshot decoded = new DictionaryCatalogArchiveCodec().decode(
+                new DictionaryCatalogArchiveCodec().encode(expected));
+
+        assertEquals(expected, decoded);
+        assertEquals(List.of(IndexId.of(3), IndexId.of(1)),
+                decoded.tables().get(expectedTable.id()).indexes().stream()
+                        .map(IndexDefinition::id).toList());
+    }
+
+    /** baseline encoder 必须拒绝与 table aggregates 不一致的全局 index map，不能静默丢失目录对象。 */
+    @Test
+    void baselineRejectsInconsistentGlobalIndexMap() {
+        TableDefinition table = table(Optional.empty());
+        SchemaDefinition schema = new SchemaDefinition(
+                SchemaId.of(1), ObjectName.of("app"), 1, 1, VERSION);
+        DictionarySnapshot inconsistent = new DictionarySnapshot(
+                VERSION, Map.of(schema.id(), schema), Map.of(table.id(), table), Map.of());
+
+        assertThrows(DictionaryCatalogCorruptionException.class,
+                () -> new DictionaryCatalogArchiveCodec().encode(inconsistent));
     }
 
     private static TableDefinition table(Optional<SegmentRef> lob) {

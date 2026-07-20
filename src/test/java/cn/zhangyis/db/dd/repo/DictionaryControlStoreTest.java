@@ -11,6 +11,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
  * DD control 双槽 TDD：ID 高水位必须在返回给 DDL 前 force，最新槽损坏时只能回退到上一完整 generation。
@@ -58,6 +59,60 @@ class DictionaryControlStoreTest {
 
         try (DictionaryControlStore reopened = DictionaryControlStore.openExisting(path, SpaceId.of(1))) {
             assertEquals(2L, reopened.snapshot().generation());
+        }
+    }
+
+    /** recovery floor 只提升 counter，忽略外部 generation 跳跃，并在 close/reopen 后保持 durable。 */
+    @Test
+    void advancesRecoveryFloorMonotonicallyAcrossReopen() {
+        Path path = directory.resolve("mysql.dd.ctrl");
+        DictionaryControlSnapshot advanced;
+        try (DictionaryControlStore store =
+                     DictionaryControlStore.openOrCreate(path, SpaceId.of(1), 1024)) {
+            DictionaryControlSnapshot floor = new DictionaryControlSnapshot(
+                    99, SpaceId.of(1), 20, 30, 40, 2048, 50, 60);
+
+            advanced = store.advanceTo(floor);
+
+            assertEquals(2, advanced.generation(), "外部 generation 不能跳过本文件的双槽序列");
+            assertEquals(20, advanced.nextSchemaId());
+            assertEquals(2048, advanced.nextSpaceId());
+        }
+        try (DictionaryControlStore reopened =
+                     DictionaryControlStore.openExisting(path, SpaceId.of(1))) {
+            assertEquals(advanced, reopened.snapshot());
+        }
+    }
+
+    /** witness 失败必须发生在 control 另一槽写入前，当前 generation 与可分配起点都保持不变。 */
+    @Test
+    void witnessFailurePreventsControlReservationPublish() {
+        Path path = directory.resolve("mysql.dd.ctrl");
+        DictionaryDurabilityWitness failing = new DictionaryDurabilityWitness() {
+            @Override
+            public void beforeControlReservation(DictionaryControlSnapshot target) {
+                throw new cn.zhangyis.db.common.exception.DatabaseRuntimeException(
+                        "injected control witness failure");
+            }
+
+            @Override
+            public void beforeCatalogMutation(
+                    cn.zhangyis.db.dd.domain.DictionaryVersion version,
+                    java.util.List<cn.zhangyis.db.storage.api.catalog.CatalogRecord> records) {
+                // 本测试只覆盖 control 端口。
+            }
+        };
+        try (DictionaryControlStore store =
+                     DictionaryControlStore.openOrCreate(path, SpaceId.of(1), 1024, failing)) {
+            DictionaryControlSnapshot before = store.snapshot();
+
+            assertThrows(cn.zhangyis.db.common.exception.DatabaseRuntimeException.class,
+                    () -> store.reserve(new DictionaryIdRequest(1, 1, 1, 1, 1, 1)));
+            assertEquals(before, store.snapshot());
+        }
+        try (DictionaryControlStore reopened =
+                     DictionaryControlStore.openExisting(path, SpaceId.of(1))) {
+            assertEquals(1, reopened.snapshot().generation());
         }
     }
 }

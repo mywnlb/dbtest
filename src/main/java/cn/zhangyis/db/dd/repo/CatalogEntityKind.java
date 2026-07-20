@@ -26,6 +26,10 @@ enum CatalogEntityKind {
     SCHEMA_TOMBSTONE(5),
     TABLE_TOMBSTONE(6),
     DDL_LOG(7),
+    /** 灾难恢复新 catalog 的首批全量快照元数据；既有增量批次不使用。 */
+    CATALOG_BASELINE_META(8),
+    /** 全量 baseline 批次的独立提交封口；126 保留在普通 commit 127 之前。 */
+    CATALOG_BASELINE_COMMIT(126),
     CATALOG_COMMIT(127);
 
     /**

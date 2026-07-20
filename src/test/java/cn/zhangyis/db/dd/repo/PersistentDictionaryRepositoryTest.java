@@ -91,6 +91,33 @@ class PersistentDictionaryRepositoryTest {
         }
     }
 
+    /** catalog mutation witness 失败时，repository 不得先 append 权威批次或发布内存 snapshot。 */
+    @Test
+    void witnessFailurePreventsCatalogMutationPublish() {
+        Path path = directory.resolve("mysql.ibd");
+        DictionaryDurabilityWitness failing = new DictionaryDurabilityWitness() {
+            @Override
+            public void beforeControlReservation(DictionaryControlSnapshot target) {
+                // 本测试只覆盖 catalog 端口。
+            }
+
+            @Override
+            public void beforeCatalogMutation(DictionaryVersion version, List<CatalogRecord> records) {
+                throw new cn.zhangyis.db.common.exception.DatabaseRuntimeException(
+                        "injected catalog witness failure");
+            }
+        };
+        try (FileInternalCatalogStore store = FileInternalCatalogStore.openOrCreate(path)) {
+            PersistentDictionaryRepository repository =
+                    new PersistentDictionaryRepository(store, failing);
+
+            assertThrows(cn.zhangyis.db.common.exception.DatabaseRuntimeException.class,
+                    () -> repository.commit(DictionaryVersion.of(2), List.of(schema(2)), List.of()));
+            assertEquals(DictionaryVersion.of(1), repository.snapshot().publishedVersion());
+            assertTrue(store.readCommittedBatches().isEmpty());
+        }
+    }
+
     /** close 未提交 Unit of Work 必须只丢弃 staging，不占用版本也不追加 catalog batch。 */
     @Test
     void rollsBackUncommittedDictionaryTransactionOnClose() {

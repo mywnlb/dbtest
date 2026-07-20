@@ -39,10 +39,12 @@ import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * DD logical objects 与 storage byte catalog record 的显式 codec。key 固定为 kind/parent/object/version/ordinal/chunk，
@@ -66,6 +68,10 @@ final class DictionaryCatalogCodec {
      * 稳定布局常量，参与页内偏移、长度或位域计算；编解码两端必须保持完全一致。
      */
     private static final int HASH_BYTES = 32;
+    /** baseline meta payload magic：ASCII {@code DDB1}。 */
+    private static final int BASELINE_MAGIC = 0x44444231;
+    /** 当前 baseline 逻辑格式版本。 */
+    private static final int BASELINE_FORMAT_VERSION = 1;
 
     /**
      * 把调用方领域值编码为数据字典的稳定表示；编码前校验范围，成功不修改输入对象。
@@ -112,6 +118,210 @@ final class DictionaryCatalogCodec {
     }
 
     /**
+     * 把一个完整稳定快照编码为新 catalog 的首批 baseline。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>交叉校验 map key、schema/table 名称、父子关系与全局 index 集，拒绝内部不一致快照。</li>
+     *     <li>校验对象版本不超过 published version，且表已经处于 ACTIVE/DISCARDED 稳定状态。</li>
+     *     <li>按 identity 排序编码 meta 与全部对象，同时以 key ordinal 保留表内 column/index 顺序。</li>
+     *     <li>追加覆盖全部 records 的 baseline commit；失败不产生部分返回值或持久副作用。</li>
+     * </ol>
+     *
+     * @param snapshot 已完成唯一性和 binding 校验的稳定快照；表只能是 ACTIVE 或 DISCARDED
+     * @return 可直接作为新 catalog 首批 append 的确定性 records
+     * @throws DictionaryCatalogCorruptionException 快照包含临时状态、DROPPED tombstone 或对象版本越界时抛出
+     */
+    List<CatalogRecord> encodeBaseline(DictionarySnapshot snapshot) {
+        // 1. disaster archive 不能信任容器 key；逐项证明 snapshot 的所有聚合视图彼此一致。
+        if (snapshot == null) {
+            throw new DictionaryCatalogCorruptionException("dictionary baseline snapshot must not be null");
+        }
+        DictionaryVersion published = snapshot.publishedVersion();
+        if (published == null) {
+            throw new DictionaryCatalogCorruptionException("dictionary baseline published version is missing");
+        }
+        List<SchemaDefinition> schemas = snapshot.schemas().values().stream()
+                .sorted(Comparator.comparingLong(schema -> schema.id().value())).toList();
+        List<TableDefinition> tables = snapshot.tables().values().stream()
+                .sorted(Comparator.comparingLong(table -> table.id().value())).toList();
+        Set<ObjectName> schemaNames = new HashSet<>();
+        for (Map.Entry<SchemaId, SchemaDefinition> entry : snapshot.schemas().entrySet()) {
+            if (!entry.getKey().equals(entry.getValue().id()) || !schemaNames.add(entry.getValue().name())) {
+                throw new DictionaryCatalogCorruptionException(
+                        "dictionary baseline schema map/name is inconsistent: " + entry.getKey().value());
+            }
+        }
+        Set<String> tableNames = new HashSet<>();
+        Map<IndexId, IndexDefinition> derivedIndexes = new LinkedHashMap<>();
+        for (Map.Entry<TableId, TableDefinition> entry : snapshot.tables().entrySet()) {
+            TableDefinition table = entry.getValue();
+            String qualifiedName = table.schemaId().value() + ":" + table.name().canonicalName();
+            if (!entry.getKey().equals(table.id())
+                    || !snapshot.schemas().containsKey(table.schemaId())
+                    || !tableNames.add(qualifiedName)) {
+                throw new DictionaryCatalogCorruptionException(
+                        "dictionary baseline table map/name/parent is inconsistent: " + entry.getKey().value());
+            }
+            for (IndexDefinition index : table.indexes()) {
+                if (derivedIndexes.putIfAbsent(index.id(), index) != null) {
+                    throw new DictionaryCatalogCorruptionException(
+                            "dictionary baseline contains duplicate index id: " + index.id().value());
+                }
+            }
+        }
+        if (!derivedIndexes.equals(snapshot.indexes())) {
+            throw new DictionaryCatalogCorruptionException(
+                    "dictionary baseline global index map differs from table aggregates");
+        }
+
+        // 2. baseline 保留对象自己的历史版本，但任何对象都不能来自 published version 的未来。
+        for (SchemaDefinition schema : schemas) {
+            if (schema.version().compareTo(published) > 0) {
+                throw new DictionaryCatalogCorruptionException(
+                        "baseline schema version exceeds published version: " + schema.id().value());
+            }
+        }
+        for (TableDefinition table : tables) {
+            if (table.version().compareTo(published) > 0
+                    || table.state() != TableState.ACTIVE && table.state() != TableState.DISCARDED
+                    || table.storageBinding().isEmpty()) {
+                throw new DictionaryCatalogCorruptionException(
+                        "baseline table is not a stable visible/recoverable object: " + table.id().value()
+                                + " state=" + table.state());
+            }
+        }
+
+        // 3. 按稳定 identity 编码；表内 children 的 ordinal 仍以聚合根声明顺序为准。
+        List<CatalogRecord> records = new ArrayList<>();
+        int indexCount = tables.stream().mapToInt(table -> table.indexes().size()).sum();
+        byte[] meta = ByteBuffer.allocate(Integer.BYTES * 5 + Long.BYTES).order(ByteOrder.BIG_ENDIAN)
+                .putInt(BASELINE_MAGIC)
+                .putInt(BASELINE_FORMAT_VERSION)
+                .putLong(published.value())
+                .putInt(schemas.size())
+                .putInt(tables.size())
+                .putInt(indexCount)
+                .array();
+        records.addAll(fragment(new CatalogKey(CatalogEntityKind.CATALOG_BASELINE_META, 0, 0,
+                published.value(), 0, 0), meta));
+        for (SchemaDefinition schema : schemas) {
+            records.addAll(fragment(new CatalogKey(CatalogEntityKind.SCHEMA, 0, schema.id().value(),
+                    published.value(), 0, 0), encodeSchema(schema)));
+        }
+        for (TableDefinition table : tables) {
+            records.addAll(fragment(new CatalogKey(CatalogEntityKind.TABLE, table.schemaId().value(),
+                    table.id().value(), published.value(), 0, 0), encodeTable(table)));
+            for (ColumnDefinition column : table.columns()) {
+                records.addAll(fragment(new CatalogKey(CatalogEntityKind.COLUMN, table.id().value(),
+                        column.columnId(), published.value(), column.ordinal(), 0), encodeColumn(column)));
+            }
+            for (int ordinal = 0; ordinal < table.indexes().size(); ordinal++) {
+                IndexDefinition index = table.indexes().get(ordinal);
+                records.addAll(fragment(new CatalogKey(CatalogEntityKind.INDEX, table.id().value(),
+                        index.id().value(), published.value(), ordinal, 0), encodeIndex(index)));
+            }
+        }
+        // 4. commit 摘要是 baseline 可见性的唯一逻辑边界，底层 store 再提供物理 batch 边界。
+        records.add(commitRecord(published, records, CatalogEntityKind.CATALOG_BASELINE_COMMIT));
+        return List.copyOf(records);
+    }
+
+    /**
+     * 尝试解码全量 baseline；普通 mutation/DDL batch 返回 empty，baseline 损坏则 fail-closed。
+     *
+     * @param batch 已通过物理 frame 校验的 catalog batch
+     * @return 完整字典快照，或非 baseline batch 的 empty
+     */
+    Optional<DictionarySnapshot> decodeBaseline(CatalogBatch batch) {
+        List<CatalogRecord> records = batch.records();
+        Optional<CatalogKey> lastKey = tryDecodeKey(records.getLast().key());
+        if (lastKey.isEmpty() || lastKey.get().kind != CatalogEntityKind.CATALOG_BASELINE_COMMIT) {
+            return Optional.empty();
+        }
+        CatalogKey commitKey = lastKey.get();
+        validateManifest(records, commitKey, CatalogEntityKind.CATALOG_BASELINE_COMMIT);
+        if (records.size() < 2) {
+            throw new DictionaryCatalogCorruptionException("dictionary baseline lacks meta record");
+        }
+
+        CatalogKey metaKey = decodeKey(records.getFirst().key());
+        if (metaKey.kind != CatalogEntityKind.CATALOG_BASELINE_META
+                || metaKey.parentId != 0 || metaKey.objectId != 0
+                || metaKey.version != commitKey.version || metaKey.ordinal != 0 || metaKey.chunk != 0) {
+            throw new DictionaryCatalogCorruptionException("dictionary baseline first record is not meta");
+        }
+        ByteBuffer meta = ByteBuffer.wrap(records.getFirst().payload()).order(ByteOrder.BIG_ENDIAN);
+        if (meta.remaining() != Integer.BYTES * 5 + Long.BYTES
+                || meta.getInt() != BASELINE_MAGIC
+                || meta.getInt() != BASELINE_FORMAT_VERSION) {
+            throw new DictionaryCatalogCorruptionException("dictionary baseline meta format is invalid");
+        }
+        long publishedVersion = meta.getLong();
+        int schemaCount = meta.getInt();
+        int tableCount = meta.getInt();
+        int indexCount = meta.getInt();
+        if (publishedVersion != commitKey.version || schemaCount < 0 || tableCount < 0 || indexCount < 0) {
+            throw new DictionaryCatalogCorruptionException("dictionary baseline meta counters/version are invalid");
+        }
+
+        Map<GroupKey, List<Fragment>> grouped = new LinkedHashMap<>();
+        for (int i = 1; i < records.size() - 1; i++) {
+            CatalogRecord record = records.get(i);
+            CatalogKey key = decodeKey(record.key());
+            if (key.kind == CatalogEntityKind.CATALOG_COMMIT
+                    || key.kind == CatalogEntityKind.CATALOG_BASELINE_COMMIT
+                    || key.kind == CatalogEntityKind.CATALOG_BASELINE_META
+                    || key.version != publishedVersion) {
+                throw new DictionaryCatalogCorruptionException("dictionary baseline contains invalid kind/version");
+            }
+            GroupKey group = new GroupKey(key.kind, key.parentId, key.objectId, key.version, key.ordinal);
+            grouped.computeIfAbsent(group, ignored -> new ArrayList<>())
+                    .add(new Fragment(key.chunk, record.payload()));
+        }
+        DecodedObjects decoded = decodeObjects(grouped);
+        if (decoded.schemas().size() != schemaCount || decoded.tables().size() != tableCount
+                || decoded.tables().stream().mapToInt(table -> table.indexes().size()).sum() != indexCount) {
+            throw new DictionaryCatalogCorruptionException("dictionary baseline aggregate counts mismatch");
+        }
+        Map<SchemaId, SchemaDefinition> schemas = new LinkedHashMap<>();
+        Map<TableId, TableDefinition> tables = new LinkedHashMap<>();
+        Map<IndexId, IndexDefinition> indexes = new LinkedHashMap<>();
+        for (SchemaDefinition schema : decoded.schemas()) {
+            if (schema.version().value() > publishedVersion
+                    || schemas.putIfAbsent(schema.id(), schema) != null
+                    || schemas.values().stream().filter(existing -> existing.name().equals(schema.name())).count() > 1) {
+                throw new DictionaryCatalogCorruptionException(
+                        "duplicate/invalid schema in dictionary baseline: " + schema.id().value());
+            }
+        }
+        for (TableDefinition table : decoded.tables()) {
+            if (table.version().value() > publishedVersion
+                    || table.state() != TableState.ACTIVE && table.state() != TableState.DISCARDED
+                    || table.storageBinding().isEmpty()
+                    || !schemas.containsKey(table.schemaId())
+                    || tables.putIfAbsent(table.id(), table) != null) {
+                throw new DictionaryCatalogCorruptionException(
+                        "invalid table in dictionary baseline: " + table.id().value());
+            }
+            boolean duplicateName = tables.values().stream().anyMatch(existing ->
+                    existing != table && existing.schemaId().equals(table.schemaId())
+                            && existing.name().equals(table.name()));
+            if (duplicateName) {
+                throw new DictionaryCatalogCorruptionException(
+                        "duplicate table name in dictionary baseline: " + table.name());
+            }
+            for (IndexDefinition index : table.indexes()) {
+                if (indexes.putIfAbsent(index.id(), index) != null) {
+                    throw new DictionaryCatalogCorruptionException(
+                            "duplicate index id in dictionary baseline: " + index.id().value());
+                }
+            }
+        }
+        return Optional.of(new DictionarySnapshot(DictionaryVersion.of(publishedVersion), schemas, tables, indexes));
+    }
+
+    /**
      * 从稳定表示解码数据字典领域值；先校验边界、标识与长度，损坏输入以领域异常拒绝。
      *
      * <p>数据流：</p>
@@ -136,7 +346,7 @@ final class DictionaryCatalogCodec {
         }
         CatalogKey commitKey = lastKey.get();
         // 2、继续完成范围、身份与候选校验；通过后，按稳定字段或 token 顺序推进游标并调用对应编解码分支，保持处理顺序与资源边界。
-        validateManifest(records, commitKey);
+        validateManifest(records, commitKey, CatalogEntityKind.CATALOG_COMMIT);
 
         Map<GroupKey, List<Fragment>> grouped = new LinkedHashMap<>();
         for (int i = 0; i < records.size() - 1; i++) {
@@ -150,30 +360,87 @@ final class DictionaryCatalogCodec {
                     .add(new Fragment(key.chunk, record.payload()));
         }
 
+        DecodedObjects decoded = decodeObjects(grouped);
+        // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
+        return Optional.of(new DecodedMutation(DictionaryVersion.of(commitKey.version),
+                decoded.schemas(), decoded.tables()));
+    }
+
+    /** 从已经按 entity key 聚合的 payload 分片重建 schema/table 聚合。 */
+    private static DecodedObjects decodeObjects(Map<GroupKey, List<Fragment>> grouped) {
         List<SchemaDefinition> schemas = new ArrayList<>();
         Map<Long, TableRoot> roots = new LinkedHashMap<>();
-        // 3、在中间分支复核阶段性结果；满足条件后，交叉校验聚合计数、类型、校验值和剩余输入，并维持领域不变量。
-        Map<Long, List<ColumnDefinition>> columns = new LinkedHashMap<>();
-        Map<Long, List<IndexDefinition>> indexes = new LinkedHashMap<>();
+        Map<Long, List<OrderedColumn>> columns = new LinkedHashMap<>();
+        Map<Long, List<OrderedIndex>> indexes = new LinkedHashMap<>();
         for (Map.Entry<GroupKey, List<Fragment>> entry : grouped.entrySet()) {
             GroupKey key = entry.getKey();
             byte[] payload = join(entry.getValue());
             switch (key.kind) {
-                case SCHEMA -> schemas.add(decodeSchema(payload));
-                case TABLE -> roots.put(key.objectId, decodeTable(payload));
-                case COLUMN -> columns.computeIfAbsent(key.parentId, ignored -> new ArrayList<>())
-                        .add(decodeColumn(payload));
-                case INDEX -> indexes.computeIfAbsent(key.parentId, ignored -> new ArrayList<>())
-                        .add(decodeIndex(payload));
+                case SCHEMA -> {
+                    SchemaDefinition schema = decodeSchema(payload);
+                    if (key.parentId != 0 || key.ordinal != 0 || key.objectId != schema.id().value()) {
+                        throw new DictionaryCatalogCorruptionException(
+                                "schema catalog key/payload identity mismatch: " + key.objectId);
+                    }
+                    schemas.add(schema);
+                }
+                case TABLE -> {
+                    TableRoot root = decodeTable(payload);
+                    if (key.ordinal != 0 || key.objectId != root.id.value()
+                            || key.parentId != root.schemaId.value()) {
+                        throw new DictionaryCatalogCorruptionException(
+                                "table catalog key/payload identity mismatch: " + key.objectId);
+                    }
+                    if (roots.putIfAbsent(key.objectId, root) != null) {
+                        throw new DictionaryCatalogCorruptionException(
+                                "duplicate table root in dictionary batch: " + key.objectId);
+                    }
+                }
+                case COLUMN -> {
+                    ColumnDefinition column = decodeColumn(payload);
+                    if (key.objectId != column.columnId() || key.ordinal != column.ordinal()) {
+                        throw new DictionaryCatalogCorruptionException(
+                                "column catalog key/payload identity mismatch: " + key.objectId);
+                    }
+                    columns.computeIfAbsent(key.parentId, ignored -> new ArrayList<>())
+                            .add(new OrderedColumn(key.ordinal, column));
+                }
+                case INDEX -> {
+                    IndexDefinition index = decodeIndex(payload);
+                    if (key.objectId != index.id().value()) {
+                        throw new DictionaryCatalogCorruptionException(
+                                "index catalog key/payload identity mismatch: " + key.objectId);
+                    }
+                    indexes.computeIfAbsent(key.parentId, ignored -> new ArrayList<>())
+                            .add(new OrderedIndex(key.ordinal, index));
+                }
                 default -> throw new DictionaryCatalogCorruptionException(
-                        "unsupported catalog mutation kind in v1: " + key.kind);
+                        "unsupported dictionary object kind: " + key.kind);
             }
+        }
+        Set<Long> orphanParents = new HashSet<>(columns.keySet());
+        orphanParents.addAll(indexes.keySet());
+        orphanParents.removeAll(roots.keySet());
+        if (!orphanParents.isEmpty()) {
+            throw new DictionaryCatalogCorruptionException(
+                    "dictionary child references missing table root: " + orphanParents.iterator().next());
         }
         List<TableDefinition> tables = new ArrayList<>();
         for (TableRoot root : roots.values()) {
-            List<ColumnDefinition> tableColumns = columns.getOrDefault(root.id.value(), List.of()).stream()
-                    .sorted(Comparator.comparingInt(ColumnDefinition::ordinal)).toList();
-            List<IndexDefinition> tableIndexes = indexes.getOrDefault(root.id.value(), List.of());
+            List<ColumnDefinition> tableColumns =
+                    columns.getOrDefault(root.id.value(), List.of()).stream()
+                            .sorted(Comparator.comparingInt(OrderedColumn::ordinal))
+                            .map(OrderedColumn::column).toList();
+            List<OrderedIndex> orderedIndexes =
+                    indexes.getOrDefault(root.id.value(), List.of()).stream()
+                            .sorted(Comparator.comparingInt(OrderedIndex::ordinal)).toList();
+            for (int ordinal = 0; ordinal < orderedIndexes.size(); ordinal++) {
+                if (orderedIndexes.get(ordinal).ordinal() != ordinal) {
+                    throw new DictionaryCatalogCorruptionException(
+                            "table index ordinal gap/duplicate: " + root.id.value());
+                }
+            }
+            List<IndexDefinition> tableIndexes = orderedIndexes.stream().map(OrderedIndex::index).toList();
             if (tableColumns.size() != root.columnCount || tableIndexes.size() != root.indexCount) {
                 throw new DictionaryCatalogCorruptionException("table aggregate child count mismatch: "
                         + root.id.value());
@@ -181,8 +448,7 @@ final class DictionaryCatalogCodec {
             tables.add(new TableDefinition(root.id, root.schemaId, root.name, root.version, root.state,
                     tableColumns, tableIndexes, root.storageBinding));
         }
-        // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
-        return Optional.of(new DecodedMutation(DictionaryVersion.of(commitKey.version), schemas, tables));
+        return new DecodedObjects(List.copyOf(schemas), List.copyOf(tables));
     }
 
     private static List<CatalogRecord> fragment(CatalogKey base, byte[] payload) {
@@ -214,6 +480,12 @@ final class DictionaryCatalogCodec {
      * @return {@code commitRecord} 编码、解码或重建的记录数据；成功时不为 {@code null}，字段顺序、隐藏列和字节边界满足当前 schema
      */
     private static CatalogRecord commitRecord(DictionaryVersion version, List<CatalogRecord> records) {
+        return commitRecord(version, records, CatalogEntityKind.CATALOG_COMMIT);
+    }
+
+    /** 以调用方指定的 commit kind 对普通 mutation 或 baseline records 统一做数量与 SHA-256 封口。 */
+    private static CatalogRecord commitRecord(DictionaryVersion version, List<CatalogRecord> records,
+                                              CatalogEntityKind commitKind) {
         // 1、读取输入长度、游标边界与必要标识，在共享或持久副作用前拒绝非法状态。
         MessageDigest digest = sha256();
         // 2、继续完成范围、身份与候选校验；通过后，按稳定字段或 token 顺序推进游标并调用对应编解码分支，保持处理顺序与资源边界。
@@ -223,15 +495,18 @@ final class DictionaryCatalogCodec {
         ByteBuffer payload = ByteBuffer.allocate(Integer.BYTES + HASH_BYTES).order(ByteOrder.BIG_ENDIAN);
         // 3、在中间分支复核阶段性结果；满足条件后，交叉校验聚合计数、类型、校验值和剩余输入，并维持领域不变量。
         payload.putInt(records.size()).put(digest.digest());
-        CatalogKey key = new CatalogKey(CatalogEntityKind.CATALOG_COMMIT, 0, version.value(),
+        CatalogKey key = new CatalogKey(commitKind, 0, version.value(),
                 version.value(), 0, 0);
         // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
         return new CatalogRecord(encodeKey(key), payload.array());
     }
 
-    private static void validateManifest(List<CatalogRecord> records, CatalogKey commitKey) {
+    private static void validateManifest(List<CatalogRecord> records, CatalogKey commitKey,
+                                         CatalogEntityKind expectedCommitKind) {
         CatalogRecord commit = records.getLast();
-        if (commitKey.chunk != 0 || commit.payload().length != Integer.BYTES + HASH_BYTES) {
+        if (commitKey.kind != expectedCommitKind || commitKey.parentId != 0
+                || commitKey.objectId != commitKey.version || commitKey.ordinal != 0 || commitKey.chunk != 0
+                || commit.payload().length != Integer.BYTES + HASH_BYTES) {
             throw new DictionaryCatalogCorruptionException("invalid dictionary commit manifest shape");
         }
         ByteBuffer payload = ByteBuffer.wrap(commit.payload()).order(ByteOrder.BIG_ENDIAN);
@@ -710,6 +985,18 @@ final class DictionaryCatalogCodec {
             schemas = List.copyOf(schemas);
             tables = List.copyOf(tables);
         }
+    }
+
+    /** schema 与 table 聚合解码的内部结果，供 mutation/baseline 两条批次协议共用。 */
+    private record DecodedObjects(List<SchemaDefinition> schemas, List<TableDefinition> tables) {
+    }
+
+    /** column key ordinal 与 payload 定义的配对，用于排序并拒绝持久 key/payload 身份分裂。 */
+    private record OrderedColumn(int ordinal, ColumnDefinition column) {
+    }
+
+    /** index 没有自身 ordinal 字段，必须以 catalog key ordinal 恢复表聚合中的声明顺序。 */
+    private record OrderedIndex(int ordinal, IndexDefinition index) {
     }
 
     /**

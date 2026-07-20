@@ -133,11 +133,17 @@
 | `RESUME_PURGE` | history list、oldest view boundary | purge cursor | transaction no、history list pointer |
 | `OPEN_TRAFFIC` | all stage results | engine ready | gate state |
 
-当前实现落点（2026-07-17）：公共组合根在 storage 的 doublewrite/redo/undo rollback/RESUME_PURGE 完成后，
+当前实现落点（2026-07-20）：公共组合根在 storage 的 doublewrite/redo/undo rollback/RESUME_PURGE 完成后，
 调用 DD 层 `DictionaryDdlRecoveryService` 消费独立 CREATE/DROP TABLE DDL log。恢复以 committed DD +
 `DdlUndoMarker` 的 ddl id/phase/object version/space/exact path 联合裁决 rollback 或 finish，再逐张校验
 ACTIVE 表固定 page3 SDI；root=0、空页、逻辑 CRC/版本/内容错配按 committed DD 重写，未知 root 或物理页损坏
 阻止 Session OPEN。无 marker 的旧 DROP_PENDING/orphan cleanup 保留兼容路径。
+
+`mysql.ibd` 丢失不并入上述普通 crash-recovery 阶段。公共组合根先持有 instance file lock 并由 admission
+fail-closed；管理员只能在实例关闭时使用 `CatalogRecoveryService`，以独立 clean manifest 证明 schema/目录
+边界、full-page scrub 全部 ACTIVE 候选、显式隔离冲突并原子发布 baseline catalog。发布后仍须重新进入上述
+普通 recovery 链，工具本身不开放 Session、不 replay redo，也不修复 torn page。没有 clean manifest、
+存在未裁决 catalog mutation intent 或 expected 文件损坏时一律停止。
 
 ### 6.2 逻辑与物理边界
 

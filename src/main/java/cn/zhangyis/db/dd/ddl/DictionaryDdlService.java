@@ -28,6 +28,7 @@ import cn.zhangyis.db.dd.repo.DictionaryControlStore;
 import cn.zhangyis.db.dd.repo.DictionaryIdAllocation;
 import cn.zhangyis.db.dd.repo.DictionaryIdRequest;
 import cn.zhangyis.db.dd.repo.PersistentDictionaryRepository;
+import cn.zhangyis.db.dd.recovery.DictionaryCleanSnapshotPublisher;
 import cn.zhangyis.db.dd.sdi.SerializedDictionaryInfoService;
 import cn.zhangyis.db.dd.tx.DictionaryTransaction;
 import cn.zhangyis.db.storage.api.ddl.StorageColumnDefinition;
@@ -97,6 +98,8 @@ public final class DictionaryDdlService {
     private final DictionaryDdlFaultInjector faultInjector;
     /** ACTIVE DD 发布前写入完整 table SDI，保证文件冗余先于 catalog 提交 durable。 */
     private final SerializedDictionaryInfoService sdi;
+    /** DDL 前检查 manifest fence，并在稳定终点发布 clean snapshot；兼容构造使用 no-op。 */
+    private final DictionaryCleanSnapshotPublisher cleanSnapshotPublisher;
 
     /**
      * 构造不接 persistent history barrier、也不注入故障的低层 DDL 服务；仅供孤立组件测试使用。
@@ -113,7 +116,8 @@ public final class DictionaryDdlService {
                                 DictionaryObjectCache cache, MetadataLockManager locks,
                                 TableDdlStorageService physical, Path tablesDirectory) {
         this(control, repository, cache, locks, physical, tablesDirectory,
-                TablePurgeBarrier.NONE, DictionaryDdlFaultInjector.NO_OP);
+                TablePurgeBarrier.NONE, DictionaryDdlFaultInjector.NO_OP,
+                DictionaryCleanSnapshotPublisher.noOp());
     }
 
     /**
@@ -133,7 +137,8 @@ public final class DictionaryDdlService {
                                 TableDdlStorageService physical, Path tablesDirectory,
                                 TablePurgeBarrier purgeBarrier) {
         this(control, repository, cache, locks, physical, tablesDirectory,
-                purgeBarrier, DictionaryDdlFaultInjector.NO_OP);
+                purgeBarrier, DictionaryDdlFaultInjector.NO_OP,
+                DictionaryCleanSnapshotPublisher.noOp());
     }
 
     /**
@@ -153,7 +158,7 @@ public final class DictionaryDdlService {
                                 TableDdlStorageService physical, Path tablesDirectory,
                                 DictionaryDdlFaultInjector faultInjector) {
         this(control, repository, cache, locks, physical, tablesDirectory,
-                TablePurgeBarrier.NONE, faultInjector);
+                TablePurgeBarrier.NONE, faultInjector, DictionaryCleanSnapshotPublisher.noOp());
     }
 
     /**
@@ -174,8 +179,32 @@ public final class DictionaryDdlService {
                                 TableDdlStorageService physical, Path tablesDirectory,
                                 TablePurgeBarrier purgeBarrier,
                                 DictionaryDdlFaultInjector faultInjector) {
+        this(control, repository, cache, locks, physical, tablesDirectory, purgeBarrier, faultInjector,
+                DictionaryCleanSnapshotPublisher.noOp());
+    }
+
+    /**
+     * 构造接入灾难恢复 clean snapshot fence 的生产 DDL 服务。
+     *
+     * @param control 字典 identity/version durable 分配器
+     * @param repository committed catalog 仓储
+     * @param cache metadata cache
+     * @param locks MDL 管理器
+     * @param physical 物理 DDL facade
+     * @param tablesDirectory 受控表空间目录
+     * @param purgeBarrier persistent history 表引用屏障
+     * @param faultInjector durable 边界故障接缝
+     * @param cleanSnapshotPublisher DDL 前 fence 与稳定终点 manifest publisher
+     */
+    public DictionaryDdlService(DictionaryControlStore control, PersistentDictionaryRepository repository,
+                                DictionaryObjectCache cache, MetadataLockManager locks,
+                                TableDdlStorageService physical, Path tablesDirectory,
+                                TablePurgeBarrier purgeBarrier,
+                                DictionaryDdlFaultInjector faultInjector,
+                                DictionaryCleanSnapshotPublisher cleanSnapshotPublisher) {
         if (control == null || repository == null || cache == null || locks == null || physical == null
-                || tablesDirectory == null || purgeBarrier == null || faultInjector == null) {
+                || tablesDirectory == null || purgeBarrier == null || faultInjector == null
+                || cleanSnapshotPublisher == null) {
             throw new DatabaseValidationException("dictionary DDL collaborators/path must not be null");
         }
         this.control = control;
@@ -187,9 +216,19 @@ public final class DictionaryDdlService {
         this.tablesDirectory = tablesDirectory.toAbsolutePath().normalize();
         this.faultInjector = faultInjector;
         this.sdi = new SerializedDictionaryInfoService(physical);
+        this.cleanSnapshotPublisher = cleanSnapshotPublisher;
     }
 
-    /** 创建 schema；X MDL 覆盖重复名称检查、ID/version 预留与 catalog publish。
+    /**
+     * 创建 schema；X MDL 覆盖重复名称检查、identity/version 预留、catalog 与 clean manifest 发布。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验调用参数并检查既有 manifest failure fence；失败时没有 identity 或 catalog 副作用。</li>
+     *     <li>取得 schema X MDL，在同一锁域内复核名称尚未存在。</li>
+     *     <li>durable 预留 schema/DDL/version，并由 dictionary transaction 先写 intent、再提交 schema catalog。</li>
+     *     <li>在 catalog 稳定后发布 clean manifest；失败建立后续 DDL fence，但不回滚已经 durable 的 schema。</li>
+     * </ol>
      *
      * @param owner 参与 {@code createSchema} 的稳定领域标识 {@code MdlOwnerId}；不得为 {@code null}，并须由对应值对象构造校验产生
      * @param name 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
@@ -201,12 +240,16 @@ public final class DictionaryDdlService {
      */
     public SchemaDefinition createSchema(MdlOwnerId owner, ObjectName name, int charsetId, int collationId,
                                          Duration timeout) {
+        // 1. manifest 已有失败必须早于 control reservation 和 MDL 等待被观察。
         validateOwnerTimeout(owner, timeout);
+        cleanSnapshotPublisher.assertAvailable();
         if (name == null || charsetId <= 0 || collationId <= 0) {
             throw new DatabaseValidationException("create schema name/charset/collation invalid");
         }
+        // 2. schema X 把名称检查与本次 catalog publish 串成单一 DDL 临界区。
         try (MdlTicket ignored = locks.acquire(new MdlRequest(owner, MdlKey.schema(name.canonicalName()),
                 MdlMode.EXCLUSIVE, MdlDuration.TRANSACTION), timeout)) {
+            // 3. control witness 与 catalog mutation intent 都早于对应权威文件提交点。
             DictionaryIdAllocation ids = control.reserve(new DictionaryIdRequest(1, 0, 0, 0, 1, 1));
             DictionaryVersion version = DictionaryVersion.of(ids.dictionaryVersion());
             SchemaDefinition schema = new SchemaDefinition(SchemaId.of(ids.firstSchemaId()), name,
@@ -217,6 +260,8 @@ public final class DictionaryDdlService {
             }
             log.info("created schema: name={} id={} ddlId={} version={}", name.canonicalName(),
                     schema.id().value(), ids.firstDdlId(), version.value());
+            // 4. schema 没有单表 SDI，只有 clean manifest 能保存其名称和默认字符语义。
+            cleanSnapshotPublisher.publish();
             return schema;
         }
     }
@@ -246,6 +291,7 @@ public final class DictionaryDdlService {
      */
     public TableDefinition createTable(MdlOwnerId owner, CreateTableCommand command, Duration timeout) {
         validateOwnerTimeout(owner, timeout);
+        cleanSnapshotPublisher.assertAvailable();
         if (command == null) {
             throw new DatabaseValidationException("create table command must not be null");
         }
@@ -316,6 +362,7 @@ public final class DictionaryDdlService {
             log.info("created table: name={} tableId={} space={} ddlId={} version={}",
                     command.name().canonicalKey(), tableId.value(), ids.firstSpaceId(), ids.firstDdlId(),
                     version.value());
+            cleanSnapshotPublisher.publish();
             return table;
         }
     }
@@ -353,6 +400,7 @@ public final class DictionaryDdlService {
                                                 CreateSecondaryIndexCommand command,
                                                 Duration timeout) {
         validateOwnerTimeout(owner, timeout);
+        cleanSnapshotPublisher.assertAvailable();
         if (command == null) {
             throw new DatabaseValidationException("create secondary index command must not be null");
         }
@@ -461,6 +509,7 @@ public final class DictionaryDdlService {
             log.info("created secondary index: table={} index={} indexId={} ddlId={} version={}",
                     name.canonicalKey(), newIndex.name().canonicalName(), newIndex.id().value(),
                     ddlId.value(), version.value());
+            cleanSnapshotPublisher.publish();
             return published;
         }
     }
@@ -494,6 +543,7 @@ public final class DictionaryDdlService {
                                               DropSecondaryIndexCommand command,
                                               Duration timeout) {
         validateOwnerTimeout(owner, timeout);
+        cleanSnapshotPublisher.assertAvailable();
         if (command == null) {
             throw new DatabaseValidationException("drop secondary index command must not be null");
         }
@@ -598,6 +648,7 @@ public final class DictionaryDdlService {
             log.info("dropped secondary index: table={} index={} indexId={} ddlId={} version={}",
                     name.canonicalKey(), removedIndex.name().canonicalName(),
                     removedIndex.id().value(), ddlId.value(), version.value());
+            cleanSnapshotPublisher.publish();
             return published;
         }
     }
@@ -627,6 +678,7 @@ public final class DictionaryDdlService {
      */
     public void dropTable(MdlOwnerId owner, QualifiedTableName name, Duration timeout) {
         validateOwnerTimeout(owner, timeout);
+        cleanSnapshotPublisher.assertAvailable();
         if (name == null) {
             throw new DatabaseValidationException("drop table name must not be null");
         }
@@ -688,6 +740,7 @@ public final class DictionaryDdlService {
             repository.ddlLog().transition(ddlId, DdlLogPhase.ENGINE_DONE, DdlLogPhase.COMMITTED);
             log.info("dropped table: name={} tableId={} ddlId={} version={}", name.canonicalKey(),
                     active.id().value(), ids.firstDdlId(), droppedVersion.value());
+            cleanSnapshotPublisher.publish();
         }
     }
 
@@ -711,6 +764,7 @@ public final class DictionaryDdlService {
     public void discardTablespace(MdlOwnerId owner, QualifiedTableName name, Path quarantine, Duration timeout) {
         // 1、校验表空间生命周期、页号、区段身份与容量边界，在共享或持久副作用前拒绝非法状态。
         validateOwnerTimeout(owner, timeout);
+        cleanSnapshotPublisher.assertAvailable();
         // 2、继续完成范围、身份与候选校验；通过后，按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，保持处理顺序与资源边界。
         if (name == null || quarantine == null) {
             throw new DatabaseValidationException("discard table name/quarantine must not be null");
@@ -751,6 +805,7 @@ public final class DictionaryDdlService {
             repository.ddlLog().transition(ddlId, DdlLogPhase.DICTIONARY_COMMITTED, DdlLogPhase.ENGINE_DONE);
             commitUpdate(discardedVersion, lifecycle(active, discardedVersion, TableState.DISCARDED));
             repository.ddlLog().transition(ddlId, DdlLogPhase.ENGINE_DONE, DdlLogPhase.COMMITTED);
+            cleanSnapshotPublisher.publish();
         }
     }
 
@@ -776,6 +831,7 @@ public final class DictionaryDdlService {
                                  TablespaceFileIdentity identity, Duration timeout) {
         // 1、校验表空间生命周期、页号、区段身份与容量边界，在共享或持久副作用前拒绝非法状态。
         validateOwnerTimeout(owner, timeout);
+        cleanSnapshotPublisher.assertAvailable();
         // 2、继续完成范围、身份与候选校验；通过后，按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，保持处理顺序与资源边界。
         if (name == null || source == null || identity == null) {
             throw new DatabaseValidationException("import table/source/identity must not be null");
@@ -812,6 +868,7 @@ public final class DictionaryDdlService {
             repository.ddlLog().transition(ddlId, DdlLogPhase.DICTIONARY_COMMITTED, DdlLogPhase.ENGINE_DONE);
             commitUpdate(activeVersion, lifecycle(discarded, activeVersion, TableState.ACTIVE));
             repository.ddlLog().transition(ddlId, DdlLogPhase.ENGINE_DONE, DdlLogPhase.COMMITTED);
+            cleanSnapshotPublisher.publish();
         }
     }
 

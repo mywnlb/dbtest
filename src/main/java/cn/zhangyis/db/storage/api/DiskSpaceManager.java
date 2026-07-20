@@ -249,8 +249,8 @@ public final class DiskSpaceManager {
      *     <li>先校验 MTR、空间标识、文件路径、初始容量与类型；失败发生在任何文件或页副作用之前。</li>
      *     <li>通过 PageStore 创建并零填充物理文件。该文件动作不受 MTR rollback 管理，后续初始化失败时由 DDL/recovery
      *     协调层关闭并清理受控命名文件。</li>
-     *     <li>在当前 MTR 中初始化 page0 FSP header，并按 GENERAL/UNDO 写入 NORMAL/ACTIVE lifecycle marker；
-     *     type 同时编码进 space flags，供重启时的 page0 loader 恢复类型和状态。</li>
+     *     <li>在当前 MTR 中初始化 page0 FSP header、page1 IBUF_BITMAP 和 page2 INODE 信封，并按
+     *     GENERAL/UNDO 写入 NORMAL/ACTIVE lifecycle marker；type 同时编码进 space flags，供重启时恢复。</li>
      *     <li>在 XDES 中保留包含固定管理页的 system extent0，防止普通 segment 把 page0/page2 等元数据页重新分配。</li>
      *     <li>直接依据建表参数发布 registry 快照，不读取尚未刷盘的 page0。该发布不等于持久提交，调用方仍须成功
      *     commit/flush 当前 MTR 后，才能把表空间暴露给普通上层访问。</li>
@@ -282,12 +282,21 @@ public final class DiskSpaceManager {
         // 2. 先建立零填充物理容量；该 FILE 动作不属于 MTR undo，后续失败由上层 DDL/recovery 负责清理。
         pageStore.create(spaceId, path, pageSize, initialSizePages);
 
-        // 3. 在同一 MTR 中写 page0 FSP header 与类型化 lifecycle，使逻辑容量、类型和初始状态可由 redo/page0 恢复。
+        // 3. 在同一 MTR 中写 page0 FSP/lifecycle，并初始化固定 page1/page2 信封；否则 inode 内容虽有
+        // checksum，却会保留零 spaceId/pageNo/type，离线 scrub 与 crash recovery 无法证明页面归属。
         SpaceHeaderSnapshot fresh = new SpaceHeaderSnapshot(spaceId, pageSize, TablespaceTypeFlags.encode(type),
                 initialSizePages, PageNo.of(0), 1L,
                 FlstBase.EMPTY, FlstBase.EMPTY, FlstBase.EMPTY,
                 PageNo.of(2), 0L, SERVER_VERSION, 1L);
         headerRepo.initialize(mtr, fresh);
+        PageGuard ibufPage = mtr.newPage(pool, PageId.of(spaceId, PageNo.of(1)),
+                PageLatchMode.EXCLUSIVE, PageType.IBUF_BITMAP);
+        PageEnvelope.writeHeader(ibufPage, new FilePageHeader(
+                spaceId, 1L, FilePageHeader.FIL_NULL, FilePageHeader.FIL_NULL, 0L, PageType.IBUF_BITMAP));
+        PageGuard inodePage = mtr.newPage(pool, PageId.of(spaceId, PageNo.of(2)),
+                PageLatchMode.EXCLUSIVE, PageType.INODE);
+        PageEnvelope.writeHeader(inodePage, new FilePageHeader(
+                spaceId, 2L, FilePageHeader.FIL_NULL, FilePageHeader.FIL_NULL, 0L, PageType.INODE));
         TablespaceState initialState = type == TablespaceType.UNDO
                 ? TablespaceState.ACTIVE : TablespaceState.NORMAL;
         if (type == TablespaceType.UNDO) {

@@ -4,6 +4,7 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.dd.ddl.DictionaryDdlService;
 import cn.zhangyis.db.dd.domain.MdlOwnerId;
 import cn.zhangyis.db.sql.binder.bound.BoundCreateIndex;
+import cn.zhangyis.db.sql.binder.bound.BoundDropIndex;
 import cn.zhangyis.db.sql.executor.storage.SqlDdlGateway;
 
 import java.time.Duration;
@@ -50,6 +51,23 @@ public final class DefaultSqlDdlGateway implements SqlDdlGateway {
             throw new DatabaseValidationException("SQL CREATE INDEX requires statement/positive timeout");
         }
         ddl.createSecondaryIndex(
+                MdlOwnerId.forDdlStatement(statementSequence.incrementAndGet()),
+                statement.command(), timeout);
+    }
+
+    /**
+     * 将 DROP INDEX bound command 交给使用独立 owner 的 DD coordinator。
+     *
+     * @param statement 已完成逻辑名称规范化、尚未持有 DD/物理资源的命令
+     * @param timeout statement 剩余正有界时间；MDL、history、pin、WAL 与 force 共用该预算
+     * @throws DatabaseValidationException 参数缺失或 timeout 非正时抛出，且不进入 DD
+     */
+    @Override
+    public void dropSecondaryIndex(BoundDropIndex statement, Duration timeout) {
+        if (statement == null || timeout == null || timeout.isZero() || timeout.isNegative()) {
+            throw new DatabaseValidationException("SQL DROP INDEX requires statement/positive timeout");
+        }
+        ddl.dropSecondaryIndex(
                 MdlOwnerId.forDdlStatement(statementSequence.incrementAndGet()),
                 statement.command(), timeout);
     }

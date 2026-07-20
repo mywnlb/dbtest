@@ -44,6 +44,7 @@ import cn.zhangyis.db.storage.api.ddl.TableStorageBinding;
 import cn.zhangyis.db.storage.api.tablespace.TablespaceFileIdentity;
 import cn.zhangyis.db.storage.api.ddl.SecondaryIndexBuildDescriptor;
 import cn.zhangyis.db.storage.api.ddl.SecondaryIndexBuildDuplicateKeyException;
+import cn.zhangyis.db.storage.api.ddl.SecondaryIndexDropDescriptor;
 import cn.zhangyis.db.storage.api.ddl.IndexStorageBinding;
 import lombok.extern.slf4j.Slf4j;
 
@@ -460,6 +461,143 @@ public final class DictionaryDdlService {
             log.info("created secondary index: table={} index={} indexId={} ddlId={} version={}",
                     name.canonicalKey(), newIndex.name().canonicalName(), newIndex.id().value(),
                     ddlId.value(), version.value());
+            return published;
+        }
+    }
+
+    /**
+     * 原子删除既有 ACTIVE 表的一个二级索引。v1 全程持 table MDL X，先提交不含索引的新 DD，再回收
+     * leaf/non-leaf segment；聚簇索引和 {@code IF EXISTS} 语义不在本入口支持。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>取得 schema IX/table X，在锁内重读 ACTIVE aggregate，按名称定位唯一二级索引及同 ordinal
+     *     物理 binding，并等待 purge history 与旧 metadata pin 排空。</li>
+     *     <li>预留 DDL/version 并写 DROP_INDEX PREPARED marker；随后把目标完整 binding 以 DROP action
+     *     写入 page3，建立 crash recovery 的精确资源所有权。</li>
+     *     <li>组装只删除一个逻辑/物理索引的新 ACTIVE aggregate，先写 SDI 再提交 DD；DD 是提交裁决点，
+     *     outcome 不确定时保留 descriptor，恢复按当前 DD 前滚或回滚。</li>
+     *     <li>补 DICTIONARY_COMMITTED 并发布 cache；此后旧索引已经逻辑不可达，才允许单 MTR 回收两个
+     *     segment 并清 descriptor。</li>
+     *     <li>物理收敛后写 ENGINE_DONE 与 COMMITTED；任一后置失败都保留可幂等恢复的 marker/新 DD。</li>
+     * </ol>
+     *
+     * @param owner 本次独立 DDL statement 的 MDL owner，不能复用用户事务 owner
+     * @param command 完整表名和目标索引逻辑名称；不存在目标必须报错
+     * @param timeout MDL、purge/pin、WAL 与文件 force 共用的正有界时限
+     * @return 不再包含目标 index definition/binding 的新 ACTIVE table aggregate
+     * @throws DatabaseValidationException owner/command/timeout 无效时抛出
+     * @throws DictionaryObjectNotFoundException schema、table 或目标索引不存在时抛出
+     * @throws DictionaryDdlException 目标是聚簇索引、binding 不一致或持久协作失败时抛出；调用方不得自行释放 segment
+     */
+    public TableDefinition dropSecondaryIndex(MdlOwnerId owner,
+                                              DropSecondaryIndexCommand command,
+                                              Duration timeout) {
+        validateOwnerTimeout(owner, timeout);
+        if (command == null) {
+            throw new DatabaseValidationException("drop secondary index command must not be null");
+        }
+        QualifiedTableName name = command.table();
+        try (MdlTicket schemaTicket = locks.acquire(new MdlRequest(owner,
+                MdlKey.schema(name.schema().canonicalName()), MdlMode.INTENTION_EXCLUSIVE,
+                MdlDuration.TRANSACTION), timeout);
+             MdlTicket tableTicket = locks.acquire(new MdlRequest(owner, MdlKey.table(name.canonicalKey()),
+                     MdlMode.EXCLUSIVE, MdlDuration.TRANSACTION), timeout)) {
+            // 1. MDL X 下重读名称与 binding，确保 Parser/Binder 的纯逻辑命令不会携带陈旧 index identity。
+            SchemaDefinition schema = repository.findSchema(name.schema()).orElseThrow(() ->
+                    new DictionaryObjectNotFoundException(
+                            "schema does not exist: " + name.schema().displayName()));
+            TableDefinition active = repository.findTable(schema.id(), name.table()).orElseThrow(() ->
+                    new DictionaryObjectNotFoundException(
+                            "table does not exist: " + name.canonicalKey()));
+            int indexOrdinal = -1;
+            for (int ordinal = 0; ordinal < active.indexes().size(); ordinal++) {
+                if (active.indexes().get(ordinal).name().equals(command.indexName())) {
+                    indexOrdinal = ordinal;
+                    break;
+                }
+            }
+            if (indexOrdinal < 0) {
+                throw new DictionaryObjectNotFoundException(
+                        "index does not exist: " + command.indexName().displayName());
+            }
+            IndexDefinition removedIndex = active.indexes().get(indexOrdinal);
+            if (removedIndex.clustered()) {
+                throw new DictionaryDdlException(
+                        "DROP INDEX cannot remove clustered primary index: "
+                                + removedIndex.name().displayName());
+            }
+            TableStorageBinding oldBinding = active.storageBinding().orElseThrow(() ->
+                    new DictionaryDdlException(
+                            "ACTIVE table has no physical binding: " + active.id().value()));
+            if (indexOrdinal >= oldBinding.indexes().size()
+                    || oldBinding.indexes().get(indexOrdinal).indexId() != removedIndex.id().value()) {
+                throw new DictionaryDdlException(
+                        "DROP INDEX logical/physical ordinal identity mismatch: index="
+                                + removedIndex.id().value());
+            }
+            IndexStorageBinding removedBinding = oldBinding.indexes().get(indexOrdinal);
+            purgeBarrier.awaitUnreferenced(active.id().value(), timeout);
+            if (!cache.awaitUnpinned(active.id(), timeout)) {
+                throw new DictionaryDdlException(
+                        "timed out waiting old dictionary pins before DROP INDEX: "
+                                + active.id().value());
+            }
+
+            // 2. PREPARED 固定 table/index/version identity；descriptor durable 前不得改变 DD 可达性。
+            DictionaryIdAllocation ids = control.reserve(
+                    new DictionaryIdRequest(0, 0, 0, 0, 1, 1));
+            DictionaryVersion version = DictionaryVersion.of(ids.dictionaryVersion());
+            DdlId ddlId = DdlId.of(ids.firstDdlId());
+            DdlLogRecord prepared = new DdlLogRecord(
+                    new DdlUndoMarker(ddlId.value(), version.value(), active.id().value()),
+                    removedIndex.id().value(), DdlLogOperation.DROP_INDEX, DdlLogPhase.PREPARED,
+                    oldBinding.spaceId(), oldBinding.path());
+            repository.ddlLog().prepare(prepared);
+            faultInjector.afterDropIndexPrepared(prepared);
+            SecondaryIndexDropDescriptor staged = physical.beginSecondaryIndexDrop(
+                    oldBinding, ddlId.value(), version.value(), removedBinding, timeout);
+            faultInjector.afterDropIndexStaged(staged);
+
+            // 3. 新 aggregate 精确删除同 ordinal 的 definition/binding；SDI 可先写，但 committed DD 是唯一裁决点。
+            List<IndexDefinition> indexes = new ArrayList<>(active.indexes());
+            indexes.remove(indexOrdinal);
+            List<IndexStorageBinding> bindings = new ArrayList<>(oldBinding.indexes());
+            bindings.remove(indexOrdinal);
+            TableStorageBinding newBinding = new TableStorageBinding(
+                    oldBinding.tableId(), oldBinding.spaceId(), oldBinding.path(),
+                    oldBinding.rowFormatVersion(), bindings, oldBinding.lobSegment());
+            TableDefinition published = new TableDefinition(
+                    active.id(), active.schemaId(), active.name(), version, TableState.ACTIVE,
+                    active.columns(), indexes, Optional.of(newBinding));
+            sdi.write(published, timeout);
+            try {
+                commitUpdate(version, published);
+            } catch (RuntimeException publishFailure) {
+                log.warn("DROP INDEX DD publish outcome is uncertain; retaining drop descriptor: "
+                                + "tableId={} indexId={} ddlId={}",
+                        active.id().value(), removedIndex.id().value(), ddlId.value(), publishFailure);
+                throw publishFailure;
+            }
+            // 此接缝覆盖“新 DD durable、marker 仍 PREPARED”的关键恢复窗口。
+            faultInjector.afterDropIndexDictionaryPublished(published);
+
+            // 4. marker/cache 都不得早于 DD；segment free 则严格晚于新 cache 发布。
+            repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.PREPARED, DdlLogPhase.DICTIONARY_COMMITTED);
+            faultInjector.afterDropIndexDictionaryCommitted(published);
+            cache.publishTable(published);
+            physical.finishSecondaryIndexDrop(newBinding, staged, timeout);
+
+            // 5. descriptor 与两个 segment 已在同一 MTR 收敛，最后只需补审计阶段。
+            DdlLogRecord engineDone = repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.DICTIONARY_COMMITTED, DdlLogPhase.ENGINE_DONE);
+            faultInjector.afterDropIndexEngineDone(engineDone);
+            repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.ENGINE_DONE, DdlLogPhase.COMMITTED);
+            log.info("dropped secondary index: table={} index={} indexId={} ddlId={} version={}",
+                    name.canonicalKey(), removedIndex.name().canonicalName(),
+                    removedIndex.id().value(), ddlId.value(), version.value());
             return published;
         }
     }

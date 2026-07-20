@@ -90,7 +90,8 @@ public final class DefaultSqlParser {
             // 2、继续完成范围、身份与候选校验；通过后，按稳定字段或 token 顺序推进游标并调用对应编解码分支，保持处理顺序与资源边界。
             if (keyword("INSERT")) statement = insert();
             else if (keyword("CREATE")) statement = createIndex();
-            else if (keyword("ALTER")) statement = alterAddIndex();
+            else if (keyword("DROP")) statement = dropIndex();
+            else if (keyword("ALTER")) statement = alterIndex();
             else if (keyword("UPDATE")) statement = update();
             else if (keyword("DELETE")) statement = delete();
             else if (keyword("SELECT")) statement = select();
@@ -104,7 +105,7 @@ public final class DefaultSqlParser {
             } else if (keyword("ROLLBACK")) {
                 take(); statement = new TransactionControlNode(TransactionControlNode.Kind.ROLLBACK);
             } else {
-                throw syntax("expected INSERT, CREATE, ALTER, UPDATE, DELETE, SELECT, SET, BEGIN, START, COMMIT or ROLLBACK",
+                throw syntax("expected INSERT, CREATE, DROP, ALTER, UPDATE, DELETE, SELECT, SET, BEGIN, START, COMMIT or ROLLBACK",
                         current());
             }
             // 3、在中间分支复核阶段性结果；满足条件后，交叉校验聚合计数、类型、校验值和剩余输入，并维持领域不变量。
@@ -158,20 +159,46 @@ public final class DefaultSqlParser {
             return new CreateIndexStatementNode(table, indexName, unique, indexKeyParts());
         }
 
-        /** v1 ALTER 只接受 TABLE ... ADD [UNIQUE] INDEX，并与独立语法产生同一 AST 类型。 */
-        private CreateIndexStatementNode alterAddIndex() {
+        /**
+         * 解析独立 DROP INDEX。v1 不接受 IF EXISTS，避免不存在目标时静默吞掉 metadata 错误。
+         *
+         * @return 与 ALTER TABLE DROP INDEX 共用的纯语法 AST
+         */
+        private DropIndexStatementNode dropIndex() {
+            requireKeyword("DROP");
+            requireKeyword("INDEX");
+            IdentifierNode indexName = identifier();
+            requireKeyword("ON");
+            QualifiedNameNode table = qualifiedName();
+            return new DropIndexStatementNode(table, indexName);
+        }
+
+        /**
+         * v1 ALTER 只接受 ADD/DROP INDEX；两种分支分别归一为独立 CREATE/DROP 使用的 AST 类型。
+         *
+         * @return 规范化的索引 DDL AST；不支持的 ALTER action 以语法异常拒绝
+         */
+        private StatementNode alterIndex() {
             requireKeyword("ALTER");
             requireKeyword("TABLE");
             QualifiedNameNode table = qualifiedName();
-            requireKeyword("ADD");
-            boolean unique = false;
-            if (keyword("UNIQUE")) {
+            if (keyword("ADD")) {
                 take();
-                unique = true;
+                boolean unique = false;
+                if (keyword("UNIQUE")) {
+                    take();
+                    unique = true;
+                }
+                requireKeyword("INDEX");
+                IdentifierNode indexName = identifier();
+                return new CreateIndexStatementNode(table, indexName, unique, indexKeyParts());
             }
-            requireKeyword("INDEX");
-            IdentifierNode indexName = identifier();
-            return new CreateIndexStatementNode(table, indexName, unique, indexKeyParts());
+            if (keyword("DROP")) {
+                take();
+                requireKeyword("INDEX");
+                return new DropIndexStatementNode(table, identifier());
+            }
+            throw syntax("expected ADD or DROP INDEX after ALTER TABLE", current());
         }
 
         /** key part v1 仅允许完整列与可选 ASC/DESC，不把前缀长度或表达式静默吞掉。 */

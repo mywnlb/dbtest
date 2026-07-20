@@ -119,6 +119,57 @@ class DatabaseEngineSessionIntegrationTest {
         }
     }
 
+    /**
+     * 两种 SQL DROP INDEX 语法必须共享原子删除链；autocommit=0 在 DROP 前提交旧事务并在结束后恢复空事务，
+     * 删除只改变访问路径，不丢失聚簇行，且重启后 DD 不得复活已回收索引。
+     */
+    @Test
+    void sqlDropsSecondaryIndexesWithImplicitCommitAndKeepsRowsAcrossRestart() {
+        EngineConfig config = config();
+        try (DatabaseEngine database = new DatabaseEngine(config)) {
+            database.open();
+            createIndexBuildTable(database);
+            try (var session = database.openSession(options(false))) {
+                session.execute("INSERT INTO index_docs (id, category) VALUES (1, 7)");
+                session.execute("INSERT INTO index_docs (id, category) VALUES (2, 8)");
+                session.execute("CREATE INDEX idx_category ON index_docs (category)");
+
+                assertInstanceOf(CommandResult.class,
+                        session.execute("DROP INDEX idx_category ON index_docs"));
+                assertTrue(session.snapshot().transactionActive(),
+                        "autocommit=0 的 DROP INDEX 后必须恢复新的 implicit transaction");
+                QueryResult first = assertInstanceOf(QueryResult.class,
+                        session.execute("SELECT category FROM index_docs WHERE id=1"));
+                assertEquals(1, first.rows().size(),
+                        "DROP 只移除访问路径，DDL 前 implicit commit 的聚簇行必须保留");
+
+                session.execute("ALTER TABLE index_docs ADD INDEX idx_category (category DESC)");
+                assertInstanceOf(CommandResult.class,
+                        session.execute("ALTER TABLE index_docs DROP INDEX idx_category"));
+            }
+            try (var lease = database.dictionary().openTable(
+                    MdlOwnerId.of(903), QualifiedTableName.of("app", "index_docs"),
+                    cn.zhangyis.db.dd.service.TableAccessIntent.READ, Duration.ofSeconds(2))) {
+                assertEquals(List.of("primary"), lease.table().indexes().stream()
+                        .map(index -> index.name().canonicalName()).toList());
+            }
+        }
+
+        try (DatabaseEngine reopened = new DatabaseEngine(config)) {
+            reopened.open();
+            try (var reader = reopened.openSession(options(true))) {
+                QueryResult result = assertInstanceOf(QueryResult.class,
+                        reader.execute("SELECT category FROM index_docs WHERE id=2"));
+                assertEquals(1, result.rows().size());
+            }
+            try (var lease = reopened.dictionary().openTable(
+                    MdlOwnerId.of(904), QualifiedTableName.of("app", "index_docs"),
+                    cn.zhangyis.db.dd.service.TableAccessIntent.READ, Duration.ofSeconds(2))) {
+                assertEquals(1, lease.table().indexes().size());
+            }
+        }
+    }
+
     /** autocommit 点 UPDATE/DELETE 从公开 SQL 维护 secondary，并完成 external LOB replacement。 */
     @Test
     void autocommitUpdateAndDeleteMaintainSecondaryAndReplacementLob() {

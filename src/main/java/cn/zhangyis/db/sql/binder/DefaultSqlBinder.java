@@ -12,6 +12,8 @@ import cn.zhangyis.db.sql.binder.bound.PointAccessKind;
 import cn.zhangyis.db.sql.binder.bound.SelectLockMode;
 import cn.zhangyis.db.sql.binder.bound.BoundStatement;
 import cn.zhangyis.db.sql.binder.bound.BoundCreateIndex;
+import cn.zhangyis.db.sql.binder.bound.BoundDropIndex;
+import cn.zhangyis.db.dd.ddl.DropSecondaryIndexCommand;
 import cn.zhangyis.db.sql.binder.exception.SqlBindingException;
 import cn.zhangyis.db.sql.binder.exception.UnknownColumnException;
 import cn.zhangyis.db.sql.binder.exception.UnsupportedSqlShapeException;
@@ -119,6 +121,38 @@ public final class DefaultSqlBinder {
         return new BoundCreateIndex(new CreateSecondaryIndexCommand(
                 table, new CreateIndexSpec(
                 ObjectName.of(statement.indexName().value()), statement.unique(), false, parts)));
+    }
+
+    /**
+     * 把 DROP INDEX 纯语法绑定为不持有 DD lease 的稳定命令。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 AST 与 current schema 容器，保证纯输入错误早于 Session implicit commit。</li>
+     *     <li>按 catalog/schema/table 规则补全限定名，不打开 table metadata 或选择物理索引。</li>
+     *     <li>规范化索引标识符，形成只携带逻辑名称的 DD command。</li>
+     *     <li>返回不可变 bound 对象；目标存在性和 clustered 属性留给 table MDL X 下的 coordinator 重验。</li>
+     * </ol>
+     *
+     * @param statement Parser 已归一的 DROP INDEX / ALTER DROP INDEX AST
+     * @param currentSchema Session 可选当前 schema；单段表名必须依赖它
+     * @return 不持 DD lease、可在 implicit commit 后交给 DDL gateway 的命令
+     * @throws SqlBindingException 表名无法限定时抛出，且不会触发事务提交
+     * @throws DatabaseValidationException statement/currentSchema 容器缺失时抛出
+     */
+    public BoundDropIndex bindDdl(DropIndexStatementNode statement,
+                                  Optional<ObjectName> currentSchema) {
+        // 1、输入容器校验不访问 DD，失败不会改变 Session transaction。
+        if (statement == null || currentSchema == null) {
+            throw new DatabaseValidationException("DROP INDEX binding statement/current schema must not be null");
+        }
+        // 2、沿 CREATE INDEX 共用的限定名规则补全 catalog/schema。
+        QualifiedTableName table = qualify(statement.table(), currentSchema);
+        // 3、ObjectName 负责稳定大小写规范化；此处不猜测 IndexId。
+        DropSecondaryIndexCommand command = new DropSecondaryIndexCommand(
+                table, ObjectName.of(statement.indexName().value()));
+        // 4、返回纯命令，DD coordinator 后续在 MDL X 下重读 ACTIVE aggregate。
+        return new BoundDropIndex(command);
     }
 
     /**

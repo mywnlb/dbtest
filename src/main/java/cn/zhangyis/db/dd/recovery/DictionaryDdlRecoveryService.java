@@ -19,6 +19,7 @@ import cn.zhangyis.db.dd.tx.DictionaryTransaction;
 import cn.zhangyis.db.storage.api.ddl.TableDdlStorageService;
 import cn.zhangyis.db.storage.api.TablePurgeBarrier;
 import cn.zhangyis.db.storage.api.ddl.SecondaryIndexBuildDescriptor;
+import cn.zhangyis.db.storage.api.ddl.SecondaryIndexDropDescriptor;
 import cn.zhangyis.db.storage.api.ddl.IndexStorageBinding;
 import cn.zhangyis.db.storage.api.tablespace.TablespaceFileIdentity;
 import lombok.extern.slf4j.Slf4j;
@@ -182,6 +183,7 @@ public final class DictionaryDdlRecoveryService {
         switch (record.operation()) {
             case CREATE_TABLE -> recoverCreate(record);
             case CREATE_INDEX -> recoverCreateIndex(record, timeout);
+            case DROP_INDEX -> recoverDropIndex(record, timeout);
             case DROP_TABLE -> recoverDrop(record, timeout);
             case DISCARD_TABLESPACE -> recoverDiscard(record, timeout);
             case IMPORT_TABLESPACE -> recoverImport(record, timeout);
@@ -390,6 +392,153 @@ public final class DictionaryDdlRecoveryService {
         repository.ddlLog().transition(
                 ddlId, DdlLogPhase.DICTIONARY_COMMITTED, DdlLogPhase.COMMITTED);
         log.info("finished CREATE INDEX during recovery: table={} index={} ddlId={}",
+                tableId.value(), record.secondaryObjectId(), ddlId.value());
+    }
+
+    /**
+     * 恢复 DROP INDEX：旧 DD 仍含目标时只回滚 descriptor，新 DD 已删除目标时完成 segment 回收。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取 marker 对应 ACTIVE table，校验 path/space，并按 secondary id 同时定位当前逻辑定义与物理 binding。</li>
+     *     <li>读取可选 DROP descriptor，与 marker 的 ddl/version/table/index identity 交叉校验；旧 DD 存在目标时
+     *     还必须精确等于其 committed binding。</li>
+     *     <li>旧 DD 仍含目标只接受 PREPARED：有 descriptor 就只清 footer，不释放 segment，随后写 ROLLED_BACK。</li>
+     *     <li>目标已从精确新版本 DD 消失时接受 PREPARED/DICTIONARY_COMMITTED/ENGINE_DONE；PREPARED 覆盖
+     *     “DD durable、phase append 未完成”窗口，先补字典阶段再发布 cache 和完成物理回收。</li>
+     *     <li>descriptor 已随 segment 原子清除时跳过物理动作，补 ENGINE_DONE/COMMITTED；任何不可解释组合阻止 OPEN。</li>
+     * </ol>
+     *
+     * @param record 非终态 DROP_INDEX marker
+     * @param timeout footer rollback 或 segment finish 的正有界持久化时限
+     * @throws DictionaryRecoveryException DD/marker/footer/binding/phase 组合无法安全裁决时抛出
+     */
+    private void recoverDropIndex(DdlLogRecord record, Duration timeout) {
+        // 1. DROP INDEX 不改变 table/space/path；当前 aggregate 必须仍是同一 ACTIVE 物理表。
+        checkedMarkerPath(record);
+        TableId tableId = TableId.of(record.marker().affectedObjectId());
+        TableDefinition table = repository.findTableForRecovery(tableId).orElseThrow(() ->
+                new DictionaryRecoveryException("DROP INDEX marker target table is absent: ddl="
+                        + record.marker().ddlOperationId() + " table=" + tableId.value()));
+        if (table.state() != TableState.ACTIVE) {
+            throw new DictionaryRecoveryException("DROP INDEX target table is not ACTIVE: table="
+                    + tableId.value() + " state=" + table.state());
+        }
+        validateBinding(table, record);
+        var tableBinding = table.storageBinding().orElseThrow();
+        var logicalIndex = table.indexes().stream()
+                .filter(index -> index.id().value() == record.secondaryObjectId()).findFirst();
+        var physicalIndex = tableBinding.indexes().stream()
+                .filter(index -> index.indexId() == record.secondaryObjectId()).findFirst();
+        if (logicalIndex.isPresent() != physicalIndex.isPresent()) {
+            throw new DictionaryRecoveryException(
+                    "DROP INDEX logical/physical binding presence mismatch: index="
+                            + record.secondaryObjectId());
+        }
+        if (logicalIndex.isPresent() && logicalIndex.orElseThrow().clustered()) {
+            throw new DictionaryRecoveryException(
+                    "DROP INDEX marker targets clustered index: " + record.secondaryObjectId());
+        }
+
+        // 2. descriptor 只授予当前 marker 处理精确 segment 的权限，任何 identity 错配都不得继续启动。
+        Optional<SecondaryIndexDropDescriptor> descriptor;
+        try {
+            descriptor = physical.readSecondaryIndexDrop(tableBinding);
+        } catch (RuntimeException failure) {
+            throw new DictionaryRecoveryException(
+                    "read DROP INDEX descriptor failed: table=" + tableId.value(), failure);
+        }
+        if (descriptor.isPresent()) {
+            SecondaryIndexDropDescriptor staged = descriptor.orElseThrow();
+            if (staged.ddlOperationId() != record.marker().ddlOperationId()
+                    || staged.dictionaryVersion() != record.marker().dictionaryVersion()
+                    || staged.tableId() != tableId.value()
+                    || staged.indexBinding().indexId() != record.secondaryObjectId()) {
+                throw new DictionaryRecoveryException(
+                        "DROP INDEX marker/descriptor identity mismatch: ddl="
+                                + record.marker().ddlOperationId());
+            }
+        }
+
+        DdlId ddlId = DdlId.of(record.marker().ddlOperationId());
+        if (logicalIndex.isPresent()) {
+            // 3. 旧 DD 是未越过提交点的权威证据；rollback 只能清 descriptor，索引必须继续可达。
+            if (record.phase() != DdlLogPhase.PREPARED
+                    || table.version().value() >= record.marker().dictionaryVersion()) {
+                throw new DictionaryRecoveryException(
+                        "uncommitted DROP INDEX has impossible table version/phase: ddl="
+                                + ddlId.value());
+            }
+            if (descriptor.isPresent()
+                    && !descriptor.orElseThrow().indexBinding().equals(physicalIndex.orElseThrow())) {
+                throw new DictionaryRecoveryException(
+                        "DROP INDEX descriptor differs from committed old binding: ddl="
+                                + ddlId.value());
+            }
+            if (descriptor.isPresent()) {
+                try {
+                    physical.rollbackSecondaryIndexDrop(
+                            tableBinding, descriptor.orElseThrow(), timeout);
+                } catch (RuntimeException failure) {
+                    throw new DictionaryRecoveryException(
+                            "rollback DROP INDEX descriptor failed: ddl=" + ddlId.value(), failure);
+                }
+            }
+            repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.PREPARED, DdlLogPhase.ROLLED_BACK);
+            log.info("rolled back DROP INDEX during recovery: table={} index={} ddlId={}",
+                    tableId.value(), record.secondaryObjectId(), ddlId.value());
+            return;
+        }
+
+        // 4. 目标缺失只有在 table 精确进入 marker version 时才证明 DD commit；PREPARED 允许 marker append 丢响应窗口。
+        if (table.version().value() != record.marker().dictionaryVersion()) {
+            throw new DictionaryRecoveryException(
+                    "committed DROP INDEX dictionary version mismatch: ddl=" + ddlId.value()
+                            + " tableVersion=" + table.version().value());
+        }
+        DdlLogPhase phase = record.phase();
+        if (phase == DdlLogPhase.PREPARED) {
+            if (descriptor.isEmpty()) {
+                throw new DictionaryRecoveryException(
+                        "committed DROP INDEX PREPARED marker has no physical descriptor: ddl="
+                                + ddlId.value());
+            }
+            repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.PREPARED, DdlLogPhase.DICTIONARY_COMMITTED);
+            phase = DdlLogPhase.DICTIONARY_COMMITTED;
+        }
+        if (phase != DdlLogPhase.DICTIONARY_COMMITTED && phase != DdlLogPhase.ENGINE_DONE) {
+            throw new DictionaryRecoveryException(
+                    "committed DROP INDEX has unsupported phase: ddl=" + ddlId.value()
+                            + " phase=" + phase);
+        }
+        cache.publishTable(table);
+        if (phase == DdlLogPhase.ENGINE_DONE) {
+            if (descriptor.isPresent()) {
+                throw new DictionaryRecoveryException(
+                        "DROP INDEX ENGINE_DONE still owns a physical descriptor: ddl="
+                                + ddlId.value());
+            }
+        } else {
+            // descriptor 为空表示 segment/footer 原子 MTR 已完成、仅 ENGINE_DONE append 尚未发生。
+            if (descriptor.isPresent()) {
+                try {
+                    physical.finishSecondaryIndexDrop(
+                            tableBinding, descriptor.orElseThrow(), timeout);
+                } catch (RuntimeException failure) {
+                    throw new DictionaryRecoveryException(
+                            "finish DROP INDEX physical reclaim failed: ddl=" + ddlId.value(), failure);
+                }
+            }
+            repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.DICTIONARY_COMMITTED, DdlLogPhase.ENGINE_DONE);
+        }
+
+        // 5. terminal marker 晚于 segment/footer 收敛；重复启动只会从 ENGINE_DONE 补这一条 transition。
+        repository.ddlLog().transition(
+                ddlId, DdlLogPhase.ENGINE_DONE, DdlLogPhase.COMMITTED);
+        log.info("finished DROP INDEX during recovery: table={} index={} ddlId={}",
                 tableId.value(), record.secondaryObjectId(), ddlId.value());
     }
 

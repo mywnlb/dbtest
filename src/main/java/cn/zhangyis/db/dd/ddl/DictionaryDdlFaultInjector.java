@@ -1,6 +1,7 @@
 package cn.zhangyis.db.dd.ddl;
 
 import cn.zhangyis.db.dd.domain.TableDefinition;
+import cn.zhangyis.db.storage.api.ddl.SecondaryIndexDropDescriptor;
 
 /**
  * 只用于确定性崩溃点测试；生产恒用 NO_OP，不参与正常 DDL 决策。
@@ -65,6 +66,46 @@ public interface DictionaryDdlFaultInjector {
      * @param active 已包含新 index definition/binding 的 committed 表版本
      */
     default void afterCreateIndexDictionaryCommitted(TableDefinition active) {
+    }
+
+    /**
+     * DROP INDEX PREPARED marker 已 durable、尚未写 page3 DROP descriptor。
+     *
+     * @param prepared 同时携带 table 与待删除 index identity 的 marker
+     */
+    default void afterDropIndexPrepared(DdlLogRecord prepared) {
+    }
+
+    /**
+     * DROP descriptor 已 durable、旧 DD 仍引用目标索引的崩溃点。
+     *
+     * @param descriptor 可由恢复 exact-CAS 回滚、但此时禁止释放 segment 的物理所有权
+     */
+    default void afterDropIndexStaged(SecondaryIndexDropDescriptor descriptor) {
+    }
+
+    /**
+     * 不含目标索引的新 DD 已 durable，但 marker 仍可能停在 PREPARED 的崩溃点。
+     *
+     * @param active 新字典版本的 ACTIVE table aggregate
+     */
+    default void afterDropIndexDictionaryPublished(TableDefinition active) {
+    }
+
+    /**
+     * DROP INDEX DICTIONARY_COMMITTED marker 已 durable、尚未回收 segment。
+     *
+     * @param active 不再包含目标索引的 committed table aggregate
+     */
+    default void afterDropIndexDictionaryCommitted(TableDefinition active) {
+    }
+
+    /**
+     * 两个索引 segment 与 descriptor 已共同回收、ENGINE_DONE marker 已 durable。
+     *
+     * @param engineDone 等待 terminal COMMITTED 的 DROP_INDEX marker
+     */
+    default void afterDropIndexEngineDone(DdlLogRecord engineDone) {
     }
 
     /**

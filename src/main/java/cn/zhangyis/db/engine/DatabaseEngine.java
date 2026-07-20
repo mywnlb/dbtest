@@ -169,8 +169,10 @@ public final class DatabaseEngine implements AutoCloseable {
     }
 
     /**
-     * 启动顺序：打开 DD catalog/control → 从 committed binding discovery → StorageEngine recovery → 构造 facade
-     * → 续作 DROP_PENDING/清 orphan → 发布 OPEN。任一失败都关闭已创建资源并保持 FAILED。
+     * 启动顺序：catalog-loss 准入 → 打开 DD catalog/control → 从 committed binding discovery
+     * → StorageEngine recovery → 构造 facade → 续作 DROP_PENDING/清 orphan → 发布 OPEN。
+     * catalog 缺失或为空但存在任一持久证据时，准入会在创建空 catalog 和 orphan cleanup 前 fail-closed；
+     * 任一失败都关闭已创建资源并保持 FAILED。
      *
      * @throws DatabaseRuntimeException 可恢复的数据库运行期协作失败时抛出；调用方应依据当前事务状态选择回滚、重试或关闭资源
      */
@@ -186,7 +188,8 @@ public final class DatabaseEngine implements AutoCloseable {
                 Path catalogPath = baseConfig.baseDir().resolve("mysql.ibd");
                 Path controlPath = baseConfig.baseDir().resolve("mysql.dd.ctrl");
                 Path tablesDirectory = baseConfig.baseDir().resolve("tables");
-                catalogStore = FileInternalCatalogStore.openOrCreate(catalogPath);
+                catalogStore = CatalogBootstrapAdmission.openCatalog(
+                        baseConfig, catalogPath, controlPath, tablesDirectory);
                 controlStore = DictionaryControlStore.openOrCreate(controlPath, DICTIONARY_SPACE_ID,
                         FIRST_USER_SPACE_ID);
                 repository = new PersistentDictionaryRepository(catalogStore);

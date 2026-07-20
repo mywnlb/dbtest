@@ -8,6 +8,7 @@ import cn.zhangyis.db.sql.parser.ast.UpdateStatementNode;
 import cn.zhangyis.db.sql.parser.ast.DeleteStatementNode;
 import cn.zhangyis.db.sql.parser.ast.SelectLockingClause;
 import cn.zhangyis.db.sql.parser.ast.CreateIndexStatementNode;
+import cn.zhangyis.db.sql.parser.ast.DropIndexStatementNode;
 import cn.zhangyis.db.sql.parser.ast.IndexKeyOrderNode;
 import cn.zhangyis.db.sql.parser.exception.SqlSyntaxException;
 import org.junit.jupiter.api.Test;
@@ -86,6 +87,21 @@ class DefaultSqlParserTest {
                 alter.keyParts().stream().map(part -> part.column().value()).toList());
     }
 
+    /** 独立 DROP INDEX 与 ALTER TABLE DROP INDEX 必须归一为同一个 AST，避免两条 DDL 链产生不同恢复语义。 */
+    @Test
+    void parsesDropIndexAndAlterTableDropIndexIntoSameAst() {
+        DropIndexStatementNode drop = assertInstanceOf(
+                DropIndexStatementNode.class,
+                parser.parse("DROP INDEX idx_status ON app.orders"));
+        DropIndexStatementNode alter = assertInstanceOf(
+                DropIndexStatementNode.class,
+                parser.parse("ALTER TABLE app.orders DROP INDEX idx_status"));
+
+        assertEquals(drop.table().parts().stream().map(part -> part.value()).toList(),
+                alter.table().parts().stream().map(part -> part.value()).toList());
+        assertEquals(drop.indexName().value(), alter.indexName().value());
+    }
+
     /** locking clause 是 SELECT 的尾部语义，不得被当作普通标识符或 WHERE 谓词吞掉。 */
     @Test
     void parsesSelectLockingClausesAndKeepsConsistentReadDefault() {
@@ -115,7 +131,9 @@ class DefaultSqlParserTest {
                 "SELECT * FROM t WHERE id=1 FOR", "SELECT * FROM t WHERE id=1 FOR DELETE",
                 "SELECT * FROM t WHERE id=1 FOR SHARE FOR UPDATE"
                 , "CREATE INDEX idx ON t (id(4))", "ALTER TABLE t ADD COLUMN c INT",
-                "CREATE FULLTEXT INDEX ft ON t (body)", "CREATE INDEX idx ON t ()"
+                "CREATE FULLTEXT INDEX ft ON t (body)", "CREATE INDEX idx ON t ()",
+                "DROP INDEX IF EXISTS idx ON t", "DROP INDEX idx t",
+                "ALTER TABLE t DROP PRIMARY KEY", "ALTER TABLE t DROP INDEX idx, DROP INDEX idx2"
         };
         for (String sql : invalid) {
             assertThrows(SqlSyntaxException.class, () -> parser.parse(sql), sql);

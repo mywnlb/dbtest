@@ -12,6 +12,7 @@ import cn.zhangyis.db.storage.engine.StorageEngine;
 import cn.zhangyis.db.storage.fil.state.TablespaceState;
 import cn.zhangyis.db.storage.fsp.segment.SegmentPurpose;
 import cn.zhangyis.db.storage.fsp.lifecycle.TablespaceLifecycleRawCodec;
+import cn.zhangyis.db.storage.fsp.exception.FspMetadataException;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.page.PageEnvelopeLayout;
 import cn.zhangyis.db.storage.page.PageType;
@@ -161,6 +162,89 @@ class TableDdlStorageServiceTest {
 
             engine.tableDdlStorageService().clearSecondaryIndexBuild(table, staged, Duration.ofSeconds(5));
             assertTrue(engine.tableDdlStorageService().readSecondaryIndexBuild(table).isEmpty());
+        } finally {
+            engine.close();
+        }
+    }
+
+    /**
+     * DROP INDEX 在字典提交前只持久化 descriptor；若上层仍以旧 DD 裁决回滚，必须只清 footer，
+     * 原 root 与两个 segment 继续有效。
+     */
+    @Test
+    void rollsBackSecondaryIndexDropWithoutReclaimingReferencedSegments() {
+        StorageEngine engine = new StorageEngine(config());
+        engine.open();
+        Path tableFile = directory.resolve("index_drop_rollback_1032.ibd");
+        try {
+            StorageTableDefinition definition = twoIndexDefinition(
+                    12, SpaceId.of(1032), tableFile, 51, 52);
+            TableStorageBinding table = engine.tableDdlStorageService().createTable(definition);
+            IndexStorageBinding secondary = table.indexes().get(1);
+
+            SecondaryIndexDropDescriptor staged =
+                    engine.tableDdlStorageService().beginSecondaryIndexDrop(
+                            table, 71, 15, secondary, Duration.ofSeconds(5));
+
+            assertEquals(Optional.of(staged),
+                    engine.tableDdlStorageService().readSecondaryIndexDrop(table));
+            engine.tableDdlStorageService().rollbackSecondaryIndexDrop(
+                    table, staged, Duration.ofSeconds(5));
+
+            assertTrue(engine.tableDdlStorageService().readSecondaryIndexDrop(table).isEmpty());
+            MiniTransaction read = engine.miniTransactionManager().beginReadOnly();
+            assertEquals(secondary.indexId(), engine.indexPageAccess().openIndexPage(
+                    read, secondary.rootPageId(), PageLatchMode.SHARED).header().indexId());
+            engine.miniTransactionManager().commit(read);
+            MiniTransaction readLeaf = engine.miniTransactionManager().beginReadOnly();
+            engine.diskSpaceManager().requireSegmentPurposeForWrite(
+                    readLeaf, secondary.leafSegment(), SegmentPurpose.INDEX_LEAF);
+            engine.miniTransactionManager().commit(readLeaf);
+            MiniTransaction readNonLeaf = engine.miniTransactionManager().beginReadOnly();
+            engine.diskSpaceManager().requireSegmentPurposeForWrite(
+                    readNonLeaf, secondary.nonLeafSegment(), SegmentPurpose.INDEX_NON_LEAF);
+            engine.miniTransactionManager().commit(readNonLeaf);
+        } finally {
+            engine.close();
+        }
+    }
+
+    /**
+     * 新 DD 已移除目标索引后，finish 必须在同一 MTR 回收 leaf/non-leaf segment 并清 footer；
+     * 旧 segment handle 随后必须因 inode identity 消失而 fail-closed。
+     */
+    @Test
+    void finishesSecondaryIndexDropByReclaimingBothSegmentsAndDescriptor() {
+        StorageEngine engine = new StorageEngine(config());
+        engine.open();
+        Path tableFile = directory.resolve("index_drop_finish_1033.ibd");
+        try {
+            StorageTableDefinition definition = twoIndexDefinition(
+                    13, SpaceId.of(1033), tableFile, 61, 62);
+            TableStorageBinding oldBinding = engine.tableDdlStorageService().createTable(definition);
+            IndexStorageBinding secondary = oldBinding.indexes().get(1);
+            SecondaryIndexDropDescriptor staged =
+                    engine.tableDdlStorageService().beginSecondaryIndexDrop(
+                            oldBinding, 81, 16, secondary, Duration.ofSeconds(5));
+            TableStorageBinding newBinding = new TableStorageBinding(
+                    oldBinding.tableId(), oldBinding.spaceId(), oldBinding.path(),
+                    oldBinding.rowFormatVersion(), List.of(oldBinding.indexes().getFirst()),
+                    oldBinding.lobSegment());
+
+            engine.tableDdlStorageService().finishSecondaryIndexDrop(
+                    newBinding, staged, Duration.ofSeconds(5));
+
+            assertTrue(engine.tableDdlStorageService().readSecondaryIndexDrop(newBinding).isEmpty());
+            MiniTransaction readLeaf = engine.miniTransactionManager().beginReadOnly();
+            assertThrows(FspMetadataException.class, () ->
+                    engine.diskSpaceManager().inspectDropSegmentPlan(
+                            readLeaf, secondary.leafSegment()));
+            engine.miniTransactionManager().rollbackUncommitted(readLeaf);
+            MiniTransaction readNonLeaf = engine.miniTransactionManager().beginReadOnly();
+            assertThrows(FspMetadataException.class, () ->
+                    engine.diskSpaceManager().inspectDropSegmentPlan(
+                            readNonLeaf, secondary.nonLeafSegment()));
+            engine.miniTransactionManager().rollbackUncommitted(readNonLeaf);
         } finally {
             engine.close();
         }
@@ -384,6 +468,22 @@ class TableDdlStorageServiceTest {
                         StorageColumnType.bigint(false, false))),
                 List.of(new StorageIndexDefinition(tableId + 10, "PRIMARY", true, true,
                         List.of(new StorageIndexKeyPart(1, StorageIndexOrder.ASC, 0)))));
+    }
+
+    /** 构造一个聚簇索引加一个二级索引的稳定物理定义，供 DROP INDEX 生命周期测试共用。 */
+    private static StorageTableDefinition twoIndexDefinition(
+            long tableId, SpaceId spaceId, Path path,
+            long primaryIndexId, long secondaryIndexId) {
+        return new StorageTableDefinition(tableId, spaceId, path,
+                2, PageNo.of(128),
+                List.of(new StorageColumnDefinition(1, "id", 0,
+                        StorageColumnType.bigint(false, false))),
+                List.of(new StorageIndexDefinition(
+                                primaryIndexId, "PRIMARY", true, true,
+                                List.of(new StorageIndexKeyPart(1, StorageIndexOrder.ASC, 0))),
+                        new StorageIndexDefinition(
+                                secondaryIndexId, "idx_id", false, false,
+                                List.of(new StorageIndexKeyPart(1, StorageIndexOrder.ASC, 0)))));
     }
 
     /** 构造 storage DTO 的 LOB 类型；长度语义与 Record ColumnType 保持一致。 */

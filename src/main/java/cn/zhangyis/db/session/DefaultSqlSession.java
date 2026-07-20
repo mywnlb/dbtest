@@ -198,6 +198,7 @@ public final class DefaultSqlSession implements SqlSession {
                 case UpdateStatementNode ignored -> executeData(statement, false, deadline);
                 case DeleteStatementNode ignored -> executeData(statement, false, deadline);
                 case CreateIndexStatementNode createIndex -> executeCreateIndex(createIndex, deadline);
+                case DropIndexStatementNode dropIndex -> executeDropIndex(dropIndex, deadline);
             };
             state = SessionState.OPEN;
             return result;
@@ -316,6 +317,50 @@ public final class DefaultSqlSession implements SqlSession {
             }
         }
         // 4、关闭 scope 并返回不可变结果，以稳定返回或领域异常完成收口。
+        return new CommandResult(transactions.status());
+    }
+
+    /**
+     * 绑定并执行 DROP INDEX / ALTER DROP INDEX；名称绑定先于 implicit commit，目标存在性由 table X 下的
+     * DD coordinator 重验。DDL 成功或失败后都恢复 Session transaction policy，不能把独立 DDL owner 泄漏给用户事务。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>从 Session 快照读取 current schema，把纯语法名称绑定为不持 DD lease 的命令。</li>
+     *     <li>执行 DDL implicit commit，释放用户事务的 row lock、MDL 与 metadata pin。</li>
+     *     <li>用剩余 deadline 调用独立 DDL gateway；其内部持 table X 并完成 DD/物理状态机。</li>
+     *     <li>无论成功或失败都恢复 DDL 后事务模式；恢复失败作为原异常 suppressed，成功返回 CommandResult。</li>
+     * </ol>
+     *
+     * @param syntax Parser 已归一的两种 DROP INDEX AST
+     * @param deadline 本条 statement 的唯一绝对期限；所有下游等待只能消费其剩余值
+     * @return 不携带 affected rows、但带最新 Session transaction status 的命令结果
+     */
+    private CommandResult executeDropIndex(DropIndexStatementNode syntax,
+                                           SqlStatementDeadline deadline) {
+        // 1、Binder 不打开 table，因此纯限定名错误早于 implicit commit。
+        Optional<ObjectName> schema = options.currentSchema().map(ObjectName::of);
+        var bound = binder.bindDdl(syntax, schema);
+        // 2、DDL 不能复用用户事务或它持有的 transaction-duration MDL。
+        transactions.prepareDdl(deadline.remaining("DDL implicit commit"));
+        RuntimeException failure = null;
+        try {
+            // 3、gateway 创建独立 owner，DD coordinator 再取得 schema IX/table X。
+            ddlGateway.dropSecondaryIndex(bound, deadline.remaining("DROP INDEX coordinator"));
+        } catch (RuntimeException ddlFailure) {
+            failure = ddlFailure;
+            throw ddlFailure;
+        } finally {
+            // 4、保持 CREATE/DROP 共用的 Session 终态与异常图规则。
+            try {
+                transactions.resumeAfterDdl();
+            } catch (RuntimeException resumeFailure) {
+                if (failure == null) {
+                    throw resumeFailure;
+                }
+                failure.addSuppressed(resumeFailure);
+            }
+        }
         return new CommandResult(transactions.status());
     }
 

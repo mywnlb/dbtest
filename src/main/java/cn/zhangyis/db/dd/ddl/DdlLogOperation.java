@@ -4,7 +4,7 @@ import cn.zhangyis.db.dd.exception.DictionaryCatalogCorruptionException;
 
 import java.util.Arrays;
 
-/** DDL log v1 支持的物理原子操作；stableCode 落盘，不能使用 enum ordinal。 */
+/** DDL log 支持的物理原子操作；stableCode 落盘并跨格式版本稳定，不能使用 enum ordinal。 */
 public enum DdlLogOperation {
     /** 创建 file-per-table tablespace、索引 segments/root，再发布 ACTIVE DD。 */
     CREATE_TABLE(1),
@@ -15,7 +15,9 @@ public enum DdlLogOperation {
     /** 将 GENERAL 表空间从 canonical path 移入受控 discarded 目录。 */
     DISCARD_TABLESPACE(4),
     /** 校验外部 DISCARDED 文件并重新挂载为 ACTIVE 表空间。 */
-    IMPORT_TABLESPACE(5);
+    IMPORT_TABLESPACE(5),
+    /** 先发布不含目标二级索引的 ACTIVE aggregate，再回收其 leaf/non-leaf segment。 */
+    DROP_INDEX(6);
 
     /** DDL log key/payload 使用且跨版本不可重排的持久码。 */
     private final int stableCode;

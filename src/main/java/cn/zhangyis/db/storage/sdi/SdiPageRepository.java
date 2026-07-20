@@ -209,8 +209,34 @@ public final class SdiPageRepository {
      * @throws SdiPageCorruptionException footer 与 SDI payload 重叠、损坏或物理 identity 跨 space 时抛出
      */
     public Optional<SdiIndexBuildDescriptor> readIndexBuild(MiniTransaction mtr, SpaceId spaceId) {
+        return readIndexDdl(mtr, spaceId, SdiIndexDdlAction.BUILD)
+                .map(descriptor -> new SdiIndexBuildDescriptor(
+                        descriptor.ddlOperationId(), descriptor.dictionaryVersion(),
+                        descriptor.tableId(), descriptor.indexBinding()));
+    }
+
+    /**
+     * 读取 page3 中未决 DROP INDEX 物理所有权；遇到 BUILD descriptor 必须 fail-closed。
+     *
+     * @param mtr 负责 page0→page3 S latch/fix 的短只读 MTR
+     * @param spaceId 已打开的目标表空间
+     * @return 完整 DROP descriptor，或 footer 全零时为空
+     * @throws SdiPageCorruptionException footer 损坏或动作与 DROP 不一致时抛出
+     */
+    public Optional<SdiIndexDdlDescriptor> readIndexDrop(MiniTransaction mtr, SpaceId spaceId) {
+        return readIndexDdl(mtr, spaceId, SdiIndexDdlAction.DROP);
+    }
+
+    /**
+     * 读取并校验通用索引 DDL footer；非空 descriptor 的动作必须与调用方预期完全一致。
+     */
+    private Optional<SdiIndexDdlDescriptor> readIndexDdl(
+            MiniTransaction mtr, SpaceId spaceId, SdiIndexDdlAction expectedAction) {
         // 1、校验表空间生命周期、页号、区段身份与容量边界，在共享或持久副作用前拒绝非法状态。
         require(mtr, spaceId);
+        if (expectedAction == null) {
+            throw new DatabaseValidationException("expected SDI index DDL action must not be null");
+        }
         SpaceHeaderSnapshot header = spaceHeaders.read(mtr, spaceId);
         requireV1Root(header.sdiRootPageNo());
         // 2、继续完成范围、身份与候选校验；通过后，按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，保持处理顺序与资源边界。
@@ -224,8 +250,14 @@ public final class SdiPageRepository {
         if (java.util.Arrays.equals(footer, new byte[footer.length])) {
             return Optional.empty();
         }
+        SdiIndexDdlDescriptor descriptor = decodeIndexDdl(spaceId, footer);
+        if (descriptor.action() != expectedAction) {
+            throw new SdiPageCorruptionException(
+                    "SDI index DDL action mismatch: expected=" + expectedAction
+                            + " actual=" + descriptor.action());
+        }
         // 4、发布稳定结果并逆序释放 lease、latch 与 fix，以稳定返回或领域异常完成收口。
-        return Optional.of(decodeIndexBuild(spaceId, footer));
+        return Optional.of(descriptor);
     }
 
     /**
@@ -246,6 +278,34 @@ public final class SdiPageRepository {
      * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public void writeIndexBuild(MiniTransaction mtr, SpaceId spaceId, SdiIndexBuildDescriptor descriptor) {
+        if (descriptor == null) {
+            throw new DatabaseValidationException("SDI index build descriptor must not be null");
+        }
+        writeIndexDdl(mtr, spaceId, new SdiIndexDdlDescriptor(
+                SdiIndexDdlAction.BUILD, descriptor.ddlOperationId(), descriptor.dictionaryVersion(),
+                descriptor.tableId(), descriptor.indexBinding()));
+    }
+
+    /**
+     * 在 page3 写入未决 DROP INDEX descriptor。调用方必须在 table MDL X 下保证同表只有一条索引 DDL。
+     *
+     * @param mtr 写 descriptor 的短物理事务
+     * @param spaceId 既有表空间 identity
+     * @param descriptor 与 marker、旧 DD binding 精确对应的 DROP 所有权
+     * @throws SdiPageCorruptionException footer 已占用或页损坏时抛出
+     * @throws DatabaseValidationException descriptor identity 与 space 不一致时抛出
+     */
+    public void writeIndexDrop(MiniTransaction mtr, SpaceId spaceId,
+                               SdiIndexDdlDescriptor descriptor) {
+        if (descriptor == null || descriptor.action() != SdiIndexDdlAction.DROP) {
+            throw new DatabaseValidationException("SDI DROP INDEX descriptor/action is invalid");
+        }
+        writeIndexDdl(mtr, spaceId, descriptor);
+    }
+
+    /** 写入通用索引 DDL descriptor；新写入统一使用带 action 的 footer v2。 */
+    private void writeIndexDdl(MiniTransaction mtr, SpaceId spaceId,
+                               SdiIndexDdlDescriptor descriptor) {
         // 1、校验表空间生命周期、页号、区段身份与容量边界，在共享或持久副作用前拒绝非法状态。
         require(mtr, spaceId);
         if (descriptor == null || !descriptor.indexBinding().rootPageId().spaceId().equals(spaceId)
@@ -264,10 +324,10 @@ public final class SdiPageRepository {
         byte[] current = page.readBytes(SdiPageLayout.indexBuildFooterOffset(pageSize),
                 SdiPageLayout.INDEX_BUILD_FOOTER_BYTES);
         if (!java.util.Arrays.equals(current, new byte[current.length])) {
-            throw new SdiPageCorruptionException("SDI index build footer is already occupied");
+            throw new SdiPageCorruptionException("SDI index DDL footer is already occupied");
         }
         // 4、发布稳定结果并逆序释放 lease、latch 与 fix，以稳定返回或领域异常完成收口。
-        page.writeBytes(SdiPageLayout.indexBuildFooterOffset(pageSize), encodeIndexBuild(descriptor));
+        page.writeBytes(SdiPageLayout.indexBuildFooterOffset(pageSize), encodeIndexDdl(descriptor));
     }
 
     /**
@@ -280,9 +340,36 @@ public final class SdiPageRepository {
      * @throws SdiPageCorruptionException 检测到不能安全解释的持久数据损坏时抛出；调用方不得继续发布普通服务或覆盖原始证据
      */
     public void clearIndexBuild(MiniTransaction mtr, SpaceId spaceId, SdiIndexBuildDescriptor expected) {
-        require(mtr, spaceId);
         if (expected == null) {
             throw new DatabaseValidationException("expected SDI index build descriptor must not be null");
+        }
+        clearIndexDdl(mtr, spaceId, new SdiIndexDdlDescriptor(
+                SdiIndexDdlAction.BUILD, expected.ddlOperationId(), expected.dictionaryVersion(),
+                expected.tableId(), expected.indexBinding()));
+    }
+
+    /**
+     * 只在 footer 与 expected DROP identity 完全相等时清空 descriptor。
+     *
+     * @param mtr 清理 descriptor 的写 MTR
+     * @param spaceId 目标表空间
+     * @param expected 已与 marker/DD 交叉校验的 DROP descriptor
+     * @throws SdiPageCorruptionException footer 动作或 identity 已变化时抛出
+     */
+    public void clearIndexDrop(MiniTransaction mtr, SpaceId spaceId,
+                               SdiIndexDdlDescriptor expected) {
+        if (expected == null || expected.action() != SdiIndexDdlAction.DROP) {
+            throw new DatabaseValidationException("expected SDI DROP INDEX descriptor/action is invalid");
+        }
+        clearIndexDdl(mtr, spaceId, expected);
+    }
+
+    /** 对通用索引 DDL footer 执行 exact identity CAS clear。 */
+    private void clearIndexDdl(MiniTransaction mtr, SpaceId spaceId,
+                               SdiIndexDdlDescriptor expected) {
+        require(mtr, spaceId);
+        if (expected == null) {
+            throw new DatabaseValidationException("expected SDI index DDL descriptor must not be null");
         }
         SpaceHeaderSnapshot header = spaceHeaders.readForUpdate(mtr, spaceId);
         requireV1Root(header.sdiRootPageNo());
@@ -292,8 +379,8 @@ public final class SdiPageRepository {
         requireFooterAvailable(page);
         byte[] current = page.readBytes(SdiPageLayout.indexBuildFooterOffset(pageSize),
                 SdiPageLayout.INDEX_BUILD_FOOTER_BYTES);
-        if (!decodeIndexBuild(spaceId, current).equals(expected)) {
-            throw new SdiPageCorruptionException("SDI index build descriptor identity changed before clear");
+        if (!decodeIndexDdl(spaceId, current).equals(expected)) {
+            throw new SdiPageCorruptionException("SDI index DDL descriptor identity changed before clear");
         }
         page.writeBytes(SdiPageLayout.indexBuildFooterOffset(pageSize),
                 new byte[SdiPageLayout.INDEX_BUILD_FOOTER_BYTES]);
@@ -317,7 +404,7 @@ public final class SdiPageRepository {
         int payloadLength = page.readInt(SdiPageLayout.PAYLOAD_LENGTH_OFFSET);
         if (payloadLength < 0 || payloadLength > SdiPageLayout.payloadCapacity(pageSize)) {
             throw new SdiPageCorruptionException(
-                    "existing SDI payload occupies CREATE INDEX footer reservation: " + payloadLength);
+                    "existing SDI payload occupies index DDL footer reservation: " + payloadLength);
         }
     }
 
@@ -327,12 +414,13 @@ public final class SdiPageRepository {
      * @param descriptor 调用方已校验的执行计划、批次、范围或候选对象；不得为 {@code null}，边界必须有序且不得跨越所属事务、表或日志批次
      * @return {@code encodeIndexBuild} 生成的非空字节表示；调用方获得独立结果或受控视图，格式失败通过领域异常报告
      */
-    private static byte[] encodeIndexBuild(SdiIndexBuildDescriptor descriptor) {
+    static byte[] encodeIndexDdl(SdiIndexDdlDescriptor descriptor) {
         IndexStorageBinding index = descriptor.indexBinding();
         ByteBuffer footer = ByteBuffer.allocate(SdiPageLayout.INDEX_BUILD_FOOTER_BYTES)
                 .order(ByteOrder.BIG_ENDIAN);
         footer.putInt(SdiPageLayout.INDEX_BUILD_MAGIC)
-                .putInt(SdiPageLayout.INDEX_BUILD_FORMAT_VERSION)
+                .putInt(SdiPageLayout.INDEX_DDL_FORMAT_VERSION)
+                .putInt(descriptor.action().stableCode())
                 .putLong(descriptor.ddlOperationId())
                 .putLong(descriptor.dictionaryVersion())
                 .putLong(descriptor.tableId())
@@ -364,13 +452,22 @@ public final class SdiPageRepository {
      * @return {@code decodeIndexBuild} 形成的不可变定义、计划或元数据快照；成功时不为 {@code null}，内部身份、版本和范围已完成交叉校验
      * @throws SdiPageCorruptionException 检测到不能安全解释的持久数据损坏时抛出；调用方不得继续发布普通服务或覆盖原始证据
      */
-    private static SdiIndexBuildDescriptor decodeIndexBuild(SpaceId spaceId, byte[] footer) {
+    static SdiIndexDdlDescriptor decodeIndexDdl(SpaceId spaceId, byte[] footer) {
         try {
             // 1、读取输入长度、游标边界与必要标识，在共享或持久副作用前拒绝非法状态。
             ByteBuffer buffer = ByteBuffer.wrap(footer).order(ByteOrder.BIG_ENDIAN);
-            if (buffer.getInt() != SdiPageLayout.INDEX_BUILD_MAGIC
-                    || buffer.getInt() != SdiPageLayout.INDEX_BUILD_FORMAT_VERSION) {
-                throw new SdiPageCorruptionException("invalid SDI index build footer magic/version");
+            if (buffer.getInt() != SdiPageLayout.INDEX_BUILD_MAGIC) {
+                throw new SdiPageCorruptionException("invalid SDI index DDL footer magic");
+            }
+            int formatVersion = buffer.getInt();
+            SdiIndexDdlAction action;
+            if (formatVersion == SdiPageLayout.LEGACY_INDEX_BUILD_FORMAT_VERSION) {
+                action = SdiIndexDdlAction.BUILD;
+            } else if (formatVersion == SdiPageLayout.INDEX_DDL_FORMAT_VERSION) {
+                action = SdiIndexDdlAction.fromStableCode(buffer.getInt());
+            } else {
+                throw new SdiPageCorruptionException(
+                        "invalid SDI index DDL footer version: " + formatVersion);
             }
             long ddlId = buffer.getLong();
             long version = buffer.getLong();
@@ -385,21 +482,21 @@ public final class SdiPageRepository {
             int crcOffset = buffer.position();
             int expectedCrc = buffer.getInt();
             if (expectedCrc != crc32c(java.util.Arrays.copyOf(footer, crcOffset))) {
-                throw new SdiPageCorruptionException("SDI index build footer CRC32C mismatch");
+                throw new SdiPageCorruptionException("SDI index DDL footer CRC32C mismatch");
             }
             for (int offset = buffer.position(); offset < footer.length; offset++) {
                 if (footer[offset] != 0) {
-                    throw new SdiPageCorruptionException("SDI index build footer reserved bytes are non-zero");
+                    throw new SdiPageCorruptionException("SDI index DDL footer reserved bytes are non-zero");
                 }
             }
             IndexStorageBinding binding = new IndexStorageBinding(indexId,
                     PageId.of(spaceId, PageNo.of(rootPageNo)), rootLevel, leaf, nonLeaf);
             // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
-            return new SdiIndexBuildDescriptor(ddlId, version, tableId, binding);
+            return new SdiIndexDdlDescriptor(action, ddlId, version, tableId, binding);
         } catch (SdiPageCorruptionException failure) {
             throw failure;
         } catch (RuntimeException failure) {
-            throw new SdiPageCorruptionException("decode SDI index build footer failed", failure);
+            throw new SdiPageCorruptionException("decode SDI index DDL footer failed", failure);
         }
     }
 

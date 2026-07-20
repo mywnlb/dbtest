@@ -167,6 +167,7 @@ public final class PersistentDdlLogRepository {
 
     private static void requireSameIdentity(DdlLogRecord before, DdlLogRecord after) {
         if (!before.marker().equals(after.marker()) || before.operation() != after.operation()
+                || before.secondaryObjectId() != after.secondaryObjectId()
                 || !before.spaceId().equals(after.spaceId()) || !before.path().equals(after.path())
                 || !before.auxiliaryPath().equals(after.auxiliaryPath())
                 || !before.fileIdentity().equals(after.fileIdentity())) {
@@ -185,7 +186,7 @@ public final class PersistentDdlLogRepository {
                     || (from == DdlLogPhase.ENGINE_DONE
                     && (to == DdlLogPhase.DICTIONARY_COMMITTED || to == DdlLogPhase.ROLLED_BACK))
                     || (from == DdlLogPhase.DICTIONARY_COMMITTED && to == DdlLogPhase.COMMITTED);
-            case DROP_TABLE, DISCARD_TABLESPACE, IMPORT_TABLESPACE -> (from == DdlLogPhase.PREPARED
+            case DROP_TABLE, DROP_INDEX, DISCARD_TABLESPACE, IMPORT_TABLESPACE -> (from == DdlLogPhase.PREPARED
                     && (to == DdlLogPhase.DICTIONARY_COMMITTED || to == DdlLogPhase.ROLLED_BACK))
                     || (from == DdlLogPhase.DICTIONARY_COMMITTED && to == DdlLogPhase.ENGINE_DONE)
                     || (from == DdlLogPhase.ENGINE_DONE && to == DdlLogPhase.COMMITTED);

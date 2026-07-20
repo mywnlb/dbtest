@@ -178,7 +178,7 @@ class PersistentDictionaryRepositoryTest {
      * repository 只允许 ACTIVE→ACTIVE 精确追加一个二级索引及对应 binding；列、聚簇索引和既有物理绑定必须不变。
      */
     @Test
-    void persistsExactSecondaryIndexAdditionAndRejectsUnrelatedReplacement() {
+    void persistsExactSecondaryIndexAdditionAndRemovalAndRejectsBindingDrift() {
         Path path = directory.resolve("create-index-mysql.ibd");
         try (FileInternalCatalogStore store = FileInternalCatalogStore.openOrCreate(path)) {
             PersistentDictionaryRepository repository = new PersistentDictionaryRepository(store);
@@ -216,10 +216,39 @@ class PersistentDictionaryRepositoryTest {
 
             assertEquals(IndexId.of(4), repository.findIndex(IndexId.of(4)).orElseThrow().id());
             TableDefinition committed = repository.findTable(TableId.of(2)).orElseThrow();
+            IndexStorageBinding driftedPrimary = new IndexStorageBinding(
+                    committed.primaryIndex().id().value(), PageId.of(space, PageNo.of(66)), 0,
+                    new SegmentRef(space, 6, SegmentId.of(16)),
+                    new SegmentRef(space, 7, SegmentId.of(17)));
+            TableDefinition driftedRemoval = new TableDefinition(
+                    committed.id(), committed.schemaId(), committed.name(), DictionaryVersion.of(4),
+                    TableState.ACTIVE, committed.columns(), List.of(committed.primaryIndex()),
+                    Optional.of(new TableStorageBinding(
+                            oldBinding.tableId(), space, oldBinding.path(), oldBinding.rowFormatVersion(),
+                            List.of(driftedPrimary), oldBinding.lobSegment())));
+            try (DictionaryTransaction drift = repository.begin(DictionaryVersion.of(4))) {
+                drift.updateTable(driftedRemoval);
+                assertThrows(cn.zhangyis.db.dd.exception.DictionaryVersionConflictException.class,
+                        drift::commit);
+            }
+
+            TableDefinition exactRemoval = new TableDefinition(
+                    committed.id(), committed.schemaId(), committed.name(), DictionaryVersion.of(4),
+                    TableState.ACTIVE, committed.columns(), List.of(committed.primaryIndex()),
+                    Optional.of(new TableStorageBinding(
+                            oldBinding.tableId(), space, oldBinding.path(), oldBinding.rowFormatVersion(),
+                            List.of(oldBinding.indexes().getFirst()), oldBinding.lobSegment())));
+            try (DictionaryTransaction remove = repository.begin(DictionaryVersion.of(4))) {
+                remove.updateTable(exactRemoval);
+                remove.commit();
+            }
+            assertTrue(repository.findIndex(IndexId.of(4)).isEmpty());
+
+            TableDefinition removed = repository.findTable(TableId.of(2)).orElseThrow();
             TableDefinition illegal = new TableDefinition(
-                    committed.id(), committed.schemaId(), ObjectName.of("renamed"), DictionaryVersion.of(4),
-                    TableState.ACTIVE, committed.columns(), committed.indexes(), committed.storageBinding());
-            try (DictionaryTransaction rename = repository.begin(DictionaryVersion.of(4))) {
+                    removed.id(), removed.schemaId(), ObjectName.of("renamed"), DictionaryVersion.of(5),
+                    TableState.ACTIVE, removed.columns(), removed.indexes(), removed.storageBinding());
+            try (DictionaryTransaction rename = repository.begin(DictionaryVersion.of(5))) {
                 rename.updateTable(illegal);
                 assertThrows(cn.zhangyis.db.dd.exception.DictionaryVersionConflictException.class, rename::commit);
             }

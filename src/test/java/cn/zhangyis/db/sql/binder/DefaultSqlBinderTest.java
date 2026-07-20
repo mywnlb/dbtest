@@ -10,8 +10,10 @@ import cn.zhangyis.db.sql.binder.bound.BoundSecondaryRangeSelect;
 import cn.zhangyis.db.sql.binder.bound.PointAccessKind;
 import cn.zhangyis.db.sql.binder.bound.SelectLockMode;
 import cn.zhangyis.db.sql.binder.bound.BoundCreateIndex;
+import cn.zhangyis.db.sql.binder.bound.BoundDropIndex;
 import cn.zhangyis.db.dd.domain.IndexOrder;
 import cn.zhangyis.db.sql.parser.ast.CreateIndexStatementNode;
+import cn.zhangyis.db.sql.parser.ast.DropIndexStatementNode;
 import cn.zhangyis.db.sql.binder.exception.SqlBindingException;
 import cn.zhangyis.db.sql.executor.SqlValue;
 import cn.zhangyis.db.sql.parser.DefaultSqlParser;
@@ -213,6 +215,26 @@ class DefaultSqlBinderTest {
         assertThrows(SqlBindingException.class, () -> binder.bindDdl(
                 assertInstanceOf(CreateIndexStatementNode.class,
                         parser.parse("CREATE INDEX bad ON app.orders (status, STATUS)")),
+                Optional.empty()));
+    }
+
+    /** DROP 两种语法只绑定规范化 table/index name，不提前打开 DD lease 或触发 implicit commit。 */
+    @Test
+    void bindsDropAndAlterDropIndexWithoutTransactionMetadataScope() {
+        BoundDropIndex drop = binder.bindDdl(
+                assertInstanceOf(DropIndexStatementNode.class,
+                        parser.parse("DROP INDEX idx_status ON orders")),
+                Optional.of(ObjectName.of("app")));
+        BoundDropIndex alter = binder.bindDdl(
+                assertInstanceOf(DropIndexStatementNode.class,
+                        parser.parse("ALTER TABLE app.orders DROP INDEX idx_status")),
+                Optional.empty());
+
+        assertEquals(drop.command(), alter.command());
+        assertEquals(ObjectName.of("idx_status"), drop.command().indexName());
+        assertThrows(SqlBindingException.class, () -> binder.bindDdl(
+                assertInstanceOf(DropIndexStatementNode.class,
+                        parser.parse("DROP INDEX idx_status ON orders")),
                 Optional.empty()));
     }
 

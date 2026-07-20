@@ -8,6 +8,7 @@ import cn.zhangyis.db.sql.binder.bound.BoundDelete;
 import cn.zhangyis.db.sql.binder.bound.BoundSecondaryRangeSelect;
 import cn.zhangyis.db.sql.binder.bound.BoundStatement;
 import cn.zhangyis.db.sql.binder.bound.BoundCreateIndex;
+import cn.zhangyis.db.sql.binder.bound.BoundDropIndex;
 import cn.zhangyis.db.sql.executor.storage.SqlStorageGateway;
 import cn.zhangyis.db.sql.executor.storage.SqlStatementDeadline;
 import cn.zhangyis.db.sql.executor.storage.SqlTransactionHandle;
@@ -75,6 +76,8 @@ public final class DefaultSqlExecutor {
             }
             case BoundCreateIndex ignored -> throw new DatabaseValidationException(
                     "bound CREATE INDEX must be executed by Session DDL coordinator");
+            case BoundDropIndex ignored -> throw new DatabaseValidationException(
+                    "bound DROP INDEX must be executed by Session DDL coordinator");
         };
     }
 

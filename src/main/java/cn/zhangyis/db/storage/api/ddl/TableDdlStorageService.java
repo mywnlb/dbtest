@@ -27,6 +27,8 @@ import cn.zhangyis.db.storage.redo.RedoBudgetPurpose;
 import cn.zhangyis.db.storage.redo.RedoBudgetWorkload;
 import cn.zhangyis.db.storage.sdi.SdiPageRepository;
 import cn.zhangyis.db.storage.sdi.SdiIndexBuildDescriptor;
+import cn.zhangyis.db.storage.sdi.SdiIndexDdlAction;
+import cn.zhangyis.db.storage.sdi.SdiIndexDdlDescriptor;
 import cn.zhangyis.db.storage.btree.BTreeIndex;
 import cn.zhangyis.db.storage.btree.BTreeInsertResult;
 import cn.zhangyis.db.storage.btree.BTreeRedoBudgetEstimator;
@@ -480,6 +482,218 @@ public final class TableDdlStorageService {
     }
 
     /**
+     * 在 DD 删除目标索引前，把其精确物理 binding 与 DDL identity 持久化到 page3。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 table、DDL/version、timeout 与索引 binding；目标必须是当前 binding 中非首位的精确成员，
+     *     避免物理层接受聚簇索引删除。</li>
+     *     <li>用短只读 MTR 确认 footer 为空；调用方的 table MDL X 排除同表 CREATE/DROP INDEX 竞争。</li>
+     *     <li>以 DDL_SDI_WRITE 预算写入带 DROP action 的 v2 descriptor，不修改 index page 或 segment inode。</li>
+     *     <li>等待 footer redo/dirty 满足 WAL 并 force 表空间；只有恢复所有权 durable 后才允许上层提交新 DD。</li>
+     * </ol>
+     *
+     * @param table 当前 committed DD 的完整物理表绑定
+     * @param ddlOperationId 已写 PREPARED marker 的正 DDL identity
+     * @param dictionaryVersion 删除索引后 table aggregate 的目标字典版本
+     * @param index 当前 DD 中待删除二级索引的精确物理 binding
+     * @param timeout footer WAL、dirty 与文件 force 的正等待时限
+     * @return durable DROP descriptor；返回值可用于 DD 提交后物理回收与 crash recovery
+     * @throws DatabaseValidationException 参数无效、目标不是当前二级索引或 identity 不一致时抛出
+     * @throws SerializedDictionaryInfoException footer 已占用、页损坏或持久化失败时抛出
+     */
+    public SecondaryIndexDropDescriptor beginSecondaryIndexDrop(
+            TableStorageBinding table, long ddlOperationId, long dictionaryVersion,
+            IndexStorageBinding index, Duration timeout) {
+        // 1. 物理层以 binding 顺序识别聚簇入口；精确 contains 防止调用方拼接相同 index id 的伪造 segment。
+        if (table == null || ddlOperationId <= 0 || dictionaryVersion <= 0
+                || index == null || timeout == null || timeout.isZero() || timeout.isNegative()
+                || table.indexes().isEmpty() || table.indexes().getFirst().equals(index)
+                || !table.indexes().contains(index)
+                || !index.rootPageId().spaceId().equals(table.spaceId())) {
+            throw new DatabaseValidationException(
+                    "secondary index drop requires current non-clustered binding/positive identities/timeout");
+        }
+        requireOpenedPath(table, "DROP INDEX begin");
+
+        // 2. 非空 BUILD footer 会以 action mismatch fail-closed，非空 DROP footer 则明确报告同表已有未决 DDL。
+        if (readSecondaryIndexDrop(table).isPresent()) {
+            throw new SerializedDictionaryInfoException(
+                    "table already has a pending secondary index drop: " + table.tableId());
+        }
+
+        SecondaryIndexDropDescriptor result = new SecondaryIndexDropDescriptor(
+                ddlOperationId, dictionaryVersion, table.tableId(), index);
+        // 3. 本阶段只写 page3，不释放任何 DD 仍可达的物理资源。
+        MiniTransaction mtr = mtrManager.begin(mtrManager.budgetFor(RedoBudgetPurpose.DDL_SDI_WRITE));
+        Lsn commitLsn;
+        try {
+            sdiPages.writeIndexDrop(mtr, table.spaceId(), toSdi(result));
+            commitLsn = mtrManager.commit(mtr);
+        } catch (RuntimeException failure) {
+            rollbackIfBound(mtr, failure);
+            throw translateSdiFailure(
+                    "stage secondary index drop failed: table=" + table.tableId(), failure);
+        }
+
+        // 4. DD commit 必须晚于 descriptor durable；异常时 PREPARED marker 让恢复按旧 DD 清 footer。
+        try {
+            flush.flushThrough(commitLsn, timeout);
+            store.force(table.spaceId());
+            return result;
+        } catch (RuntimeException failure) {
+            throw translateSdiFailure(
+                    "make secondary index drop descriptor durable failed: table=" + table.tableId(), failure);
+        }
+    }
+
+    /**
+     * 读取 page3 的未决 DROP INDEX descriptor，不修改页或 DDL 状态。
+     *
+     * @param table 用于校验 space/path/table identity 的当前或新 DD binding
+     * @return 未决 DROP descriptor，或 footer 为空
+     * @throws SerializedDictionaryInfoException footer 损坏、动作不是 DROP 或 table identity 不匹配时抛出
+     * @throws DatabaseValidationException table 为空时抛出
+     */
+    public Optional<SecondaryIndexDropDescriptor> readSecondaryIndexDrop(TableStorageBinding table) {
+        if (table == null) {
+            throw new DatabaseValidationException("secondary index drop read table must not be null");
+        }
+        requireOpenedPath(table, "DROP INDEX descriptor read");
+        MiniTransaction mtr = mtrManager.beginReadOnly();
+        try {
+            Optional<SecondaryIndexDropDescriptor> result = sdiPages.readIndexDrop(
+                            mtr, table.spaceId())
+                    .map(TableDdlStorageService::fromSdiDrop);
+            if (result.isPresent() && result.orElseThrow().tableId() != table.tableId()) {
+                throw new SerializedDictionaryInfoException(
+                        "secondary index drop table identity mismatch: expected=" + table.tableId());
+            }
+            mtrManager.commit(mtr);
+            return result;
+        } catch (RuntimeException failure) {
+            rollbackIfBound(mtr, failure);
+            throw translateSdiFailure(
+                    "read secondary index drop descriptor failed: table=" + table.tableId(), failure);
+        }
+    }
+
+    /**
+     * 在旧 DD 仍包含目标索引时回滚 DROP，只清除 descriptor，不释放任何 segment。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 table/expected/timeout，并读取 footer 做 exact identity CAS；不匹配时禁止写页。</li>
+     *     <li>以短写 MTR 清除 DROP descriptor；索引 root、leaf/non-leaf inode 与页面保持原样。</li>
+     *     <li>提交 footer clear redo，不发布 DD/cache，也不触碰普通 B+Tree 可达性。</li>
+     *     <li>等待 WAL/dirty 并 force；返回后旧 DD 可继续安全引用原索引。</li>
+     * </ol>
+     *
+     * @param table 仍包含目标索引的旧 committed binding
+     * @param expected 与 marker、旧 DD 精确匹配的 DROP descriptor
+     * @param timeout footer clear 的正持久化时限
+     * @throws DatabaseValidationException 参数或 table identity 不一致时抛出
+     * @throws SerializedDictionaryInfoException footer 缺失、改变、损坏或持久化失败时抛出
+     */
+    public void rollbackSecondaryIndexDrop(TableStorageBinding table,
+                                           SecondaryIndexDropDescriptor expected,
+                                           Duration timeout) {
+        // 1. 只有当前 page3 exact descriptor 才授予本恢复任务清理 footer 的权限。
+        validateSecondaryIndexDropArguments(table, expected, timeout, "rollback");
+        requireOpenedPath(table, "DROP INDEX rollback");
+        SecondaryIndexDropDescriptor durable = readSecondaryIndexDrop(table).orElseThrow(() ->
+                new SerializedDictionaryInfoException("secondary index drop descriptor is absent"));
+        if (!durable.equals(expected)) {
+            throw new SerializedDictionaryInfoException(
+                    "secondary index drop descriptor changed before rollback");
+        }
+
+        // 2. 旧 DD 仍引用 segment，所以回滚绝不检查或修改 inode，仅 exact-CAS 清 page3。
+        MiniTransaction clear = mtrManager.begin(
+                mtrManager.budgetFor(RedoBudgetPurpose.DDL_SDI_WRITE));
+        Lsn commitLsn;
+        try {
+            sdiPages.clearIndexDrop(clear, table.spaceId(), toSdi(expected));
+            // 3. page3 clear 是本次 MTR 唯一持久副作用。
+            commitLsn = mtrManager.commit(clear);
+        } catch (RuntimeException failure) {
+            rollbackIfBound(clear, failure);
+            throw translateSdiFailure(
+                    "rollback secondary index drop failed: table=" + table.tableId(), failure);
+        }
+
+        // 4. 只有 footer clear durable 后才向上层报告 ROLLED_BACK 可写。
+        try {
+            flush.flushThrough(commitLsn, timeout);
+            store.force(table.spaceId());
+        } catch (RuntimeException failure) {
+            throw translateSdiFailure(
+                    "make secondary index drop rollback durable failed: table=" + table.tableId(), failure);
+        }
+    }
+
+    /**
+     * 在新 DD 已不再包含目标索引后，原子回收两个 segment 并清除 DROP descriptor。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验并 exact-read footer；descriptor 是资源所有权证据，缺失或改变时禁止盲目释放 inode。</li>
+     *     <li>分别在短只读 MTR 中冻结 leaf/non-leaf drop plan，释放全部 page latch 后再等待写 redo admission。</li>
+     *     <li>单个写 MTR 按管理页锁序 drop 两个 segment，随后 exact-CAS 清 page3；任一步失败都由 MTR 回滚，
+     *     保留 descriptor 供重启重试。</li>
+     *     <li>提交后等待 WAL/dirty/checkpoint 并 force；返回即代表 DD 不可达资源与恢复证据共同收敛。</li>
+     * </ol>
+     *
+     * @param table 已发布新 DD 的表绑定；其中可以不再包含目标索引
+     * @param expected 与 marker、旧 binding 精确匹配的 DROP descriptor
+     * @param timeout segment free、footer clear 与文件 force 的正等待时限
+     * @throws DatabaseValidationException 参数或 table identity 不一致时抛出
+     * @throws SerializedDictionaryInfoException descriptor/segment 损坏、identity 改变或持久化失败时抛出
+     */
+    public void finishSecondaryIndexDrop(TableStorageBinding table,
+                                         SecondaryIndexDropDescriptor expected,
+                                         Duration timeout) {
+        // 1. 上层必须先提交新 DD；物理层仍以 exact footer 阻止错误任务释放复用后的 inode。
+        validateSecondaryIndexDropArguments(table, expected, timeout, "finish");
+        requireOpenedPath(table, "DROP INDEX finish");
+        SecondaryIndexDropDescriptor durable = readSecondaryIndexDrop(table).orElseThrow(() ->
+                new SerializedDictionaryInfoException("secondary index drop descriptor is absent"));
+        if (!durable.equals(expected)) {
+            throw new SerializedDictionaryInfoException(
+                    "secondary index drop descriptor changed before finish");
+        }
+
+        // 2. admission 等待前结束 plan MTR，避免持 page2 latch 等 redo capacity。
+        SegmentDropPlan leafPlan = inspectDropPlan(expected.indexBinding().leafSegment());
+        SegmentDropPlan nonLeafPlan = inspectDropPlan(expected.indexBinding().nonLeafSegment());
+        RedoBudgetWorkload workload = indexDropWorkload(leafPlan, nonLeafPlan);
+
+        // 3. 两个 inode 与 footer 属于同一物理收敛单元；MTR 失败不会留下 descriptor 已清但 segment 尚存。
+        MiniTransaction drop = mtrManager.begin(
+                mtrManager.budgetFor(RedoBudgetPurpose.DDL_INDEX_DROP, workload));
+        Lsn commitLsn;
+        try {
+            disk.dropSegment(drop, expected.indexBinding().leafSegment());
+            disk.dropSegment(drop, expected.indexBinding().nonLeafSegment());
+            sdiPages.clearIndexDrop(drop, table.spaceId(), toSdi(expected));
+            commitLsn = mtrManager.commit(drop);
+        } catch (RuntimeException failure) {
+            rollbackIfBound(drop, failure);
+            throw translateSdiFailure(
+                    "finish secondary index drop failed: table=" + table.tableId(), failure);
+        }
+
+        // 4. WAL-safe force 之后才能让 DDL log 进入 terminal COMMITTED。
+        try {
+            flush.flushThrough(commitLsn, timeout);
+            store.force(table.spaceId());
+        } catch (RuntimeException failure) {
+            throw translateSdiFailure(
+                    "make secondary index drop finish durable failed: table=" + table.tableId(), failure);
+        }
+    }
+
+    /**
      * 扫描聚簇 live rows 并填充已 staged 的二级 B+Tree；不发布 DD，也不清 page3 descriptor。
      *
      * <p>数据流：</p>
@@ -663,6 +877,12 @@ public final class TableDdlStorageService {
                 descriptor.tableId(), descriptor.indexBinding());
     }
 
+    /** 把 storage.api DROP 所有权映射为 page3 通用 descriptor，不改变任何 identity。 */
+    private static SdiIndexDdlDescriptor toSdi(SecondaryIndexDropDescriptor descriptor) {
+        return new SdiIndexDdlDescriptor(SdiIndexDdlAction.DROP, descriptor.ddlOperationId(),
+                descriptor.dictionaryVersion(), descriptor.tableId(), descriptor.indexBinding());
+    }
+
     /** 使用独立短读 MTR 刷新 root level，结束后调用方才能申请下一条结构写 redo budget。 */
     private BTreeIndex refreshRoot(BTreeIndex index) {
         MiniTransaction read = mtrManager.beginReadOnly();
@@ -727,6 +947,25 @@ public final class TableDdlStorageService {
     private static SecondaryIndexBuildDescriptor fromSdi(SdiIndexBuildDescriptor descriptor) {
         return new SecondaryIndexBuildDescriptor(descriptor.ddlOperationId(), descriptor.dictionaryVersion(),
                 descriptor.tableId(), descriptor.indexBinding());
+    }
+
+    /** 把已校验 action 的 page3 descriptor 映射为稳定 storage.api DROP 所有权。 */
+    private static SecondaryIndexDropDescriptor fromSdiDrop(SdiIndexDdlDescriptor descriptor) {
+        return new SecondaryIndexDropDescriptor(descriptor.ddlOperationId(),
+                descriptor.dictionaryVersion(), descriptor.tableId(), descriptor.indexBinding());
+    }
+
+    /** DROP rollback/finish 共用的纯参数与 table identity 校验。 */
+    private static void validateSecondaryIndexDropArguments(
+            TableStorageBinding table, SecondaryIndexDropDescriptor expected,
+            Duration timeout, String action) {
+        if (table == null || expected == null || timeout == null
+                || timeout.isZero() || timeout.isNegative()
+                || table.tableId() != expected.tableId()) {
+            throw new DatabaseValidationException(
+                    "secondary index drop " + action
+                            + " requires matching table/descriptor/positive timeout");
+        }
     }
 
     /**

@@ -12,8 +12,8 @@ import java.util.Optional;
  * 一次 durable DDL phase marker。除 phase 外的字段在同一 ddl id 生命周期内不可变。
  *
  * @param marker 跨 DDL log、字典版本和受影响对象的稳定关联标记。
- * @param secondaryObjectId CREATE_INDEX 预留的 index id；表级 DDL 固定为 0。
- * @param operation CREATE_TABLE、DROP_TABLE 或 CREATE_INDEX。
+ * @param secondaryObjectId CREATE_INDEX/DROP_INDEX 的 index id；表级 DDL 固定为 0。
+ * @param operation 当前 marker 的 operation-specific 状态机类型，包括表、索引与表空间 transfer DDL。
  * @param phase 当前单批原子发布的阶段。
  * @param spaceId 目标 file-per-table 物理空间。
  * @param path 目标表空间的绝对规范路径；恢复仍须通过受控目录校验。
@@ -32,7 +32,7 @@ public record DdlLogRecord(DdlUndoMarker marker, long secondaryObjectId,
         this(marker, 0L, operation, phase, spaceId, path, Optional.empty(), Optional.empty());
     }
 
-    /** CREATE_INDEX 既有调用方使用的兼容构造器。 */
+    /** CREATE_INDEX/DROP_INDEX 调用方使用的 secondary identity 构造器。 */
     public DdlLogRecord(DdlUndoMarker marker, long secondaryObjectId, DdlLogOperation operation,
                         DdlLogPhase phase, SpaceId spaceId, Path path) {
         this(marker, secondaryObjectId, operation, phase, spaceId, path, Optional.empty(), Optional.empty());
@@ -67,8 +67,10 @@ public record DdlLogRecord(DdlUndoMarker marker, long secondaryObjectId,
         if (marker == null || operation == null || phase == null || spaceId == null || path == null) {
             throw new DatabaseValidationException("DDL log record fields must not be null");
         }
-        if (operation == DdlLogOperation.CREATE_INDEX && secondaryObjectId <= 0
-                || operation != DdlLogOperation.CREATE_INDEX && secondaryObjectId != 0) {
+        boolean indexOperation = operation == DdlLogOperation.CREATE_INDEX
+                || operation == DdlLogOperation.DROP_INDEX;
+        if (indexOperation && secondaryObjectId <= 0
+                || !indexOperation && secondaryObjectId != 0) {
             throw new DatabaseValidationException("DDL secondary object identity does not match operation");
         }
     }

@@ -33,6 +33,10 @@ SDI v1 是固定单页快照，不实现 InnoDB 真实 SDI B+Tree、多页对象
 未来 catalog rebuild 必须先设计 schema 级冗余、目录级 manifest 和冲突隔离，不能把扫描到的任意
 `.ibd` 直接发布为 ACTIVE DD。
 
+当前公共组合根已增加 catalog-loss admission guard：`mysql.ibd` missing/empty 且存在 DD control、
+redo、undo、doublewrite 或受控表空间候选时，在 storage/DD recovery 与 orphan cleanup 前 fail-closed，
+并原样保留恢复证据。这只解决误建空 catalog 的数据安全风险，不具备 SDI 发现或 catalog 重建语义。
+
 UNDO 表空间 page 3 继续属于 rollback segment header；只有 GENERAL 表空间启用 SDI。
 temporary undo 与 SDI 没有共享 owner 或生命周期，不在本切片接入。
 
@@ -153,6 +157,7 @@ storage crash recovery 先按正常顺序完成 doublewrite repair 和 redo repl
 
 ## 10. 后续扩展
 
-catalog-loss rebuild 需要另行设计 schema 级 SDI、目录 manifest、重复 identity/path 冲突隔离和
+catalog-loss admission guard 已负责在重建能力缺失时保护原文件；真正 rebuild 仍需另行设计 schema 级 SDI、
+目录 manifest、重复 identity/path 冲突隔离和
 “完整扫描结束”提交点。多页 SDI 应通过独立 segment/B+Tree 或有界 page chain 扩展，不能改变 v1
 page3 header 的既有字段语义；v1 decoder 保持只接受 format 1，升级由显式迁移器完成。

@@ -266,7 +266,8 @@ public final class PersistentDictionaryRepository {
                 && before.storageBinding().equals(after.storageBinding())
                 && validLifecycleTransition(before.state(), after.state());
         boolean addSecondaryIndex = exactSecondaryIndexAddition(before, after);
-        if (!lifecycle && !addSecondaryIndex) {
+        boolean removeSecondaryIndex = exactSecondaryIndexRemoval(before, after);
+        if (!lifecycle && !addSecondaryIndex && !removeSecondaryIndex) {
             throw new DictionaryVersionConflictException("invalid table lifecycle transition: "
                     + before.state() + " -> " + after.state());
         }
@@ -312,6 +313,46 @@ public final class PersistentDictionaryRepository {
             return false;
         }
         return after.indexes().getLast().id().value() == newBinding.indexes().getLast().indexId();
+    }
+
+    /**
+     * 精确识别 DROP INDEX 的 ACTIVE→ACTIVE aggregate 替换。逻辑定义与物理 binding 必须在同一 ordinal
+     * 删除同一个非聚簇 index，其余顺序、identity、row format、space/path 与 LOB 均保持不变。
+     */
+    private static boolean exactSecondaryIndexRemoval(TableDefinition before, TableDefinition after) {
+        if (before.state() != cn.zhangyis.db.dd.domain.TableState.ACTIVE
+                || after.state() != cn.zhangyis.db.dd.domain.TableState.ACTIVE
+                || before.indexes().size() != after.indexes().size() + 1
+                || before.storageBinding().isEmpty() || after.storageBinding().isEmpty()) {
+            return false;
+        }
+        var oldBinding = before.storageBinding().orElseThrow();
+        var newBinding = after.storageBinding().orElseThrow();
+        if (oldBinding.tableId() != newBinding.tableId()
+                || !oldBinding.spaceId().equals(newBinding.spaceId())
+                || !oldBinding.path().equals(newBinding.path())
+                || oldBinding.rowFormatVersion() != newBinding.rowFormatVersion()
+                || !oldBinding.lobSegment().equals(newBinding.lobSegment())
+                || oldBinding.indexes().size() != newBinding.indexes().size() + 1) {
+            return false;
+        }
+        for (int removedOrdinal = 0; removedOrdinal < before.indexes().size(); removedOrdinal++) {
+            var removed = before.indexes().get(removedOrdinal);
+            if (removed.clustered()
+                    || removed.id().value() != oldBinding.indexes().get(removedOrdinal).indexId()) {
+                continue;
+            }
+            List<cn.zhangyis.db.dd.domain.IndexDefinition> logical = new java.util.ArrayList<>(
+                    before.indexes());
+            logical.remove(removedOrdinal);
+            List<cn.zhangyis.db.storage.api.ddl.IndexStorageBinding> physical =
+                    new java.util.ArrayList<>(oldBinding.indexes());
+            physical.remove(removedOrdinal);
+            if (logical.equals(after.indexes()) && physical.equals(newBinding.indexes())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private DictionarySnapshot rebuild(List<CatalogBatch> batches) {

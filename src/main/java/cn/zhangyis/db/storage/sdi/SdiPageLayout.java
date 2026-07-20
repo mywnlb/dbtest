@@ -5,7 +5,7 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.storage.page.PageEnvelopeLayout;
 
 /**
- * GENERAL 表空间固定 page3 的 SDI v1 布局。所有偏移相对物理页首，body 不能覆盖 index-build footer
+ * GENERAL 表空间固定 page3 的 SDI v1 布局。所有偏移相对物理页首，body 不能覆盖 index-DDL footer
  * 与统一 FIL trailer。
  */
 public final class SdiPageLayout {
@@ -50,12 +50,14 @@ public final class SdiPageLayout {
      * 持久结构布局常量；它定义 {@code SdiPageLayout} 中 {@code PAYLOAD_OFFSET} 的固定偏移、槽位或宽度，读写两端必须使用同一数值。
      */
     public static final int PAYLOAD_OFFSET = PAYLOAD_CRC32C_OFFSET + Integer.BYTES;
-    /** CREATE INDEX 崩溃回收 descriptor 的固定页尾保留区。 */
+    /** CREATE/DROP INDEX 崩溃恢复 descriptor 共用的固定页尾保留区。 */
     public static final int INDEX_BUILD_FOOTER_BYTES = 96;
-    /** footer magic：ASCII `IDX1`。全零 footer 表示没有未决 build。 */
+    /** footer magic：ASCII `IDX1`。全零 footer 表示没有未决索引 DDL。 */
     public static final int INDEX_BUILD_MAGIC = 0x49445831;
-    /** footer 固定格式版本。 */
-    public static final int INDEX_BUILD_FORMAT_VERSION = 1;
+    /** 旧 CREATE INDEX footer 版本；没有 action 字段，兼容读取时固定解释为 BUILD。 */
+    public static final int LEGACY_INDEX_BUILD_FORMAT_VERSION = 1;
+    /** 当前索引 DDL footer 版本；在 version 后显式持久化 BUILD/DROP action。 */
+    public static final int INDEX_DDL_FORMAT_VERSION = 2;
 
     /**
      * 计算当前实例单页最多容纳的 opaque DD payload。

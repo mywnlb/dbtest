@@ -11,6 +11,7 @@ import cn.zhangyis.db.dd.domain.IndexOrder;
 import cn.zhangyis.db.dd.domain.MdlOwnerId;
 import cn.zhangyis.db.dd.domain.ObjectName;
 import cn.zhangyis.db.dd.domain.QualifiedTableName;
+import cn.zhangyis.db.dd.exception.DictionaryCatalogAdmissionException;
 import cn.zhangyis.db.dd.exception.DictionaryObjectNotFoundException;
 import cn.zhangyis.db.dd.recovery.DictionaryRecoveryException;
 import cn.zhangyis.db.dd.repo.DictionaryControlStore;
@@ -37,6 +38,7 @@ import java.time.Duration;
 import java.util.List;
 import cn.zhangyis.db.session.SessionOptions;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -199,6 +201,59 @@ class DatabaseEngineTest {
         DatabaseEngine reopened = new DatabaseEngine(config);
         assertThrows(DictionaryRecoveryException.class, reopened::open);
         assertEquals(DatabaseEngineState.FAILED, reopened.state());
+        reopened.close();
+    }
+
+    /**
+     * 即使实例没有用户表，redo/control/undo 也足以证明它不是 fresh；截空 catalog 后不得静默重建。
+     */
+    @Test
+    void failsClosedForZeroLengthCatalogInExistingEmptyDatabase() throws Exception {
+        EngineConfig config = config();
+        try (DatabaseEngine database = new DatabaseEngine(config)) {
+            database.open();
+        }
+        Path catalog = directory.resolve("mysql.ibd");
+        try (FileChannel channel = FileChannel.open(catalog, StandardOpenOption.WRITE)) {
+            channel.truncate(0);
+            channel.force(true);
+        }
+
+        DatabaseEngine reopened = new DatabaseEngine(config);
+        assertThrows(DictionaryCatalogAdmissionException.class, reopened::open);
+
+        assertEquals(DatabaseEngineState.FAILED, reopened.state());
+        assertEquals(0, Files.size(catalog), "failed admission must not initialize the empty catalog");
+        reopened.close();
+    }
+
+    /**
+     * 删除 catalog 后，原 ACTIVE 表会被空 catalog 误判为 orphan；准入必须在 recovery 前阻断并逐字节保留表空间。
+     */
+    @Test
+    void preservesTablespaceWhenCatalogIsMissingInsteadOfRunningOrphanCleanup() throws Exception {
+        EngineConfig config = config();
+        Path tableFile;
+        try (DatabaseEngine database = new DatabaseEngine(config)) {
+            database.open();
+            database.ddl().createSchema(MdlOwnerId.of(12), ObjectName.of("app"), 1, 1,
+                    Duration.ofSeconds(5));
+            tableFile = database.ddl().createTable(MdlOwnerId.of(12),
+                    tableCommand("app", "orders"), Duration.ofSeconds(5))
+                    .storageBinding().orElseThrow().path();
+        }
+        byte[] tableBefore = Files.readAllBytes(tableFile);
+        Path catalog = directory.resolve("mysql.ibd");
+        Files.delete(catalog);
+
+        DatabaseEngine reopened = new DatabaseEngine(config);
+        assertThrows(DictionaryCatalogAdmissionException.class, reopened::open);
+
+        assertEquals(DatabaseEngineState.FAILED, reopened.state());
+        assertFalse(Files.exists(catalog), "failed admission must not recreate the missing catalog");
+        assertTrue(Files.exists(tableFile), "orphan cleanup must not run without an authoritative catalog");
+        assertArrayEquals(tableBefore, Files.readAllBytes(tableFile),
+                "catalog admission is read-only and must preserve the complete tablespace image");
         reopened.close();
     }
 

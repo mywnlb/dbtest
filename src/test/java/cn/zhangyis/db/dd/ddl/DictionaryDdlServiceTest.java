@@ -119,6 +119,219 @@ class DictionaryDdlServiceTest {
         }
     }
 
+    /** 正常 DROP INDEX 必须先发布不含目标的 exact DD，再回收 descriptor/segments，并可跨重启保持删除结果。 */
+    @Test
+    void dropsSecondaryIndexAndKeepsRemovalAcrossRestart() {
+        try (DatabaseEngine database = new DatabaseEngine(config())) {
+            database.open();
+            database.ddl().createSchema(
+                    MdlOwnerId.of(102), ObjectName.of("app"), 1, 1, Duration.ofSeconds(5));
+            database.ddl().createTable(
+                    MdlOwnerId.of(102), updateCommand(), Duration.ofSeconds(5));
+            TableDefinition withIndex = database.ddl().createSecondaryIndex(
+                    MdlOwnerId.of(103), secondaryIndexCommand(), Duration.ofSeconds(5));
+
+            TableDefinition withoutIndex = database.ddl().dropSecondaryIndex(
+                    MdlOwnerId.of(104), dropIndexCommand(), Duration.ofSeconds(5));
+
+            assertEquals(1, withoutIndex.indexes().size());
+            assertEquals(ObjectName.of("PRIMARY"), withoutIndex.indexes().getFirst().name());
+            assertTrue(withoutIndex.version().compareTo(withIndex.version()) > 0);
+            assertTrue(database.storage().tableDdlStorageService()
+                    .readSecondaryIndexDrop(withoutIndex.storageBinding().orElseThrow()).isEmpty());
+        }
+
+        try (DatabaseEngine reopened = new DatabaseEngine(config())) {
+            reopened.open();
+            try (var lease = reopened.dictionary().openTable(
+                    MdlOwnerId.of(105), QualifiedTableName.of("app", "orders"),
+                    TableAccessIntent.READ, Duration.ofSeconds(5))) {
+                assertEquals(List.of(ObjectName.of("PRIMARY")),
+                        lease.table().indexes().stream().map(index -> index.name()).toList());
+            }
+        }
+    }
+
+    /** 聚簇索引与不存在索引必须在 identity reserve/footer 写入前拒绝，不能生成误导性的未决 DDL。 */
+    @Test
+    void rejectsClusteredOrMissingIndexBeforePreparingDrop() {
+        try (DatabaseEngine database = new DatabaseEngine(config())) {
+            database.open();
+            database.ddl().createSchema(
+                    MdlOwnerId.of(106), ObjectName.of("app"), 1, 1, Duration.ofSeconds(5));
+            TableDefinition table = database.ddl().createTable(
+                    MdlOwnerId.of(106), updateCommand(), Duration.ofSeconds(5));
+
+            assertThrows(DictionaryDdlException.class, () -> database.ddl().dropSecondaryIndex(
+                    MdlOwnerId.of(107),
+                    new DropSecondaryIndexCommand(
+                            QualifiedTableName.of("app", "orders"), ObjectName.of("PRIMARY")),
+                    Duration.ofSeconds(5)));
+            assertThrows(DictionaryObjectNotFoundException.class,
+                    () -> database.ddl().dropSecondaryIndex(
+                            MdlOwnerId.of(108),
+                            new DropSecondaryIndexCommand(
+                                    QualifiedTableName.of("app", "orders"), ObjectName.of("missing_idx")),
+                            Duration.ofSeconds(5)));
+
+            try (var lease = database.dictionary().openTable(
+                    MdlOwnerId.of(109), QualifiedTableName.of("app", "orders"),
+                    TableAccessIntent.READ, Duration.ofSeconds(5))) {
+                assertEquals(1, lease.table().indexes().size());
+            }
+            assertTrue(database.storage().tableDdlStorageService()
+                    .readSecondaryIndexDrop(table.storageBinding().orElseThrow()).isEmpty());
+        }
+    }
+
+    /**
+     * 已打开的 READ metadata lease 持有 table shared MDL 时，DROP INDEX 的 table X 必须有界等待；
+     * lease 释放后继续执行，期间不得提前改 DD 或释放 segment。
+     *
+     * @throws Exception future 的有界等待或测试线程调度失败时保留原始异常
+     */
+    @Test
+    void waitsForExistingMetadataLeaseBeforeDroppingIndex() throws Exception {
+        try (DatabaseEngine database = new DatabaseEngine(config())) {
+            database.open();
+            database.ddl().createSchema(
+                    MdlOwnerId.of(115), ObjectName.of("app"), 1, 1, Duration.ofSeconds(5));
+            database.ddl().createTable(
+                    MdlOwnerId.of(115), updateCommand(), Duration.ofSeconds(5));
+            TableDefinition withIndex = database.ddl().createSecondaryIndex(
+                    MdlOwnerId.of(116), secondaryIndexCommand(), Duration.ofSeconds(5));
+            var lease = database.dictionary().openTable(
+                    MdlOwnerId.of(117), QualifiedTableName.of("app", "orders"),
+                    TableAccessIntent.READ, Duration.ofSeconds(5));
+            try (var executor = Executors.newSingleThreadExecutor()) {
+                var drop = executor.submit(() -> database.ddl().dropSecondaryIndex(
+                        MdlOwnerId.of(118), dropIndexCommand(), Duration.ofSeconds(5)));
+
+                assertThrows(java.util.concurrent.TimeoutException.class,
+                        () -> drop.get(200, TimeUnit.MILLISECONDS));
+                assertEquals(2, lease.table().indexes().size());
+                assertTrue(database.storage().tableDdlStorageService()
+                        .readSecondaryIndexDrop(withIndex.storageBinding().orElseThrow()).isEmpty());
+
+                lease.close();
+                assertEquals(1, drop.get(3, TimeUnit.SECONDS).indexes().size());
+            } finally {
+                lease.close();
+            }
+        }
+    }
+
+    /** 旧 DD 仍包含目标索引时，恢复只能清 DROP descriptor，不能回收仍被 committed metadata 引用的 segment。 */
+    @Test
+    void rollsBackDropIndexAfterDescriptorStagingCrash() {
+        StorageEngine storage = new StorageEngine(config());
+        storage.open();
+        Path tables = directory.resolve("drop-index-staged-tables");
+        try (FileInternalCatalogStore catalog = FileInternalCatalogStore.openOrCreate(
+                directory.resolve("drop-index-staged-mysql.ibd"));
+             DictionaryControlStore control = DictionaryControlStore.openOrCreate(
+                     directory.resolve("drop-index-staged-mysql.dd.ctrl"), SpaceId.of(1), 1024)) {
+            PersistentDictionaryRepository repository = new PersistentDictionaryRepository(catalog);
+            DictionaryObjectCache cache = new DictionaryObjectCache(16);
+            MetadataLockManager locks = new MetadataLockManager(8, 128);
+            DictionaryDdlService base = new DictionaryDdlService(
+                    control, repository, cache, locks, storage.tableDdlStorageService(), tables);
+            base.createSchema(MdlOwnerId.of(130), ObjectName.of("app"), 1, 1, Duration.ofSeconds(5));
+            base.createTable(MdlOwnerId.of(130), updateCommand(), Duration.ofSeconds(5));
+            TableDefinition withIndex = base.createSecondaryIndex(
+                    MdlOwnerId.of(131), secondaryIndexCommand(), Duration.ofSeconds(5));
+            DictionaryDdlService crashing = ddlWithFault(
+                    storage, control, repository, cache, locks, tables,
+                    new DictionaryDdlFaultInjector() {
+                        @Override
+                        public void afterDropPendingPublished(TableDefinition pending) {
+                        }
+
+                        @Override
+                        public void afterDropIndexStaged(
+                                cn.zhangyis.db.storage.api.ddl.SecondaryIndexDropDescriptor descriptor) {
+                            throw new DictionaryDdlException(
+                                    "injected crash after DROP INDEX descriptor stage");
+                        }
+                    });
+
+            assertThrows(DictionaryDdlException.class, () -> crashing.dropSecondaryIndex(
+                    MdlOwnerId.of(132), dropIndexCommand(), Duration.ofSeconds(5)));
+            assertTrue(storage.tableDdlStorageService()
+                    .readSecondaryIndexDrop(withIndex.storageBinding().orElseThrow()).isPresent());
+
+            new DictionaryDdlRecoveryService(
+                    control, repository, cache, storage.tableDdlStorageService(), tables)
+                    .recover(Duration.ofSeconds(5));
+
+            TableDefinition recovered = repository.findTable(withIndex.id()).orElseThrow();
+            assertEquals(2, recovered.indexes().size());
+            assertTrue(storage.tableDdlStorageService()
+                    .readSecondaryIndexDrop(recovered.storageBinding().orElseThrow()).isEmpty());
+            assertEquals(DdlLogPhase.ROLLED_BACK, repository.ddlLog()
+                    .find(cn.zhangyis.db.dd.domain.DdlId.of(4)).orElseThrow().phase());
+        } finally {
+            storage.close();
+        }
+    }
+
+    /**
+     * 新 DD 已 durable 而 DDL marker 仍为 PREPARED 时，恢复必须以前者为提交真相，完成两个 segment 回收并补终态。
+     */
+    @Test
+    void finishesDropIndexFromPreparedMarkerAfterDictionaryPublishCrash() {
+        StorageEngine storage = new StorageEngine(config());
+        storage.open();
+        Path tables = directory.resolve("drop-index-prepared-new-dd-tables");
+        try (FileInternalCatalogStore catalog = FileInternalCatalogStore.openOrCreate(
+                directory.resolve("drop-index-prepared-new-dd-mysql.ibd"));
+             DictionaryControlStore control = DictionaryControlStore.openOrCreate(
+                     directory.resolve("drop-index-prepared-new-dd-mysql.dd.ctrl"), SpaceId.of(1), 1024)) {
+            PersistentDictionaryRepository repository = new PersistentDictionaryRepository(catalog);
+            DictionaryObjectCache cache = new DictionaryObjectCache(16);
+            MetadataLockManager locks = new MetadataLockManager(8, 128);
+            DictionaryDdlService base = new DictionaryDdlService(
+                    control, repository, cache, locks, storage.tableDdlStorageService(), tables);
+            base.createSchema(MdlOwnerId.of(140), ObjectName.of("app"), 1, 1, Duration.ofSeconds(5));
+            base.createTable(MdlOwnerId.of(140), updateCommand(), Duration.ofSeconds(5));
+            TableDefinition withIndex = base.createSecondaryIndex(
+                    MdlOwnerId.of(141), secondaryIndexCommand(), Duration.ofSeconds(5));
+            DictionaryDdlService crashing = ddlWithFault(
+                    storage, control, repository, cache, locks, tables,
+                    new DictionaryDdlFaultInjector() {
+                        @Override
+                        public void afterDropPendingPublished(TableDefinition pending) {
+                        }
+
+                        @Override
+                        public void afterDropIndexDictionaryPublished(TableDefinition active) {
+                            throw new DictionaryDdlException(
+                                    "injected crash after DROP INDEX DD publish");
+                        }
+                    });
+
+            assertThrows(DictionaryDdlException.class, () -> crashing.dropSecondaryIndex(
+                    MdlOwnerId.of(142), dropIndexCommand(), Duration.ofSeconds(5)));
+            TableDefinition committed = repository.findTable(withIndex.id()).orElseThrow();
+            assertEquals(1, committed.indexes().size());
+            assertEquals(DdlLogPhase.PREPARED, repository.ddlLog()
+                    .find(cn.zhangyis.db.dd.domain.DdlId.of(4)).orElseThrow().phase());
+
+            new DictionaryDdlRecoveryService(
+                    control, repository, cache, storage.tableDdlStorageService(), tables)
+                    .recover(Duration.ofSeconds(5));
+
+            TableDefinition recovered = repository.findTable(withIndex.id()).orElseThrow();
+            assertEquals(1, recovered.indexes().size());
+            assertTrue(storage.tableDdlStorageService()
+                    .readSecondaryIndexDrop(recovered.storageBinding().orElseThrow()).isEmpty());
+            assertEquals(DdlLogPhase.COMMITTED, repository.ddlLog()
+                    .find(cn.zhangyis.db.dd.domain.DdlId.of(4)).orElseThrow().phase());
+        } finally {
+            storage.close();
+        }
+    }
+
     /** ENGINE_DONE 前后 DD 仍是旧版本时，恢复必须回收 staged segments/footer 并回滚 marker。 */
     @Test
     void rollsBackCreateIndexAfterEngineDoneCrash() {
@@ -1040,6 +1253,11 @@ class DictionaryDdlServiceTest {
                 new CreateIndexSpec(ObjectName.of("idx_value"), false, false,
                         List.of(new CreateIndexKeyPartSpec(
                                 ObjectName.of("value"), IndexOrder.ASC, 0))));
+    }
+
+    private static DropSecondaryIndexCommand dropIndexCommand() {
+        return new DropSecondaryIndexCommand(
+                QualifiedTableName.of("app", "orders"), ObjectName.of("idx_value"));
     }
 
     private EngineConfig config() {

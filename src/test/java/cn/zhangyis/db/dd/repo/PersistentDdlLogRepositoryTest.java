@@ -94,6 +94,31 @@ class PersistentDdlLogRepositoryTest {
         }
     }
 
+    /** DROP INDEX 使用 dictionary-first 删除状态机，并在每个 durable phase 保持目标 secondary identity。 */
+    @Test
+    void persistsDropIndexIdentityAndTransitionsAcrossRestart() {
+        Path catalog = directory.resolve("drop-index-mysql.ibd");
+        Path tablePath = directory.resolve("tables/table_11_space_1024.ibd");
+        try (FileInternalCatalogStore store = FileInternalCatalogStore.openOrCreate(catalog)) {
+            PersistentDdlLogRepository logs = new PersistentDdlLogRepository(store);
+            logs.prepare(new DdlLogRecord(
+                    new DdlUndoMarker(18, 32, 11), 23,
+                    DdlLogOperation.DROP_INDEX, DdlLogPhase.PREPARED,
+                    SpaceId.of(1024), tablePath));
+            logs.transition(DdlId.of(18), DdlLogPhase.PREPARED, DdlLogPhase.DICTIONARY_COMMITTED);
+            logs.transition(DdlId.of(18), DdlLogPhase.DICTIONARY_COMMITTED, DdlLogPhase.ENGINE_DONE);
+            logs.transition(DdlId.of(18), DdlLogPhase.ENGINE_DONE, DdlLogPhase.COMMITTED);
+        }
+
+        try (FileInternalCatalogStore store = FileInternalCatalogStore.openExisting(catalog)) {
+            DdlLogRecord recovered = new PersistentDdlLogRepository(store)
+                    .find(DdlId.of(18)).orElseThrow();
+            assertEquals(DdlLogOperation.DROP_INDEX, recovered.operation());
+            assertEquals(23, recovered.secondaryObjectId());
+            assertEquals(DdlLogPhase.COMMITTED, recovered.phase());
+        }
+    }
+
     /** 非法跳转、重复 prepare 与终态推进必须在 append 前拒绝，不能污染 durable phase history。 */
     @Test
     void rejectsInvalidTransitionsBeforePersistence() {

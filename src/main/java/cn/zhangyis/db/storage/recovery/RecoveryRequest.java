@@ -31,7 +31,7 @@ import java.util.Set;
  *                             否则新 MTR 会从 0 重新分配 LSN 覆盖已有日志。
  * @param transactionRecoveryContext 可选正式事务恢复上下文；在 redo replay 前装载 sidecar，期间接收 transaction delta。
  * @param transactionUndoRecovery 可选事务 undo 恢复参与者；消费 immutable snapshot 并负责正式 UNDO_ROLLBACK/RESUME_PURGE。
- * @param skipPolicy force-skip 恢复策略；NORMAL/READ_ONLY_VALIDATE 必须为空，避免普通启动隐式跳过数据。
+ * @param skipPolicy 对象级恢复排除策略；NORMAL/READ_ONLY 可携带 committed DD 隔离集合，但管理员集合仅 FORCE 可用。
  */
 public record RecoveryRequest(RecoveryMode mode,
                               RedoCheckpointStore checkpointStore,
@@ -45,7 +45,7 @@ public record RecoveryRequest(RecoveryMode mode,
                               RedoLogManager recoveredRedoManager,
                               TransactionRecoveryContext transactionRecoveryContext,
                               TransactionUndoRecoveryParticipant transactionUndoRecovery,
-                              RecoverySkipPolicy skipPolicy) {
+                              RecoverySpaceExclusionPolicy skipPolicy) {
 
     public RecoveryRequest {
         if (mode == null || checkpointStore == null || redoRepository == null
@@ -53,13 +53,15 @@ public record RecoveryRequest(RecoveryMode mode,
             throw new DatabaseValidationException("recovery request core dependencies must not be null");
         }
         if (skipPolicy == null) {
-            skipPolicy = RecoverySkipPolicy.none();
+            skipPolicy = RecoverySpaceExclusionPolicy.none();
         }
-        if (mode != RecoveryMode.FORCE_SKIP_CORRUPT_TABLESPACE && !skipPolicy.isEmpty()) {
+        if (mode != RecoveryMode.FORCE_SKIP_CORRUPT_TABLESPACE
+                && !skipPolicy.administrativeSpaces().isEmpty()) {
             throw new DatabaseValidationException(
-                    "skip policy is only allowed in FORCE_SKIP_CORRUPT_TABLESPACE mode");
+                    "administrative recovery exclusions are only allowed in FORCE_SKIP_CORRUPT_TABLESPACE mode");
         }
-        if (mode == RecoveryMode.FORCE_SKIP_CORRUPT_TABLESPACE && skipPolicy.isEmpty()) {
+        if (mode == RecoveryMode.FORCE_SKIP_CORRUPT_TABLESPACE
+                && skipPolicy.administrativeSpaces().isEmpty()) {
             throw new DatabaseValidationException("FORCE_SKIP_CORRUPT_TABLESPACE requires skipped spaces");
         }
         if (transactionUndoRecovery != null && transactionRecoveryContext == null) {
@@ -87,6 +89,27 @@ public record RecoveryRequest(RecoveryMode mode,
         spacesToReconcile = spacesToReconcile == null ? List.of() : List.copyOf(spacesToReconcile);
     }
 
+    /** 兼容仍按旧单集合模型构造请求的低层测试；该集合被解释为管理员本次声明。 */
+    public RecoveryRequest(RecoveryMode mode,
+                           RedoCheckpointStore checkpointStore,
+                           RedoLogFileRepository redoRepository,
+                           RedoApplyDispatcher dispatcher,
+                           RedoApplyContext applyContext,
+                           DoublewriteRecoveryScanner doublewriteScanner,
+                           List<PageId> pagesToRepair,
+                           UndoTablespaceRecoveryParticipant undoTablespaceRecovery,
+                           List<SpaceId> spacesToReconcile,
+                           RedoLogManager recoveredRedoManager,
+                           TransactionRecoveryContext transactionRecoveryContext,
+                           TransactionUndoRecoveryParticipant transactionUndoRecovery,
+                           RecoverySkipPolicy skipPolicy) {
+        this(mode, checkpointStore, redoRepository, dispatcher, applyContext, doublewriteScanner,
+                pagesToRepair, undoTablespaceRecovery, spacesToReconcile, recoveredRedoManager,
+                transactionRecoveryContext, transactionUndoRecovery,
+                skipPolicy == null ? RecoverySpaceExclusionPolicy.none()
+                        : RecoverySpaceExclusionPolicy.of(skipPolicy.skippedSpaces(), Set.of()));
+    }
+
     /**
      * 创建 NORMAL 模式请求。默认不检查 doublewrite 页，适合纯 redo replay 测试或后续 discovery 之前的空扫描。
      *
@@ -102,7 +125,7 @@ public record RecoveryRequest(RecoveryMode mode,
                                          RedoApplyContext applyContext) {
         return new RecoveryRequest(RecoveryMode.NORMAL, checkpointStore, redoRepository,
                 dispatcher, applyContext, null, List.of(), null, List.of(), null, null, null,
-                RecoverySkipPolicy.none());
+                RecoverySpaceExclusionPolicy.none());
     }
 
     /**
@@ -121,7 +144,7 @@ public record RecoveryRequest(RecoveryMode mode,
                                                    RedoApplyContext applyContext) {
         return new RecoveryRequest(RecoveryMode.READ_ONLY_VALIDATE, checkpointStore, redoRepository,
                 dispatcher, applyContext, null, List.of(), null, List.of(), null, null, null,
-                RecoverySkipPolicy.none());
+                RecoverySpaceExclusionPolicy.none());
     }
 
     /**
@@ -143,7 +166,22 @@ public record RecoveryRequest(RecoveryMode mode,
         return new RecoveryRequest(RecoveryMode.FORCE_SKIP_CORRUPT_TABLESPACE,
                 checkpointStore, redoRepository, dispatcher, applyContext,
                 null, List.of(), null, List.of(), null, null, null,
-                RecoverySkipPolicy.of(skippedSpaces));
+                RecoverySpaceExclusionPolicy.of(skippedSpaces, Set.of()));
+    }
+
+    /**
+     * 把组合根已从 committed DD 证明的隔离集合带入所有恢复模式；保持其它恢复输入逐字不变。
+     *
+     * @param policy 已保留管理员/DD 来源的完整对象级排除策略
+     * @return 携带同一恢复依赖和新排除证据的不可变请求
+     */
+    public RecoveryRequest withSpaceExclusionPolicy(RecoverySpaceExclusionPolicy policy) {
+        if (policy == null) {
+            throw new DatabaseValidationException("recovery space exclusion policy must not be null");
+        }
+        return new RecoveryRequest(mode, checkpointStore, redoRepository, dispatcher, applyContext,
+                doublewriteScanner, pagesToRepair, undoTablespaceRecovery, spacesToReconcile,
+                recoveredRedoManager, transactionRecoveryContext, transactionUndoRecovery, policy);
     }
 
     /**

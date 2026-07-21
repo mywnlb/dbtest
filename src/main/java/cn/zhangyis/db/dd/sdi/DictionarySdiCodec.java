@@ -529,7 +529,8 @@ public final class DictionarySdiCodec {
             case ACTIVE -> 1;
             case DROP_PENDING -> 2;
             case DROPPED -> 3;
-            case DISCARD_PENDING, DISCARDED, IMPORT_PENDING ->
+            case DISCARD_PENDING, DISCARDED, IMPORT_PENDING,
+                 RECOVERY_UNAVAILABLE, RECOVERY_DISCARDED ->
                     throw new DictionarySdiCorruptionException("non-active tablespace state cannot enter SDI: " + state);
         };
     }

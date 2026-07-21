@@ -10,15 +10,20 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
  * @param rolledBackActiveSlots 已执行 recovery rollback 并释放内存 slot 的 ACTIVE 段数量。
  * @param skippedActiveSlots 为 force-recovery 扩展保留的诊断字段；当前生产链不允许跳过 ACTIVE，固定为 0。
  * @param rebuiltHistoryEntries 从 COMMITTED undo header 重建并提交到内存 history list 的条目数量。
+ * @param skippedActiveRollbackRecords recovered ACTIVE 中目标表隔离、仅推进 logical head 的记录数
+ * @param skippedPreparedRollbackRecords recovered PREPARED rollback 中目标表隔离、仅推进 logical head 的记录数
  */
 public record TransactionUndoRecoveryResult(int restoredSlots,
                                             int rolledBackActiveSlots,
                                             int skippedActiveSlots,
-                                            int rebuiltHistoryEntries) {
+                                            int rebuiltHistoryEntries,
+                                            int skippedActiveRollbackRecords,
+                                            int skippedPreparedRollbackRecords) {
 
     public TransactionUndoRecoveryResult {
         if (restoredSlots < 0 || rolledBackActiveSlots < 0
-                || skippedActiveSlots < 0 || rebuiltHistoryEntries < 0) {
+                || skippedActiveSlots < 0 || rebuiltHistoryEntries < 0
+                || skippedActiveRollbackRecords < 0 || skippedPreparedRollbackRecords < 0) {
             throw new DatabaseValidationException("transaction undo recovery counters must not be negative");
         }
         if (rolledBackActiveSlots + skippedActiveSlots > restoredSlots) {
@@ -30,5 +35,11 @@ public record TransactionUndoRecoveryResult(int restoredSlots,
                     + restoredSlots + ", rolledBack=" + rolledBackActiveSlots
                     + ", skipped=" + skippedActiveSlots + ", history=" + rebuiltHistoryEntries);
         }
+    }
+
+    /** 兼容新增记录级隔离统计前的构造器。 */
+    public TransactionUndoRecoveryResult(int restoredSlots, int rolledBackActiveSlots,
+                                         int skippedActiveSlots, int rebuiltHistoryEntries) {
+        this(restoredSlots, rolledBackActiveSlots, skippedActiveSlots, rebuiltHistoryEntries, 0, 0);
     }
 }

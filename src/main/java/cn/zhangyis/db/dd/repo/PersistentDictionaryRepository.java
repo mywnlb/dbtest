@@ -365,7 +365,8 @@ public final class PersistentDictionaryRepository {
                                                      cn.zhangyis.db.dd.domain.TableState after) {
         return before == cn.zhangyis.db.dd.domain.TableState.ACTIVE
                 && (after == cn.zhangyis.db.dd.domain.TableState.DROP_PENDING
-                || after == cn.zhangyis.db.dd.domain.TableState.DISCARD_PENDING)
+                || after == cn.zhangyis.db.dd.domain.TableState.DISCARD_PENDING
+                || after == cn.zhangyis.db.dd.domain.TableState.RECOVERY_UNAVAILABLE)
                 || before == cn.zhangyis.db.dd.domain.TableState.DROP_PENDING
                 && after == cn.zhangyis.db.dd.domain.TableState.DROPPED
                 || before == cn.zhangyis.db.dd.domain.TableState.DISCARD_PENDING
@@ -373,7 +374,13 @@ public final class PersistentDictionaryRepository {
                 || before == cn.zhangyis.db.dd.domain.TableState.DISCARDED
                 && after == cn.zhangyis.db.dd.domain.TableState.IMPORT_PENDING
                 || before == cn.zhangyis.db.dd.domain.TableState.IMPORT_PENDING
-                && after == cn.zhangyis.db.dd.domain.TableState.ACTIVE;
+                && after == cn.zhangyis.db.dd.domain.TableState.ACTIVE
+                || before == cn.zhangyis.db.dd.domain.TableState.RECOVERY_UNAVAILABLE
+                && (after == cn.zhangyis.db.dd.domain.TableState.RECOVERY_DISCARDED
+                || after == cn.zhangyis.db.dd.domain.TableState.DROPPED)
+                || before == cn.zhangyis.db.dd.domain.TableState.RECOVERY_DISCARDED
+                && (after == cn.zhangyis.db.dd.domain.TableState.ACTIVE
+                || after == cn.zhangyis.db.dd.domain.TableState.DROPPED);
     }
 
     /**

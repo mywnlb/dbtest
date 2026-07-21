@@ -181,7 +181,8 @@ public final class PersistentDdlLogRepository {
             return false;
         }
         return switch (operation) {
-            case CREATE_TABLE, CREATE_INDEX, REBUILD_TABLE -> (from == DdlLogPhase.PREPARED
+            case CREATE_TABLE, CREATE_INDEX, REBUILD_TABLE, DISCARD_RECOVERY_UNAVAILABLE,
+                 DROP_RECOVERY_UNAVAILABLE, IMPORT_RECOVERY_REPLACEMENT -> (from == DdlLogPhase.PREPARED
                     && (to == DdlLogPhase.ENGINE_DONE || to == DdlLogPhase.ROLLED_BACK))
                     || (from == DdlLogPhase.ENGINE_DONE
                     && (to == DdlLogPhase.DICTIONARY_COMMITTED || to == DdlLogPhase.ROLLED_BACK))

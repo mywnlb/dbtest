@@ -32,4 +32,14 @@ public interface TransactionUndoRecoveryParticipant {
     default void resumePurgeAfterRedo() {
         // 低层无 persistent history 的参与者没有可恢复工作。
     }
+
+    /**
+     * 新恢复总控使用的带统计入口；默认先调用兼容 void 方法，再返回空摘要。
+     *
+     * @return 本次恢复期 purge 的完成与隔离记录统计
+     */
+    default cn.zhangyis.db.storage.trx.PurgeSummary resumePurgeAfterRedoWithSummary() {
+        resumePurgeAfterRedo();
+        return new cn.zhangyis.db.storage.trx.PurgeSummary(0, 0, 0, 0, 0);
+    }
 }

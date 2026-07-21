@@ -47,6 +47,19 @@ class RecoveryForceSkipModelTest {
         assertEquals(Set.of(SpaceId.of(7)), policy.skippedSpaces());
     }
 
+    /** 管理员本次声明与 DD 已隔离空间必须取并集，同时保留两类证据供报告和下次正常启动使用。 */
+    @Test
+    void exclusionPolicyUnionsAdministrativeAndDictionarySpaces() {
+        RecoverySpaceExclusionPolicy policy = RecoverySpaceExclusionPolicy.of(
+                Set.of(SpaceId.of(7)), Set.of(SpaceId.of(8), SpaceId.of(7)));
+
+        assertEquals(Set.of(SpaceId.of(7)), policy.administrativeSpaces());
+        assertEquals(Set.of(SpaceId.of(7), SpaceId.of(8)), policy.dictionarySpaces());
+        assertEquals(Set.of(SpaceId.of(7), SpaceId.of(8)), policy.excludedSpaces());
+        assertTrue(policy.shouldSkip(PageId.of(SpaceId.of(8), PageNo.of(3))));
+        assertEquals("[7, 8]", policy.describeExcludedSpaces());
+    }
+
     /**
      * 验证 {@code forceSkipRequestRequiresNonEmptySkippedSpaces} 所描述的空间分配或复用路径，并断言 extent/segment 所有权、链表和重复释放边界。
      *

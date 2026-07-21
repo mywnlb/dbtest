@@ -717,6 +717,16 @@ Kill 状态图见 [session-protocol-kill-cleanup-state.mmd](diagrams/session-pro
 14. processlist snapshot、diagnostic area、warning area。
 15. 并发、断连、timeout、golden packet 和端到端集成测试。
 
+## 16.1 2026-07-21 恢复导出只读会话边界
+
+- 公共组合根在 FORCE 对象隔离后发布 `RECOVERY_EXPORT_READ_ONLY`，在普通启动仍有隔离对象时发布
+  `DEGRADED`；模式与不可用表清单是本次 open 的稳定快照。
+- 导出只读只允许无锁普通 SELECT；目标表由 DD 返回 `TableRecoveryUnavailableException`，健康表仍可导出。
+- `FOR SHARE/FOR UPDATE`、INSERT/UPDATE/DELETE、DDL、COMMIT/ROLLBACK/SAVEPOINT、XA 等可能建立写事务、
+  事务锁或持久状态的命令，在 Session 分类和 `DefaultSqlStorageGateway` 二次守门处均被拒绝。
+- 低层 `StorageWriteAdmission` 继续封锁 MTR/checkpoint/后台 worker，防止新增 Session 语法或 Java 调用绕过
+  Session 分类。本 v1 没有权限系统、网络协议管理命令或 SQL 级 recovery backup/import 语法。
+
 ## 17. 十五轮自检记录
 
 | 轮次 | 检查主题 | 检查结果 |

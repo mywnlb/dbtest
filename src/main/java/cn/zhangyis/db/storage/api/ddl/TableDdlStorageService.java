@@ -28,6 +28,10 @@ import cn.zhangyis.db.storage.fsp.segment.SegmentPurpose;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
 import cn.zhangyis.db.storage.mtr.MiniTransactionState;
+import cn.zhangyis.db.storage.engine.StorageWriteAdmission;
+import cn.zhangyis.db.storage.fsp.lifecycle.TablespaceLifecycleHeader;
+import cn.zhangyis.db.storage.fsp.lifecycle.TablespaceLifecycleRawCodec;
+import cn.zhangyis.db.storage.page.PageImageChecksum;
 import cn.zhangyis.db.storage.redo.RedoBudgetPurpose;
 import cn.zhangyis.db.storage.redo.RedoBudgetWorkload;
 import cn.zhangyis.db.storage.sdi.SdiPageRepository;
@@ -52,8 +56,16 @@ import cn.zhangyis.db.storage.redo.RedoBudgetWorkload;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -123,6 +135,10 @@ public final class TableDdlStorageService {
      * 本实例 tablespace 的固定页大小；外部文件检查必须使用该权威配置，不能相信 SQL 或文件名提供的值。
      */
     private final PageSize pageSize;
+    /**
+     * 统一写准入闸门；raw 文件动作没有 MTR 可替它检查，因此必须在获得表空间独占 lease 前显式校验。
+     */
+    private final StorageWriteAdmission writeAdmission;
 
     /**
      * 创建 {@code TableDdlStorageService}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
@@ -146,9 +162,37 @@ public final class TableDdlStorageService {
                                   PageSize pageSize, SplitCapableBTreeIndexService btree,
                                   BTreeRootSnapshotService rootSnapshots,
                                   LobStorage lobStorage) {
+        this(mtrManager, disk, indexPages, pool, store, flush, accessController, pageSize,
+                btree, rootSnapshots, lobStorage, StorageWriteAdmission.normal());
+    }
+
+    /**
+     * 创建接入引擎统一写闸门的物理 DDL 门面。
+     *
+     * @param mtrManager 短物理事务协作者
+     * @param disk 空间管理稳定门面
+     * @param indexPages 索引页访问协作者
+     * @param pool 缓冲池；离线动作依赖其 resident-page 证据
+     * @param store 物理页文件入口
+     * @param flush WAL-safe 刷盘协作者
+     * @param accessController 与 MTR 共用的分空间准入控制器
+     * @param pageSize 实例固定页大小
+     * @param btree B+Tree DDL 协作者
+     * @param rootSnapshots B+Tree root 稳定快照协作者
+     * @param lobStorage LOB 迁移门面
+     * @param writeAdmission 组合根唯一写准入闸门；不得为 {@code null}
+     * @throws DatabaseValidationException 任一协作者为空时抛出
+     */
+    public TableDdlStorageService(MiniTransactionManager mtrManager, DiskSpaceManager disk,
+                                  IndexPageAccess indexPages, BufferPool pool, PageStore store,
+                                  FlushService flush, TablespaceAccessController accessController,
+                                  PageSize pageSize, SplitCapableBTreeIndexService btree,
+                                  BTreeRootSnapshotService rootSnapshots,
+                                  LobStorage lobStorage,
+                                  StorageWriteAdmission writeAdmission) {
         if (mtrManager == null || disk == null || indexPages == null || pool == null || store == null
                 || flush == null || accessController == null || pageSize == null
-                || btree == null || rootSnapshots == null || lobStorage == null) {
+                || btree == null || rootSnapshots == null || lobStorage == null || writeAdmission == null) {
             throw new DatabaseValidationException("table DDL storage collaborators must not be null");
         }
         this.mtrManager = mtrManager;
@@ -163,6 +207,7 @@ public final class TableDdlStorageService {
         this.btree = btree;
         this.rootSnapshots = rootSnapshots;
         this.lobStorage = lobStorage;
+        this.writeAdmission = writeAdmission;
     }
 
     /**
@@ -1521,6 +1566,251 @@ public final class TableDdlStorageService {
     }
 
     /**
+     * 不读取 page0 地把已隔离表空间移入受控 quarantine。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验写闸门、参数和绝对规范路径，拒绝符号链接，避免 FORCE 导出实例或路径替换绕过隔离。</li>
+     *     <li>取得该 SpaceId 的独占 operation lease，再证明 registry 未打开且 Buffer Pool 没有任何 resident frame。</li>
+     *     <li>按 source/destination 存在矩阵执行：两者同时存在即失败；source 缺失视为恢复重试完成；否则原子移动。</li>
+     *     <li>只记录物理终点，不读取、修复或相信损坏 page0；DD 状态由上层 DDL log 状态机另行发布。</li>
+     * </ol>
+     *
+     * @param binding DD 隔离表保存的稳定 table/space/canonical path 绑定
+     * @param quarantine 由实例受控目录和 table/space identity 派生的唯一目标路径
+     * @param timeout 调用方统一的正等待上界；当前文件动作不延长该上界
+     * @throws DatabaseValidationException 参数或路径不满足离线约束时抛出
+     * @throws TableDdlStorageException 发现打开句柄、缓存页、冲突文件或原子移动失败时抛出
+     */
+    public void discardRecoveryUnavailable(
+            TableStorageBinding binding, Path quarantine, Duration timeout) {
+        // 1. raw 路径没有 MTR 兜底，必须先检查统一写闸门和不可被目录穿越替换的路径身份。
+        validateOfflineArguments(binding, quarantine, timeout, "recovery discard");
+        writeAdmission.assertWriteAllowed();
+        Path source = checkedOfflinePath(binding.path(), "recovery discard source");
+        Path target = checkedOfflinePath(quarantine, "recovery discard target");
+        if (source.equals(target)) {
+            throw new DatabaseValidationException("recovery discard source and target must differ");
+        }
+
+        // 2. 独占 lease 阻止并发重新挂载；隔离空间正常启动不会进入 registry，也不得残留 frame。
+        try (TablespaceAccessLease ignored = accessController.acquireExclusive(binding.spaceId())) {
+            assertOffline(binding.spaceId(), "recovery discard");
+
+            // 3. 存在矩阵是恢复幂等性的唯一裁决，不解析可能损坏的 page0。
+            boolean sourceExists = Files.exists(source, LinkOption.NOFOLLOW_LINKS);
+            boolean targetExists = Files.exists(target, LinkOption.NOFOLLOW_LINKS);
+            if (sourceExists && targetExists) {
+                throw new TableDdlStorageException(
+                        "recovery discard source and target both exist: " + source + " / " + target);
+            }
+            if (!sourceExists) {
+                return;
+            }
+            try {
+                Files.createDirectories(target.getParent());
+                Files.move(source, target, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+            } catch (IOException failure) {
+                throw new TableDdlStorageException(
+                        "atomically move recovery-unavailable tablespace failed: " + source, failure);
+            }
+
+            // 4. 上层只有在本方法稳定返回后才能推进 ENGINE_DONE/字典终态。
+            log.info("discarded recovery-unavailable tablespace: table={} space={} quarantine={}",
+                    binding.tableId(), binding.spaceId().value(), target);
+        }
+    }
+
+    /**
+     * 不读取 page0 地幂等删除已隔离 canonical 文件；可信备份目录不属于本方法所有权。
+     *
+     * @param binding DD 隔离表保存的稳定物理绑定
+     * @param timeout 调用方统一的正等待上界
+     * @throws DatabaseValidationException 参数或路径非法时抛出
+     * @throws TableDdlStorageException 目标仍在线、仍有缓存页或删除失败时抛出
+     */
+    public void dropRecoveryUnavailable(TableStorageBinding binding, Duration timeout) {
+        dropRecoveryUnavailable(binding, binding == null ? null : binding.path(), timeout);
+    }
+
+    /**
+     * 删除隔离对象当前拥有的 exact 文件；RECOVERY_DISCARDED 调用方传固定 quarantine，可信备份目录永不传入。
+     *
+     * @param binding DD 中保留的原始 canonical identity
+     * @param source 本次状态实际拥有的 canonical 或固定 discarded 文件路径
+     * @param timeout 调用方统一的正等待上界
+     */
+    public void dropRecoveryUnavailable(
+            TableStorageBinding binding, Path source, Duration timeout) {
+        validateOfflineArguments(binding, source, timeout, "recovery drop");
+        writeAdmission.assertWriteAllowed();
+        Path checkedSource = checkedOfflinePath(source, "recovery drop source");
+        try (TablespaceAccessLease ignored = accessController.acquireExclusive(binding.spaceId())) {
+            assertOffline(binding.spaceId(), "recovery drop");
+            try {
+                Files.deleteIfExists(checkedSource);
+            } catch (IOException failure) {
+                throw new TableDdlStorageException(
+                        "delete recovery-unavailable tablespace failed: " + checkedSource, failure);
+            }
+            log.info("dropped recovery-unavailable tablespace: table={} space={} path={}",
+                    binding.tableId(), binding.spaceId().value(), checkedSource);
+        }
+    }
+
+    /**
+     * 为 ACTIVE 表生成稳定可信备份数据文件；manifest 与 HMAC 由 DD recovery-backup 层在本方法返回后最后发布。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验写准入、打开 binding 与全新受控目标，取得 SpaceId 独占 lease 阻断新的 MTR。</li>
+     *     <li>drain 脏页并 force canonical 文件，以 checkpoint LSN 建立稳定 clean-copy 边界。</li>
+     *     <li>复制到同目录临时文件，在副本 page0 写 DISCARDED lifecycle、重盖 checksum 并 force。</li>
+     *     <li>原子发布数据文件，重新检查 page0 identity 与整文件 hash；失败删除临时文件且不产生 manifest。</li>
+     * </ol>
+     *
+     * @param binding DD 锁内重读的 ACTIVE 物理绑定
+     * @param target recovery-backups 根内尚不存在的最终数据文件
+     * @param timeout drain 与 cache 协作使用的正上界
+     * @return 已 force 且可由 manifest 签名的不可变文件证据
+     * @throws TableDdlStorageException drain、复制、page0 改写、force 或 hash 失败时抛出
+     */
+    public RecoveryBackupFile createRecoveryBackupFile(
+            TableStorageBinding binding, Path target, Duration timeout) {
+        // 1. 备份会创建持久文件，导出只读/关闭闸门必须在取得资源前拒绝。
+        validateOfflineArguments(binding, target, timeout, "recovery backup");
+        writeAdmission.assertWriteAllowed();
+        requireOpenedPath(binding, "recovery backup");
+        Path normalizedTarget = checkedOfflinePath(target, "recovery backup target");
+        Path temporary = normalizedTarget.resolveSibling(
+                normalizedTarget.getFileName() + ".tmp");
+        if (Files.exists(normalizedTarget, LinkOption.NOFOLLOW_LINKS)
+                || Files.isSymbolicLink(temporary)) {
+            throw new TableDdlStorageException(
+                    "recovery backup target already exists or temporary is unsafe: " + normalizedTarget);
+        }
+
+        try (TablespaceAccessLease ignored = accessController.acquireExclusive(binding.spaceId())) {
+            // 2. X lease 内没有新页修改；drain+force 后 canonical bytes 对本次复制保持稳定。
+            TablespaceDrainResult drained = flush.drainTablespace(binding.spaceId(), timeout);
+            if (drained.timedOut()) {
+                throw new TableDdlStorageException(
+                        "timed out draining tablespace before recovery backup: "
+                                + binding.spaceId().value());
+            }
+            store.force(binding.spaceId());
+
+            // 3. 只修改副本生命周期；在线 canonical 始终保持 NORMAL，失败也不会影响服务文件。
+            try {
+                Files.createDirectories(normalizedTarget.getParent());
+                Files.deleteIfExists(temporary);
+                Files.copy(binding.path(), temporary, StandardCopyOption.COPY_ATTRIBUTES);
+                markBackupCopyDiscarded(temporary);
+                Files.move(temporary, normalizedTarget, StandardCopyOption.ATOMIC_MOVE);
+            } catch (IOException failure) {
+                throw new TableDdlStorageException(
+                        "create recovery backup data file failed: " + normalizedTarget, failure);
+            } finally {
+                try {
+                    Files.deleteIfExists(temporary);
+                } catch (IOException cleanupFailure) {
+                    log.warn("failed to clean recovery backup temporary file: {}", temporary, cleanupFailure);
+                }
+            }
+
+            // 4. 原子发布后从副本本身重建 identity/hash，manifest 不信任内存里的源文件假设。
+            TablespaceFileIdentity identity = fileInspection.inspect(
+                    normalizedTarget, binding.spaceId(), pageSize);
+            try {
+                return new RecoveryBackupFile(
+                        normalizedTarget, identity, drained.checkpointLsn(),
+                        Files.size(normalizedTarget), sha256(normalizedTarget));
+            } catch (IOException failure) {
+                throw new TableDdlStorageException(
+                        "read recovery backup evidence failed: " + normalizedTarget, failure);
+            }
+        }
+    }
+
+    /**
+     * 启动 DDL recovery 在 DD 已处于终态前重新挂载 ENGINE_DONE 的 NORMAL replacement；不产生写或 redo。
+     *
+     * @param binding marker 与 DD 共同确认的 replacement canonical binding
+     * @throws TableDdlStorageException 文件无法按 NORMAL page0 身份挂载时抛出并阻止开放流量
+     */
+    public void mountRecoveryReplacement(TableStorageBinding binding) {
+        if (binding == null) {
+            throw new DatabaseValidationException("recovery replacement binding must not be null");
+        }
+        Path path = checkedOfflinePath(binding.path(), "recovery replacement path");
+        try (TablespaceAccessLease ignored = accessController.acquireExclusive(binding.spaceId())) {
+            assertOffline(binding.spaceId(), "recovery replacement mount");
+            disk.openTablespaceForRecovery(binding.spaceId(), path);
+            if (disk.tablespaceState(binding.spaceId()) != TablespaceState.NORMAL) {
+                disk.closeTablespace(binding.spaceId());
+                throw new TableDdlStorageException(
+                        "recovery replacement page0 is not NORMAL: " + binding.spaceId().value());
+            }
+        }
+    }
+
+    /** 在离线副本 page0 原地写 DISCARDED 并重盖页校验和，随后 force 数据与 metadata。 */
+    private void markBackupCopyDiscarded(Path path) throws IOException {
+        byte[] page = new byte[pageSize.bytes()];
+        try (FileChannel channel = FileChannel.open(
+                path, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+            ByteBuffer buffer = ByteBuffer.wrap(page);
+            long readPosition = 0;
+            while (buffer.hasRemaining()) {
+                int read = channel.read(buffer, readPosition);
+                if (read < 0) {
+                    throw new IOException("unexpected EOF reading recovery backup page0");
+                }
+                readPosition += read;
+            }
+            TablespaceLifecycleHeader current = TablespaceLifecycleRawCodec
+                    .read(ByteBuffer.wrap(page)).orElseThrow(() ->
+                            new TableDdlStorageException(
+                                    "ACTIVE backup source lacks lifecycle marker: " + path));
+            if (current.state() != TablespaceState.NORMAL) {
+                throw new TableDdlStorageException(
+                        "recovery backup source page0 is not NORMAL: " + current.state());
+            }
+            TablespaceLifecycleHeader discarded = new TablespaceLifecycleHeader(
+                    TablespaceState.DISCARDED, current.initialSizeInPages(), 0,
+                    current.initialSizeInPages(), TablespaceState.NORMAL);
+            TablespaceLifecycleRawCodec.write(ByteBuffer.wrap(page), discarded);
+            PageImageChecksum.stamp(page, pageSize);
+            ByteBuffer output = ByteBuffer.wrap(page);
+            long writePosition = 0;
+            while (output.hasRemaining()) {
+                writePosition += channel.write(output, writePosition);
+            }
+            channel.force(true);
+        }
+    }
+
+    /** 流式计算整文件 SHA-256，避免把大型表空间一次性载入堆。 */
+    private static String sha256(Path path) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            try (InputStream input = Files.newInputStream(path)) {
+                byte[] buffer = new byte[64 * 1024];
+                int read;
+                while ((read = input.read(buffer)) >= 0) {
+                    if (read > 0) {
+                        digest.update(buffer, 0, read);
+                    }
+                }
+            }
+            return java.util.HexFormat.of().formatHex(digest.digest());
+        } catch (NoSuchAlgorithmException | IOException failure) {
+            throw new TableDdlStorageException(
+                    "compute recovery backup SHA-256 failed: " + path, failure);
+        }
+    }
+
+    /**
      * 校验外部 DISCARDED 文件、复制到 canonical path，并恢复 page0 NORMAL。
      *
      * <p>数据流：</p>
@@ -1692,6 +1982,50 @@ public final class TableDdlStorageService {
         if (!openedPath.equals(bindingPath)) {
             throw new TableDdlStorageException(operation + " binding path does not match opened tablespace: space="
                     + binding.spaceId().value() + " binding=" + bindingPath + " opened=" + openedPath);
+        }
+    }
+
+    /** 校验离线动作的领域参数，所有失败都早于 lease 与文件副作用。 */
+    private static void validateOfflineArguments(
+            TableStorageBinding binding, Path path, Duration timeout, String operation) {
+        if (binding == null || path == null || timeout == null || timeout.isZero() || timeout.isNegative()) {
+            throw new DatabaseValidationException(operation + " requires binding/path/positive timeout");
+        }
+    }
+
+    /** 规范化离线路径并逐级拒绝符号链接；DD 层仍负责把路径限制在具体业务根目录。 */
+    private static Path checkedOfflinePath(Path path, String role) {
+        if (!path.isAbsolute()) {
+            throw new DatabaseValidationException(role + " must be absolute: " + path);
+        }
+        Path normalized = path.toAbsolutePath().normalize();
+        if (hasSymbolicLinkComponent(normalized)) {
+            throw new DatabaseValidationException(role + " must not be a symbolic link: " + normalized);
+        }
+        return normalized;
+    }
+
+    /** 检查绝对路径的全部既有分量，阻止 canonical/transfer 父目录被链接替换后的 raw IO。 */
+    private static boolean hasSymbolicLinkComponent(Path path) {
+        Path current = path.getRoot();
+        for (Path component : path) {
+            current = current == null ? component : current.resolve(component);
+            if (Files.exists(current, LinkOption.NOFOLLOW_LINKS) && Files.isSymbolicLink(current)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 独占 lease 内证明目标没有运行期句柄或缓存帧，避免 raw 文件动作与页访问交叉。 */
+    private void assertOffline(cn.zhangyis.db.domain.SpaceId spaceId, String operation) {
+        if (disk.isTablespaceOpen(spaceId)) {
+            throw new TableDdlStorageException(operation + " requires unopened tablespace: " + spaceId.value());
+        }
+        boolean resident = pool.residentPageIds().stream()
+                .anyMatch(pageId -> pageId.spaceId().equals(spaceId));
+        if (resident) {
+            throw new TableDdlStorageException(operation + " found resident buffer frames: " + spaceId.value());
         }
     }
 

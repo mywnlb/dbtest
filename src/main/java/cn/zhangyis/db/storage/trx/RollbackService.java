@@ -377,7 +377,7 @@ public final class RollbackService {
             throw new DatabaseValidationException(
                     "prepared rollback transaction/index must not be null");
         }
-        return rollbackPreparedInternal(txn, clusteredIndex);
+        return rollbackPreparedInternal(txn, clusteredIndex, false);
     }
 
     /**
@@ -396,7 +396,18 @@ public final class RollbackService {
             throw new DatabaseValidationException(
                     "resolved prepared rollback requires UndoTargetMetadataResolver");
         }
-        return rollbackPreparedInternal(txn, null);
+        return rollbackPreparedInternal(txn, null, false);
+    }
+
+    /**
+     * 启动恢复专用 PREPARED 回滚；与 live 入口共享终态协议，但允许隔离目标仅推进系统 undo logical head。
+     *
+     * @param txn 从持久 PREPARED slot 恢复出的事务
+     * @param clusteredIndex legacy 单索引兼容目标；DD resolver 模式可为 {@code null}
+     * @return 健康 inverse 与隔离记录跳过数
+     */
+    public RollbackSummary rollbackPreparedRecovered(Transaction txn, BTreeIndex clusteredIndex) {
+        return rollbackPreparedInternal(txn, clusteredIndex, true);
     }
 
     /** prepared rollback 两种 metadata入口共用实现。
@@ -414,7 +425,8 @@ public final class RollbackService {
      * @return {@code rollbackPreparedInternal} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
      * @throws TransactionStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
      */
-    private RollbackSummary rollbackPreparedInternal(Transaction txn, BTreeIndex clusteredIndex) {
+    private RollbackSummary rollbackPreparedInternal(Transaction txn, BTreeIndex clusteredIndex,
+                                                      boolean recovered) {
         // 1、重试态显式保留 prepared origin；普通 ROLLING_BACK 不能进入。
         TransactionState initialState = txn.state();
         if (initialState != TransactionState.PREPARED
@@ -427,17 +439,25 @@ public final class RollbackService {
             throw new TransactionStateException(
                     "prepared rollback requires ordinary undo context");
         }
-        preflightAllBindings(clusteredIndex, context, emptyTargets());
+        if (recovered) {
+            for (UndoLogBinding binding : context.bindings()) {
+                preflightRecoveredBinding(clusteredIndex, binding);
+            }
+        } else {
+            preflightAllBindings(clusteredIndex, context, emptyTargets());
+        }
         // 2、只在首次决议时推进运行态；失败重试保持原态。
         if (initialState == TransactionState.PREPARED) {
             txnMgr.beginPreparedRollback(txn);
         }
         // 3、marker 更新不依赖 ACTIVE/PREPARED状态，只对持久 logical head做CAS。
-        int applied = rollbackAllBindings(context, clusteredIndex);
+        RollbackSummary progress = recovered
+                ? rollbackRecoveredBindings(context.bindings(), clusteredIndex)
+                : new RollbackSummary(rollbackAllBindings(context, clusteredIndex));
         // 4、物理 owner终结成功后才允许 manager发布 ROLLED_BACK。
         finalizer.finalizePreparedRollback(txn, context);
         txnMgr.finishPreparedRollback(txn);
-        return new RollbackSummary(applied);
+        return progress;
     }
 
     /** 普通与 prepared full rollback 共用的逐条 inverse/marker 循环；终结状态由各自调用方处理。
@@ -832,6 +852,7 @@ public final class RollbackService {
         boolean first = true;
         while (!rp.isNull()) {
             RecordAt at = readUndoRecord(binding.firstPageId(), clusteredIndex, rp);
+            requireLiveTargetAvailable(at);
             UndoRecord rec = at.record();
             long undoNo = rec.undoNo().value();
             if (first) {
@@ -1008,6 +1029,7 @@ public final class RollbackService {
      * @throws UndoLogFormatException 当前聚簇版本所有权、二级前态或 exact-version metadata 与 undo 证据冲突时抛出。
      */
     private void applyUndoRecordInOwnMtr(RecordAt at, BTreeIndex clusteredIndex) {
+        requireLiveTargetAvailable(at);
         // 1. 旧 undo 没有二级 tail，保持已有单树行为，也让低层测试不必伪造表级 wiring。
         if (at.record().secondaryMutations().isEmpty()) {
             applyClusteredInverseInOwnMtr(at);
@@ -1308,6 +1330,31 @@ public final class RollbackService {
     }
 
     /**
+     * 恢复隔离记录的专用 marker MTR：只验证 expected/target record 并更新系统 undo first-page，
+     * 不规划或释放 LOB，也不访问任何用户 B+Tree 页。
+     */
+    private void persistRecoveryUnavailableLogicalHead(PageId firstPageId,
+                                                       UndoLogicalHead expectedHead,
+                                                       UndoLogicalHead targetHead,
+                                                       RecordAt current,
+                                                       BTreeIndex clusteredIndex) {
+        BTreeIndex markerIndex = targetHead.isEmpty()
+                ? current.index()
+                : resolveIndexAt(firstPageId, targetHead.rollPointer(), clusteredIndex);
+        MiniTransaction marker = mtrMgr.begin(mtrMgr.budgetFor(
+                RedoBudgetPurpose.ROLLBACK_MARKER, rollbackMarkerWorkload(List.of())));
+        try {
+            UndoLogSegment writable = undoAccess.open(marker, firstPageId, PageLatchMode.EXCLUSIVE);
+            writable.updateLogicalHead(expectedHead, targetHead,
+                    markerIndex.keyDef(), markerIndex.schema());
+            mtrMgr.commit(marker);
+        } catch (RuntimeException error) {
+            rollbackActiveStateMtr(marker, error);
+            throw error;
+        }
+    }
+
+    /**
      * partial rollback 的所有 inverse 完成后，在一个 marker MTR 中按 PageId 排序更新一个或两个 first-page heads。
      * marker 永不领先数据修改；任一 CAS 失败都不发布内存保存点边界，事务由上层转为 rollback-only。
      *
@@ -1573,27 +1620,43 @@ public final class RollbackService {
             preflightRecoveredBinding(clusteredIndex, binding);
         }
         // 3、在中间分支复核阶段性结果；满足条件后，按恢复阶段应用物理页或事务状态变化，并维持领域不变量。
+        RollbackSummary progress = rollbackRecoveredBindings(bindings, clusteredIndex);
+        finalizer.finalizeRecoveredRollback(bindings, creatorTrxId);
+        // 4、发布恢复结果并释放恢复专用资源，以稳定返回或领域异常完成收口。
+        return progress;
+    }
+
+    /** recovered ACTIVE/PREPARED 共用逐记录循环；隔离记录只推进 head，健康记录仍执行完整 inverse。 */
+    private RollbackSummary rollbackRecoveredBindings(Collection<UndoLogBinding> source,
+                                                       BTreeIndex clusteredIndex) {
+        List<UndoLogBinding> bindings = new ArrayList<>(source);
         int applied = 0;
+        int skipped = 0;
         while (true) {
             UndoLogBinding binding = newestRecoveredBinding(bindings);
             if (binding == null) {
                 break;
             }
             UndoLogicalHead expectedHead = binding.logicalHead();
-            RecordAt current = readUndoRecord(binding.firstPageId(), clusteredIndex, expectedHead.rollPointer());
+            RecordAt current = readUndoRecord(binding.firstPageId(), clusteredIndex,
+                    expectedHead.rollPointer());
             UndoLogicalHead targetHead = derivePredecessorHead(
                     binding.firstPageId(), clusteredIndex, expectedHead, current);
-            applyUndoRecordInOwnMtr(current, clusteredIndex);
-            applied++;
-            progressFaultInjector.after(RollbackProgressPhase.AFTER_INVERSE_COMMIT, expectedHead);
-            persistLogicalHead(binding.firstPageId(), expectedHead, targetHead, current,
-                    clusteredIndex);
+            if (current.target().recoveryUnavailable()) {
+                persistRecoveryUnavailableLogicalHead(binding.firstPageId(), expectedHead,
+                        targetHead, current, clusteredIndex);
+                skipped++;
+            } else {
+                applyUndoRecordInOwnMtr(current, clusteredIndex);
+                applied++;
+                progressFaultInjector.after(RollbackProgressPhase.AFTER_INVERSE_COMMIT, expectedHead);
+                persistLogicalHead(binding.firstPageId(), expectedHead, targetHead, current,
+                        clusteredIndex);
+            }
             binding.publishHead(targetHead);
             progressFaultInjector.after(RollbackProgressPhase.AFTER_PROGRESS_COMMIT, targetHead);
         }
-        finalizer.finalizeRecoveredRollback(bindings, creatorTrxId);
-        // 4、发布恢复结果并释放恢复专用资源，以稳定返回或领域异常完成收口。
-        return new RollbackSummary(applied);
+        return new RollbackSummary(applied, skipped);
     }
 
     /** recovery 生产入口；每条 undo identity 通过 DD target resolver 定位，不接受 last-index fallback。
@@ -1628,6 +1691,13 @@ public final class RollbackService {
             }
             previous = at.record().undoNo().value();
             pointer = at.record().prevRollPointer();
+        }
+    }
+
+    /** live/statement/savepoint 前检必须在事务状态转换和用户页修改前拒绝隔离目标。 */
+    private static void requireLiveTargetAvailable(RecordAt at) {
+        if (at.target().recoveryUnavailable()) {
+            throw new UndoTargetUnavailableException(at.record().tableId());
         }
     }
 

@@ -557,6 +557,22 @@ force 模式必须显式配置并记录在 `RecoveryProgressJournal`。默认启
 14. recovery force mode。
 15. 故障注入和 crash point 集成测试。
 
+## 16.1 2026-07-21 对象级 Force Recovery v1 落点
+
+- `DatabaseEngine` 在 `StorageEngine` discovery 前运行 `DictionaryRecoveryIsolationPlanner`：管理员 SpaceId
+  必须唯一映射到 committed `ACTIVE/RECOVERY_UNAVAILABLE` file-per-table 对象；系统/undo、未知、共享
+  SpaceId/物理路径、非稳定状态和未决 DDL 相交全部在 DD 写入前 fail-closed。
+- FORCE 将全部新目标在一个字典事务内提交为 `RECOVERY_UNAVAILABLE`。普通启动从 DD 重建长期排除集合；
+  `RecoverySpaceExclusionPolicy` 再与管理员集合取并集，统一过滤 doublewrite、redo、文件 reconcile、undo 和 purge。
+- recovery rollback/purge 只有在完整解码当前 undo、验证 predecessor 与目标 disposition 后，才允许跳过不可用
+  对象的链首并推进持久进度；live rollback/purge 遇到同一目标仍抛异常，不能掩盖在线一致性错误。
+- FORCE 打开后使用 `RECOVERY_EXPORT_READ_ONLY`：Session、storage gateway、MTR、checkpoint 及后台 worker
+  共同拒绝写入；普通启动存在隔离对象时使用 `DEGRADED`，健康对象仍可服务。
+- 隔离对象的 DISCARD/DROP 走 raw/offline 物理路径，不读取 page0；可信 replacement import 以本实例
+  UUID/HMAC identity、完整文件 hash、定义 hash和 page0 identity 为证据，固定 op 8/9/10 DDL phase 可跨重启续作。
+- 本 v1 只支持用户 file-per-table，且访问模式在单次 open 生命周期内保持稳定；不修坏页、不隔离系统/undo/
+  共享空间，也不提供跨实例信任或 SQL 管理语法。
+
 ## 17. 十五轮自检记录
 
 | 轮次 | 检查主题 | 检查结果 |

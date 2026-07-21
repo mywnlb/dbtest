@@ -416,6 +416,21 @@ public final class DiskSpaceManager {
     }
 
     /**
+     * 判断运行期 registry 是否仍持有目标表空间句柄，不触发 page0 加载或文件打开。
+     *
+     * <p>该只读证据供 recovery-unavailable 的离线文件操作建立“不得绕过在线句柄”的前置条件；返回
+     * {@code false} 只说明本进程没有发布该空间，不证明路径一定存在或文件内容可信。</p>
+     *
+     * @param spaceId 待检查的稳定表空间标识；不得为 {@code null}
+     * @return registry 当前含有任意生命周期状态句柄时为 {@code true}
+     * @throws DatabaseValidationException 标识为空时抛出
+     */
+    public boolean isTablespaceOpen(SpaceId spaceId) {
+        requireSpace(spaceId);
+        return registry.isOpen(spaceId);
+    }
+
+    /**
      * 仅在当前进程把表空间标记为 INACTIVE，使后续普通空间管理准入抛 {@link TablespaceUnavailableException}。
      * 本方法不写 page0、不关闭文件；需要跨重启保持状态时必须由 UNDO lifecycle 编排写持久 marker。
      *

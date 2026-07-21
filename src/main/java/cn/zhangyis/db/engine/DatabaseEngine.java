@@ -10,6 +10,8 @@ import cn.zhangyis.db.engine.adapter.DefaultSqlDdlGateway;
 import cn.zhangyis.db.dd.ddl.DictionaryDdlService;
 import cn.zhangyis.db.dd.mdl.MetadataLockManager;
 import cn.zhangyis.db.dd.recovery.DictionaryDdlRecoveryService;
+import cn.zhangyis.db.dd.recovery.DictionaryRecoveryIsolationPlanner;
+import cn.zhangyis.db.dd.recovery.RecoveryIsolationPlan;
 import cn.zhangyis.db.dd.recovery.DictionaryRecoveryManifestRepository;
 import cn.zhangyis.db.dd.recovery.DictionaryRecoverySnapshotPublisher;
 import cn.zhangyis.db.dd.recovery.DictionaryTablespaceDiscovery;
@@ -22,9 +24,11 @@ import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.engine.EngineConfig;
 import cn.zhangyis.db.storage.engine.EngineTablespaceConfig;
 import cn.zhangyis.db.storage.engine.StorageEngine;
+import cn.zhangyis.db.storage.engine.RecoveryExportWriteRejectedException;
 import cn.zhangyis.db.storage.fil.catalog.FileInternalCatalogStore;
 import cn.zhangyis.db.storage.fil.catalog.FileDictionaryRecoveryManifestStore;
 import cn.zhangyis.db.engine.recovery.DatabaseInstanceFileLock;
+import cn.zhangyis.db.engine.recovery.RecoveryUnavailableTable;
 import cn.zhangyis.db.engine.xa.FileXaRegistry;
 import cn.zhangyis.db.engine.xa.PersistentXaCoordinator;
 import cn.zhangyis.db.storage.recovery.PreparedTransactionDecisionProvider;
@@ -155,6 +159,10 @@ public final class DatabaseEngine implements AutoCloseable {
      * 本对象持有的 {@code sessions} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
      */
     private SessionRegistry sessions;
+    /** 启动完成后稳定发布的访问能力；OPEN 之前保持 NORMAL 占位且不对外可读。 */
+    private volatile DatabaseAccessMode accessMode = DatabaseAccessMode.NORMAL;
+    /** committed DD 中全部恢复隔离对象的不可变诊断快照。 */
+    private volatile List<RecoveryUnavailableTable> unavailableTables = List.of();
 
     /**
      * 创建 {@code DatabaseEngine}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
@@ -230,7 +238,19 @@ public final class DatabaseEngine implements AutoCloseable {
                         FIRST_USER_SPACE_ID, manifestRepository);
                 repository = new PersistentDictionaryRepository(catalogStore, manifestRepository);
                 reconcileControlHighWater();
-                // 3. discovery 只消费 committed binding；StorageEngine recovery 完成前不创建 Session。
+                // 3. FORCE 先把整组 SpaceId 原子固化为 DD 隔离状态；普通启动也从 DD 重建长期排除集合。
+                RecoveryIsolationPlan isolationPlan = new DictionaryRecoveryIsolationPlanner(
+                        controlStore, repository, DICTIONARY_SPACE_ID, baseConfig.undoSpaceId(), tablesDirectory)
+                        .plan(baseConfig.recoveryMode(), baseConfig.forceSkippedSpaces());
+                unavailableTables = isolationPlan.unavailableTables();
+                accessMode = determineAccessMode(baseConfig, unavailableTables);
+                cache = new DictionaryObjectCache(DICTIONARY_CACHE_CAPACITY);
+                metadataLocks = new MetadataLockManager();
+                dictionary = new DataDictionaryService(repository, cache, metadataLocks);
+                DictionaryRecoverySnapshotPublisher cleanSnapshotPublisher =
+                        new DictionaryRecoverySnapshotPublisher(
+                                repository, controlStore, manifestRepository, tablesDirectory);
+                // 隔离提交后才允许 discovery；RECOVERY_UNAVAILABLE/RECOVERY_DISCARDED 永不进入用户文件打开列表。
                 DictionaryTablespaceDiscovery discovery =
                         new DictionaryTablespaceDiscovery(repository, tablesDirectory);
                 List<EngineTablespaceConfig> tablespaces = discovery.discover().stream()
@@ -241,24 +261,20 @@ public final class DatabaseEngine implements AutoCloseable {
                                 ? xaRegistry.decisionFor(transactionId)
                                 : preparedDecisionProvider.decisionFor(transactionId);
                 storage = new StorageEngine(
-                        baseConfig.withRecoveryTablespaces(tablespaces), compositePreparedDecisions);
+                        baseConfig.withRecoveryTablespaces(tablespaces), compositePreparedDecisions,
+                        isolationPlan.exclusionPolicy(), () -> {
+                            new DictionaryDdlRecoveryService(controlStore, repository, cache,
+                                    storage.tableDdlStorageServiceForRecoveryCompletion(), tablesDirectory,
+                                    storage.tablePurgeBarrierForRecoveryCompletion())
+                                    .recover(baseConfig.flushTimeout());
+                            cleanSnapshotPublisher.publish();
+                        });
                 storage.configureIndexMetadataResolver(new DictionaryIndexMetadataResolver(repository));
                 storage.open();
                 xaRegistry.completeRecoveryDecisions();
                 xaCoordinator = new PersistentXaCoordinator(xaRegistry);
 
-                cache = new DictionaryObjectCache(DICTIONARY_CACHE_CAPACITY);
-                metadataLocks = new MetadataLockManager();
-                dictionary = new DataDictionaryService(repository, cache, metadataLocks);
-                // 4. DDL/SDI/orphan 收敛后才允许 clean 覆盖此前 mutation intent。
-                new DictionaryDdlRecoveryService(controlStore, repository, cache,
-                        storage.tableDdlStorageService(), tablesDirectory, storage.tablePurgeBarrier())
-                        .recover(baseConfig.flushTimeout());
-                DictionaryRecoverySnapshotPublisher cleanSnapshotPublisher =
-                        new DictionaryRecoverySnapshotPublisher(
-                                repository, controlStore, manifestRepository, tablesDirectory);
-                // 旧健康实例首次升级在 DDL/SDI/orphan 全部收敛后生成首个 clean snapshot。
-                cleanSnapshotPublisher.publish();
+                // 4. DDL/SDI/orphan 与 clean publish 已在 StorageEngine completion hook 内、worker/写闸门发布前完成。
                 ddl = new DictionaryDdlService(controlStore, repository, cache, metadataLocks,
                         storage.tableDdlStorageService(), tablesDirectory, storage.tablePurgeBarrier(),
                         cn.zhangyis.db.dd.ddl.DictionaryDdlFaultInjector.NO_OP,
@@ -296,6 +312,7 @@ public final class DatabaseEngine implements AutoCloseable {
      */
     public DictionaryDdlService ddl() {
         requireOpen();
+        rejectRecoveryExportFacade("DDL");
         return ddl;
     }
 
@@ -305,7 +322,20 @@ public final class DatabaseEngine implements AutoCloseable {
      */
     public StorageEngine storage() {
         requireOpen();
+        rejectRecoveryExportFacade("raw storage");
         return storage;
+    }
+
+    /** @return 启动完成后稳定的数据库访问模式。 */
+    public DatabaseAccessMode accessMode() {
+        requireOpen();
+        return accessMode;
+    }
+
+    /** @return 按 TableId 排序的 committed 恢复隔离对象，不包含可变页或内部句柄。 */
+    public List<RecoveryUnavailableTable> unavailableTables() {
+        requireOpen();
+        return unavailableTables;
     }
 
     /**
@@ -323,11 +353,13 @@ public final class DatabaseEngine implements AutoCloseable {
             requireOpen();
             SessionId id = sessions.nextId();
             DefaultSqlStorageGateway gateway = new DefaultSqlStorageGateway(storage, sqlMetadataMapper,
-                    options.rowLockTimeout());
+                    options.rowLockTimeout(),
+                    accessMode == DatabaseAccessMode.RECOVERY_EXPORT_READ_ONLY);
             DefaultSqlSession session = new DefaultSqlSession(id, options, dictionary, sqlParser, sqlBinder,
                     new DefaultSqlExecutor(gateway), gateway, new DefaultSqlDdlGateway(ddl),
                     xaCoordinator,
                     sessionExecutionGate,
+                    accessMode == DatabaseAccessMode.RECOVERY_EXPORT_READ_ONLY,
                     () -> sessions.deregister(id));
             sessions.register(session);
             return session;
@@ -339,6 +371,27 @@ public final class DatabaseEngine implements AutoCloseable {
     /** 返回当前组合根生命周期状态，不触发任何 IO。 */
     public DatabaseEngineState state() {
         return state;
+    }
+
+    /** 根据请求模式和 commit 后隔离集合计算一次性服务能力，不从瞬时文件存在性推导。 */
+    private static DatabaseAccessMode determineAccessMode(
+            EngineConfig config, List<RecoveryUnavailableTable> unavailable) {
+        if (config.recoveryMode() == cn.zhangyis.db.storage.recovery.RecoveryMode.READ_ONLY_VALIDATE) {
+            return DatabaseAccessMode.VALIDATION_READ_ONLY;
+        }
+        if (config.recoveryMode()
+                == cn.zhangyis.db.storage.recovery.RecoveryMode.FORCE_SKIP_CORRUPT_TABLESPACE) {
+            return DatabaseAccessMode.RECOVERY_EXPORT_READ_ONLY;
+        }
+        return unavailable.isEmpty() ? DatabaseAccessMode.NORMAL : DatabaseAccessMode.DEGRADED;
+    }
+
+    /** FORCE 模式只经受限 SQL gateway 读取健康对象，禁止调用方取得可绕过写闸门的底层 facade。 */
+    private void rejectRecoveryExportFacade(String facade) {
+        if (accessMode == DatabaseAccessMode.RECOVERY_EXPORT_READ_ONLY) {
+            throw new RecoveryExportWriteRejectedException(
+                    facade + " facade is unavailable in recovery export read-only mode");
+        }
     }
 
     /**

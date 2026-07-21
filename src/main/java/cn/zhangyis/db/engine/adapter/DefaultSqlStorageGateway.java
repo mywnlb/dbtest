@@ -36,6 +36,7 @@ import cn.zhangyis.db.storage.btree.SearchKeyComparator;
 import cn.zhangyis.db.storage.btree.SecondaryIndexMetadata;
 import cn.zhangyis.db.storage.engine.EngineState;
 import cn.zhangyis.db.storage.engine.StorageEngine;
+import cn.zhangyis.db.storage.engine.RecoveryExportWriteRejectedException;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionState;
 import cn.zhangyis.db.storage.record.format.LogicalRecord;
@@ -87,6 +88,8 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
     private final DictionaryStorageMetadataMapper mapper;
     /** 行锁等待与 handle 并发占用都必须有界；Session 可用 statement timeout 构造此 adapter。 */
     private final Duration operationTimeout;
+    /** FORCE 导出模式的 gateway 级二次防线；即使绕过 Session AST 也不能写 storage。 */
+    private final boolean recoveryExportReadOnly;
     /** residual comparison 复用 Record 的 NULL/type/collation 排序，不在 SQL adapter 复制比较规则。 */
     private final SearchKeyComparator predicateComparator =
             new SearchKeyComparator(new TypeCodecRegistry());
@@ -101,6 +104,17 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
      */
     public DefaultSqlStorageGateway(StorageEngine engine, DictionaryStorageMetadataMapper mapper,
                                     Duration operationTimeout) {
+        this(engine, mapper, operationTimeout, false);
+    }
+
+    /**
+     * @param engine 当前已打开 storage 组合根
+     * @param mapper exact DD-to-storage mapper
+     * @param operationTimeout handle/lock 等待上限
+     * @param recoveryExportReadOnly 是否启用 FORCE 导出写拒绝
+     */
+    public DefaultSqlStorageGateway(StorageEngine engine, DictionaryStorageMetadataMapper mapper,
+                                    Duration operationTimeout, boolean recoveryExportReadOnly) {
         if (engine == null || mapper == null || operationTimeout == null
                 || operationTimeout.isZero() || operationTimeout.isNegative()) {
             throw new DatabaseValidationException("gateway engine/mapper/positive operation timeout required");
@@ -108,6 +122,7 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
         this.engine = engine;
         this.mapper = mapper;
         this.operationTimeout = operationTimeout;
+        this.recoveryExportReadOnly = recoveryExportReadOnly;
     }
 
     /** 显式映射 SQL isolation；v1 只开放已有 RR/RC ReadView 语义。
@@ -146,6 +161,7 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
      */
     @Override
     public SqlXaTransactionIdentity xaIdentity(SqlTransactionHandle transaction) {
+        rejectRecoveryExportWrite("XA identity/prepare");
         return withActive(transaction, null, handle -> {
             boolean hasWrites = handle.wrote || handle.transaction.undoContext() != null;
             long transactionId = hasWrites ? handle.transaction.transactionId().value() : 0;
@@ -175,6 +191,7 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
      */
     @Override
     public SqlXaPrepareOutcome prepareXa(SqlTransactionHandle transaction, Duration timeout) {
+        rejectRecoveryExportWrite("XA prepare");
         requirePositiveXaTimeout(timeout, "prepare");
         return withActive(transaction, null, handle -> {
             // 1、只有已有真实 write/undo owner 的 branch 才进入 storage PREPARED。
@@ -208,6 +225,7 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
     @Override
     public SqlXaCompletionOutcome commitPreparedXa(
             SqlTransactionHandle transaction, Duration timeout) {
+        rejectRecoveryExportWrite("XA prepared commit");
         requirePositiveXaTimeout(timeout, "commit prepared");
         return withXaState(transaction, true, handle -> {
             handle.state = EngineSqlTransactionHandle.State.COMMIT_DECIDED;
@@ -232,6 +250,7 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
     @Override
     public SqlXaCompletionOutcome rollbackPreparedXa(
             SqlTransactionHandle transaction, Duration timeout) {
+        rejectRecoveryExportWrite("XA prepared rollback");
         requirePositiveXaTimeout(timeout, "rollback prepared");
         return withXaState(transaction, false, handle -> {
             handle.state = EngineSqlTransactionHandle.State.ROLLBACK_DECIDED;
@@ -389,6 +408,7 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
     @Override
     public SqlWriteOutcome insert(SqlTransactionHandle transaction, BoundClusteredInsert statement,
                                   SqlStatementDeadline deadline) {
+        rejectRecoveryExportWrite("INSERT");
         if (statement == null || deadline == null) {
             throw new DatabaseValidationException("bound INSERT/deadline must not be null");
         }
@@ -434,6 +454,7 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
     @Override
     public SqlWriteOutcome update(SqlTransactionHandle transaction, BoundUpdate statement,
                                   SqlStatementDeadline deadline) {
+        rejectRecoveryExportWrite("UPDATE");
         if (statement == null || deadline == null) {
             throw new DatabaseValidationException("bound UPDATE/deadline must not be null");
         }
@@ -480,6 +501,7 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
     @Override
     public SqlWriteOutcome delete(SqlTransactionHandle transaction, BoundDelete statement,
                                   SqlStatementDeadline deadline) {
+        rejectRecoveryExportWrite("DELETE");
         if (statement == null || deadline == null) {
             throw new DatabaseValidationException("bound DELETE/deadline must not be null");
         }
@@ -746,6 +768,7 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
     @Override
     public SqlWriteOutcome updateRange(SqlTransactionHandle transaction, BoundRangeUpdate statement,
                                        SqlStatementDeadline deadline) {
+        rejectRecoveryExportWrite("range UPDATE");
         if (statement == null || deadline == null) {
             throw new DatabaseValidationException("bound range UPDATE/deadline must not be null");
         }
@@ -794,6 +817,7 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
     @Override
     public SqlWriteOutcome deleteRange(SqlTransactionHandle transaction, BoundRangeDelete statement,
                                        SqlStatementDeadline deadline) {
+        rejectRecoveryExportWrite("range DELETE");
         if (statement == null || deadline == null) {
             throw new DatabaseValidationException("bound range DELETE/deadline must not be null");
         }
@@ -1225,6 +1249,7 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
     public SqlCommitOutcome commit(SqlTransactionHandle transaction, SqlCommitRequest request) {
         if (request == null) throw new DatabaseValidationException("SQL commit request must not be null");
         return withActive(transaction, null, handle -> {
+            rejectRecoveryExportWrittenTransaction(handle, "commit");
             try {
                 SqlCommitOutcome outcome;
                 if (handle.wrote || handle.transaction.undoContext() != null) {
@@ -1258,6 +1283,7 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
     @Override
     public SqlRollbackOutcome rollback(SqlTransactionHandle transaction) {
         return withActive(transaction, null, handle -> {
+            rejectRecoveryExportWrittenTransaction(handle, "rollback");
             try {
                 SqlRollbackOutcome outcome;
                 if (handle.transaction.undoContext() != null) {
@@ -1285,6 +1311,22 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
                 throw adapt("rollback failed before physical rollback boundary", rollbackFailure);
             }
         });
+    }
+
+    /** 在任何 mutation facade 调用前拒绝 FORCE 导出写意图。 */
+    private void rejectRecoveryExportWrite(String operation) {
+        if (recoveryExportReadOnly) {
+            throw new RecoveryExportWriteRejectedException(
+                    operation + " is rejected in recovery export read-only mode");
+        }
+    }
+
+    /** 导出模式只允许终结从未写入且没有 undo context 的轻量事务。 */
+    private void rejectRecoveryExportWrittenTransaction(EngineSqlTransactionHandle handle, String operation) {
+        if (recoveryExportReadOnly && (handle.wrote || handle.transaction.undoContext() != null)) {
+            throw new RecoveryExportWriteRejectedException(
+                    operation + " rejected a written transaction in recovery export read-only mode");
+        }
     }
 
     private <T> T withActive(SqlTransactionHandle candidate, SqlStatementDeadline deadline,

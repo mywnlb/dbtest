@@ -58,8 +58,37 @@
       font-size: .91em;
     }
 
+    .storage-tree {
+      margin: 22px 0;
+      padding: 18px 20px;
+      overflow-x: auto;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--code);
+      color: #c9d1d9;
+      font: 13px/1.72 "Cascadia Code", Consolas, monospace;
+      white-space: pre;
+    }
+
+    .storage-tree code {
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: inherit;
+      font: inherit;
+    }
+
     .wrap {
       width: min(920px, calc(100% - 32px));
+      margin: 0 auto;
+    }
+
+    .content-shell {
+      display: grid;
+      grid-template-columns: 240px minmax(0, 920px);
+      gap: 40px;
+      align-items: start;
+      width: min(1200px, calc(100% - 40px));
       margin: 0 auto;
     }
 
@@ -110,8 +139,12 @@
     }
 
     nav {
+      position: sticky;
+      top: 20px;
+      max-height: calc(100vh - 40px);
       margin: 38px 0 22px;
-      padding: 24px;
+      padding: 20px 18px;
+      overflow-y: auto;
       border: 1px solid var(--border);
       border-radius: 12px;
       background: rgba(22, 27, 34, .76);
@@ -128,16 +161,23 @@
     }
 
     nav ol {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 8px 28px;
       margin: 0;
       padding-left: 22px;
     }
 
-    nav a { color: #c9d1d9; }
+    nav li + li { margin-top: 8px; }
 
-    main { padding: 20px 0 84px; }
+    nav a {
+      display: block;
+      color: #c9d1d9;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    main {
+      min-width: 0;
+      padding: 20px 0 84px;
+    }
 
     section {
       margin-top: 64px;
@@ -362,12 +402,97 @@
       font-size: 12px;
     }
 
+    .back-to-top {
+      position: fixed;
+      right: max(20px, env(safe-area-inset-right));
+      bottom: max(20px, env(safe-area-inset-bottom));
+      z-index: 100;
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      min-height: 44px;
+      padding: 9px 14px;
+      border: 1px solid rgba(88, 166, 255, .56);
+      border-radius: 999px;
+      background: rgba(22, 27, 34, .94);
+      box-shadow: 0 10px 28px rgba(0, 0, 0, .34);
+      color: #c9d1d9;
+      font: 600 13px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+      cursor: pointer;
+      opacity: 0;
+      visibility: hidden;
+      transform: translateY(10px);
+      pointer-events: none;
+      transition: opacity .2s ease, transform .2s ease, visibility .2s ease,
+                  border-color .2s ease, color .2s ease;
+    }
+
+    .back-to-top.is-visible {
+      opacity: 1;
+      visibility: visible;
+      transform: translateY(0);
+      pointer-events: auto;
+    }
+
+    .back-to-top:hover {
+      border-color: var(--blue);
+      color: #fff;
+    }
+
+    .back-to-top:focus-visible {
+      outline: 3px solid rgba(88, 166, 255, .34);
+      outline-offset: 3px;
+    }
+
+    .back-to-top__icon {
+      color: var(--blue);
+      font-size: 17px;
+      line-height: 1;
+    }
+
+    @media (max-width: 960px) {
+      .content-shell {
+        display: block;
+        width: min(920px, calc(100% - 32px));
+      }
+
+      nav {
+        position: static;
+        max-height: none;
+        padding: 24px;
+        overflow-y: visible;
+      }
+
+      nav ol {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 8px 28px;
+      }
+
+      nav li + li { margin-top: 0; }
+    }
+
     @media (max-width: 720px) {
       header { padding-top: 48px; }
       nav ol, .source-nav { grid-template-columns: 1fr; }
       .cards { grid-template-columns: 1fr; }
       section { margin-top: 52px; }
       figure { margin-left: -8px; margin-right: -8px; padding: 12px; }
+
+      .back-to-top {
+        right: max(14px, env(safe-area-inset-right));
+        bottom: max(14px, env(safe-area-inset-bottom));
+        justify-content: center;
+        width: 44px;
+        padding: 0;
+      }
+
+      .back-to-top__label { display: none; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      .back-to-top { transition: none; }
     }
   </style>
 </head>
@@ -381,19 +506,19 @@
         说明当前代码已经接通的真实链路，以及它与 MySQL 8.0 / InnoDB 之间有意保留的教学型差异。
       </p>
       <div class="meta">
-        <span>基于 2026-07-20 当前工作树</span>
+        <span>基于 2026-07-21 当前工作树</span>
         <span>以生产源码与 current implementation map 为准</span>
         <span>非 MySQL 二进制兼容实现</span>
       </div>
     </div>
   </header>
 
-  <div class="wrap">
+  <div class="content-shell">
     <nav aria-label="文章目录">
       <strong>Contents</strong>
       <ol>
         <li><a href="#overview">当前实现全景</a></li>
-        <li><a href="#physical">表空间、段、区与页</a></li>
+        <li><a href="#physical">磁盘物理与逻辑结构</a></li>
         <li><a href="#page">通用页信封与管理页</a></li>
         <li><a href="#memory">Buffer Pool 与 MTR</a></li>
         <li><a href="#record">INDEX 页与记录组织</a></li>
@@ -420,7 +545,7 @@
         <div class="cards">
           <div class="card">
             <b><span class="tag ok">WIRED</span> 数据访问</b>
-            <p>表级 DML → 事务/锁 → B+Tree → Record → MTR → Buffer Pool → PageStore。</p>
+            <p>TableDmlService 编排事务/锁与 B+Tree；B+Tree 用 Record 算子解释页内结构，并经 IndexPageAccess / MTR 访问 Buffer Pool。</p>
           </div>
           <div class="card">
             <b><span class="tag ok">WIRED</span> 持久化</b>
@@ -428,14 +553,14 @@
           </div>
           <div class="card">
             <b><span class="tag ok">WIRED</span> 恢复</b>
-            <p>启动时依次执行 Doublewrite 修复、Redo replay、未提交事务回滚与 Purge 恢复。</p>
+            <p>启动时按阶段完成 Doublewrite 修复、Redo replay、边界安装、Undo/文件续作、事务回滚与 Purge 恢复。</p>
           </div>
         </div>
 
         <figure>
           <svg viewBox="0 0 840 580" role="img" aria-labelledby="arch-title arch-desc">
             <title id="arch-title">当前存储引擎生产链路</title>
-            <desc id="arch-desc">从上层存储 API 到事务、B+Tree、记录、MTR、Buffer Pool、空间与文件，并展示 Redo、Flush 和恢复的侧向协作。</desc>
+            <desc id="arch-desc">从上层存储 API 到事务、B+Tree、记录、MTR、Buffer Pool、空间与文件，并展示 Redo 和 WAL 刷页协作。</desc>
             <defs>
               <marker id="a1" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
                 <path d="M0,0 L8,4 L0,8 Z" fill="#6e7681"/>
@@ -473,7 +598,6 @@
             <text x="420" y="291" fill="#e6edf3" font-size="14" text-anchor="middle" font-weight="700">Mini Transaction</text>
             <text x="420" y="311" fill="#9da7b3" font-size="11" text-anchor="middle">latch/fix memo · redo collect</text>
             <line x1="420" y1="222" x2="420" y2="265" stroke="#6e7681" marker-end="url(#a1)"/>
-            <line x1="665" y1="222" x2="523" y2="280" stroke="#6e7681" marker-end="url(#a1)"/>
 
             <rect x="72" y="366" width="206" height="62" rx="8" fill="#161b22" stroke="#4493f8"/>
             <text x="175" y="392" fill="#e6edf3" font-size="14" text-anchor="middle" font-weight="700">Redo Ring</text>
@@ -484,12 +608,12 @@
             <text x="420" y="413" fill="#9da7b3" font-size="11" text-anchor="middle">frame · LRU · dirty page</text>
 
             <rect x="562" y="366" width="206" height="62" rx="8" fill="#161b22" stroke="#4493f8"/>
-            <text x="665" y="392" fill="#e6edf3" font-size="14" text-anchor="middle" font-weight="700">FSP / Segment</text>
+            <text x="665" y="392" fill="#e6edf3" font-size="14" text-anchor="middle" font-weight="700">DiskSpaceManager / FSP</text>
             <text x="665" y="413" fill="#9da7b3" font-size="11" text-anchor="middle">extent · page allocation</text>
 
             <line x1="389" y1="324" x2="210" y2="365" stroke="#d29922" marker-end="url(#a1)"/>
             <line x1="420" y1="324" x2="420" y2="365" stroke="#6e7681" marker-end="url(#a1)"/>
-            <line x1="451" y1="324" x2="630" y2="365" stroke="#6e7681" marker-end="url(#a1)"/>
+            <path d="M488 222 C552 258, 610 312, 650 365" fill="none" stroke="#6e7681" marker-end="url(#a1)"/>
 
             <rect x="194" y="476" width="452" height="54" rx="8" fill="#161b22" stroke="#30363d"/>
             <text x="420" y="499" fill="#e6edf3" font-size="14" text-anchor="middle" font-weight="700">PageStore / FileChannel / Tablespace Files</text>
@@ -500,10 +624,8 @@
 
             <path d="M175 428 C175 462, 194 480, 218 493" fill="none" stroke="#3fb950" stroke-dasharray="5 4" marker-end="url(#a1)"/>
             <text x="78" y="456" fill="#3fb950" font-size="11">WAL / flush 协作</text>
-            <path d="M645 503 C760 503, 790 457, 790 345 C790 280, 768 242, 727 222" fill="none" stroke="#a371f7" stroke-dasharray="5 4" marker-end="url(#a1)"/>
-            <text x="700" y="342" fill="#a371f7" font-size="11" transform="rotate(-90 700 342)">recovery replay</text>
           </svg>
-          <figcaption>图 1：当前代码的主要生产调用与持有关系。虚线表示持久化/恢复协作，不表示普通前台调用方向。</figcaption>
+          <figcaption>图 1：当前代码的主要生产调用与持有关系。Record 与 MTR 是 B+Tree 的两类并列协作者；虚线只表示 WAL/刷页协作。</figcaption>
         </figure>
 
         <blockquote>
@@ -513,90 +635,335 @@
       </section>
 
       <section id="physical">
-        <h2 class="sec"><span class="no">02</span>表空间、段、区与页</h2>
+        <h2 class="sec"><span class="no">02</span>磁盘物理结构与逻辑组织</h2>
 
         <p>
-          物理文件由 <code>PageStore</code> 负责，空间生命周期与分配则由
+          物理结构和逻辑结构描述的是同一批数据的两个视角。物理视角回答“哪个文件、哪个页号、哪个字节偏移”；
+          逻辑视角回答“这张表的哪个索引、哪个 Segment 拥有哪些 Extent 和 Page”。当前实现的基本关系是：
+        </p>
+
+        <pre class="storage-tree"><code>物理定位：实例目录 → 持久文件 → Page（页号）→ 页内字节
+逻辑归属：DD Table → GENERAL Tablespace → Index / LOB → Segment → Extent / Fragment Page → Record
+事务历史：Transaction → INSERT / UPDATE Undo Log → UNDO Segment → UNDO / UNDO_PAYLOAD Page</code></pre>
+
+        <p>
+          <code>PageStore</code> 只负责按页读写表空间文件；
           <a href="../../src/main/java/cn/zhangyis/db/storage/api/DiskSpaceManager.java"><code>DiskSpaceManager</code></a>
-          协调 FSP、表空间注册表和访问租约。上层不会直接拿到 <code>FileChannel</code>；
-          每次针对已注册表空间的生产访问都先取得共享 operation lease，再进入 Buffer Pool/MTR 或页存储层。
+          才负责 FSP 元数据、生命周期、空间分配和访问租约。上层不会直接取得 <code>FileChannel</code>，
+          而 Segment、Extent、Record 也都不是独立操作系统文件。
+        </p>
+
+        <h3>物理结构一：实例目录中真实存在的文件</h3>
+        <p>
+          公共组合根以 <code>EngineConfig.baseDir</code> 为实例目录。文件名相似不等于格式相同：例如
+          <code>mysql.ibd</code> 是页对齐的追加式 DD catalog，当前并不是由 <code>PageStore</code> 管理的 FSP 表空间；
+          真正采用“Page 0 + Extent + Segment”格式的是用户表空间和系统 Undo 表空间。
         </p>
 
         <figure>
-          <svg viewBox="0 0 840 405" role="img" aria-labelledby="space-title space-desc">
-            <title id="space-title">表空间、区、段、页的关系</title>
-            <desc id="space-desc">一个表空间文件包含若干 extent，extent 包含固定数量页面；segment 跨 extent 组织同一用途页面。</desc>
+          <svg viewBox="0 0 840 600" role="img" aria-labelledby="files-title files-desc">
+            <title id="files-title">MiniMySQL 实例目录的物理文件组织</title>
+            <desc id="files-desc">实例目录分为数据与字典文件、日志与页恢复文件、控制与诊断文件三组。</desc>
             <defs>
-              <marker id="a2" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+              <marker id="a2a" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
                 <path d="M0,0 L8,4 L0,8 Z" fill="#6e7681"/>
               </marker>
             </defs>
-            <rect x="24" y="26" width="792" height="350" rx="14" fill="#0d1117" stroke="#30363d"/>
-            <text x="52" y="58" fill="#9da7b3" font-size="12" font-weight="700">TABLESPACE FILE</text>
+            <rect x="24" y="24" width="792" height="552" rx="14" fill="#0d1117" stroke="#30363d"/>
+            <text x="52" y="57" fill="#9da7b3" font-size="12" font-weight="700">INSTANCE PHYSICAL FILES</text>
 
-            <rect x="52" y="84" width="736" height="78" rx="8" fill="#161b22" stroke="#4493f8"/>
-            <g font-size="11" text-anchor="middle">
-              <rect x="66" y="99" width="102" height="48" rx="5" fill="#17263c" stroke="#4493f8"/>
-              <text x="117" y="119" fill="#e6edf3">Page 0</text><text x="117" y="137" fill="#9da7b3">FSP_HDR</text>
-              <rect x="176" y="99" width="102" height="48" rx="5" fill="#202234" stroke="#a371f7"/>
-              <text x="227" y="119" fill="#e6edf3">Page 1</text><text x="227" y="137" fill="#9da7b3">reserved</text>
-              <rect x="286" y="99" width="102" height="48" rx="5" fill="#1b2920" stroke="#3fb950"/>
-              <text x="337" y="119" fill="#e6edf3">Page 2</text><text x="337" y="137" fill="#9da7b3">INODE</text>
-              <rect x="396" y="99" width="118" height="48" rx="5" fill="#2a2114" stroke="#d29922"/>
-              <text x="455" y="119" fill="#e6edf3">Page 3</text><text x="455" y="137" fill="#9da7b3">SDI / RSEG</text>
-              <rect x="522" y="99" width="114" height="48" rx="5" fill="#161b22" stroke="#30363d"/>
-              <text x="579" y="119" fill="#e6edf3">Page 4 …</text><text x="579" y="137" fill="#9da7b3">data pages</text>
-              <rect x="644" y="99" width="126" height="48" rx="5" fill="#161b22" stroke="#30363d"/>
-              <text x="707" y="119" fill="#e6edf3">… Page N</text><text x="707" y="137" fill="#9da7b3">autoextend</text>
-            </g>
+            <rect x="300" y="74" width="240" height="54" rx="8" fill="#17263c" stroke="#4493f8"/>
+            <text x="420" y="97" fill="#e6edf3" font-size="14" text-anchor="middle" font-weight="700">EngineConfig.baseDir</text>
+            <text x="420" y="115" fill="#9da7b3" font-size="10.5" text-anchor="middle">一个实例的受控根目录</text>
+            <path d="M420 128 V151 H167 V169" fill="none" stroke="#6e7681" marker-end="url(#a2a)"/>
+            <path d="M420 151 V169" fill="none" stroke="#6e7681" marker-end="url(#a2a)"/>
+            <path d="M420 151 H673 V169" fill="none" stroke="#6e7681" marker-end="url(#a2a)"/>
 
-            <text x="52" y="201" fill="#9da7b3" font-size="12" font-weight="700">EXTENT OWNERSHIP</text>
-            <rect x="52" y="218" width="210" height="58" rx="7" fill="#161b22" stroke="#d29922"/>
-            <text x="157" y="243" fill="#e6edf3" font-size="13" text-anchor="middle" font-weight="700">Extent 0</text>
-            <text x="157" y="263" fill="#9da7b3" font-size="11" text-anchor="middle">页 0..3 固定保留</text>
-            <rect x="276" y="218" width="240" height="58" rx="7" fill="#161b22" stroke="#3fb950"/>
-            <text x="396" y="243" fill="#e6edf3" font-size="13" text-anchor="middle" font-weight="700">Extent 1 … K</text>
-            <text x="396" y="263" fill="#9da7b3" font-size="11" text-anchor="middle">FREE / FRAG / FSEG</text>
-            <rect x="530" y="218" width="258" height="58" rx="7" fill="#161b22" stroke="#4493f8"/>
-            <text x="659" y="243" fill="#e6edf3" font-size="13" text-anchor="middle" font-weight="700">按 PageSize 计算页数</text>
-            <text x="659" y="263" fill="#9da7b3" font-size="11" text-anchor="middle">不是固定“每区 64 页”</text>
+            <rect x="48" y="174" width="238" height="332" rx="10" fill="#111820" stroke="#3fb950"/>
+            <text x="167" y="200" fill="#b7e6bd" font-size="13" text-anchor="middle" font-weight="700">DATA / DICTIONARY</text>
+            <rect x="64" y="218" width="206" height="66" rx="7" fill="#17263c" stroke="#4493f8"/>
+            <text x="167" y="239" fill="#e6edf3" font-size="11" text-anchor="middle">tables/</text>
+            <text x="167" y="257" fill="#9da7b3" font-size="9.5" text-anchor="middle">table_&lt;tableId&gt;_space_&lt;spaceId&gt;.ibd</text>
+            <text x="167" y="273" fill="#4493f8" font-size="9.5" text-anchor="middle">GENERAL · PageStore/FSP</text>
+            <rect x="64" y="296" width="206" height="58" rx="7" fill="#1d1530" stroke="#a371f7"/>
+            <text x="167" y="319" fill="#e6edf3" font-size="11" text-anchor="middle">undo_&lt;spaceId&gt;.ibu</text>
+            <text x="167" y="339" fill="#9da7b3" font-size="9.5" text-anchor="middle">UNDO · RSEG / Undo Segment</text>
+            <rect x="64" y="366" width="206" height="58" rx="7" fill="#2a2114" stroke="#d29922"/>
+            <text x="167" y="389" fill="#e6edf3" font-size="11" text-anchor="middle">mysql.ibd</text>
+            <text x="167" y="409" fill="#9da7b3" font-size="9.5" text-anchor="middle">append-only DD + DDL phases</text>
+            <text x="167" y="452" fill="#6e7681" font-size="9.5" text-anchor="middle">扩展名相同，内部格式不同</text>
+            <text x="167" y="471" fill="#6e7681" font-size="9.5" text-anchor="middle">只有前两类进入 PageStore</text>
 
-            <text x="52" y="318" fill="#9da7b3" font-size="12" font-weight="700">LOGICAL SEGMENTS</text>
-            <path d="M184 337 C280 300, 480 300, 584 337" fill="none" stroke="#3fb950" stroke-width="4" opacity=".7"/>
-            <circle cx="184" cy="337" r="9" fill="#3fb950"/><circle cx="312" cy="319" r="9" fill="#3fb950"/>
-            <circle cx="454" cy="319" r="9" fill="#3fb950"/><circle cx="584" cy="337" r="9" fill="#3fb950"/>
-            <text x="658" y="341" fill="#c9d1d9" font-size="12">LEAF / NON_LEAF / LOB / UNDO / SYSTEM</text>
-            <line x1="586" y1="337" x2="646" y2="337" stroke="#6e7681" marker-end="url(#a2)"/>
+            <rect x="301" y="174" width="238" height="332" rx="10" fill="#111820" stroke="#f85149"/>
+            <text x="420" y="200" fill="#f3b5b2" font-size="13" text-anchor="middle" font-weight="700">WAL / PAGE RECOVERY</text>
+            <rect x="317" y="218" width="206" height="58" rx="7" fill="#2d1012" stroke="#f85149"/>
+            <text x="420" y="241" fill="#e6edf3" font-size="11" text-anchor="middle">redo/redo-NNNNNN.log</text>
+            <text x="420" y="261" fill="#9da7b3" font-size="9.5" text-anchor="middle">默认 8 × 8 MiB 文件环</text>
+            <rect x="317" y="288" width="206" height="66" rx="7" fill="#2d1012" stroke="#f85149"/>
+            <text x="420" y="311" fill="#e6edf3" font-size="10.5" text-anchor="middle">redo-control</text>
+            <text x="420" y="329" fill="#e6edf3" font-size="10.5" text-anchor="middle">transaction-recovery-control</text>
+            <text x="420" y="344" fill="#9da7b3" font-size="9" text-anchor="middle">checkpoint + trx recovery baseline</text>
+            <rect x="317" y="366" width="206" height="72" rx="7" fill="#202234" stroke="#a371f7"/>
+            <text x="420" y="389" fill="#e6edf3" font-size="10.5" text-anchor="middle">doublewrite-flush-list.dwb</text>
+            <text x="420" y="407" fill="#e6edf3" font-size="10.5" text-anchor="middle">doublewrite-lru.dwb</text>
+            <text x="420" y="425" fill="#9da7b3" font-size="9" text-anchor="middle">torn-page 完整页副本</text>
+            <text x="420" y="471" fill="#6e7681" font-size="9.5" text-anchor="middle">单文件 redo.log / 旧 doublewrite.dwb</text>
+            <text x="420" y="488" fill="#6e7681" font-size="9.5" text-anchor="middle">只在显式回退或兼容路径出现</text>
+
+            <rect x="554" y="174" width="238" height="332" rx="10" fill="#111820" stroke="#39c5cf"/>
+            <text x="673" y="200" fill="#a8e6ea" font-size="13" text-anchor="middle" font-weight="700">CONTROL / DIAGNOSTIC</text>
+            <rect x="570" y="218" width="206" height="62" rx="7" fill="#12262a" stroke="#39c5cf"/>
+            <text x="673" y="241" fill="#e6edf3" font-size="10.5" text-anchor="middle">mysql.dd.ctrl · mysql.dd.manifest</text>
+            <text x="673" y="261" fill="#9da7b3" font-size="9.5" text-anchor="middle">DD counter / clean recovery evidence</text>
+            <rect x="570" y="292" width="206" height="54" rx="7" fill="#12262a" stroke="#39c5cf"/>
+            <text x="673" y="314" fill="#e6edf3" font-size="11" text-anchor="middle">mysql.xa</text>
+            <text x="673" y="333" fill="#9da7b3" font-size="9.5" text-anchor="middle">XID / durable decision registry</text>
+            <rect x="570" y="358" width="206" height="54" rx="7" fill="#161b22" stroke="#6e7681"/>
+            <text x="673" y="380" fill="#e6edf3" font-size="11" text-anchor="middle">mysql.instance.lock</text>
+            <text x="673" y="399" fill="#9da7b3" font-size="9.5" text-anchor="middle">跨进程实例互斥，不保存业务数据</text>
+            <rect x="570" y="424" width="206" height="62" rx="7" fill="#161b22" stroke="#6e7681"/>
+            <text x="673" y="447" fill="#e6edf3" font-size="10.5" text-anchor="middle">buffer-pool.dump</text>
+            <text x="673" y="465" fill="#e6edf3" font-size="10.5" text-anchor="middle">recovery-progress.jsonl</text>
+            <text x="673" y="480" fill="#9da7b3" font-size="9" text-anchor="middle">可丢弃热页提示 / 诊断日志</text>
+
+            <rect x="48" y="526" width="744" height="32" rx="6" fill="#161b22" stroke="#30363d"/>
+            <text x="420" y="547" fill="#9da7b3" font-size="10" text-anchor="middle">按操作出现：tablespace-transfer/（discarded / incoming / rebuilding）与 catalog-recovery/（evidence / quarantine）</text>
           </svg>
-          <figcaption>图 2：表空间是物理文件；Extent 是空间分配单元；Segment 是跨页、跨区的逻辑所有权。</figcaption>
+          <figcaption>图 2A：实例目录的物理文件地图。数据页、WAL、恢复副本、字典和诊断文件具有不同权威性，不能仅凭扩展名归类。</figcaption>
         </figure>
 
-        <h3>页大小会改变区内页数</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>物理对象</th><th>当前路径/命名</th><th>保存内容与权威边界</th></tr></thead>
+            <tbody>
+              <tr><td><strong>用户表空间</strong></td><td><code>tables/table_&lt;tableId&gt;_space_&lt;spaceId&gt;.ibd</code></td><td>当前 CREATE TABLE 为每张表建立一个 GENERAL 单文件表空间；聚簇/二级索引、LOB、FSP 和 SDI 同文件。</td></tr>
+              <tr><td><strong>系统 Undo 表空间</strong></td><td><code>undo_&lt;spaceId&gt;.ibu</code></td><td>当前实例一个系统 Undo 空间、一个默认 Rollback Segment；保存 INSERT/UPDATE Undo 及外部 Undo payload。</td></tr>
+              <tr><td><strong>Redo 与 checkpoint</strong></td><td><code>redo/redo-NNNNNN.log</code>、<code>redo-control</code></td><td>Redo ring 保存可重放的 MTR batch；control 双槽保存 checkpoint label。默认环为 8 个 8 MiB 文件。</td></tr>
+              <tr><td><strong>Doublewrite</strong></td><td><code>doublewrite-flush-list.dwb</code>、<code>doublewrite-lru.dwb</code></td><td>保存刷页中的完整页副本，用于 torn page 修复；不是数据文件的第二份长期镜像。</td></tr>
+              <tr><td><strong>内部字典</strong></td><td><code>mysql.ibd</code>、<code>mysql.dd.ctrl</code>、<code>mysql.dd.manifest</code></td><td>分别保存追加式 DD/DDL history、双槽 identity 高水位和 clean recovery evidence；<code>mysql.ibd</code> 当前不是 FSP 表空间。</td></tr>
+              <tr><td><strong>事务恢复证据</strong></td><td><code>transaction-recovery-control</code>、<code>mysql.xa</code></td><td>前者保存事务计数器恢复基线；后者保存 server XID、PREPARED 与最终决议，二者都不能由普通数据页猜测替代。</td></tr>
+              <tr><td><strong>辅助文件</strong></td><td><code>buffer-pool.dump</code>、<code>recovery-progress.jsonl</code>、<code>mysql.instance.lock</code></td><td>分别用于热页预取提示、恢复诊断和跨进程互斥；前两者不是恢复正确性的权威输入。</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>物理结构二：单个 PageStore 表空间是一串定长页</h3>
         <p>
-          当前实现支持 4、8、16、32、64 KiB 页面。对于不大于 16 KiB 的页面，一个区保持 1 MiB；
-          32 KiB 页面使用 2 MiB 区，64 KiB 页面使用 4 MiB 区，因此大页配置仍保持 64 页/区。
+          用户 <code>.ibd</code> 和系统 <code>.ibu</code> 都是单文件表空间：页号从 0 开始线性排列，文件长度必须按实例
+          <code>PageSize</code> 对齐。Extent 是连续页号形成的物理分配单位；Extent 0 整区由系统保留，只有 page 0～3
+          具有固定管理职责，余下页不会交给普通 Segment 分配器，因此业务页从 Extent 1 开始。
+        </p>
+
+        <figure>
+          <svg viewBox="0 0 840 540" role="img" aria-labelledby="space-title space-desc">
+            <title id="space-title">当前表空间文件的线性物理结构</title>
+            <desc id="space-desc">Extent 0 整区系统保留，page 0 到 page 3 为固定管理页，普通数据和 undo 页面从 Extent 1 开始分配。</desc>
+            <defs>
+              <marker id="a2b" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+                <path d="M0,0 L8,4 L0,8 Z" fill="#6e7681"/>
+              </marker>
+            </defs>
+            <rect x="24" y="24" width="792" height="492" rx="14" fill="#0d1117" stroke="#30363d"/>
+            <text x="52" y="57" fill="#9da7b3" font-size="12" font-weight="700">PAGESTORE TABLESPACE FILE</text>
+            <text x="788" y="57" fill="#6e7681" font-size="10" text-anchor="end">offset(page N) = N × PageSize</text>
+
+            <rect x="52" y="78" width="736" height="152" rx="10" fill="#161b22" stroke="#d29922"/>
+            <text x="70" y="102" fill="#d8b969" font-size="12" font-weight="700">Extent 0 · SYSTEM RESERVED · XDES=FSEG_FRAG(owner 0)</text>
+            <g text-anchor="middle">
+              <rect x="68" y="118" width="132" height="82" rx="6" fill="#17263c" stroke="#4493f8"/>
+              <text x="134" y="141" fill="#e6edf3" font-size="11" font-weight="700">page 0 · FSP_HDR</text>
+              <text x="134" y="160" fill="#9da7b3" font-size="9.5">space header + lifecycle</text>
+              <text x="134" y="177" fill="#9da7b3" font-size="9.5">全部 v1 XDES entries</text>
+              <rect x="208" y="118" width="120" height="82" rx="6" fill="#202234" stroke="#a371f7"/>
+              <text x="268" y="141" fill="#e6edf3" font-size="11" font-weight="700">page 1 · IBUF</text>
+              <text x="268" y="160" fill="#9da7b3" font-size="9.5">信封已初始化</text>
+              <text x="268" y="177" fill="#a371f7" font-size="9.5">Change Buffer 未接线</text>
+              <rect x="336" y="118" width="120" height="82" rx="6" fill="#1b2920" stroke="#3fb950"/>
+              <text x="396" y="141" fill="#e6edf3" font-size="11" font-weight="700">page 2 · INODE</text>
+              <text x="396" y="160" fill="#9da7b3" font-size="9.5">SegmentInode array</text>
+              <text x="396" y="177" fill="#9da7b3" font-size="9.5">创建时信封已初始化</text>
+              <rect x="464" y="118" width="126" height="82" rx="6" fill="#2a2114" stroke="#d29922"/>
+              <text x="527" y="141" fill="#e6edf3" font-size="11" font-weight="700">page 3</text>
+              <text x="527" y="160" fill="#9da7b3" font-size="9.5">GENERAL → SDI v1</text>
+              <text x="527" y="177" fill="#9da7b3" font-size="9.5">UNDO → RSEG_HEADER v4</text>
+              <rect x="598" y="118" width="174" height="82" rx="6" fill="#161b22" stroke="#30363d"/>
+              <text x="685" y="141" fill="#e6edf3" font-size="11" font-weight="700">page 4 … extent0 末页</text>
+              <text x="685" y="160" fill="#9da7b3" font-size="9.5">系统保留尾部</text>
+              <text x="685" y="177" fill="#6e7681" font-size="9.5">普通 allocator 不返回</text>
+            </g>
+
+            <line x1="420" y1="230" x2="420" y2="258" stroke="#6e7681" marker-end="url(#a2b)"/>
+            <rect x="52" y="266" width="736" height="142" rx="10" fill="#161b22" stroke="#4493f8"/>
+            <text x="70" y="290" fill="#8fc3ff" font-size="12" font-weight="700">Extent 1 … K · FSP MANAGED</text>
+            <text x="770" y="290" fill="#6e7681" font-size="9.5" text-anchor="end">FREE / FREE_FRAG / FULL_FRAG / FSEG</text>
+            <g text-anchor="middle">
+              <rect x="68" y="310" width="116" height="68" rx="6" fill="#0d2847" stroke="#4493f8"/>
+              <text x="126" y="335" fill="#e6edf3" font-size="11">INDEX leaf</text>
+              <text x="126" y="355" fill="#9da7b3" font-size="9.5">clustered / secondary</text>
+              <rect x="192" y="310" width="116" height="68" rx="6" fill="#0d2818" stroke="#3fb950"/>
+              <text x="250" y="335" fill="#e6edf3" font-size="11">INDEX non-leaf</text>
+              <text x="250" y="355" fill="#9da7b3" font-size="9.5">node pointers</text>
+              <rect x="316" y="310" width="108" height="68" rx="6" fill="#2d1a0f" stroke="#d29922"/>
+              <text x="370" y="335" fill="#e6edf3" font-size="11">BLOB</text>
+              <text x="370" y="355" fill="#9da7b3" font-size="9.5">GENERAL only</text>
+              <rect x="432" y="310" width="108" height="68" rx="6" fill="#1d1530" stroke="#a371f7"/>
+              <text x="486" y="335" fill="#e6edf3" font-size="11">UNDO</text>
+              <text x="486" y="355" fill="#9da7b3" font-size="9.5">UNDO only</text>
+              <rect x="548" y="310" width="116" height="68" rx="6" fill="#1d1530" stroke="#a371f7"/>
+              <text x="606" y="335" fill="#e6edf3" font-size="11">UNDO_PAYLOAD</text>
+              <text x="606" y="355" fill="#9da7b3" font-size="9.5">large undo record</text>
+              <rect x="672" y="310" width="100" height="68" rx="6" fill="#161b22" stroke="#6e7681"/>
+              <text x="722" y="335" fill="#e6edf3" font-size="11">ALLOCATED</text>
+              <text x="722" y="355" fill="#9da7b3" font-size="9.5">zero / unused</text>
+            </g>
+
+            <rect x="52" y="432" width="352" height="56" rx="7" fill="#17263c" stroke="#4493f8"/>
+            <text x="228" y="455" fill="#e6edf3" font-size="11" text-anchor="middle" font-weight="700">page 0 XDES：从 Extent 视角记录状态、owner、bitmap</text>
+            <text x="228" y="474" fill="#9da7b3" font-size="9.5" text-anchor="middle">当前 v1 没有后续独立 XDES 管理页</text>
+            <rect x="436" y="432" width="352" height="56" rx="7" fill="#1b2920" stroke="#3fb950"/>
+            <text x="612" y="455" fill="#e6edf3" font-size="11" text-anchor="middle" font-weight="700">page 2 INODE：从 Segment 视角记录 fragment 与 extent lists</text>
+            <text x="612" y="474" fill="#9da7b3" font-size="9.5" text-anchor="middle">同一 Segment 的真实页号可以彼此不相邻</text>
+          </svg>
+          <figcaption>图 2B：当前单文件表空间的真实线性布局。Extent 0 整区保留；管理页与普通数据页都服从相同 PageSize。</figcaption>
+        </figure>
+
+        <div class="formula">
+          pageOffset = pageNo × PageSize.bytes　｜　pagesPerExtent = extentSizeBytes ÷ PageSize.bytes　｜　extentFirstPageNo = extentNo × pagesPerExtent
+        </div>
+
+        <h3>页大小同时决定 Extent 页数和当前 FSP 容量</h3>
+        <p>
+          当前实现支持 4、8、16、32、64 KiB 页面。页不大于 16 KiB 时 Extent 为 1 MiB；32 KiB 页面使用
+          2 MiB Extent，64 KiB 页面使用 4 MiB Extent。每个 XDES entry 固定 68 B，并含 256 bit 页位图；
+          只有前 <code>pagesPerExtent</code> 位有效。
         </p>
 
         <div class="table-wrap">
           <table>
-            <thead><tr><th>PageSize</th><th>Extent 物理大小</th><th>每区页数</th><th>设计含义</th></tr></thead>
+            <thead><tr><th>PageSize</th><th>Extent 大小</th><th>每区页数</th><th>page 0 可容纳 XDES</th><th>当前可描述容量</th></tr></thead>
             <tbody>
-              <tr><td>4 KiB</td><td>1 MiB</td><td>256</td><td>XDES 固定 256 bit，全部有效</td></tr>
-              <tr><td>8 KiB</td><td>1 MiB</td><td>128</td><td>只使用 bitmap 前 128 bit</td></tr>
-              <tr><td>16 KiB</td><td>1 MiB</td><td>64</td><td>默认教学配置常见取值</td></tr>
-              <tr><td>32 KiB</td><td>2 MiB</td><td>64</td><td>避免一个区只剩过少页面</td></tr>
-              <tr><td>64 KiB</td><td>4 MiB</td><td>64</td><td>保持相同的区内页数量级</td></tr>
+              <tr><td>4 KiB</td><td>1 MiB</td><td>256</td><td>56 个 Extent</td><td>约 56 MiB</td></tr>
+              <tr><td>8 KiB</td><td>1 MiB</td><td>128</td><td>116 个 Extent</td><td>约 116 MiB</td></tr>
+              <tr><td>16 KiB</td><td>1 MiB</td><td>64</td><td>237 个 Extent</td><td>约 237 MiB</td></tr>
+              <tr><td>32 KiB</td><td>2 MiB</td><td>64</td><td>478 个 Extent</td><td>约 956 MiB</td></tr>
+              <tr><td>64 KiB</td><td>4 MiB</td><td>64</td><td>960 个 Extent</td><td>约 3.75 GiB</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <blockquote class="warn">
+          <strong>当前实现边界：</strong>设计文档保留了未来独立 XDES 管理页的方向，但生产
+          <code>ExtentDescriptorRepository</code> 目前只支持 page 0 内嵌区域；超过上表容量会 fail-closed，
+          不能照搬 InnoDB“每隔固定范围再出现一组 XDES 页”的物理图。
+        </blockquote>
+
+        <h3>逻辑结构：Segment 是归属清单，不是连续文件区域</h3>
+        <p>
+          当前 CREATE TABLE 为表生成一个 <code>TableStorageBinding</code>。每个聚簇或二级索引都持有稳定 root
+          <code>PageId</code>、一个 <code>INDEX_LEAF</code> Segment 和一个 <code>INDEX_NON_LEAF</code> Segment；
+          表中存在可外置字段时还会建立一个表级 <code>LOB</code> Segment。Segment 的权威证据是 page 2 中的
+          <code>SegmentInode</code> entry，而不是文件中某段连续字节。
+        </p>
+
+        <figure>
+          <svg viewBox="0 0 840 650" role="img" aria-labelledby="logical-title logical-desc">
+            <title id="logical-title">表、索引、Segment、Extent 和物理页的逻辑归属</title>
+            <desc id="logical-desc">表的索引绑定指向稳定根页及叶子和非叶 Segment，Segment 通过 INODE 条目拥有分散的 fragment 页面和 extent。</desc>
+            <defs>
+              <marker id="a2c" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+                <path d="M0,0 L8,4 L0,8 Z" fill="#6e7681"/>
+              </marker>
+            </defs>
+            <rect x="24" y="24" width="792" height="602" rx="14" fill="#0d1117" stroke="#30363d"/>
+            <text x="52" y="57" fill="#9da7b3" font-size="12" font-weight="700">LOGICAL OWNERSHIP OVER PHYSICAL PAGES</text>
+
+            <rect x="298" y="74" width="244" height="54" rx="8" fill="#17263c" stroke="#4493f8"/>
+            <text x="420" y="97" fill="#e6edf3" font-size="13" text-anchor="middle" font-weight="700">DD Table → TableStorageBinding</text>
+            <text x="420" y="115" fill="#9da7b3" font-size="9.5" text-anchor="middle">spaceId · path · index bindings · optional LOB</text>
+            <path d="M360 128 L225 162" fill="none" stroke="#6e7681" marker-end="url(#a2c)"/>
+            <path d="M480 128 L615 162" fill="none" stroke="#6e7681" marker-end="url(#a2c)"/>
+
+            <rect x="52" y="166" width="346" height="82" rx="9" fill="#161b22" stroke="#4493f8"/>
+            <text x="225" y="189" fill="#e6edf3" font-size="12" text-anchor="middle" font-weight="700">IndexStorageBinding（每个 clustered / secondary 一份）</text>
+            <text x="225" y="210" fill="#9da7b3" font-size="10" text-anchor="middle">stable root PageId · leaf SegmentRef · non-leaf SegmentRef</text>
+            <text x="225" y="229" fill="#6e7681" font-size="9.5" text-anchor="middle">root 初建为 leaf；长高后 pageId 稳定，内部新页走 non-leaf segment</text>
+            <rect x="442" y="166" width="346" height="82" rx="9" fill="#161b22" stroke="#d29922"/>
+            <text x="615" y="189" fill="#e6edf3" font-size="12" text-anchor="middle" font-weight="700">Optional table LOB binding</text>
+            <text x="615" y="210" fill="#9da7b3" font-size="10" text-anchor="middle">一个表级 LOB SegmentRef</text>
+            <text x="615" y="229" fill="#6e7681" font-size="9.5" text-anchor="middle">TEXT / BLOB / JSON 外置值通过 LobReference 定位页链</text>
+
+            <path d="M147 248 V282" fill="none" stroke="#6e7681" marker-end="url(#a2c)"/>
+            <path d="M317 248 V282" fill="none" stroke="#6e7681" marker-end="url(#a2c)"/>
+            <path d="M487 248 V282" fill="none" stroke="#6e7681" marker-end="url(#a2c)"/>
+            <text x="420" y="273" fill="#9da7b3" font-size="10" text-anchor="middle">Segment identity 全部落到同一 tablespace 的 page 2</text>
+            <rect x="52" y="288" width="736" height="104" rx="10" fill="#161b22" stroke="#a371f7"/>
+            <text x="70" y="312" fill="#cdb6f6" font-size="12" font-weight="700">page 2 · INODE ARRAY（每条 entry 384 B）</text>
+            <g text-anchor="middle">
+              <rect x="70" y="326" width="154" height="46" rx="6" fill="#0d2847" stroke="#4493f8"/>
+              <text x="147" y="345" fill="#e6edf3" font-size="10.5">INDEX_LEAF entry</text>
+              <text x="147" y="361" fill="#9da7b3" font-size="9">fragment + extent lists</text>
+              <rect x="232" y="326" width="170" height="46" rx="6" fill="#0d2818" stroke="#3fb950"/>
+              <text x="317" y="345" fill="#e6edf3" font-size="10.5">INDEX_NON_LEAF entry</text>
+              <text x="317" y="361" fill="#9da7b3" font-size="9">fragment + extent lists</text>
+              <rect x="410" y="326" width="154" height="46" rx="6" fill="#2d1a0f" stroke="#d29922"/>
+              <text x="487" y="345" fill="#e6edf3" font-size="10.5">LOB entry</text>
+              <text x="487" y="361" fill="#9da7b3" font-size="9">optional</text>
+              <rect x="572" y="326" width="198" height="46" rx="6" fill="#1d1530" stroke="#a371f7"/>
+              <text x="671" y="345" fill="#e6edf3" font-size="10.5">UNDO / SYSTEM entry</text>
+              <text x="671" y="361" fill="#9da7b3" font-size="9">用于对应专用空间或内部 owner</text>
+            </g>
+
+            <path d="M250 392 V421" fill="none" stroke="#6e7681" marker-end="url(#a2c)"/>
+            <path d="M590 392 V421" fill="none" stroke="#6e7681" marker-end="url(#a2c)"/>
+            <rect x="52" y="428" width="352" height="72" rx="8" fill="#161b22" stroke="#3fb950"/>
+            <text x="228" y="451" fill="#e6edf3" font-size="11" text-anchor="middle" font-weight="700">每个 INODE entry 的拥有清单</text>
+            <text x="228" y="470" fill="#9da7b3" font-size="9.5" text-anchor="middle">32 个 fragment page slots</text>
+            <text x="228" y="487" fill="#9da7b3" font-size="9.5" text-anchor="middle">FREE / NOT_FULL / FULL 三条 segment extent list</text>
+            <rect x="436" y="428" width="352" height="72" rx="8" fill="#161b22" stroke="#4493f8"/>
+            <text x="612" y="451" fill="#e6edf3" font-size="11" text-anchor="middle" font-weight="700">page 0 的 XDES 交叉证明</text>
+            <text x="612" y="470" fill="#9da7b3" font-size="9.5" text-anchor="middle">每个 Extent：state · ownerSegment · list node</text>
+            <text x="612" y="487" fill="#9da7b3" font-size="9.5" text-anchor="middle">256 bit allocation bitmap（仅前 pagesPerExtent 位有效）</text>
+
+            <path d="M228 500 V530" fill="none" stroke="#6e7681" marker-end="url(#a2c)"/>
+            <path d="M612 500 V530" fill="none" stroke="#6e7681" marker-end="url(#a2c)"/>
+            <text x="420" y="535" fill="#9da7b3" font-size="10" text-anchor="middle">同色表示同一逻辑 Segment；在文件页号上可以被其它 Segment 或空闲 Extent 隔开</text>
+            <rect x="52" y="550" width="736" height="50" rx="7" fill="none" stroke="#6e7681"/>
+            <rect x="60" y="558" width="92" height="34" rx="4" fill="#0d2847" stroke="#4493f8"/><text x="106" y="579" fill="#e6edf3" font-size="9" text-anchor="middle">leaf frag pA</text>
+            <rect x="158" y="558" width="128" height="34" rx="4" fill="#0d2818" stroke="#3fb950"/><text x="222" y="579" fill="#e6edf3" font-size="9" text-anchor="middle">non-leaf Extent B</text>
+            <rect x="292" y="558" width="122" height="34" rx="4" fill="#0d2847" stroke="#4493f8"/><text x="353" y="579" fill="#e6edf3" font-size="9" text-anchor="middle">leaf Extent C</text>
+            <rect x="420" y="558" width="86" height="34" rx="4" fill="#161b22" stroke="#6e7681"/><text x="463" y="579" fill="#9da7b3" font-size="9" text-anchor="middle">FREE D</text>
+            <rect x="512" y="558" width="112" height="34" rx="4" fill="#2d1a0f" stroke="#d29922"/><text x="568" y="579" fill="#e6edf3" font-size="9" text-anchor="middle">LOB Extent E</text>
+            <rect x="630" y="558" width="150" height="34" rx="4" fill="#0d2847" stroke="#4493f8"/><text x="705" y="579" fill="#e6edf3" font-size="9" text-anchor="middle">leaf Extent F</text>
+            <text x="420" y="616" fill="#6e7681" font-size="9.5" text-anchor="middle">逻辑连续 ≠ 物理相邻；B+Tree key 顺序与文件页号顺序也是两套独立顺序</text>
+          </svg>
+          <figcaption>图 2C：逻辑结构由 DD binding、INODE 和 XDES 共同表达；Segment 通过清单认领分散的页，而不是占据一段连续文件。</figcaption>
+        </figure>
+
+        <p>
+          每个索引 root 初建时从 leaf Segment 分配并保持物理页号稳定；root split 会在原页重建更高层级，
+          新叶页继续从 leaf Segment 分配，新增内部 child/sibling 页从 non-leaf Segment 分配。因此不能仅凭
+          <code>PAGE_LEVEL</code> 反推 root 页最初的 FSP Segment 归属。
+        </p>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>权威结构</th><th>粒度</th><th>当前落盘内容</th><th>回答的问题</th></tr></thead>
+            <tbody>
+              <tr><td><strong>DD / SDI binding</strong></td><td>表、索引</td><td>space/path、root PageId、leaf/non-leaf SegmentRef、可选 LOB SegmentRef</td><td>“这张表和这棵索引从哪里打开？”</td></tr>
+              <tr><td><strong>SegmentInode</strong></td><td>Segment</td><td>384 B：segment id/purpose、使用与预留页数、三条 extent list、32 个 fragment slot</td><td>“这个 Segment 拥有哪些页和区？”</td></tr>
+              <tr><td><strong>XDES entry</strong></td><td>Extent</td><td>68 B：state、owner segment、双向 list node、256 bit 分配位图</td><td>“这个 Extent 属于谁、哪些页已占用？”</td></tr>
+              <tr><td><strong>FilePageHeader</strong></td><td>Page</td><td>spaceId、pageNo、prev/next、pageLSN、pageType、checksum/trailer</td><td>“这张物理页是谁、如何恢复和校验？”</td></tr>
             </tbody>
           </table>
         </div>
 
         <h3>页面分配不是直接“文件尾追加”</h3>
         <ol class="steps">
-          <li><strong>先用 fragment page。</strong>Segment 尚小时，优先消费最多 32 个 fragment slot，避免过早独占整个区。</li>
-          <li><strong>再用已有 segment extent。</strong>在属于该段且仍有空闲位的区内分配页面。</li>
-          <li><strong>需要时申请新 extent。</strong>叶段可依据顺序插入方向批量预留 1～4 个区；非叶段不使用方向提示。</li>
-          <li><strong>空间不足时自动扩展一次。</strong><code>DiskSpaceManager</code> 扩展文件并更新 FSP 元数据，然后重新尝试分配。</li>
-          <li><strong>同一 MTR 记录物理变化。</strong>分配至少产生 <code>FSP_PAGE_ALLOC</code> 与 <code>PAGE_INIT</code> Redo，避免元数据与新页初始化脱节。</li>
+          <li><strong>先用 fragment page。</strong>Segment 尚小时，从公共 <code>FREE_FRAG</code> Extent 取单页，并把页号写进该 INODE entry 的最多 32 个 fragment slot。</li>
+          <li><strong>再用已有 Segment Extent。</strong>分配器沿该 Segment 的 <code>NOT_FULL</code> 或 <code>FREE</code> extent list 找候选，并同时更新 XDES bitmap 和 INODE 计数。</li>
+          <li><strong>需要时取得新 Extent。</strong>叶段可根据顺序插入方向一次取得并挂入 1～4 个区；非叶、LOB、UNDO 和无方向请求保持单区取得。</li>
+          <li><strong>物理空间不足时先扩文件。</strong><code>DiskSpaceManager</code> 通过 <code>PageStore.ensureCapacity/extend</code> 扩展零填充文件，更新 page 0 的 <code>currentSizeInPages</code> 后重试。</li>
+          <li><strong>同一 MTR 封闭元数据与新页。</strong>分配至少产生 <code>FSP_PAGE_ALLOC</code> 和 <code>PAGE_INIT</code>，并为 XDES/INODE/FLST after-image 收集 Redo，避免“页已出现但归属账本未恢复”。</li>
         </ol>
       </section>
 
@@ -604,10 +971,11 @@
         <h2 class="sec"><span class="no">03</span>通用页信封与固定管理页</h2>
 
         <p>
-          所有持久页都先服从
+          所有已经格式化的表空间页都先服从
           <a href="../../src/main/java/cn/zhangyis/db/storage/page/PageEnvelopeLayout.java"><code>PageEnvelopeLayout</code></a>：
           前 38 字节是通用物理头，最后 8 字节是 trailer。INDEX、UNDO、FSP 等页面只在两者之间解释自己的类型区域。
-          这让磁盘层可以校验页身份、校验和与 page LSN，却不需要理解 record 或事务语义。
+          这使 page0 loader、恢复扫描和各 typed entrance 能在不理解 record 业务语义的前提下校验各自负责的
+          页身份、格式、校验和或 page LSN；普通 Buffer Pool 装载本身不承担统一的全页校验。
         </p>
 
         <figure>
@@ -624,8 +992,9 @@
 
             <rect x="270" y="91" width="354" height="92" rx="7" fill="#161b22" stroke="#3fb950"/>
             <text x="447" y="116" fill="#e6edf3" font-size="14" text-anchor="middle" font-weight="700">Type-specific Body</text>
-            <text x="447" y="141" fill="#9da7b3" font-size="11" text-anchor="middle">FSP_HDR / INODE / SDI / INDEX / UNDO / RSEG / BLOB</text>
-            <text x="447" y="160" fill="#9da7b3" font-size="11" text-anchor="middle">布局由对应模块解释，FIL 层不越界解析</text>
+            <text x="447" y="137" fill="#9da7b3" font-size="10.5" text-anchor="middle">FSP_HDR / INODE / SDI / INDEX / UNDO</text>
+            <text x="447" y="154" fill="#9da7b3" font-size="10.5" text-anchor="middle">RSEG_HEADER / BLOB / UNDO_PAYLOAD</text>
+            <text x="447" y="172" fill="#9da7b3" font-size="11" text-anchor="middle">布局由对应模块解释，FIL 层不越界解析</text>
 
             <rect x="634" y="91" width="152" height="92" rx="7" fill="#202234" stroke="#a371f7"/>
             <text x="710" y="116" fill="#e6edf3" font-size="14" text-anchor="middle" font-weight="700">Trailer · 8 B</text>
@@ -642,9 +1011,10 @@
             <text x="586" y="244" fill="#6e7681" font-size="11">pageSize - 8</text>
             <text x="739" y="244" fill="#6e7681" font-size="11">pageSize</text>
 
-            <text x="52" y="276" fill="#d29922" font-size="11">打开已有页时会校验 pageNo、pageType、checksum 与 trailer；损坏页按 fail-closed 处理。</text>
+            <text x="52" y="270" fill="#d29922" font-size="10.5">Page 0 loader 校验信封、checksum 与 trailer；INDEX / UNDO 类型入口另行校验结构或版本。</text>
+            <text x="52" y="286" fill="#d29922" font-size="10.5">Buffer Pool 的普通缺页装载并不会对所有页统一执行 checksum 校验。</text>
           </svg>
-          <figcaption>图 3：所有页共享相同的物理信封，模块专属内容只存在于 body。</figcaption>
+          <figcaption>图 3：所有已格式化页面共享相同的物理信封，模块专属内容只存在于 body。</figcaption>
         </figure>
 
         <div class="table-wrap">
@@ -652,15 +1022,19 @@
             <thead><tr><th>固定位置</th><th>GENERAL 表空间</th><th>UNDO 表空间</th><th>当前用途</th></tr></thead>
             <tbody>
               <tr><td><strong>Page 0</strong></td><td>FSP_HDR</td><td>FSP_HDR</td><td>空间配置、生命周期与页 0 内嵌 XDES</td></tr>
-              <tr><td><strong>Page 1</strong></td><td>IBUF_BITMAP（预留）</td><td>IBUF_BITMAP（预留）</td><td><span class="tag reserved">UNWIRED</span> 当前没有 Change Buffer</td></tr>
-              <tr><td><strong>Page 2</strong></td><td>INODE</td><td>INODE</td><td>段头、fragment slot 与 extent 所有权</td></tr>
-              <tr><td><strong>Page 3</strong></td><td>SDI</td><td>RSEG_HEADER v4</td><td>普通空间保存元数据映像；Undo 空间保存回滚段权威状态</td></tr>
+              <tr><td><strong>Page 1</strong></td><td>IBUF_BITMAP 信封</td><td>IBUF_BITMAP 信封</td><td>创建表空间时已格式化物理信封；<span class="tag reserved">UNWIRED</span> Change Buffer bitmap body 与生产语义尚未接线</td></tr>
+              <tr><td><strong>Page 2</strong></td><td>INODE</td><td>INODE</td><td>创建表空间时已格式化信封并保留空 entry array；后续创建 Segment 时写入 384 B entry</td></tr>
+              <tr><td><strong>Page 3</strong></td><td>SDI v1</td><td>RSEG_HEADER v4</td><td>GENERAL 物理建表阶段格式化单页 SDI；Undo 启动阶段格式化回滚段权威 header</td></tr>
             </tbody>
           </table>
         </div>
 
         <p>
-          表空间创建时先建立文件，再初始化 Page 0 并保留 Extent 0 的页 0～3。普通空间进入
+          <code>DiskSpaceManager.createTablespace</code> 先建立文件，再在同一 MTR 中初始化 Page 0、Page 1、Page 2
+          的信封，并把 Extent 0 的 XDES 写成 <code>FSEG_FRAG / owner=0</code>；其中位图只把固定页 0～3 标为已占用，
+          该 Extent 也不会进入普通
+          Segment 的候选链。随后 GENERAL 物理建表格式化 Page 3 SDI，Undo bootstrap 则把同一页格式化为
+          RSEG_HEADER。普通空间进入
           <code>GENERAL / NORMAL</code>，Undo 空间进入 <code>UNDO / ACTIVE</code>。
           后续读写必须通过生命周期校验；<code>CORRUPTED</code>、<code>INACTIVE</code>、
           <code>TRUNCATING</code> 或 <code>DISCARDED</code> 空间不会继续接受普通业务操作。
@@ -683,11 +1057,12 @@
             <tbody>
               <tr><td><code>FREE</code></td><td>未绑定页面，可从 free list 获取</td><td>不能被业务线程直接读取</td></tr>
               <tr><td><code>LOADING</code></td><td>一个线程正在从 PageStore 装载</td><td>同页请求在锁外等待同一个 future</td></tr>
-              <tr><td><code>CLEAN</code></td><td>内存页与数据文件一致</td><td>pin 为 0 时可参与淘汰</td></tr>
+              <tr><td><code>CLEAN</code></td><td>内存页与数据文件一致</td><td><code>fixCount</code> 为 0 时可参与淘汰</td></tr>
               <tr><td><code>DIRTY_PENDING</code></td><td>页已修改，MTR 尚未提交发布</td><td>不能被 flush 提前写出</td></tr>
               <tr><td><code>DIRTY</code></td><td>已带有效 page LSN 的脏页</td><td>进入 flush list，并约束 checkpoint</td></tr>
               <tr><td><code>FLUSHING</code></td><td>某个快照正在刷盘</td><td>仍算 dirty boundary；并发修改用版本号区分</td></tr>
-              <tr><td><code>EVICTING / STALE</code></td><td>淘汰中或映射已失效</td><td>旧句柄不能重新发布到 page hash</td></tr>
+              <tr><td><code>EVICTING</code></td><td>已选为 victim，正在撤销映射或刷出</td><td>不能再授予新的业务 fix</td></tr>
+              <tr><td><code>STALE</code></td><td>原页面映射已失效</td><td>旧句柄不能重新发布到 page hash</td></tr>
             </tbody>
           </table>
         </div>
@@ -695,7 +1070,7 @@
         <h3>命中、缺页与单飞装载</h3>
         <p>
           Instance 内部显式维护 page hash、frame mutex、free/LRU/flush list 锁与 page latch。
-          推荐锁序是 page hash → frame mutex → list lock → page latch。缺页时只有首个线程创建
+          源码声明的强制锁序是 page hash → frame mutex → list lock → page latch。缺页时只有首个线程创建
           <code>LOADING</code> frame 并发起磁盘读取；其他线程拿到相同的 load future，释放内部锁后再等待，
           因而不会持有全局结构锁阻塞 I/O。
         </p>
@@ -708,7 +1083,7 @@
         <figure>
           <svg viewBox="0 0 840 440" role="img" aria-labelledby="mtr-title mtr-desc">
             <title id="mtr-title">MTR 修改页面与提交链路</title>
-            <desc id="mtr-desc">MTR 在获取资源之前进行 redo 容量节流，修改 Buffer Pool 页面并收集 redo，提交时追加日志、盖页 LSN、发布脏页和释放资源。</desc>
+            <desc id="mtr-desc">MTR 在获取资源之前进行 redo 容量节流，修改 Buffer Pool 页面并收集 redo；提交时冻结并校验批次、追加日志、转移预留、停止收集、盖页 LSN、发布脏页并封闭 redo 区间。</desc>
             <defs>
               <marker id="a4" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
                 <path d="M0,0 L8,4 L0,8 Z" fill="#6e7681"/>
@@ -749,40 +1124,45 @@
             <path d="M736 144 L736 184 L119 184 L119 224" fill="none" stroke="#6e7681" marker-end="url(#a4)"/>
             <text x="420" y="177" fill="#9da7b3" font-size="11" text-anchor="middle">commit</text>
 
-            <g font-size="12" text-anchor="middle">
-              <rect x="50" y="225" width="138" height="60" rx="7" fill="#17263c" stroke="#4493f8"/>
-              <text x="119" y="249" fill="#e6edf3" font-weight="700">6. freeze batch</text>
-              <text x="119" y="269" fill="#9da7b3">复核预算</text>
+            <g font-size="11" text-anchor="middle">
+              <rect x="50" y="225" width="112" height="60" rx="7" fill="#17263c" stroke="#4493f8"/>
+              <text x="106" y="249" fill="#e6edf3" font-weight="700">6. freeze batch</text>
+              <text x="106" y="269" fill="#9da7b3">预算覆盖校验</text>
 
-              <rect x="208" y="225" width="138" height="60" rx="7" fill="#17263c" stroke="#4493f8"/>
-              <text x="277" y="249" fill="#e6edf3" font-weight="700">7. append redo</text>
-              <text x="277" y="269" fill="#9da7b3">取得 LSN range</text>
+              <rect x="174" y="225" width="112" height="60" rx="7" fill="#17263c" stroke="#4493f8"/>
+              <text x="230" y="249" fill="#e6edf3" font-weight="700">7. append redo</text>
+              <text x="230" y="269" fill="#9da7b3">取得 LSN range</text>
 
-              <rect x="366" y="225" width="138" height="60" rx="7" fill="#17263c" stroke="#4493f8"/>
-              <text x="435" y="249" fill="#e6edf3" font-weight="700">8. stamp page</text>
-              <text x="435" y="269" fill="#9da7b3">pageLSN = endLSN</text>
+              <rect x="298" y="225" width="112" height="60" rx="7" fill="#17263c" stroke="#a371f7"/>
+              <text x="354" y="249" fill="#e6edf3" font-weight="700">8. transfer</text>
+              <text x="354" y="269" fill="#9da7b3">预留转 append</text>
 
-              <rect x="524" y="225" width="138" height="60" rx="7" fill="#17263c" stroke="#3fb950"/>
-              <text x="593" y="249" fill="#e6edf3" font-weight="700">9. release memo</text>
-              <text x="593" y="269" fill="#9da7b3">LIFO + publish dirty</text>
+              <rect x="422" y="225" width="112" height="60" rx="7" fill="#17263c" stroke="#4493f8"/>
+              <text x="478" y="249" fill="#e6edf3" font-weight="700">9. stamp page</text>
+              <text x="478" y="269" fill="#9da7b3">停止收集 · endLSN</text>
 
-              <rect x="682" y="225" width="108" height="60" rx="7" fill="#17263c" stroke="#3fb950"/>
-              <text x="736" y="249" fill="#e6edf3" font-weight="700">10. closed</text>
-              <text x="736" y="269" fill="#9da7b3">MTR 完成</text>
+              <rect x="546" y="225" width="112" height="60" rx="7" fill="#17263c" stroke="#3fb950"/>
+              <text x="602" y="249" fill="#e6edf3" font-weight="700">10. release memo</text>
+              <text x="602" y="269" fill="#9da7b3">LIFO · publish dirty</text>
+
+              <rect x="670" y="225" width="120" height="60" rx="7" fill="#17263c" stroke="#3fb950"/>
+              <text x="730" y="249" fill="#e6edf3" font-weight="700">11. mark closed</text>
+              <text x="730" y="269" fill="#9da7b3">COMMITTED</text>
             </g>
 
             <g stroke="#6e7681" marker-end="url(#a4)">
-              <line x1="188" y1="255" x2="207" y2="255"/>
-              <line x1="346" y1="255" x2="365" y2="255"/>
-              <line x1="504" y1="255" x2="523" y2="255"/>
-              <line x1="662" y1="255" x2="681" y2="255"/>
+              <line x1="162" y1="255" x2="173" y2="255"/>
+              <line x1="286" y1="255" x2="297" y2="255"/>
+              <line x1="410" y1="255" x2="421" y2="255"/>
+              <line x1="534" y1="255" x2="545" y2="255"/>
+              <line x1="658" y1="255" x2="669" y2="255"/>
             </g>
 
             <rect x="50" y="332" width="740" height="48" rx="7" fill="#2a2114" stroke="#d29922"/>
             <text x="420" y="353" fill="#e6edf3" font-size="12" text-anchor="middle" font-weight="700">rollbackUncommitted 的真实语义</text>
-            <text x="420" y="371" fill="#d8b969" font-size="11" text-anchor="middle">只按逆序释放 latch / fix / lease；不会把已经写入 byte[] 的内容自动回滚</text>
+            <text x="420" y="371" fill="#d8b969" font-size="11" text-anchor="middle">只逆序释放 memo 中的 latch / fix / lease / reservation 等资源；不会自动恢复已改 byte[]</text>
           </svg>
-          <figcaption>图 4：MTR 是短物理原子单元，不等同于数据库事务。</figcaption>
+          <figcaption>图 4：MTR 封闭短物理临界区和一个 Redo group，不等同于负责业务回滚的数据库事务。</figcaption>
         </figure>
 
         <blockquote class="warn">
@@ -836,7 +1216,7 @@
 
               <rect x="176" y="366" width="488" height="74" rx="6" fill="#161b22" stroke="#30363d" stroke-dasharray="5 4"/>
               <text x="420" y="398" fill="#6e7681" text-anchor="middle" font-weight="700">Free Space</text>
-              <text x="420" y="419" fill="#6e7681" text-anchor="middle">heap 向下，directory 向上，二者相遇即页满</text>
+              <text x="420" y="419" fill="#6e7681" text-anchor="middle">heapTop → 高地址；dirStart → 低地址；连续空闲区在中间</text>
 
               <rect x="176" y="448" width="488" height="61" rx="6" fill="#2a2114" stroke="#d29922"/>
               <text x="420" y="472" fill="#e6edf3" text-anchor="middle" font-weight="700">Page Directory · each slot = unsigned short</text>
@@ -855,6 +1235,11 @@
           <figcaption>图 5：当前 INDEX 页的实际字节布局；它借鉴 InnoDB 思想，但不是 MySQL 页格式的二进制复刻。</figcaption>
         </figure>
 
+        <p>
+          页内插入只消费连续空闲区；已被 purge 摘链的字节进入 GarbageList。若“连续空闲不足、空闲加 garbage
+          足够”，B+Tree 会先重组页面再决定是否分裂，不能把“heap 与目录相遇”简单等同于立即分裂。
+        </p>
+
         <h3>记录头、隐藏列与目录搜索</h3>
         <ul>
           <li>
@@ -862,7 +1247,7 @@
             record length 2 B。它表达链表与目录分组所需语义，但不兼容 COMPACT/DYNAMIC 原始记录头。
           </li>
           <li>
-            聚簇记录尾部保存 15 字节隐藏信息：8 字节 <code>DB_TRX_ID</code> 与 7 字节
+            聚簇叶页的普通 <code>CONVENTIONAL</code> 记录尾部保存 15 字节隐藏信息：8 字节 <code>DB_TRX_ID</code> 与 7 字节
             <code>DB_ROLL_PTR</code>。MVCC 由此定位创建/修改事务和前一版本。
           </li>
           <li>
@@ -877,7 +1262,7 @@
 
         <p>
           字段层支持 28 种 <code>TypeId</code>、字符集/排序规则、日期时间等编解码。
-          超页内阈值的业务值可放入 BLOB 链，记录只保留外部引用。业务 LOB 页面与 Undo 大载荷使用的
+          超过页内阈值的 TEXT/BLOB/JSON 等 overflow-capable 值可放入 BLOB 链，记录只保留外部引用。业务 LOB 页面与 Undo 大载荷使用的
           <code>UNDO_PAYLOAD</code> 页面彼此独立，不能混为同一种外部页。
         </p>
       </section>
@@ -903,7 +1288,7 @@
           </div>
           <div class="card">
             <b>写入：乐观后悲观</b>
-            <p>常规插入只在叶页持 X；溢出后重启并保留安全祖先，必要时执行级联分裂。</p>
+            <p>多层树的无分裂乐观插入只在叶页持 X；溢出后重启并保留安全祖先，必要时执行级联分裂。</p>
           </div>
         </div>
 
@@ -938,8 +1323,8 @@
 
               <rect x="432" y="92" width="144" height="72" rx="7" fill="#202234" stroke="#a371f7"/>
               <text x="504" y="116" fill="#e6edf3" font-weight="700">等待行锁</text>
-              <text x="504" y="137" fill="#9da7b3">timeout / cancel</text>
-              <text x="504" y="154" fill="#9da7b3">可被明确唤醒</text>
+              <text x="504" y="137" fill="#9da7b3">timeout / deadlock</text>
+              <text x="504" y="154" fill="#9da7b3">interrupt / signal</text>
 
               <rect x="624" y="92" width="168" height="72" rx="7" fill="#1b2920" stroke="#3fb950"/>
               <text x="708" y="116" fill="#e6edf3" font-weight="700">短 MTR #2</text>
@@ -960,8 +1345,8 @@
         <p>
           分裂前会先预留最坏情况下需要的空间，避免修改一半后才发现无法分配页面。高度至少为 2 时，
           悲观写路径先在根上取得 SX；如果最终确实要改根，再以 X 模式重启，不做危险的 latch upgrade。
-          当前实现没有 B-link sibling high-key，也没有 optimistic latch coupling，因此并发策略仍属于
-          结构清晰、便于教学和验证的 crabbing 方案。
+          当前实现已经使用 S/SX/X page latch 的 crabbing / latch coupling，但没有 B-link sibling high-key，
+          也没有基于页版本校验的 OLC 重定位协议。
         </p>
       </section>
 
@@ -972,7 +1357,8 @@
           表级写入通过
           <a href="../../src/main/java/cn/zhangyis/db/storage/api/dml/TableDmlService.java"><code>TableDmlService</code></a>
           编排，而不是让 SQL 层分别操作聚簇与二级索引。数据库事务是跨多次 MTR 的 Unit of Work：
-          每个索引通常由独立短 MTR 修改，语句失败时依靠 Undo 和 statement guard 反向补偿。
+          每个索引通常由独立短 MTR 修改；外层 SQL storage gateway 在调用前建立 statement guard，
+          失败时显式按 Undo 边界反向补偿，成功时才关闭该 guard。
         </p>
 
         <h3>INSERT：先冻结逻辑计划，再逐索引落盘</h3>
@@ -982,8 +1368,9 @@
             聚簇 key 成为后续行锁、唯一性判断与重定位的稳定逻辑标识。
           </li>
           <li>
-            <strong>统一检查全部唯一约束。</strong>先对聚簇索引和所有唯一二级索引执行 current unique check、
-            获取必要锁，并冻结二级索引 key/covering payload 与对应 Undo 计划，避免写到一半才发现重复键。
+            <strong>先完成全部发布检查。</strong>聚簇索引检查唯一性；每个不含 NULL 的二级逻辑键先取得事务锁，
+            再检查发布前态，其中不含 NULL 的唯一二级索引扫描 logical prefix，其余路径检查完整 physical identity。随后冻结
+            “二级逻辑键 + 完整聚簇键后缀”与对应 Undo mutation。
           </li>
           <li>
             <strong>取得 DML/Purge 行级 guard。</strong>防止前台写与 purge 对同一逻辑行并发做不相容的物理处理。
@@ -994,14 +1381,14 @@
           </li>
           <li>
             <strong>逐个写二级索引。</strong>每个 secondary 使用独立短 MTR，索引项包含二级逻辑 key、
-            聚簇 key 以及覆盖列 payload。全部成功后语句 guard 才提交。
+            完整聚簇 key 后缀。全部成功后，外层调用方才把 statement guard 作为成功边界关闭。
           </li>
         </ol>
 
         <figure>
           <svg viewBox="0 0 840 530" role="img" aria-labelledby="insert-title insert-desc">
             <title id="insert-title">表级 INSERT 的当前写链</title>
-            <desc id="insert-desc">事务先统一检查聚簇和二级索引唯一性，再写聚簇记录和各二级索引，每个索引使用短 MTR，最终由 redo 和 buffer pool 承接持久化。</desc>
+            <desc id="insert-desc">事务先检查聚簇唯一性与每个二级索引的发布前态，再写聚簇记录和各二级索引；每棵索引使用短 MTR，最终由 redo 和 buffer pool 承接持久化。</desc>
             <defs>
               <marker id="a7" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
                 <path d="M0,0 L8,4 L0,8 Z" fill="#6e7681"/>
@@ -1015,7 +1402,7 @@
 
             <rect x="76" y="166" width="206" height="67" rx="7" fill="#202234" stroke="#a371f7"/>
             <text x="179" y="191" fill="#e6edf3" font-size="13" text-anchor="middle" font-weight="700">Transaction / Lock</text>
-            <text x="179" y="212" fill="#9da7b3" font-size="11" text-anchor="middle">所有 unique check + row guard</text>
+            <text x="179" y="212" fill="#9da7b3" font-size="11" text-anchor="middle">clustered / secondary locks → row guard</text>
 
             <rect x="317" y="166" width="206" height="67" rx="7" fill="#2a2114" stroke="#d29922"/>
             <text x="420" y="191" fill="#e6edf3" font-size="13" text-anchor="middle" font-weight="700">INSERT Undo Log</text>
@@ -1023,7 +1410,7 @@
 
             <rect x="558" y="166" width="206" height="67" rx="7" fill="#1b2920" stroke="#3fb950"/>
             <text x="661" y="191" fill="#e6edf3" font-size="13" text-anchor="middle" font-weight="700">Frozen Index Plans</text>
-            <text x="661" y="212" fill="#9da7b3" font-size="11" text-anchor="middle">key + covering payload</text>
+            <text x="661" y="212" fill="#9da7b3" font-size="11" text-anchor="middle">secondary key + full PK suffix</text>
 
             <line x1="370" y1="128" x2="218" y2="165" stroke="#6e7681" marker-end="url(#a7)"/>
             <line x1="420" y1="128" x2="420" y2="165" stroke="#6e7681" marker-end="url(#a7)"/>
@@ -1067,8 +1454,8 @@
               <tr>
                 <td><strong>非键 UPDATE</strong></td>
                 <td>FOR UPDATE 当前读；生成 UPDATE Undo；替换页内版本并更新隐藏列</td>
-                <td>逻辑 key 不变时保留；覆盖列变化则更新 payload</td>
-                <td>外部 LOB 引用可在 patch 中保留</td>
+                <td>逻辑 key 不变时保持二级 entry 不变</td>
+                <td>v1 二级 entry 没有 covering 列；外部 LOB 引用可在 patch 中保留</td>
               </tr>
               <tr>
                 <td><strong>二级键 UPDATE</strong></td>
@@ -1099,7 +1486,7 @@
           当前事务最多同时拥有两条 Undo log：<code>INSERT</code> 与 <code>UPDATE</code> 分离，
           二者共享事务级单调递增的 <code>undoNo</code>。回滚段 Page 3 的 v4 header 是槽位、
           history、free list 与两类 cache 的权威持久状态；Undo 页使用 v3 格式，首个页含 log header，
-          后续页只保存链与 record area。
+          后继页保留并清零 first-page 专属 header 区，同时复制 Undo kind；所有页的 record area 都从 offset 136 开始。
         </p>
 
         <div class="table-wrap">
@@ -1125,7 +1512,7 @@
         <h3>一致性读如何沿版本链回溯</h3>
         <ol class="steps">
           <li><strong>先读当前聚簇版本。</strong>记录中的 <code>DB_TRX_ID</code> 表明该版本由哪个事务产生。</li>
-          <li><strong>ReadView 判断可见性。</strong>REPEATABLE READ 在事务内复用首个 ReadView；READ COMMITTED 每个 statement 新建。</li>
+          <li><strong>ReadView 判断可见性。</strong>REPEATABLE READ 在事务内复用首个 ReadView；READ COMMITTED 每次一致性读新建，并由语句边界负责关闭。</li>
           <li><strong>不可见则跟随 RollPointer。</strong><code>DB_ROLL_PTR</code> 定位 Undo record，重建上一版本。</li>
           <li><strong>重复直到可见或链结束。</strong>链损坏、指针越界或 Undo 格式不匹配都会 fail-closed，而不是返回可能错误的数据。</li>
         </ol>
@@ -1138,8 +1525,9 @@
 
         <h3>Purge 为什么不能看到 delete-mark 就删</h3>
         <p>
-          Purge 依据全局低水位选择 history 中已经对所有活跃 ReadView 不可见的版本，再通过版本安全检查、
-          DML row guard 和二级索引回查，物理移除 delete-mark 的 secondary/clustered record，最后回收 Undo。
+          Purge 只从持久 history 队首按 FIFO 推进；队首提交号尚未越过全局低水位，或 creator 仍活跃时，
+          不能跳过它处理后继。满足边界后，再通过版本安全检查、零等待 DML row guard 和二级索引回查，
+          物理移除 delete-mark 的 secondary/clustered record，持久化 logical-head 进度，最后回收 Undo owner。
           当前 Purge 可由后台 worker 驱动，但“Purge 自动触发 Undo tablespace truncate”尚未生产接线；
           truncate 恢复服务已经存在，主动调度仍属于缺口。
         </p>
@@ -1149,8 +1537,9 @@
         <h2 class="sec"><span class="no">09</span>Redo、WAL、Doublewrite 与 Checkpoint</h2>
 
         <p>
-          每个包含持久修改且成功提交的 MTR 都先把 Redo batch 追加到持久 Redo ring，取得连续 LSN 区间，再把
-          <code>endLSN</code> 盖到被修改页。生产默认使用 8 个 8 MiB 日志文件；日志按 512 B block 编码，
+          每个包含持久修改且成功提交的 MTR 都先把 Redo batch 追加到 <code>RedoLogManager</code> 的 pending 队列，
+          取得连续 LSN 区间，再把 <code>endLSN</code> 盖到被修改页；后台 writer/flusher 随后把 batch 写入并
+          force 持久 Redo ring，依次推进 written/flushed 边界。生产默认使用 8 个 8 MiB 日志文件；日志按 512 B block 编码，
           block header 为 32 B、payload 为 472 B，末尾 8 B 保存 trailer。文件和容量均可配置，默认值不是格式上限。
         </p>
 
@@ -1162,7 +1551,7 @@
         </p>
 
         <div class="formula">
-          WAL：dataPage 可写入数据文件 ⇔ redo.flushedLSN ≥ page.pageLSN
+          WAL 必要条件：写 dataPage 之前，必须满足 redo.flushedLSN ≥ page.pageLSN
         </div>
 
         <h3>批量刷页的真实顺序</h3>
@@ -1190,7 +1579,7 @@
 
             <rect x="52" y="88" width="212" height="72" rx="8" fill="#17263c" stroke="#4493f8"/>
             <text x="158" y="113" fill="#e6edf3" font-size="13" text-anchor="middle" font-weight="700">Redo ring</text>
-            <text x="158" y="135" fill="#9da7b3" font-size="11" text-anchor="middle">closed → written → flushed</text>
+            <text x="158" y="135" fill="#9da7b3" font-size="11" text-anchor="middle">closed · written · flushed</text>
             <text x="158" y="151" fill="#9da7b3" font-size="11" text-anchor="middle">background RedoFlushWorker</text>
 
             <rect x="314" y="88" width="212" height="72" rx="8" fill="#161b22" stroke="#3fb950"/>
@@ -1204,7 +1593,8 @@
             <text x="682" y="151" fill="#9da7b3" font-size="11" text-anchor="middle">等待时不持 page latch</text>
 
             <line x1="526" y1="124" x2="575" y2="124" stroke="#6e7681" marker-end="url(#a9)"/>
-            <path d="M264 124 C290 124, 289 124, 313 124" stroke="#3fb950" fill="none" stroke-dasharray="5 4" marker-end="url(#a9)"/>
+            <path d="M264 116 C390 62, 570 62, 630 87" stroke="#3fb950" fill="none" stroke-dasharray="5 4" marker-end="url(#a9)"/>
+            <text x="438" y="76" fill="#3fb950" font-size="10.5" text-anchor="middle">redo.flushedLSN</text>
 
             <rect x="108" y="232" width="250" height="78" rx="8" fill="#202234" stroke="#a371f7"/>
             <text x="233" y="257" fill="#e6edf3" font-size="13" text-anchor="middle" font-weight="700">DoublewriteChannel</text>
@@ -1222,7 +1612,7 @@
             <rect x="108" y="361" width="624" height="51" rx="8" fill="#1b2920" stroke="#3fb950"/>
             <text x="420" y="382" fill="#e6edf3" font-size="13" text-anchor="middle" font-weight="700">Checkpoint safe LSN</text>
             <text x="420" y="401" fill="#b7e6bd" font-size="11" text-anchor="middle">min(oldestDirtyLSN（若存在）, redo.closedLSN, redo.flushedLSN)</text>
-            <path d="M158 160 C158 329, 330 325, 370 360" fill="none" stroke="#3fb950" stroke-dasharray="5 4" marker-end="url(#a9)"/>
+            <path d="M158 160 C86 180, 86 330, 370 360" fill="none" stroke="#3fb950" stroke-dasharray="5 4" marker-end="url(#a9)"/>
             <path d="M420 160 C420 319, 420 319, 420 360" fill="none" stroke="#3fb950" stroke-dasharray="5 4" marker-end="url(#a9)"/>
           </svg>
           <figcaption>图 8：WAL 防止“数据先于日志”；Doublewrite 防止 torn page；Checkpoint 决定可回收的 Redo 边界。</figcaption>
@@ -1247,23 +1637,26 @@
         <ol class="steps">
           <li><strong>TRAFFIC_CLOSED。</strong>保持存储入口关闭，防止前台访问观察到半恢复状态。</li>
           <li><strong>DOUBLEWRITE_REPAIR。</strong>从两个通道扫描完整页副本，修复被 torn write 破坏且可判定目标身份的数据页。</li>
-          <li><strong>REDO_REPLAY。</strong>从 checkpoint 边界扫描完整 Redo batch；仅当页上 LSN 落后时幂等重放。</li>
-          <li><strong>REDO_BOUNDARY_INSTALL。</strong>把恢复扫描得到的 closed/written/flushed/reclaim 边界安装回运行时 Redo 状态。</li>
+          <li><strong>REDO_REPLAY。</strong>从 checkpoint 边界扫描完整 Redo batch；页类记录仅在目标 pageLSN 落后时幂等重放，事务状态 delta 则按日志顺序恢复。</li>
+          <li><strong>REDO_BOUNDARY_INSTALL。</strong>让新 LSN 从 recoveredToLsn 续写，并把 closed/written/flushed 运行时边界复位到该值；不在此改写 reclaim 边界。</li>
           <li><strong>UNDO_TABLESPACE_RESUME。</strong>恢复被中断的 Undo tablespace truncate 状态机，使生命周期回到可解释状态。</li>
-          <li><strong>SPACE_FILE_RECONCILE。</strong>对照持久元数据与实际文件长度，处理已记录空间扩展但文件尾尚未完成的窗口。</li>
-          <li><strong>UNDO_ROLLBACK。</strong>从事务恢复状态识别 loser transaction，按 Undo 逆序撤销未提交修改。</li>
-          <li><strong>RESUME_PURGE。</strong>重建 history/purge 进度，继续清理由已提交旧版本留下的垃圾。</li>
-          <li><strong>恢复结果 force，然后 OPEN_TRAFFIC。</strong>必要时持久化恢复产生的新 Redo 和脏页，再开放流量；force 是阶段间持久化动作，不是独立的 <code>RecoveryStageName</code>。</li>
+          <li><strong>SPACE_FILE_RECONCILE。</strong>读取恢复后的 page0.currentSizeInPages，并用 <code>ensureCapacity</code> 幂等补齐可能缺失的文件尾容量。</li>
+          <li><strong>UNDO_ROLLBACK。</strong>恢复 committed history、裁决 PREPARED，并按 Undo 逆序撤销 crash 前仍为 ACTIVE 的事务。</li>
+          <li><strong>RESUME_PURGE。</strong>在恢复出的 committed history 上真实推进 Purge，继续清理由已提交旧版本留下的垃圾。</li>
+          <li><strong>恢复写 force，然后 OPEN_TRAFFIC。</strong>先 flush rollback/purge 新产生的 Redo（若有），再 force 恢复直接写出的数据页，最后开放流量；force 不是独立的 <code>RecoveryStageName</code>。</li>
         </ol>
 
         <blockquote>
-          只读诊断模式走另一条链：它扫描并校验 Redo、Doublewrite 与表空间，但不 apply、force 或写入恢复结果，
-          最终只开放 <code>READ_ONLY_DIAGNOSTIC</code>。这不是“用只读方式执行一次普通恢复”。
+          只读诊断模式走另一条链：它扫描 Redo 与 Doublewrite slots，并只读检查其引用的候选页及启动所需元数据，
+          但不会全表空间逐页扫描，也不 apply、force 或写入恢复结果，最终进入
+          <code>READ_ONLY_DIAGNOSTIC_OPEN</code>。这不是“用只读方式执行一次普通恢复”。
         </blockquote>
 
         <p>
-          在公共 <code>DatabaseEngine</code> 外层，存储恢复完成后还会进行数据字典发现、DDL recovery 和 SDI reconcile，
-          最后才开放完整数据库服务。本文聚焦存储部分，因此没有把 DDL 阶段画成
+          公共 <code>DatabaseEngine</code> 先取得实例锁，打开 XA registry，再完成 DD catalog/manifest/control
+          准入并从 committed binding discovery 用户表空间；随后把 XA 决议提供器交给 <code>StorageEngine</code>
+          执行 recovery，完成 registry recovery decision 后再执行包含 SDI reconcile 的 DDL recovery，
+          最后才构造 Session 门面并发布完整数据库 <code>OPEN</code>。本文聚焦存储部分，因此没有把外层 DDL 阶段画成
           <code>CrashRecoveryService</code> 的内部步骤。
         </p>
       </section>
@@ -1285,7 +1678,8 @@
               <tr>
                 <td><span class="tag ok">WIRED</span></td>
                 <td>表空间/FSP/segment/page 分配、分片 Buffer Pool、MTR、任意高度 B+Tree、Record/LOB、
-                  多索引 DML、锁/MVCC、双 Undo log、Purge、持久 Redo、WAL/Doublewrite/Checkpoint、Crash Recovery</td>
+                  多索引 DML、锁/MVCC、双 Undo log、Purge、持久 Redo、WAL/Doublewrite/Checkpoint、Crash Recovery，
+                  以及四隔离级别、命名 savepoint 与持久 server XA</td>
                 <td>这些能力由 <code>StorageEngine</code> 生产装配，并有对应协作/恢复测试</td>
               </tr>
               <tr>
@@ -1297,19 +1691,19 @@
               <tr>
                 <td><span class="tag partial">PARTIAL</span></td>
                 <td>INDEX header 尚无 <code>PAGE_MAX_TRX_ID</code> 与 <code>PAGE_BTR_SEG_*</code>；
-                  MTR rollback 不恢复页面字节；B+Tree 无 B-link/OLC；JSON 仍是文本而非 binary JSON</td>
+                  MTR rollback 不恢复页面字节；B+Tree 无 B-link/基于页版本的 OLC；JSON 仍是文本而非 binary JSON</td>
                 <td>这些差异会影响并发扩展、页格式兼容与失败编程模型</td>
               </tr>
               <tr>
                 <td><span class="tag reserved">UNWIRED</span></td>
-                <td>Change Buffer、随机 read-ahead 默认运行、Purge 主动触发 Undo truncate、临时 Undo、
-                  全数据目录自动发现修复、server XID/SQL XA</td>
+                <td>Change Buffer、随机 read-ahead 的生产启用、Purge 主动触发 Undo truncate、临时 Undo、
+                  全数据目录自动发现修复</td>
                 <td>类型存在或恢复入口存在，不等于普通生产路径已经调用</td>
               </tr>
               <tr>
                 <td><span class="tag danger">UNSUPPORTED</span></td>
-                <td>主键 UPDATE、READ UNCOMMITTED / SERIALIZABLE、任意复合比较范围、命名 savepoint、
-                  MySQL 原生表空间直接互读</td>
+                <td>主键 UPDATE、OR / IN / LIKE / LIMIT 查询形状、主键/类型/foreign/generated/online ALTER、
+                  MySQL 原生表空间直接互读，以及 XA active branch 跨 Session migration</td>
                 <td>调用方应得到明确错误，不能静默降级为可能错误的行为</td>
               </tr>
             </tbody>
@@ -1323,13 +1717,13 @@
             <tbody>
               <tr><td>1</td><td><strong>页大小可配置，Extent 内页数不是永远 64。</strong></td><td>分析页号、XDES 和容量时必须先看 PageSize。</td></tr>
               <tr><td>2</td><td><strong>Disk/FSP 不理解 record，Record 也不直接碰文件。</strong></td><td>这是当前存储分层最核心的依赖边界。</td></tr>
-              <tr><td>3</td><td><strong>MTR 原子地保护物理修改，Transaction 原子地保护一条业务写。</strong></td><td>一次表级 INSERT 会跨多个短 MTR。</td></tr>
+              <tr><td>3</td><td><strong>MTR 封闭短物理临界区与 Redo group，Transaction 负责跨 MTR 的业务原子性。</strong></td><td>一次表级 INSERT 会跨多个短 MTR；未提交 MTR 不提供页面 content undo。</td></tr>
               <tr><td>4</td><td><strong>事务锁等待前必须释放 page latch/fix，成功后重新 B+Tree 定位。</strong></td><td>避免锁序反转，也防止使用已经移动的物理位置。</td></tr>
               <tr><td>5</td><td><strong>Page Directory 是二分入口，不是记录本体。</strong></td><td>实际查找是“slot 二分 + 分组链扫”。</td></tr>
               <tr><td>6</td><td><strong>二级键 UPDATE 采用 new-before-old。</strong></td><td>语句中途失败时仍能由 Undo 找回可达入口。</td></tr>
               <tr><td>7</td><td><strong>INSERT Undo 与 UPDATE Undo 的提交后命运不同。</strong></td><td>只有 UPDATE Undo 必须为历史一致性读长期保留。</td></tr>
               <tr><td>8</td><td><strong>数据页写盘前必须满足 Redo WAL。</strong></td><td>否则崩溃后可能出现无法由日志解释的新数据页。</td></tr>
-              <tr><td>9</td><td><strong>Doublewrite、Redo、Undo 解决三种不同问题。</strong></td><td>分别处理 torn page、已提交/物理重放、未提交事务回滚。</td></tr>
+              <tr><td>9</td><td><strong>Doublewrite、Redo、Undo 解决三种不同问题。</strong></td><td>分别处理 torn page、物理状态重放、未提交事务与旧版本回溯。</td></tr>
               <tr><td>10</td><td><strong>Checkpoint 是安全交集，不是“当前最大 LSN”。</strong></td><td>推进过快会回收仍被脏页或事务恢复状态需要的日志。</td></tr>
               <tr><td>11</td><td><strong>恢复必须按阶段串行并保持流量关闭。</strong></td><td>Doublewrite 修复、Redo、Undo、Purge 的顺序具有恢复语义。</td></tr>
               <tr><td>12</td><td><strong>当前实现借鉴 InnoDB 思想，但不承诺 MySQL 二进制兼容。</strong></td><td>阅读布局数字时应以本项目源码为准，不能套用 MySQL 常量。</td></tr>
@@ -1340,7 +1734,13 @@
         <h3>源码导航</h3>
         <div class="source-nav">
           <a href="../../src/main/java/cn/zhangyis/db/storage/engine/StorageEngine.java">engine/StorageEngine.java</a>
+          <a href="../../src/main/java/cn/zhangyis/db/engine/DatabaseEngine.java">engine/DatabaseEngine.java</a>
+          <a href="../../src/main/java/cn/zhangyis/db/engine/adapter/DefaultSqlStorageGateway.java">engine/adapter/DefaultSqlStorageGateway.java</a>
+          <a href="../../src/main/java/cn/zhangyis/db/storage/engine/EngineConfig.java">engine/EngineConfig.java</a>
           <a href="../../src/main/java/cn/zhangyis/db/storage/api/DiskSpaceManager.java">api/DiskSpaceManager.java</a>
+          <a href="../../src/main/java/cn/zhangyis/db/storage/api/ddl/TableDdlStorageService.java">api/ddl/TableDdlStorageService.java</a>
+          <a href="../../src/main/java/cn/zhangyis/db/storage/fsp/extent/ExtentDescriptorLayout.java">fsp/extent/ExtentDescriptorLayout.java</a>
+          <a href="../../src/main/java/cn/zhangyis/db/storage/fsp/segment/SegmentInodeLayout.java">fsp/segment/SegmentInodeLayout.java</a>
           <a href="../../src/main/java/cn/zhangyis/db/storage/fsp/segment/SegmentPageAllocator.java">fsp/segment/SegmentPageAllocator.java</a>
           <a href="../../src/main/java/cn/zhangyis/db/storage/buf/LruBufferPool.java">buf/LruBufferPool.java</a>
           <a href="../../src/main/java/cn/zhangyis/db/storage/mtr/MiniTransactionManager.java">mtr/MiniTransactionManager.java</a>
@@ -1349,7 +1749,9 @@
           <a href="../../src/main/java/cn/zhangyis/db/storage/api/dml/TableDmlService.java">api/dml/TableDmlService.java</a>
           <a href="../../src/main/java/cn/zhangyis/db/storage/undo/UndoPageLayout.java">undo/UndoPageLayout.java</a>
           <a href="../../src/main/java/cn/zhangyis/db/storage/undo/RollbackSegmentHeaderLayout.java">undo/RollbackSegmentHeaderLayout.java</a>
+          <a href="../../src/main/java/cn/zhangyis/db/storage/redo/RedoLogManager.java">redo/RedoLogManager.java</a>
           <a href="../../src/main/java/cn/zhangyis/db/storage/flush/FlushCoordinator.java">flush/FlushCoordinator.java</a>
+          <a href="../../src/main/java/cn/zhangyis/db/storage/flush/checkpoint/CheckpointCoordinator.java">flush/checkpoint/CheckpointCoordinator.java</a>
           <a href="../../src/main/java/cn/zhangyis/db/storage/recovery/CrashRecoveryService.java">recovery/CrashRecoveryService.java</a>
         </div>
 
@@ -1363,8 +1765,45 @@
 
   <footer>
     <div class="wrap">
-      MiniMySQL / InnoDB-style Java teaching implementation · Current storage implementation guide · 2026-07-20
+      MiniMySQL / InnoDB-style Java teaching implementation · Current storage implementation guide · 2026-07-21
     </div>
   </footer>
+
+  <button class="back-to-top" type="button" aria-label="回到页面顶部" aria-hidden="true" tabindex="-1">
+    <span class="back-to-top__icon" aria-hidden="true">↑</span>
+    <span class="back-to-top__label">回到顶部</span>
+  </button>
+
+  <script>
+    (() => {
+      const button = document.querySelector('.back-to-top');
+      const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+      let ticking = false;
+
+      const updateVisibility = () => {
+        const visible = window.scrollY >= 480;
+        button.classList.toggle('is-visible', visible);
+        button.setAttribute('aria-hidden', String(!visible));
+        button.tabIndex = visible ? 0 : -1;
+        ticking = false;
+      };
+
+      window.addEventListener('scroll', () => {
+        if (!ticking) {
+          window.requestAnimationFrame(updateVisibility);
+          ticking = true;
+        }
+      }, { passive: true });
+
+      button.addEventListener('click', () => {
+        window.scrollTo({
+          top: 0,
+          behavior: reducedMotion.matches ? 'auto' : 'smooth'
+        });
+      });
+
+      updateVisibility();
+    })();
+  </script>
 </body>
 </html>

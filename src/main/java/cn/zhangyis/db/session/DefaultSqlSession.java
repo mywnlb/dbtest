@@ -22,6 +22,7 @@ import cn.zhangyis.db.session.exception.SessionBusyException;
 import cn.zhangyis.db.session.exception.SessionStateException;
 import cn.zhangyis.db.session.exception.TransactionOutcomeUnknownException;
 import cn.zhangyis.db.session.xa.SessionXaCoordinator;
+import cn.zhangyis.db.storage.engine.RecoveryExportWriteRejectedException;
 
 import java.time.Duration;
 import java.math.BigInteger;
@@ -69,6 +70,8 @@ public final class DefaultSqlSession implements SqlSession {
     private final Runnable onClose;
     /** DatabaseEngine 用户语句 gate；permit 覆盖完整 execute 与失败 cleanup。 */
     private final SessionExecutionAdmission executionAdmission;
+    /** FORCE 导出会话的语法级准入；为 true 时仅允许非写 SELECT 与本地事务控制。 */
+    private final boolean recoveryExportReadOnly;
     /** Session 生命周期和 transaction policy 的唯一串行化 owner，公平避免 close/后续 execute 饥饿。 */
     private final ReentrantLock operationLock = new ReentrantLock(true);
     /**
@@ -169,6 +172,34 @@ public final class DefaultSqlSession implements SqlSession {
                              SessionXaCoordinator xaCoordinator,
                              SessionExecutionAdmission executionAdmission,
                              Runnable onClose) {
+        this(id, options, dictionary, parser, binder, executor, gateway, ddlGateway, xaCoordinator,
+                executionAdmission, false, onClose);
+    }
+
+    /**
+     * DatabaseEngine 的 FORCE 导出构造入口；旧构造器保持普通读写兼容。
+     *
+     * @param id Session 稳定身份
+     * @param options Session SQL 与 timeout 配置
+     * @param dictionary DD 读取 facade
+     * @param parser SQL parser
+     * @param binder SQL binder
+     * @param executor SQL executor
+     * @param gateway 带二次写防线的 storage port
+     * @param ddlGateway DDL port
+     * @param xaCoordinator XA coordinator；导出模式会在调用前拒绝 XA
+     * @param executionAdmission DatabaseEngine statement gate
+     * @param recoveryExportReadOnly 是否启用 FORCE 导出语句白名单
+     * @param onClose Session registry 注销回调
+     */
+    public DefaultSqlSession(SessionId id, SessionOptions options, DataDictionaryService dictionary,
+                             DefaultSqlParser parser, DefaultSqlBinder binder, DefaultSqlExecutor executor,
+                             SqlStorageGateway gateway,
+                             cn.zhangyis.db.sql.executor.storage.SqlDdlGateway ddlGateway,
+                             SessionXaCoordinator xaCoordinator,
+                             SessionExecutionAdmission executionAdmission,
+                             boolean recoveryExportReadOnly,
+                             Runnable onClose) {
         if (id == null || options == null || dictionary == null || parser == null || binder == null
                 || executor == null || gateway == null || ddlGateway == null
                 || xaCoordinator == null || executionAdmission == null || onClose == null) {
@@ -182,6 +213,7 @@ public final class DefaultSqlSession implements SqlSession {
         this.ddlGateway = ddlGateway;
         this.onClose = onClose;
         this.executionAdmission = executionAdmission;
+        this.recoveryExportReadOnly = recoveryExportReadOnly;
         this.transactions = new SessionTransactionPolicy(options, gateway, dictionary,
                 MdlOwnerId.forSession(id.value()), xaCoordinator);
     }
@@ -219,6 +251,7 @@ public final class DefaultSqlSession implements SqlSession {
             if (state != SessionState.OPEN) throw new SessionStateException("session cannot execute from state " + state);
             state = SessionState.EXECUTING;
             StatementNode statement = parser.parse(sql);
+            assertRecoveryExportStatementAllowed(statement);
             if (statement instanceof SelectStatementNode select
                     && select.lockingClause() == SelectLockingClause.NONE
                     && transactions.requiresSerializableLockingRead()) {
@@ -272,6 +305,26 @@ public final class DefaultSqlSession implements SqlSession {
             // 5. permit 覆盖 Session 锁内全部 cleanup；释放顺序与获取顺序相反。
             if (acquired) operationLock.unlock();
             permit.close();
+        }
+    }
+
+    /**
+     * FORCE 导出只允许一致性读/共享锁读、SET autocommit、BEGIN/COMMIT/ROLLBACK 和 SAVEPOINT 控制；
+     * FOR UPDATE、DML、DDL 与 XA 在 transaction preparation、MDL 或 registry 副作用前拒绝。
+     */
+    private void assertRecoveryExportStatementAllowed(StatementNode statement) {
+        if (!recoveryExportReadOnly) {
+            return;
+        }
+        boolean allowed = statement instanceof SetAutocommitNode
+                || statement instanceof TransactionControlNode
+                || statement instanceof SavepointStatementNode
+                || statement instanceof SelectStatementNode select
+                && select.lockingClause() != SelectLockingClause.FOR_UPDATE;
+        if (!allowed) {
+            throw new RecoveryExportWriteRejectedException(
+                    "statement is rejected in recovery export read-only mode: "
+                            + statement.getClass().getSimpleName());
         }
     }
 

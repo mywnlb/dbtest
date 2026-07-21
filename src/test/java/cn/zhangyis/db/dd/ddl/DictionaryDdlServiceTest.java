@@ -19,6 +19,7 @@ import cn.zhangyis.db.dd.service.DataDictionaryService;
 import cn.zhangyis.db.dd.service.TableAccessIntent;
 import cn.zhangyis.db.dd.sdi.DictionarySdiCodec;
 import cn.zhangyis.db.engine.DatabaseEngine;
+import cn.zhangyis.db.engine.DatabaseAccessMode;
 import cn.zhangyis.db.engine.adapter.DictionaryIndexMetadataResolver;
 import cn.zhangyis.db.engine.adapter.DictionaryStorageMetadataMapper;
 import cn.zhangyis.db.domain.PageNo;
@@ -26,6 +27,9 @@ import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.engine.EngineConfig;
 import cn.zhangyis.db.storage.engine.StorageEngine;
+import cn.zhangyis.db.storage.engine.RecoveryExportWriteRejectedException;
+import cn.zhangyis.db.dd.exception.TableRecoveryUnavailableException;
+import cn.zhangyis.db.dd.recovery.backup.RecoveryBackupArtifact;
 import cn.zhangyis.db.storage.api.TablePurgeBarrier;
 import cn.zhangyis.db.storage.api.TablePurgeBarrierTimeoutException;
 import cn.zhangyis.db.storage.api.ddl.SerializedDictionaryInfo;
@@ -52,10 +56,12 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.math.BigInteger;
 import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -71,6 +77,99 @@ class DictionaryDdlServiceTest {
 
     @TempDir
     Path directory;
+
+    /**
+     * FORCE 隔离必须跨重启成为 DD 长期状态；可信备份只能经 HMAC incoming pair 把
+     * RECOVERY_UNAVAILABLE→RECOVERY_DISCARDED→ACTIVE 完整收敛，导出实例本身不得写入。
+     */
+    @Test
+    void isolatesObjectInForceModeAndRestoresOnlyTrustedBackup() throws Exception {
+        QualifiedTableName name = QualifiedTableName.of("app", "orders");
+        RecoveryBackupArtifact backup;
+        SpaceId spaceId;
+        long tableId;
+        Path canonicalPath;
+
+        // 1. 健康实例先写入可观察数据并生成本实例签名的 clean backup。
+        try (DatabaseEngine database = new DatabaseEngine(config())) {
+            database.open();
+            database.ddl().createSchema(
+                    MdlOwnerId.of(600), ObjectName.of("app"), 1, 1,
+                    Duration.ofSeconds(5));
+            TableDefinition table = database.ddl().createTable(
+                    MdlOwnerId.of(601), updateCommand(), Duration.ofSeconds(5));
+            spaceId = table.storageBinding().orElseThrow().spaceId();
+            tableId = table.id().value();
+            canonicalPath = table.storageBinding().orElseThrow().path();
+            try (var session = database.openSession(SessionOptions.defaults())) {
+                session.execute("INSERT INTO app.orders (id,value) VALUES (1,77)");
+            }
+            backup = database.ddl().createRecoveryBackup(
+                    MdlOwnerId.of(602), name, Duration.ofSeconds(5));
+            assertTrue(Files.isRegularFile(backup.dataPath()));
+            assertTrue(Files.isRegularFile(backup.manifestPath()));
+        }
+
+        // 2. FORCE 在 storage discovery 前原子持久化隔离，并把所有写入口封为导出只读。
+        try (DatabaseEngine forced = new DatabaseEngine(
+                config().withForceSkipRecovery(Set.of(spaceId)))) {
+            forced.open();
+            assertEquals(DatabaseAccessMode.RECOVERY_EXPORT_READ_ONLY,
+                    forced.accessMode());
+            assertEquals(1, forced.unavailableTables().size());
+            assertThrows(RecoveryExportWriteRejectedException.class, forced::ddl);
+            try (var session = forced.openSession(SessionOptions.defaults())) {
+                assertThrows(TableRecoveryUnavailableException.class,
+                        () -> session.execute("SELECT id FROM app.orders WHERE id=1"));
+                assertThrows(RecoveryExportWriteRejectedException.class,
+                        () -> session.execute(
+                                "INSERT INTO app.orders (id,value) VALUES (2,88)"));
+            }
+        }
+
+        // 3. 普通降级启动不挂载隔离空间；Java DDL raw DISCARD 不读取 page0。
+        try (DatabaseEngine degraded = new DatabaseEngine(config())) {
+            degraded.open();
+            assertEquals(DatabaseAccessMode.DEGRADED, degraded.accessMode());
+            degraded.ddl().discardTablespace(
+                    MdlOwnerId.of(603), name, Duration.ofSeconds(5));
+            assertFalse(Files.exists(canonicalPath));
+            assertTrue(Files.exists(directory.resolve("tablespace-transfer")
+                    .resolve("discarded")
+                    .resolve("table_" + tableId + "_space_" + spaceId.value() + ".ibd")));
+
+            // 管理员显式把 archive pair 放入固定 recovery-incoming；SQL/Java API 不能传任意主机路径。
+            Path incomingRoot = directory.resolve("tablespace-transfer")
+                    .resolve("recovery-incoming");
+            Files.createDirectories(incomingRoot);
+            String stem = "table_" + tableId + "_space_" + spaceId.value();
+            Files.copy(backup.dataPath(), incomingRoot.resolve(stem + ".ibd"),
+                    StandardCopyOption.COPY_ATTRIBUTES);
+            Files.copy(backup.manifestPath(), incomingRoot.resolve(stem + ".manifest"),
+                    StandardCopyOption.COPY_ATTRIBUTES);
+
+            degraded.ddl().importTablespace(
+                    MdlOwnerId.of(604), name, Duration.ofSeconds(5));
+            assertEquals(DatabaseAccessMode.DEGRADED, degraded.accessMode(),
+                    "组合根访问模式在本次 open 生命周期内保持稳定快照");
+            try (var session = degraded.openSession(SessionOptions.defaults())) {
+                QueryResult result = assertInstanceOf(QueryResult.class,
+                        session.execute("SELECT value FROM app.orders WHERE id=1"));
+                assertEquals(1, result.rows().size());
+            }
+        }
+
+        // 4. 再次普通启动从 ACTIVE DD discovery 挂载 replacement，访问模式恢复 NORMAL。
+        try (DatabaseEngine reopened = new DatabaseEngine(config())) {
+            reopened.open();
+            assertEquals(DatabaseAccessMode.NORMAL, reopened.accessMode());
+            try (var session = reopened.openSession(SessionOptions.defaults())) {
+                QueryResult result = assertInstanceOf(QueryResult.class,
+                        session.execute("SELECT value FROM app.orders WHERE id=1"));
+                assertEquals(1, result.rows().size());
+            }
+        }
+    }
 
     /**
      * CREATE INDEX 必须回填既有行、发布新 exact DD/SDI/binding 并在重启后继续供 SQL 二级访问；

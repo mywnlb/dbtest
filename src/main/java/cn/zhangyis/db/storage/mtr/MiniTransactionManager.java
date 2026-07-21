@@ -8,6 +8,7 @@ import cn.zhangyis.db.storage.redo.RedoBudgetPurpose;
 import cn.zhangyis.db.storage.redo.RedoBudgetWorkload;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
 import cn.zhangyis.db.storage.fil.access.TablespaceAccessController;
+import cn.zhangyis.db.storage.engine.StorageWriteAdmission;
 
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -33,6 +34,8 @@ public final class MiniTransactionManager {
     private final RedoCapacityThrottle redoCapacityThrottle;
     /** 实例页大小感知的生产操作 profile；只估算，不读取或修改 MTR/redo 状态。 */
     private final MtrOperationRedoBudgetEstimator operationBudgetEstimator;
+    /** 所有写 MTR 在 redo 预算与页资源之前检查的实例级准入；只读 MTR 不消费该能力。 */
+    private final StorageWriteAdmission writeAdmission;
     /**
      * 创建 {@code MiniTransactionManager}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
      */
@@ -86,13 +89,35 @@ public final class MiniTransactionManager {
                                   RedoLogManager redoLogManager,
                                   RedoCapacityThrottle redoCapacityThrottle,
                                   PageSize pageSize) {
+        this(accessController, redoLogManager, redoCapacityThrottle, pageSize,
+                StorageWriteAdmission.normal());
+    }
+
+    /**
+     * 创建带实例级写闸门的生产 MTR 管理器。
+     *
+     * @param accessController 表空间 operation lease owner
+     * @param redoLogManager 当前实例 redo owner
+     * @param redoCapacityThrottle begin-time redo 预算准入
+     * @param pageSize 实例固定页大小
+     * @param writeAdmission 在任何写 MTR 资源获取前检查的组合根闸门
+     */
+    public MiniTransactionManager(TablespaceAccessController accessController,
+                                  RedoLogManager redoLogManager,
+                                  RedoCapacityThrottle redoCapacityThrottle,
+                                  PageSize pageSize,
+                                  StorageWriteAdmission writeAdmission) {
         if (accessController == null || redoLogManager == null || redoCapacityThrottle == null) {
             throw new DatabaseValidationException("MTR access controller/redo manager/throttle must not be null");
+        }
+        if (writeAdmission == null) {
+            throw new DatabaseValidationException("MTR storage write admission must not be null");
         }
         this.accessController = accessController;
         this.redoLogManager = redoLogManager;
         this.redoCapacityThrottle = redoCapacityThrottle;
         this.operationBudgetEstimator = new MtrOperationRedoBudgetEstimator(pageSize);
+        this.writeAdmission = writeAdmission;
     }
 
     /**
@@ -102,6 +127,7 @@ public final class MiniTransactionManager {
      * @throws MtrStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
      */
     public MiniTransaction begin() {
+        writeAdmission.assertWriteAllowed();
         if (redoCapacityThrottle.requiresExplicitBudget()) {
             throw new MtrStateException("capacity-aware mini transaction requires an explicit redo budget");
         }
@@ -124,6 +150,7 @@ public final class MiniTransactionManager {
         if (budget == null) {
             throw new DatabaseValidationException("mini transaction redo budget must not be null");
         }
+        writeAdmission.assertWriteAllowed();
         return beginInternal(budget);
     }
 

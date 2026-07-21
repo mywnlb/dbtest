@@ -18,10 +18,7 @@ import java.util.Set;
  * @param detectedOnlyPageCount doublewrite detect-only 发现但未修复的可疑页数。
  * @param appliedBatchCount 交给 redo dispatcher 的批次数。
  * @param completedStages 已完成阶段顺序。
- * @param skippedSpaces force-skip 模式显式跳过的表空间集合；普通模式为空。
- * @param skippedDoublewritePageCount doublewrite 阶段跳过的 page 数。
- * @param skippedRedoRecordCount redo replay 阶段跳过的 page record 数。
- * @param skippedReconcileSpaceCount SPACE_FILE_RECONCILE 阶段跳过的表空间数。
+ * @param exclusionSummary 管理员/DD 排除来源以及物理、rollback、purge 各阶段跳过统计。
  */
 public record RecoveryReport(RecoveryMode mode,
                              RecoveryState state,
@@ -31,24 +28,29 @@ public record RecoveryReport(RecoveryMode mode,
                              int detectedOnlyPageCount,
                              int appliedBatchCount,
                              List<RecoveryStageName> completedStages,
-                             Set<SpaceId> skippedSpaces,
-                             int skippedDoublewritePageCount,
-                             int skippedRedoRecordCount,
-                             int skippedReconcileSpaceCount) {
+                             RecoveryExclusionSummary exclusionSummary) {
 
     public RecoveryReport {
         if (mode == null || state == null || checkpointLsn == null
-                || recoveredToLsn == null || completedStages == null || skippedSpaces == null) {
+                || recoveredToLsn == null || completedStages == null || exclusionSummary == null) {
             throw new DatabaseValidationException("recovery report fields must not be null");
         }
         if (repairedPageCount < 0 || detectedOnlyPageCount < 0 || appliedBatchCount < 0) {
             throw new DatabaseValidationException("recovery report counts must not be negative");
         }
-        if (skippedDoublewritePageCount < 0 || skippedRedoRecordCount < 0 || skippedReconcileSpaceCount < 0) {
-            throw new DatabaseValidationException("recovery skipped counts must not be negative");
-        }
         completedStages = List.copyOf(completedStages);
-        skippedSpaces = Set.copyOf(skippedSpaces);
+    }
+
+    /** 兼容旧 canonical 构造；单集合被解释为管理员来源，记录级统计为零。 */
+    public RecoveryReport(RecoveryMode mode, RecoveryState state, Lsn checkpointLsn, Lsn recoveredToLsn,
+                          int repairedPageCount, int detectedOnlyPageCount, int appliedBatchCount,
+                          List<RecoveryStageName> completedStages, Set<SpaceId> skippedSpaces,
+                          int skippedDoublewritePageCount, int skippedRedoRecordCount,
+                          int skippedReconcileSpaceCount) {
+        this(mode, state, checkpointLsn, recoveredToLsn, repairedPageCount, detectedOnlyPageCount,
+                appliedBatchCount, completedStages,
+                new RecoveryExclusionSummary(skippedSpaces, Set.of(), skippedDoublewritePageCount,
+                        skippedRedoRecordCount, skippedReconcileSpaceCount, 0, 0, 0));
     }
 
     /**
@@ -63,8 +65,17 @@ public record RecoveryReport(RecoveryMode mode,
                           int appliedBatchCount,
                           List<RecoveryStageName> completedStages) {
         this(mode, state, checkpointLsn, recoveredToLsn, repairedPageCount, detectedOnlyPageCount,
-                appliedBatchCount, completedStages, Set.of(), 0, 0, 0);
+                appliedBatchCount, completedStages, RecoveryExclusionSummary.none());
     }
+
+    /** @return 管理员与 DD 排除集合并集；保留旧报告访问器名称。 */
+    public Set<SpaceId> skippedSpaces() { return exclusionSummary.excludedSpaces(); }
+    /** @return doublewrite 阶段跳过页数。 */
+    public int skippedDoublewritePageCount() { return exclusionSummary.skippedDoublewritePages(); }
+    /** @return redo replay 跳过记录数。 */
+    public int skippedRedoRecordCount() { return exclusionSummary.skippedRedoRecords(); }
+    /** @return file reconcile 跳过空间数。 */
+    public int skippedReconcileSpaceCount() { return exclusionSummary.skippedReconcileSpaces(); }
 
     /**
      * 构造普通可写恢复报告。

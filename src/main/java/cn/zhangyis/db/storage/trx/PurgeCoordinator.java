@@ -238,6 +238,7 @@ public final class PurgeCoordinator implements PurgeTarget {
         int removedClustered = 0;
         int removedSecondary = 0;
         int deferredLogs = 0;
+        int skippedUnavailable = 0;
         while (purgedLogs < maxLogs) {
             Optional<HistoryEntry> headOpt = history.peekCommitted();
             if (headOpt.isEmpty()) {
@@ -255,10 +256,12 @@ public final class PurgeCoordinator implements PurgeTarget {
             }
             removedClustered += outcome.removedClustered();
             removedSecondary += outcome.removedSecondary();
+            skippedUnavailable += outcome.skippedUnavailable();
             purgedLogs++;
         }
         // 4. 统计是诊断快照，history 已由各成功 finalization 自身原子发布。
-        return new PurgeSummary(purgedLogs, removedClustered, removedSecondary, deferredLogs);
+        return new PurgeSummary(purgedLogs, removedClustered, removedSecondary, deferredLogs,
+                skippedUnavailable);
     }
 
     /**
@@ -283,6 +286,7 @@ public final class PurgeCoordinator implements PurgeTarget {
     private PurgeLogOutcome purgeCommittedLog(HistoryEntry entry) {
         int removedClustered = 0;
         int removedSecondary = 0;
+        int skippedUnavailable = 0;
         while (true) {
             // 1. 每轮重新读取持久 head，使 crash 重试和本轮已提交 progress 使用完全相同的权威入口。
             UndoLogicalHead head = readLogicalChainStart(entry).head();
@@ -292,6 +296,12 @@ public final class PurgeCoordinator implements PurgeTarget {
 
             // 2. 单条 task 冻结当前 record、直接前驱和所有 ownership；不把整条大事务 undo 链装入内存。
             PurgeRecordTask task = buildHeadTask(entry, head);
+            if (task.recoveryUnavailable()) {
+                // 隔离分支发生在 row guard、B+Tree root refresh、secondary/LOB 计划之前；只写系统 undo 进度。
+                persistRecoveryUnavailableProgress(entry, head, task);
+                skippedUnavailable++;
+                continue;
+            }
             if (rowGuards == null) {
                 requireLegacyTaskIsSelfContained(task);
                 removedClustered += purgeClustered(entry, task);
@@ -304,7 +314,7 @@ public final class PurgeCoordinator implements PurgeTarget {
             Optional<PurgeDmlRowGuard> guard = rowGuards.tryAcquireForPurge(
                     task.record().tableId(), task.clusterKey());
             if (guard.isEmpty()) {
-                return PurgeLogOutcome.deferred(removedClustered, removedSecondary);
+                return PurgeLogOutcome.deferred(removedClustered, removedSecondary, skippedUnavailable);
             }
             try (PurgeDmlRowGuard ignored = guard.orElseThrow()) {
                 for (SecondaryTask secondaryTask : task.secondaryTasks()) {
@@ -326,7 +336,7 @@ public final class PurgeCoordinator implements PurgeTarget {
         try (HistoryList.HeadRemovalLease lease = history.beginHeadRemoval(entry)) {
             finalizer.finalizePurgedHistory(entry, lease);
         }
-        return PurgeLogOutcome.completed(removedClustered, removedSecondary);
+        return PurgeLogOutcome.completed(removedClustered, removedSecondary, skippedUnavailable);
     }
 
     /**
@@ -405,22 +415,7 @@ public final class PurgeCoordinator implements PurgeTarget {
                     + record.type());
         }
 
-        // 2. old image 与 exact-version secondary layout 共同产生完整 physical identity；这里只冻结值，不改树。
-        List<SecondaryTask> secondaryTasks = new ArrayList<>();
-        for (SecondaryUndoMutation mutation : record.secondaryMutations()) {
-            SecondaryIndexMetadata metadata = current.target().tableIndexes().requireSecondary(mutation.indexId());
-            LogicalRecord oldRow = new LogicalRecord(current.target().tableIndexes().schemaVersion(),
-                    record.oldColumnValues(), false,
-                    cn.zhangyis.db.storage.record.format.RecordType.CONVENTIONAL,
-                    record.oldHiddenColumns());
-            SearchKey physicalKey = metadata.layout().physicalKey(metadata.layout().toEntry(oldRow, true));
-            secondaryTasks.add(new SecondaryTask(metadata, physicalKey));
-        }
-
-        // 3. LV 只授权 purge-old；reference identity 必须与 exact table LOB segment 交叉校验并冻结 redo workload。
-        Optional<LobFreeBatchPlan> lobFreePlan = planPurgeLobFree(record, current.target());
-
-        // 4. 直接前驱决定本条记录完成后的持久 head；跨表事务必须使用前驱自身 exact-version key/schema 校验。
+        // 2. 先完整读取直接前驱并校验 creator/undoNo；隔离分支也必须证明链连续，不能盲写 head。
         UndoLogicalHead targetHead = UndoLogicalHead.EMPTY;
         BTreeIndex targetHeadIndex = current.target().clusteredIndex();
         if (!record.prevRollPointer().isNull()) {
@@ -433,9 +428,29 @@ public final class PurgeCoordinator implements PurgeTarget {
             targetHead = new UndoLogicalHead(predecessor.record().undoNo(), record.prevRollPointer());
             targetHeadIndex = predecessor.target().clusteredIndex();
         }
+        if (current.target().recoveryUnavailable()) {
+            return new PurgeRecordTask(record, head.rollPointer(), current.target(),
+                    new SearchKey(record.clusterKey()), List.of(), false, Optional.empty(),
+                    targetHead, targetHeadIndex, true);
+        }
+
+        // 3. 健康对象才从 old image 与 exact-version secondary layout 产生 physical identity。
+        List<SecondaryTask> secondaryTasks = new ArrayList<>();
+        for (SecondaryUndoMutation mutation : record.secondaryMutations()) {
+            SecondaryIndexMetadata metadata = current.target().tableIndexes().requireSecondary(mutation.indexId());
+            LogicalRecord oldRow = new LogicalRecord(current.target().tableIndexes().schemaVersion(),
+                    record.oldColumnValues(), false,
+                    cn.zhangyis.db.storage.record.format.RecordType.CONVENTIONAL,
+                    record.oldHiddenColumns());
+            SearchKey physicalKey = metadata.layout().physicalKey(metadata.layout().toEntry(oldRow, true));
+            secondaryTasks.add(new SecondaryTask(metadata, physicalKey));
+        }
+
+        // 4. 健康对象的 LV 才授权 purge-old；隔离对象绝不进入 LOB 计划。
+        Optional<LobFreeBatchPlan> lobFreePlan = planPurgeLobFree(record, current.target());
         return new PurgeRecordTask(record, head.rollPointer(), current.target(),
                 new SearchKey(record.clusterKey()), List.copyOf(secondaryTasks),
-                record.type() == UndoRecordType.DELETE_MARK, lobFreePlan, targetHead, targetHeadIndex);
+                record.type() == UndoRecordType.DELETE_MARK, lobFreePlan, targetHead, targetHeadIndex, false);
     }
 
     /**
@@ -535,6 +550,37 @@ public final class PurgeCoordinator implements PurgeTarget {
             if (physicalMutationStarted) {
                 throw new PurgeProgressException("purge record progress failed after physical mutation began: firstPage="
                         + entry.undoFirstPageId() + ", undoNo=" + expected.undoNo().value(), error);
+            }
+            throw error;
+        }
+        faultInjector.onBoundary(PurgeProgressPhase.AFTER_RECORD_PROGRESS_COMMIT,
+                task.target().clusteredIndex().indexId());
+    }
+
+    /**
+     * 隔离对象专用 purge progress：current/前驱已经完整解码校验，本方法只 CAS 推进系统 undo first-page；
+     * 不取得 row guard，不创建 secondary/clustered task，也不构造或执行 LOB free 计划。
+     */
+    private void persistRecoveryUnavailableProgress(HistoryEntry entry, UndoLogicalHead expected,
+                                                    PurgeRecordTask task) {
+        MiniTransaction progress = mgr.begin(mgr.budgetFor(
+                RedoBudgetPurpose.PURGE_RECORD_PROGRESS, RedoBudgetWorkload.pageImages(6L)));
+        boolean mutationStarted = false;
+        try {
+            UndoLogSegment writable = undoAccess.open(
+                    progress, entry.undoFirstPageId(), PageLatchMode.EXCLUSIVE);
+            writable.validateLogicalHeadUpdate(expected, task.targetHead(),
+                    task.targetHeadIndex().keyDef(), task.targetHeadIndex().schema());
+            mutationStarted = true;
+            writable.updateLogicalHead(expected, task.targetHead(),
+                    task.targetHeadIndex().keyDef(), task.targetHeadIndex().schema());
+            mgr.commit(progress);
+        } catch (RuntimeException error) {
+            rollbackReadMtr(progress, error);
+            if (mutationStarted) {
+                throw new PurgeProgressException(
+                        "recovery-unavailable purge head update failed after mutation began: firstPage="
+                                + entry.undoFirstPageId() + ", undoNo=" + expected.undoNo().value(), error);
             }
             throw error;
         }
@@ -838,7 +884,8 @@ public final class PurgeCoordinator implements PurgeTarget {
     private record PurgeRecordTask(UndoRecord record, RollPointer rollPointer, UndoTargetMetadata target,
                                    SearchKey clusterKey, List<SecondaryTask> secondaryTasks,
                                    boolean deleteClustered, Optional<LobFreeBatchPlan> lobFreePlan,
-                                   UndoLogicalHead targetHead, BTreeIndex targetHeadIndex) {
+                                   UndoLogicalHead targetHead, BTreeIndex targetHeadIndex,
+                                   boolean recoveryUnavailable) {
     }
 
     /**
@@ -857,13 +904,16 @@ public final class PurgeCoordinator implements PurgeTarget {
      * @param removedClustered 本 log 已真实删除的聚簇记录数。
      * @param removedSecondary 本 log 已真实删除的二级 entry 数。
      */
-    private record PurgeLogOutcome(boolean completed, int removedClustered, int removedSecondary) {
-        private static PurgeLogOutcome completed(int removedClustered, int removedSecondary) {
-            return new PurgeLogOutcome(true, removedClustered, removedSecondary);
+    private record PurgeLogOutcome(boolean completed, int removedClustered, int removedSecondary,
+                                   int skippedUnavailable) {
+        private static PurgeLogOutcome completed(int removedClustered, int removedSecondary,
+                                                 int skippedUnavailable) {
+            return new PurgeLogOutcome(true, removedClustered, removedSecondary, skippedUnavailable);
         }
 
-        private static PurgeLogOutcome deferred(int removedClustered, int removedSecondary) {
-            return new PurgeLogOutcome(false, removedClustered, removedSecondary);
+        private static PurgeLogOutcome deferred(int removedClustered, int removedSecondary,
+                                                int skippedUnavailable) {
+            return new PurgeLogOutcome(false, removedClustered, removedSecondary, skippedUnavailable);
         }
     }
 

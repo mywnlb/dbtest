@@ -65,4 +65,30 @@ public final class TablespaceLifecycleRawCodec {
                 PageNo.of(page.getLong(SpaceHeaderLayout.LIFECYCLE_TARGET_SIZE)),
                 TablespaceState.fromPersistentCode(page.getInt(SpaceHeaderLayout.LIFECYCLE_FINISH_STATE))));
     }
+
+    /**
+     * 把已经完成领域校验的生命周期头写回 raw page-0 保留区。
+     *
+     * <p>该入口只供离线可信备份副本使用：调用方必须在文件未挂载且页面镜像由自己独占时调用，随后重新计算
+     * page checksum 并 force 文件。它不会生成 redo，也不能用于在线表空间状态迁移。</p>
+     *
+     * @param page 调用方独占的完整 page-0 可写缓冲；容量必须覆盖生命周期保留区
+     * @param header 已由构造器验证的稳定生命周期头
+     * @throws DatabaseValidationException 参数为空或缓冲区过小时抛出；输入页面保持未写状态
+     */
+    public static void write(ByteBuffer page, TablespaceLifecycleHeader header) {
+        if (page == null || header == null) {
+            throw new DatabaseValidationException("tablespace lifecycle page/header must not be null");
+        }
+        if (page.capacity() < SpaceHeaderLayout.LIFECYCLE_FINISH_STATE + Integer.BYTES) {
+            throw new DatabaseValidationException("tablespace lifecycle page buffer too small: " + page.capacity());
+        }
+        page.putInt(SpaceHeaderLayout.LIFECYCLE_MAGIC, TablespaceLifecycleFormat.MAGIC);
+        page.putInt(SpaceHeaderLayout.LIFECYCLE_FORMAT, TablespaceLifecycleFormat.VERSION);
+        page.putInt(SpaceHeaderLayout.LIFECYCLE_STATE, header.state().persistentCode());
+        page.putLong(SpaceHeaderLayout.LIFECYCLE_INITIAL_SIZE, header.initialSizeInPages().value());
+        page.putLong(SpaceHeaderLayout.LIFECYCLE_EPOCH, header.truncateEpoch());
+        page.putLong(SpaceHeaderLayout.LIFECYCLE_TARGET_SIZE, header.targetSizeInPages().value());
+        page.putInt(SpaceHeaderLayout.LIFECYCLE_FINISH_STATE, header.finishState().persistentCode());
+    }
 }

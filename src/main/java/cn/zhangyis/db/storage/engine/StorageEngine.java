@@ -78,6 +78,7 @@ import cn.zhangyis.db.storage.recovery.PreparedTransactionDecision;
 import cn.zhangyis.db.storage.recovery.PreparedTransactionDecisionProvider;
 import cn.zhangyis.db.storage.recovery.RecoveryReport;
 import cn.zhangyis.db.storage.recovery.RecoveryRequest;
+import cn.zhangyis.db.storage.recovery.RecoverySpaceExclusionPolicy;
 import cn.zhangyis.db.storage.recovery.RecoveryState;
 import cn.zhangyis.db.storage.recovery.RecoveryTrafficGate;
 import cn.zhangyis.db.storage.recovery.TransactionUndoRecoveryResult;
@@ -112,6 +113,7 @@ import cn.zhangyis.db.storage.trx.SecondaryMvccReader;
 import cn.zhangyis.db.storage.trx.SecondaryCurrentReadService;
 import cn.zhangyis.db.storage.trx.RollbackSegmentSlotManager;
 import cn.zhangyis.db.storage.trx.RollbackService;
+import cn.zhangyis.db.storage.trx.RollbackSummary;
 import cn.zhangyis.db.storage.trx.RecoveredUndoLogIdentity;
 import cn.zhangyis.db.storage.trx.Transaction;
 import cn.zhangyis.db.storage.trx.TransactionManager;
@@ -182,6 +184,12 @@ public final class StorageEngine {
      * 构造时冻结的 {@code config} 配置快照；已完成范围和组合校验，运行期策略读取它但不得就地修改。
      */
     private final EngineConfig config;
+    /** 管理员本次声明与 DD durable 隔离的恢复排除并集；所有恢复 IO 阶段共享同一不可变实例。 */
+    private final RecoverySpaceExclusionPolicy recoveryExclusionPolicy;
+    /** DatabaseEngine 注入的 DDL/manifest 完成钩子；在 worker 与用户写准入发布前同线程执行。 */
+    private final Runnable recoveryCompletionHook;
+    /** 写 MTR 的唯一实例级准入；构造即为 RECOVERY_INTERNAL，完成钩子后单向封存。 */
+    private final StorageWriteAdmission writeAdmission = StorageWriteAdmission.recoveryInternal();
     /** 恢复 PREPARED 的外部权威决议源；默认 unresolved，绝不由存储层猜测全局事务结果。 */
     private final PreparedTransactionDecisionProvider preparedDecisionProvider;
     /**
@@ -359,7 +367,38 @@ public final class StorageEngine {
     public StorageEngine(EngineConfig config,
                          PreparedTransactionDecisionProvider preparedDecisionProvider) {
         this(config, new RecoveryTrafficGate(), defaultRecoveryProgressJournal(config),
-                preparedDecisionProvider);
+                preparedDecisionProvider, configuredExclusionPolicy(config), () -> { });
+    }
+
+    /**
+     * 构造携带对象级 DD 隔离证据的存储引擎；公共 DatabaseEngine 在用户表空间 discovery 前使用该入口。
+     *
+     * @param config 引擎物理与恢复配置
+     * @param preparedDecisionProvider PREPARED 外部决议源
+     * @param exclusionPolicy 已由 DD 规划器证明的管理员/DD 排除集合
+     */
+    public StorageEngine(EngineConfig config,
+                         PreparedTransactionDecisionProvider preparedDecisionProvider,
+                         RecoverySpaceExclusionPolicy exclusionPolicy) {
+        this(config, new RecoveryTrafficGate(), defaultRecoveryProgressJournal(config),
+                preparedDecisionProvider, exclusionPolicy, () -> { });
+    }
+
+    /**
+     * 构造带 DatabaseEngine 恢复完成钩子的存储引擎。钩子只能执行 DDL recovery/clean publish，
+     * 返回前用户入口尚未发布且后台 worker 尚未启动。
+     *
+     * @param config 引擎配置
+     * @param preparedDecisionProvider PREPARED 决议源
+     * @param exclusionPolicy 对象级排除证据
+     * @param recoveryCompletionHook storage crash recovery 后、服务发布前的同线程完成动作
+     */
+    public StorageEngine(EngineConfig config,
+                         PreparedTransactionDecisionProvider preparedDecisionProvider,
+                         RecoverySpaceExclusionPolicy exclusionPolicy,
+                         Runnable recoveryCompletionHook) {
+        this(config, new RecoveryTrafficGate(), defaultRecoveryProgressJournal(config),
+                preparedDecisionProvider, exclusionPolicy, recoveryCompletionHook);
     }
 
     /**
@@ -371,7 +410,7 @@ public final class StorageEngine {
      */
     StorageEngine(EngineConfig config, RecoveryTrafficGate recoveryGate, RecoveryProgressJournal recoveryProgressJournal) {
         this(config, recoveryGate, recoveryProgressJournal,
-                PreparedTransactionDecisionProvider.unresolved());
+                PreparedTransactionDecisionProvider.unresolved(), configuredExclusionPolicy(config), () -> { });
     }
 
     /**
@@ -386,17 +425,38 @@ public final class StorageEngine {
     StorageEngine(EngineConfig config, RecoveryTrafficGate recoveryGate,
                   RecoveryProgressJournal recoveryProgressJournal,
                   PreparedTransactionDecisionProvider preparedDecisionProvider) {
+        this(config, recoveryGate, recoveryProgressJournal, preparedDecisionProvider,
+                configuredExclusionPolicy(config), () -> { });
+    }
+
+    /** 统一校验并冻结启动恢复依赖；package 构造器仍默认只携带旧配置中的管理员集合。 */
+    private StorageEngine(EngineConfig config, RecoveryTrafficGate recoveryGate,
+                          RecoveryProgressJournal recoveryProgressJournal,
+                          PreparedTransactionDecisionProvider preparedDecisionProvider,
+                          RecoverySpaceExclusionPolicy exclusionPolicy,
+                          Runnable recoveryCompletionHook) {
         if (config == null) {
             throw new DatabaseValidationException("engine config must not be null");
         }
-        if (recoveryGate == null || recoveryProgressJournal == null || preparedDecisionProvider == null) {
+        if (recoveryGate == null || recoveryProgressJournal == null || preparedDecisionProvider == null
+                || exclusionPolicy == null || recoveryCompletionHook == null) {
             throw new DatabaseValidationException(
-                    "engine recovery gate/journal/prepared decision provider must not be null");
+                    "engine recovery gate/journal/prepared decision provider/exclusion policy must not be null");
         }
         this.config = config;
+        this.recoveryExclusionPolicy = exclusionPolicy;
+        this.recoveryCompletionHook = recoveryCompletionHook;
         this.recoveryGate = recoveryGate;
         this.recoveryProgressJournal = recoveryProgressJournal;
         this.preparedDecisionProvider = preparedDecisionProvider;
+    }
+
+    /** 旧低层构造只把 config 的 force 集合解释为管理员证据；DD 证据只能由上层显式注入。 */
+    private static RecoverySpaceExclusionPolicy configuredExclusionPolicy(EngineConfig config) {
+        if (config == null) {
+            throw new DatabaseValidationException("engine config must not be null");
+        }
+        return RecoverySpaceExclusionPolicy.of(config.forceSkippedSpaces(), Set.of());
     }
 
     private static RecoveryProgressJournal defaultRecoveryProgressJournal(EngineConfig config) {
@@ -540,7 +600,7 @@ public final class StorageEngine {
                 config.flushTimeout(),
                 config.redoRotationEnabled() ? config.redoRotation().fileBytes() : Long.MAX_VALUE);
         this.miniTransactionManager = new MiniTransactionManager(
-                accessController, redo, redoCapacityThrottle, config.pageSize());
+                accessController, redo, redoCapacityThrottle, config.pageSize(), writeAdmission);
 
         this.typeRegistry = new TypeCodecRegistry();
         this.lobStorage = new LobStorage(diskSpaceManager, pool, config.pageSize(), typeRegistry);
@@ -563,7 +623,7 @@ public final class StorageEngine {
         this.purgeDmlRowGuards = new PurgeDmlRowGuardManager();
         this.tableDdlStorageService = new TableDdlStorageService(miniTransactionManager, diskSpaceManager,
                 indexPageAccess, pool, store, flushService, accessController, config.pageSize(),
-                btreeService, btreeRootSnapshots, lobStorage);
+                btreeService, btreeRootSnapshots, lobStorage, writeAdmission);
         this.lockObservationService = new DefaultLockObservationService();
         // 3、在中间分支复核阶段性结果；满足条件后，调用 binder、executor、字典或 storage 稳定接口完成领域动作，并维持领域不变量。
         this.lockManager = new LockManager(lockObservationService);
@@ -633,6 +693,16 @@ public final class StorageEngine {
             this.state = EngineState.READ_ONLY;
             return;
         }
+        // DatabaseEngine 的 DDL/SDI/orphan 收敛必须仍处于 recovery-internal 写窗口；完成后强制刷清副作用。
+        recoveryCompletionHook.run();
+        flushService.flushThrough(redo.currentLsn(), config.flushTimeout());
+        if (config.recoveryMode() == RecoveryMode.FORCE_SKIP_CORRUPT_TABLESPACE) {
+            // FORCE 只用于导出健康对象：不启动任何会写文件或主动触页的后台 worker/warmup。
+            writeAdmission.seal(StorageWriteAdmission.Mode.EXPORT_READ_ONLY);
+            this.state = EngineState.OPEN;
+            return;
+        }
+        writeAdmission.seal(StorageWriteAdmission.Mode.NORMAL);
         // redo flusher 早于 page cleaner 启动：先让 durable LSN 能自动前进，page cleaner 的 WAL gate 才不空等。
         startBackgroundRedoFlusher();
         startBackgroundPageCleaner();
@@ -680,14 +750,16 @@ public final class StorageEngine {
      */
     private void validateRecoverySkipConfiguration() {
         // 1、读取 checkpoint、redo、doublewrite 或事务持久证据，在共享或持久副作用前拒绝非法状态。
-        Set<SpaceId> skipped = config.forceSkippedSpaces();
+        Set<SpaceId> skipped = recoveryExclusionPolicy.excludedSpaces();
         // 2、继续完成范围、身份与候选校验；通过后，依据 page LSN、恢复进度和稳定标识判断跳过或续作，保持处理顺序与资源边界。
-        if (config.recoveryMode() != RecoveryMode.FORCE_SKIP_CORRUPT_TABLESPACE && !skipped.isEmpty()) {
+        if (config.recoveryMode() != RecoveryMode.FORCE_SKIP_CORRUPT_TABLESPACE
+                && !recoveryExclusionPolicy.administrativeSpaces().isEmpty()) {
             throw new DatabaseValidationException(
                     "force skipped spaces are only allowed in FORCE_SKIP_CORRUPT_TABLESPACE mode");
         }
         // 3、在中间分支复核阶段性结果；满足条件后，按恢复阶段应用物理页或事务状态变化，并维持领域不变量。
-        if (config.recoveryMode() == RecoveryMode.FORCE_SKIP_CORRUPT_TABLESPACE && skipped.isEmpty()) {
+        if (config.recoveryMode() == RecoveryMode.FORCE_SKIP_CORRUPT_TABLESPACE
+                && recoveryExclusionPolicy.administrativeSpaces().isEmpty()) {
             throw new DatabaseValidationException("FORCE_SKIP_CORRUPT_TABLESPACE requires skipped spaces");
         }
         if (skipped.contains(config.undoSpaceId())) {
@@ -724,7 +796,7 @@ public final class StorageEngine {
         // 1、只打开恢复准入范围内的物理空间，避免 redo/doublewrite 访问未发现文件。
         diskSpaceManager.openTablespaceForRecovery(config.undoSpaceId(), config.undoFile());
         for (EngineTablespaceConfig tablespace : config.recoveryTablespaces()) {
-            if (config.forceSkippedSpaces().contains(tablespace.spaceId())) {
+            if (recoveryExclusionPolicy.shouldSkip(tablespace.spaceId())) {
                 continue;
             }
             diskSpaceManager.openTablespaceForRecovery(tablespace.spaceId(), tablespace.path());
@@ -760,7 +832,7 @@ public final class StorageEngine {
 
         // 3、写恢复模式注入 rollback+purge 参与者；只读诊断模式禁止任何 undo/history 写入。
         TransactionUndoRecoveryParticipant undoRecovery = transactionUndoRecoveryParticipant();
-        RecoveryRequest request = switch (config.recoveryMode()) {
+        RecoveryRequest request = (switch (config.recoveryMode()) {
             case NORMAL -> RecoveryRequest.normal(checkpointStore, redoRepo,
                             RedoApplyDispatcher.pageDispatcher(),
                             new RedoApplyContext(store, config.pageSize()))
@@ -782,7 +854,7 @@ public final class StorageEngine {
                     .withUndoTablespaceRecovery(buildUndoTablespaceRecovery())
                     .withSpaceFileReconcile(recoverySpaces)
                     .withTransactionRecovery(transactionRecovery, undoRecovery);
-        };
+        }).withSpaceExclusionPolicy(recoveryExclusionPolicy);
 
         // 4、恢复总控负责阶段顺序、redo flush/page force 与 traffic gate；失败不会发布半恢复引擎。
         lastRecoveryReport = crashRecoveryService.recover(request);
@@ -812,8 +884,8 @@ public final class StorageEngine {
              * 在 redo 与事务 undo 恢复完成后转交引擎级 purge 恢复步骤；调用返回前普通 SQL 流量仍保持关闭。
              */
             @Override
-            public void resumePurgeAfterRedo() {
-                StorageEngine.this.resumePurgeAfterRedo();
+            public PurgeSummary resumePurgeAfterRedoWithSummary() {
+                return StorageEngine.this.resumePurgeAfterRedo();
             }
         };
     }
@@ -830,11 +902,11 @@ public final class StorageEngine {
      *
      * @throws TransactionRecoveryException 恢复证据、阶段顺序或事务重建无法继续时抛出；owner 应停止恢复并保持普通流量关闭
      */
-    private void resumePurgeAfterRedo() {
+    private PurgeSummary resumePurgeAfterRedo() {
         // 1、persistent history 非空却没有 metadata 定位能力时，不能假装 RESUME_PURGE 已完成后开放流量。
         int historyBefore = history.committedSize();
         if (historyBefore == 0) {
-            return;
+            return new PurgeSummary(0, 0, 0, 0, 0);
         }
         if (purgeCoordinator == null) {
             throw new TransactionRecoveryException(
@@ -844,13 +916,23 @@ public final class StorageEngine {
 
         // 2、恢复期没有用户事务和后台 purge worker；循环只推进当前安全 boundary，单批上限沿用 slot 容量。
         // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
+        int purgedLogs = 0;
+        int removedClustered = 0;
+        int removedSecondary = 0;
+        int deferred = 0;
+        int skippedUnavailable = 0;
         while (historyBefore > 0) {
             PurgeSummary summary = purgeCoordinator.runBatch(config.slotCapacity());
+            purgedLogs += summary.purgedLogs();
+            removedClustered += summary.removedClusteredRecords();
+            removedSecondary += summary.removedSecondaryEntries();
+            deferred += summary.deferredLogs();
+            skippedUnavailable += summary.recoveryUnavailableRecordsSkipped();
             int historyAfter = history.committedSize();
 
             // 3、零进展保留不安全 head；正进展必须和 history 摘除数完全一致，否则拒绝潜在无限循环/投影漂移。
             if (summary.purgedLogs() == 0) {
-                return;
+                break;
             }
             if (historyAfter != historyBefore - summary.purgedLogs()) {
                 throw new TransactionRecoveryException(
@@ -859,6 +941,8 @@ public final class StorageEngine {
             }
             historyBefore = historyAfter;
         }
+        return new PurgeSummary(purgedLogs, removedClustered, removedSecondary, deferred,
+                skippedUnavailable);
     }
 
     /**
@@ -1003,9 +1087,10 @@ public final class StorageEngine {
         // 已有 physical history 必须先恢复，prepared UPDATE commit 的 append lease 才能与 page3 tail 精确衔接。
         // 3、在中间分支复核阶段性结果；满足条件后，按恢复阶段应用物理页或事务状态变化，并维持领域不变量。
         history.restore(committed);
-        int resolvedPreparedSlots = resolveRecoveredPreparedTransactions(
+        PreparedRecoveryResolution preparedResolution = resolveRecoveredPreparedTransactions(
                 preparedGroups, preparedDecisions);
         int rolledBackActiveSlots = 0;
+        int skippedActiveRollbackRecords = 0;
 
         Map<TransactionId, List<RecoveredUndoSlotEvidence>> activeGroups =
                 groupByCreator(reconciliation.activeSlots());
@@ -1014,17 +1099,19 @@ public final class StorageEngine {
                     .map(recovered -> new RecoveredUndoLogIdentity(
                             recovered.kind(), recovered.slotId(), recovered.firstPageId()))
                     .toList();
-            rollbackService.rollbackRecovered(logs, group.getKey(), clusteredIndex);
+            RollbackSummary summary = rollbackService.rollbackRecovered(logs, group.getKey(), clusteredIndex);
+            skippedActiveRollbackRecords += summary.recoveryUnavailableRecordsSkipped();
             rolledBackActiveSlots += logs.size();
         }
         // prepared/active phase-two MTR 产生了新的 terminal redo；开放流量前至少先使 redo durable，
         // 即使数据/undo dirty page 尚未落盘，下一次崩溃也能幂等重放到相同终态。
-        if (resolvedPreparedSlots > 0 || rolledBackActiveSlots > 0) {
+        if (preparedResolution.resolvedSlots() > 0 || rolledBackActiveSlots > 0) {
             redo.flush();
         }
         // 4、发布恢复结果并释放恢复专用资源，以稳定返回或领域异常完成收口。
         return new TransactionUndoRecoveryResult(occupiedSlots.size(), rolledBackActiveSlots,
-                0, committed.size());
+                0, committed.size(), skippedActiveRollbackRecords,
+                preparedResolution.skippedUnavailableRecords());
     }
 
     /** 按 creator 保持 page3 扫描顺序分组；返回集合只含恢复值对象，不持有任何 page latch。 */
@@ -1058,10 +1145,11 @@ public final class StorageEngine {
      * @return 已完成 phase-two 的 slot 数量
      * @throws TransactionRecoveryException binding、决议、metadata 或 phase-two 失败时抛出
      */
-    private int resolveRecoveredPreparedTransactions(
+    private PreparedRecoveryResolution resolveRecoveredPreparedTransactions(
             Map<TransactionId, List<RecoveredUndoSlotEvidence>> groups,
             Map<TransactionId, PreparedTransactionDecision> decisions) {
         int resolvedSlots = 0;
+        int skippedUnavailableRecords = 0;
         for (Map.Entry<TransactionId, List<RecoveredUndoSlotEvidence>> group : groups.entrySet()) {
             // 1、每条 first page 单独读取并释放 S latch；global high-water 取两种 log 的最大物理值。
             List<RecoveredPreparedBinding> recoveredBindings = group.getValue().stream()
@@ -1090,9 +1178,13 @@ public final class StorageEngine {
                 transactionManager.commitPrepared(transaction);
             } else if (decision == PreparedTransactionDecision.ROLLBACK) {
                 if (clusteredIndex != null) {
-                    rollbackService.rollbackPrepared(transaction, clusteredIndex);
+                    skippedUnavailableRecords += rollbackService
+                            .rollbackPreparedRecovered(transaction, clusteredIndex)
+                            .recoveryUnavailableRecordsSkipped();
                 } else {
-                    rollbackService.rollbackPrepared(transaction);
+                    skippedUnavailableRecords += rollbackService
+                            .rollbackPreparedRecovered(transaction, null)
+                            .recoveryUnavailableRecordsSkipped();
                 }
             } else {
                 throw new TransactionRecoveryException(
@@ -1102,7 +1194,11 @@ public final class StorageEngine {
             // 4、成功终态已经由 manager 移出 active table；slot 数按物理 participant owner 计数。
             resolvedSlots += group.getValue().size();
         }
-        return resolvedSlots;
+        return new PreparedRecoveryResolution(resolvedSlots, skippedUnavailableRecords);
+    }
+
+    /** recovered PREPARED phase-two 的 slot 完成数与隔离记录跳过数。 */
+    private record PreparedRecoveryResolution(int resolvedSlots, int skippedUnavailableRecords) {
     }
 
     /**
@@ -1566,6 +1662,7 @@ public final class StorageEngine {
      */
     public void checkpoint() {
         requireOpen();
+        writeAdmission.assertWriteAllowed();
         flushService.flushThrough(redo.currentLsn(), config.flushTimeout());
     }
 
@@ -1602,8 +1699,10 @@ public final class StorageEngine {
         // 3、在中间分支复核阶段性结果；满足条件后，调用 binder、executor、字典或 storage 稳定接口完成领域动作，并维持领域不变量。
         stopBackgroundPurgeDriver();
         flushService.flushThrough(redo.currentLsn(), config.flushTimeout());
-        // warmup dump：后台 worker 已停、dirty 已刷，residentMap 稳定，保存热页定位供下次 open 预取。最佳努力（IO 失败不抛）。
-        new BufferPoolWarmupService().dump(pool, config.bufferPoolDumpFile());
+        // FORCE 导出模式不写 warmup sidecar；普通实例才保存热页定位。
+        if (writeAdmission.mode() != StorageWriteAdmission.Mode.EXPORT_READ_ONLY) {
+            new BufferPoolWarmupService().dump(pool, config.bufferPoolDumpFile());
+        }
         // 4、关闭 scope 并返回不可变结果，以稳定返回或领域异常完成收口。
         closeOpenedHandles();
     }
@@ -1632,6 +1731,7 @@ public final class StorageEngine {
         // 3、在中间分支复核阶段性结果；满足条件后，调用 binder、executor、字典或 storage 稳定接口完成领域动作，并维持领域不变量。
         closeQuietly(doublewriteChannel, errors);
         closeQuietly(legacyDoublewriteRepo, errors);
+        writeAdmission.close();
         state = EngineState.CLOSED;
         // 4、关闭 scope 并返回不可变结果，以稳定返回或领域异常完成收口。
         if (!errors.isEmpty()) {
@@ -1882,6 +1982,40 @@ public final class StorageEngine {
      */
     public TablePurgeBarrier tablePurgeBarrier() {
         requireOpen();
+        return tablePurgeBarrier;
+    }
+
+    /**
+     * 仅供组合根注入的 recovery completion hook 在普通 OPEN 发布前取得物理 DDL facade。
+     *
+     * <p>StorageEngine 在 {@link #open()} 内部仍保持 NEW，直到 DDL/SDI/orphan 收敛、flush 和写闸门封存全部完成；
+     * 因而不能复用公开 {@link #tableDdlStorageService()}。本入口只在组件已经初始化且状态仍为 NEW 时返回，
+     * 不开放事务、DML 或用户流量，也不能在 open 调用前猜测可用。</p>
+     *
+     * @return 当前 open 调用已接线且仍处恢复内部写窗口的物理 DDL facade
+     * @throws EngineStateException 不在 recovery completion 初始化窗口时抛出
+     */
+    public TableDdlStorageService tableDdlStorageServiceForRecoveryCompletion() {
+        if (state != EngineState.NEW || tableDdlStorageService == null
+                || writeAdmission.mode() != StorageWriteAdmission.Mode.RECOVERY_INTERNAL) {
+            throw new EngineStateException(
+                    "table DDL recovery facade is unavailable: state=" + state);
+        }
+        return tableDdlStorageService;
+    }
+
+    /**
+     * 仅供 recovery completion hook 读取已经由事务恢复重建的 persistent history barrier。
+     *
+     * @return 与本次 open 的 rollback/purge history 共享 owner 的表级屏障
+     * @throws EngineStateException recovery 内部窗口尚未初始化或已经结束时抛出
+     */
+    public TablePurgeBarrier tablePurgeBarrierForRecoveryCompletion() {
+        if (state != EngineState.NEW || tablePurgeBarrier == null
+                || writeAdmission.mode() != StorageWriteAdmission.Mode.RECOVERY_INTERNAL) {
+            throw new EngineStateException(
+                    "table purge recovery barrier is unavailable: state=" + state);
+        }
         return tablePurgeBarrier;
     }
 

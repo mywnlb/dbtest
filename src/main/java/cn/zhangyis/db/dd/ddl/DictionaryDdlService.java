@@ -54,6 +54,9 @@ import cn.zhangyis.db.storage.api.ddl.StorageColumnRewrite;
 import cn.zhangyis.db.storage.api.ddl.StorageDefaultValue;
 import cn.zhangyis.db.storage.api.ddl.StorageTableRebuildRequest;
 import cn.zhangyis.db.storage.api.ddl.TableRebuildException;
+import cn.zhangyis.db.dd.recovery.backup.RecoveryBackupArtifact;
+import cn.zhangyis.db.dd.recovery.backup.RecoveryBackupService;
+import cn.zhangyis.db.dd.recovery.backup.ValidatedRecoveryBackup;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;
@@ -108,6 +111,8 @@ public final class DictionaryDdlService {
     private final SerializedDictionaryInfoService sdi;
     /** DDL 前检查 manifest fence，并在稳定终点发布 clean snapshot；兼容构造使用 no-op。 */
     private final DictionaryCleanSnapshotPublisher cleanSnapshotPublisher;
+    /** 可信 clean backup 的 lazy identity、固定路径、HMAC 与物理副本协调器。 */
+    private final RecoveryBackupService recoveryBackups;
 
     /**
      * 构造不接 persistent history barrier、也不注入故障的低层 DDL 服务；仅供孤立组件测试使用。
@@ -225,6 +230,12 @@ public final class DictionaryDdlService {
         this.faultInjector = faultInjector;
         this.sdi = new SerializedDictionaryInfoService(physical);
         this.cleanSnapshotPublisher = cleanSnapshotPublisher;
+        Path instanceRoot = this.tablesDirectory.getParent();
+        if (instanceRoot == null) {
+            throw new DatabaseValidationException(
+                    "tables directory has no instance root for recovery backups");
+        }
+        this.recoveryBackups = new RecoveryBackupService(instanceRoot, physical);
     }
 
     /**
@@ -703,10 +714,20 @@ public final class DictionaryDdlService {
             // 1、MDL 阻断新表访问后读取 ACTIVE metadata；此时还未改 cache/catalog/物理文件。
             SchemaDefinition schema = repository.findSchema(name.schema()).orElseThrow(() ->
                     new DictionaryObjectNotFoundException("schema does not exist: " + name.schema().displayName()));
-            TableDefinition active = repository.findTable(schema.id(), name.table()).orElseThrow(() ->
+            TableDefinition active = repository.findTableForRecovery(schema.id(), name.table()).orElseThrow(() ->
                     new DictionaryObjectNotFoundException("table does not exist: " + name.canonicalKey()));
             TableStorageBinding binding = active.storageBinding().orElseThrow(() ->
                     new DictionaryDdlException("ACTIVE table has no physical binding: " + active.id().value()));
+
+            if (active.state() == TableState.RECOVERY_UNAVAILABLE
+                    || active.state() == TableState.RECOVERY_DISCARDED) {
+                dropRecoveryIsolatedLocked(active, binding, timeout);
+                return;
+            }
+            if (active.state() != TableState.ACTIVE) {
+                throw new DictionaryDdlException("table is not ACTIVE or recovery-isolated: "
+                        + active.id().value() + " state=" + active.state());
+            }
 
             // 2、history 仍引用表 metadata 时不能发布 DROP_PENDING；等待只持 Java Condition，不持存储资源。
             purgeBarrier.awaitUnreferenced(active.id().value(), timeout);
@@ -919,8 +940,145 @@ public final class DictionaryDdlService {
         Path quarantine = transferPath("discarded", target.tableId(), target.binding());
         ensureTransferDirectory(quarantine.getParent());
         // 3、原有状态机在锁内复核同一个 tableId/spaceId。
-        discardTablespace(owner, name, quarantine, timeout);
+        if (target.state() == TableState.RECOVERY_UNAVAILABLE) {
+            discardRecoveryUnavailable(owner, name, quarantine, timeout);
+        } else {
+            discardTablespace(owner, name, quarantine, timeout);
+        }
         // 4、终态与恢复证据由被调用状态机完整发布。
+    }
+
+    /**
+     * 将 FORCE 隔离的对象从 {@code RECOVERY_UNAVAILABLE} 收敛为 {@code RECOVERY_DISCARDED}。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>取得 schema IX/table X，重读隔离状态、binding 与固定 quarantine identity；不读取损坏 page0。</li>
+     *     <li>等待 committed history 与旧 metadata pin 清零，写 PREPARED 并建立不可回退 cache 屏障。</li>
+     *     <li>调用 raw/offline storage 在独占 SpaceId lease 内幂等移动文件，成功后写 ENGINE_DONE。</li>
+     *     <li>以 marker 预留的唯一版本提交 RECOVERY_DISCARDED，再依次写 DICTIONARY_COMMITTED/COMMITTED。</li>
+     * </ol>
+     *
+     * @param owner 独立 DDL owner；不得是 session 保留 owner
+     * @param name 恢复可见目录中的隔离表名
+     * @param quarantine 由实例 transfer 根与 table/space identity 派生的固定目标
+     * @param timeout MDL、history、pin 与物理 lease 共用的正上界
+     * @throws DictionaryDdlException 状态、binding、持久阶段或物理移动无法安全收敛时抛出
+     */
+    public void discardRecoveryUnavailable(
+            MdlOwnerId owner, QualifiedTableName name, Path quarantine, Duration timeout) {
+        // 1. 任何文件副作用前先固定逻辑名称与路径所有权。
+        validateOwnerTimeout(owner, timeout);
+        cleanSnapshotPublisher.assertAvailable();
+        if (name == null || quarantine == null) {
+            throw new DatabaseValidationException(
+                    "recovery discard table/quarantine must not be null");
+        }
+        Path target = checkedTransferPath(quarantine);
+        try (MdlTicket schemaTicket = locks.acquire(new MdlRequest(owner,
+                MdlKey.schema(name.schema().canonicalName()), MdlMode.INTENTION_EXCLUSIVE,
+                MdlDuration.TRANSACTION), timeout);
+             MdlTicket tableTicket = locks.acquire(new MdlRequest(owner,
+                     MdlKey.table(name.canonicalKey()), MdlMode.EXCLUSIVE,
+                     MdlDuration.TRANSACTION), timeout)) {
+            SchemaDefinition schema = repository.findSchema(name.schema()).orElseThrow(() ->
+                    new DictionaryObjectNotFoundException(
+                            "schema does not exist: " + name.schema().displayName()));
+            TableDefinition unavailable = repository.findTableForRecovery(
+                    schema.id(), name.table()).orElseThrow(() ->
+                    new DictionaryObjectNotFoundException(
+                            "table does not exist: " + name.canonicalKey()));
+            if (unavailable.state() != TableState.RECOVERY_UNAVAILABLE) {
+                throw new DictionaryDdlException(
+                        "table is not RECOVERY_UNAVAILABLE: " + unavailable.id().value());
+            }
+            TableStorageBinding binding = unavailable.storageBinding().orElseThrow(() ->
+                    new DictionaryDdlException(
+                            "RECOVERY_UNAVAILABLE table has no binding: " + unavailable.id().value()));
+            Path expected = transferPath("discarded", unavailable.id(), binding);
+            if (!target.equals(expected)) {
+                throw new DatabaseValidationException(
+                        "recovery DISCARD target must match table/space identity: " + expected);
+            }
+
+            // 2. 隔离对象仍可能被恢复事务 history 引用；先清零再发布 durable 物理意图。
+            purgeBarrier.awaitUnreferenced(unavailable.id().value(), timeout);
+            DictionaryIdAllocation ids = control.reserve(
+                    new DictionaryIdRequest(0, 0, 0, 0, 1, 1));
+            DictionaryVersion finalVersion = DictionaryVersion.of(ids.dictionaryVersion());
+            DdlId ddlId = DdlId.of(ids.firstDdlId());
+            DdlLogRecord prepared = new DdlLogRecord(
+                    new DdlUndoMarker(ddlId.value(), finalVersion.value(), unavailable.id().value()),
+                    DdlLogOperation.DISCARD_RECOVERY_UNAVAILABLE, DdlLogPhase.PREPARED,
+                    binding.spaceId(), binding.path(), Optional.of(target), Optional.empty());
+            repository.ddlLog().prepare(prepared);
+            cache.invalidateTable(unavailable.id(), finalVersion);
+            if (!cache.awaitUnpinned(unavailable.id(), timeout)) {
+                throw new DictionaryDdlException(
+                        "timed out waiting pins before recovery DISCARD: " + unavailable.id().value());
+            }
+
+            // 3. raw 路径不打开文件；幂等完成才允许 durable phase 前进。
+            physical.discardRecoveryUnavailable(binding, target, timeout);
+            repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.PREPARED, DdlLogPhase.ENGINE_DONE);
+
+            // 4. DD 终态晚于物理终点，重启可依据 marker 确定重试方向。
+            TableDefinition discarded = lifecycle(
+                    unavailable, finalVersion, TableState.RECOVERY_DISCARDED);
+            commitUpdate(finalVersion, discarded);
+            repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.ENGINE_DONE, DdlLogPhase.DICTIONARY_COMMITTED);
+            repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.DICTIONARY_COMMITTED, DdlLogPhase.COMMITTED);
+            cleanSnapshotPublisher.publish();
+        }
+    }
+
+    /**
+     * table X 已持有时删除 recovery-isolated canonical 文件并发布 DROPPED；可信备份不在删除所有权内。
+     *
+     * @param isolated 锁内重读的 RECOVERY_UNAVAILABLE/RECOVERY_DISCARDED aggregate
+     * @param binding 与 aggregate 同版本的稳定物理绑定
+     * @param timeout history、pin 与物理 lease 共用的正上界
+     */
+    private void dropRecoveryIsolatedLocked(
+            TableDefinition isolated, TableStorageBinding binding, Duration timeout) {
+        // 1. 先清空所有可能仍携带 table identity 的事务历史与 metadata pin。
+        purgeBarrier.awaitUnreferenced(isolated.id().value(), timeout);
+        DictionaryIdAllocation ids = control.reserve(
+                new DictionaryIdRequest(0, 0, 0, 0, 1, 1));
+        DictionaryVersion finalVersion = DictionaryVersion.of(ids.dictionaryVersion());
+        DdlId ddlId = DdlId.of(ids.firstDdlId());
+        Path deletionPath = isolated.state() == TableState.RECOVERY_DISCARDED
+                ? transferPath("discarded", isolated.id(), binding)
+                : binding.path();
+        DdlLogRecord prepared = new DdlLogRecord(
+                new DdlUndoMarker(ddlId.value(), finalVersion.value(), isolated.id().value()),
+                DdlLogOperation.DROP_RECOVERY_UNAVAILABLE, DdlLogPhase.PREPARED,
+                binding.spaceId(), binding.path(),
+                isolated.state() == TableState.RECOVERY_DISCARDED
+                        ? Optional.of(deletionPath) : Optional.empty(), Optional.empty());
+        repository.ddlLog().prepare(prepared);
+        cache.invalidateTable(isolated.id(), finalVersion);
+        if (!cache.awaitUnpinned(isolated.id(), timeout)) {
+            throw new DictionaryDdlException(
+                    "timed out waiting pins before recovery DROP: " + isolated.id().value());
+        }
+
+        // 2. RECOVERY_DISCARDED 的 canonical path 通常已缺失，raw 删除按 deleteIfExists 幂等收敛。
+        physical.dropRecoveryUnavailable(binding, deletionPath, timeout);
+        repository.ddlLog().transition(
+                ddlId, DdlLogPhase.PREPARED, DdlLogPhase.ENGINE_DONE);
+
+        // 3. 物理终点之后才发布 tombstone，任何中断均能从 PREPARED/ENGINE_DONE 继续。
+        TableDefinition dropped = lifecycle(isolated, finalVersion, TableState.DROPPED);
+        commitUpdate(finalVersion, dropped);
+        repository.ddlLog().transition(
+                ddlId, DdlLogPhase.ENGINE_DONE, DdlLogPhase.DICTIONARY_COMMITTED);
+        repository.ddlLog().transition(
+                ddlId, DdlLogPhase.DICTIONARY_COMMITTED, DdlLogPhase.COMMITTED);
+        cleanSnapshotPublisher.publish();
     }
 
     /**
@@ -941,6 +1099,10 @@ public final class DictionaryDdlService {
     public void importTablespace(MdlOwnerId owner, QualifiedTableName name, Duration timeout) {
         // 1、路径只由 committed binding 派生，最终 identity 在 table X 下再次核对。
         TransferTarget target = transferTarget(name);
+        if (target.state() == TableState.RECOVERY_DISCARDED) {
+            importRecoveryReplacement(owner, name, timeout);
+            return;
+        }
         Path source = transferPath("incoming", target.tableId(), target.binding());
         ensureTransferDirectory(source.getParent());
         // 2、检查阶段不复制、不打开为在线 tablespace，也不产生 redo。
@@ -949,6 +1111,150 @@ public final class DictionaryDdlService {
         // 3、原状态机负责 MDL、DDL log、物理挂载与字典发布。
         importTablespace(owner, name, source, identity, timeout);
         // 4、所有 durable 终态均由原状态机在 clean snapshot 发布后对外可见。
+    }
+
+    /**
+     * 为 ACTIVE 表创建本实例 HMAC 签名的 clean backup archive pair；该 Java facade 不新增 SQL 语法。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>取得 schema IX/table X 并重读 ACTIVE aggregate，阻止并发 DDL 改变定义或 binding。</li>
+     *     <li>等待 persistent history 引用与 metadata pin 清零；等待期间不持 page latch/MTR/file lease。</li>
+     *     <li>由 backup service 懒加载实例 identity，并调用 storage X lease 执行 drain/force/stable copy。</li>
+     *     <li>返回数据+manifest archive pair；本操作不修改 DD state/version，也不清理历史备份。</li>
+     * </ol>
+     *
+     * @param owner 独立 DDL/管理操作 MDL owner
+     * @param name 必须解析为 committed ACTIVE 表
+     * @param timeout MDL、history、pin、drain 与 file lease 共用的正上界
+     * @return 已完成 HMAC manifest 原子发布的 archive pair
+     */
+    public RecoveryBackupArtifact createRecoveryBackup(
+            MdlOwnerId owner, QualifiedTableName name, Duration timeout) {
+        // 1. recovery backup 是 Java 管理 facade，仍使用与 DDL 相同的 schema→table 锁序。
+        validateOwnerTimeout(owner, timeout);
+        cleanSnapshotPublisher.assertAvailable();
+        if (name == null) {
+            throw new DatabaseValidationException(
+                    "recovery backup table name must not be null");
+        }
+        try (MdlTicket schemaTicket = locks.acquire(new MdlRequest(owner,
+                MdlKey.schema(name.schema().canonicalName()), MdlMode.INTENTION_EXCLUSIVE,
+                MdlDuration.TRANSACTION), timeout);
+             MdlTicket tableTicket = locks.acquire(new MdlRequest(owner,
+                     MdlKey.table(name.canonicalKey()), MdlMode.EXCLUSIVE,
+                     MdlDuration.TRANSACTION), timeout)) {
+            SchemaDefinition schema = repository.findSchema(name.schema()).orElseThrow(() ->
+                    new DictionaryObjectNotFoundException(
+                            "schema does not exist: " + name.schema().displayName()));
+            TableDefinition active = repository.findTable(
+                    schema.id(), name.table()).orElseThrow(() ->
+                    new DictionaryObjectNotFoundException(
+                            "table does not exist: " + name.canonicalKey()));
+            if (active.state() != TableState.ACTIVE) {
+                throw new DictionaryDdlException(
+                        "recovery backup source is not ACTIVE: " + active.id().value());
+            }
+
+            // 2. clean backup 不能携带尚待 purge 的 committed row history，也不能越过旧 metadata pin。
+            purgeBarrier.awaitUnreferenced(active.id().value(), timeout);
+            if (!cache.awaitUnpinned(active.id(), timeout)) {
+                throw new DictionaryDdlException(
+                        "timed out waiting pins before recovery backup: " + active.id().value());
+            }
+
+            // 3. identity 仅在此处懒创建；普通启动完全不依赖该文件。
+            RecoveryBackupArtifact artifact = recoveryBackups.createBackup(active, timeout);
+
+            // 4. 备份不推进 DD；archive 生命周期独立于后续 DROP，供管理员显式 staging。
+            log.info("created trusted recovery backup: table={} space={} backup={} data={}",
+                    active.id().value(), active.storageBinding().orElseThrow().spaceId().value(),
+                    artifact.manifest().backupId(), artifact.dataPath());
+            return artifact;
+        }
+    }
+
+    /**
+     * 使用固定 recovery-incoming pair 把 RECOVERY_DISCARDED 对象替换为可信 clean backup 并重新发布 ACTIVE。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>取得 schema IX/table X，重读 RECOVERY_DISCARDED aggregate，并在 marker 前完成 HMAC/hash/page0 验证。</li>
+     *     <li>预留单一版本、写 op=10 PREPARED、建立 cache 屏障并等待旧 pin 清零。</li>
+     *     <li>storage 原子复制固定 incoming 数据，挂载后把 page0 恢复 NORMAL并 force，再写 ENGINE_DONE。</li>
+     *     <li>提交 ACTIVE aggregate，写 DICTIONARY_COMMITTED/COMMITTED 并发布 cache；incoming/archive 均保留。</li>
+     * </ol>
+     *
+     * @param owner 独立管理操作 MDL owner
+     * @param name 必须解析为 RECOVERY_DISCARDED 对象
+     * @param timeout MDL、pin、WAL/flush 与 file lease 共用的正上界
+     */
+    public void importRecoveryReplacement(
+            MdlOwnerId owner, QualifiedTableName name, Duration timeout) {
+        // 1. 验证发生在 table X 内，避免定义摘要校验后被并发 ALTER/rename 换绑。
+        validateOwnerTimeout(owner, timeout);
+        cleanSnapshotPublisher.assertAvailable();
+        if (name == null) {
+            throw new DatabaseValidationException(
+                    "recovery replacement table name must not be null");
+        }
+        try (MdlTicket schemaTicket = locks.acquire(new MdlRequest(owner,
+                MdlKey.schema(name.schema().canonicalName()), MdlMode.INTENTION_EXCLUSIVE,
+                MdlDuration.TRANSACTION), timeout);
+             MdlTicket tableTicket = locks.acquire(new MdlRequest(owner,
+                     MdlKey.table(name.canonicalKey()), MdlMode.EXCLUSIVE,
+                     MdlDuration.TRANSACTION), timeout)) {
+            SchemaDefinition schema = repository.findSchema(name.schema()).orElseThrow(() ->
+                    new DictionaryObjectNotFoundException(
+                            "schema does not exist: " + name.schema().displayName()));
+            TableDefinition discarded = repository.findTableForRecovery(
+                    schema.id(), name.table()).orElseThrow(() ->
+                    new DictionaryObjectNotFoundException(
+                            "table does not exist: " + name.canonicalKey()));
+            if (discarded.state() != TableState.RECOVERY_DISCARDED) {
+                throw new DictionaryDdlException(
+                        "trusted recovery import requires RECOVERY_DISCARDED table: "
+                                + discarded.id().value());
+            }
+            TableStorageBinding binding = discarded.storageBinding().orElseThrow(() ->
+                    new DictionaryDdlException(
+                            "RECOVERY_DISCARDED table has no binding: " + discarded.id().value()));
+            ValidatedRecoveryBackup backup = recoveryBackups.validateIncoming(discarded);
+
+            // 2. 只有完整验证成功才能留下 durable op=10 意图；之后任何失败均由启动恢复前滚。
+            DictionaryIdAllocation ids = control.reserve(
+                    new DictionaryIdRequest(0, 0, 0, 0, 1, 1));
+            DictionaryVersion activeVersion = DictionaryVersion.of(ids.dictionaryVersion());
+            DdlId ddlId = DdlId.of(ids.firstDdlId());
+            DdlLogRecord prepared = new DdlLogRecord(
+                    new DdlUndoMarker(ddlId.value(), activeVersion.value(), discarded.id().value()),
+                    DdlLogOperation.IMPORT_RECOVERY_REPLACEMENT, DdlLogPhase.PREPARED,
+                    binding.spaceId(), binding.path(), Optional.of(backup.dataPath()),
+                    Optional.of(backup.fileIdentity()));
+            repository.ddlLog().prepare(prepared);
+            cache.invalidateTable(discarded.id(), activeVersion);
+            if (!cache.awaitUnpinned(discarded.id(), timeout)) {
+                throw new DictionaryDdlException(
+                        "timed out waiting pins before trusted recovery import: "
+                                + discarded.id().value());
+            }
+
+            // 3. source 保留；canonical replacement 在 NORMAL page0 force 后才形成 ENGINE_DONE。
+            physical.importTablespace(
+                    binding, backup.dataPath(), backup.fileIdentity(), timeout);
+            repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.PREPARED, DdlLogPhase.ENGINE_DONE);
+
+            // 4. catalog ACTIVE 是逻辑可见性的唯一发布点，晚于全部物理持久化。
+            TableDefinition active = lifecycle(discarded, activeVersion, TableState.ACTIVE);
+            commitUpdate(activeVersion, active);
+            repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.ENGINE_DONE, DdlLogPhase.DICTIONARY_COMMITTED);
+            cache.publishTable(active);
+            repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.DICTIONARY_COMMITTED, DdlLogPhase.COMMITTED);
+            cleanSnapshotPublisher.publish();
+        }
     }
 
     /**
@@ -1627,13 +1933,29 @@ public final class DictionaryDdlService {
 
     /** 限制 DISCARD/IMPORT 外部路径在实例 transfer 根内，防止 DDL marker 携带任意文件路径。 */
     private Path checkedTransferPath(Path path) {
+        if (path == null) {
+            throw new DatabaseValidationException("tablespace transfer path must not be null");
+        }
         Path normalized = path.toAbsolutePath().normalize();
         Path transferRoot = transferRoot();
-        if (!normalized.startsWith(transferRoot)) {
+        if (!normalized.startsWith(transferRoot) || hasSymbolicLinkComponent(normalized)) {
             throw new DatabaseValidationException(
-                    "tablespace transfer path escapes controlled root: " + normalized);
+                    "tablespace transfer path escapes controlled root or contains a symbolic link: " + normalized);
         }
         return normalized;
+    }
+
+    /** 逐级拒绝既有符号链接，避免合法字符串前缀在文件系统解析时指向实例根之外。 */
+    private static boolean hasSymbolicLinkComponent(Path path) {
+        Path current = path.getRoot();
+        for (Path component : path) {
+            current = current == null ? component : current.resolve(component);
+            if (Files.exists(current, java.nio.file.LinkOption.NOFOLLOW_LINKS)
+                    && Files.isSymbolicLink(current)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** 根据恢复可见 catalog 解析 table/space identity；调用方必须在后续 table X 内重新校验。 */
@@ -1649,7 +1971,7 @@ public final class DictionaryDdlService {
         TableStorageBinding binding = table.storageBinding().orElseThrow(() ->
                 new DictionaryDdlException(
                         "tablespace transfer table has no physical binding: " + table.id().value()));
-        return new TransferTarget(table.id(), binding);
+        return new TransferTarget(table.id(), table.state(), binding);
     }
 
     /** 形成携带 table/space identity 的固定文件名，避免管理员误把另一张表文件放入 incoming。 */
@@ -1679,6 +2001,6 @@ public final class DictionaryDdlService {
     }
 
     /** 路径预计算使用的不可变 identity；不是锁内权威状态。 */
-    private record TransferTarget(TableId tableId, TableStorageBinding binding) {
+    private record TransferTarget(TableId tableId, TableState state, TableStorageBinding binding) {
     }
 }

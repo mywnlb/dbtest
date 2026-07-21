@@ -9,9 +9,11 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
  * @param removedClusteredRecords  本批物理移除的 delete-marked 聚簇记录数（stale 跳过的不计入）。
  * @param removedSecondaryEntries  本批物理移除的 delete-marked secondary entry 数（RETAIN/ABSENT 不计入）。
  * @param deferredLogs             因 row guard busy 而保留在 history head 的日志数；单批当前只可能为 0 或 1。
+ * @param recoveryUnavailableRecordsSkipped 已完整解码校验但因目标表隔离而仅推进 logical head 的记录数
  */
 public record PurgeSummary(int purgedLogs, int removedClusteredRecords,
-                           int removedSecondaryEntries, int deferredLogs) {
+                           int removedSecondaryEntries, int deferredLogs,
+                           int recoveryUnavailableRecordsSkipped) {
 
     /**
      * 校验 purge 批次统计不会出现负值；统计只描述已观察结果，不反向驱动 history 状态。
@@ -24,8 +26,15 @@ public record PurgeSummary(int purgedLogs, int removedClusteredRecords,
      */
     public PurgeSummary {
         if (purgedLogs < 0 || removedClusteredRecords < 0
-                || removedSecondaryEntries < 0 || deferredLogs < 0) {
+                || removedSecondaryEntries < 0 || deferredLogs < 0
+                || recoveryUnavailableRecordsSkipped < 0) {
             throw new DatabaseValidationException("purge summary counts must be non-negative");
         }
+    }
+
+    /** 兼容既有普通 purge 调用点；健康路径没有恢复隔离跳过。 */
+    public PurgeSummary(int purgedLogs, int removedClusteredRecords,
+                        int removedSecondaryEntries, int deferredLogs) {
+        this(purgedLogs, removedClusteredRecords, removedSecondaryEntries, deferredLogs, 0);
     }
 }

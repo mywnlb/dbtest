@@ -14,8 +14,10 @@ import java.util.Optional;
  *
  * @param tableIndexes 同一 DD table/schema version 派生的聚簇与全部二级运行期 metadata。
  * @param lobSegment   同一 table binding 的可选 LOB segment；不存在时 INSERT undo 不得携带 external ownership。
+ * @param disposition 目标对象是否允许物理访问；隔离对象只把 metadata 用于 undo 完整解码与链校验
  */
-public record UndoTargetMetadata(TableIndexMetadata tableIndexes, Optional<SegmentRef> lobSegment) {
+public record UndoTargetMetadata(TableIndexMetadata tableIndexes, Optional<SegmentRef> lobSegment,
+                                 UndoTargetDisposition disposition) {
 
     /**
      * 校验表级索引聚合和 LOB segment 属于同一物理 tablespace。
@@ -25,7 +27,7 @@ public record UndoTargetMetadata(TableIndexMetadata tableIndexes, Optional<Segme
      * @throws DatabaseValidationException 字段缺失或 LOB segment 与聚簇 root 不属于同一 space 时抛出。
      */
     public UndoTargetMetadata {
-        if (tableIndexes == null || lobSegment == null) {
+        if (tableIndexes == null || lobSegment == null || disposition == null) {
             throw new DatabaseValidationException("undo target requires table indexes and optional LOB segment");
         }
         if (lobSegment.isPresent()
@@ -33,6 +35,16 @@ public record UndoTargetMetadata(TableIndexMetadata tableIndexes, Optional<Segme
                         tableIndexes.clusteredIndex().rootPageId().spaceId())) {
             throw new DatabaseValidationException("undo target index/LOB segment must belong to the same space");
         }
+    }
+
+    /** 兼容既有调用点；显式构造的传统目标均视为可物理访问。 */
+    public UndoTargetMetadata(TableIndexMetadata tableIndexes, Optional<SegmentRef> lobSegment) {
+        this(tableIndexes, lobSegment, UndoTargetDisposition.AVAILABLE);
+    }
+
+    /** @return {@code true} 表示 recovery 必须跳过用户 B+Tree/LOB inverse，仅推进系统 undo 进度。 */
+    public boolean recoveryUnavailable() {
+        return disposition == UndoTargetDisposition.RECOVERY_UNAVAILABLE;
     }
 
     /**

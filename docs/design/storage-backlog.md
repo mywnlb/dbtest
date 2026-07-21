@@ -12,26 +12,27 @@
 >
 > 最近校对：2026-07-21（基于当前源码与 `current-implementation-map.md`：comparison/composite/full-scan、
 > 四隔离级别、命名 SAVEPOINT、persistent server XA、受控 DISCARD/IMPORT、table options/defaults 与
-> general blocking ALTER shadow rebuild 均已进入生产链；temporary undo、online DDL 与主键/类型变更仍未完成）。
+> general blocking ALTER shadow rebuild、对象级 force recovery + trusted replacement 均已进入生产链；
+> temporary undo、online DDL 与主键/类型变更仍未完成）。
 
 ## 九份文档的当前完成度（粗估，表达"核心在、外围缺"）
 
 | 文档 | 已闭环的核心 | 主要缺口 | 粗估 |
 | --- | --- | --- | --- |
 | F flush/checkpoint/doublewrite | FLUSH_LIST / SINGLE_PAGE / SHUTDOWN / **LRU_FLUSH(WAL 安全淘汰)**、WAL gate、recoverable doublewrite 生产接线、**bounded doublewrite slot reuse（0.5）**、仓储级 `DoublewriteBatch` 连续 slot 原语、**生产 FlushList/LRU batch dispatch（v1）**、**FlushList/LRU 双物理 doublewrite channel**、**engine 配置化 `DoublewriteMode`**、**DETECT_ONLY metadata/report（0.7）**、fuzzy checkpoint + 持久 label、PageCleanerWorker、**速率/IO capacity adaptive flush（v1）**、**0.6b 前台 reservation throttle**、**legacy BufferPool flush API 移除（2026-07-05）** | 全空间 doublewrite discovery、动态 slot/IO 配置 | ~88% |
-| U undo/purge | 既有 undo/history/finalization 能力 + **secondary/LOB tail、statement/named-savepoint/full/recovery inverse、version-safe purge、affected-table history 与 real recovery resume** | 多 worker、多 rseg/tablespace、多页 free shrink、purge→truncate 调度、temporary undo | ~94% |
+| U undo/purge | 既有 undo/history/finalization 能力 + **secondary/LOB tail、statement/named-savepoint/full/recovery inverse、version-safe purge、affected-table history、real recovery resume 与 unavailable-target recovery skip** | 多 worker、多 rseg/tablespace、多页 free shrink、purge→truncate 调度、temporary undo | ~95% |
 | T transaction/mvcc | 既有事务/ReadView/LockManager 能力 + **四隔离级别、命名 SAVEPOINT retention boundary、comparison/composite/full-scan read/locking DML、persistent server XA + storage PREPARED** | RC residual-miss 提前释放、global gap 精确化、XA active branch migration/compaction | ~98% |
-| R crash-recovery | 既有恢复阶段 + **catalog-loss recovery、persistent XA 决议、multi-index rollback、real RESUME_PURGE、table/index/transfer/rebuild DDL recovery、ACTIVE SDI reconcile** | worker/lock diagnostics、对象级 force recovery、全实例/系统与 undo 空间 checksum scrub、online DDL row-log recovery | ~97% |
+| R crash-recovery | 既有恢复阶段 + **catalog-loss recovery、persistent XA 决议、multi-index rollback、real RESUME_PURGE、table/index/transfer/rebuild DDL recovery、ACTIVE SDI reconcile、对象级 force isolation/export/trusted replacement** | worker/lock diagnostics、全实例/系统与 undo 空间 checksum scrub、online DDL row-log recovery | ~99% |
 | B btree | 既有多层结构能力 + **紧凑 secondary layout、insert/mark/revive/remove/prefix scan、root snapshot、multi-level secondary shrink** | B-link/OLC、global gap 精确化、PAGE_MAX_TRX_ID/segment header、leaf row semantic redo | ~89% |
 | BP buffer-pool | get/new/fix、page latch、`PageGuard`、page hash/free/flush list、WAL-safe eviction、DIRTY_PENDING/EVICTING/STALE、midpoint LRU、LOADING IO 边界、read-ahead、多 instance、**DROP/DISCARD/IMPORT/rebuild stale-frame generation 与 drain/invalidate** | read-ahead/warmup 动态配置与更细 IO 调度 | ~95% |
 | D disk-manager | fil/fsp/segment/extent/page 分配、page0/FSP checksum、autoextend、undo truncation、GENERAL lifecycle、reservation、fsync/preallocation seam、FSP redo、**DD discovery + DROP/DISCARD/IMPORT exact identity/path lifecycle + fixed page3 SDI** | 平台 native preallocation、动态 reserveFactor/IO capacity、跨设备 transfer 由 admin 预处理 | ~95% |
 | Rec record | `TableSchema`/`IndexKeyDef`/**28 类 `TypeId`**、字段 codec、record header/PageDirectory/hidden columns、页内全套原语、undo old image codec、**0.21a-h validator/排序/inline scalar/BIT/ENUM/SET/Unicode weight/TEXT-BLOB-JSON envelope/off-page LOB chain**、**LOB UPDATE/DELETE replacement ownership+purge** | 完整 UCA/更多 charset、MySQL binary JSON、PAGE_MAX_TRX_ID/segment header | ~94% |
 | Redo redo-log | `RedoLogManager` 内存/durable 双模式、9 类 redo record 编码、append/write/flush、后台 flusher、written/closed tracker、WAL/checkpoint、LogBlock v1、ring/control v2、连续恢复扫描、page/trx handlers、capacity throttle、DurabilityPolicy、operation budget、**B+Tree sibling/node/root page-local delta** | 按 height/segment plan snapshot 收紧预算 profile、leaf row 等更细 semantic redo | ~88% |
-| DD/DDL | 既有 DD/DDL 能力 + **catalog-loss recovery、table options/column defaults、purge-aware DROP、受控 DISCARD/IMPORT、CREATE/DROP INDEX、ordered multi-action blocking ALTER + one-shadow rebuild recovery、SDI v3** | online DDL/binlog、主键/类型/foreign/generated ALTER、marker schema digest、catalog B+Tree/redo 化 | ~96% |
+| DD/DDL | 既有 DD/DDL 能力 + **catalog-loss recovery、table options/defaults、purge-aware DROP、受控 transfer、blocking ALTER/rebuild recovery、recovery unavailable/discarded lifecycle、op8/9/10 与 HMAC backup/import** | online DDL/binlog、主键/类型/foreign/generated ALTER、marker schema digest、catalog B+Tree/redo 化、跨实例 recovery trust | ~98% |
 
 当前 storage、DD、进程内 SQL Session 与 persistent XA 组合根已经闭环。SQL 支持 comparison/composite/full
 scan、四隔离级别、命名 SAVEPOINT、XA、受控 tablespace transfer 和 general blocking ALTER。主要跨层卡点转为：
-online DDL row log/binlog、主键/类型/foreign/generated ALTER、对象级 force recovery，以及必须等待临时表
+online DDL row log/binlog、主键/类型/foreign/generated ALTER，以及必须等待临时表
 owner/lifecycle 的 **temporary undo**。
 
 ## Tier 0 — 现在可独立做（storage 内闭环，无新上层依赖）
@@ -93,7 +94,7 @@ owner/lifecycle 的 **temporary undo**。
 | 2.2 | ✅ **二级索引 purge / 回表 MVCC / comparison-composite range 已接（2026-07-17~20）**：logical-prefix S/X、multi-index undo/purge、unique point、open/closed/unbounded composite range、full scan、current/read-view residual 与 real RESUME_PURGE | U/T | 多 worker purge 与更贴近 InnoDB 的 marked-key 可见唯一检查 |
 | 2.3 | 🟡 **DDL undo marker + atomic DDL log 已接（2026-07-20）**：CREATE/DROP TABLE/INDEX、DISCARD/IMPORT、REBUILD_TABLE operation-specific identity/phase、exact-path rollback/finish、legacy marker 兼容；REBUILD v1 未单列 schema digest；**temporary undo 仍保留** | U/T/R | 临时表 owner/lifecycle 与独立 temporary tablespace 尚未建立，禁止塞入普通 history/page3 |
 | 2.4 | ✅ **DD DISCOVER_TABLESPACE v1 已接（2026-07-15）**：ACTIVE/DROP_PENDING binding 生成 recovery spaces，ACTIVE 缺文件 fail-closed；2.9 离线工具另对 manifest ACTIVE file-per-table 做全页扫描 | R | 普通启动不做全 data-dir checksum scrub；系统/undo/未受 manifest 管理空间的离线 scrub 仍未接 |
-| 2.5 | ✅ **RECOVER_DDL atomic + SDI reconcile 已接（2026-07-20）**：独立 marker 裁决 table/index/transfer/rebuild rollback/finish；REBUILD 以 committed old/new binding 决定删 shadow 或旧空间；兼容 legacy pending/orphan | R | online DDL row-log recovery、marker schema digest、对象级 force recovery |
+| 2.5 | ✅ **RECOVER_DDL atomic + SDI reconcile 已接（2026-07-20~21）**：独立 marker 裁决 table/index/transfer/rebuild 与 recovery-object op8/9/10 rollback/finish；REBUILD 以 committed old/new binding 裁决，可信 replacement 以 HMAC/hash/identity 裁决；兼容 legacy pending/orphan | R | online DDL row-log recovery、marker schema digest |
 | 2.6 | ✅ **四隔离级别、named savepoint 与 persistent server XA 已接（2026-07-20，07-21 复审加固）**：RU current read、RR/RC ReadView、SERIALIZABLE promotion、lock retention boundary、fsync XID registry、XA SQL/RECOVER/startup gate/offline decision；per-XID phase 共用绝对 deadline，registry I/O 失败 fail-stop | T/R | RC residual-miss 提前释放、XA compaction/heuristic/active migration |
 | 2.7a | ✅ **B+Tree point current-read + logical key 锁接入已落**（2026-07-01~20）：短 MTR 定位 -> 无 page latch 等锁 -> 重定位；SQL DML、显式 point locking SELECT 与 SERIALIZABLE promotion 共用 physical/logical locks | B/T | 普通非锁定 point SELECT 按隔离级别走 MVCC/RU current；global gap 精确化另列 |
 | 2.7b | ✅ **B+Tree range current-read + SQL comparison/composite range/range DML 已落**（2026-07-01~20，07-21 复审加固）：open/closed/unbounded、256-row continuation、最长连续复合前缀/full scan、MVCC/RU/current 回表、locking read 与 Halloween/partial 防线均接线；逐行锁/terminal gap/relocation 共享单一绝对预算 | B/T | global gap 精确化、RC residual-miss 提前解锁 |
@@ -101,6 +102,7 @@ owner/lifecycle 的 **temporary undo**。
 | 2.9 | ✅ **catalog-loss recovery v1 已闭环并完成复审加固（2026-07-20）**：普通启动 fail-closed；独立 durable clean manifest/witness 保存 schema、完整目录与高水位；离线 API 完整枚举并 full-page scrub 候选，NOFOLLOW channel 与 XDES state/owner/list/bitmap 均严格校验，token 绑定全部证据；零长度 manifest 先保留，管理员显式隔离冲突后，以 safe control + clean-digest 稳定临时 baseline 原子发布 catalog，随后仍由普通引擎严格打开 | D | v1 不从无 manifest 的散落 SDI 猜 schema、不自动启动、不修 torn page、不承诺 Java/Windows 不可移植的目录 fsync |
 | 2.10 | ✅ **DROP + controlled DISCARD/IMPORT lifecycle 已接**：purge barrier、DD pending states、exact transfer paths、page0/SDI/file identity、spaceVersion、flush/invalidate 与 startup resume 均闭环 | D/DD/R | 跨设备来源由 admin 预复制；完整目录 fsync 可移植性不承诺 |
 | 2.11 | ✅ **general blocking ALTER v1 已接（2026-07-20，07-21 复审加固）**：ordered multi-action、table X、metadata-only 或 one shadow rebuild、256-row continuation、target LOB reallocation/all-index unique rebuild、DD binding swap 与 old/new crash recovery；ALTER/CREATE INDEX/DROP INDEX 在 DD commit 前建立 publication barrier，未知结果不再放行旧 aggregate | DD/B/T/R | online row log/binlog、主键/类型/foreign/generated、prefix syntax、FULLTEXT/SPATIAL、并行/外排/断点续作、marker digest |
+| 2.12 | ✅ **object-level force recovery v1 已接（2026-07-21）**：DD 原子隔离、管理员/DD union exclusion、redo/doublewrite/reconcile/undo/purge skip、导出只读写闸门、raw DISCARD/DROP、实例 HMAC clean backup 与固定 incoming trusted replacement | DD/R/U/T/D | v1 仅用户 file-per-table；系统/undo/共享空间、跨实例 trust、自动 repair 与 SQL/权限管理语法不支持 |
 
 ## 推荐路线
 
@@ -120,9 +122,9 @@ PAGE_INIT/PAGE_BYTES 通用 recovery 和 external reference undo 往返都有测
 持久 free undo segment list 与 DD/catalog/MDL/physical CREATE-DROP/discovery/index resolver v1 都已完成。
 **2.8 Primary-point SQL / Session、2.2 secondary closure 与 point-write LOB lifecycle 均已完成**：SQL INSERT/UPDATE/DELETE 维护全部索引；唯一二级点查走真实回表 MVCC；replacement 新链由 rollback 回收，旧链由逐记录 purge progress 回收；affected-table history、real RESUME_PURGE 与 DROP barrier 已进入生产组合根。
 **comparison/composite/full-scan、四隔离级别、named SAVEPOINT、persistent server XA、受控
-DISCARD/IMPORT、table options/defaults 与 general blocking ALTER 均已完成（2026-07-20）**。
-下一条高价值跨层主线可选 online DDL row log/binlog 或 object-level force recovery；前者必须增加可恢复
-row-log phase，后者必须先定义 DD unavailable lifecycle。temporary undo 仍必须等待临时表 owner/lifecycle 与
+DISCARD/IMPORT、table options/defaults、general blocking ALTER 与 object-level force recovery 均已完成（2026-07-21）**。
+下一条高价值跨层主线建议推进 online DDL row log/binlog：先定义 DML 捕获、row-log durable phase、重启 replay
+与最终 MDL cutover，再实现最小 ADD INDEX online slice。temporary undo 仍必须等待临时表 owner/lifecycle 与
 独立 temporary tablespace，不能塞进普通 history/page3。
 
 **btree / buffer-pool / record 的 Tier 0 项（0.8–0.13、0.21–0.23）与上面这条路线并行、互不阻塞**，但不是当前 crash-safety 主线，按需挑：

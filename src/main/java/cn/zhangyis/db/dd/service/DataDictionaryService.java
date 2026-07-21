@@ -9,6 +9,8 @@ import cn.zhangyis.db.dd.domain.SchemaDefinition;
 import cn.zhangyis.db.dd.domain.TableDefinition;
 import cn.zhangyis.db.dd.exception.DictionaryObjectNotFoundException;
 import cn.zhangyis.db.dd.exception.MetadataLockTimeoutException;
+import cn.zhangyis.db.dd.exception.TableRecoveryUnavailableException;
+import cn.zhangyis.db.dd.domain.TableState;
 import cn.zhangyis.db.dd.mdl.MdlDuration;
 import cn.zhangyis.db.dd.mdl.MdlKey;
 import cn.zhangyis.db.dd.mdl.MdlMode;
@@ -96,8 +98,7 @@ public final class DataDictionaryService {
                     .orElseThrow(() -> new DictionaryObjectNotFoundException(
                             "schema does not exist: " + name.schema().displayName()));
             TableDefinition resolved = repository.findTable(schema.id(), name.table())
-                    .orElseThrow(() -> new DictionaryObjectNotFoundException(
-                            "table does not exist: " + name.canonicalKey()));
+                    .orElseGet(() -> unavailableOrMissing(schema, name));
             pin = cache.pinTable(resolved.id(), remaining(deadline), () -> repository.findTable(resolved.id()));
             return new TableMetadataLease(pin, tickets);
         } catch (RuntimeException failure) {
@@ -107,6 +108,16 @@ public final class DataDictionaryService {
             closeTickets(tickets, failure);
             throw failure;
         }
+    }
+
+    /** ACTIVE lookup 失败后区分持久恢复隔离与真正缺失，避免上层把坏对象误当成可重建的新表。 */
+    private TableDefinition unavailableOrMissing(SchemaDefinition schema, QualifiedTableName name) {
+        TableDefinition recovery = repository.findTableForRecovery(schema.id(), name.table()).orElse(null);
+        if (recovery != null && (recovery.state() == TableState.RECOVERY_UNAVAILABLE
+                || recovery.state() == TableState.RECOVERY_DISCARDED)) {
+            throw new TableRecoveryUnavailableException(name, recovery.id(), recovery.state());
+        }
+        throw new DictionaryObjectNotFoundException("table does not exist: " + name.canonicalKey());
     }
 
     /**

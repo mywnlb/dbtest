@@ -55,7 +55,9 @@ public record DdlLogRecord(DdlUndoMarker marker, long secondaryObjectId,
         path = path.toAbsolutePath().normalize();
         auxiliaryPath = auxiliaryPath == null ? Optional.empty() : auxiliaryPath.map(value -> value.toAbsolutePath().normalize());
         fileIdentity = fileIdentity == null ? Optional.empty() : fileIdentity;
-        if ((operation == DdlLogOperation.DISCARD_TABLESPACE || operation == DdlLogOperation.IMPORT_TABLESPACE)
+        if ((operation == DdlLogOperation.DISCARD_TABLESPACE
+                || operation == DdlLogOperation.IMPORT_TABLESPACE
+                || operation == DdlLogOperation.IMPORT_RECOVERY_REPLACEMENT)
                 && fileIdentity.isPresent() && !fileIdentity.orElseThrow().spaceId().equals(spaceId)) {
             throw new DatabaseValidationException("tablespace transfer log identity does not match space");
         }
@@ -78,6 +80,17 @@ public record DdlLogRecord(DdlUndoMarker marker, long secondaryObjectId,
                 && (auxiliaryPath == null || auxiliaryPath.isEmpty())) {
             throw new DatabaseValidationException(
                     "REBUILD TABLE log requires a shadow auxiliary path");
+        }
+        if ((operation == DdlLogOperation.DISCARD_RECOVERY_UNAVAILABLE
+                || operation == DdlLogOperation.IMPORT_RECOVERY_REPLACEMENT)
+                && (auxiliaryPath == null || auxiliaryPath.isEmpty())) {
+            throw new DatabaseValidationException(
+                    operation + " log requires a controlled auxiliary path");
+        }
+        if (operation == DdlLogOperation.IMPORT_RECOVERY_REPLACEMENT
+                && (fileIdentity == null || fileIdentity.isEmpty())) {
+            throw new DatabaseValidationException(
+                    "recovery replacement log requires validated file identity");
         }
     }
 

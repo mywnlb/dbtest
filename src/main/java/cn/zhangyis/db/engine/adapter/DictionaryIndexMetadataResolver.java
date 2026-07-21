@@ -10,6 +10,7 @@ import cn.zhangyis.db.storage.btree.IndexMetadataResolver;
 import cn.zhangyis.db.storage.btree.BTreeIndex;
 import cn.zhangyis.db.storage.trx.UndoTargetMetadata;
 import cn.zhangyis.db.storage.trx.UndoTargetMetadataResolver;
+import cn.zhangyis.db.storage.trx.UndoTargetDisposition;
 
 /** committed DD table/index 定义与物理 binding 的 rollback/purge adapter。无全局默认索引或名称猜测。 */
 public final class DictionaryIndexMetadataResolver implements IndexMetadataResolver, UndoTargetMetadataResolver {
@@ -72,6 +73,10 @@ public final class DictionaryIndexMetadataResolver implements IndexMetadataResol
             throw new DictionaryObjectNotFoundException("undo index is not the clustered index: table="
                     + tableId + " index=" + indexId);
         }
-        return new UndoTargetMetadata(mapped.tableIndexes(), mapped.lobSegment());
+        UndoTargetDisposition disposition = table.state() == TableState.RECOVERY_UNAVAILABLE
+                || table.state() == TableState.RECOVERY_DISCARDED
+                ? UndoTargetDisposition.RECOVERY_UNAVAILABLE
+                : UndoTargetDisposition.AVAILABLE;
+        return new UndoTargetMetadata(mapped.tableIndexes(), mapped.lobSegment(), disposition);
     }
 }

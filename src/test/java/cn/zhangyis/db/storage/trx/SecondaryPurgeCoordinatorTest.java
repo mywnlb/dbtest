@@ -62,6 +62,83 @@ class SecondaryPurgeCoordinatorTest {
     @TempDir
     Path directory;
 
+    /** recovery rollback 必须完整解码 undo 并仅推进系统 logical head；同一隔离目标的 live rollback 必须提前拒绝。 */
+    @Test
+    void recoveryRollbackSkipsUnavailableTargetButLiveRollbackRejectsIt() {
+        MutableTargetResolver resolver = new MutableTargetResolver();
+        StorageEngine engine = new StorageEngine(config());
+        engine.configureIndexMetadataResolver(resolver);
+        engine.open();
+        try {
+            TableIndexMetadata table = createTable(engine, "unavailable-rollback.ibd");
+            resolver.install(new UndoTargetMetadata(table, Optional.empty()));
+            Transaction transaction = transaction(engine);
+            engine.tableDmlService().insert(new TableInsertCommand(
+                    transaction, table, row(1, "isolated@example.test"),
+                    Optional.empty(), TIMEOUT));
+            UndoLogBinding binding = UndoTestContexts.newestBinding(
+                    transaction.undoContext());
+            resolver.install(new UndoTargetMetadata(
+                    table, Optional.empty(), UndoTargetDisposition.RECOVERY_UNAVAILABLE));
+
+            assertThrows(UndoTargetUnavailableException.class,
+                    () -> engine.rollbackService().rollback(transaction));
+            assertEquals(TransactionState.ACTIVE, transaction.state(),
+                    "live preflight failure must precede transaction state transition");
+
+            RollbackSummary recovered = engine.rollbackService().rollbackRecovered(
+                    List.of(new RecoveredUndoLogIdentity(
+                            binding.kind(), binding.slotId(), binding.firstPageId())),
+                    transaction.transactionId());
+
+            assertEquals(0, recovered.undoRecordsApplied());
+            assertEquals(1, recovered.recoveryUnavailableRecordsSkipped());
+            assertTrue(clustered(engine, table, 1).isPresent(),
+                    "recovery isolation must not touch the unavailable user tablespace");
+            engine.lockManager().releaseAll(transaction.transactionId());
+        } finally {
+            engine.close();
+        }
+    }
+
+    /** committed history 指向隔离对象时，purge 只推进已完整校验的 undo head，不生成 B+Tree/LOB 物理工作。 */
+    @Test
+    void purgeAdvancesUnavailableHistoryWithoutTouchingUserIndexes() {
+        MutableTargetResolver resolver = new MutableTargetResolver();
+        StorageEngine engine = new StorageEngine(config());
+        engine.configureIndexMetadataResolver(resolver);
+        engine.open();
+        try {
+            TableIndexMetadata table = createTable(engine, "unavailable-purge.ibd");
+            resolver.install(new UndoTargetMetadata(table, Optional.empty()));
+            LogicalRecord before = row(1, "before-isolation@example.test");
+            LogicalRecord after = row(1, "after-isolation@example.test");
+            Transaction insert = transaction(engine);
+            engine.tableDmlService().insert(new TableInsertCommand(
+                    insert, table, before, Optional.empty(), TIMEOUT));
+            commit(engine, insert);
+            Transaction update = transaction(engine);
+            engine.tableDmlService().update(new TableUpdateCommand(
+                    update, table, primaryKey(1), after, TIMEOUT));
+            commit(engine, update);
+            resolver.install(new UndoTargetMetadata(
+                    table, Optional.empty(), UndoTargetDisposition.RECOVERY_UNAVAILABLE));
+
+            PurgeSummary summary = engine.purgeCoordinator().runBatch(1);
+
+            assertEquals(1, summary.purgedLogs());
+            assertEquals(1, summary.recoveryUnavailableRecordsSkipped());
+            assertEquals(0, summary.removedSecondaryEntries());
+            assertEquals(0, summary.removedClusteredRecords());
+            assertEquals(0, engine.tablePurgeBarrier().referenceCount(TABLE_ID));
+            assertTrue(secondaryIncludingDeleted(
+                    engine, table.requireSecondary(EMAIL_ID), before).isPresent(),
+                    "isolation purge must leave obsolete user-index bytes untouched");
+        } finally {
+            engine.close();
+        }
+    }
+
     /** UPDATE A→B 提交后，purge 应证明当前/较新版本不再需要 A，再物理删除 marked A entry并保留当前 B 行。 */
     @Test
     @DisplayName("purge removes obsolete secondary key from committed update")

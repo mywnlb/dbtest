@@ -597,13 +597,27 @@ Atomic DDL recovery 流程见 [atomic-ddl-recovery-flow.mmd](diagrams/atomic-ddl
 - DD discovery 从 ACTIVE/DROP_PENDING table 只返回稳定 storage API binding；公共 `cn.zhangyis.db.engine.DatabaseEngine` 再转换 recovery tablespace 配置，在 storage rollback/RESUME_PURGE 后运行 logged DDL recovery 与 legacy cleanup，全部完成后才发布 OPEN。
 - SDI v1 使用 GENERAL 表空间固定 page3 与 page0 `SDI_ROOT=3`；`DictionarySdiCodec` 保存完整 ACTIVE table/column/index/storage binding 聚合，storage 只持 opaque payload + identity/version + CRC32C。page3 尾部保留独立 96-byte index DDL descriptor，footer v2 显式保存 BUILD/DROP action并兼容把 v1 解读为 BUILD；普通 SDI rewrite 不覆盖它。启动逐张比较 committed ACTIVE DD，root=0、空页、逻辑 CRC/内容错配会重写，未知 root、action/CRC/reserved bytes 或物理页损坏均 fail-closed。
 - `UndoRecordCodec.peekIdentity`、`IndexMetadataResolver` 和 `engine.adapter.DictionaryIndexMetadataResolver` 已让 rollback/purge 按 tableId/indexId 解析目标 B+Tree，legacy 单索引构造仅供低层兼容。
+- 对象级 force recovery 新增稳定 `TableState.RECOVERY_UNAVAILABLE(6)` 与
+  `RECOVERY_DISCARDED(7)`；普通 lookup/cache、ACTIVE SDI reconcile 和用户表空间 discovery 均隐藏，
+  recovery lookup 与 clean catalog/manifest 保留完整定义和 binding 作为长期诊断、排除与恢复证据。
+- `DictionaryRecoveryIsolationPlanner` 在 storage discovery 前证明管理员 SpaceId 与 committed DD 的一对一归属，
+  并在单个字典版本/事务内完成 ACTIVE→RECOVERY_UNAVAILABLE；重复 path、共享/未知 space、系统/undo、
+  非稳定状态与 unresolved DDL identity/path 相交均不允许产生部分提交。
+- recovery object DDL 使用稳定 operation code 8/9/10，严格按 physical-first phase 执行 raw DISCARD、DROP
+  与 trusted replacement IMPORT；raw 路径逐级拒绝符号链接且要求无句柄/frame，恢复不读取不可用源的 page0。
+- `RecoveryIdentityStore` 懒持久化实例 UUID、256-bit HMAC key 与 CRC；`RecoveryBackupService` 只对 ACTIVE
+  表在 MDL X、history/pin drain、space X lease、flush/force 后生成 DISCARDED 副本，并最后原子发布 HMAC manifest。
+  IMPORT 只接受固定 `recovery-incoming` pair，重新校验 HMAC、文件/定义 hash、table/space/file identity 和 page0。
+- 可信 archive/incoming 独立保留，普通 DROP 不删除备份；恢复身份丢失/损坏只阻断 backup/import，不阻断普通启动。
+  Java 管理 facade 已接，未新增 SQL 语法、任意主机路径、跨实例信任或自动修复。
 
 明确保留的差异：
 
 - SDI 仍是单页 v1，不支持多页/B+Tree 或在单表 payload 内保存 schema 默认属性。`mysql.ibd` 丢失后的
   catalog rebuild 已由独立 clean manifest + full-page scrub + 显式隔离/重建 API 闭环；普通启动仍只做
   admission fail-closed，绝不自动采用 SDI。binlog participant、online DDL row log、除 ADD/DROP INDEX
-  外的 ALTER TABLE 和 foreign key 未实现。
+  外的部分 ALTER TABLE 和 foreign key 未实现；对象级 force recovery 已有 file-per-table v1，但系统/undo/
+  共享空间隔离、跨实例信任与自动 repair 不在该切片范围。
 - CREATE INDEX v1 全程持有 table X，并把聚簇扫描结果暂存在内存后逐条插入，不支持并发 DML、并行/外排 build、prefix key part、FULLTEXT/SPATIAL；这是教学版 blocking inplace build，不等同于 MySQL 8.0 online DDL。
 - 独立 DDL log v3 覆盖 CREATE/DROP TABLE、CREATE/DROP INDEX 与 DISCARD/IMPORT TABLESPACE；CREATE SCHEMA 尚无 marker，因此 control reconciliation 用 committed dictionary version 提供保守下界。temporary undo 也未接，在临时表 owner/lifecycle 与独立 temporary tablespace 完成前继续拒绝进入普通 undo。
 - DROP barrier 不持久化独立计数；恢复从 page3/undo first-page persistent history 重建 affected-table 引用。该简化保持单一恢复真相，但当前仍是单 rseg、单线程 purge。

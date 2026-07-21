@@ -399,7 +399,10 @@ public final class DictionaryRecoveryManifestRepository implements DictionaryDur
         });
     }
 
-    /** 构造只包含 ACTIVE/DISCARDED 且没有 DROPPED tombstone 的 rebuild baseline。 */
+    /**
+     * 构造只包含稳定服务/隔离状态且没有 DROPPED tombstone 的 rebuild baseline。
+     * RECOVERY_UNAVAILABLE/RECOVERY_DISCARDED 保留逻辑 catalog 与 binding 供对象级恢复，但不会进入下方 ACTIVE path witness。
+     */
     private static DictionarySnapshot stableSnapshot(DictionarySnapshot source) {
         if (source == null) {
             throw new DatabaseValidationException("dictionary snapshot must not be null");
@@ -412,7 +415,10 @@ public final class DictionaryRecoveryManifestRepository implements DictionaryDur
                     if (table.state() == TableState.DROPPED) {
                         return;
                     }
-                    if (table.state() != TableState.ACTIVE && table.state() != TableState.DISCARDED) {
+                    if (table.state() != TableState.ACTIVE
+                            && table.state() != TableState.DISCARDED
+                            && table.state() != TableState.RECOVERY_UNAVAILABLE
+                            && table.state() != TableState.RECOVERY_DISCARDED) {
                         throw new DictionaryRecoveryManifestException(
                                 "cannot publish clean snapshot with transient table state: "
                                         + table.id().value() + "/" + table.state());

@@ -133,12 +133,12 @@ final class DictionaryCatalogCodec {
      * <p>数据流：</p>
      * <ol>
      *     <li>交叉校验 map key、schema/table 名称、父子关系与全局 index 集，拒绝内部不一致快照。</li>
-     *     <li>校验对象版本不超过 published version，且表已经处于 ACTIVE/DISCARDED 稳定状态。</li>
+     *     <li>校验对象版本不超过 published version，且表已经处于可重建的稳定状态。</li>
      *     <li>按 identity 排序编码 meta 与全部对象，同时以 key ordinal 保留表内 column/index 顺序。</li>
      *     <li>追加覆盖全部 records 的 baseline commit；失败不产生部分返回值或持久副作用。</li>
      * </ol>
      *
-     * @param snapshot 已完成唯一性和 binding 校验的稳定快照；表只能是 ACTIVE 或 DISCARDED
+     * @param snapshot 已完成唯一性和 binding 校验的稳定快照；表只能是 ACTIVE、DISCARDED 或持久恢复隔离状态
      * @return 可直接作为新 catalog 首批 append 的确定性 records
      * @throws DictionaryCatalogCorruptionException 快照包含临时状态、DROPPED tombstone 或对象版本越界时抛出
      */
@@ -194,7 +194,7 @@ final class DictionaryCatalogCodec {
         }
         for (TableDefinition table : tables) {
             if (table.version().compareTo(published) > 0
-                    || table.state() != TableState.ACTIVE && table.state() != TableState.DISCARDED
+                    || !stableTableState(table.state())
                     || table.storageBinding().isEmpty()) {
                 throw new DictionaryCatalogCorruptionException(
                         "baseline table is not a stable visible/recoverable object: " + table.id().value()
@@ -307,7 +307,7 @@ final class DictionaryCatalogCodec {
         }
         for (TableDefinition table : decoded.tables()) {
             if (table.version().value() > publishedVersion
-                    || table.state() != TableState.ACTIVE && table.state() != TableState.DISCARDED
+                    || !stableTableState(table.state())
                     || table.storageBinding().isEmpty()
                     || !schemas.containsKey(table.schemaId())
                     || tables.putIfAbsent(table.id(), table) != null) {
@@ -777,6 +777,8 @@ final class DictionaryCatalogCodec {
             case DISCARD_PENDING -> 3;
             case DISCARDED -> 4;
             case IMPORT_PENDING -> 5;
+            case RECOVERY_UNAVAILABLE -> 6;
+            case RECOVERY_DISCARDED -> 7;
         };
     }
 
@@ -788,8 +790,21 @@ final class DictionaryCatalogCodec {
             case 3 -> TableState.DISCARD_PENDING;
             case 4 -> TableState.DISCARDED;
             case 5 -> TableState.IMPORT_PENDING;
+            case 6 -> TableState.RECOVERY_UNAVAILABLE;
+            case 7 -> TableState.RECOVERY_DISCARDED;
             default -> throw new DictionaryCatalogCorruptionException("unknown table state code: " + code);
         };
+    }
+
+    /**
+     * 判断表是否可进入 clean catalog archive；恢复隔离状态必须被保留，否则 catalog 灾难重建会重新暴露坏文件。
+     *
+     * @param state catalog 中待归档的表生命周期状态
+     * @return {@code true} 表示没有未完成 DDL，且该状态能被稳定重建
+     */
+    private static boolean stableTableState(TableState state) {
+        return state == TableState.ACTIVE || state == TableState.DISCARDED
+                || state == TableState.RECOVERY_UNAVAILABLE || state == TableState.RECOVERY_DISCARDED;
     }
 
     private static void writeSegment(DataOutputStream out, SegmentRef segment) throws IOException {

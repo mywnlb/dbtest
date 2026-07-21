@@ -17,6 +17,7 @@ import cn.zhangyis.db.storage.redo.RedoCheckpointLabel;
 import cn.zhangyis.db.storage.redo.RedoLogBatch;
 import cn.zhangyis.db.storage.redo.RedoLogFormatException;
 import cn.zhangyis.db.storage.redo.RedoRecoveryReader;
+import cn.zhangyis.db.storage.trx.PurgeSummary;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
@@ -157,13 +158,15 @@ public final class CrashRecoveryService {
                             skippedReconcileSpaceCount, request.skipPolicy()));
                 }
 
+                TransactionUndoRecoveryResult undoResult =
+                        new TransactionUndoRecoveryResult(0, 0, 0, 0, 0, 0);
+                PurgeSummary purgeSummary = new PurgeSummary(0, 0, 0, 0, 0);
                 if (request.transactionUndoRecovery() != null) {
                     // 4、恢复 committed history、决议 PREPARED、再回滚 ACTIVE；返回时所有 undo/page latch 已释放。
                     tracker.begin(RecoveryStageName.UNDO_ROLLBACK);
                     RecoveredTransactionSnapshot transactionSnapshot =
                             request.transactionRecoveryContext().snapshot();
-                    TransactionUndoRecoveryResult undoResult =
-                            request.transactionUndoRecovery().recoverAfterRedo(
+                    undoResult = request.transactionUndoRecovery().recoverAfterRedo(
                                     reader.recoveredToLsn(), transactionSnapshot);
                     if (undoResult == null) {
                         throw new DatabaseValidationException("transaction undo recovery result must not be null");
@@ -172,7 +175,10 @@ public final class CrashRecoveryService {
 
                     // 5、在独立阶段真实推进恢复出的 history；异常直接阻止 OPEN_TRAFFIC。
                     tracker.begin(RecoveryStageName.RESUME_PURGE);
-                    request.transactionUndoRecovery().resumePurgeAfterRedo();
+                    purgeSummary = request.transactionUndoRecovery().resumePurgeAfterRedoWithSummary();
+                    if (purgeSummary == null) {
+                        throw new DatabaseValidationException("transaction purge recovery summary must not be null");
+                    }
                     tracker.complete(state, reader.recoveredToLsn());
                     if (request.recoveredRedoManager() != null) {
                         request.recoveredRedoManager().flush();
@@ -192,8 +198,14 @@ public final class CrashRecoveryService {
                 RecoveryReport report = new RecoveryReport(request.mode(), state, checkpoint.checkpointLsn(),
                         reader.recoveredToLsn(), doublewriteSummary.repairedPageCount(),
                         doublewriteSummary.detectedOnlyPageCount(), redoSummary.appliedBatchCount(), stages,
-                        request.skipPolicy().skippedSpaces(), doublewriteSummary.skippedPageCount(),
-                        redoSummary.skippedRecordCount(), skippedReconcileSpaceCount);
+                        new RecoveryExclusionSummary(
+                                request.skipPolicy().administrativeSpaces(),
+                                request.skipPolicy().dictionarySpaces(),
+                                doublewriteSummary.skippedPageCount(), redoSummary.skippedRecordCount(),
+                                skippedReconcileSpaceCount,
+                                undoResult.skippedActiveRollbackRecords(),
+                                undoResult.skippedPreparedRollbackRecords(),
+                                purgeSummary.recoveryUnavailableRecordsSkipped()));
                 lastReport = report;
                 lastError = null;
                 return report;
@@ -498,7 +510,7 @@ public final class CrashRecoveryService {
         }
     }
 
-    private static String skipDetail(String label, int count, RecoverySkipPolicy skipPolicy) {
+    private static String skipDetail(String label, int count, RecoverySpaceExclusionPolicy skipPolicy) {
         if (count == 0) {
             return "";
         }

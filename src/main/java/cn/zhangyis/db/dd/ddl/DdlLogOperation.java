@@ -22,7 +22,13 @@ public enum DdlLogOperation {
      * 阻塞式结构 ALTER：path/spaceId 是旧 binding，auxiliaryPath/secondaryObjectId 是新 shadow
      * path/space id；committed DD 是交换裁决点。
      */
-    REBUILD_TABLE(7);
+    REBUILD_TABLE(7),
+    /** 无需读取损坏 page0，把 RECOVERY_UNAVAILABLE 原文件移入受控隔离目录。 */
+    DISCARD_RECOVERY_UNAVAILABLE(8),
+    /** 无需读取损坏 page0，删除 RECOVERY_UNAVAILABLE 的原始物理文件并保留 DD tombstone。 */
+    DROP_RECOVERY_UNAVAILABLE(9),
+    /** 校验可信 clean backup 后，以新物理文件替换 RECOVERY_DISCARDED 对象并重新激活。 */
+    IMPORT_RECOVERY_REPLACEMENT(10);
 
     /** DDL log key/payload 使用且跨版本不可重排的持久码。 */
     private final int stableCode;

@@ -23,6 +23,8 @@ import cn.zhangyis.db.storage.api.ddl.SecondaryIndexDropDescriptor;
 import cn.zhangyis.db.storage.api.ddl.IndexStorageBinding;
 import cn.zhangyis.db.storage.api.ddl.TableStorageBinding;
 import cn.zhangyis.db.storage.api.tablespace.TablespaceFileIdentity;
+import cn.zhangyis.db.dd.recovery.backup.RecoveryBackupService;
+import cn.zhangyis.db.dd.recovery.backup.ValidatedRecoveryBackup;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;
@@ -59,6 +61,8 @@ public final class DictionaryDdlRecoveryService {
     private final Path tablesDirectory;
     /** 以 committed ACTIVE DD 校验/修复 page3，不接受 SDI 反向发布 catalog。 */
     private final SerializedDictionaryInfoService sdi;
+    /** op=10 恢复前重验 HMAC/hash/page0 的可信备份协作者；identity IO 仍保持懒加载。 */
+    private final RecoveryBackupService recoveryBackups;
 
     /**
      * 构造不接 persistent history barrier 的低层恢复服务；只适用于没有真实 committed history 的组件测试。
@@ -119,6 +123,12 @@ public final class DictionaryDdlRecoveryService {
         this.discovery = new DictionaryTablespaceDiscovery(repository, tablesDirectory);
         // 4、完成初始状态发布；失败以领域异常终止构造，成功对象满足类级生命周期不变量。
         this.sdi = new SerializedDictionaryInfoService(physical);
+        Path instanceRoot = this.tablesDirectory.getParent();
+        if (instanceRoot == null) {
+            throw new DatabaseValidationException(
+                    "tables directory has no instance root for recovery backups");
+        }
+        this.recoveryBackups = new RecoveryBackupService(instanceRoot, physical);
     }
 
     /**
@@ -189,7 +199,309 @@ public final class DictionaryDdlRecoveryService {
             case DISCARD_TABLESPACE -> recoverDiscard(record, timeout);
             case IMPORT_TABLESPACE -> recoverImport(record, timeout);
             case REBUILD_TABLE -> recoverRebuild(record);
+            case DISCARD_RECOVERY_UNAVAILABLE -> recoverUnavailableDiscard(record, timeout);
+            case DROP_RECOVERY_UNAVAILABLE -> recoverUnavailableDrop(record, timeout);
+            case IMPORT_RECOVERY_REPLACEMENT -> recoverReplacementImport(record, timeout);
         }
+    }
+
+    /**
+     * 重放不依赖 page0 的隔离对象 DISCARD，严格维持 physical→DD 的 create-like 阶段顺序。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 marker canonical/transfer 路径、table/space binding 与允许的 DD 起止状态。</li>
+     *     <li>PREPARED 时调用 raw 幂等移动；源缺失视为已完成，两端同时存在由 storage fail-closed。</li>
+     *     <li>ENGINE_DONE 时使用 marker 已预留版本提交 RECOVERY_DISCARDED，再写 DICTIONARY_COMMITTED。</li>
+     *     <li>发布 cache 隔离屏障并写 COMMITTED；已提交终态只允许补齐后置 phase。</li>
+     * </ol>
+     *
+     * @param record durable DISCARD_RECOVERY_UNAVAILABLE marker
+     * @param timeout 物理独占 lease 的正等待上界
+     * @throws DictionaryRecoveryException DD、路径、binding 或 phase 不能唯一收敛时抛出
+     */
+    private void recoverUnavailableDiscard(DdlLogRecord record, Duration timeout) {
+        // 1. canonical path 只能来自 tables 根，quarantine 只能来自固定 transfer/discarded 根。
+        Path path = checkedMarkerPath(record);
+        Path quarantine = record.auxiliaryPath().map(this::checkedTransferPath).orElseThrow(() ->
+                new DictionaryRecoveryException(
+                        "recovery DISCARD marker has no quarantine path"));
+        TableDefinition table = recoveryObject(record);
+        TableStorageBinding binding = matchingRecoveryBinding(record, table, path);
+        if (table.state() != TableState.RECOVERY_UNAVAILABLE
+                && table.state() != TableState.RECOVERY_DISCARDED) {
+            throw new DictionaryRecoveryException(
+                    "recovery DISCARD target has invalid state: " + table.state());
+        }
+        DdlId ddlId = DdlId.of(record.marker().ddlOperationId());
+        DdlLogPhase phase = record.phase();
+
+        // 2. DD 尚未到终态时物理动作必须可重复，且不能打开损坏文件。
+        if (table.state() == TableState.RECOVERY_UNAVAILABLE && phase == DdlLogPhase.PREPARED) {
+            physical.discardRecoveryUnavailable(binding, quarantine, timeout);
+            repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.PREPARED, DdlLogPhase.ENGINE_DONE);
+            phase = DdlLogPhase.ENGINE_DONE;
+        }
+
+        // 3. ENGINE_DONE 是提交 DD 的唯一入口，版本直接来自 durable marker 而不重新 reserve。
+        if (table.state() == TableState.RECOVERY_UNAVAILABLE && phase == DdlLogPhase.ENGINE_DONE) {
+            DictionaryVersion version = DictionaryVersion.of(
+                    record.marker().dictionaryVersion());
+            TableDefinition discarded = lifecycle(
+                    table, version, TableState.RECOVERY_DISCARDED);
+            commitRecoveredTable(discarded);
+            cache.invalidateTable(table.id(), version);
+            repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.ENGINE_DONE, DdlLogPhase.DICTIONARY_COMMITTED);
+            phase = DdlLogPhase.DICTIONARY_COMMITTED;
+        }
+
+        // 4. 若 catalog 已是终态，只接受与 physical-first 顺序一致的后置 phase。
+        TableDefinition current = repository.findTableForRecovery(table.id()).orElseThrow();
+        if (current.state() != TableState.RECOVERY_DISCARDED
+                || phase == DdlLogPhase.PREPARED) {
+            throw new DictionaryRecoveryException(
+                    "recovery DISCARD phase/DD state mismatch: phase=" + phase
+                            + " state=" + current.state());
+        }
+        if (phase == DdlLogPhase.ENGINE_DONE) {
+            repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.ENGINE_DONE, DdlLogPhase.DICTIONARY_COMMITTED);
+            phase = DdlLogPhase.DICTIONARY_COMMITTED;
+        }
+        cache.invalidateTable(current.id(), current.version());
+        if (phase == DdlLogPhase.DICTIONARY_COMMITTED) {
+            repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.DICTIONARY_COMMITTED, DdlLogPhase.COMMITTED);
+        }
+    }
+
+    /**
+     * 重放 recovery-isolated DROP；raw deleteIfExists 与 tombstone 提交均按 durable phase 幂等收敛。
+     *
+     * @param record durable DROP_RECOVERY_UNAVAILABLE marker
+     * @param timeout 物理独占 lease 的正等待上界
+     * @throws DictionaryRecoveryException 状态、binding 或 phase 无法唯一解释时抛出
+     */
+    private void recoverUnavailableDrop(DdlLogRecord record, Duration timeout) {
+        // 1. tombstone 前仅允许两种隔离态；canonical path 必须仍受 tables 根约束。
+        Path path = checkedMarkerPath(record);
+        TableDefinition table = recoveryObject(record);
+        TableStorageBinding binding = matchingRecoveryBinding(record, table, path);
+        if (table.state() != TableState.RECOVERY_UNAVAILABLE
+                && table.state() != TableState.RECOVERY_DISCARDED
+                && table.state() != TableState.DROPPED) {
+            throw new DictionaryRecoveryException(
+                    "recovery DROP target has invalid state: " + table.state());
+        }
+        DdlId ddlId = DdlId.of(record.marker().ddlOperationId());
+        DdlLogPhase phase = record.phase();
+        Path deletionPath = record.auxiliaryPath()
+                .map(this::checkedTransferPath).orElse(path);
+        if (table.state() == TableState.RECOVERY_DISCARDED
+                && record.auxiliaryPath().isEmpty()) {
+            throw new DictionaryRecoveryException(
+                    "RECOVERY_DISCARDED drop marker lacks discarded-file path");
+        }
+
+        // 2. PREPARED 只执行无 page0 的幂等删除；RECOVERY_DISCARDED 缺少 canonical 文件属于正常终点。
+        if (table.state() != TableState.DROPPED && phase == DdlLogPhase.PREPARED) {
+            physical.dropRecoveryUnavailable(binding, deletionPath, timeout);
+            repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.PREPARED, DdlLogPhase.ENGINE_DONE);
+            phase = DdlLogPhase.ENGINE_DONE;
+        }
+
+        // 3. 物理完成后用 marker 版本发布 DROPPED，保留 binding 作为审计 tombstone。
+        if (table.state() != TableState.DROPPED && phase == DdlLogPhase.ENGINE_DONE) {
+            DictionaryVersion version = DictionaryVersion.of(
+                    record.marker().dictionaryVersion());
+            TableDefinition dropped = lifecycle(table, version, TableState.DROPPED);
+            commitRecoveredTable(dropped);
+            cache.invalidateTable(table.id(), version);
+            repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.ENGINE_DONE, DdlLogPhase.DICTIONARY_COMMITTED);
+            phase = DdlLogPhase.DICTIONARY_COMMITTED;
+        }
+
+        // 4. 已有 tombstone 时只补允许的 post-DD phase；PREPARED 绝不能越过缺失的 ENGINE_DONE。
+        TableDefinition current = repository.findTableForRecovery(table.id()).orElseThrow();
+        if (current.state() != TableState.DROPPED || phase == DdlLogPhase.PREPARED) {
+            throw new DictionaryRecoveryException(
+                    "recovery DROP phase/DD state mismatch: phase=" + phase
+                            + " state=" + current.state());
+        }
+        if (phase == DdlLogPhase.ENGINE_DONE) {
+            repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.ENGINE_DONE, DdlLogPhase.DICTIONARY_COMMITTED);
+            phase = DdlLogPhase.DICTIONARY_COMMITTED;
+        }
+        cache.invalidateTable(current.id(), current.version());
+        if (phase == DdlLogPhase.DICTIONARY_COMMITTED) {
+            repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.DICTIONARY_COMMITTED, DdlLogPhase.COMMITTED);
+        }
+    }
+
+    /**
+     * 重放可信 replacement import。PREPARED 必须重新验证固定 incoming pair；ENGINE_DONE 重启后重新挂载
+     * 已恢复为 NORMAL 的 canonical 文件，随后才允许提交 ACTIVE。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 marker path/space/identity 与 RECOVERY_DISCARDED 或已提交 ACTIVE aggregate。</li>
+     *     <li>PREPARED 时重新验证 HMAC/hash/page0 并幂等覆盖 canonical，完成 NORMAL force 后写 ENGINE_DONE。</li>
+     *     <li>重启时若直接看到 ENGINE_DONE，则只读挂载已完成 replacement；再用 marker 版本提交 ACTIVE。</li>
+     *     <li>补齐 DICTIONARY_COMMITTED、发布 ACTIVE cache并写 COMMITTED；来源 incoming pair 始终保留。</li>
+     * </ol>
+     *
+     * @param record durable IMPORT_RECOVERY_REPLACEMENT marker
+     * @param timeout 物理 import、flush 与 lease 的正上界
+     * @throws DictionaryRecoveryException 可信证据、阶段或 DD state 无法唯一收敛时抛出
+     */
+    private void recoverReplacementImport(DdlLogRecord record, Duration timeout) {
+        // 1. marker canonical path 与 DD binding 必须一致，file identity 是初次 HMAC 验证后的 durable 摘要。
+        Path path = checkedMarkerPath(record);
+        TableDefinition table = recoveryObject(record);
+        TableStorageBinding binding = matchingRecoveryBinding(record, table, path);
+        TablespaceFileIdentity markerIdentity = record.fileIdentity().orElseThrow(() ->
+                new DictionaryRecoveryException(
+                        "trusted replacement marker has no file identity"));
+        Path source = record.auxiliaryPath().map(this::checkedTransferPath).orElseThrow(() ->
+                new DictionaryRecoveryException(
+                        "trusted replacement marker has no incoming data path"));
+        if (table.state() != TableState.RECOVERY_DISCARDED
+                && table.state() != TableState.ACTIVE) {
+            throw new DictionaryRecoveryException(
+                    "trusted replacement target has invalid DD state: " + table.state());
+        }
+        DdlId ddlId = DdlId.of(record.marker().ddlOperationId());
+        DdlLogPhase phase = record.phase();
+        boolean importedNow = false;
+
+        // 2. PREPARED 绝不只信 marker identity；重新验证仍在固定 incoming 的完整签名 pair 后才覆盖 canonical。
+        if (table.state() == TableState.RECOVERY_DISCARDED
+                && phase == DdlLogPhase.PREPARED) {
+            Path expectedSource = recoveryBackups.incomingDataPath(table);
+            if (!source.equals(expectedSource)) {
+                throw new DictionaryRecoveryException(
+                        "trusted replacement marker source is not fixed incoming path: " + source);
+            }
+            ValidatedRecoveryBackup backup = recoveryBackups.validateIncoming(table);
+            if (!backup.fileIdentity().equals(markerIdentity)) {
+                throw new DictionaryRecoveryException(
+                        "trusted replacement marker identity changed since validation");
+            }
+            physical.importTablespace(
+                    binding, source, markerIdentity, timeout);
+            repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.PREPARED, DdlLogPhase.ENGINE_DONE);
+            phase = DdlLogPhase.ENGINE_DONE;
+            importedNow = true;
+        }
+
+        // 3. ENGINE_DONE 跨重启后句柄已关闭；若不是本次 import 打开的，就按 NORMAL page0 只读重挂载。
+        if (table.state() == TableState.RECOVERY_DISCARDED
+                && phase == DdlLogPhase.ENGINE_DONE) {
+            if (!importedNow) {
+                physical.mountRecoveryReplacement(binding);
+            }
+            DictionaryVersion version = DictionaryVersion.of(
+                    record.marker().dictionaryVersion());
+            TableDefinition active = lifecycle(table, version, TableState.ACTIVE);
+            commitRecoveredTable(active);
+            repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.ENGINE_DONE, DdlLogPhase.DICTIONARY_COMMITTED);
+            table = active;
+            phase = DdlLogPhase.DICTIONARY_COMMITTED;
+        }
+
+        // 4. catalog 已提交但 phase append 结果不确定时允许从 ENGINE_DONE 补齐，其余越级组合拒绝。
+        TableDefinition current = repository.findTableForRecovery(table.id()).orElseThrow();
+        if (current.state() != TableState.ACTIVE
+                || current.version().value() != record.marker().dictionaryVersion()
+                || phase == DdlLogPhase.PREPARED) {
+            throw new DictionaryRecoveryException(
+                    "trusted replacement phase/DD state mismatch: phase=" + phase
+                            + " state=" + current.state());
+        }
+        if (phase == DdlLogPhase.ENGINE_DONE) {
+            repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.ENGINE_DONE, DdlLogPhase.DICTIONARY_COMMITTED);
+            phase = DdlLogPhase.DICTIONARY_COMMITTED;
+        }
+        cache.publishTable(current);
+        if (phase == DdlLogPhase.DICTIONARY_COMMITTED) {
+            repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.DICTIONARY_COMMITTED, DdlLogPhase.COMMITTED);
+        }
+    }
+
+    /** marker affected id 必须命中一个恢复可见 aggregate。 */
+    private TableDefinition recoveryObject(DdlLogRecord record) {
+        TableId tableId = TableId.of(record.marker().affectedObjectId());
+        return repository.findTableForRecovery(tableId).orElseThrow(() ->
+                new DictionaryRecoveryException(
+                        "recovery-object DDL target table is absent: " + tableId.value()));
+    }
+
+    /** DD binding 是 marker path/space 的第二份独立身份见证。 */
+    private static TableStorageBinding matchingRecoveryBinding(
+            DdlLogRecord record, TableDefinition table, Path checkedPath) {
+        TableStorageBinding binding = table.storageBinding().orElseThrow(() ->
+                new DictionaryRecoveryException(
+                        "recovery-object table has no binding: " + table.id().value()));
+        if (!binding.spaceId().equals(record.spaceId())
+                || !binding.path().toAbsolutePath().normalize().equals(checkedPath)) {
+            throw new DictionaryRecoveryException(
+                    "recovery-object marker/DD binding mismatch: table=" + table.id().value());
+        }
+        return binding;
+    }
+
+    /** 以 marker 已预留的严格后继版本提交恢复终态，不在重启时消耗新的字典版本。 */
+    private void commitRecoveredTable(TableDefinition table) {
+        try (DictionaryTransaction tx = repository.begin(table.version())) {
+            tx.updateTable(table);
+            tx.commit();
+        }
+    }
+
+    /** 只替换字典版本与生命周期，保持隔离前的逻辑定义和物理 identity 完全不变。 */
+    private static TableDefinition lifecycle(
+            TableDefinition before, DictionaryVersion version, TableState state) {
+        return new TableDefinition(
+                before.id(), before.schemaId(), before.name(), version, state,
+                before.columns(), before.indexes(), before.storageBinding(), before.options());
+    }
+
+    /** 只允许 marker auxiliary path 位于固定 tablespace-transfer 根，禁止借 catalog 删除任意路径。 */
+    private Path checkedTransferPath(Path path) {
+        if (path == null) {
+            throw new DictionaryRecoveryException("DDL transfer path must not be null");
+        }
+        Path root = tablesDirectory.getParent().resolve("tablespace-transfer")
+                .toAbsolutePath().normalize();
+        Path normalized = path.toAbsolutePath().normalize();
+        if (!normalized.startsWith(root) || hasSymbolicLinkComponent(normalized)) {
+            throw new DictionaryRecoveryException(
+                    "DDL transfer path escapes controlled root or is a symbolic link: " + normalized);
+        }
+        return normalized;
+    }
+
+    /** 逐级拒绝既有符号链接；即使最终文件尚不存在，也不能通过已替换的父目录逃逸实例根。 */
+    private static boolean hasSymbolicLinkComponent(Path path) {
+        Path current = path.getRoot();
+        for (Path component : path) {
+            current = current == null ? component : current.resolve(component);
+            if (Files.exists(current, java.nio.file.LinkOption.NOFOLLOW_LINKS)
+                    && Files.isSymbolicLink(current)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -279,7 +591,7 @@ public final class DictionaryDdlRecoveryService {
     private void recoverDiscard(DdlLogRecord record, Duration timeout) {
         // 1、读取 checkpoint、redo、doublewrite 或事务持久证据，在共享或持久副作用前拒绝非法状态。
         Path path = checkedMarkerPath(record);
-        Path quarantine = record.auxiliaryPath().map(discovery::checkedPath).orElseThrow(() ->
+        Path quarantine = record.auxiliaryPath().map(this::checkedTransferPath).orElseThrow(() ->
                 new DictionaryRecoveryException("DISCARD marker has no quarantine path"));
         // 2、继续完成范围、身份与候选校验；通过后，依据 page LSN、恢复进度和稳定标识判断跳过或续作，保持处理顺序与资源边界。
         TableId tableId = TableId.of(record.marker().affectedObjectId());
@@ -325,7 +637,8 @@ public final class DictionaryDdlRecoveryService {
     private void recoverImport(DdlLogRecord record, Duration timeout) {
         // 1、读取 checkpoint、redo、doublewrite 或事务持久证据，在共享或持久副作用前拒绝非法状态。
         Path target = checkedMarkerPath(record);
-        Path source = record.auxiliaryPath().map(discovery::checkedPath).orElseThrow(() -> new DictionaryRecoveryException("IMPORT marker has no source path"));
+        Path source = record.auxiliaryPath().map(this::checkedTransferPath).orElseThrow(() ->
+                new DictionaryRecoveryException("IMPORT marker has no source path"));
         TablespaceFileIdentity identity = record.fileIdentity().orElseThrow(() -> new DictionaryRecoveryException("IMPORT marker has no file identity"));
         TableId tableId = TableId.of(record.marker().affectedObjectId());
         // 2、继续完成范围、身份与候选校验；通过后，依据 page LSN、恢复进度和稳定标识判断跳过或续作，保持处理顺序与资源边界。
@@ -893,7 +1206,9 @@ public final class DictionaryDdlRecoveryService {
         for (TableDefinition table : repository.snapshot().tables().values()) {
             table.storageBinding().ifPresent(binding -> {
                 Path path = discovery.checkedPath(binding.path());
-                if (table.state() == TableState.ACTIVE || table.state() == TableState.DROP_PENDING) {
+                if (table.state() == TableState.ACTIVE || table.state() == TableState.DROP_PENDING
+                        || table.state() == TableState.RECOVERY_UNAVAILABLE
+                        || table.state() == TableState.RECOVERY_DISCARDED) {
                     live.add(path);
                 } else {
                     delete(path, "DROPPED tablespace residue");

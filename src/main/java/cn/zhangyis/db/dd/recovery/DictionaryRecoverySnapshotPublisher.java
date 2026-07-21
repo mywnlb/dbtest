@@ -87,6 +87,8 @@ public final class DictionaryRecoverySnapshotPublisher implements DictionaryClea
                 boolean transientState = snapshot.tables().values().stream().anyMatch(table ->
                         table.state() != TableState.ACTIVE
                                 && table.state() != TableState.DISCARDED
+                                && table.state() != TableState.RECOVERY_UNAVAILABLE
+                                && table.state() != TableState.RECOVERY_DISCARDED
                                 && table.state() != TableState.DROPPED);
                 if (transientState) {
                     return null;

@@ -201,6 +201,35 @@ class PersistentDictionaryRepositoryTest {
         }
     }
 
+    /** 强制恢复隔离必须成为 durable DD 状态；普通 lookup 隐藏对象，恢复 lookup 跨重启保留完整 binding。 */
+    @Test
+    void persistsRecoveryIsolationLifecycleAcrossRestart() {
+        Path path = directory.resolve("recovery-isolation-mysql.ibd");
+        try (FileInternalCatalogStore store = FileInternalCatalogStore.openOrCreate(path)) {
+            PersistentDictionaryRepository repository = new PersistentDictionaryRepository(store);
+            try (DictionaryTransaction create = repository.begin(DictionaryVersion.of(2))) {
+                create.createSchema(schema(2));
+                create.createTable(table(2));
+                create.commit();
+            }
+            TableDefinition active = repository.findTable(TableId.of(2)).orElseThrow();
+            replaceState(repository, active, DictionaryVersion.of(3), TableState.RECOVERY_UNAVAILABLE);
+            TableDefinition unavailable = repository.findTableForRecovery(TableId.of(2)).orElseThrow();
+            replaceState(repository, unavailable, DictionaryVersion.of(4), TableState.RECOVERY_DISCARDED);
+
+            assertTrue(repository.findTable(TableId.of(2)).isEmpty());
+            assertEquals(TableState.RECOVERY_DISCARDED,
+                    repository.findTableForRecovery(TableId.of(2)).orElseThrow().state());
+        }
+
+        try (FileInternalCatalogStore store = FileInternalCatalogStore.openExisting(path)) {
+            PersistentDictionaryRepository reopened = new PersistentDictionaryRepository(store);
+            TableDefinition isolated = reopened.findTableForRecovery(TableId.of(2)).orElseThrow();
+            assertEquals(TableState.RECOVERY_DISCARDED, isolated.state());
+            assertEquals(SpaceId.of(1024), isolated.storageBinding().orElseThrow().spaceId());
+        }
+    }
+
     /**
      * repository 只允许 ACTIVE→ACTIVE 精确追加一个二级索引及对应 binding；列、聚簇索引和既有物理绑定必须不变。
      */
@@ -288,6 +317,17 @@ class PersistentDictionaryRepositoryTest {
     private static SchemaDefinition schema(long version) {
         return new SchemaDefinition(SchemaId.of(1), ObjectName.of("app"), 1, 1,
                 DictionaryVersion.of(version));
+    }
+
+    /** 以新字典版本仅替换生命周期状态，保持 schema、record layout 与物理 binding 逐字不变。 */
+    private static void replaceState(PersistentDictionaryRepository repository, TableDefinition before,
+                                     DictionaryVersion version, TableState state) {
+        TableDefinition after = new TableDefinition(before.id(), before.schemaId(), before.name(), version,
+                state, before.columns(), before.indexes(), before.storageBinding(), before.options());
+        try (DictionaryTransaction transaction = repository.begin(version)) {
+            transaction.updateTable(after);
+            transaction.commit();
+        }
     }
 
     private static TableDefinition table(long version) {

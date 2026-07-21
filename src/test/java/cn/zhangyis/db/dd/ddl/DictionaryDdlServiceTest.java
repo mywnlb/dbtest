@@ -1,6 +1,7 @@
 package cn.zhangyis.db.dd.ddl;
 
 import cn.zhangyis.db.dd.cache.DictionaryObjectCache;
+import cn.zhangyis.db.dd.domain.ColumnDefaultDefinition;
 import cn.zhangyis.db.dd.domain.ColumnTypeDefinition;
 import cn.zhangyis.db.dd.domain.IndexOrder;
 import cn.zhangyis.db.dd.domain.MdlOwnerId;
@@ -29,6 +30,7 @@ import cn.zhangyis.db.storage.api.TablePurgeBarrier;
 import cn.zhangyis.db.storage.api.TablePurgeBarrierTimeoutException;
 import cn.zhangyis.db.storage.api.ddl.SerializedDictionaryInfo;
 import cn.zhangyis.db.storage.api.ddl.SerializedDictionaryInfoException;
+import cn.zhangyis.db.storage.api.ddl.StorageDefaultValue;
 import cn.zhangyis.db.storage.api.dml.DmlCommitCommand;
 import cn.zhangyis.db.storage.api.dml.TableInsertCommand;
 import cn.zhangyis.db.storage.api.dml.TableUpdateCommand;
@@ -50,6 +52,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.math.BigInteger;
 import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
@@ -881,6 +884,155 @@ class DictionaryDdlServiceTest {
         }
     }
 
+    /**
+     * shadow/SDI/ENGINE_DONE durable 后崩溃但 DD 仍引用旧 binding 时，恢复必须删除 exact shadow，
+     * 保留原表文件并把 REBUILD marker 终结为 ROLLED_BACK。
+     */
+    @Test
+    void rollsBackAlterEngineDoneAgainstOldDictionaryBinding() {
+        StorageEngine storage = new StorageEngine(config());
+        storage.open();
+        Path tables = directory.resolve("alter-engine-done-tables");
+        try (FileInternalCatalogStore catalog = FileInternalCatalogStore.openOrCreate(
+                directory.resolve("alter-engine-done-mysql.ibd"));
+             DictionaryControlStore control = DictionaryControlStore.openOrCreate(
+                     directory.resolve("alter-engine-done-mysql.dd.ctrl"),
+                     SpaceId.of(1), 1024)) {
+            PersistentDictionaryRepository repository =
+                    new PersistentDictionaryRepository(catalog);
+            DictionaryObjectCache cache = new DictionaryObjectCache(16);
+            MetadataLockManager locks = new MetadataLockManager(8, 128);
+            DictionaryDdlService ddl = new DictionaryDdlService(
+                    control, repository, cache, locks,
+                    storage.tableDdlStorageService(), tables);
+            ddl.createSchema(
+                    MdlOwnerId.of(73), ObjectName.of("app"),
+                    1, 2, Duration.ofSeconds(5));
+            TableDefinition before = ddl.createTable(
+                    MdlOwnerId.of(73), command(), Duration.ofSeconds(5));
+            Path oldPath = before.storageBinding().orElseThrow().path();
+            DictionaryDdlService crashing = ddlWithFault(
+                    storage, control, repository, cache, locks, tables,
+                    new DictionaryDdlFaultInjector() {
+                        @Override
+                        public void afterDropPendingPublished(TableDefinition pending) {
+                        }
+
+                        @Override
+                        public void afterAlterEngineDone(DdlLogRecord engineDone) {
+                            throw new DictionaryDdlException(
+                                    "injected crash after ALTER ENGINE_DONE");
+                        }
+                    });
+
+            assertThrows(DictionaryDdlException.class, () -> crashing.alterTable(
+                    MdlOwnerId.of(74), structuralAlterCommand(),
+                    Duration.ofSeconds(5)));
+            DdlLogRecord marker = repository.ddlLog().unresolved().getFirst();
+            Path shadowPath = marker.auxiliaryPath().orElseThrow();
+            assertEquals(DdlLogOperation.REBUILD_TABLE, marker.operation());
+            assertEquals(DdlLogPhase.ENGINE_DONE, marker.phase());
+            assertTrue(Files.exists(oldPath));
+            assertTrue(Files.exists(shadowPath));
+            assertEquals(before.storageBinding(),
+                    repository.findTableForRecovery(before.id())
+                            .orElseThrow().storageBinding());
+
+            DictionaryObjectCache recoveryCache = new DictionaryObjectCache(16);
+            new DictionaryDdlRecoveryService(
+                    control, repository, recoveryCache,
+                    storage.tableDdlStorageService(), tables)
+                    .recover(Duration.ofSeconds(5));
+
+            assertTrue(Files.exists(oldPath));
+            assertFalse(Files.exists(shadowPath));
+            assertEquals(DdlLogPhase.ROLLED_BACK, repository.ddlLog()
+                    .find(cn.zhangyis.db.dd.domain.DdlId.of(
+                            marker.marker().ddlOperationId()))
+                    .orElseThrow().phase());
+            try (var pin = recoveryCache.pinTable(
+                    before.id(), Duration.ofSeconds(1), () -> Optional.of(before))) {
+                assertEquals(before, pin.value());
+            }
+        } finally {
+            storage.close();
+        }
+    }
+
+    /**
+     * committed DD 与 DICTIONARY_COMMITTED 已引用 shadow 后崩溃时，恢复必须保留新空间、发布 cache、
+     * 补 COMMITTED 并把不再被字典引用的旧空间作为受控 orphan 删除。
+     */
+    @Test
+    void finishesAlterAfterDictionaryBindingSwap() {
+        StorageEngine storage = new StorageEngine(config());
+        storage.open();
+        Path tables = directory.resolve("alter-dd-committed-tables");
+        try (FileInternalCatalogStore catalog = FileInternalCatalogStore.openOrCreate(
+                directory.resolve("alter-dd-committed-mysql.ibd"));
+             DictionaryControlStore control = DictionaryControlStore.openOrCreate(
+                     directory.resolve("alter-dd-committed-mysql.dd.ctrl"),
+                     SpaceId.of(1), 1024)) {
+            PersistentDictionaryRepository repository =
+                    new PersistentDictionaryRepository(catalog);
+            DictionaryObjectCache cache = new DictionaryObjectCache(16);
+            MetadataLockManager locks = new MetadataLockManager(8, 128);
+            DictionaryDdlService ddl = new DictionaryDdlService(
+                    control, repository, cache, locks,
+                    storage.tableDdlStorageService(), tables);
+            ddl.createSchema(
+                    MdlOwnerId.of(75), ObjectName.of("app"),
+                    1, 2, Duration.ofSeconds(5));
+            TableDefinition before = ddl.createTable(
+                    MdlOwnerId.of(75), command(), Duration.ofSeconds(5));
+            Path oldPath = before.storageBinding().orElseThrow().path();
+            DictionaryDdlService crashing = ddlWithFault(
+                    storage, control, repository, cache, locks, tables,
+                    new DictionaryDdlFaultInjector() {
+                        @Override
+                        public void afterDropPendingPublished(TableDefinition pending) {
+                        }
+
+                        @Override
+                        public void afterAlterDictionaryCommitted(
+                                TableDefinition active) {
+                            throw new DictionaryDdlException(
+                                    "injected crash after ALTER DD commit");
+                        }
+                    });
+
+            assertThrows(DictionaryDdlException.class, () -> crashing.alterTable(
+                    MdlOwnerId.of(76), structuralAlterCommand(),
+                    Duration.ofSeconds(5)));
+            DdlLogRecord marker = repository.ddlLog().unresolved().getFirst();
+            TableDefinition committed =
+                    repository.findTableForRecovery(before.id()).orElseThrow();
+            Path shadowPath = committed.storageBinding().orElseThrow().path();
+            assertEquals(DdlLogPhase.DICTIONARY_COMMITTED, marker.phase());
+            assertTrue(Files.exists(oldPath));
+            assertTrue(Files.exists(shadowPath));
+
+            new DictionaryDdlRecoveryService(
+                    control, repository, cache,
+                    storage.tableDdlStorageService(), tables)
+                    .recover(Duration.ofSeconds(5));
+
+            assertFalse(Files.exists(oldPath));
+            assertTrue(Files.exists(shadowPath));
+            assertEquals(DdlLogPhase.COMMITTED, repository.ddlLog()
+                    .find(cn.zhangyis.db.dd.domain.DdlId.of(
+                            marker.marker().ddlOperationId()))
+                    .orElseThrow().phase());
+            try (var pin = cache.pinTable(
+                    committed.id(), Duration.ofSeconds(1),
+                    () -> Optional.of(committed))) {
+                assertEquals(committed, pin.value());
+            }
+        } finally {
+            storage.close();
+        }
+    }
+
     /** DROP 只写 PREPARED、DD 仍 ACTIVE 时没有越过提交裁决点，恢复不得删除原表文件。 */
     @Test
     void rollsBackDropPreparedMarker() {
@@ -1188,6 +1340,58 @@ class DictionaryDdlServiceTest {
         }
     }
 
+    /**
+     * ALTER shadow 已完成后，catalog append 可能已经 durable 但响应丢失。此时当前进程必须阻断旧 cache，
+     * 不能继续把 DML 送往旧 binding；重新读取 committed catalog 则应看到唯一的新 aggregate。
+     */
+    @Test
+    void blocksOldAlterBindingWhenCatalogCommitOutcomeIsUncertain() {
+        Path catalogPath = directory.resolve("mysql.ibd");
+        Path controlPath = directory.resolve("mysql.dd.ctrl");
+        Path tables = directory.resolve("tables");
+        StorageEngine storage = new StorageEngine(config());
+        storage.open();
+        try (FileInternalCatalogStore catalog = FileInternalCatalogStore.openOrCreate(catalogPath);
+             DictionaryControlStore control = DictionaryControlStore.openOrCreate(
+                     controlPath, SpaceId.of(1), 1024)) {
+            PersistentDictionaryRepository initial = new PersistentDictionaryRepository(catalog);
+            DictionaryObjectCache cache = new DictionaryObjectCache(16);
+            MetadataLockManager locks = new MetadataLockManager(8, 128);
+            DictionaryDdlService ddl = new DictionaryDdlService(control, initial, cache, locks,
+                    storage.tableDdlStorageService(), tables);
+            ddl.createSchema(MdlOwnerId.of(40), ObjectName.of("app"), 1, 1, Duration.ofSeconds(5));
+            TableDefinition before = ddl.createTable(
+                    MdlOwnerId.of(40), command(), Duration.ofSeconds(5));
+
+            PersistentDictionaryRepository uncertainRepository =
+                    new PersistentDictionaryRepository(durableThenThrow(catalog));
+            DictionaryDdlService uncertainDdl = new DictionaryDdlService(
+                    control, uncertainRepository, cache, locks,
+                    storage.tableDdlStorageService(), tables);
+            DataDictionaryService liveDictionary =
+                    new DataDictionaryService(uncertainRepository, cache, locks);
+
+            // 1、故障发生在新 aggregate 已写入 catalog、repository 尚未发布内存 snapshot 的窗口。
+            assertThrows(InternalCatalogPersistenceException.class,
+                    () -> uncertainDdl.alterTable(
+                            MdlOwnerId.of(40), structuralAlterCommand(), Duration.ofSeconds(5)));
+
+            // 2、旧 cache 必须被 publication barrier 拒绝，不能继续访问仍存在但已不再是持久真相的旧空间。
+            assertThrows(DictionaryObjectNotFoundException.class,
+                    () -> liveDictionary.openTable(
+                            MdlOwnerId.of(41), QualifiedTableName.of("app", "orders"),
+                            TableAccessIntent.READ, Duration.ofSeconds(2)));
+
+            // 3、从 committed batches 重建证明新 binding/列已经 durable，后续启动可据此完成 marker 前滚。
+            PersistentDictionaryRepository durableView = new PersistentDictionaryRepository(catalog);
+            TableDefinition durable = durableView.findTableForRecovery(before.id()).orElseThrow();
+            assertEquals(2, durable.columns().size());
+            assertFalse(durable.storageBinding().equals(before.storageBinding()));
+        } finally {
+            storage.close();
+        }
+    }
+
     private static InternalCatalogStore durableThenThrow(InternalCatalogStore delegate) {
         return new InternalCatalogStore() {
             @Override
@@ -1253,6 +1457,21 @@ class DictionaryDdlServiceTest {
                 new CreateIndexSpec(ObjectName.of("idx_value"), false, false,
                         List.of(new CreateIndexKeyPartSpec(
                                 ObjectName.of("value"), IndexOrder.ASC, 0))));
+    }
+
+    /** 构造会强制建立 shadow 的最小 ADD COLUMN 命令。 */
+    private static AlterTableCommand structuralAlterCommand() {
+        return new AlterTableCommand(
+                QualifiedTableName.of("app", "orders"),
+                List.of(new AlterTableAction.AddColumn(
+                        ObjectName.of("status"),
+                        ColumnTypeDefinition.integer(false, false),
+                        ColumnDefaultDefinition.constant("9"),
+                        Optional.of(new StorageDefaultValue.IntegerValue(
+                                BigInteger.valueOf(9))),
+                        new AlterTableAction.Position(
+                                AlterTableAction.PositionKind.LAST,
+                                Optional.empty()))));
     }
 
     private static DropSecondaryIndexCommand dropIndexCommand() {

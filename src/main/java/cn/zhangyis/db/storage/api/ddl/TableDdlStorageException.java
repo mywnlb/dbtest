@@ -3,7 +3,7 @@ package cn.zhangyis.db.storage.api.ddl;
 import cn.zhangyis.db.common.exception.DatabaseRuntimeException;
 
 /** 可回滚或由启动恢复续作的物理 DDL 失败。 */
-public final class TableDdlStorageException extends DatabaseRuntimeException {
+public class TableDdlStorageException extends DatabaseRuntimeException {
     /**
      * 创建 {@code TableDdlStorageException}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
      *

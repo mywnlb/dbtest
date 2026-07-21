@@ -139,8 +139,36 @@ public final class LockManager {
      */
     public LockHandle acquire(TransactionId owner, TransactionLockKey key,
                               TransactionLockMode mode, Duration timeout) {
+        return acquire(owner, key, mode, timeout, LockRetentionKind.TRANSACTION);
+    }
+
+    /**
+     * 申请带显式最短持有期的事务锁。该重载只供能够证明 undo/语句收口顺序的协调器使用；
+     * 普通 current-read 与 DML 必须调用四参入口，默认保留到事务终态。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 owner、资源、模式、等待期限和 retention；非法分类不进入锁表。</li>
+     *     <li>分配全局单调请求序号，并在目标分片内重新检查兼容性。</li>
+     *     <li>立即授予或进入有界等待队列，同时维护 wait-for graph 与观测事件。</li>
+     *     <li>唤醒后返回携带相同 retention 的句柄；失败清理等待请求与图边。</li>
+     * </ol>
+     *
+     * @param owner 申请锁的真实事务 id，不能为 NONE
+     * @param key 锁资源
+     * @param mode 与资源匹配的锁模式
+     * @param timeout 正的最大等待时间
+     * @param retentionKind 最短合法持有期；普通事务锁必须为 TRANSACTION
+     * @return 已授予锁的释放句柄
+     */
+    public LockHandle acquire(TransactionId owner, TransactionLockKey key,
+                              TransactionLockMode mode, Duration timeout,
+                              LockRetentionKind retentionKind) {
         // 1、校验 owner、目标资源、锁模式与等待时限，在共享或持久副作用前拒绝非法状态。
         validateAcquire(owner, key, mode, timeout);
+        if (retentionKind == null) {
+            throw new DatabaseValidationException("lock retention kind must not be null");
+        }
         long remainingNanos = timeoutNanos(timeout);
         // 2、继续完成范围、身份与候选校验；通过后，按分片与队列锁顺序定位请求，保持处理顺序与资源边界。
         long requestId = nextRequestId.getAndIncrement();
@@ -152,7 +180,7 @@ public final class LockManager {
         // 4、唤醒后再次验证结果并释放内部短锁，以稳定返回或领域异常完成收口。
         try {
             List<LockRequest> blockers = blockingRequests(shard, owner, key, mode);
-            request = new LockRequest(requestId, owner, key, mode, threadEventId,
+            request = new LockRequest(requestId, owner, key, mode, retentionKind, threadEventId,
                     shard.mutex.newCondition());
             if (blockers.isEmpty()) {
                 grantRequest(shard, request);
@@ -268,6 +296,74 @@ public final class LockManager {
         waitForGraph.removeTransaction(owner);
         // 4、唤醒后再次验证结果并释放内部短锁，以稳定返回或领域异常完成收口。
         return released;
+    }
+
+    /**
+     * 捕获当前锁请求高水位。边界不取得分片锁，也不依赖事务已经分配写 id；回滚时使用真实 owner
+     * 再过滤请求，因此别的事务在该序号之后取得的锁不会被触碰。
+     *
+     * @return 当前已分配的最后一个请求序号；0 表示尚无任何请求
+     */
+    public LockSavepoint createSavepoint() {
+        return new LockSavepoint(nextRequestId.get() - 1);
+    }
+
+    /**
+     * 释放指定 owner 在保存点之后取得、且 retention 明确允许提前释放的锁。
+     * 普通 record/gap/next-key/logical 锁即使序号更晚也保持到事务终态。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验真实 owner 与保存点序号，不修改任何锁状态。</li>
+     *     <li>逐分片在 mutex 内筛选 owner、序号和 retention，避免跨分片全局大锁。</li>
+     *     <li>释放白名单 granted 请求并取消同类 waiting 请求，随后重算等待图。</li>
+     *     <li>在每个分片内唤醒新兼容 waiter，返回实际提前释放的 granted 数量。</li>
+     * </ol>
+     *
+     * @param owner partial rollback 所属真实事务 id
+     * @param savepoint undo 反向应用之前捕获的锁获取边界
+     * @return 实际提前释放的已授予锁数量
+     */
+    public int rollbackToSavepoint(TransactionId owner, LockSavepoint savepoint) {
+        validateOwner(owner);
+        if (savepoint == null) {
+            throw new DatabaseValidationException("lock savepoint must not be null");
+        }
+        int released = 0;
+        for (LockShard shard : shards) {
+            shard.mutex.lock();
+            try {
+                SequencedSet<LockRequest> ownerLocks = shard.heldByOwner.get(owner);
+                if (ownerLocks != null) {
+                    for (LockRequest request : List.copyOf(ownerLocks)) {
+                        if (releaseableAfter(request, savepoint)) {
+                            releaseGrantedRequest(shard, request);
+                            released++;
+                        }
+                    }
+                }
+                Iterator<LockRequest> waiting = shard.waiting.iterator();
+                while (waiting.hasNext()) {
+                    LockRequest request = waiting.next();
+                    if (request.owner.equals(owner) && releaseableAfter(request, savepoint)) {
+                        waiting.remove();
+                        request.state = TransactionLockState.RELEASED;
+                        waitForGraph.removeRequest(request.requestId);
+                        observation.markRowLockReleased(request.observation(), "SAVEPOINT_WAIT_CANCELLED");
+                        request.condition.signal();
+                    }
+                }
+                grantCompatibleWaiters(shard);
+            } finally {
+                shard.mutex.unlock();
+            }
+        }
+        return released;
+    }
+
+    private static boolean releaseableAfter(LockRequest request, LockSavepoint savepoint) {
+        return request.requestId > savepoint.acquisitionSequence()
+                && request.retentionKind != LockRetentionKind.TRANSACTION;
     }
 
     /**
@@ -533,7 +629,8 @@ public final class LockManager {
 
     private void grantRequest(LockShard shard, LockRequest request) {
         request.state = TransactionLockState.GRANTED;
-        request.handle = new LockHandle(this, request.requestId, request.owner, request.key, request.mode);
+        request.handle = new LockHandle(this, request.requestId, request.owner, request.key,
+                request.mode, request.retentionKind);
         shard.granted.add(request);
         shard.heldByOwner.computeIfAbsent(request.owner, ignored -> new LinkedHashSet<>()).add(request);
     }
@@ -682,6 +779,9 @@ public final class LockManager {
         /** 请求锁模式。 */
         private final TransactionLockMode mode;
 
+        /** partial rollback 可释放边界；由 acquire 固定，授予/等待期间不变。 */
+        private final LockRetentionKind retentionKind;
+
         /** 观测层 thread/event id；未接 lockobs 时为 NONE。 */
         private final ThreadEventId threadEventId;
 
@@ -701,15 +801,18 @@ public final class LockManager {
          * @param owner 参与 {@code 构造} 的稳定领域标识 {@code TransactionId}；不得为 {@code null}，并须由对应值对象构造校验产生
          * @param key 参与 {@code 构造} 的稳定领域标识 {@code TransactionLockKey}；不得为 {@code null}，并须由对应值对象构造校验产生
          * @param mode 调用方请求的目标状态、阶段或模式；不得为 {@code null}，且必须是当前状态机允许的后继值
+         * @param retentionKind 请求的最短锁持有期；不得为 {@code null}
          * @param threadEventId 参与 {@code 构造} 的稳定领域标识 {@code ThreadEventId}；不得为 {@code null}，并须由对应值对象构造校验产生
          * @param condition 锁子系统提供的请求、观测或持有状态；不得为 {@code null}，资源身份、owner 和锁生命周期必须与当前事务或会话一致
          */
         private LockRequest(long requestId, TransactionId owner, TransactionLockKey key,
-                            TransactionLockMode mode, ThreadEventId threadEventId, Condition condition) {
+                            TransactionLockMode mode, LockRetentionKind retentionKind,
+                            ThreadEventId threadEventId, Condition condition) {
             this.requestId = requestId;
             this.owner = owner;
             this.key = key;
             this.mode = mode;
+            this.retentionKind = retentionKind;
             this.threadEventId = threadEventId;
             this.condition = condition;
             this.state = TransactionLockState.GRANTED;

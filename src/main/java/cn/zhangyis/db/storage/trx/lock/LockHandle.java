@@ -26,6 +26,9 @@ public final class LockHandle implements AutoCloseable {
     /** 已授予锁模式。 */
     private final TransactionLockMode mode;
 
+    /** 该锁允许被释放的最早事务边界；普通调用默认 TRANSACTION。 */
+    private final LockRetentionKind retentionKind;
+
     /** 防止 close 与 releaseAll 重复释放同一请求。 */
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
@@ -45,9 +48,11 @@ public final class LockHandle implements AutoCloseable {
      * @param owner 参与 {@code 构造} 的稳定领域标识 {@code TransactionId}；不得为 {@code null}，并须由对应值对象构造校验产生
      * @param key 参与 {@code 构造} 的稳定领域标识 {@code TransactionLockKey}；不得为 {@code null}，并须由对应值对象构造校验产生
      * @param mode 调用方请求的目标状态、阶段或模式；不得为 {@code null}，且必须是当前状态机允许的后继值
+     * @param retentionKind 调用方声明的最短锁持有期；不得为 {@code null}
      * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
-    LockHandle(LockManager manager, long requestId, TransactionId owner, TransactionLockKey key, TransactionLockMode mode) {
+    LockHandle(LockManager manager, long requestId, TransactionId owner, TransactionLockKey key,
+               TransactionLockMode mode, LockRetentionKind retentionKind) {
         // 1、校验必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝非法组合。
         if (manager == null) {
             throw new DatabaseValidationException("lock handle manager must not be null");
@@ -59,8 +64,8 @@ public final class LockHandle implements AutoCloseable {
         if (key == null) {
             throw new DatabaseValidationException("lock handle key must not be null");
         }
-        if (mode == null) {
-            throw new DatabaseValidationException("lock handle mode must not be null");
+        if (mode == null || retentionKind == null) {
+            throw new DatabaseValidationException("lock handle mode/retention must not be null");
         }
         this.manager = manager;
         // 3、绑定已校验协作者并初始化本对象拥有的状态、显式锁、队列或缓存，不允许半初始化实例逃逸。
@@ -69,6 +74,7 @@ public final class LockHandle implements AutoCloseable {
         this.key = key;
         // 4、完成初始状态发布；失败以领域异常终止构造，成功对象满足类级生命周期不变量。
         this.mode = mode;
+        this.retentionKind = retentionKind;
     }
 
     /** 返回持锁事务 id。 */
@@ -84,6 +90,11 @@ public final class LockHandle implements AutoCloseable {
     /** 返回锁模式。 */
     public TransactionLockMode mode() {
         return mode;
+    }
+
+    /** @return partial rollback 判断该锁能否提前释放的稳定 retention 分类。 */
+    public LockRetentionKind retentionKind() {
+        return retentionKind;
     }
 
     long requestId() {

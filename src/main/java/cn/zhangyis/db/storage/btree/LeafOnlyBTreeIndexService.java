@@ -225,13 +225,19 @@ public final class LeafOnlyBTreeIndexService implements BTreeIndexService {
 
     /** true 表示当前记录位于下界之前。 */
     private boolean belowLower(RecordCursor cursor, BTreeIndex index, BTreeScanRange range) {
-        int c = comparator.compare(cursor, range.lowerKey(), index.keyDef(), index.schema());
+        if (range.lowerBound().isEmpty()) {
+            return false;
+        }
+        int c = comparator.compare(cursor, range.lowerBound().orElseThrow(), index.keyDef(), index.schema());
         return c < 0 || (c == 0 && !range.lowerInclusive());
     }
 
     /** true 表示当前记录已越过上界；record 链有序，调用方可停止扫描。 */
     private boolean aboveUpper(RecordCursor cursor, BTreeIndex index, BTreeScanRange range) {
-        int c = comparator.compare(cursor, range.upperKey(), index.keyDef(), index.schema());
+        if (range.upperBound().isEmpty()) {
+            return false;
+        }
+        int c = comparator.compare(cursor, range.upperBound().orElseThrow(), index.keyDef(), index.schema());
         return c > 0 || (c == 0 && !range.upperInclusive());
     }
 

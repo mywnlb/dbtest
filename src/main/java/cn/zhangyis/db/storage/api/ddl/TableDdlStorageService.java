@@ -1,8 +1,10 @@
 package cn.zhangyis.db.storage.api.ddl;
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
+import cn.zhangyis.db.domain.LobReference;
 import cn.zhangyis.db.domain.Lsn;
 import cn.zhangyis.db.domain.PageId;
+import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.storage.api.DiskSpaceManager;
 import cn.zhangyis.db.storage.api.SegmentRef;
@@ -15,6 +17,9 @@ import cn.zhangyis.db.storage.fil.io.PageStore;
 import cn.zhangyis.db.storage.fil.io.TablespaceFileTransfer;
 import cn.zhangyis.db.storage.api.tablespace.TablespaceFileIdentity;
 import cn.zhangyis.db.storage.api.tablespace.TablespaceFileInspection;
+import cn.zhangyis.db.storage.api.lob.LobStorage;
+import cn.zhangyis.db.storage.api.lob.LobWriteAllocation;
+import cn.zhangyis.db.storage.api.lob.LobWritePlan;
 import cn.zhangyis.db.storage.fil.state.TablespaceType;
 import cn.zhangyis.db.storage.fil.state.TablespaceState;
 import cn.zhangyis.db.storage.flush.FlushService;
@@ -33,10 +38,17 @@ import cn.zhangyis.db.storage.btree.BTreeIndex;
 import cn.zhangyis.db.storage.btree.BTreeInsertResult;
 import cn.zhangyis.db.storage.btree.BTreeRedoBudgetEstimator;
 import cn.zhangyis.db.storage.btree.BTreeRootSnapshotService;
+import cn.zhangyis.db.storage.btree.BTreeScanRange;
+import cn.zhangyis.db.storage.btree.PreparedClusteredInsert;
 import cn.zhangyis.db.storage.btree.SecondaryIndexMetadata;
 import cn.zhangyis.db.storage.btree.SplitCapableBTreeIndexService;
 import cn.zhangyis.db.storage.record.format.LogicalRecord;
+import cn.zhangyis.db.storage.record.page.SearchKey;
+import cn.zhangyis.db.storage.record.schema.ColumnType;
+import cn.zhangyis.db.storage.record.schema.StorageKind;
 import cn.zhangyis.db.storage.record.type.ColumnValue;
+import cn.zhangyis.db.storage.btree.TableIndexMetadata;
+import cn.zhangyis.db.storage.redo.RedoBudgetWorkload;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;
@@ -53,6 +65,9 @@ import java.util.Optional;
  */
 @Slf4j
 public final class TableDdlStorageService {
+
+    /** 每个只读 MTR 最多物化的源聚簇行数；批次之间只保存完整 physical key continuation。 */
+    private static final int REBUILD_SCAN_BATCH_SIZE = 256;
 
     /**
      * 本对象持有的 {@code mtrManager} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
@@ -92,6 +107,8 @@ public final class TableDdlStorageService {
     private final SplitCapableBTreeIndexService btree;
     /** 每行写 MTR 前从稳定 root 页刷新层级，避免低估 split redo。 */
     private final BTreeRootSnapshotService rootSnapshots;
+    /** shadow rebuild 跨空间读取旧 LOB 并在目标专属 segment 重分配，禁止复制旧 external reference。 */
+    private final LobStorage lobStorage;
     /** 稳定 storage DTO/binding 到聚簇/二级 exact-version descriptor 的唯一工厂。 */
     private final BTreeIndexMetadataFactory indexMetadataFactory = new BTreeIndexMetadataFactory();
     /**
@@ -102,6 +119,10 @@ public final class TableDdlStorageService {
      * 本对象持有的 {@code fileInspection} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
      */
     private final TablespaceFileInspection fileInspection = new TablespaceFileInspection();
+    /**
+     * 本实例 tablespace 的固定页大小；外部文件检查必须使用该权威配置，不能相信 SQL 或文件名提供的值。
+     */
+    private final PageSize pageSize;
 
     /**
      * 创建 {@code TableDdlStorageService}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
@@ -116,16 +137,18 @@ public final class TableDdlStorageService {
      * @param pageSize 调用方提供的长度或容量值对象；不得为 {@code null}，且必须已通过其构造范围校验
      * @param btree 由组合根提供的 {@code SplitCapableBTreeIndexService} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
      * @param rootSnapshots 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
+     * @param lobStorage 由组合根提供的 LOB 读写门面；rebuild 必须用它迁移 external ownership
      * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public TableDdlStorageService(MiniTransactionManager mtrManager, DiskSpaceManager disk,
                                   IndexPageAccess indexPages, BufferPool pool, PageStore store,
                                   FlushService flush, TablespaceAccessController accessController,
                                   PageSize pageSize, SplitCapableBTreeIndexService btree,
-                                  BTreeRootSnapshotService rootSnapshots) {
+                                  BTreeRootSnapshotService rootSnapshots,
+                                  LobStorage lobStorage) {
         if (mtrManager == null || disk == null || indexPages == null || pool == null || store == null
                 || flush == null || accessController == null || pageSize == null
-                || btree == null || rootSnapshots == null) {
+                || btree == null || rootSnapshots == null || lobStorage == null) {
             throw new DatabaseValidationException("table DDL storage collaborators must not be null");
         }
         this.mtrManager = mtrManager;
@@ -135,9 +158,11 @@ public final class TableDdlStorageService {
         this.store = store;
         this.flush = flush;
         this.accessController = accessController;
+        this.pageSize = pageSize;
         this.sdiPages = new SdiPageRepository(pool, pageSize);
         this.btree = btree;
         this.rootSnapshots = rootSnapshots;
+        this.lobStorage = lobStorage;
     }
 
     /**
@@ -171,13 +196,7 @@ public final class TableDdlStorageService {
      */
     public TableStorageBinding createTable(StorageTableDefinition definition) {
         // 1. 先完成所有无副作用的 schema/key 可实现性校验；任何失败都必须早于文件创建和 MTR 页修改。
-        if (definition == null) {
-            throw new DatabaseValidationException("storage table definition must not be null");
-        }
-        for (StorageIndexDefinition index : definition.indexes()) {
-            schemaMapper.tableSchema(definition, index.clustered());
-            schemaMapper.indexKey(definition, index);
-        }
+        validateTableDefinition(definition);
         boolean requiresLobSegment = definition.columns().stream()
                 .anyMatch(column -> isLobCapable(column.type().typeId()));
 
@@ -231,6 +250,35 @@ public final class TableDdlStorageService {
                 definition.spaceId().value(), definition.path(), indexes.size(), lobSegment.isPresent());
         return new TableStorageBinding(definition.tableId(), definition.spaceId(), definition.path(),
                 definition.schemaVersion(), indexes, lobSegment);
+    }
+
+    /**
+     * 在不创建文件、不申请 redo、不打开 MTR 的前提下验证物理表定义可被当前 Record/B+Tree 实现解释。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>拒绝空请求，保证后续 schema 映射不会产生非领域空指针异常。</li>
+     *     <li>逐索引把完整表列映射为 leaf/node record schema，验证 type、charset/collation 与隐藏列布局。</li>
+     *     <li>逐索引构造 key definition，验证 key part、prefix、顺序与列引用均可由比较器实现。</li>
+     *     <li>全部映射成功后正常返回；本方法不修改 registry、文件、buffer page、redo 或 DDL 状态。</li>
+     * </ol>
+     *
+     * @param definition 已由 DD 组装、准备进入物理 CREATE/rebuild 的完整定义；不得为 {@code null}
+     * @throws DatabaseValidationException 定义为空或任一列/索引不能映射时抛出；失败保证没有物理副作用
+     */
+    public void validateTableDefinition(StorageTableDefinition definition) {
+        // 1、空请求在进入 mapper 前用统一项目异常拒绝。
+        if (definition == null) {
+            throw new DatabaseValidationException(
+                    "storage table definition must not be null");
+        }
+        for (StorageIndexDefinition index : definition.indexes()) {
+            // 2、record schema 映射会校验当前 codec registry 支持的类型与字符排序规则。
+            schemaMapper.tableSchema(definition, index.clustered());
+            // 3、key 映射会校验 column identity、prefix 和 ASC/DESC 的可实现性。
+            schemaMapper.indexKey(definition, index);
+        }
+        // 4、纯校验成功，不留下任何运行期或持久状态。
     }
 
     /**
@@ -799,6 +847,458 @@ public final class TableDdlStorageService {
     }
 
     /**
+     * 在未发布的新 tablespace 中复制全部 live 聚簇行并重建所有二级索引。调用方必须持 table MDL X
+     * 且已等待 purge barrier；本方法不修改源空间或 DD。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验源/目标 identity 与列投影，并创建全新目标空间、segments 和空 root。</li>
+     *     <li>以 256 行 continuation 批次在短只读 MTR 中物化源 live rows，批次之间不保留 page latch/fix。</li>
+     *     <li>逐行投影目标列；旧 external LOB 完整读取后在目标专属 segment 重分配，再以独立短 MTR
+     *     插入聚簇与全部二级树；unique 冲突在 DD 发布前失败。</li>
+     *     <li>刷新所有 root binding，等待最后 redo/dirty/checkpoint 并 force 新空间；失败携带 shadow binding
+     *     返回给拥有 durable marker 的 DD coordinator，由它统一执行精确补偿。</li>
+     * </ol>
+     *
+     * <p>教学实现差异：当前 rebuild 是单线程 blocking copy，没有 MySQL online DDL row log、并行扫描、
+     * 外排排序或可暂停进度；但扫描内存有界，LOB ownership 不跨 tablespace 复用。</p>
+     *
+     * @param request 完整源/目标 schema、binding 与列投影
+     * @param timeout 最终 WAL/force 与失败 cleanup 使用的正有界时间
+     * @return 已包含最终 root level/page 的新物理 binding
+     * @throws DatabaseValidationException identity、投影或 REQUIRED 新列与非空源表冲突时抛出
+     * @throws TableRebuildException 基础 shadow CREATE 后，行投影、UNIQUE 校验、索引插入或 force 失败时抛出；
+     *                               异常保留原始 cause 并携带必须回收的 shadow binding
+     */
+    public TableStorageBinding rebuildTable(
+            StorageTableRebuildRequest request, Duration timeout) {
+        // 1、所有无副作用校验早于目标 tablespace 创建。
+        if (request == null || timeout == null || timeout.isZero() || timeout.isNegative()) {
+            throw new DatabaseValidationException(
+                    "table rebuild requires request and positive timeout");
+        }
+        requireOpenedPath(request.sourceBinding(), "ALTER TABLE shadow rebuild source");
+        TableStorageBinding target = createTable(request.targetDefinition());
+        try {
+            TableIndexMetadata sourceIndexes = indexMetadataFactory.createTable(
+                    request.sourceDefinition(), request.sourceBinding());
+            TableIndexMetadata targetIndexes =
+                    indexMetadataFactory.createTable(request.targetDefinition(), target);
+            BTreeIndex clustered = targetIndexes.clusteredIndex();
+            List<SecondaryIndexMetadata> secondaries =
+                    new ArrayList<>(targetIndexes.secondaryIndexes());
+            Optional<SearchKey> continuation = Optional.empty();
+            Lsn lastCommit = null;
+
+            // 2、每批源扫描在独立只读 MTR 内完成，返回值不持 page guard；完整 physical key 排除式续扫。
+            while (true) {
+                MiniTransaction scan = mtrManager.beginReadOnly();
+                List<cn.zhangyis.db.storage.btree.BTreeLookupResult> batch;
+                try {
+                    BTreeScanRange range = continuation
+                            .map(key -> BTreeScanRange.after(
+                                    key, REBUILD_SCAN_BATCH_SIZE))
+                            .orElseGet(() -> BTreeScanRange.unbounded(
+                                    REBUILD_SCAN_BATCH_SIZE));
+                    batch = btree.scan(
+                            scan, sourceIndexes.clusteredIndex(), range);
+                    mtrManager.commit(scan);
+                } catch (RuntimeException failure) {
+                    rollbackIfBound(scan, failure);
+                    throw failure;
+                }
+                if (batch.isEmpty()) {
+                    break;
+                }
+                if (request.rewrites().stream().anyMatch(
+                        rewrite -> rewrite.sourceOrdinal() < 0
+                                && rewrite.defaultValue().isEmpty())) {
+                    throw new DatabaseValidationException(
+                            "ADD COLUMN without a default requires an empty source table");
+                }
+
+                // 3、每行先 hydrate/project，再以目标 LOB ownership 发布聚簇，最后逐棵维护二级树。
+                for (var result : batch) {
+                    LogicalRecord sourceRow = result.record();
+                    RebuildProjection projection = projectRebuildRow(
+                            sourceRow, request.rewrites(),
+                            sourceIndexes.clusteredIndex(), request.sourceBinding(),
+                            targetIndexes.clusteredIndex(), target);
+                    clustered = refreshRoot(clustered);
+                    RebuildClusteredInsert clusteredResult =
+                            insertRebuildClusteredRow(
+                                    clustered, sourceRow, projection,
+                                    request.targetDefinition().schemaVersion());
+                    clustered = clusteredResult.index();
+                    LogicalRecord row = clusteredResult.row();
+                    lastCommit = clusteredResult.lsn();
+
+                    for (int i = 0; i < secondaries.size(); i++) {
+                        SecondaryIndexMetadata secondary = secondaries.get(i);
+                        BTreeIndex current = refreshRoot(secondary.index());
+                        LogicalRecord entry = secondary.layout().toEntry(row, false);
+                        var logicalKey = secondary.layout().logicalKey(entry);
+                        boolean containsNull = logicalKey.values().stream()
+                                .anyMatch(ColumnValue.NullValue.class::isInstance);
+                        if (secondary.logicalUnique() && !containsNull) {
+                            MiniTransaction uniqueRead =
+                                    mtrManager.beginReadOnly();
+                            try {
+                                if (!btree.scanSecondaryPrefixIncludingDeleted(
+                                        uniqueRead,
+                                        new SecondaryIndexMetadata(
+                                                current, secondary.layout(),
+                                                true),
+                                        logicalKey, 1).isEmpty()) {
+                                    throw new SecondaryIndexBuildDuplicateKeyException(
+                                            "ALTER TABLE rebuild found duplicate UNIQUE key: index="
+                                                    + current.indexId());
+                                }
+                                mtrManager.commit(uniqueRead);
+                            } catch (RuntimeException failure) {
+                                rollbackIfBound(uniqueRead, failure);
+                                throw failure;
+                            }
+                        }
+                        MiniTransaction secondaryInsert =
+                                mtrManager.begin(mtrManager.budgetFor(
+                                        RedoBudgetPurpose.SECONDARY_INDEX,
+                                        BTreeRedoBudgetEstimator.insert(
+                                                current.rootLevel())));
+                        try {
+                            BTreeInsertResult inserted =
+                                    btree.insertSecondary(
+                                            secondaryInsert, current, entry);
+                            lastCommit =
+                                    mtrManager.commit(secondaryInsert);
+                            secondaries.set(i, new SecondaryIndexMetadata(
+                                    inserted.indexAfterInsert(),
+                                    secondary.layout(),
+                                    secondary.logicalUnique()));
+                        } catch (RuntimeException failure) {
+                            rollbackIfBound(secondaryInsert, failure);
+                            throw failure;
+                        }
+                    }
+                }
+                continuation = Optional.of(physicalKey(
+                        batch.getLast().record(),
+                        sourceIndexes.clusteredIndex()));
+                if (batch.size() < REBUILD_SCAN_BATCH_SIZE) {
+                    break;
+                }
+            }
+
+            // 4、root grow 后的 page/level 必须进入最终 DD binding；返回前 force 新空间。
+            clustered = refreshRoot(clustered);
+            List<IndexStorageBinding> bindings = new ArrayList<>();
+            bindings.add(indexBinding(clustered));
+            for (SecondaryIndexMetadata secondary : secondaries) {
+                bindings.add(indexBinding(refreshRoot(secondary.index())));
+            }
+            // binding 的逻辑顺序必须按 target definition，而 metadata 聚合把二级按 id 排序。
+            java.util.Map<Long, IndexStorageBinding> byId = bindings.stream().collect(
+                    java.util.stream.Collectors.toMap(IndexStorageBinding::indexId, value -> value));
+            List<IndexStorageBinding> ordered = request.targetDefinition().indexes().stream()
+                    .map(index -> byId.get(index.indexId())).toList();
+            target = new TableStorageBinding(
+                    target.tableId(), target.spaceId(), target.path(),
+                    target.rowFormatVersion(), ordered, target.lobSegment());
+            if (lastCommit != null) {
+                flush.flushThrough(lastCommit, timeout);
+            }
+            store.force(target.spaceId());
+            return target;
+        } catch (RuntimeException failure) {
+            // durable DDL marker 归 DD 所有；把完整 binding 交回 coordinator，避免 storage 删除结果与
+            // marker 终态彼此失联。若进程在异常交付前崩溃，启动恢复仍按 marker exact path 删除。
+            throw new TableRebuildException(
+                    "ALTER TABLE shadow rebuild failed: table=" + target.tableId()
+                            + " space=" + target.spaceId().value(),
+                    target, failure);
+        }
+    }
+
+    /**
+     * 将源行投影为目标 placeholder，并为每个需要 externalization 的目标列冻结新空间 LOB 计划。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>按 target ordinal 读取 source ordinal 或 ADD COLUMN typed default。</li>
+     *     <li>遇到旧 external 时在独立只读 MTR 完整 hydrate，并核对引用属于源 binding 的 LOB segment。</li>
+     *     <li>按目标列类型判断 inline/external；external 值只生成同长度 placeholder 和目标 segment 写计划。</li>
+     *     <li>返回不持页资源的不可变投影；此阶段尚未在目标空间分配 LOB 页。</li>
+     * </ol>
+     *
+     * @param source 当前批次已物化且不持 page guard 的 live 聚簇行
+     * @param rewrites 与目标列 ordinal 一一对应的源位置/default 投影
+     * @param sourceIndex committed 源聚簇 schema
+     * @param sourceBinding 源 LOB ownership 的权威 binding
+     * @param targetIndex shadow 目标聚簇 schema
+     * @param targetBinding 尚未发布但基础 CREATE 已完成的目标 binding
+     * @return placeholder values 与按 ordinal 排序的目标 LOB 写计划
+     * @throws DatabaseValidationException default 缺失、LOB binding 错配或类型无法物化时抛出
+     */
+    private RebuildProjection projectRebuildRow(
+            LogicalRecord source, List<StorageColumnRewrite> rewrites,
+            BTreeIndex sourceIndex, TableStorageBinding sourceBinding,
+            BTreeIndex targetIndex, TableStorageBinding targetBinding) {
+        // 1、sourceOrdinal 始终指向 ALTER 开始时的 committed row format。
+        List<ColumnValue> placeholders = new ArrayList<>(rewrites.size());
+        List<PlannedRebuildLob> lobs = new ArrayList<>();
+        for (int ordinal = 0; ordinal < rewrites.size(); ordinal++) {
+            StorageColumnRewrite rewrite = rewrites.get(ordinal);
+            ColumnValue value = rewrite.sourceOrdinal() >= 0
+                    ? source.columnValues().get(rewrite.sourceOrdinal())
+                    : toColumnValue(rewrite.defaultValue().orElseThrow(() ->
+                    new DatabaseValidationException(
+                            "non-empty rebuild row requires ADD COLUMN default")));
+
+            // 2、旧 external 的物理 identity 绝不能进入 shadow record；先读取完整逻辑值并释放源 latch。
+            if (value instanceof ColumnValue.ExternalValue external) {
+                value = hydrateRebuildLob(
+                        sourceIndex.schema().column(
+                                rewrite.sourceOrdinal()).type(),
+                        sourceBinding, external);
+            }
+
+            // 3、目标类型决定是否重新 externalize；计划绑定目标专属 LOB segment。
+            ColumnType targetType =
+                    targetIndex.schema().column(ordinal).type();
+            if (targetType.storageKind() == StorageKind.OVERFLOW_CAPABLE
+                    && !(value instanceof ColumnValue.NullValue)
+                    && lobStorage.requiresExternalization(
+                            targetType, value)) {
+                Optional<SegmentRef> targetLob =
+                        targetBinding.lobSegment();
+                if (targetLob.isEmpty()) {
+                    throw new DatabaseValidationException(
+                            "shadow target requires a LOB segment at ordinal "
+                                    + ordinal);
+                }
+                SegmentRef segment = targetLob.orElseThrow();
+                LobWritePlan plan =
+                        lobStorage.planWrite(segment, targetType, value);
+                LobReference placeholderReference = new LobReference(
+                        segment.spaceId(), PageNo.of(4L + ordinal),
+                        plan.totalLength(), plan.pageCount(),
+                        segment.segmentId(), segment.inodeSlot(),
+                        plan.crc32());
+                placeholders.add(new ColumnValue.ExternalValue(
+                        targetType.typeId(), placeholderReference,
+                        plan.inlinePrefix()));
+                lobs.add(new PlannedRebuildLob(ordinal, plan));
+            } else {
+                placeholders.add(value);
+            }
+        }
+        // 4、返回值只持逻辑值/冻结计划，不持源或目标页资源。
+        return new RebuildProjection(
+                List.copyOf(placeholders), List.copyOf(lobs));
+    }
+
+    /**
+     * 读取一条旧 external LOB 并在返回前释放全部页 latch/fix。
+     *
+     * @param sourceType committed 源列类型
+     * @param sourceBinding committed 源表 LOB ownership
+     * @param external 源聚簇记录中的 external envelope
+     * @return 可按目标 charset/type 重新编码的完整逻辑值
+     */
+    private ColumnValue hydrateRebuildLob(
+            ColumnType sourceType, TableStorageBinding sourceBinding,
+            ColumnValue.ExternalValue external) {
+        SegmentRef segment = sourceBinding.lobSegment().orElseThrow(() ->
+                new DatabaseValidationException(
+                        "source external LOB has no authoritative segment"));
+        LobReference reference = external.reference();
+        if (!reference.spaceId().equals(segment.spaceId())
+                || !reference.segmentId().equals(segment.segmentId())
+                || reference.inodeSlot() != segment.inodeSlot()) {
+            throw new DatabaseValidationException(
+                    "source external LOB does not belong to source binding");
+        }
+        MiniTransaction read = mtrManager.beginReadOnly();
+        try {
+            ColumnValue value =
+                    lobStorage.read(read, sourceType, external);
+            mtrManager.commit(read);
+            return value;
+        } catch (RuntimeException failure) {
+            rollbackIfBound(read, failure);
+            throw failure;
+        }
+    }
+
+    /**
+     * 在一个目标写 MTR 中发布新 LOB ownership 与聚簇记录；源页资源已在调用前释放。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验源隐藏列，合并 B+Tree split 与全部 LOB 页链 redo 工作量后申请 admission。</li>
+     *     <li>以 placeholder 固定聚簇路径/编码长度，再按 ordinal 写出目标 LOB 链。</li>
+     *     <li>用真实 external envelope 发布聚簇行并转移 allocation ownership。</li>
+     *     <li>提交 MTR 返回新 root/row/LSN；失败先补偿未转移 LOB，再关闭 prepare guard 并回滚 ACTIVE MTR。</li>
+     * </ol>
+     *
+     * @param clustered 刷新过 root level 的目标聚簇 descriptor
+     * @param sourceRow 提供 DB_TRX_ID/DB_ROLL_PTR 的源 live 行
+     * @param projection 目标 placeholder 与冻结 LOB 计划
+     * @param schemaVersion 目标 row format version
+     * @return 已提交的目标聚簇 descriptor、真实行与 end LSN
+     */
+    private RebuildClusteredInsert insertRebuildClusteredRow(
+            BTreeIndex clustered, LogicalRecord sourceRow,
+            RebuildProjection projection, long schemaVersion) {
+        // 1、保留原版本隐藏列，使 MVCC/undo identity 不因纯物理重建被伪造。
+        var hidden = sourceRow.hiddenColumns();
+        if (hidden == null || hidden.dbTrxId().isNone()) {
+            throw new DatabaseValidationException(
+                    "shadow rebuild source clustered row has no transaction identity");
+        }
+        RedoBudgetWorkload workload =
+                BTreeRedoBudgetEstimator.insert(clustered.rootLevel());
+        for (PlannedRebuildLob lob : projection.lobs()) {
+            workload = workload.plus(lob.plan().workload());
+        }
+        MiniTransaction insert = mtrManager.begin(mtrManager.budgetFor(
+                RedoBudgetPurpose.CLUSTERED_INSERT, workload));
+        PreparedClusteredInsert prepared = null;
+        List<LobWriteAllocation> allocations =
+                new ArrayList<>(projection.lobs().size());
+        try {
+            // 2、placeholder 与实际 external envelope 等长，prepare 可安全冻结 split/leaf 资源。
+            LogicalRecord placeholder = new LogicalRecord(
+                    schemaVersion, projection.placeholderValues(), false,
+                    sourceRow.recordType(), hidden);
+            prepared = btree.prepareClusteredInsert(
+                    insert, clustered, placeholder, hidden.dbTrxId());
+            List<ColumnValue> actualValues =
+                    new ArrayList<>(projection.placeholderValues());
+            for (PlannedRebuildLob lob : projection.lobs()) {
+                LobWriteAllocation allocation =
+                        lobStorage.writePlanned(insert, lob.plan());
+                allocations.add(allocation);
+                actualValues.set(lob.ordinal(), allocation.value());
+            }
+
+            // 3、row 成为新 ownership anchor 后，guard 转移；旧空间引用从未写入目标页。
+            LogicalRecord actual = new LogicalRecord(
+                    schemaVersion, actualValues, false,
+                    sourceRow.recordType(), hidden);
+            BTreeInsertResult result =
+                    prepared.publish(actual, hidden.dbRollPtr());
+            for (LobWriteAllocation allocation : allocations) {
+                allocation.transferOwnership();
+            }
+            prepared.close();
+            prepared = null;
+
+            // 4、commit LSN 同时覆盖新 LOB/FSP 与聚簇 row；调用方随后才能发布二级 entry。
+            Lsn lsn = mtrManager.commit(insert);
+            return new RebuildClusteredInsert(
+                    result.indexAfterInsert(), actual, lsn);
+        } catch (RuntimeException failure) {
+            for (int i = allocations.size() - 1; i >= 0; i--) {
+                try {
+                    allocations.get(i).close();
+                } catch (RuntimeException cleanup) {
+                    failure.addSuppressed(cleanup);
+                }
+            }
+            if (prepared != null) {
+                try {
+                    prepared.close();
+                } catch (RuntimeException cleanup) {
+                    failure.addSuppressed(cleanup);
+                }
+            }
+            rollbackIfBound(insert, failure);
+            throw failure;
+        }
+    }
+
+    /** 从完整物理聚簇记录提取 continuation key；聚簇 key 唯一，exclusive lower 不会漏/重行。 */
+    private static SearchKey physicalKey(
+            LogicalRecord record, BTreeIndex index) {
+        List<ColumnValue> values =
+                new ArrayList<>(index.keyDef().parts().size());
+        for (var part : index.keyDef().parts()) {
+            values.add(record.columnValues().get(
+                    part.columnId().value()));
+        }
+        return new SearchKey(values);
+    }
+
+    /** 一列目标 externalization 的 ordinal 与冻结写计划。 */
+    private record PlannedRebuildLob(int ordinal, LobWritePlan plan) {
+        private PlannedRebuildLob {
+            if (ordinal < 0 || plan == null) {
+                throw new DatabaseValidationException(
+                        "invalid rebuild LOB plan");
+            }
+        }
+    }
+
+    /** 不持 page guard 的目标 placeholder 与有序 LOB 计划。 */
+    private record RebuildProjection(
+            List<ColumnValue> placeholderValues,
+            List<PlannedRebuildLob> lobs) {
+        private RebuildProjection {
+            if (placeholderValues == null || lobs == null) {
+                throw new DatabaseValidationException(
+                        "invalid rebuild row projection");
+            }
+            placeholderValues = List.copyOf(placeholderValues);
+            lobs = List.copyOf(lobs);
+        }
+    }
+
+    /** 单行聚簇写的已提交结果，供随后二级 entry 构造。 */
+    private record RebuildClusteredInsert(
+            BTreeIndex index, LogicalRecord row, Lsn lsn) {
+        private RebuildClusteredInsert {
+            if (index == null || row == null || lsn == null) {
+                throw new DatabaseValidationException(
+                        "invalid rebuild clustered insert result");
+            }
+        }
+    }
+
+    /** storage API 常量 DTO 到 record 值的显式、穷尽映射。 */
+    private static ColumnValue toColumnValue(StorageDefaultValue value) {
+        return switch (value) {
+            case StorageDefaultValue.NullValue ignored -> ColumnValue.NullValue.INSTANCE;
+            case StorageDefaultValue.IntegerValue integer ->
+                    new ColumnValue.IntValue(integer.value().longValue());
+            case StorageDefaultValue.FloatingValue floating ->
+                    new ColumnValue.DoubleValue(floating.value());
+            case StorageDefaultValue.DecimalValue decimal ->
+                    new ColumnValue.DecimalValue(decimal.value());
+            case StorageDefaultValue.StringValue string ->
+                    new ColumnValue.StringValue(string.value());
+            case StorageDefaultValue.BytesValue bytes ->
+                    new ColumnValue.BinaryValue(bytes.value());
+            case StorageDefaultValue.TemporalValue temporal ->
+                    new ColumnValue.TemporalValue(
+                            cn.zhangyis.db.storage.record.type.TemporalKind.valueOf(
+                                    temporal.kind().name()), temporal.value());
+            case StorageDefaultValue.BitValue bits ->
+                    new ColumnValue.BitValue(bits.value());
+            case StorageDefaultValue.EnumValue enumeration ->
+                    new ColumnValue.EnumValue(enumeration.ordinal());
+            case StorageDefaultValue.SetValue set ->
+                    new ColumnValue.SetValue(set.bitmap());
+        };
+    }
+
+    /** 运行期 B+Tree descriptor 到可持久 DD binding 的纯映射。 */
+    private static IndexStorageBinding indexBinding(BTreeIndex index) {
+        return new IndexStorageBinding(index.indexId(), index.rootPageId(), index.rootLevel(),
+                index.leafSegment(), index.nonLeafSegment());
+    }
+
+    /**
      * 回收尚未被 committed DD 引用的 staged index segments，并在同一 MTR 清空 page3 descriptor。
      *
      * <p>数据流：</p>
@@ -1075,6 +1575,38 @@ public final class TableDdlStorageService {
             log.info("imported physical tablespace: table={} space={} source={}", binding.tableId(),
                     binding.spaceId().value(), source);
         }
+    }
+
+    /**
+     * 在 IMPORT 产生复制、打开或 redo 副作用前读取外部文件 page0，并使用当前实例页大小校验稳定身份。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验源路径与期望 space id，拒绝缺失身份且不创建临时文件。</li>
+     *     <li>使用组合根固定的 page size 打开源文件，防止调用方通过自报页大小改变 framing。</li>
+     *     <li>由只读 inspector 校验 page0 checksum、space id、类型和版本。</li>
+     *     <li>返回不可变 identity；文件损坏时保留底层 cause 且不挂载 tablespace。</li>
+     * </ol>
+     *
+     * @param source 实例受控 incoming 目录中的候选文件；不得为 {@code null}
+     * @param expectedSpaceId DD 当前 binding 的稳定 space id；不得为 {@code null}
+     * @return 从 page0 读取并完成完整性校验的文件身份
+     * @throws DatabaseValidationException 参数缺失或 page0 身份与期望 space 不一致时抛出
+     */
+    public TablespaceFileIdentity inspectTablespaceFile(
+            Path source, cn.zhangyis.db.domain.SpaceId expectedSpaceId) {
+        // 1、纯参数错误不得触发文件打开。
+        if (source == null || expectedSpaceId == null) {
+            throw new DatabaseValidationException(
+                    "tablespace inspection source/expected space must not be null");
+        }
+        // 2、页大小只来自已打开引擎的固定配置。
+        PageSize configuredPageSize = pageSize;
+        // 3、inspector 负责 page0 framing、checksum 与 identity 交叉校验。
+        TablespaceFileIdentity identity =
+                fileInspection.inspect(source, expectedSpaceId, configuredPageSize);
+        // 4、返回只读身份；本方法不复制、挂载或修改候选文件。
+        return identity;
     }
 
     /**

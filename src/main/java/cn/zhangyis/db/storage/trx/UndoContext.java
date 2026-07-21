@@ -294,9 +294,7 @@ public final class UndoContext {
      */
     void releaseSavepoint(TransactionSavepoint savepoint) {
         int index = requireOwnedSavepoint(savepoint);
-        for (int i = savepointStack.size() - 1; i >= index; i--) {
-            savepointStack.remove(i);
-        }
+        savepointStack.remove(index);
     }
 
     /**

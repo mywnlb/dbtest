@@ -549,7 +549,8 @@ public final class RollbackService {
     public RollbackSummary rollbackToSavepoint(Transaction txn, BTreeIndex clusteredIndex,
                                                TransactionSavepoint savepoint) {
         // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
-        if (txn == null || clusteredIndex == null || savepoint == null) {
+        if (txn == null || savepoint == null
+                || clusteredIndex == null && indexResolver == null && targetResolver == null) {
             throw new DatabaseValidationException("rollbackToSavepoint txn/index/savepoint must not be null");
         }
         if (txn.state() != TransactionState.ACTIVE) {
@@ -573,6 +574,23 @@ public final class RollbackService {
         ctx.completeRollbackToSavepoint(savepoint);
         // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         return new RollbackSummary(applied);
+    }
+
+    /**
+     * 生产 DD resolver 模式的命名保存点入口。每条 undo 自带 table/index identity，本入口不接受 Session
+     * 传入最后访问的索引，避免跨表事务回滚时误用单表 fallback。
+     *
+     * @param txn 当前 ACTIVE 事务
+     * @param savepoint 同一事务当前 undo context 拥有的保存点
+     * @return 实际反向应用的 undo 记录数
+     * @throws DatabaseValidationException 当前组合根没有 target/index resolver 或保存点归属错误时抛出
+     */
+    public RollbackSummary rollbackToSavepoint(Transaction txn, TransactionSavepoint savepoint) {
+        if (targetResolver == null && indexResolver == null) {
+            throw new DatabaseValidationException(
+                    "resolved savepoint rollback requires target or index resolver");
+        }
+        return rollbackToSavepoint(txn, null, savepoint);
     }
 
     /**
@@ -601,7 +619,8 @@ public final class RollbackService {
     public RollbackSummary rollbackToEmptyStatementBoundary(Transaction txn, BTreeIndex clusteredIndex,
                                                             EmptyUndoBoundary boundary) {
         // 1、校验事务身份、状态、undo 绑定与冻结计划，在共享或持久副作用前拒绝非法状态。
-        if (txn == null || clusteredIndex == null || boundary == null) {
+        if (txn == null || boundary == null
+                || clusteredIndex == null && indexResolver == null && targetResolver == null) {
             throw new DatabaseValidationException("empty statement rollback txn/index/boundary must not be null");
         }
         if (txn.state() != TransactionState.ACTIVE) {
@@ -622,6 +641,22 @@ public final class RollbackService {
         boundary.markRolledBack();
         // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         return new RollbackSummary(applied);
+    }
+
+    /**
+     * 使用生产 DD resolver 把命名保存点回滚到首写前空边界；适用于保存点创建后首次写入任意表的场景。
+     *
+     * @param txn 当前 ACTIVE 事务
+     * @param boundary 本 service 在事务首写前创建的空边界能力
+     * @return 实际反向应用的 undo 记录数
+     */
+    public RollbackSummary rollbackToEmptyStatementBoundary(
+            Transaction txn, EmptyUndoBoundary boundary) {
+        if (targetResolver == null && indexResolver == null) {
+            throw new DatabaseValidationException(
+                    "resolved empty-boundary rollback requires target or index resolver");
+        }
+        return rollbackToEmptyStatementBoundary(txn, null, boundary);
     }
 
     /**
@@ -646,7 +681,7 @@ public final class RollbackService {
     }
 
     /**
-     * 释放一个运行期保存点及其嵌套边界，不修改 undo 链。statement guard 在成功路径或 partial rollback 完成后
+     * 释放一个运行期保存点，不修改 undo 链或更晚边界。statement guard 在成功路径或 partial rollback 完成后
      * 调用本方法，避免已经离开语句作用域的边界继续留在 {@link UndoContext} 中。事务必须仍为 ACTIVE，且保存点
      * 必须属于该事务当前的 undo context；非法或重复释放会以领域异常暴露调用方生命周期错误。
      *

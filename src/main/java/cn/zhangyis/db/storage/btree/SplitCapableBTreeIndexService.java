@@ -1356,7 +1356,9 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         // 3、在中间分支复核阶段性结果；满足条件后，执行核心状态转换与受控 IO，并维持领域不变量。
         List<BTreeCurrentReadPosition> positions = new ArrayList<>();
         // 0.13c 读 crab：S-crab 下降到起始 leaf，沿 sibling 链 hand-over-hand 扫；祖先与前驱 leaf 均早释放。
-        IndexPageHandle leafHandle = descendSharedCrab(mtr, index, range.lowerKey());
+        IndexPageHandle leafHandle = range.lowerBound().isPresent()
+                ? descendSharedCrab(mtr, index, range.lowerBound().orElseThrow())
+                : descendLeftmostSharedCrab(mtr, index);
         // 4、汇总稳定结果并沿现有 finally/Guard 释放资源，以稳定返回或领域异常完成收口。
         while (true) {
             RecordPage leaf = leafHandle.recordPage();
@@ -1420,6 +1422,24 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
     public List<BTreeLookupResult> scanIncludingDeleted(MiniTransaction mtr, BTreeIndex index,
                                                         BTreeScanRange range) {
         requireSecondaryIndex(index, "scanIncludingDeleted");
+        return doScan(mtr, index, range, true);
+    }
+
+    /**
+     * 扫描聚簇索引并保留 delete-marked 当前版本，供 range MVCC 逐 identity 沿 undo 链恢复可见版本。
+     *
+     * @param mtr 调用方拥有的短只读 MTR；返回前不自动提交
+     * @param index exact-version 聚簇索引
+     * @param range 可无界或有界的批次范围
+     * @return 不持 page 资源的当前物理候选，包含 delete-marked 行
+     * @throws DatabaseValidationException descriptor 不是聚簇索引或参数缺失时抛出
+     */
+    public List<BTreeLookupResult> scanClusteredIncludingDeleted(
+            MiniTransaction mtr, BTreeIndex index, BTreeScanRange range) {
+        if (index == null || !index.clustered()) {
+            throw new DatabaseValidationException(
+                    "clustered including-deleted scan requires clustered index");
+        }
         return doScan(mtr, index, range, true);
     }
 
@@ -1592,7 +1612,9 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
         // 任意树高（0.13c 读 crab）：S-crab 下降到 lowerKey 起始 leaf（祖先早释放），再沿 FIL sibling next 链
         // hand-over-hand 顺序扫（level 0 时起始 leaf 即 root，无 next）。
         // 2. lower bound 决定起始 leaf；S-crab 释放全部祖先，仅保留 leaf handle。
-        IndexPageHandle leafHandle = descendSharedCrab(mtr, index, range.lowerKey());
+        IndexPageHandle leafHandle = range.lowerBound().isPresent()
+                ? descendSharedCrab(mtr, index, range.lowerBound().orElseThrow())
+                : descendLeftmostSharedCrab(mtr, index);
         ScanAccumulator acc = new ScanAccumulator(range.limit());
         while (true) {
             // 3. 当前 leaf 内统一执行边界比较、delete 过滤和 limit 累积。
@@ -3198,12 +3220,40 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
     }
 
     private GapLockKey terminalGapForRange(MiniTransaction mtr, BTreeIndex index, BTreeScanRange range) {
-        LeafLocation upperLeaf = findLeafSharedCrab(mtr, index, range.upperKey());
-        OptionalInt found = search.findEqual(upperLeaf.page(), range.upperKey(), index.keyDef(), index.schema());
+        if (range.upperBound().isEmpty()) {
+            return new GapLockKey(index.indexId(), rightmostKey(mtr, index), null);
+        }
+        SearchKey upper = range.upperBound().orElseThrow();
+        LeafLocation upperLeaf = findLeafSharedCrab(mtr, index, upper);
+        OptionalInt found = search.findEqual(upperLeaf.page(), upper, index.keyDef(), index.schema());
         if (found.isPresent() && !range.upperInclusive()) {
             return gapBeforeRecord(upperLeaf.page(), index, found.getAsInt());
         }
-        return gapForSearchKey(upperLeaf.page(), index, range.upperKey());
+        return gapForSearchKey(upperLeaf.page(), index, upper);
+    }
+
+    /**
+     * 定位最右 leaf 的最后一个 key；空树返回 null，从而形成 (-∞,+∞) terminal gap。
+     */
+    private SearchKey rightmostKey(MiniTransaction mtr, BTreeIndex index) {
+        IndexPageHandle leaf = descendLeftmostSharedCrab(mtr, index);
+        SearchKey last = null;
+        while (true) {
+            List<Integer> offsets = leaf.recordPage().recordOffsetsInOrder();
+            if (!offsets.isEmpty()) {
+                last = keyAt(leaf.recordPage(), index, offsets.getLast());
+            }
+            long next = leaf.fileHeader().nextPageNo();
+            if (next == FilePageHeader.FIL_NULL) {
+                return last;
+            }
+            PageId nextId = PageId.of(index.rootPageId().spaceId(), PageNo.of(next));
+            IndexPageHandle nextHandle = openBTreePageOutOfOrder(mtr, nextId, index,
+                    PageLatchMode.SHARED,
+                    "btree rightmost search: next leaf is latched before predecessor release");
+            pageAccess.releaseHandle(mtr, leaf);
+            leaf = nextHandle;
+        }
     }
 
     private SearchKey keyAt(RecordPage leaf, BTreeIndex index, int recordOffset) {
@@ -3211,12 +3261,20 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
     }
 
     private boolean belowLower(RecordCursor cursor, BTreeIndex index, BTreeScanRange range) {
-        int c = recordComparator.compare(cursor, range.lowerKey(), index.keyDef(), index.schema());
+        if (range.lowerBound().isEmpty()) {
+            return false;
+        }
+        int c = recordComparator.compare(
+                cursor, range.lowerBound().orElseThrow(), index.keyDef(), index.schema());
         return c < 0 || (c == 0 && !range.lowerInclusive());
     }
 
     private boolean aboveUpper(RecordCursor cursor, BTreeIndex index, BTreeScanRange range) {
-        int c = recordComparator.compare(cursor, range.upperKey(), index.keyDef(), index.schema());
+        if (range.upperBound().isEmpty()) {
+            return false;
+        }
+        int c = recordComparator.compare(
+                cursor, range.upperBound().orElseThrow(), index.keyDef(), index.schema());
         return c > 0 || (c == 0 && !range.upperInclusive());
     }
 

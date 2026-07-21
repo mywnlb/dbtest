@@ -67,11 +67,17 @@ public record DdlLogRecord(DdlUndoMarker marker, long secondaryObjectId,
         if (marker == null || operation == null || phase == null || spaceId == null || path == null) {
             throw new DatabaseValidationException("DDL log record fields must not be null");
         }
-        boolean indexOperation = operation == DdlLogOperation.CREATE_INDEX
-                || operation == DdlLogOperation.DROP_INDEX;
-        if (indexOperation && secondaryObjectId <= 0
-                || !indexOperation && secondaryObjectId != 0) {
+        boolean secondaryIdentityOperation = operation == DdlLogOperation.CREATE_INDEX
+                || operation == DdlLogOperation.DROP_INDEX
+                || operation == DdlLogOperation.REBUILD_TABLE;
+        if (secondaryIdentityOperation && secondaryObjectId <= 0
+                || !secondaryIdentityOperation && secondaryObjectId != 0) {
             throw new DatabaseValidationException("DDL secondary object identity does not match operation");
+        }
+        if (operation == DdlLogOperation.REBUILD_TABLE
+                && (auxiliaryPath == null || auxiliaryPath.isEmpty())) {
+            throw new DatabaseValidationException(
+                    "REBUILD TABLE log requires a shadow auxiliary path");
         }
     }
 

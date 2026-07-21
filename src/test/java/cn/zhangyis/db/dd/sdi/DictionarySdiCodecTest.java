@@ -13,6 +13,8 @@ import cn.zhangyis.db.dd.domain.SchemaId;
 import cn.zhangyis.db.dd.domain.TableDefinition;
 import cn.zhangyis.db.dd.domain.TableId;
 import cn.zhangyis.db.dd.domain.TableState;
+import cn.zhangyis.db.dd.domain.TableOptions;
+import cn.zhangyis.db.dd.domain.ColumnDefaultDefinition;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.SegmentId;
@@ -29,8 +31,11 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataOutputStream;
 import java.io.DataInputStream;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -102,19 +107,35 @@ class DictionarySdiCodecTest {
     void decodesLegacyV1PayloadAndDerivesPhysicalRowFormatVersion() {
         DictionarySdiCodec codec = new DictionarySdiCodec();
         TableDefinition expected = table();
-        byte[] v2 = codec.encode(expected);
-        int rowFormatOffset = rowFormatOffset(v2);
-        byte[] v1 = new byte[v2.length - Long.BYTES];
-        System.arraycopy(v2, 0, v1, 0, rowFormatOffset);
-        System.arraycopy(v2, rowFormatOffset + Long.BYTES,
-                v1, rowFormatOffset, v2.length - rowFormatOffset - Long.BYTES);
-        ByteBuffer.wrap(v1).order(ByteOrder.BIG_ENDIAN).putInt(Integer.BYTES, 1);
+        byte[] v1 = legacyV1Payload(expected);
 
         TableDefinition decoded = codec.decode(v1);
 
         assertEquals(expected, decoded);
         assertEquals(expected.version().value(),
                 decoded.storageBinding().orElseThrow().rowFormatVersion());
+    }
+
+    /** v3 必须同时保存 table options 与每列 default，不允许只在 catalog 中存在。 */
+    @Test
+    void roundTripsOptionsAndColumnDefaultsInV3() {
+        TableDefinition base = table();
+        List<ColumnDefinition> columns = List.of(
+                new ColumnDefinition(base.columns().get(0).columnId(), base.columns().get(0).name(),
+                        base.columns().get(0).type(), 0, ColumnDefaultDefinition.required()),
+                new ColumnDefinition(base.columns().get(1).columnId(), base.columns().get(1).name(),
+                        base.columns().get(1).type(), 1,
+                        ColumnDefaultDefinition.constant("'paid'")),
+                base.columns().get(2));
+        TableDefinition expected = new TableDefinition(
+                base.id(), base.schemaId(), base.name(), base.version(), base.state(),
+                columns, base.indexes(), base.storageBinding(),
+                new TableOptions("订单表", 45, 255));
+
+        TableDefinition decoded =
+                new DictionarySdiCodec().decode(new DictionarySdiCodec().encode(expected));
+
+        assertEquals(expected, decoded);
     }
 
     private static TableDefinition table() {
@@ -185,5 +206,96 @@ class DictionarySdiCodecTest {
     private static void skipString(DataInputStream in) throws IOException {
         int length = in.readInt();
         in.skipNBytes(length);
+    }
+
+    /**
+     * 独立写出历史 v1 shape：无 table options、独立 rowFormatVersion 与 column default。
+     * 测试不从当前 encoder 切片，避免当前字段顺序错误同时污染兼容 golden。
+     */
+    private static byte[] legacyV1Payload(TableDefinition table) {
+        try {
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            try (DataOutputStream out = new DataOutputStream(bytes)) {
+                TableStorageBinding binding = table.storageBinding().orElseThrow();
+                out.writeInt(0x44445331);
+                out.writeInt(1);
+                out.writeLong(table.id().value());
+                out.writeLong(table.schemaId().value());
+                writeName(out, table.name());
+                out.writeLong(table.version().value());
+                out.writeByte(1);
+                out.writeLong(binding.tableId());
+                out.writeInt(binding.spaceId().value());
+                writeString(out, binding.path().toString());
+                out.writeInt(binding.indexes().size());
+                for (IndexStorageBinding index : binding.indexes()) {
+                    out.writeLong(index.indexId());
+                    out.writeLong(index.rootPageId().pageNo().value());
+                    out.writeInt(index.rootLevel());
+                    writeSegment(out, index.leafSegment());
+                    writeSegment(out, index.nonLeafSegment());
+                }
+                out.writeBoolean(binding.lobSegment().isPresent());
+                if (binding.lobSegment().isPresent()) {
+                    writeSegment(out, binding.lobSegment().orElseThrow());
+                }
+                out.writeInt(table.columns().size());
+                for (ColumnDefinition column : table.columns()) {
+                    writeLegacyColumn(out, column);
+                }
+                out.writeInt(table.indexes().size());
+                for (IndexDefinition index : table.indexes()) {
+                    out.writeLong(index.id().value());
+                    writeName(out, index.name());
+                    out.writeBoolean(index.unique());
+                    out.writeBoolean(index.clustered());
+                    out.writeInt(index.keyParts().size());
+                    for (IndexKeyPart part : index.keyParts()) {
+                        out.writeLong(part.columnId());
+                        out.writeByte(part.order() == IndexOrder.ASC ? 1 : 2);
+                        out.writeInt(part.prefixBytes());
+                    }
+                }
+            }
+            return bytes.toByteArray();
+        } catch (IOException impossible) {
+            throw new AssertionError(impossible);
+        }
+    }
+
+    /** 写出不含 default 尾部的历史列 shape。 */
+    private static void writeLegacyColumn(DataOutputStream out, ColumnDefinition column)
+            throws IOException {
+        out.writeLong(column.columnId());
+        writeName(out, column.name());
+        out.writeInt(column.ordinal());
+        ColumnTypeDefinition type = column.type();
+        out.writeInt(type.typeId().stableCode());
+        out.writeBoolean(type.unsigned());
+        out.writeBoolean(type.nullable());
+        out.writeInt(type.length());
+        out.writeInt(type.scale());
+        out.writeInt(type.charsetId());
+        out.writeInt(type.collationId());
+        out.writeInt(type.symbols().size());
+        for (String symbol : type.symbols()) {
+            writeString(out, symbol);
+        }
+    }
+
+    private static void writeName(DataOutputStream out, ObjectName name) throws IOException {
+        writeString(out, name.displayName());
+        writeString(out, name.canonicalName());
+    }
+
+    private static void writeString(DataOutputStream out, String value) throws IOException {
+        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
+        out.writeInt(bytes.length);
+        out.write(bytes);
+    }
+
+    private static void writeSegment(DataOutputStream out, SegmentRef segment) throws IOException {
+        out.writeInt(segment.inodeSlot());
+        out.writeLong(segment.segmentId().value());
     }
 }

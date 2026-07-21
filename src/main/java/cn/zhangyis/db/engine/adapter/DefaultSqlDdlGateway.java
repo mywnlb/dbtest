@@ -5,6 +5,8 @@ import cn.zhangyis.db.dd.ddl.DictionaryDdlService;
 import cn.zhangyis.db.dd.domain.MdlOwnerId;
 import cn.zhangyis.db.sql.binder.bound.BoundCreateIndex;
 import cn.zhangyis.db.sql.binder.bound.BoundDropIndex;
+import cn.zhangyis.db.sql.binder.bound.BoundAlterTablespace;
+import cn.zhangyis.db.sql.binder.bound.BoundAlterTable;
 import cn.zhangyis.db.sql.executor.storage.SqlDdlGateway;
 
 import java.time.Duration;
@@ -68,6 +70,44 @@ public final class DefaultSqlDdlGateway implements SqlDdlGateway {
             throw new DatabaseValidationException("SQL DROP INDEX requires statement/positive timeout");
         }
         ddl.dropSecondaryIndex(
+                MdlOwnerId.forDdlStatement(statementSequence.incrementAndGet()),
+                statement.command(), timeout);
+    }
+
+    /**
+     * 把受控表空间生命周期动作交给 DD；路径和 page0 identity 均由实例组合根内的 coordinator
+     * 计算，SQL 不能提交任意主机路径。
+     *
+     * @param statement 已补全 schema 的 DISCARD/IMPORT 意图
+     * @param timeout 本条语句剩余正有界时间
+     */
+    @Override
+    public void alterTablespace(BoundAlterTablespace statement, Duration timeout) {
+        if (statement == null || timeout == null || timeout.isZero() || timeout.isNegative()) {
+            throw new DatabaseValidationException(
+                    "SQL ALTER TABLESPACE requires statement/positive timeout");
+        }
+        MdlOwnerId owner = MdlOwnerId.forDdlStatement(statementSequence.incrementAndGet());
+        switch (statement.action()) {
+            case DISCARD -> ddl.discardTablespace(owner, statement.table(), timeout);
+            case IMPORT -> ddl.importTablespace(owner, statement.table(), timeout);
+        }
+    }
+
+    /**
+     * 用独立 statement owner 执行一次通用 ALTER；一个 bound command 只调用一次 coordinator，
+     * 不能把多个 action 拆成可被其它 DDL 插入的多次提交。
+     *
+     * @param statement 保序 ALTER command
+     * @param timeout 本条语句剩余正有界时间
+     */
+    @Override
+    public void alterTable(BoundAlterTable statement, Duration timeout) {
+        if (statement == null || timeout == null || timeout.isZero() || timeout.isNegative()) {
+            throw new DatabaseValidationException(
+                    "SQL ALTER TABLE requires statement/positive timeout");
+        }
+        ddl.alterTable(
                 MdlOwnerId.forDdlStatement(statementSequence.incrementAndGet()),
                 statement.command(), timeout);
     }

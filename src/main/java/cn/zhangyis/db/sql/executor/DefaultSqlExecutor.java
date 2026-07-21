@@ -9,6 +9,11 @@ import cn.zhangyis.db.sql.binder.bound.BoundSecondaryRangeSelect;
 import cn.zhangyis.db.sql.binder.bound.BoundStatement;
 import cn.zhangyis.db.sql.binder.bound.BoundCreateIndex;
 import cn.zhangyis.db.sql.binder.bound.BoundDropIndex;
+import cn.zhangyis.db.sql.binder.bound.BoundRangeSelect;
+import cn.zhangyis.db.sql.binder.bound.BoundRangeUpdate;
+import cn.zhangyis.db.sql.binder.bound.BoundRangeDelete;
+import cn.zhangyis.db.sql.binder.bound.BoundAlterTablespace;
+import cn.zhangyis.db.sql.binder.bound.BoundAlterTable;
 import cn.zhangyis.db.sql.executor.storage.SqlStorageGateway;
 import cn.zhangyis.db.sql.executor.storage.SqlStatementDeadline;
 import cn.zhangyis.db.sql.executor.storage.SqlTransactionHandle;
@@ -62,6 +67,9 @@ public final class DefaultSqlExecutor {
             case BoundSecondaryRangeSelect select -> new QueryResult(
                     resultColumns(select.table(), select.projectionOrdinals()),
                     storage.selectRange(transaction, select, deadline), status);
+            case BoundRangeSelect select -> new QueryResult(
+                    resultColumns(select.table(), select.projectionOrdinals()),
+                    storage.selectRange(transaction, select, deadline), status);
             case BoundUpdate update -> {
                 var outcome = storage.update(transaction, update, deadline);
                 yield new UpdateResult(outcome.affectedRows(),
@@ -74,10 +82,26 @@ public final class DefaultSqlExecutor {
                         new TransactionStatus(status.autocommit(), status.transactionActive(),
                                 outcome.rollbackOnly()));
             }
+            case BoundRangeUpdate update -> {
+                var outcome = storage.updateRange(transaction, update, deadline);
+                yield new UpdateResult(outcome.affectedRows(),
+                        new TransactionStatus(status.autocommit(), status.transactionActive(),
+                                outcome.rollbackOnly()));
+            }
+            case BoundRangeDelete delete -> {
+                var outcome = storage.deleteRange(transaction, delete, deadline);
+                yield new UpdateResult(outcome.affectedRows(),
+                        new TransactionStatus(status.autocommit(), status.transactionActive(),
+                                outcome.rollbackOnly()));
+            }
             case BoundCreateIndex ignored -> throw new DatabaseValidationException(
                     "bound CREATE INDEX must be executed by Session DDL coordinator");
             case BoundDropIndex ignored -> throw new DatabaseValidationException(
                     "bound DROP INDEX must be executed by Session DDL coordinator");
+            case BoundAlterTablespace ignored -> throw new DatabaseValidationException(
+                    "bound ALTER TABLESPACE must be executed by Session DDL coordinator");
+            case BoundAlterTable ignored -> throw new DatabaseValidationException(
+                    "bound ALTER TABLE must be executed by Session DDL coordinator");
         };
     }
 

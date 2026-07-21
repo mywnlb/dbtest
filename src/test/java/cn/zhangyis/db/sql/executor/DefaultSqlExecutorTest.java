@@ -9,6 +9,13 @@ import cn.zhangyis.db.sql.binder.bound.BoundUpdate;
 import cn.zhangyis.db.sql.binder.bound.BoundDelete;
 import cn.zhangyis.db.sql.binder.bound.BoundSecondaryRangeSelect;
 import cn.zhangyis.db.sql.binder.bound.SelectLockMode;
+import cn.zhangyis.db.sql.binder.bound.BoundRangeSelect;
+import cn.zhangyis.db.sql.binder.bound.BoundRangeUpdate;
+import cn.zhangyis.db.sql.binder.bound.BoundRangeDelete;
+import cn.zhangyis.db.sql.binder.bound.BoundIndexRange;
+import cn.zhangyis.db.sql.binder.bound.BoundRangeEndpoint;
+import cn.zhangyis.db.sql.binder.bound.BoundRowPredicate;
+import cn.zhangyis.db.sql.binder.bound.BoundRowPredicateOperator;
 import cn.zhangyis.db.sql.executor.storage.*;
 import cn.zhangyis.db.storage.api.SegmentRef;
 import cn.zhangyis.db.storage.api.ddl.IndexStorageBinding;
@@ -63,7 +70,26 @@ class DefaultSqlExecutorTest {
                 new BoundDelete(table, List.of(new SqlValue.IntegerValue(BigInteger.ONE))), status,
                 SqlStatementDeadline.after(Duration.ofSeconds(1))));
         assertEquals(1, deleted.affectedRows());
-        assertEquals(5, gateway.calls);
+
+        BoundIndexRange payloadRange = new BoundIndexRange(
+                Optional.of(new BoundRangeEndpoint(List.of(new SqlValue.StringValue("a")), true)),
+                Optional.of(new BoundRangeEndpoint(List.of(new SqlValue.StringValue("z")), false)));
+        List<BoundRowPredicate> predicates = List.of(new BoundRowPredicate(
+                1, BoundRowPredicateOperator.GREATER_THAN_OR_EQUAL,
+                new SqlValue.StringValue("a")));
+        QueryResult comparison = assertInstanceOf(QueryResult.class, executor.execute(handle,
+                new BoundRangeSelect(table, List.of(0), 4, payloadRange, predicates,
+                        SelectLockMode.CONSISTENT, false),
+                status, SqlStatementDeadline.after(Duration.ofSeconds(1))));
+        assertEquals(2, comparison.rows().size());
+        assertEquals(2, assertInstanceOf(UpdateResult.class, executor.execute(handle,
+                new BoundRangeUpdate(table, List.of(1), List.of(new SqlValue.StringValue("after")),
+                        4, payloadRange, predicates, false),
+                status, SqlStatementDeadline.after(Duration.ofSeconds(1)))).affectedRows());
+        assertEquals(2, assertInstanceOf(UpdateResult.class, executor.execute(handle,
+                new BoundRangeDelete(table, 4, payloadRange, predicates, false),
+                status, SqlStatementDeadline.after(Duration.ofSeconds(1)))).affectedRows());
+        assertEquals(8, gateway.calls);
     }
 
     private static TableDefinition table() {
@@ -93,6 +119,19 @@ class DefaultSqlExecutorTest {
     private static final class RecordingGateway implements SqlStorageGateway {
         private int calls;
         @Override public SqlTransactionHandle begin(SqlTransactionRequest request) { return new TestHandle(); }
+        @Override public SqlSavepointHandle createSavepoint(
+                SqlTransactionHandle transaction, SqlStatementDeadline deadline) {
+            return new TestSavepoint();
+        }
+        @Override public SqlSavepointHandle rollbackToSavepoint(
+                SqlTransactionHandle transaction, SqlSavepointHandle savepoint,
+                SqlStatementDeadline deadline) {
+            return savepoint;
+        }
+        @Override public void releaseSavepoint(
+                SqlTransactionHandle transaction, SqlSavepointHandle savepoint,
+                SqlStatementDeadline deadline) {
+        }
         @Override public SqlWriteOutcome insert(SqlTransactionHandle transaction, BoundClusteredInsert statement,
                                                 SqlStatementDeadline deadline) {
             calls++; return new SqlWriteOutcome(1, false);
@@ -110,6 +149,14 @@ class DefaultSqlExecutorTest {
                     new SqlRow(List.of(new SqlValue.IntegerValue(BigInteger.ONE))),
                     new SqlRow(List.of(new SqlValue.IntegerValue(BigInteger.TWO))));
         }
+        @Override public List<SqlRow> selectRange(SqlTransactionHandle transaction,
+                                                 BoundRangeSelect statement,
+                                                 SqlStatementDeadline deadline) {
+            calls++;
+            return List.of(
+                    new SqlRow(List.of(new SqlValue.IntegerValue(BigInteger.ONE))),
+                    new SqlRow(List.of(new SqlValue.IntegerValue(BigInteger.TWO))));
+        }
         @Override public SqlWriteOutcome update(SqlTransactionHandle transaction, BoundUpdate statement,
                                                 SqlStatementDeadline deadline) {
             calls++; return new SqlWriteOutcome(1, false);
@@ -118,6 +165,16 @@ class DefaultSqlExecutorTest {
                                                 SqlStatementDeadline deadline) {
             calls++; return new SqlWriteOutcome(1, false);
         }
+        @Override public SqlWriteOutcome updateRange(
+                SqlTransactionHandle transaction, BoundRangeUpdate statement,
+                SqlStatementDeadline deadline) {
+            calls++; return new SqlWriteOutcome(2, false);
+        }
+        @Override public SqlWriteOutcome deleteRange(
+                SqlTransactionHandle transaction, BoundRangeDelete statement,
+                SqlStatementDeadline deadline) {
+            calls++; return new SqlWriteOutcome(2, false);
+        }
         @Override public SqlCommitOutcome commit(SqlTransactionHandle transaction, SqlCommitRequest request) {
             return new SqlCommitOutcome(0, true, 0);
         }
@@ -125,4 +182,6 @@ class DefaultSqlExecutorTest {
             return new SqlRollbackOutcome(0, 0);
         }
     }
+
+    private static final class TestSavepoint implements SqlSavepointHandle { }
 }

@@ -303,6 +303,32 @@ class SplitCapableBTreeIndexServiceTest {
     }
 
     /**
+     * 无界扫描必须从最左 leaf 开始；以完整 physical key 作为下一批 exclusive continuation
+     * 时不得重复或遗漏上一批末行。
+     */
+    @Test
+    void scansUnboundedTreeAndContinuesAfterLastPhysicalKey() {
+        onBTreePool((ctx) -> {
+            BTreeIndex current = ctx.insertWideRows(1, 8);
+            BTreeIndexService service = ctx.service();
+
+            MiniTransaction first = ctx.mgr.begin();
+            List<BTreeLookupResult> firstBatch = service.scan(
+                    first, current, BTreeScanRange.unbounded(3));
+            ctx.mgr.commit(first);
+            assertEquals(List.of(1L, 2L, 3L),
+                    firstBatch.stream().map(SplitCapableBTreeIndexServiceTest::idOf).toList());
+
+            MiniTransaction second = ctx.mgr.begin();
+            List<Long> continued = service.scan(second, current,
+                            BTreeScanRange.after(kId(3), 20))
+                    .stream().map(SplitCapableBTreeIndexServiceTest::idOf).toList();
+            ctx.mgr.commit(second);
+            assertEquals(List.of(4L, 5L, 6L, 7L, 8L), continued);
+        });
+    }
+
+    /**
      * 验证 {@code rootSplitEmitsBtreeSiblingLinkDeltasWithoutPhysicalSiblingBytes} 所描述的边界场景保持既有领域不变量，不产生方法名明确禁止的副作用。
      */
     @Test

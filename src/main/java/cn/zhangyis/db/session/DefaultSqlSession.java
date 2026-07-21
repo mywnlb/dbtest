@@ -6,6 +6,8 @@ import cn.zhangyis.db.common.exception.DatabaseFailureClassifier;
 import cn.zhangyis.db.common.exception.DatabaseFatalException;
 import cn.zhangyis.db.dd.domain.MdlOwnerId;
 import cn.zhangyis.db.dd.domain.ObjectName;
+import cn.zhangyis.db.dd.domain.ColumnTypeDefinition;
+import cn.zhangyis.db.dd.domain.DictionaryTypeId;
 import cn.zhangyis.db.dd.service.DataDictionaryService;
 import cn.zhangyis.db.sql.binder.*;
 import cn.zhangyis.db.sql.binder.bound.BoundStatement;
@@ -19,8 +21,12 @@ import cn.zhangyis.db.sql.parser.ast.*;
 import cn.zhangyis.db.session.exception.SessionBusyException;
 import cn.zhangyis.db.session.exception.SessionStateException;
 import cn.zhangyis.db.session.exception.TransactionOutcomeUnknownException;
+import cn.zhangyis.db.session.xa.SessionXaCoordinator;
 
 import java.time.Duration;
+import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -91,6 +97,7 @@ public final class DefaultSqlSession implements SqlSession {
                              SqlStorageGateway gateway, Runnable onClose) {
         this(id, options, dictionary, parser, binder, executor, gateway,
                 cn.zhangyis.db.sql.executor.storage.SqlDdlGateway.UNSUPPORTED,
+                SessionXaCoordinator.UNSUPPORTED,
                 SessionExecutionAdmission.unrestricted(), onClose);
     }
 
@@ -112,6 +119,7 @@ public final class DefaultSqlSession implements SqlSession {
                              Runnable onClose) {
         this(id, options, dictionary, parser, binder, executor, gateway,
                 cn.zhangyis.db.sql.executor.storage.SqlDdlGateway.UNSUPPORTED,
+                SessionXaCoordinator.UNSUPPORTED,
                 executionAdmission, onClose);
     }
 
@@ -135,9 +143,35 @@ public final class DefaultSqlSession implements SqlSession {
                              cn.zhangyis.db.sql.executor.storage.SqlDdlGateway ddlGateway,
                              SessionExecutionAdmission executionAdmission,
                              Runnable onClose) {
+        this(id, options, dictionary, parser, binder, executor, gateway, ddlGateway,
+                SessionXaCoordinator.UNSUPPORTED, executionAdmission, onClose);
+    }
+
+    /**
+     * DatabaseEngine 完整组合根构造入口；显式注入实例级 XA coordinator。
+     *
+     * @param id Session 稳定身份
+     * @param options Session SQL 与 timeout 语义
+     * @param dictionary transaction metadata owner
+     * @param parser SQL parser
+     * @param binder SQL binder
+     * @param executor SQL executor
+     * @param gateway opaque storage transaction port
+     * @param ddlGateway DDL port
+     * @param xaCoordinator 实例共享 XID registry/coordinator
+     * @param executionAdmission DatabaseEngine statement gate
+     * @param onClose Session registry 注销回调
+     */
+    public DefaultSqlSession(SessionId id, SessionOptions options, DataDictionaryService dictionary,
+                             DefaultSqlParser parser, DefaultSqlBinder binder, DefaultSqlExecutor executor,
+                             SqlStorageGateway gateway,
+                             cn.zhangyis.db.sql.executor.storage.SqlDdlGateway ddlGateway,
+                             SessionXaCoordinator xaCoordinator,
+                             SessionExecutionAdmission executionAdmission,
+                             Runnable onClose) {
         if (id == null || options == null || dictionary == null || parser == null || binder == null
                 || executor == null || gateway == null || ddlGateway == null
-                || executionAdmission == null || onClose == null) {
+                || xaCoordinator == null || executionAdmission == null || onClose == null) {
             throw new DatabaseValidationException("session collaborators must not be null");
         }
         this.id = id;
@@ -149,7 +183,7 @@ public final class DefaultSqlSession implements SqlSession {
         this.onClose = onClose;
         this.executionAdmission = executionAdmission;
         this.transactions = new SessionTransactionPolicy(options, gateway, dictionary,
-                MdlOwnerId.forSession(id.value()));
+                MdlOwnerId.forSession(id.value()), xaCoordinator);
     }
 
     @Override public SessionId id() { return id; }
@@ -185,6 +219,12 @@ public final class DefaultSqlSession implements SqlSession {
             if (state != SessionState.OPEN) throw new SessionStateException("session cannot execute from state " + state);
             state = SessionState.EXECUTING;
             StatementNode statement = parser.parse(sql);
+            if (statement instanceof SelectStatementNode select
+                    && select.lockingClause() == SelectLockingClause.NONE
+                    && transactions.requiresSerializableLockingRead()) {
+                statement = new SelectStatementNode(select.star(), select.projections(), select.table(),
+                        select.predicates(), SelectLockingClause.FOR_SHARE);
+            }
             if (transactions.rollbackOnly() && !isRollback(statement)) {
                 throw new SessionStateException("rollback-only transaction accepts only ROLLBACK/close");
             }
@@ -192,6 +232,8 @@ public final class DefaultSqlSession implements SqlSession {
             SqlExecutionResult result = switch (statement) {
                 case SetAutocommitNode set -> executeSet(set, deadline);
                 case TransactionControlNode control -> executeControl(control, deadline);
+                case SavepointStatementNode savepoint -> executeSavepoint(savepoint, deadline);
+                case XaStatementNode xa -> executeXa(xa, deadline);
                 case InsertStatementNode ignored -> executeData(statement, false, deadline);
                 case SelectStatementNode select -> executeData(
                         statement, select.lockingClause() == SelectLockingClause.NONE, deadline);
@@ -199,6 +241,10 @@ public final class DefaultSqlSession implements SqlSession {
                 case DeleteStatementNode ignored -> executeData(statement, false, deadline);
                 case CreateIndexStatementNode createIndex -> executeCreateIndex(createIndex, deadline);
                 case DropIndexStatementNode dropIndex -> executeDropIndex(dropIndex, deadline);
+                case AlterTablespaceStatementNode alterTablespace ->
+                        executeAlterTablespace(alterTablespace, deadline);
+                case AlterTableStatementNode alterTable ->
+                        executeAlterTable(alterTable, deadline);
             };
             state = SessionState.OPEN;
             return result;
@@ -364,6 +410,95 @@ public final class DefaultSqlSession implements SqlSession {
         return new CommandResult(transactions.status());
     }
 
+    /**
+     * 执行 DISCARD/IMPORT TABLESPACE，并与其它阻塞 DDL 共用“先绑定、再 implicit commit、最后独立
+     * MDL owner”的 Session 边界。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>使用 Session 当前 schema 补全表名；纯名称错误发生在事务提交之前。</li>
+     *     <li>完成 DDL implicit commit，确保用户 row lock、transaction MDL 与 metadata pin 已释放。</li>
+     *     <li>把无路径的 bound 意图交给 DDL gateway；DD 在 table X 下选择受控 transfer 文件并执行状态机。</li>
+     *     <li>无论 DDL 成败均恢复 Session policy；恢复失败附加到原异常，成功返回最新事务状态。</li>
+     * </ol>
+     *
+     * @param syntax parser 产生的 DISCARD/IMPORT TABLESPACE AST
+     * @param deadline 本条 SQL 的绝对 deadline
+     * @return 不含 affected rows、携带 DDL 后 Session 状态的命令结果
+     */
+    private CommandResult executeAlterTablespace(AlterTablespaceStatementNode syntax,
+                                                 SqlStatementDeadline deadline) {
+        // 1、Binder 只补全逻辑名，不提前读取可能过期的 table state/binding。
+        Optional<ObjectName> schema = options.currentSchema().map(ObjectName::of);
+        var bound = binder.bindDdl(syntax, schema);
+        // 2、先结束用户事务，避免独立 DDL owner 等待本会话自己的 transaction-duration 资源。
+        transactions.prepareDdl(deadline.remaining("DDL implicit commit"));
+        RuntimeException failure = null;
+        try {
+            // 3、下游在 table X 内派生固定路径、校验 page0 identity 并推进 DDL log。
+            ddlGateway.alterTablespace(
+                    bound, deadline.remaining("ALTER TABLESPACE coordinator"));
+        } catch (RuntimeException ddlFailure) {
+            failure = ddlFailure;
+            throw ddlFailure;
+        } finally {
+            // 4、恢复 Session transaction policy，保留完整异常图。
+            try {
+                transactions.resumeAfterDdl();
+            } catch (RuntimeException resumeFailure) {
+                if (failure == null) {
+                    throw resumeFailure;
+                }
+                failure.addSuppressed(resumeFailure);
+            }
+        }
+        return new CommandResult(transactions.status());
+    }
+
+    /**
+     * 执行通用阻塞式 ALTER。Binder 在 implicit commit 前完成类型/default 等纯 SQL 校验，DD 则在
+     * table MDL X 下按 action 顺序构造并一次发布 staged definition。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>读取 current schema/zone 并绑定无资源命令，纯输入错误不提交现有事务。</li>
+     *     <li>执行 DDL implicit commit，释放用户事务持有的 row lock、MDL 和 metadata pin。</li>
+     *     <li>一次调用独立 DDL gateway；多 action 不得拆分成多个可观察版本。</li>
+     *     <li>无论成功失败均恢复 Session policy，成功返回 DDL 后事务状态。</li>
+     * </ol>
+     *
+     * @param syntax 通用 ALTER AST
+     * @param deadline 本条语句唯一绝对期限
+     * @return DDL 后 Session 命令状态
+     */
+    private CommandResult executeAlterTable(AlterTableStatementNode syntax,
+                                            SqlStatementDeadline deadline) {
+        // 1、纯绑定阶段不打开 DD lease，table-dependent action 在 coordinator 内重验。
+        Optional<ObjectName> schema = options.currentSchema().map(ObjectName::of);
+        var bound = binder.bindDdl(syntax, schema, options.zoneId());
+        // 2、独立 DDL owner 不得与用户事务资源形成自等待。
+        transactions.prepareDdl(deadline.remaining("DDL implicit commit"));
+        RuntimeException failure = null;
+        try {
+            // 3、整个 action list 只进入一次 coordinator。
+            ddlGateway.alterTable(bound, deadline.remaining("ALTER TABLE coordinator"));
+        } catch (RuntimeException ddlFailure) {
+            failure = ddlFailure;
+            throw ddlFailure;
+        } finally {
+            // 4、保持所有 DDL 共用的 Session 恢复与 suppressed 规则。
+            try {
+                transactions.resumeAfterDdl();
+            } catch (RuntimeException resumeFailure) {
+                if (failure == null) {
+                    throw resumeFailure;
+                }
+                failure.addSuppressed(resumeFailure);
+            }
+        }
+        return new CommandResult(transactions.status());
+    }
+
     private CommandResult executeSet(SetAutocommitNode set, SqlStatementDeadline deadline) {
         transactions.setAutocommit(set.enabled(), deadline.remaining("SET autocommit finalization"));
         return new CommandResult(transactions.status());
@@ -383,6 +518,110 @@ public final class DefaultSqlSession implements SqlSession {
             case ROLLBACK -> transactions.rollbackAndContinue(deadline.remaining("ROLLBACK transition"));
         }
         return new CommandResult(transactions.status());
+    }
+
+    /**
+     * 执行命名保存点命令；Session 只传规范 SQL 名称和不透明 transaction 能力，不接触 undo/lock 对象。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>Parser 已保证名称和命令种类完整；Session operation lock 继续串行化同一事务的名称映射。</li>
+     *     <li>把同一 statement deadline 传给 transaction policy，约束 gateway handle 获取。</li>
+     *     <li>policy 按 CREATE/ROLLBACK_TO/RELEASE 更新 opaque 保存点映射，失败不发布半完成名称状态。</li>
+     *     <li>返回当前事务状态；命令不隐式 commit，也不创建 autocommit 临时事务。</li>
+     * </ol>
+     *
+     * @param savepoint Parser 产生的命名保存点 AST
+     * @param deadline 当前 execute 创建的唯一绝对语句期限
+     * @return 不携带行结果、包含当前事务状态的命令结果
+     */
+    private CommandResult executeSavepoint(
+            SavepointStatementNode savepoint, SqlStatementDeadline deadline) {
+        // 1、名称保留用户拼写；规范化只由 transaction policy 完成。
+        String name = savepoint.name().value();
+        // 2、所有 gateway 等待继续消费同一个 deadline。
+        switch (savepoint.kind()) {
+            // 3、每个分支都由 policy 在 storage 成功后才更新 Session 名称映射。
+            case CREATE -> transactions.createSavepoint(name, deadline);
+            case ROLLBACK_TO -> transactions.rollbackToSavepoint(name, deadline);
+            case RELEASE -> transactions.releaseSavepoint(name, deadline);
+        }
+        // 4、保存点不改变 autocommit/active 标志，只观察当前状态。
+        return new CommandResult(transactions.status());
+    }
+
+    /**
+     * 分派 XA 控制语句。活动 branch 生命周期由 transaction policy 拥有；持久 PREPARED 与 phase two
+     * 由实例 coordinator 拥有，Session 不读取 registry channel 或 storage Transaction。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>把 AST XID 转换为防御性复制的领域 XaId；RECOVER 不要求 XID。</li>
+     *     <li>按命令调用 transaction policy，并把同一 statement deadline 的剩余预算传给持久 phase。</li>
+     *     <li>RECOVER 将 registry PREPARED 快照投影为四列公开结果，不暴露 opaque handle。</li>
+     *     <li>其它命令返回最新 transaction status；PREPARE 成功后 active=false。</li>
+     * </ol>
+     *
+     * @param xa Parser 已交叉校验的 XA AST
+     * @param deadline 当前 execute 唯一绝对期限
+     * @return XA RECOVER 查询结果或命令结果
+     */
+    private SqlExecutionResult executeXa(XaStatementNode xa, SqlStatementDeadline deadline) {
+        // 1、RECOVER 是唯一没有 XID 的命令。
+        if (xa.kind() == XaStatementNode.Kind.RECOVER) {
+            // 3、结果列对齐 MySQL XA RECOVER 的 format/gtrid/bqual/data 形态。
+            return xaRecoverResult(xa.convertXid());
+        }
+        var xid = xa.xid().orElseThrow().toXaId();
+        // 2、JOIN/RESUME 不区分运行期行为；两者都只能恢复本 Session ended branch。
+        switch (xa.kind()) {
+            case START -> transactions.startXa(
+                    xid, xa.startMode() != XaStatementNode.StartMode.NONE);
+            case END -> transactions.endXa(xid,
+                    xa.endMode() != XaStatementNode.EndMode.NONE,
+                    xa.endMode() == XaStatementNode.EndMode.FOR_MIGRATE);
+            case PREPARE -> transactions.prepareXa(
+                    xid, deadline.remaining("XA PREPARE transition"));
+            case COMMIT -> transactions.commitXa(
+                    xid, xa.onePhase(), deadline.remaining("XA COMMIT transition"));
+            case ROLLBACK -> transactions.rollbackXa(
+                    xid, deadline.remaining("XA ROLLBACK transition"));
+            case RECOVER -> throw new SessionStateException("XA RECOVER dispatch invariant violated");
+        }
+        // 4、命令结果只发布 Session 事务快照；storage/registry identity 不泄漏。
+        return new CommandResult(transactions.status());
+    }
+
+    /**
+     * 把 durable PREPARED registry 快照转换为公开 QueryResult。
+     */
+    private QueryResult xaRecoverResult(boolean convertXid) {
+        ColumnTypeDefinition integer = ColumnTypeDefinition.bigint(false, false);
+        ColumnTypeDefinition dataType = ColumnTypeDefinition.scalar(
+                convertXid ? DictionaryTypeId.VARCHAR : DictionaryTypeId.VARBINARY,
+                false, false);
+        List<ResultColumn> columns = List.of(
+                new ResultColumn("formatID", integer),
+                new ResultColumn("gtrid_length", integer),
+                new ResultColumn("bqual_length", integer),
+                new ResultColumn("data", dataType));
+        ArrayList<SqlRow> rows = new ArrayList<>();
+        for (var entry : transactions.recoverXa()) {
+            byte[] gtrid = entry.xid().gtrid();
+            byte[] bqual = entry.xid().bqual();
+            byte[] combined = new byte[gtrid.length + bqual.length];
+            System.arraycopy(gtrid, 0, combined, 0, gtrid.length);
+            System.arraycopy(bqual, 0, combined, gtrid.length, bqual.length);
+            SqlValue data = convertXid
+                    ? new SqlValue.StringValue(entry.xid().toString())
+                    : new SqlValue.BytesValue(combined);
+            rows.add(new SqlRow(List.of(
+                    new SqlValue.IntegerValue(BigInteger.valueOf(entry.xid().formatId())),
+                    new SqlValue.IntegerValue(BigInteger.valueOf(gtrid.length)),
+                    new SqlValue.IntegerValue(BigInteger.valueOf(bqual.length)),
+                    data)));
+        }
+        return new QueryResult(columns, rows, transactions.status());
     }
 
     /** 快照也使用有界锁，避免读取 transaction policy 的一半状态转换。
@@ -465,7 +704,9 @@ public final class DefaultSqlSession implements SqlSession {
 
     private static boolean isRollback(StatementNode statement) {
         return statement instanceof TransactionControlNode control
-                && control.kind() == TransactionControlNode.Kind.ROLLBACK;
+                && control.kind() == TransactionControlNode.Kind.ROLLBACK
+                || statement instanceof XaStatementNode xa
+                && xa.kind() == XaStatementNode.Kind.ROLLBACK;
     }
 
     private static SqlExecutionResult withStatus(SqlExecutionResult result, TransactionStatus status) {

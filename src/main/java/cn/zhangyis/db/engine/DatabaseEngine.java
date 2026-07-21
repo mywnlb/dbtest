@@ -25,6 +25,8 @@ import cn.zhangyis.db.storage.engine.StorageEngine;
 import cn.zhangyis.db.storage.fil.catalog.FileInternalCatalogStore;
 import cn.zhangyis.db.storage.fil.catalog.FileDictionaryRecoveryManifestStore;
 import cn.zhangyis.db.engine.recovery.DatabaseInstanceFileLock;
+import cn.zhangyis.db.engine.xa.FileXaRegistry;
+import cn.zhangyis.db.engine.xa.PersistentXaCoordinator;
 import cn.zhangyis.db.storage.recovery.PreparedTransactionDecisionProvider;
 import lombok.extern.slf4j.Slf4j;
 import cn.zhangyis.db.session.DefaultSqlSession;
@@ -105,6 +107,10 @@ public final class DatabaseEngine implements AutoCloseable {
     private DictionaryRecoveryManifestRepository manifestRepository;
     /** 从 open 前持有到全部资源关闭后的跨进程实例独占锁。 */
     private DatabaseInstanceFileLock instanceFileLock;
+    /** instance lock 覆盖下打开的 append-only XID registry；必须晚于 storage、早于 instance lock 关闭。 */
+    private FileXaRegistry xaRegistry;
+    /** 共享 live prepared branch coordinator；Session 只依赖其稳定端口。 */
+    private PersistentXaCoordinator xaCoordinator;
     /**
      * 本对象持有的 {@code controlStore} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
      */
@@ -211,6 +217,7 @@ public final class DatabaseEngine implements AutoCloseable {
                 ensureBaseDirectory();
                 instanceFileLock = DatabaseInstanceFileLock.acquire(
                         baseConfig.baseDir(), baseConfig.flushTimeout());
+                xaRegistry = FileXaRegistry.openOrCreate(baseConfig.baseDir());
                 // 2. 只有 catalog admission 成功后才允许打开/修复 manifest，并把它注入 control/repository。
                 Path catalogPath = baseConfig.baseDir().resolve("mysql.ibd");
                 Path controlPath = baseConfig.baseDir().resolve("mysql.dd.ctrl");
@@ -229,10 +236,16 @@ public final class DatabaseEngine implements AutoCloseable {
                 List<EngineTablespaceConfig> tablespaces = discovery.discover().stream()
                         .map(binding -> new EngineTablespaceConfig(binding.spaceId(), binding.path()))
                         .toList();
+                PreparedTransactionDecisionProvider compositePreparedDecisions = transactionId ->
+                        xaRegistry.containsTransaction(transactionId)
+                                ? xaRegistry.decisionFor(transactionId)
+                                : preparedDecisionProvider.decisionFor(transactionId);
                 storage = new StorageEngine(
-                        baseConfig.withRecoveryTablespaces(tablespaces), preparedDecisionProvider);
+                        baseConfig.withRecoveryTablespaces(tablespaces), compositePreparedDecisions);
                 storage.configureIndexMetadataResolver(new DictionaryIndexMetadataResolver(repository));
                 storage.open();
+                xaRegistry.completeRecoveryDecisions();
+                xaCoordinator = new PersistentXaCoordinator(xaRegistry);
 
                 cache = new DictionaryObjectCache(DICTIONARY_CACHE_CAPACITY);
                 metadataLocks = new MetadataLockManager();
@@ -313,6 +326,7 @@ public final class DatabaseEngine implements AutoCloseable {
                     options.rowLockTimeout());
             DefaultSqlSession session = new DefaultSqlSession(id, options, dictionary, sqlParser, sqlBinder,
                     new DefaultSqlExecutor(gateway), gateway, new DefaultSqlDdlGateway(ddl),
+                    xaCoordinator,
                     sessionExecutionGate,
                     () -> sessions.deregister(id));
             sessions.register(session);
@@ -468,11 +482,14 @@ public final class DatabaseEngine implements AutoCloseable {
             }
         }
         storage = null;
+        xaCoordinator = null;
         // 2. 用户入口不拥有独立资源，但必须在下层 close 后清除引用。
         sqlMetadataMapper = null;
         sqlParser = null;
         sqlBinder = null;
         sessions = null;
+        failure = closeOne(xaRegistry, failure);
+        xaRegistry = null;
         // 3. witness 的调用方已经停止，按 control/catalog/manifest 顺序关闭持久 DD 文件。
         failure = closeOne(controlStore, failure);
         controlStore = null;

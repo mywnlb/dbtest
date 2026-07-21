@@ -2,6 +2,7 @@ package cn.zhangyis.db.session;
 
 import cn.zhangyis.db.sql.binder.DefaultSqlBinder;
 import cn.zhangyis.db.sql.binder.SqlTypeCoercion;
+import cn.zhangyis.db.sql.binder.bound.SelectLockMode;
 import cn.zhangyis.db.sql.executor.*;
 import cn.zhangyis.db.sql.executor.storage.*;
 import cn.zhangyis.db.sql.executor.storage.exception.SqlStorageException;
@@ -73,6 +74,55 @@ class DefaultSqlSessionTest {
             assertEquals(List.of("begin:RW", "range", "commit"), gateway.events);
             assertEquals(SessionTransactionMode.NONE, session.snapshot().transactionMode());
             session.close();
+        }
+    }
+
+    /**
+     * SERIALIZABLE autocommit 普通 SELECT 保持语句级一致性读；BEGIN 后同一语法必须在 Binder 前提升为 FOR SHARE。
+     */
+    @Test
+    void promotesSerializableLongTransactionSelectButKeepsAutocommitConsistent() {
+        try (SessionTestDictionary dictionary = new SessionTestDictionary(directory)) {
+            SessionTransactionPolicyTest.RecordingGateway gateway =
+                    new SessionTransactionPolicyTest.RecordingGateway();
+            DefaultSqlSession session = session(dictionary, gateway,
+                    options(Duration.ofSeconds(1), SqlIsolationLevel.SERIALIZABLE), () -> { });
+
+            session.execute("SELECT id FROM range_orders WHERE category='a'");
+            assertEquals(SelectLockMode.CONSISTENT, gateway.lastRangeLockMode);
+            assertTrue(gateway.requests.getFirst().readOnly());
+            assertTrue(gateway.requests.getFirst().autocommit());
+
+            session.execute("BEGIN");
+            gateway.events.clear();
+            session.execute("SELECT id FROM range_orders WHERE category='a'");
+            assertEquals(SelectLockMode.FOR_SHARE, gateway.lastRangeLockMode);
+            assertEquals(List.of("range"), gateway.events,
+                    "显式事务复用 BEGIN 创建的 RW handle，不得创建临时 RO transaction");
+            session.execute("ROLLBACK");
+            session.close();
+        }
+    }
+
+    /** SAVEPOINT SQL 生命周期必须经过 Session 名称映射，且名称比较大小写不敏感。 */
+    @Test
+    void executesNamedSavepointSqlLifecycle() {
+        try (SessionTestDictionary dictionary = new SessionTestDictionary(directory)) {
+            SessionTransactionPolicyTest.RecordingGateway gateway =
+                    new SessionTransactionPolicyTest.RecordingGateway();
+            DefaultSqlSession session = session(dictionary, gateway,
+                    options(Duration.ofSeconds(1)), () -> { });
+            session.execute("BEGIN");
+            session.execute("SAVEPOINT BeforeBatch");
+            session.execute("SAVEPOINT Later");
+            session.execute("ROLLBACK TO SAVEPOINT beforebatch");
+            assertThrows(SessionStateException.class,
+                    () -> session.execute("RELEASE SAVEPOINT Later"));
+            session.execute("RELEASE SAVEPOINT BEFOREBATCH");
+            session.execute("ROLLBACK");
+            session.close();
+            assertTrue(gateway.events.contains("rollback-to-savepoint"));
+            assertTrue(gateway.events.contains("release-savepoint"));
         }
     }
 
@@ -187,9 +237,13 @@ class DefaultSqlSessionTest {
     }
 
     private static SessionOptions options(Duration statementTimeout) {
+        return options(statementTimeout, SqlIsolationLevel.REPEATABLE_READ);
+    }
+
+    private static SessionOptions options(Duration statementTimeout, SqlIsolationLevel isolationLevel) {
         Duration child = statementTimeout.compareTo(Duration.ofMillis(50)) > 0
                 ? Duration.ofMillis(50) : statementTimeout;
-        return new SessionOptions(Optional.of("app"), true, SqlIsolationLevel.REPEATABLE_READ,
+        return new SessionOptions(Optional.of("app"), true, isolationLevel,
                 SqlDurabilityMode.BACKGROUND_FLUSH, ZoneId.of("UTC"), statementTimeout,
                 child, child, child);
     }

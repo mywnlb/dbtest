@@ -21,6 +21,7 @@ import cn.zhangyis.db.storage.api.TablePurgeBarrier;
 import cn.zhangyis.db.storage.api.ddl.SecondaryIndexBuildDescriptor;
 import cn.zhangyis.db.storage.api.ddl.SecondaryIndexDropDescriptor;
 import cn.zhangyis.db.storage.api.ddl.IndexStorageBinding;
+import cn.zhangyis.db.storage.api.ddl.TableStorageBinding;
 import cn.zhangyis.db.storage.api.tablespace.TablespaceFileIdentity;
 import lombok.extern.slf4j.Slf4j;
 
@@ -187,7 +188,77 @@ public final class DictionaryDdlRecoveryService {
             case DROP_TABLE -> recoverDrop(record, timeout);
             case DISCARD_TABLESPACE -> recoverDiscard(record, timeout);
             case IMPORT_TABLESPACE -> recoverImport(record, timeout);
+            case REBUILD_TABLE -> recoverRebuild(record);
         }
+    }
+
+    /**
+     * 依据 committed DD 裁决 shadow rebuild：旧 binding 仍被引用则删除 shadow 并回滚 marker；新 binding
+     * 已提交则保留 shadow、终结 marker，旧文件由统一 orphan cleanup 删除。任何第三种 identity 阻止 OPEN。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>从 marker 读取旧/新受控路径，并从 committed DD 读取当前唯一 binding。</li>
+     *     <li>DD 仍引用旧 binding 时删除 exact shadow path，并把 PREPARED/ENGINE_DONE 终结为 ROLLED_BACK。</li>
+     *     <li>DD 已引用新 binding 时拒绝 PREPARED phase loss，补齐 ENGINE_DONE→DICTIONARY_COMMITTED。</li>
+     *     <li>发布 committed table cache、补 COMMITTED；旧路径留给全局 orphan cleanup 在 ACTIVE 对账后删除。</li>
+     * </ol>
+     *
+     * @param record 非终态 REBUILD_TABLE marker
+     * @throws DictionaryRecoveryException marker、DD binding、路径或 phase 无法形成旧/新二选一裁决时抛出，
+     *                                     调用方必须保持普通流量关闭
+     */
+    private void recoverRebuild(DdlLogRecord record) {
+        // 1、marker 两条路径都必须经过实例 tables 目录守门；DD binding 是交换是否提交的唯一裁决点。
+        Path oldPath = checkedMarkerPath(record);
+        Path shadowPath = record.auxiliaryPath().map(discovery::checkedPath).orElseThrow(() ->
+                new DictionaryRecoveryException("REBUILD marker has no shadow path"));
+        TableId tableId = TableId.of(record.marker().affectedObjectId());
+        TableDefinition table = repository.findTableForRecovery(tableId).orElseThrow(() ->
+                new DictionaryRecoveryException(
+                        "REBUILD marker target table is absent: " + tableId.value()));
+        TableStorageBinding binding = table.storageBinding().orElseThrow(() ->
+                new DictionaryRecoveryException(
+                        "REBUILD marker target has no binding: " + tableId.value()));
+        DdlId ddlId = DdlId.of(record.marker().ddlOperationId());
+        boolean committedOld = binding.spaceId().equals(record.spaceId())
+                && binding.path().equals(oldPath);
+        boolean committedNew = binding.spaceId().value() == record.secondaryObjectId()
+                && binding.path().equals(shadowPath);
+        if (committedOld) {
+            // 2、旧 DD 证明交换未提交；删除只针对 marker exact shadow，绝不触碰仍被引用的旧文件。
+            if (record.phase() == DdlLogPhase.DICTIONARY_COMMITTED) {
+                throw new DictionaryRecoveryException(
+                        "REBUILD marker says dictionary committed but DD retains old binding");
+            }
+            if (Files.exists(shadowPath)) {
+                delete(shadowPath, "rolled-back ALTER shadow tablespace");
+            }
+            repository.ddlLog().transition(
+                    ddlId, record.phase(), DdlLogPhase.ROLLED_BACK);
+            // ALTER 在 DD 提交前建立了本地 publication barrier；旧 DD 获胜后必须显式恢复旧 aggregate 准入。
+            cache.restoreTableAfterDdlRollback(
+                    table, DictionaryVersion.of(record.marker().dictionaryVersion()));
+            return;
+        }
+        // 3、新 DD 与 PREPARED 不可同时成立；它表示 durable phase history 丢失，不能猜测前滚。
+        if (!committedNew || record.phase() == DdlLogPhase.PREPARED) {
+            throw new DictionaryRecoveryException(
+                    "REBUILD marker/DD binding identity cannot be reconciled: table="
+                            + tableId.value());
+        }
+        if (record.phase() == DdlLogPhase.ENGINE_DONE) {
+            repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.ENGINE_DONE, DdlLogPhase.DICTIONARY_COMMITTED);
+        }
+        DdlLogPhase current = repository.ddlLog().find(ddlId).orElseThrow().phase();
+        if (current == DdlLogPhase.DICTIONARY_COMMITTED) {
+            // 4、cache 只发布 committed DD；旧 path 的删除晚于全部 ACTIVE SDI reconcile。
+            cache.publishTable(table);
+            repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.DICTIONARY_COMMITTED, DdlLogPhase.COMMITTED);
+        }
+        // oldPath 尚未被 discovery 打开，统一 orphan cleanup 会在所有 marker/SDI 收敛后安全删除。
     }
 
     /**
@@ -227,7 +298,7 @@ public final class DictionaryDdlRecoveryService {
                 repository.ddlLog().transition(DdlId.of(record.marker().ddlOperationId()), DdlLogPhase.DICTIONARY_COMMITTED, DdlLogPhase.ENGINE_DONE);
             DictionaryIdAllocation ids = control.reserve(new DictionaryIdRequest(0,0,0,0,0,1));
             try (DictionaryTransaction tx = repository.begin(DictionaryVersion.of(ids.dictionaryVersion()))) {
-                tx.updateTable(new TableDefinition(table.id(), table.schemaId(), table.name(), DictionaryVersion.of(ids.dictionaryVersion()), TableState.DISCARDED, table.columns(), table.indexes(), table.storageBinding())); tx.commit();
+                tx.updateTable(new TableDefinition(table.id(), table.schemaId(), table.name(), DictionaryVersion.of(ids.dictionaryVersion()), TableState.DISCARDED, table.columns(), table.indexes(), table.storageBinding(), table.options())); tx.commit();
             }
             cache.invalidateTable(table.id(), DictionaryVersion.of(ids.dictionaryVersion()));
             repository.ddlLog().transition(DdlId.of(record.marker().ddlOperationId()), DdlLogPhase.ENGINE_DONE, DdlLogPhase.COMMITTED);
@@ -266,8 +337,14 @@ public final class DictionaryDdlRecoveryService {
         repository.ddlLog().transition(DdlId.of(record.marker().ddlOperationId()), DdlLogPhase.DICTIONARY_COMMITTED, DdlLogPhase.ENGINE_DONE);
         DictionaryIdAllocation ids = control.reserve(new DictionaryIdRequest(0,0,0,0,0,1));
         DictionaryVersion version = DictionaryVersion.of(ids.dictionaryVersion());
-        try (DictionaryTransaction tx = repository.begin(version)) { tx.updateTable(new TableDefinition(table.id(), table.schemaId(), table.name(), version, TableState.ACTIVE, table.columns(), table.indexes(), table.storageBinding())); tx.commit(); }
-        cache.invalidateTable(table.id(), version);
+        TableDefinition active = new TableDefinition(
+                table.id(), table.schemaId(), table.name(), version, TableState.ACTIVE,
+                table.columns(), table.indexes(), table.storageBinding(), table.options());
+        try (DictionaryTransaction tx = repository.begin(version)) {
+            tx.updateTable(active);
+            tx.commit();
+        }
+        cache.publishTable(active);
         // 4、发布恢复结果并释放恢复专用资源，以稳定返回或领域异常完成收口。
         repository.ddlLog().transition(DdlId.of(record.marker().ddlOperationId()), DdlLogPhase.ENGINE_DONE, DdlLogPhase.COMMITTED);
     }
@@ -350,6 +427,8 @@ public final class DictionaryDdlRecoveryService {
                 }
             }
             repository.ddlLog().transition(ddlId, record.phase(), DdlLogPhase.ROLLED_BACK);
+            cache.restoreTableAfterDdlRollback(
+                    table, DictionaryVersion.of(record.marker().dictionaryVersion()));
             log.info("rolled back CREATE INDEX during recovery: table={} index={} ddlId={}",
                     tableId.value(), record.secondaryObjectId(), ddlId.value());
             return;
@@ -486,6 +565,8 @@ public final class DictionaryDdlRecoveryService {
             }
             repository.ddlLog().transition(
                     ddlId, DdlLogPhase.PREPARED, DdlLogPhase.ROLLED_BACK);
+            cache.restoreTableAfterDdlRollback(
+                    table, DictionaryVersion.of(record.marker().dictionaryVersion()));
             log.info("rolled back DROP INDEX during recovery: table={} index={} ddlId={}",
                     tableId.value(), record.secondaryObjectId(), ddlId.value());
             return;
@@ -750,7 +831,8 @@ public final class DictionaryDdlRecoveryService {
         DictionaryIdAllocation ids = control.reserve(new DictionaryIdRequest(0, 0, 0, 0, 0, 1));
         DictionaryVersion version = DictionaryVersion.of(ids.dictionaryVersion());
         TableDefinition dropped = new TableDefinition(pending.id(), pending.schemaId(), pending.name(), version,
-                TableState.DROPPED, pending.columns(), pending.indexes(), pending.storageBinding());
+                TableState.DROPPED, pending.columns(), pending.indexes(), pending.storageBinding(),
+                pending.options());
         try (DictionaryTransaction transaction = repository.begin(version)) {
             transaction.updateTable(dropped);
             transaction.commit();

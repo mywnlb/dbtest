@@ -14,6 +14,13 @@ import cn.zhangyis.db.sql.binder.bound.BoundUpdate;
 import cn.zhangyis.db.sql.binder.bound.BoundDelete;
 import cn.zhangyis.db.sql.binder.bound.BoundSecondaryRangeSelect;
 import cn.zhangyis.db.sql.binder.bound.SelectLockMode;
+import cn.zhangyis.db.sql.binder.bound.BoundRangeSelect;
+import cn.zhangyis.db.sql.binder.bound.BoundRangeUpdate;
+import cn.zhangyis.db.sql.binder.bound.BoundRangeDelete;
+import cn.zhangyis.db.sql.binder.bound.BoundIndexRange;
+import cn.zhangyis.db.sql.binder.bound.BoundRangeEndpoint;
+import cn.zhangyis.db.sql.binder.bound.BoundRowPredicate;
+import cn.zhangyis.db.sql.binder.bound.BoundRowPredicateOperator;
 import cn.zhangyis.db.sql.executor.SqlRow;
 import cn.zhangyis.db.sql.executor.SqlValue;
 import cn.zhangyis.db.sql.executor.storage.*;
@@ -68,6 +75,36 @@ class DefaultSqlStorageGatewayTest {
                     new SqlValue.IntegerValue(BigInteger.ONE)), row.values());
             gateway.commit(read, new SqlCommitRequest(SqlDurabilityMode.BACKGROUND_FLUSH,
                     Duration.ofSeconds(1)));
+        }
+    }
+
+    /**
+     * Opaque gateway XA 能力必须保持真实 Transaction 隔离，并完成 write identity、phase one、
+     * durable prepared commit 与 terminal handle 拒绝。
+     */
+    @Test
+    void preparesAndCommitsWrittenOpaqueXaHandle() {
+        try (DatabaseEngine database = openDatabase()) {
+            TableDefinition table = createTable(database);
+            DefaultSqlStorageGateway gateway = new DefaultSqlStorageGateway(database.storage(),
+                    new DictionaryStorageMetadataMapper(), Duration.ofSeconds(2));
+            SqlTransactionHandle handle = gateway.begin(new SqlTransactionRequest(
+                    SqlIsolationLevel.REPEATABLE_READ, false, false));
+            gateway.insert(handle, new BoundClusteredInsert(table, List.of(
+                            new SqlValue.IntegerValue(BigInteger.valueOf(91)),
+                            new SqlValue.StringValue("xa@example.test"),
+                            new SqlValue.StringValue("prepared"))),
+                    SqlStatementDeadline.after(Duration.ofSeconds(2)));
+
+            SqlXaTransactionIdentity identity = gateway.xaIdentity(handle);
+            assertTrue(identity.hasWrites());
+            assertEquals(identity.transactionId(),
+                    gateway.prepareXa(handle, Duration.ofSeconds(2)).transactionId());
+            SqlXaCompletionOutcome completed =
+                    gateway.commitPreparedXa(handle, Duration.ofSeconds(2));
+            assertTrue(completed.committed());
+            assertTrue(completed.transactionNumber() > 0);
+            assertThrows(SqlTransactionStateException.class, () -> gateway.rollback(handle));
         }
     }
 
@@ -181,6 +218,198 @@ class DefaultSqlStorageGatewayTest {
                     SqlStatementDeadline.after(Duration.ofSeconds(5))).size());
             assertTrue(gateway.commit(locking, new SqlCommitRequest(
                     SqlDurabilityMode.BACKGROUND_FLUSH, Duration.ofSeconds(1))).releasedLockCount() >= 3);
+        }
+    }
+
+    /**
+     * comparison range 必须走真实分页/current-read；范围 UPDATE 先物化 identity 后再修改
+     * access key，确保不会因新 key 再次进入扫描而发生 Halloween，范围 DELETE 同样一次性收口。
+     */
+    @Test
+    void executesComparisonFullScanAndRangeMutationsWithoutHalloween() {
+        try (DatabaseEngine database = openDatabase()) {
+            TableDefinition table = createRangeTable(database);
+            DefaultSqlStorageGateway gateway = new DefaultSqlStorageGateway(database.storage(),
+                    new DictionaryStorageMetadataMapper(), Duration.ofSeconds(3));
+            for (int id = 1; id <= 3; id++) {
+                SqlTransactionHandle insert = gateway.begin(new SqlTransactionRequest(
+                        SqlIsolationLevel.REPEATABLE_READ, false, false));
+                gateway.insert(insert, new BoundClusteredInsert(table, List.of(
+                                new SqlValue.IntegerValue(BigInteger.valueOf(id)),
+                                new SqlValue.StringValue("m" + id + "@example.test"),
+                                new SqlValue.StringValue("body-" + id))),
+                        SqlStatementDeadline.after(Duration.ofSeconds(5)));
+                gateway.commit(insert, new SqlCommitRequest(
+                        SqlDurabilityMode.FLUSH_ON_COMMIT, Duration.ofSeconds(2)));
+            }
+            IndexDefinition email = table.indexes().stream()
+                    .filter(index -> !index.clustered()).findFirst().orElseThrow();
+            BoundIndexRange emailRange = new BoundIndexRange(
+                    java.util.Optional.of(new BoundRangeEndpoint(
+                            List.of(new SqlValue.StringValue("a")), true)),
+                    java.util.Optional.of(new BoundRangeEndpoint(
+                            List.of(new SqlValue.StringValue("z")), false)));
+            List<BoundRowPredicate> emailPredicates = List.of(
+                    new BoundRowPredicate(1, BoundRowPredicateOperator.GREATER_THAN_OR_EQUAL,
+                            new SqlValue.StringValue("a")),
+                    new BoundRowPredicate(1, BoundRowPredicateOperator.LESS_THAN,
+                            new SqlValue.StringValue("z")));
+
+            SqlTransactionHandle update = gateway.begin(new SqlTransactionRequest(
+                    SqlIsolationLevel.REPEATABLE_READ, false, false));
+            SqlWriteOutcome changed = gateway.updateRange(update, new BoundRangeUpdate(
+                            table, List.of(1), List.of(new SqlValue.StringValue("zz@example.test")),
+                            email.id().value(), emailRange, emailPredicates, false),
+                    SqlStatementDeadline.after(Duration.ofSeconds(10)));
+            assertEquals(3, changed.affectedRows(),
+                    "每个初始 identity 只能修改一次，不能因索引 key 变化重复进入扫描");
+            gateway.commit(update, new SqlCommitRequest(
+                    SqlDurabilityMode.FLUSH_ON_COMMIT, Duration.ofSeconds(3)));
+
+            SqlTransactionHandle fullScan = gateway.begin(new SqlTransactionRequest(
+                    SqlIsolationLevel.READ_COMMITTED, true, true));
+            BoundRangeSelect scan = new BoundRangeSelect(table, List.of(0),
+                    table.primaryIndex().id().value(), BoundIndexRange.unbounded(),
+                    List.of(new BoundRowPredicate(1, BoundRowPredicateOperator.EQUAL,
+                            new SqlValue.StringValue("ZZ@example.test"))),
+                    SelectLockMode.CONSISTENT, false);
+            assertEquals(List.of(BigInteger.ONE, BigInteger.TWO, BigInteger.valueOf(3)),
+                    gateway.selectRange(fullScan, scan, SqlStatementDeadline.after(Duration.ofSeconds(5)))
+                            .stream()
+                            .map(row -> assertInstanceOf(
+                                    SqlValue.IntegerValue.class, row.values().getFirst()).value())
+                            .toList());
+            gateway.commit(fullScan, new SqlCommitRequest(
+                    SqlDurabilityMode.BACKGROUND_FLUSH, Duration.ofSeconds(1)));
+
+            BoundIndexRange idRange = new BoundIndexRange(
+                    java.util.Optional.of(new BoundRangeEndpoint(
+                            List.of(new SqlValue.IntegerValue(BigInteger.TWO)), true)),
+                    java.util.Optional.of(new BoundRangeEndpoint(
+                            List.of(new SqlValue.IntegerValue(BigInteger.valueOf(3))), true)));
+            List<BoundRowPredicate> idPredicates = List.of(
+                    new BoundRowPredicate(0, BoundRowPredicateOperator.GREATER_THAN_OR_EQUAL,
+                            new SqlValue.IntegerValue(BigInteger.TWO)),
+                    new BoundRowPredicate(0, BoundRowPredicateOperator.LESS_THAN_OR_EQUAL,
+                            new SqlValue.IntegerValue(BigInteger.valueOf(3))));
+            SqlTransactionHandle delete = gateway.begin(new SqlTransactionRequest(
+                    SqlIsolationLevel.REPEATABLE_READ, false, false));
+            assertEquals(2, gateway.deleteRange(delete, new BoundRangeDelete(
+                            table, table.primaryIndex().id().value(), idRange, idPredicates, false),
+                    SqlStatementDeadline.after(Duration.ofSeconds(10))).affectedRows());
+            gateway.commit(delete, new SqlCommitRequest(
+                    SqlDurabilityMode.FLUSH_ON_COMMIT, Duration.ofSeconds(3)));
+
+            SqlTransactionHandle verify = gateway.begin(new SqlTransactionRequest(
+                    SqlIsolationLevel.READ_COMMITTED, true, true));
+            assertEquals(1, gateway.selectRange(verify, scan,
+                    SqlStatementDeadline.after(Duration.ofSeconds(5))).size());
+            gateway.commit(verify, new SqlCommitRequest(
+                    SqlDurabilityMode.BACKGROUND_FLUSH, Duration.ofSeconds(1)));
+        }
+    }
+
+    /**
+     * RU 不创建 ReadView：另一 ACTIVE 事务的最新未标删版本立即可见；当前 delete-mark 也立即使该行消失。
+     * 聚簇与唯一二级访问都必须回到同一当前版本语义。
+     */
+    @Test
+    void readUncommittedSeesLatestUncommittedVersionAndCurrentDeleteMark() {
+        try (DatabaseEngine database = openDatabase()) {
+            TableDefinition table = createTable(database);
+            DefaultSqlStorageGateway gateway = new DefaultSqlStorageGateway(database.storage(),
+                    new DictionaryStorageMetadataMapper(), Duration.ofSeconds(3));
+            SqlTransactionHandle writer = gateway.begin(new SqlTransactionRequest(
+                    SqlIsolationLevel.REPEATABLE_READ, false, false));
+            gateway.insert(writer, new BoundClusteredInsert(table, List.of(
+                            new SqlValue.IntegerValue(BigInteger.ONE),
+                            new SqlValue.StringValue("dirty@example.test"),
+                            new SqlValue.StringValue("uncommitted"))),
+                    SqlStatementDeadline.after(Duration.ofSeconds(5)));
+
+            SqlTransactionHandle ru = gateway.begin(new SqlTransactionRequest(
+                    SqlIsolationLevel.READ_UNCOMMITTED, true, true));
+            BoundPointSelect primary = new BoundPointSelect(table, List.of(2),
+                    table.primaryIndex().id().value(), PointAccessKind.CLUSTERED_PRIMARY,
+                    List.of(new SqlValue.IntegerValue(BigInteger.ONE)));
+            assertEquals(new SqlValue.StringValue("uncommitted"),
+                    gateway.selectPoint(ru, primary,
+                            SqlStatementDeadline.after(Duration.ofSeconds(5)))
+                            .orElseThrow().values().getFirst());
+            IndexDefinition email = table.indexes().stream()
+                    .filter(index -> !index.clustered()).findFirst().orElseThrow();
+            BoundPointSelect secondary = new BoundPointSelect(table, List.of(0),
+                    email.id().value(), PointAccessKind.UNIQUE_SECONDARY,
+                    List.of(new SqlValue.StringValue("DIRTY@example.test")));
+            assertEquals(new SqlValue.IntegerValue(BigInteger.ONE),
+                    gateway.selectPoint(ru, secondary,
+                            SqlStatementDeadline.after(Duration.ofSeconds(5)))
+                            .orElseThrow().values().getFirst());
+
+            gateway.delete(writer, new BoundDelete(table,
+                            List.of(new SqlValue.IntegerValue(BigInteger.ONE))),
+                    SqlStatementDeadline.after(Duration.ofSeconds(5)));
+            assertTrue(gateway.selectPoint(ru, primary,
+                    SqlStatementDeadline.after(Duration.ofSeconds(5))).isEmpty());
+            assertTrue(gateway.selectPoint(ru, secondary,
+                    SqlStatementDeadline.after(Duration.ofSeconds(5))).isEmpty());
+
+            gateway.rollback(writer);
+            gateway.commit(ru, new SqlCommitRequest(
+                    SqlDurabilityMode.BACKGROUND_FLUSH, Duration.ofSeconds(1)));
+        }
+    }
+
+    /**
+     * opaque 保存点必须撤销更晚 undo、保留目标供重复 ROLLBACK TO，并在 RELEASE 后拒绝复用旧能力。
+     */
+    @Test
+    void rollsBackAndReusesOpaqueSqlSavepoint() {
+        try (DatabaseEngine database = openDatabase()) {
+            TableDefinition table = createTable(database);
+            DefaultSqlStorageGateway gateway = new DefaultSqlStorageGateway(database.storage(),
+                    new DictionaryStorageMetadataMapper(), Duration.ofSeconds(3));
+            SqlTransactionHandle transaction = gateway.begin(new SqlTransactionRequest(
+                    SqlIsolationLevel.REPEATABLE_READ, false, false));
+            gateway.insert(transaction, new BoundClusteredInsert(table, List.of(
+                            new SqlValue.IntegerValue(BigInteger.ONE),
+                            new SqlValue.StringValue("first@example.test"),
+                            new SqlValue.StringValue("first"))),
+                    SqlStatementDeadline.after(Duration.ofSeconds(5)));
+            SqlStatementDeadline savepointDeadline =
+                    SqlStatementDeadline.after(Duration.ofSeconds(10));
+            SqlSavepointHandle savepoint =
+                    gateway.createSavepoint(transaction, savepointDeadline);
+            gateway.insert(transaction, new BoundClusteredInsert(table, List.of(
+                            new SqlValue.IntegerValue(BigInteger.TWO),
+                            new SqlValue.StringValue("second@example.test"),
+                            new SqlValue.StringValue("second"))),
+                    SqlStatementDeadline.after(Duration.ofSeconds(5)));
+
+            savepoint = gateway.rollbackToSavepoint(
+                    transaction, savepoint, savepointDeadline);
+            savepoint = gateway.rollbackToSavepoint(
+                    transaction, savepoint, savepointDeadline);
+            gateway.releaseSavepoint(transaction, savepoint, savepointDeadline);
+            SqlSavepointHandle released = savepoint;
+            assertThrows(cn.zhangyis.db.common.exception.DatabaseValidationException.class,
+                    () -> gateway.releaseSavepoint(
+                            transaction, released, savepointDeadline));
+            gateway.commit(transaction, new SqlCommitRequest(
+                    SqlDurabilityMode.FLUSH_ON_COMMIT, Duration.ofSeconds(3)));
+
+            SqlTransactionHandle verify = gateway.begin(new SqlTransactionRequest(
+                    SqlIsolationLevel.READ_COMMITTED, true, true));
+            assertTrue(gateway.selectPoint(verify, new BoundPointSelect(table, List.of(0),
+                            table.primaryIndex().id().value(), PointAccessKind.CLUSTERED_PRIMARY,
+                            List.of(new SqlValue.IntegerValue(BigInteger.ONE))),
+                    SqlStatementDeadline.after(Duration.ofSeconds(5))).isPresent());
+            assertTrue(gateway.selectPoint(verify, new BoundPointSelect(table, List.of(0),
+                            table.primaryIndex().id().value(), PointAccessKind.CLUSTERED_PRIMARY,
+                            List.of(new SqlValue.IntegerValue(BigInteger.TWO))),
+                    SqlStatementDeadline.after(Duration.ofSeconds(5))).isEmpty());
+            gateway.commit(verify, new SqlCommitRequest(
+                    SqlDurabilityMode.BACKGROUND_FLUSH, Duration.ofSeconds(1)));
         }
     }
 

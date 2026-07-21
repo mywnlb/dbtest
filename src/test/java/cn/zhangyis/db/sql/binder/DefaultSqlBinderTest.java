@@ -11,6 +11,10 @@ import cn.zhangyis.db.sql.binder.bound.PointAccessKind;
 import cn.zhangyis.db.sql.binder.bound.SelectLockMode;
 import cn.zhangyis.db.sql.binder.bound.BoundCreateIndex;
 import cn.zhangyis.db.sql.binder.bound.BoundDropIndex;
+import cn.zhangyis.db.sql.binder.bound.BoundRangeDelete;
+import cn.zhangyis.db.sql.binder.bound.BoundRangeSelect;
+import cn.zhangyis.db.sql.binder.bound.BoundRangeUpdate;
+import cn.zhangyis.db.sql.binder.bound.BoundRowPredicateOperator;
 import cn.zhangyis.db.dd.domain.IndexOrder;
 import cn.zhangyis.db.sql.parser.ast.CreateIndexStatementNode;
 import cn.zhangyis.db.sql.parser.ast.DropIndexStatementNode;
@@ -119,6 +123,86 @@ class DefaultSqlBinderTest {
         }
     }
 
+    /**
+     * Binder 应选择最长连续复合前缀，并把 DESC part 的 SQL 下界翻转为物理上界；
+     * 所有谓词仍保留为 residual，防止索引边界近似造成错误命中。
+     */
+    @Test
+    void bindsCompositeComparisonRangeAndResidualPredicates() {
+        try (BinderTestFixture fixture = new BinderTestFixture(directory);
+             TransactionMetadataScope transaction = new TransactionMetadataScope(fixture.dictionary,
+                     MdlOwnerId.of(208));
+             StatementBindingScope statement = transaction.beginStatement(Duration.ofSeconds(1))) {
+            BoundRangeSelect bound = assertInstanceOf(BoundRangeSelect.class, binder.bind(
+                    parser.parse("""
+                            SELECT id, tenant FROM orders
+                            WHERE status='open' AND tenant>=2 AND tenant<9
+                            """),
+                    context(statement, Optional.of(ObjectName.of("app")))));
+
+            assertEquals(6, bound.accessIndexId());
+            assertEquals(List.of(new SqlValue.StringValue("open"),
+                            new SqlValue.IntegerValue(BigInteger.valueOf(9))),
+                    bound.indexRange().lower().orElseThrow().keyValues());
+            assertFalse(bound.indexRange().lower().orElseThrow().inclusive());
+            assertEquals(List.of(new SqlValue.StringValue("open"),
+                            new SqlValue.IntegerValue(BigInteger.valueOf(2))),
+                    bound.indexRange().upper().orElseThrow().keyValues());
+            assertTrue(bound.indexRange().upper().orElseThrow().inclusive());
+            assertEquals(3, bound.predicates().size());
+            assertEquals(BoundRowPredicateOperator.GREATER_THAN_OR_EQUAL,
+                    bound.predicates().get(1).operator());
+        }
+    }
+
+    /** 无首列可用索引时回退聚簇 full scan；数值矛盾范围直接发布 empty plan，不访问 storage。 */
+    @Test
+    void bindsClusteredFullScanAndDetectsEmptyIntersection() {
+        try (BinderTestFixture fixture = new BinderTestFixture(directory);
+             TransactionMetadataScope transaction = new TransactionMetadataScope(fixture.dictionary,
+                     MdlOwnerId.of(209))) {
+            try (StatementBindingScope statement = transaction.beginStatement(Duration.ofSeconds(1))) {
+                BoundRangeSelect fullScan = assertInstanceOf(BoundRangeSelect.class, binder.bind(
+                        parser.parse("SELECT id FROM orders WHERE tenant>2"),
+                        context(statement, Optional.of(ObjectName.of("app")))));
+                assertEquals(3, fullScan.accessIndexId());
+                assertTrue(fullScan.indexRange().lower().isEmpty());
+                assertTrue(fullScan.indexRange().upper().isEmpty());
+                assertFalse(fullScan.empty());
+            }
+            try (StatementBindingScope statement = transaction.beginStatement(Duration.ofSeconds(1))) {
+                BoundRangeSelect empty = assertInstanceOf(BoundRangeSelect.class, binder.bind(
+                        parser.parse("SELECT id FROM orders WHERE id>10 AND id<=10"),
+                        context(statement, Optional.of(ObjectName.of("app")))));
+                assertTrue(empty.empty());
+            }
+        }
+    }
+
+    /** 非 point UPDATE/DELETE 应冻结为 FOR_UPDATE range plan，赋值仍禁止触碰聚簇 key。 */
+    @Test
+    void bindsRangeUpdateAndDeleteWithoutLosingPointCompatibility() {
+        try (BinderTestFixture fixture = new BinderTestFixture(directory);
+             TransactionMetadataScope transaction = new TransactionMetadataScope(fixture.dictionary,
+                     MdlOwnerId.of(210))) {
+            try (StatementBindingScope statement = transaction.beginStatement(Duration.ofSeconds(1))) {
+                BoundRangeUpdate update = assertInstanceOf(BoundRangeUpdate.class, binder.bind(
+                        parser.parse("UPDATE orders SET note='archived' WHERE status='old' AND tenant>=2"),
+                        context(statement, Optional.of(ObjectName.of("app")))));
+                assertEquals(List.of(2), update.assignmentOrdinals());
+                assertEquals(6, update.accessIndexId());
+            }
+            try (StatementBindingScope statement = transaction.beginStatement(Duration.ofSeconds(1))) {
+                BoundRangeDelete delete = assertInstanceOf(BoundRangeDelete.class, binder.bind(
+                        parser.parse("DELETE FROM orders WHERE tenant BETWEEN 2 AND 8"),
+                        context(statement, Optional.of(ObjectName.of("app")))));
+                assertEquals(3, delete.accessIndexId());
+                assertTrue(delete.indexRange().lower().isEmpty());
+                assertTrue(delete.indexRange().upper().isEmpty());
+            }
+        }
+    }
+
     /** 点 UPDATE/DELETE 只接受完整聚簇主键；赋值按 ordinal、主键按 index part 顺序冻结。 */
     @Test
     void bindsPrimaryPointUpdateAndDelete() {
@@ -153,15 +237,16 @@ class DefaultSqlBinderTest {
                      MdlOwnerId.of(206))) {
             assertBindFails(transaction, "UPDATE orders SET id=8 WHERE id=7 AND tenant=2");
             assertBindFails(transaction, "UPDATE orders SET note='a', NOTE='b' WHERE id=7 AND tenant=2");
-            assertBindFails(transaction, "UPDATE orders SET note='a' WHERE id=7");
-            assertBindFails(transaction, "UPDATE orders SET note='a' WHERE id=7 AND tenant=2 AND note='old'");
-            assertBindFails(transaction, "UPDATE orders SET note='a' WHERE note='old'");
+            assertDoesNotThrow(() -> bind(transaction, "UPDATE orders SET note='a' WHERE id=7"));
+            assertDoesNotThrow(() -> bind(transaction,
+                    "UPDATE orders SET note='a' WHERE id=7 AND tenant=2 AND note='old'"));
+            assertDoesNotThrow(() -> bind(transaction, "UPDATE orders SET note='a' WHERE note='old'"));
             assertBindFails(transaction, "UPDATE orders SET note='a' WHERE id=7 AND id=8 AND tenant=2");
-            assertBindFails(transaction, "DELETE FROM orders WHERE id=7");
-            assertBindFails(transaction, "DELETE FROM orders WHERE note='old'");
+            assertDoesNotThrow(() -> bind(transaction, "DELETE FROM orders WHERE id=7"));
+            assertDoesNotThrow(() -> bind(transaction, "DELETE FROM orders WHERE note='old'"));
             assertBindFails(transaction, "DELETE FROM prefix_key WHERE code='x'");
             assertBindFails(transaction, "DELETE FROM lob_key WHERE body='x'");
-            assertTrue(fixture.locks.snapshot().granted().isEmpty());
+            assertFalse(fixture.locks.snapshot().granted().isEmpty());
         }
     }
 
@@ -171,15 +256,16 @@ class DefaultSqlBinderTest {
         try (BinderTestFixture fixture = new BinderTestFixture(directory);
              TransactionMetadataScope transaction = new TransactionMetadataScope(fixture.dictionary,
                      MdlOwnerId.of(202))) {
-            assertBindFails(transaction, "SELECT * FROM orders WHERE id=1");
-            assertBindFails(transaction, "SELECT * FROM orders WHERE id=1 AND tenant=2 AND note='x'");
-            assertBindFails(transaction, "SELECT * FROM orders WHERE note='x' FOR UPDATE");
-            assertBindFails(transaction, "SELECT * FROM orders WHERE status='x' AND id=1");
+            assertDoesNotThrow(() -> bind(transaction, "SELECT * FROM orders WHERE id=1"));
+            assertDoesNotThrow(() -> bind(transaction,
+                    "SELECT * FROM orders WHERE id=1 AND tenant=2 AND note='x'"));
+            assertDoesNotThrow(() -> bind(transaction, "SELECT * FROM orders WHERE note='x' FOR UPDATE"));
+            assertDoesNotThrow(() -> bind(transaction, "SELECT * FROM orders WHERE status='x' AND id=1"));
             assertBindFails(transaction, "INSERT INTO orders (id, tenant) VALUES (1, 2)");
             assertBindFails(transaction, "SELECT * FROM prefix_key WHERE code='x'");
             assertBindFails(transaction, "SELECT * FROM lob_key WHERE body='x'");
             assertBindFails(transaction, "SELECT * FROM unbound WHERE id=1");
-            assertTrue(fixture.locks.snapshot().granted().isEmpty());
+            assertFalse(fixture.locks.snapshot().granted().isEmpty());
         }
     }
 
@@ -242,6 +328,12 @@ class DefaultSqlBinderTest {
         try (StatementBindingScope statement = transaction.beginStatement(Duration.ofSeconds(1))) {
             assertThrows(SqlBindingException.class, () -> binder.bind(parser.parse(sql),
                     context(statement, Optional.of(ObjectName.of("app")))));
+        }
+    }
+
+    private void bind(TransactionMetadataScope transaction, String sql) {
+        try (StatementBindingScope statement = transaction.beginStatement(Duration.ofSeconds(1))) {
+            binder.bind(parser.parse(sql), context(statement, Optional.of(ObjectName.of("app"))));
         }
     }
 

@@ -10,6 +10,13 @@ import cn.zhangyis.db.sql.parser.ast.SelectLockingClause;
 import cn.zhangyis.db.sql.parser.ast.CreateIndexStatementNode;
 import cn.zhangyis.db.sql.parser.ast.DropIndexStatementNode;
 import cn.zhangyis.db.sql.parser.ast.IndexKeyOrderNode;
+import cn.zhangyis.db.sql.parser.ast.BetweenPredicateNode;
+import cn.zhangyis.db.sql.parser.ast.SavepointStatementNode;
+import cn.zhangyis.db.sql.parser.ast.ComparisonOperator;
+import cn.zhangyis.db.sql.parser.ast.ComparisonPredicateNode;
+import cn.zhangyis.db.sql.parser.ast.XaStatementNode;
+import cn.zhangyis.db.sql.parser.ast.AlterTableStatementNode;
+import cn.zhangyis.db.sql.parser.ast.AlterTablespaceStatementNode;
 import cn.zhangyis.db.sql.parser.exception.SqlSyntaxException;
 import org.junit.jupiter.api.Test;
 import java.util.List;
@@ -48,6 +55,56 @@ class DefaultSqlParserTest {
         assertFalse(assertInstanceOf(SetAutocommitNode.class,
                 parser.parse("SET autocommit = 0")).enabled());
         assertThrows(SqlSyntaxException.class, () -> parser.parse("SET autocommit = true"));
+    }
+
+    /** 命名保存点三种命令必须保留名称，并接受 MySQL 的 ROLLBACK TO 可选 SAVEPOINT 关键字。 */
+    @Test
+    void parsesNamedSavepointLifecycle() {
+        SavepointStatementNode create = assertInstanceOf(SavepointStatementNode.class,
+                parser.parse("SAVEPOINT BeforeBatch"));
+        assertEquals(SavepointStatementNode.Kind.CREATE, create.kind());
+        assertEquals("BeforeBatch", create.name().value());
+
+        assertEquals(SavepointStatementNode.Kind.ROLLBACK_TO,
+                assertInstanceOf(SavepointStatementNode.class,
+                        parser.parse("ROLLBACK TO SAVEPOINT beforebatch")).kind());
+        assertEquals("beforebatch", assertInstanceOf(SavepointStatementNode.class,
+                parser.parse("ROLLBACK TO beforebatch")).name().value());
+        assertEquals(SavepointStatementNode.Kind.RELEASE,
+                assertInstanceOf(SavepointStatementNode.class,
+                        parser.parse("RELEASE SAVEPOINT beforebatch;")).kind());
+    }
+
+    /**
+     * XA grammar 必须保留字节 XID、signed format id 与命令专属选项，并严格拒绝非法尾部。
+     */
+    @Test
+    void parsesCompleteXaGrammarAndOptions() {
+        XaStatementNode start = assertInstanceOf(XaStatementNode.class,
+                parser.parse("XA BEGIN X'0102', 'branch', -7 JOIN"));
+        assertEquals(XaStatementNode.Kind.START, start.kind());
+        assertEquals(XaStatementNode.StartMode.JOIN, start.startMode());
+        assertArrayEquals(new byte[]{1, 2}, start.xid().orElseThrow().gtrid());
+        assertEquals(-7, start.xid().orElseThrow().formatId());
+
+        XaStatementNode end = assertInstanceOf(XaStatementNode.class,
+                parser.parse("XA END 'global' SUSPEND FOR MIGRATE"));
+        assertEquals(XaStatementNode.EndMode.FOR_MIGRATE, end.endMode());
+        assertEquals(XaStatementNode.Kind.PREPARE,
+                assertInstanceOf(XaStatementNode.class,
+                        parser.parse("XA PREPARE 'global'")).kind());
+        assertTrue(assertInstanceOf(XaStatementNode.class,
+                parser.parse("XA COMMIT 'global' ONE PHASE")).onePhase());
+        assertEquals(XaStatementNode.Kind.ROLLBACK,
+                assertInstanceOf(XaStatementNode.class,
+                        parser.parse("XA ROLLBACK 'global'")).kind());
+        assertTrue(assertInstanceOf(XaStatementNode.class,
+                parser.parse("XA RECOVER CONVERT XID")).convertXid());
+
+        assertThrows(SqlSyntaxException.class,
+                () -> parser.parse("XA PREPARE 'global' JOIN"));
+        assertThrows(SqlSyntaxException.class,
+                () -> parser.parse("XA COMMIT 'global', '', 2147483648"));
     }
 
     /**
@@ -102,6 +159,44 @@ class DefaultSqlParserTest {
         assertEquals(drop.indexName().value(), alter.indexName().value());
     }
 
+    /**
+     * 通用 ALTER 必须保留多 action 顺序、列位置/default/type 及 rename/options；DISCARD/IMPORT
+     * 使用独立 AST，不能与结构 action 混为普通列表。
+     */
+    @Test
+    void parsesOrderedBlockingAlterAndTablespaceLifecycle() {
+        AlterTableStatementNode alter = assertInstanceOf(
+                AlterTableStatementNode.class,
+                parser.parse("""
+                        ALTER TABLE app.orders
+                          DEFAULT CHARACTER SET 45 COLLATE 255,
+                          ADD COLUMN status VARCHAR(32) NOT NULL DEFAULT 'new' FIRST,
+                          ADD INDEX idx_status (status DESC),
+                          COMMENT='orders v2',
+                          RENAME TO archive.orders_v2
+                        """));
+
+        assertEquals(5, alter.actions().size());
+        assertInstanceOf(AlterTableStatementNode.DefaultCharset.class, alter.actions().get(0));
+        AlterTableStatementNode.AddColumn add = assertInstanceOf(
+                AlterTableStatementNode.AddColumn.class, alter.actions().get(1));
+        assertEquals(AlterTableStatementNode.PositionKind.FIRST, add.position().kind());
+        assertFalse(add.type().nullable());
+        assertEquals(32, add.type().length());
+        assertInstanceOf(AlterTableStatementNode.AddIndex.class, alter.actions().get(2));
+        assertInstanceOf(AlterTableStatementNode.Comment.class, alter.actions().get(3));
+        assertInstanceOf(AlterTableStatementNode.Rename.class, alter.actions().get(4));
+
+        AlterTablespaceStatementNode discard = assertInstanceOf(
+                AlterTablespaceStatementNode.class,
+                parser.parse("ALTER TABLE orders DISCARD TABLESPACE"));
+        assertEquals(AlterTablespaceStatementNode.Action.DISCARD, discard.action());
+        AlterTablespaceStatementNode imported = assertInstanceOf(
+                AlterTablespaceStatementNode.class,
+                parser.parse("ALTER TABLE orders IMPORT TABLESPACE"));
+        assertEquals(AlterTablespaceStatementNode.Action.IMPORT, imported.action());
+    }
+
     /** locking clause 是 SELECT 的尾部语义，不得被当作普通标识符或 WHERE 谓词吞掉。 */
     @Test
     void parsesSelectLockingClausesAndKeepsConsistentReadDefault() {
@@ -119,21 +214,62 @@ class DefaultSqlParserTest {
     }
 
     /**
+     * 比较与 BETWEEN 必须保留开闭边界语义；BETWEEN 内部的 AND 由谓词自身消费，
+     * 外层 AND 仍继续形成同一 conjunction，不能被错误截断。
+     */
+    @Test
+    void parsesComparisonAndBetweenPredicatesAcrossReadAndWriteStatements() {
+        SelectStatementNode select = assertInstanceOf(SelectStatementNode.class,
+                parser.parse("""
+                        SELECT id FROM orders
+                        WHERE tenant = 7 AND created_at >= '2026-01-01'
+                          AND created_at < '2027-01-01' AND score BETWEEN 60 AND 100
+                        FOR SHARE
+                        """));
+
+        ComparisonPredicateNode lower = assertInstanceOf(
+                ComparisonPredicateNode.class, select.predicates().get(1));
+        ComparisonPredicateNode upper = assertInstanceOf(
+                ComparisonPredicateNode.class, select.predicates().get(2));
+        BetweenPredicateNode between = assertInstanceOf(
+                BetweenPredicateNode.class, select.predicates().get(3));
+        assertEquals(ComparisonOperator.GREATER_THAN_OR_EQUAL, lower.operator());
+        assertEquals(ComparisonOperator.LESS_THAN, upper.operator());
+        assertEquals("score", between.column().value());
+        assertEquals(SelectLockingClause.FOR_SHARE, select.lockingClause());
+
+        UpdateStatementNode update = assertInstanceOf(UpdateStatementNode.class,
+                parser.parse("UPDATE orders SET status='old' WHERE id>10 AND id<=20"));
+        assertEquals(ComparisonOperator.GREATER_THAN,
+                assertInstanceOf(ComparisonPredicateNode.class, update.predicates().getFirst()).operator());
+        assertEquals(ComparisonOperator.LESS_THAN_OR_EQUAL,
+                assertInstanceOf(ComparisonPredicateNode.class, update.predicates().getLast()).operator());
+
+        DeleteStatementNode delete = assertInstanceOf(DeleteStatementNode.class,
+                parser.parse("DELETE FROM orders WHERE created_at BETWEEN '2020-01-01' AND '2020-12-31'"));
+        assertInstanceOf(BetweenPredicateNode.class, delete.predicates().getFirst());
+    }
+
+    /**
      * 验证 {@code rejectsUnsupportedShapesAndBrokenFraming} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
      */
     @Test
     void rejectsUnsupportedShapesAndBrokenFraming() {
         String[] invalid = {
                 "", "INSERT INTO t VALUES (1)", "INSERT INTO t(id) VALUES (1),(2)",
-                "SELECT * FROM t", "SELECT * FROM t WHERE id > 1", "SELECT * FROM t WHERE id=1 OR x=2",
+                "SELECT * FROM t", "SELECT * FROM t WHERE id <> 1", "SELECT * FROM t WHERE id=1 OR x=2",
                 "SELECT * FROM t WHERE id=1; SELECT 1", "INSERT INTO t(id) VALUES (X'ABC')",
                 "INSERT INTO t(id) VALUES (B'012')", "SELECT * FROM `t WHERE id=1", "BEGIN garbage",
                 "SELECT * FROM t WHERE id=1 FOR", "SELECT * FROM t WHERE id=1 FOR DELETE",
                 "SELECT * FROM t WHERE id=1 FOR SHARE FOR UPDATE"
-                , "CREATE INDEX idx ON t (id(4))", "ALTER TABLE t ADD COLUMN c INT",
+                , "CREATE INDEX idx ON t (id(4))", "ALTER TABLE t ADD COLUMN",
                 "CREATE FULLTEXT INDEX ft ON t (body)", "CREATE INDEX idx ON t ()",
                 "DROP INDEX IF EXISTS idx ON t", "DROP INDEX idx t",
-                "ALTER TABLE t DROP PRIMARY KEY", "ALTER TABLE t DROP INDEX idx, DROP INDEX idx2"
+                "ALTER TABLE t DROP PRIMARY KEY", "ALTER TABLE t CONVERT TO CHARACTER SET 45",
+                "SELECT * FROM t WHERE id <", "SELECT * FROM t WHERE id BETWEEN 1",
+                "SELECT * FROM t WHERE id BETWEEN 1 OR 2", "SELECT * FROM t WHERE id ! 1"
+                , "SAVEPOINT", "ROLLBACK TO", "ROLLBACK TO SAVEPOINT",
+                "RELEASE beforebatch", "RELEASE SAVEPOINT"
         };
         for (String sql : invalid) {
             assertThrows(SqlSyntaxException.class, () -> parser.parse(sql), sql);

@@ -6,6 +6,7 @@ import cn.zhangyis.db.sql.binder.bound.BoundPointSelect;
 import cn.zhangyis.db.sql.binder.bound.BoundSecondaryRangeSelect;
 import cn.zhangyis.db.sql.binder.bound.BoundUpdate;
 import cn.zhangyis.db.sql.binder.bound.BoundDelete;
+import cn.zhangyis.db.sql.binder.bound.SelectLockMode;
 import cn.zhangyis.db.sql.executor.SqlRow;
 import cn.zhangyis.db.sql.executor.storage.*;
 import org.junit.jupiter.api.Test;
@@ -70,6 +71,38 @@ class SessionTransactionPolicyTest {
         }
     }
 
+    /**
+     * 命名映射必须支持同名替换、只释放目标以及 ROLLBACK TO 删除更晚名称但保留目标。
+     */
+    @Test
+    void managesNamedSavepointMapWithoutLeakingStorageHandles() {
+        try (SessionTestDictionary dictionary = new SessionTestDictionary(directory)) {
+            RecordingGateway gateway = new RecordingGateway();
+            SessionTransactionPolicy policy = new SessionTransactionPolicy(options(false), gateway,
+                    dictionary.service, MdlOwnerId.of(3));
+            SqlStatementDeadline deadline = SqlStatementDeadline.after(Duration.ofSeconds(2));
+
+            policy.createSavepoint("A", deadline);
+            policy.createSavepoint("B", deadline);
+            policy.releaseSavepoint("A", deadline);
+            policy.rollbackToSavepoint("b", deadline);
+            policy.createSavepoint("B", deadline);
+            policy.createSavepoint("C", deadline);
+            policy.rollbackToSavepoint("B", deadline);
+            assertThrows(cn.zhangyis.db.session.exception.SessionStateException.class,
+                    () -> policy.releaseSavepoint("C", deadline),
+                    "ROLLBACK TO 必须删除目标之后的名称");
+            policy.rollbackToSavepoint("b", deadline);
+            policy.close();
+
+            assertEquals(List.of(
+                    "begin:RW", "savepoint", "savepoint", "release-savepoint",
+                    "rollback-to-savepoint", "savepoint", "release-savepoint",
+                    "savepoint", "rollback-to-savepoint", "rollback-to-savepoint", "rollback"),
+                    gateway.events);
+        }
+    }
+
     private static SessionOptions options(boolean autocommit) {
         return new SessionOptions(Optional.of("app"), autocommit, SqlIsolationLevel.REPEATABLE_READ,
                 SqlDurabilityMode.FLUSH_ON_COMMIT, java.time.ZoneId.of("UTC"), Duration.ofSeconds(2),
@@ -78,9 +111,26 @@ class SessionTransactionPolicyTest {
 
     static class RecordingGateway implements SqlStorageGateway {
         final List<String> events = new ArrayList<>();
+        final List<SqlTransactionRequest> requests = new ArrayList<>();
+        SelectLockMode lastRangeLockMode;
         int next;
         @Override public SqlTransactionHandle begin(SqlTransactionRequest request) {
+            requests.add(request);
             events.add("begin:" + (request.readOnly() ? "RO" : "RW")); return new Handle(++next);
+        }
+        @Override public SqlSavepointHandle createSavepoint(
+                SqlTransactionHandle transaction, SqlStatementDeadline deadline) {
+            events.add("savepoint"); return new Savepoint(++next);
+        }
+        @Override public SqlSavepointHandle rollbackToSavepoint(
+                SqlTransactionHandle transaction, SqlSavepointHandle savepoint,
+                SqlStatementDeadline deadline) {
+            events.add("rollback-to-savepoint"); return savepoint;
+        }
+        @Override public void releaseSavepoint(
+                SqlTransactionHandle transaction, SqlSavepointHandle savepoint,
+                SqlStatementDeadline deadline) {
+            events.add("release-savepoint");
         }
         @Override public SqlWriteOutcome insert(SqlTransactionHandle transaction, BoundClusteredInsert statement,
                                                 SqlStatementDeadline deadline) {
@@ -94,7 +144,14 @@ class SessionTransactionPolicyTest {
         @Override public List<SqlRow> selectRange(SqlTransactionHandle transaction,
                                                  BoundSecondaryRangeSelect statement,
                                                  SqlStatementDeadline deadline) {
+            lastRangeLockMode = statement.lockMode();
             events.add("range"); return List.of();
+        }
+        @Override public List<SqlRow> selectRange(SqlTransactionHandle transaction,
+                                                 cn.zhangyis.db.sql.binder.bound.BoundRangeSelect statement,
+                                                 SqlStatementDeadline deadline) {
+            lastRangeLockMode = statement.lockMode();
+            events.add("comparison-range"); return List.of();
         }
         @Override public SqlWriteOutcome update(SqlTransactionHandle transaction, BoundUpdate statement,
                                                 SqlStatementDeadline deadline) {
@@ -104,6 +161,18 @@ class SessionTransactionPolicyTest {
                                                 SqlStatementDeadline deadline) {
             events.add("delete"); return new SqlWriteOutcome(1, false);
         }
+        @Override public SqlWriteOutcome updateRange(
+                SqlTransactionHandle transaction,
+                cn.zhangyis.db.sql.binder.bound.BoundRangeUpdate statement,
+                SqlStatementDeadline deadline) {
+            events.add("range-update"); return new SqlWriteOutcome(0, false);
+        }
+        @Override public SqlWriteOutcome deleteRange(
+                SqlTransactionHandle transaction,
+                cn.zhangyis.db.sql.binder.bound.BoundRangeDelete statement,
+                SqlStatementDeadline deadline) {
+            events.add("range-delete"); return new SqlWriteOutcome(0, false);
+        }
         @Override public SqlCommitOutcome commit(SqlTransactionHandle transaction, SqlCommitRequest request) {
             events.add("commit"); return new SqlCommitOutcome(0, true, 0);
         }
@@ -111,5 +180,6 @@ class SessionTransactionPolicyTest {
             events.add("rollback"); return new SqlRollbackOutcome(0, 0);
         }
         record Handle(int id) implements SqlTransactionHandle { }
+        record Savepoint(int id) implements SqlSavepointHandle { }
     }
 }

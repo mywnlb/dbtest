@@ -135,15 +135,20 @@ class UndoContextTest {
     }
 
     /**
-     * 验证 {@code releaseSavepointRemovesNestedRange} 对应的事务、MVCC 与锁行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
+     * 验证释放旧保存点只撤销该 runtime handle，不会误删随后创建的替代边界。
+     *
+     * <p>命名 SAVEPOINT 同名替换必须先创建新边界，再释放旧边界；若底层按区间删除，替代边界会被一并
+     * 清除，Session 名称表将持有失效 capability。两个边界随后都能独立释放，证明 owner stack 没有泄漏。</p>
      */
-    @Test void releaseSavepointRemovesNestedRange() {
+    @Test void releaseSavepointKeepsNestedBoundaries() {
         Transaction txn = new Transaction(TransactionOptions.defaults(), 1L);
         UndoContext context = freshInsert();
         txn.setUndoContext(context);
         TransactionSavepoint first = context.createSavepoint(txn);
-        context.createSavepoint(txn);
+        TransactionSavepoint nested = context.createSavepoint(txn);
         context.releaseSavepoint(first);
+        assertEquals(1, context.savepointCount());
+        context.releaseSavepoint(nested);
         assertEquals(0, context.savepointCount());
     }
 

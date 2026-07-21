@@ -563,7 +563,7 @@ public final class StorageEngine {
         this.purgeDmlRowGuards = new PurgeDmlRowGuardManager();
         this.tableDdlStorageService = new TableDdlStorageService(miniTransactionManager, diskSpaceManager,
                 indexPageAccess, pool, store, flushService, accessController, config.pageSize(),
-                btreeService, btreeRootSnapshots);
+                btreeService, btreeRootSnapshots, lobStorage);
         this.lockObservationService = new DefaultLockObservationService();
         // 3、在中间分支复核阶段性结果；满足条件后，调用 binder、executor、字典或 storage 稳定接口完成领域动作，并维持领域不变量。
         this.lockManager = new LockManager(lockObservationService);

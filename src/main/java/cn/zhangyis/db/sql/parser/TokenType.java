@@ -14,9 +14,16 @@ package cn.zhangyis.db.sql.parser;
  *     <li>{@code LPAREN}：括号结构边界</li>
  *     <li>{@code RPAREN}：括号结构边界</li>
  *     <li>{@code EQUALS}：等值谓词或赋值运算符</li>
+ *     <li>{@code LESS_THAN}/{@code LESS_EQUAL}：严格/闭合上界比较符</li>
+ *     <li>{@code GREATER_THAN}/{@code GREATER_EQUAL}：严格/闭合下界比较符</li>
  *     <li>{@code STAR}：SELECT 全列投影标记</li>
  *     <li>{@code SEMICOLON}：单条语句的可选结束符</li>
  *     <li>{@code EOF}：输入已被完整消费的终止 token</li>
  * </ul>
  */
-enum TokenType { IDENT, STRING, NUMBER, HEX, BIT, COMMA, DOT, LPAREN, RPAREN, EQUALS, STAR, SEMICOLON, EOF }
+enum TokenType {
+    IDENT, STRING, NUMBER, HEX, BIT,
+    COMMA, DOT, LPAREN, RPAREN,
+    EQUALS, LESS_THAN, LESS_EQUAL, GREATER_THAN, GREATER_EQUAL,
+    STAR, SEMICOLON, EOF
+}

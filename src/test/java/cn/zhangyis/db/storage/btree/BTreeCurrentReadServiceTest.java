@@ -507,6 +507,36 @@ class BTreeCurrentReadServiceTest {
     }
 
     /**
+     * SERIALIZABLE range locking read 必须与 RR 一样取得每行 next-key 和 terminal gap，
+     * 不能退化成 RC 的纯 record 锁。
+     */
+    @Test
+    void serializableRangeUsesNextKeyAndTerminalGapLocks() {
+        onPool(ctx -> {
+            ctx.createTablespaceAndRoot();
+            SplitCapableBTreeIndexService btree = ctx.service();
+            BTreeCurrentReadService currentRead = ctx.currentReadService(btree);
+            BTreeIndex index = ctx.clusteredIndex();
+            insertCommitted(ctx, btree, index, smallRow(3));
+            insertCommitted(ctx, btree, index, smallRow(5));
+            TransactionId owner = TransactionId.of(2250);
+
+            assertEquals(List.of(3L, 5L), idsOf(currentRead.lockRange(
+                    index, new BTreeScanRange(kId(2), true, kId(6), true, 20),
+                    request(owner, IsolationLevel.SERIALIZABLE),
+                    BTreeCurrentReadMode.FOR_SHARE)));
+            var granted = ctx.lockManager.snapshot().grantedLocks().stream()
+                    .filter(lock -> lock.owner().equals(owner)).toList();
+            assertEquals(3, granted.size());
+            assertEquals(2, granted.stream()
+                    .filter(lock -> lock.mode() == TransactionLockMode.NEXT_KEY_S).count());
+            assertEquals(1, granted.stream()
+                    .filter(lock -> lock.mode() == TransactionLockMode.GAP_S).count());
+            assertEquals(3, ctx.lockManager.releaseAll(owner));
+        });
+    }
+
+    /**
      * 验证 {@code rangeRelocatesAfterRowsChangeDuringWait} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
      */
     @Test
@@ -572,6 +602,60 @@ class BTreeCurrentReadServiceTest {
                     .noneMatch(lock -> lock.owner().equals(waiter)),
                     "range timeout must release locks granted earlier in the same attempt");
             assertEquals(1, ctx.lockManager.releaseAll(blocker));
+        });
+    }
+
+    /**
+     * 验证同一 range current-read 的多个锁等待共享单一绝对预算：第一行消耗的等待时间必须从第二行扣除，
+     * 第二个冲突锁不得重新获得完整 timeout；失败后本轮已授予的第一行锁也必须被清理。
+     */
+    @Test
+    void rangeLocksShareOneAbsoluteWaitBudget() {
+        onPool(ctx -> {
+            ctx.createTablespaceAndRoot();
+            SplitCapableBTreeIndexService btree = ctx.service();
+            BTreeCurrentReadService currentRead = ctx.currentReadService(btree);
+            BTreeIndex index = ctx.clusteredIndex();
+            BTreeInsertResult three = insertCommitted(ctx, btree, index, smallRow(3));
+            BTreeInsertResult five = insertCommitted(ctx, btree, index, smallRow(5));
+            TransactionId firstBlocker = TransactionId.of(2451);
+            TransactionId secondBlocker = TransactionId.of(2452);
+            TransactionId waiter = TransactionId.of(2453);
+            ctx.lockManager.acquire(firstBlocker, RecordLockKey.from(three.recordRef()),
+                    TransactionLockMode.REC_X, WAIT_TIMEOUT);
+            ctx.lockManager.acquire(secondBlocker, RecordLockKey.from(five.recordRef()),
+                    TransactionLockMode.REC_X, WAIT_TIMEOUT);
+            Duration totalBudget = Duration.ofMillis(600);
+
+            // 1、waiter 先被第一行阻塞，明确消费超过一半的总预算。
+            CompletableFuture<List<BTreeLookupResult>> waitingRange = CompletableFuture.supplyAsync(
+                    () -> currentRead.lockRange(index,
+                            new BTreeScanRange(kId(2), true, kId(6), true, 20),
+                            new BTreeCurrentReadRequest(waiter, IsolationLevel.READ_COMMITTED,
+                                    totalBudget, 2),
+                            BTreeCurrentReadMode.FOR_UPDATE));
+            awaitUntil(() -> hasWaitEdge(ctx.lockManager, waiter, firstBlocker));
+            try {
+                TimeUnit.MILLISECONDS.sleep(350);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError("interrupted while consuming first range-lock budget", interrupted);
+            }
+
+            // 2、释放第一行后 waiter 会取得它并转等第二行，但第二行只能使用不足 250ms 的剩余预算。
+            assertEquals(1, ctx.lockManager.releaseAll(firstBlocker));
+            awaitUntil(() -> hasWaitEdge(ctx.lockManager, waiter, secondBlocker));
+            ExecutionException timeout = assertThrows(ExecutionException.class,
+                    () -> waitingRange.get(400, TimeUnit.MILLISECONDS),
+                    "second row must not receive a fresh 600ms timeout");
+
+            // 3、总预算超时沿用领域异常，并逆序释放本次 range 已取得的第一行锁和 wait queue。
+            assertTrue(timeout.getCause() instanceof LockWaitTimeoutException);
+            assertTrue(ctx.lockManager.snapshot().grantedLocks().stream()
+                    .noneMatch(lock -> lock.owner().equals(waiter)));
+            assertTrue(ctx.lockManager.snapshot().waitEdges().stream()
+                    .noneMatch(edge -> edge.waitingTransactionId().equals(waiter)));
+            assertEquals(1, ctx.lockManager.releaseAll(secondBlocker));
         });
     }
 

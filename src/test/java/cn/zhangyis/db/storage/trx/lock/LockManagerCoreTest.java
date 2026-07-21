@@ -109,6 +109,29 @@ class LockManagerCoreTest {
     }
 
     /**
+     * 保存点回滚只能释放显式白名单锁；普通 record/gap/next-key 即使在边界之后取得也必须留到事务终态。
+     */
+    @Test
+    void savepointRollbackReleasesOnlyEligibleRetentionKinds() {
+        LockManager manager = new LockManager(4, 16);
+        TransactionId owner = TransactionId.of(25);
+        LockSavepoint boundary = manager.createSavepoint();
+        LockHandle regular = manager.acquire(owner, recordKey(31),
+                TransactionLockMode.REC_X, TEST_TIMEOUT);
+        LockHandle eligible = manager.acquire(owner, recordKey(32),
+                TransactionLockMode.REC_X, TEST_TIMEOUT,
+                LockRetentionKind.SAVEPOINT_RELEASEABLE);
+
+        assertEquals(1, manager.rollbackToSavepoint(owner, boundary));
+        assertTrue(manager.snapshot().grantedLocks().stream()
+                .anyMatch(lock -> lock.owner().equals(owner) && lock.key().equals(regular.key())));
+        assertTrue(manager.snapshot().grantedLocks().stream()
+                .noneMatch(lock -> lock.owner().equals(owner) && lock.key().equals(eligible.key())));
+        assertEquals(1, manager.releaseAll(owner),
+                "普通事务锁必须一直保留到 releaseAll");
+    }
+
+    /**
      * 验证 {@code nextKeyExclusiveBlocksBothCoveredRecordAndPrecedingGapInsert} 所描述的并发场景，并断言等待、唤醒、超时与资源释放顺序。
      */
     @Test

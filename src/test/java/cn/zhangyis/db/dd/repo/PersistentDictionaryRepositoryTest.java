@@ -277,8 +277,11 @@ class PersistentDictionaryRepositoryTest {
                     TableState.ACTIVE, removed.columns(), removed.indexes(), removed.storageBinding());
             try (DictionaryTransaction rename = repository.begin(DictionaryVersion.of(5))) {
                 rename.updateTable(illegal);
-                assertThrows(cn.zhangyis.db.dd.exception.DictionaryVersionConflictException.class, rename::commit);
+                rename.commit();
             }
+            assertEquals("renamed", repository.findTable(TableId.of(2))
+                    .orElseThrow().name().canonicalName(),
+                    "阻塞式 ALTER 已允许 ACTIVE table 的 metadata-only rename");
         }
     }
 

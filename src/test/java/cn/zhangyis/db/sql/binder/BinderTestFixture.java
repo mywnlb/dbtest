@@ -57,7 +57,11 @@ final class BinderTestFixture implements AutoCloseable {
                 List.of(new IndexKeyPart(3, IndexOrder.ASC, 0)));
         IndexDefinition status = new IndexDefinition(IndexId.of(5), ObjectName.of("idx_status"), false, false,
                 List.of(new IndexKeyPart(4, IndexOrder.ASC, 0)));
-        return table(2, "orders", columns, List.of(primary, note, status), directory,
+        IndexDefinition statusTenant = new IndexDefinition(
+                IndexId.of(6), ObjectName.of("idx_status_tenant"), false, false,
+                List.of(new IndexKeyPart(4, IndexOrder.ASC, 0),
+                        new IndexKeyPart(2, IndexOrder.DESC, 0)));
+        return table(2, "orders", columns, List.of(primary, note, status, statusTenant), directory,
                 Optional.of(segment(5, 30, 30)));
     }
 

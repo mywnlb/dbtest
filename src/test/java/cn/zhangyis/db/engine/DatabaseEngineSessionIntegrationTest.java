@@ -5,6 +5,8 @@ import cn.zhangyis.db.dd.domain.*;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.SpaceId;
+import cn.zhangyis.db.domain.XaId;
+import cn.zhangyis.db.engine.xa.XaRecoveryMaintenance;
 import cn.zhangyis.db.session.SessionOptions;
 import cn.zhangyis.db.session.SessionState;
 import cn.zhangyis.db.sql.executor.QueryResult;
@@ -17,7 +19,9 @@ import cn.zhangyis.db.storage.engine.EngineConfig;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.math.BigInteger;
 import java.nio.file.Path;
+import java.nio.file.Files;
 import java.time.Duration;
 import java.time.ZoneId;
 import java.util.List;
@@ -71,6 +75,108 @@ class DatabaseEngineSessionIntegrationTest {
                 assertEquals(java.math.BigInteger.valueOf(7),
                         ((cn.zhangyis.db.sql.executor.SqlValue.IntegerValue)
                                 result.rows().getFirst().values().get(1)).value());
+            }
+        }
+    }
+
+    /**
+     * SQL XA 写分支必须经过 durable PREPARED、可被其它 Session RECOVER/COMMIT，并在完成后从 registry 消失。
+     */
+    @Test
+    void sqlXaPrepareRecoverAndCrossSessionCommit() {
+        try (DatabaseEngine database = new DatabaseEngine(config())) {
+            database.open();
+            createTable(database);
+            try (var owner = database.openSession(options(true));
+                 var coordinator = database.openSession(options(true))) {
+                assertInstanceOf(CommandResult.class,
+                        owner.execute("XA START 'global-91', 'docs', 17"));
+                owner.execute("INSERT INTO docs (id, email, body) VALUES "
+                        + "(91, 'xa91@example.test', 'prepared body')");
+                owner.execute("XA END 'global-91', 'docs', 17");
+                CommandResult prepared = assertInstanceOf(CommandResult.class,
+                        owner.execute("XA PREPARE 'global-91', 'docs', 17"));
+                assertFalse(prepared.transactionStatus().transactionActive());
+
+                QueryResult recover = assertInstanceOf(QueryResult.class,
+                        coordinator.execute("XA RECOVER CONVERT XID"));
+                assertEquals(1, recover.rows().size());
+                coordinator.execute("XA COMMIT 'global-91', 'docs', 17");
+                assertTrue(assertInstanceOf(QueryResult.class,
+                        coordinator.execute("XA RECOVER")).rows().isEmpty());
+
+                QueryResult row = assertInstanceOf(QueryResult.class,
+                        coordinator.execute("SELECT id FROM docs WHERE id=91"));
+                assertEquals(1, row.rows().size());
+            }
+        }
+    }
+
+    /**
+     * XA 只读 prepare 使用 READ_ONLY 优化，不创建 registry PREPARED；ONE PHASE 也直接终结活动分支。
+     */
+    @Test
+    void sqlXaReadOnlyAndOnePhaseDoNotLeavePreparedEntries() {
+        try (DatabaseEngine database = new DatabaseEngine(config())) {
+            database.open();
+            createTable(database);
+            try (var session = database.openSession(options(true))) {
+                session.execute("XA START 'read-only'");
+                session.execute("SELECT * FROM docs WHERE id=404");
+                session.execute("XA END 'read-only'");
+                CommandResult readOnly = assertInstanceOf(CommandResult.class,
+                        session.execute("XA PREPARE 'read-only'"));
+                assertFalse(readOnly.transactionStatus().transactionActive());
+                assertTrue(assertInstanceOf(QueryResult.class,
+                        session.execute("XA RECOVER")).rows().isEmpty());
+
+                session.execute("XA START 'one-phase'");
+                session.execute("INSERT INTO docs (id, email, body) VALUES "
+                        + "(92, 'xa92@example.test', 'one phase')");
+                session.execute("XA END 'one-phase'");
+                session.execute("XA COMMIT 'one-phase' ONE PHASE");
+                assertTrue(assertInstanceOf(QueryResult.class,
+                        session.execute("SELECT id FROM docs WHERE id=92")).rows().size() == 1);
+            }
+        }
+    }
+
+    /**
+     * 未决 PREPARED 必须阻止普通 OPEN；离线工具只写 registry 决议，下一次启动由 storage recovery
+     * 完成 prepared commit 并在成功后写 COMPLETED。
+     */
+    @Test
+    void unresolvedPreparedBlocksOpenUntilOfflineDecision() {
+        EngineConfig config = config();
+        DatabaseEngine first = new DatabaseEngine(config);
+        first.open();
+        createTable(first);
+        try (var session = first.openSession(options(true))) {
+            session.execute("XA START 'restart-xa', 'docs', 23");
+            session.execute("INSERT INTO docs (id, email, body) VALUES "
+                    + "(93, 'xa93@example.test', 'restart prepared')");
+            session.execute("XA END 'restart-xa', 'docs', 23");
+            session.execute("XA PREPARE 'restart-xa', 'docs', 23");
+        }
+        first.close();
+
+        DatabaseEngine blocked = new DatabaseEngine(config);
+        assertThrows(cn.zhangyis.db.common.exception.DatabaseRuntimeException.class, blocked::open);
+        assertEquals(DatabaseEngineState.FAILED, blocked.state());
+
+        XaId xid = new XaId(23, "restart-xa".getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                "docs".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        new XaRecoveryMaintenance().decide(
+                directory, Duration.ofSeconds(2), xid, true);
+
+        try (DatabaseEngine recovered = new DatabaseEngine(config)) {
+            recovered.open();
+            try (var reader = recovered.openSession(options(true))) {
+                QueryResult row = assertInstanceOf(QueryResult.class,
+                        reader.execute("SELECT id FROM docs WHERE id=93"));
+                assertEquals(1, row.rows().size());
+                assertTrue(assertInstanceOf(QueryResult.class,
+                        reader.execute("XA RECOVER")).rows().isEmpty());
             }
         }
     }
@@ -166,6 +272,150 @@ class DatabaseEngineSessionIntegrationTest {
                     MdlOwnerId.of(904), QualifiedTableName.of("app", "index_docs"),
                     cn.zhangyis.db.dd.service.TableAccessIntent.READ, Duration.ofSeconds(2))) {
                 assertEquals(1, lease.table().indexes().size());
+            }
+        }
+    }
+
+    /**
+     * 多 action ALTER 必须只建立一个 shadow space，按声明顺序定位新列并复制 live rows/重建索引；
+     * 随后的 metadata-only COMMENT+RENAME 保持新 row format，重启后 DD/SDI/物理 binding 一致。
+     */
+    @Test
+    void sqlBlockingAlterRebuildsRowsOnceAndPersistsMetadataRename() {
+        EngineConfig config = config();
+        try (DatabaseEngine database = new DatabaseEngine(config)) {
+            database.open();
+            createIndexBuildTable(database);
+            try (var session = database.openSession(options(true))) {
+                session.execute("INSERT INTO index_docs (id, category) VALUES (1, 7)");
+                session.execute("INSERT INTO index_docs (id, category) VALUES (2, 8)");
+
+                assertInstanceOf(CommandResult.class, session.execute("""
+                        ALTER TABLE index_docs
+                          DEFAULT CHARACTER SET 1 COLLATE 2,
+                          ADD COLUMN status VARCHAR(16) NOT NULL DEFAULT 'new' AFTER id,
+                          ADD INDEX idx_status (status),
+                          COMMENT='rebuilt'
+                        """));
+                QueryResult rebuilt = assertInstanceOf(QueryResult.class,
+                        session.execute("SELECT status, category FROM index_docs WHERE id=1"));
+                assertEquals("new", assertInstanceOf(
+                        SqlValue.StringValue.class,
+                        rebuilt.rows().getFirst().values().getFirst()).value());
+                assertEquals(java.math.BigInteger.valueOf(7), assertInstanceOf(
+                        SqlValue.IntegerValue.class,
+                        rebuilt.rows().getFirst().values().getLast()).value());
+
+                session.execute(
+                        "ALTER TABLE index_docs COMMENT='renamed', RENAME TO renamed_docs");
+                QueryResult renamed = assertInstanceOf(QueryResult.class,
+                        session.execute("SELECT status FROM renamed_docs WHERE id=2"));
+                assertEquals("new", assertInstanceOf(
+                        SqlValue.StringValue.class,
+                        renamed.rows().getFirst().values().getFirst()).value());
+            }
+            try (var lease = database.dictionary().openTable(
+                    MdlOwnerId.of(905), QualifiedTableName.of("app", "renamed_docs"),
+                    cn.zhangyis.db.dd.service.TableAccessIntent.READ,
+                    Duration.ofSeconds(2))) {
+                assertEquals("renamed", lease.table().options().comment());
+                assertEquals(List.of("id", "status", "category"),
+                        lease.table().columns().stream()
+                                .map(column -> column.name().canonicalName()).toList());
+                assertEquals(List.of("primary", "idx_status"),
+                        lease.table().indexes().stream()
+                                .map(index -> index.name().canonicalName()).toList());
+            }
+        }
+
+        try (DatabaseEngine reopened = new DatabaseEngine(config)) {
+            reopened.open();
+            try (var reader = reopened.openSession(options(true))) {
+                QueryResult result = assertInstanceOf(QueryResult.class,
+                        reader.execute("SELECT category FROM renamed_docs WHERE status='new'"));
+                assertEquals(2, result.rows().size());
+            }
+        }
+    }
+
+    /**
+     * 阻塞 ALTER 遇到旧空间 external TEXT 时必须 hydrate 完整值并在 shadow LOB segment 重分配；
+     * 新聚簇记录不能继续引用已被交换后删除的旧 tablespace。
+     */
+    @Test
+    void sqlBlockingAlterReallocatesExternalLobIntoShadowSpace() {
+        EngineConfig config = config();
+        String body = "跨空间LOB".repeat(180);
+        try (DatabaseEngine database = new DatabaseEngine(config)) {
+            database.open();
+            createTable(database);
+            try (var session = database.openSession(options(true))) {
+                session.execute(
+                        "INSERT INTO docs (id, email, body) VALUES "
+                                + "(81, 'lob-alter@example.test', '"
+                                + body + "')");
+
+                session.execute("""
+                        ALTER TABLE docs
+                          ADD COLUMN status INT NOT NULL DEFAULT 4 AFTER id
+                        """);
+
+                QueryResult result = assertInstanceOf(
+                        QueryResult.class,
+                        session.execute(
+                                "SELECT body, status FROM docs WHERE id=81"));
+                assertEquals(body, assertInstanceOf(
+                        SqlValue.StringValue.class,
+                        result.rows().getFirst().values().getFirst()).value());
+                assertEquals(BigInteger.valueOf(4), assertInstanceOf(
+                        SqlValue.IntegerValue.class,
+                        result.rows().getFirst().values().getLast()).value());
+            }
+        }
+
+        try (DatabaseEngine reopened = new DatabaseEngine(config)) {
+            reopened.open();
+            try (var session = reopened.openSession(options(true))) {
+                QueryResult result = assertInstanceOf(
+                        QueryResult.class,
+                        session.execute(
+                                "SELECT body FROM docs WHERE email='lob-alter@example.test'"));
+                assertEquals(body, assertInstanceOf(
+                        SqlValue.StringValue.class,
+                        result.rows().getFirst().values().getFirst()).value());
+            }
+        }
+    }
+
+    /**
+     * SQL DISCARD/IMPORT 只能使用实例受控 transfer 目录。管理员把 discarded 文件复制并 force 到
+     * incoming 后，IMPORT 校验 page0 identity 并恢复 ACTIVE。
+     */
+    @Test
+    void sqlDiscardAndImportUseControlledTransferDirectories() throws Exception {
+        try (DatabaseEngine database = new DatabaseEngine(config())) {
+            database.open();
+            createIndexBuildTable(database);
+            try (var session = database.openSession(options(true))) {
+                session.execute("ALTER TABLE index_docs DISCARD TABLESPACE");
+                Path discardedDirectory =
+                        directory.resolve("tablespace-transfer").resolve("discarded");
+                Path discarded;
+                try (var files = Files.list(discardedDirectory)) {
+                    discarded = files.findFirst().orElseThrow();
+                }
+                Path incomingDirectory =
+                        directory.resolve("tablespace-transfer").resolve("incoming");
+                Files.createDirectories(incomingDirectory);
+                Files.copy(discarded, incomingDirectory.resolve(discarded.getFileName()));
+
+                session.execute("ALTER TABLE index_docs IMPORT TABLESPACE");
+                try (var lease = database.dictionary().openTable(
+                        MdlOwnerId.of(906), QualifiedTableName.of("app", "index_docs"),
+                        cn.zhangyis.db.dd.service.TableAccessIntent.READ,
+                        Duration.ofSeconds(2))) {
+                    assertEquals(TableState.ACTIVE, lease.table().state());
+                }
             }
         }
     }

@@ -14,6 +14,8 @@ import cn.zhangyis.db.dd.domain.SchemaId;
 import cn.zhangyis.db.dd.domain.TableDefinition;
 import cn.zhangyis.db.dd.domain.TableId;
 import cn.zhangyis.db.dd.domain.TableState;
+import cn.zhangyis.db.dd.domain.TableOptions;
+import cn.zhangyis.db.dd.domain.ColumnDefaultDefinition;
 import cn.zhangyis.db.dd.exception.DictionaryCatalogCorruptionException;
 import cn.zhangyis.db.storage.api.catalog.CatalogBatch;
 import cn.zhangyis.db.storage.api.catalog.CatalogRecord;
@@ -72,6 +74,14 @@ final class DictionaryCatalogCodec {
     private static final int BASELINE_MAGIC = 0x44444231;
     /** 当前 baseline 逻辑格式版本。 */
     private static final int BASELINE_FORMAT_VERSION = 1;
+    /** 新 table payload 的显式 envelope；旧 payload 以原始 long tableId 开头。 */
+    private static final int TABLE_PAYLOAD_MAGIC = 0x44445432;
+    /** table payload 当前格式。 */
+    private static final int TABLE_PAYLOAD_VERSION = 2;
+    /** 新 column payload 的显式 envelope。 */
+    private static final int COLUMN_PAYLOAD_MAGIC = 0x44444332;
+    /** column payload 当前格式。 */
+    private static final int COLUMN_PAYLOAD_VERSION = 2;
 
     /**
      * 把调用方领域值编码为数据字典的稳定表示；编码前校验范围，成功不修改输入对象。
@@ -363,7 +373,7 @@ final class DictionaryCatalogCodec {
         DecodedObjects decoded = decodeObjects(grouped);
         // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
         return Optional.of(new DecodedMutation(DictionaryVersion.of(commitKey.version),
-                decoded.schemas(), decoded.tables()));
+                decoded.schemas(), decoded.tables(), decoded.legacyOptionTables()));
     }
 
     /** 从已经按 entity key 聚合的 payload 分片重建 schema/table 聚合。 */
@@ -426,6 +436,7 @@ final class DictionaryCatalogCodec {
                     "dictionary child references missing table root: " + orphanParents.iterator().next());
         }
         List<TableDefinition> tables = new ArrayList<>();
+        Set<TableId> legacyOptionTables = new HashSet<>();
         for (TableRoot root : roots.values()) {
             List<ColumnDefinition> tableColumns =
                     columns.getOrDefault(root.id.value(), List.of()).stream()
@@ -445,10 +456,25 @@ final class DictionaryCatalogCodec {
                 throw new DictionaryCatalogCorruptionException("table aggregate child count mismatch: "
                         + root.id.value());
             }
+            TableOptions options;
+            if (root.options.isPresent()) {
+                options = root.options.orElseThrow();
+            } else {
+                Optional<SchemaDefinition> schema = schemas.stream().filter(candidate ->
+                        candidate.id().equals(root.schemaId)).findFirst();
+                options = schema.map(value -> new TableOptions(
+                                "", value.defaultCharsetId(), value.defaultCollationId()))
+                        .orElseGet(TableOptions::legacyDefaults);
+                if (schema.isEmpty()) {
+                    // 普通 mutation 往往不重复写 schema；repository 会使用此前已发布 schema 精确迁移。
+                    legacyOptionTables.add(root.id);
+                }
+            }
             tables.add(new TableDefinition(root.id, root.schemaId, root.name, root.version, root.state,
-                    tableColumns, tableIndexes, root.storageBinding));
+                    tableColumns, tableIndexes, root.storageBinding, options));
         }
-        return new DecodedObjects(List.copyOf(schemas), List.copyOf(tables));
+        return new DecodedObjects(
+                List.copyOf(schemas), List.copyOf(tables), Set.copyOf(legacyOptionTables));
     }
 
     private static List<CatalogRecord> fragment(CatalogKey base, byte[] payload) {
@@ -630,11 +656,16 @@ final class DictionaryCatalogCodec {
      */
     private static byte[] encodeTable(TableDefinition table) {
         return write(out -> {
+            out.writeInt(TABLE_PAYLOAD_MAGIC);
+            out.writeInt(TABLE_PAYLOAD_VERSION);
             out.writeLong(table.id().value());
             out.writeLong(table.schemaId().value());
             writeName(out, table.name());
             out.writeLong(table.version().value());
             out.writeByte(tableStateCode(table.state()));
+            writeString(out, table.options().comment());
+            out.writeInt(table.options().defaultCharsetId());
+            out.writeInt(table.options().defaultCollationId());
             out.writeInt(table.columns().size());
             out.writeInt(table.indexes().size());
             out.writeBoolean(table.storageBinding().isPresent());
@@ -670,11 +701,25 @@ final class DictionaryCatalogCodec {
      */
     private static TableRoot decodeTable(byte[] payload) {
         return read(payload, in -> {
+            in.mark(payload.length);
+            int prefix = in.readInt();
+            boolean current = prefix == TABLE_PAYLOAD_MAGIC;
+            if (current) {
+                if (in.readInt() != TABLE_PAYLOAD_VERSION) {
+                    throw new DictionaryCatalogCorruptionException(
+                            "unsupported table payload format");
+                }
+            } else {
+                in.reset();
+            }
             TableId id = TableId.of(in.readLong());
             SchemaId schemaId = SchemaId.of(in.readLong());
             ObjectName name = readName(in);
             DictionaryVersion version = DictionaryVersion.of(in.readLong());
             int stateCode = in.readUnsignedByte();
+            Optional<TableOptions> options = current
+                    ? Optional.of(new TableOptions(readString(in), in.readInt(), in.readInt()))
+                    : Optional.empty();
             int columnCount = in.readInt();
             int indexCount = in.readInt();
             if (columnCount <= 0 || indexCount <= 0) {
@@ -720,7 +765,7 @@ final class DictionaryCatalogCodec {
                         id.value(), spaceId, path, rowFormatVersion, bindings, lobSegment));
             }
             return new TableRoot(id, schemaId, name, version, tableStateFromCode(stateCode),
-                    columnCount, indexCount, binding);
+                    columnCount, indexCount, binding, options);
         });
     }
 
@@ -764,6 +809,8 @@ final class DictionaryCatalogCodec {
      */
     private static byte[] encodeColumn(ColumnDefinition column) {
         return write(out -> {
+            out.writeInt(COLUMN_PAYLOAD_MAGIC);
+            out.writeInt(COLUMN_PAYLOAD_VERSION);
             out.writeLong(column.columnId());
             writeName(out, column.name());
             out.writeInt(column.ordinal());
@@ -779,6 +826,10 @@ final class DictionaryCatalogCodec {
             for (String symbol : type.symbols()) {
                 writeString(out, symbol);
             }
+            out.writeByte(columnDefaultCode(column.defaultDefinition().kind()));
+            if (column.defaultDefinition().constantLiteral().isPresent()) {
+                writeString(out, column.defaultDefinition().constantLiteral().orElseThrow());
+            }
         });
     }
 
@@ -790,6 +841,17 @@ final class DictionaryCatalogCodec {
      */
     private static ColumnDefinition decodeColumn(byte[] payload) {
         return read(payload, in -> {
+            in.mark(payload.length);
+            int prefix = in.readInt();
+            boolean current = prefix == COLUMN_PAYLOAD_MAGIC;
+            if (current) {
+                if (in.readInt() != COLUMN_PAYLOAD_VERSION) {
+                    throw new DictionaryCatalogCorruptionException(
+                            "unsupported column payload format");
+                }
+            } else {
+                in.reset();
+            }
             long id = in.readLong();
             ObjectName name = readName(in);
             int ordinal = in.readInt();
@@ -808,10 +870,31 @@ final class DictionaryCatalogCodec {
             for (int i = 0; i < symbolCount; i++) {
                 symbols.add(readString(in));
             }
-            return new ColumnDefinition(id, name,
-                    new ColumnTypeDefinition(typeId, unsigned, nullable, length, scale, charset, collation, symbols),
-                    ordinal);
+            ColumnTypeDefinition type = new ColumnTypeDefinition(
+                    typeId, unsigned, nullable, length, scale, charset, collation, symbols);
+            ColumnDefaultDefinition defaultDefinition = current
+                    ? readColumnDefault(in) : nullable
+                    ? ColumnDefaultDefinition.implicitNull() : ColumnDefaultDefinition.required();
+            return new ColumnDefinition(id, name, type, ordinal, defaultDefinition);
         });
+    }
+
+    private static int columnDefaultCode(ColumnDefaultDefinition.Kind kind) {
+        return switch (kind) {
+            case REQUIRED -> 1;
+            case IMPLICIT_NULL -> 2;
+            case CONSTANT -> 3;
+        };
+    }
+
+    private static ColumnDefaultDefinition readColumnDefault(DataInputStream in) throws IOException {
+        return switch (in.readUnsignedByte()) {
+            case 1 -> ColumnDefaultDefinition.required();
+            case 2 -> ColumnDefaultDefinition.implicitNull();
+            case 3 -> ColumnDefaultDefinition.constant(readString(in));
+            default -> throw new DictionaryCatalogCorruptionException(
+                    "unknown column default code");
+        };
     }
 
     /**
@@ -980,15 +1063,17 @@ final class DictionaryCatalogCodec {
      * @param tables 参与 {@code 构造} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
      */
     record DecodedMutation(DictionaryVersion version, List<SchemaDefinition> schemas,
-                           List<TableDefinition> tables) {
+                           List<TableDefinition> tables, Set<TableId> legacyOptionTables) {
         DecodedMutation {
             schemas = List.copyOf(schemas);
             tables = List.copyOf(tables);
+            legacyOptionTables = Set.copyOf(legacyOptionTables);
         }
     }
 
     /** schema 与 table 聚合解码的内部结果，供 mutation/baseline 两条批次协议共用。 */
-    private record DecodedObjects(List<SchemaDefinition> schemas, List<TableDefinition> tables) {
+    private record DecodedObjects(List<SchemaDefinition> schemas, List<TableDefinition> tables,
+                                  Set<TableId> legacyOptionTables) {
     }
 
     /** column key ordinal 与 payload 定义的配对，用于排序并拒绝持久 key/payload 身份分裂。 */
@@ -1048,7 +1133,8 @@ final class DictionaryCatalogCodec {
      */
     private record TableRoot(TableId id, SchemaId schemaId, ObjectName name, DictionaryVersion version,
                              TableState state, int columnCount, int indexCount,
-                             Optional<TableStorageBinding> storageBinding) {
+                             Optional<TableStorageBinding> storageBinding,
+                             Optional<TableOptions> options) {
     }
 
     /**

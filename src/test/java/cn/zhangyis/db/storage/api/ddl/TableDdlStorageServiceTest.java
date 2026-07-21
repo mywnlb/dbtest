@@ -462,6 +462,81 @@ class TableDdlStorageServiceTest {
         }
     }
 
+    /**
+     * shadow rebuild 的源扫描必须跨过 256 行批次边界且不重不漏；continuation 使用上一批最后一条
+     * 完整聚簇 physical key，而不是页号或不稳定 RecordRef。
+     */
+    @Test
+    void rebuildsMoreThanOneContinuationBatchExactlyOnce() {
+        StorageEngine engine = new StorageEngine(config());
+        engine.open();
+        Path sourcePath = directory.resolve("rebuild_source_1040.ibd");
+        Path targetPath = directory.resolve("rebuild_target_1041.ibd");
+        try {
+            StorageTableDefinition sourceDefinition =
+                    definition(40, SpaceId.of(1040), sourcePath);
+            TableStorageBinding sourceBinding =
+                    engine.tableDdlStorageService().createTable(
+                            sourceDefinition);
+            var sourceIndex = new BTreeIndexMetadataFactory()
+                    .createTable(sourceDefinition, sourceBinding)
+                    .clusteredIndex();
+            for (long id = 1; id <= 270; id++) {
+                MiniTransaction insert =
+                        engine.miniTransactionManager().begin(
+                                engine.miniTransactionManager().budgetFor(
+                                        RedoBudgetPurpose.CLUSTERED_INSERT,
+                                        BTreeRedoBudgetEstimator.insert(
+                                                sourceIndex.rootLevel())));
+                var inserted = engine.btreeService().insertClustered(
+                        insert, sourceIndex,
+                        new LogicalRecord(
+                                sourceDefinition.schemaVersion(),
+                                List.of(new ColumnValue.IntValue(id)),
+                                false, RecordType.CONVENTIONAL),
+                        TransactionId.of(id), RollPointer.NULL);
+                engine.miniTransactionManager().commit(insert);
+                sourceIndex = inserted.indexAfterInsert();
+            }
+
+            StorageTableDefinition targetDefinition =
+                    new StorageTableDefinition(
+                            sourceDefinition.tableId(),
+                            SpaceId.of(1041), targetPath, 3,
+                            PageNo.of(128), sourceDefinition.columns(),
+                            sourceDefinition.indexes());
+            TableStorageBinding targetBinding =
+                    engine.tableDdlStorageService().rebuildTable(
+                            new StorageTableRebuildRequest(
+                                    sourceDefinition, sourceBinding,
+                                    targetDefinition,
+                                    List.of(StorageColumnRewrite.source(0))),
+                            Duration.ofSeconds(10));
+
+            var targetIndex = new BTreeIndexMetadataFactory()
+                    .createTable(targetDefinition, targetBinding)
+                    .clusteredIndex();
+            MiniTransaction read =
+                    engine.miniTransactionManager().beginReadOnly();
+            List<LogicalRecord> rows = engine.btreeService()
+                    .scanAll(read, targetIndex, 300).stream()
+                    .map(result -> result.record()).toList();
+            engine.miniTransactionManager().commit(read);
+
+            assertEquals(270, rows.size());
+            assertEquals(270, rows.stream()
+                    .map(row -> ((ColumnValue.IntValue)
+                            row.columnValues().getFirst()).value())
+                    .distinct().count());
+            assertEquals(1L, ((ColumnValue.IntValue)
+                    rows.getFirst().columnValues().getFirst()).value());
+            assertEquals(270L, ((ColumnValue.IntValue)
+                    rows.getLast().columnValues().getFirst()).value());
+        } finally {
+            engine.close();
+        }
+    }
+
     private static StorageTableDefinition definition(long tableId, SpaceId spaceId, Path path) {
         return new StorageTableDefinition(tableId, spaceId, path, 2, PageNo.of(128),
                 List.of(new StorageColumnDefinition(1, "id", 0,

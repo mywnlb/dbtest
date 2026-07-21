@@ -13,12 +13,23 @@ final class EngineSqlTransactionHandle implements SqlTransactionHandle {
      * <p>未单独声明 Javadoc 的枚举值语义：</p>
      * <ul>
      *     <li>{@code ACTIVE}：表示“ACTIVE”状态；状态机只允许通过声明的领域分支进入或离开该状态</li>
+     *     <li>{@code PREPARED}：storage phase one 已强持久，普通 SQL 操作必须拒绝</li>
+     *     <li>{@code COMMIT_DECIDED}：registry 已持久选择提交，只允许同方向 phase-two 重试</li>
+     *     <li>{@code ROLLBACK_DECIDED}：registry 已持久选择回滚，只允许同方向 phase-two 重试</li>
      *     <li>{@code COMMITTED}：表示“COMMITTED”状态；状态机只允许通过声明的领域分支进入或离开该状态</li>
      *     <li>{@code ROLLED_BACK}：表示“ROLLEDBACK”状态；状态机只允许通过声明的领域分支进入或离开该状态</li>
      *     <li>{@code FAILED}：表示“FAILED”状态；状态机只允许通过声明的领域分支进入或离开该状态</li>
      * </ul>
      */
-    enum State { ACTIVE, COMMITTED, ROLLED_BACK, FAILED }
+    enum State {
+        ACTIVE,
+        PREPARED,
+        COMMIT_DECIDED,
+        ROLLBACK_DECIDED,
+        COMMITTED,
+        ROLLED_BACK,
+        FAILED
+    }
 
     /** 防止同一不透明 handle 被两个调用线程同时用于 statement/commit/rollback。 */
     final ReentrantLock operationLock = new ReentrantLock(true);

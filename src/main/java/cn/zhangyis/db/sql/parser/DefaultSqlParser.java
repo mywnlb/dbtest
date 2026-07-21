@@ -7,6 +7,7 @@ import cn.zhangyis.db.sql.parser.exception.SqlSyntaxException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Optional;
 
 /** v1 递归下降 parser；实例只持最大输入配置，单次 parse 的 token/cursor 均为局部状态。 */
 public final class DefaultSqlParser {
@@ -88,7 +89,8 @@ public final class DefaultSqlParser {
             // 1、读取输入长度、游标边界与必要标识，在共享或持久副作用前拒绝非法状态。
             StatementNode statement;
             // 2、继续完成范围、身份与候选校验；通过后，按稳定字段或 token 顺序推进游标并调用对应编解码分支，保持处理顺序与资源边界。
-            if (keyword("INSERT")) statement = insert();
+            if (keyword("XA")) statement = xa();
+            else if (keyword("INSERT")) statement = insert();
             else if (keyword("CREATE")) statement = createIndex();
             else if (keyword("DROP")) statement = dropIndex();
             else if (keyword("ALTER")) statement = alterIndex();
@@ -103,9 +105,28 @@ public final class DefaultSqlParser {
             } else if (keyword("COMMIT")) {
                 take(); statement = new TransactionControlNode(TransactionControlNode.Kind.COMMIT);
             } else if (keyword("ROLLBACK")) {
-                take(); statement = new TransactionControlNode(TransactionControlNode.Kind.ROLLBACK);
+                take();
+                if (keyword("TO")) {
+                    take();
+                    if (keyword("SAVEPOINT")) {
+                        take();
+                    }
+                    statement = new SavepointStatementNode(
+                            SavepointStatementNode.Kind.ROLLBACK_TO, identifier());
+                } else {
+                    statement = new TransactionControlNode(TransactionControlNode.Kind.ROLLBACK);
+                }
+            } else if (keyword("SAVEPOINT")) {
+                take();
+                statement = new SavepointStatementNode(
+                        SavepointStatementNode.Kind.CREATE, identifier());
+            } else if (keyword("RELEASE")) {
+                take();
+                requireKeyword("SAVEPOINT");
+                statement = new SavepointStatementNode(
+                        SavepointStatementNode.Kind.RELEASE, identifier());
             } else {
-                throw syntax("expected INSERT, CREATE, DROP, ALTER, UPDATE, DELETE, SELECT, SET, BEGIN, START, COMMIT or ROLLBACK",
+                throw syntax("expected data, DDL, transaction or savepoint statement",
                         current());
             }
             // 3、在中间分支复核阶段性结果；满足条件后，交叉校验聚合计数、类型、校验值和剩余输入，并维持领域不变量。
@@ -113,6 +134,140 @@ public final class DefaultSqlParser {
             require(TokenType.EOF, "end of statement");
             // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
             return statement;
+        }
+
+        /**
+         * 解析 XA START/BEGIN、END、PREPARE、COMMIT、ROLLBACK 与 RECOVER。
+         *
+         * <p>数据流：</p>
+         * <ol>
+         *     <li>消费 XA 与命令关键字，RECOVER 独立解析可选 CONVERT XID。</li>
+         *     <li>其它命令按 `gtrid[, bqual[, formatId]]` 解码 XID，字符串使用 UTF-8、HEX 使用原字节。</li>
+         *     <li>解析命令专属 JOIN/RESUME、SUSPEND/FOR MIGRATE 或 ONE PHASE，拒绝跨命令选项。</li>
+         *     <li>构造已交叉校验 AST；外层统一消费分号与 EOF，任何多余 token 都失败。</li>
+         * </ol>
+         *
+         * @return 完整 XA AST
+         */
+        private XaStatementNode xa() {
+            // 1、RECOVER 不携带单一 XID，CONVERT XID 只改变结果显示请求。
+            requireKeyword("XA");
+            if (keyword("RECOVER")) {
+                take();
+                boolean convert = false;
+                if (keyword("CONVERT")) {
+                    take();
+                    requireKeyword("XID");
+                    convert = true;
+                }
+                return new XaStatementNode(XaStatementNode.Kind.RECOVER, java.util.Optional.empty(),
+                        XaStatementNode.StartMode.NONE, XaStatementNode.EndMode.NONE,
+                        false, convert);
+            }
+
+            XaStatementNode.Kind kind;
+            if (keyword("START") || keyword("BEGIN")) {
+                take();
+                kind = XaStatementNode.Kind.START;
+            } else if (keyword("END")) {
+                take();
+                kind = XaStatementNode.Kind.END;
+            } else if (keyword("PREPARE")) {
+                take();
+                kind = XaStatementNode.Kind.PREPARE;
+            } else if (keyword("COMMIT")) {
+                take();
+                kind = XaStatementNode.Kind.COMMIT;
+            } else if (keyword("ROLLBACK")) {
+                take();
+                kind = XaStatementNode.Kind.ROLLBACK;
+            } else {
+                throw syntax("expected XA START, END, PREPARE, COMMIT, ROLLBACK or RECOVER",
+                        current());
+            }
+
+            // 2、XID 字节及 signed format id 在语法层完成确定性解码。
+            XaIdentifierNode xid = xaIdentifier();
+            XaStatementNode.StartMode startMode = XaStatementNode.StartMode.NONE;
+            XaStatementNode.EndMode endMode = XaStatementNode.EndMode.NONE;
+            boolean onePhase = false;
+
+            // 3、每类命令只接受自己的尾部选项。
+            if (kind == XaStatementNode.Kind.START) {
+                if (keyword("JOIN")) {
+                    take();
+                    startMode = XaStatementNode.StartMode.JOIN;
+                } else if (keyword("RESUME")) {
+                    take();
+                    startMode = XaStatementNode.StartMode.RESUME;
+                }
+            } else if (kind == XaStatementNode.Kind.END && keyword("SUSPEND")) {
+                take();
+                endMode = XaStatementNode.EndMode.SUSPEND;
+                if (keyword("FOR")) {
+                    take();
+                    requireKeyword("MIGRATE");
+                    endMode = XaStatementNode.EndMode.FOR_MIGRATE;
+                }
+            } else if (kind == XaStatementNode.Kind.COMMIT && keyword("ONE")) {
+                take();
+                requireKeyword("PHASE");
+                onePhase = true;
+            }
+
+            // 4、构造器再次交叉校验 kind/option，避免后续分派接受非法组合。
+            return new XaStatementNode(kind, java.util.Optional.of(xid), startMode, endMode,
+                    onePhase, false);
+        }
+
+        /**
+         * 解析 MySQL 风格 XID 三元组。未给 bqual 时为空，未给 formatId 时为 1。
+         */
+        private XaIdentifierNode xaIdentifier() {
+            Token first = current();
+            byte[] gtrid = xaBytes();
+            byte[] bqual = new byte[0];
+            int formatId = 1;
+            if (match(TokenType.COMMA)) {
+                take();
+                bqual = xaBytes();
+                if (match(TokenType.COMMA)) {
+                    take();
+                    Token format = require(TokenType.NUMBER, "signed XA format id");
+                    try {
+                        if (format.text().contains(".") || format.text().contains("e")
+                                || format.text().contains("E")) {
+                            throw new NumberFormatException("non-integral XA format id");
+                        }
+                        formatId = Integer.parseInt(format.text());
+                    } catch (NumberFormatException invalid) {
+                        throw syntax("XA format id must be a signed 32-bit integer", format);
+                    }
+                }
+            }
+            try {
+                return new XaIdentifierNode(formatId, gtrid, bqual, first.position());
+            } catch (DatabaseValidationException invalid) {
+                throw syntax(invalid.getMessage(), first);
+            }
+        }
+
+        /** 把 STRING/HEX XID 组件转换为确定字节序列。 */
+        private byte[] xaBytes() {
+            Token token = current();
+            if (token.type() == TokenType.STRING) {
+                take();
+                return token.text().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            }
+            if (token.type() == TokenType.HEX) {
+                take();
+                try {
+                    return java.util.HexFormat.of().parseHex(token.text());
+                } catch (IllegalArgumentException invalid) {
+                    throw syntax("XA hex literal must contain complete hexadecimal bytes", token);
+                }
+            }
+            throw syntax("expected XA string or hex literal", token);
         }
 
         /**
@@ -174,7 +329,8 @@ public final class DefaultSqlParser {
         }
 
         /**
-         * v1 ALTER 只接受 ADD/DROP INDEX；两种分支分别归一为独立 CREATE/DROP 使用的 AST 类型。
+         * 解析 ALTER TABLE 的索引与表空间生命周期动作；索引分支归一为独立 CREATE/DROP 使用的 AST，
+         * DISCARD/IMPORT 保留专属节点，防止 Session 把文件生命周期动作交给普通 executor。
          *
          * @return 规范化的索引 DDL AST；不支持的 ALTER action 以语法异常拒绝
          */
@@ -182,6 +338,40 @@ public final class DefaultSqlParser {
             requireKeyword("ALTER");
             requireKeyword("TABLE");
             QualifiedNameNode table = qualifiedName();
+            if (keyword("DISCARD")) {
+                take();
+                requireKeyword("TABLESPACE");
+                return new AlterTablespaceStatementNode(
+                        table, AlterTablespaceStatementNode.Action.DISCARD);
+            }
+            if (keyword("IMPORT")) {
+                take();
+                requireKeyword("TABLESPACE");
+                return new AlterTablespaceStatementNode(
+                        table, AlterTablespaceStatementNode.Action.IMPORT);
+            }
+            List<AlterTableStatementNode.Action> actions = new ArrayList<>();
+            actions.add(alterAction());
+            while (match(TokenType.COMMA)) {
+                take();
+                actions.add(alterAction());
+            }
+            // 单索引 action 保持既有 AST/DDL 状态机；多 action 必须作为一次 staged ALTER 原子发布。
+            if (actions.size() == 1 && actions.getFirst() instanceof AlterTableStatementNode.AddIndex add) {
+                return new CreateIndexStatementNode(table, add.name(), add.unique(), add.keyParts());
+            }
+            if (actions.size() == 1 && actions.getFirst() instanceof AlterTableStatementNode.DropIndex drop) {
+                return new DropIndexStatementNode(table, drop.name());
+            }
+            return new AlterTableStatementNode(table, actions);
+        }
+
+        /**
+         * 解析通用 ALTER 的一个 action；调用方消费 action 间逗号，索引 key part 与类型参数内部逗号由本分支消费。
+         *
+         * @return 保留用户顺序的单个 action
+         */
+        private AlterTableStatementNode.Action alterAction() {
             if (keyword("ADD")) {
                 take();
                 boolean unique = false;
@@ -189,16 +379,148 @@ public final class DefaultSqlParser {
                     take();
                     unique = true;
                 }
-                requireKeyword("INDEX");
-                IdentifierNode indexName = identifier();
-                return new CreateIndexStatementNode(table, indexName, unique, indexKeyParts());
+                if (keyword("INDEX")) {
+                    take();
+                    IdentifierNode name = identifier();
+                    return new AlterTableStatementNode.AddIndex(
+                            name, unique, indexKeyParts());
+                }
+                if (unique) {
+                    throw syntax("UNIQUE must be followed by INDEX", current());
+                }
+                if (keyword("COLUMN")) {
+                    take();
+                }
+                IdentifierNode name = identifier();
+                AlterTableStatementNode.ColumnType type = alterColumnType();
+                Optional<LiteralNode> defaultLiteral = Optional.empty();
+                if (keyword("DEFAULT")) {
+                    take();
+                    defaultLiteral = Optional.of(literal());
+                }
+                AlterTableStatementNode.ColumnPosition position =
+                        AlterTableStatementNode.ColumnPosition.last();
+                if (keyword("FIRST")) {
+                    take();
+                    position = new AlterTableStatementNode.ColumnPosition(
+                            AlterTableStatementNode.PositionKind.FIRST, Optional.empty());
+                } else if (keyword("AFTER")) {
+                    take();
+                    position = new AlterTableStatementNode.ColumnPosition(
+                            AlterTableStatementNode.PositionKind.AFTER,
+                            Optional.of(identifier()));
+                }
+                return new AlterTableStatementNode.AddColumn(
+                        name, type, defaultLiteral, position);
             }
             if (keyword("DROP")) {
                 take();
-                requireKeyword("INDEX");
-                return new DropIndexStatementNode(table, identifier());
+                if (keyword("INDEX")) {
+                    take();
+                    return new AlterTableStatementNode.DropIndex(identifier());
+                }
+                if (keyword("COLUMN")) {
+                    take();
+                }
+                return new AlterTableStatementNode.DropColumn(identifier());
             }
-            throw syntax("expected ADD or DROP INDEX after ALTER TABLE", current());
+            if (keyword("RENAME")) {
+                take();
+                if (keyword("TO") || keyword("AS")) {
+                    take();
+                }
+                return new AlterTableStatementNode.Rename(qualifiedName());
+            }
+            if (keyword("COMMENT")) {
+                take();
+                if (match(TokenType.EQUALS)) {
+                    take();
+                }
+                Token comment = require(TokenType.STRING, "string table comment");
+                return new AlterTableStatementNode.Comment(comment.text());
+            }
+            if (keyword("DEFAULT")) {
+                take();
+                requireKeyword("CHARACTER");
+                requireKeyword("SET");
+                if (match(TokenType.EQUALS)) {
+                    take();
+                }
+                int charset = positiveAlterNumber("charset id");
+                requireKeyword("COLLATE");
+                if (match(TokenType.EQUALS)) {
+                    take();
+                }
+                return new AlterTableStatementNode.DefaultCharset(
+                        charset, positiveAlterNumber("collation id"));
+            }
+            if (keyword("CONVERT")) {
+                take();
+                requireKeyword("TO");
+                requireKeyword("CHARACTER");
+                requireKeyword("SET");
+                int charset = positiveAlterNumber("charset id");
+                requireKeyword("COLLATE");
+                return new AlterTableStatementNode.ConvertCharset(
+                        charset, positiveAlterNumber("collation id"));
+            }
+            throw syntax("unsupported ALTER TABLE action", current());
+        }
+
+        /**
+         * 解析 ADD COLUMN 的类型 shape。当前 SQL 切片支持 DD 中除 ENUM/SET 外的类型关键字、
+         * 可选一个或两个数值参数、UNSIGNED 与 NULL/NOT NULL。
+         */
+        private AlterTableStatementNode.ColumnType alterColumnType() {
+            Token type = require(TokenType.IDENT, "column type");
+            int length = 0;
+            int scale = 0;
+            if (match(TokenType.LPAREN)) {
+                take();
+                length = positiveAlterNumber("column length or precision");
+                if (match(TokenType.COMMA)) {
+                    take();
+                    Token scaleToken = require(TokenType.NUMBER, "column scale");
+                    try {
+                        scale = Integer.parseInt(scaleToken.text());
+                    } catch (NumberFormatException overflow) {
+                        throw syntax("column scale exceeds integer range", scaleToken);
+                    }
+                    if (scale < 0) {
+                        throw syntax("column scale must be non-negative", scaleToken);
+                    }
+                }
+                require(TokenType.RPAREN, "')'");
+            }
+            boolean unsigned = false;
+            boolean nullable = true;
+            if (keyword("UNSIGNED")) {
+                take();
+                unsigned = true;
+            }
+            if (keyword("NOT")) {
+                take();
+                requireKeyword("NULL");
+                nullable = false;
+            } else if (keyword("NULL")) {
+                take();
+            }
+            return new AlterTableStatementNode.ColumnType(
+                    type.text(), length, scale, unsigned, nullable);
+        }
+
+        /** 读取 ALTER 中必须为正且可表示为 int 的稳定数值 id/长度。 */
+        private int positiveAlterNumber(String label) {
+            Token number = require(TokenType.NUMBER, label);
+            try {
+                int value = Integer.parseInt(number.text());
+                if (value <= 0) {
+                    throw syntax(label + " must be positive", number);
+                }
+                return value;
+            } catch (NumberFormatException overflow) {
+                throw syntax(label + " exceeds integer range", number);
+            }
         }
 
         /** key part v1 仅允许完整列与可选 ASC/DESC，不把前缀长度或表达式静默吞掉。 */
@@ -264,8 +586,8 @@ public final class DefaultSqlParser {
             requireKeyword("WHERE"); return new DeleteStatementNode(table, predicates());
         }
 
-        private List<EqualityPredicateNode> predicates() {
-            List<EqualityPredicateNode> result = new ArrayList<>(); result.add(predicate());
+        private List<PredicateNode> predicates() {
+            List<PredicateNode> result = new ArrayList<>(); result.add(predicate());
             while (keyword("AND")) { take(); result.add(predicate()); } return List.copyOf(result);
         }
 
@@ -278,7 +600,7 @@ public final class DefaultSqlParser {
             requireKeyword("FROM");
             QualifiedNameNode table = qualifiedName();
             requireKeyword("WHERE");
-            List<EqualityPredicateNode> predicates = new ArrayList<>();
+            List<PredicateNode> predicates = new ArrayList<>();
             predicates.add(predicate());
             while (keyword("AND")) { take(); predicates.add(predicate()); }
             SelectLockingClause lockingClause = SelectLockingClause.NONE;
@@ -297,10 +619,46 @@ public final class DefaultSqlParser {
             return new SelectStatementNode(star, projections, table, predicates, lockingClause);
         }
 
-        private EqualityPredicateNode predicate() {
+        /**
+         * 解析一个列对 literal 的 comparison 或 BETWEEN。
+         *
+         * <p>数据流：</p>
+         * <ol>
+         *     <li>读取左侧列标识符；列解析失败时不消费任何字面量。</li>
+         *     <li>优先识别 BETWEEN，并在节点内部消费其语法专用 AND。</li>
+         *     <li>否则消费一个已支持的二元比较符；未支持操作符在 AST 发布前失败。</li>
+         *     <li>读取右侧 literal 并构造保留开闭边界的不可变谓词。</li>
+         * </ol>
+         *
+         * @return 尚未绑定 DD 类型和索引路径的不可变谓词
+         * @throws SqlSyntaxException 操作符、BETWEEN 边界或字面量缺失时抛出
+         */
+        private PredicateNode predicate() {
+            // 1、列名只表达语法身份；Parser 不在这里访问 DD。
             IdentifierNode column = identifier();
-            require(TokenType.EQUALS, "'='");
-            return new EqualityPredicateNode(column, literal());
+            // 2、BETWEEN 自己拥有中间 AND，外层 conjunction 循环只消费后续 AND。
+            if (keyword("BETWEEN")) {
+                take();
+                LiteralNode lower = literal();
+                requireKeyword("AND");
+                return new BetweenPredicateNode(column, lower, literal());
+            }
+            // 3、操作符 token 决定范围方向和开闭性，等值保留既有 AST 类型。
+            Token operator = current();
+            take();
+            // 4、literal 缺失会抛稳定位置异常，不发布半构造谓词。
+            return switch (operator.type()) {
+                case EQUALS -> new EqualityPredicateNode(column, literal());
+                case LESS_THAN -> new ComparisonPredicateNode(
+                        column, ComparisonOperator.LESS_THAN, literal());
+                case LESS_EQUAL -> new ComparisonPredicateNode(
+                        column, ComparisonOperator.LESS_THAN_OR_EQUAL, literal());
+                case GREATER_THAN -> new ComparisonPredicateNode(
+                        column, ComparisonOperator.GREATER_THAN, literal());
+                case GREATER_EQUAL -> new ComparisonPredicateNode(
+                        column, ComparisonOperator.GREATER_THAN_OR_EQUAL, literal());
+                default -> throw syntax("expected =, <, <=, >, >= or BETWEEN", operator);
+            };
         }
 
         private SetAutocommitNode set() {

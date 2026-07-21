@@ -14,6 +14,8 @@ import cn.zhangyis.db.dd.domain.SchemaDefinition;
 import cn.zhangyis.db.dd.domain.TableDefinition;
 import cn.zhangyis.db.dd.domain.TableId;
 import cn.zhangyis.db.dd.domain.TableState;
+import cn.zhangyis.db.dd.domain.TableOptions;
+import cn.zhangyis.db.dd.domain.ColumnDefaultDefinition;
 import cn.zhangyis.db.dd.exception.DictionaryCatalogCorruptionException;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageNo;
@@ -51,21 +53,45 @@ class DictionaryCatalogCodecTest {
 
     private static final DictionaryVersion VERSION = DictionaryVersion.of(2);
 
-    /** 旧 table payload 在 index binding 后 EOF；其前缀字节保持不变并解码为无 LOB segment。 */
+    /** 新格式使用显式 envelope，但升级 decoder 仍须接受无 envelope 的旧 table payload。 */
     @Test
-    void decodesLegacyTablePayloadAndKeepsOldPrefixBytesStable() {
+    void decodesLegacyTablePayloadBehindExplicitCurrentEnvelope() {
         TableDefinition legacy = table(Optional.empty());
         DictionaryCatalogCodec codec = new DictionaryCatalogCodec();
         List<CatalogRecord> encoded = codec.encode(VERSION, List.of(), List.of(legacy));
         byte[] independentGolden = legacyTablePayload(legacy);
         byte[] newPayload = encoded.getFirst().payload();
 
-        assertArrayEquals(independentGolden, Arrays.copyOf(newPayload, independentGolden.length),
-                "新 codec 只能在旧 table payload 尾部追加能力位与物理行格式版本");
+        assertEquals(0x44445432,
+                ByteBuffer.wrap(newPayload).order(ByteOrder.BIG_ENDIAN).getInt(),
+                "新格式必须显式声明 envelope，不能再靠可歧义的 EOF 猜版本");
         DictionaryCatalogCodec.DecodedMutation decoded = codec.decode(batchWithTablePayload(
                 encoded, independentGolden)).orElseThrow();
 
         assertTrue(decoded.tables().getFirst().storageBinding().orElseThrow().lobSegment().isEmpty());
+    }
+
+    /** v2 table/column payload 必须无损保存 options 与三态 default 语义。 */
+    @Test
+    void roundTripsTableOptionsAndColumnDefaults() {
+        TableDefinition base = table(Optional.empty());
+        List<ColumnDefinition> columns = List.of(
+                new ColumnDefinition(1, ObjectName.of("id"),
+                        base.columns().getFirst().type(), 0, ColumnDefaultDefinition.required()),
+                new ColumnDefinition(2, ObjectName.of("body"),
+                        base.columns().getLast().type(), 1,
+                        ColumnDefaultDefinition.constant("'ready'")));
+        TableDefinition expected = new TableDefinition(
+                base.id(), base.schemaId(), base.name(), base.version(), base.state(),
+                columns, base.indexes(), base.storageBinding(),
+                new TableOptions("订单归档", 45, 255));
+
+        TableDefinition decoded = new DictionaryCatalogCodec().decode(new CatalogBatch(1,
+                new DictionaryCatalogCodec().encode(
+                        VERSION, List.of(), List.of(expected)))).orElseThrow().tables().getFirst();
+
+        assertEquals(expected.options(), decoded.options());
+        assertEquals(expected.columns(), decoded.columns());
     }
 
     /** 新 payload 必须保留完整 LOB segment identity，不能仅持久化一个 capability boolean。 */

@@ -5,10 +5,14 @@ import cn.zhangyis.db.sql.binder.bound.BoundPointSelect;
 import cn.zhangyis.db.sql.binder.bound.BoundUpdate;
 import cn.zhangyis.db.sql.binder.bound.BoundDelete;
 import cn.zhangyis.db.sql.binder.bound.BoundSecondaryRangeSelect;
+import cn.zhangyis.db.sql.binder.bound.BoundRangeSelect;
+import cn.zhangyis.db.sql.binder.bound.BoundRangeUpdate;
+import cn.zhangyis.db.sql.binder.bound.BoundRangeDelete;
 import cn.zhangyis.db.sql.executor.SqlRow;
 
 import java.util.List;
 import java.util.Optional;
+import java.time.Duration;
 
 /** SQL executor 到存储内核的唯一 port；真实 transaction/MTR/record/physical reference 均封装在 adapter 内。 */
 public interface SqlStorageGateway {
@@ -19,6 +23,87 @@ public interface SqlStorageGateway {
      * @return {@code begin} 取得或创建的受控存储资源；成功时不为 {@code null}，调用方必须按其 Guard/lease 契约释放
      */
     SqlTransactionHandle begin(SqlTransactionRequest request);
+
+    /**
+     * 在 registry 写 PREPARING 前读取 opaque branch 的稳定 storage 身份。默认实现明确表示
+     * 当前 gateway 没有 XA 能力，使已有测试替身和其它实现无需伪造 transaction id。
+     *
+     * @param transaction 本 gateway 创建且仍为 ACTIVE 的事务能力
+     * @return 有写分支返回正 transaction id；只读/未写分支返回 0
+     */
+    default SqlXaTransactionIdentity xaIdentity(SqlTransactionHandle transaction) {
+        throw new cn.zhangyis.db.sql.executor.storage.exception.SqlTransactionStateException(
+                "SQL storage gateway does not support XA");
+    }
+
+    /**
+     * 把已写 PREPARING 的活动写分支强持久为 PREPARED。
+     *
+     * @param transaction 本 gateway 创建且仍为 ACTIVE 的写事务能力
+     * @param timeout phase-one redo durability 的正等待上限
+     * @return storage PREPARED durable 结果
+     */
+    default SqlXaPrepareOutcome prepareXa(SqlTransactionHandle transaction, Duration timeout) {
+        throw new cn.zhangyis.db.sql.executor.storage.exception.SqlTransactionStateException(
+                "SQL storage gateway does not support XA");
+    }
+
+    /**
+     * 按已经持久化的提交决议完成 prepared branch；同方向 durability 重试必须幂等。
+     *
+     * @param transaction prepareXa 返回后保留的 opaque PREPARED 能力
+     * @param timeout terminal redo durability 的正等待上限
+     * @return durable commit 与锁收尾结果
+     */
+    default SqlXaCompletionOutcome commitPreparedXa(
+            SqlTransactionHandle transaction, Duration timeout) {
+        throw new cn.zhangyis.db.sql.executor.storage.exception.SqlTransactionStateException(
+                "SQL storage gateway does not support XA");
+    }
+
+    /**
+     * 按已经持久化的回滚决议完成 prepared branch；同方向 durability 重试必须幂等。
+     *
+     * @param transaction prepareXa 返回后保留的 opaque PREPARED 能力
+     * @param timeout terminal redo durability 的正等待上限
+     * @return durable rollback、inverse 与锁收尾结果
+     */
+    default SqlXaCompletionOutcome rollbackPreparedXa(
+            SqlTransactionHandle transaction, Duration timeout) {
+        throw new cn.zhangyis.db.sql.executor.storage.exception.SqlTransactionStateException(
+                "SQL storage gateway does not support XA");
+    }
+
+    /**
+     * 在当前 ACTIVE 事务中创建不透明保存点；实现必须同时捕获 undo 与锁获取边界。
+     *
+     * @param transaction 本 gateway 创建且仍为 ACTIVE 的事务能力
+     * @param deadline 当前 SQL 语句的唯一绝对期限；handle 等待不得越过它
+     * @return 可用于 rollback/release 的事务归属保存点能力
+     */
+    SqlSavepointHandle createSavepoint(SqlTransactionHandle transaction, SqlStatementDeadline deadline);
+
+    /**
+     * 回滚目标保存点之后的修改并保留目标边界。首写前空边界被消费时，实现返回等价的新能力。
+     *
+     * @param transaction 保存点所属 ACTIVE 事务
+     * @param savepoint 由本 gateway 为同一事务创建且尚未释放的能力
+     * @param deadline 当前 SQL 语句的唯一绝对期限
+     * @return 回滚后仍代表目标名称的有效能力；可能与输入对象不同
+     */
+    SqlSavepointHandle rollbackToSavepoint(SqlTransactionHandle transaction,
+                                           SqlSavepointHandle savepoint,
+                                           SqlStatementDeadline deadline);
+
+    /**
+     * 释放单个保存点名称对应的运行期边界，不修改 undo 链或更晚保存点。
+     *
+     * @param transaction 保存点所属 ACTIVE 事务
+     * @param savepoint 由本 gateway 创建且尚未释放的能力
+     * @param deadline 当前 SQL 语句的唯一绝对期限
+     */
+    void releaseSavepoint(SqlTransactionHandle transaction, SqlSavepointHandle savepoint,
+                          SqlStatementDeadline deadline);
 
     /**
      * 执行已绑定的单行聚簇 INSERT。adapter 必须让 handle wait、行锁与下游阶段共同受同一绝对 deadline 限制。
@@ -74,6 +159,25 @@ public interface SqlStorageGateway {
      */
     List<SqlRow> selectRange(SqlTransactionHandle transaction, BoundSecondaryRangeSelect statement,
                              SqlStatementDeadline deadline);
+
+    /**
+     * 执行 comparison/composite/full-scan SELECT。实现必须分页物化完整结果并执行全部 residual，
+     * 容量超限时不得返回 partial rows。
+     */
+    List<SqlRow> selectRange(SqlTransactionHandle transaction, BoundRangeSelect statement,
+                             SqlStatementDeadline deadline);
+
+    /**
+     * 先锁定并物化完整聚簇 identity 集，再执行 point UPDATE，避免扫描 key 被修改导致 Halloween。
+     */
+    SqlWriteOutcome updateRange(SqlTransactionHandle transaction, BoundRangeUpdate statement,
+                                SqlStatementDeadline deadline);
+
+    /**
+     * 先锁定并物化完整聚簇 identity 集，再执行 point DELETE；容量溢出必须早于首笔 mutation。
+     */
+    SqlWriteOutcome deleteRange(SqlTransactionHandle transaction, BoundRangeDelete statement,
+                                SqlStatementDeadline deadline);
 
     /** 提交不透明事务；request 的 timeout 约束 durability 等待，终态结果必须说明是否已持久化。
      *

@@ -52,6 +52,8 @@ final class SqlLexer {
                 case '(' -> tokens.add(single(TokenType.LPAREN));
                 case ')' -> tokens.add(single(TokenType.RPAREN));
                 case '=' -> tokens.add(single(TokenType.EQUALS));
+                case '<' -> tokens.add(lessThan());
+                case '>' -> tokens.add(greaterThan());
                 case '*' -> tokens.add(single(TokenType.STAR));
                 case ';' -> tokens.add(single(TokenType.SEMICOLON));
                 case '`' -> tokens.add(quotedIdentifier());
@@ -76,6 +78,45 @@ final class SqlLexer {
         SourcePosition start = position();
         char ch = take();
         return new Token(type, Character.toString(ch), Character.toString(ch), start);
+    }
+
+    /**
+     * 读取小于或小于等于 token；{@code <>} 不属于当前 slice，必须整体拒绝，
+     * 不能拆成两个可被后续语法误解释的 token。
+     *
+     * @return 保留完整词形与起始位置的比较 token
+     * @throws SqlSyntaxException 遇到尚未支持的 {@code <>} 时抛出
+     */
+    private Token lessThan() {
+        SourcePosition start = position();
+        int begin = offset;
+        take();
+        if (peek(0) == '>') {
+            take();
+            throw syntax("operator '<>' is not supported", start);
+        }
+        TokenType type = peek(0) == '=' ? takeAndReturn(TokenType.LESS_EQUAL) : TokenType.LESS_THAN;
+        String lexeme = sql.substring(begin, offset);
+        return new Token(type, lexeme, lexeme, start);
+    }
+
+    /**
+     * 读取大于或大于等于 token，并把二字符运算符作为一个不可分割词法单元。
+     *
+     * @return 保留完整词形与起始位置的比较 token
+     */
+    private Token greaterThan() {
+        SourcePosition start = position();
+        int begin = offset;
+        take();
+        TokenType type = peek(0) == '=' ? takeAndReturn(TokenType.GREATER_EQUAL) : TokenType.GREATER_THAN;
+        String lexeme = sql.substring(begin, offset);
+        return new Token(type, lexeme, lexeme, start);
+    }
+
+    private TokenType takeAndReturn(TokenType type) {
+        take();
+        return type;
     }
 
     private Token identifier() {

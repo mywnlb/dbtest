@@ -14,6 +14,8 @@ import cn.zhangyis.db.dd.domain.SchemaId;
 import cn.zhangyis.db.dd.domain.TableDefinition;
 import cn.zhangyis.db.dd.domain.TableId;
 import cn.zhangyis.db.dd.domain.TableState;
+import cn.zhangyis.db.dd.domain.TableOptions;
+import cn.zhangyis.db.dd.domain.ColumnDefaultDefinition;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.SegmentId;
@@ -45,11 +47,13 @@ public final class DictionarySdiCodec {
      */
     private static final int MAGIC = 0x44445331;
     /** v2 为 binding 增加独立物理行格式版本；decoder 继续接受 v1。 */
-    private static final int FORMAT_VERSION = 2;
+    private static final int FORMAT_VERSION = 3;
     /**
      * 当前稳定格式版本；编解码与恢复路径共同依赖该值，升级时必须保留旧版本判定。
      */
     private static final int LEGACY_FORMAT_VERSION = 1;
+    /** v2 只有 rowFormatVersion，没有 table/default 扩展。 */
+    private static final int ROW_FORMAT_VERSION = 2;
     /** 单个名称、路径或 ENUM/SET symbol 的 UTF-8 上界。 */
     private static final int MAX_STRING_BYTES = 8 * 1024;
     /** 防止损坏 count 导致无界分配。 */
@@ -98,6 +102,9 @@ public final class DictionarySdiCodec {
             writeName(out, table.name());
             out.writeLong(table.version().value());
             out.writeByte(tableStateCode(table.state()));
+            writeString(out, table.options().comment());
+            out.writeInt(table.options().defaultCharsetId());
+            out.writeInt(table.options().defaultCollationId());
             writeBinding(out, binding);
             out.writeInt(table.columns().size());
             for (ColumnDefinition column : table.columns()) {
@@ -135,7 +142,8 @@ public final class DictionarySdiCodec {
                 throw new DictionarySdiCorruptionException("invalid dictionary SDI payload magic");
             }
             int format = in.readInt();
-            if (format != LEGACY_FORMAT_VERSION && format != FORMAT_VERSION) {
+            if (format != LEGACY_FORMAT_VERSION && format != ROW_FORMAT_VERSION
+                    && format != FORMAT_VERSION) {
                 throw new DictionarySdiCorruptionException("unsupported dictionary SDI payload format: " + format);
             }
 
@@ -148,11 +156,14 @@ public final class DictionarySdiCodec {
             if (state != TableState.ACTIVE) {
                 throw new DictionarySdiCorruptionException("SDI v1 table state must be ACTIVE: " + state);
             }
+            TableOptions options = format == FORMAT_VERSION
+                    ? new TableOptions(readString(in), in.readInt(), in.readInt())
+                    : TableOptions.legacyDefaults();
             TableStorageBinding binding = readBinding(in, tableId, version, format);
             int columnCount = boundedPositiveCount(in.readInt(), MAX_COLUMNS, "column");
             List<ColumnDefinition> columns = new ArrayList<>(columnCount);
             for (int i = 0; i < columnCount; i++) {
-                columns.add(readColumn(in));
+                columns.add(readColumn(in, format));
             }
             int indexCount = boundedPositiveCount(in.readInt(), MAX_INDEXES, "index");
             List<IndexDefinition> indexes = new ArrayList<>(indexCount);
@@ -162,7 +173,7 @@ public final class DictionarySdiCodec {
 
             // 3. TableDefinition 构造器复核 child/binding 集合；EOF 防止未知尾部被静默接受。
             TableDefinition decoded = new TableDefinition(tableId, schemaId, name, version, state,
-                    columns, indexes, Optional.of(binding));
+                    columns, indexes, Optional.of(binding), options);
             if (in.available() != 0) {
                 throw new DictionarySdiCorruptionException("dictionary SDI payload has trailing bytes");
             }
@@ -293,6 +304,10 @@ public final class DictionarySdiCodec {
         for (String symbol : type.symbols()) {
             writeString(out, symbol);
         }
+        out.writeByte(columnDefaultCode(column.defaultDefinition().kind()));
+        if (column.defaultDefinition().constantLiteral().isPresent()) {
+            writeString(out, column.defaultDefinition().constantLiteral().orElseThrow());
+        }
     }
 
     /**
@@ -310,7 +325,7 @@ public final class DictionarySdiCodec {
      * @return {@code readColumn} 形成的不可变定义、计划或元数据快照；成功时不为 {@code null}，内部身份、版本和范围已完成交叉校验
      * @throws IOException 底层文件读写失败时抛出；调用方不得据此发布持久化成功状态
      */
-    private static ColumnDefinition readColumn(DataInputStream in) throws IOException {
+    private static ColumnDefinition readColumn(DataInputStream in, int format) throws IOException {
         // 1、读取输入长度、游标边界与必要标识，在共享或持久副作用前拒绝非法状态。
         long columnId = in.readLong();
         ObjectName name = readName(in);
@@ -330,9 +345,30 @@ public final class DictionarySdiCodec {
             symbols.add(readString(in));
         }
         // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
-        return new ColumnDefinition(columnId, name,
-                new ColumnTypeDefinition(typeId, unsigned, nullable, length, scale, charset, collation, symbols),
-                ordinal);
+        ColumnTypeDefinition type = new ColumnTypeDefinition(
+                typeId, unsigned, nullable, length, scale, charset, collation, symbols);
+        ColumnDefaultDefinition defaultDefinition = format == FORMAT_VERSION
+                ? readColumnDefault(in) : nullable
+                ? ColumnDefaultDefinition.implicitNull() : ColumnDefaultDefinition.required();
+        return new ColumnDefinition(columnId, name, type, ordinal, defaultDefinition);
+    }
+
+    private static int columnDefaultCode(ColumnDefaultDefinition.Kind kind) {
+        return switch (kind) {
+            case REQUIRED -> 1;
+            case IMPLICIT_NULL -> 2;
+            case CONSTANT -> 3;
+        };
+    }
+
+    private static ColumnDefaultDefinition readColumnDefault(DataInputStream in) throws IOException {
+        return switch (in.readUnsignedByte()) {
+            case 1 -> ColumnDefaultDefinition.required();
+            case 2 -> ColumnDefaultDefinition.implicitNull();
+            case 3 -> ColumnDefaultDefinition.constant(readString(in));
+            default -> throw new DictionarySdiCorruptionException(
+                    "unknown SDI column default code");
+        };
     }
 
     /**

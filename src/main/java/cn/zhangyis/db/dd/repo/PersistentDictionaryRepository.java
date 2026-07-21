@@ -9,6 +9,7 @@ import cn.zhangyis.db.dd.domain.SchemaDefinition;
 import cn.zhangyis.db.dd.domain.SchemaId;
 import cn.zhangyis.db.dd.domain.TableDefinition;
 import cn.zhangyis.db.dd.domain.TableId;
+import cn.zhangyis.db.dd.domain.TableOptions;
 import cn.zhangyis.db.dd.exception.DictionaryCatalogCorruptionException;
 import cn.zhangyis.db.dd.exception.DictionaryObjectExistsException;
 import cn.zhangyis.db.dd.exception.DictionaryObjectNotFoundException;
@@ -312,20 +313,52 @@ public final class PersistentDictionaryRepository {
     }
 
     private static void validateTableReplacement(TableDefinition before, TableDefinition after) {
-        if (!before.schemaId().equals(after.schemaId()) || !before.name().equals(after.name())
-                || !before.columns().equals(after.columns())) {
-            throw new DictionaryVersionConflictException(
-                    "table replacement cannot change identity or columns");
+        if (!before.id().equals(after.id())) {
+            throw new DictionaryVersionConflictException("table replacement cannot change table identity");
         }
         boolean lifecycle = before.indexes().equals(after.indexes())
+                && before.schemaId().equals(after.schemaId())
+                && before.name().equals(after.name())
+                && before.columns().equals(after.columns())
+                && before.options().equals(after.options())
                 && before.storageBinding().equals(after.storageBinding())
                 && validLifecycleTransition(before.state(), after.state());
         boolean addSecondaryIndex = exactSecondaryIndexAddition(before, after);
         boolean removeSecondaryIndex = exactSecondaryIndexRemoval(before, after);
-        if (!lifecycle && !addSecondaryIndex && !removeSecondaryIndex) {
+        boolean metadataAlter = exactMetadataAlter(before, after);
+        boolean blockingRebuild = exactBlockingRebuild(before, after);
+        if (!lifecycle && !addSecondaryIndex && !removeSecondaryIndex
+                && !metadataAlter && !blockingRebuild) {
             throw new DictionaryVersionConflictException("invalid table lifecycle transition: "
                     + before.state() + " -> " + after.state());
         }
+    }
+
+    /** COMMENT/default charset/rename 只替换逻辑 metadata，物理 row format 与索引绑定必须逐字保持。 */
+    private static boolean exactMetadataAlter(TableDefinition before, TableDefinition after) {
+        return before.state() == cn.zhangyis.db.dd.domain.TableState.ACTIVE
+                && after.state() == cn.zhangyis.db.dd.domain.TableState.ACTIVE
+                && before.columns().equals(after.columns())
+                && before.indexes().equals(after.indexes())
+                && before.storageBinding().equals(after.storageBinding());
+    }
+
+    /**
+     * 阻塞式结构 ALTER 只能换到全新 space/path，table id 保持，且新 binding 的 row format 必须等于
+     * 新 DD version。物理 segments/root 的完整集合继续由 TableDefinition 构造器交叉校验。
+     */
+    private static boolean exactBlockingRebuild(TableDefinition before, TableDefinition after) {
+        if (before.state() != cn.zhangyis.db.dd.domain.TableState.ACTIVE
+                || after.state() != cn.zhangyis.db.dd.domain.TableState.ACTIVE
+                || before.storageBinding().isEmpty() || after.storageBinding().isEmpty()) {
+            return false;
+        }
+        var oldBinding = before.storageBinding().orElseThrow();
+        var newBinding = after.storageBinding().orElseThrow();
+        return oldBinding.tableId() == newBinding.tableId()
+                && !oldBinding.spaceId().equals(newBinding.spaceId())
+                && !oldBinding.path().equals(newBinding.path())
+                && newBinding.rowFormatVersion() == after.version().value();
     }
 
     private static boolean validLifecycleTransition(cn.zhangyis.db.dd.domain.TableState before,
@@ -350,6 +383,10 @@ public final class PersistentDictionaryRepository {
     private static boolean exactSecondaryIndexAddition(TableDefinition before, TableDefinition after) {
         if (before.state() != cn.zhangyis.db.dd.domain.TableState.ACTIVE
                 || after.state() != cn.zhangyis.db.dd.domain.TableState.ACTIVE
+                || !before.schemaId().equals(after.schemaId())
+                || !before.name().equals(after.name())
+                || !before.columns().equals(after.columns())
+                || !before.options().equals(after.options())
                 || after.indexes().size() != before.indexes().size() + 1
                 || !after.indexes().subList(0, before.indexes().size()).equals(before.indexes())
                 || after.indexes().getLast().clustered()
@@ -377,6 +414,10 @@ public final class PersistentDictionaryRepository {
     private static boolean exactSecondaryIndexRemoval(TableDefinition before, TableDefinition after) {
         if (before.state() != cn.zhangyis.db.dd.domain.TableState.ACTIVE
                 || after.state() != cn.zhangyis.db.dd.domain.TableState.ACTIVE
+                || !before.schemaId().equals(after.schemaId())
+                || !before.name().equals(after.name())
+                || !before.columns().equals(after.columns())
+                || !before.options().equals(after.options())
                 || before.indexes().size() != after.indexes().size() + 1
                 || before.storageBinding().isEmpty() || after.storageBinding().isEmpty()) {
             return false;
@@ -430,7 +471,8 @@ public final class PersistentDictionaryRepository {
                 continue;
             }
             mutationSeen = true;
-            DictionaryCatalogCodec.DecodedMutation mutation = decoded.get();
+            DictionaryCatalogCodec.DecodedMutation mutation = deriveLegacyTableOptions(
+                    current, decoded.get());
             if (mutation.version().compareTo(current.publishedVersion()) <= 0) {
                 throw new DictionaryCatalogCorruptionException("dictionary committed versions are not monotonic: before="
                         + current.publishedVersion().value() + ", actual=" + mutation.version().value());
@@ -460,5 +502,31 @@ public final class PersistentDictionaryRepository {
             current = new DictionarySnapshot(mutation.version(), schemas, tables, indexes);
         }
         return current;
+    }
+
+    /**
+     * 旧 table payload 不携带 options，而普通 mutation batch 通常也不重复写父 schema；因此迁移必须在
+     * repository 已重建到前一版本后，用当前或同批 schema defaults 填充，不能由 codec 猜测固定字符集。
+     */
+    private static DictionaryCatalogCodec.DecodedMutation deriveLegacyTableOptions(
+            DictionarySnapshot current, DictionaryCatalogCodec.DecodedMutation mutation) {
+        if (mutation.legacyOptionTables().isEmpty()) {
+            return mutation;
+        }
+        Map<SchemaId, SchemaDefinition> schemas = new LinkedHashMap<>(current.schemas());
+        mutation.schemas().forEach(schema -> schemas.put(schema.id(), schema));
+        List<TableDefinition> tables = mutation.tables().stream().map(table -> {
+            if (!mutation.legacyOptionTables().contains(table.id())) {
+                return table;
+            }
+            SchemaDefinition schema = Optional.ofNullable(schemas.get(table.schemaId())).orElseThrow(() ->
+                    new DictionaryCatalogCorruptionException(
+                            "legacy table options reference missing schema: " + table.schemaId().value()));
+            return new TableDefinition(table.id(), table.schemaId(), table.name(), table.version(),
+                    table.state(), table.columns(), table.indexes(), table.storageBinding(),
+                    new TableOptions("", schema.defaultCharsetId(), schema.defaultCollationId()));
+        }).toList();
+        return new DictionaryCatalogCodec.DecodedMutation(
+                mutation.version(), mutation.schemas(), tables, java.util.Set.of());
     }
 }

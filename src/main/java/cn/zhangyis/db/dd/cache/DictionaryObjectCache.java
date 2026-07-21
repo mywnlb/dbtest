@@ -134,11 +134,65 @@ public final class DictionaryObjectCache {
     }
 
     /**
-     * 建立 DROP 本地准入屏障：移除 current 并把所有版本标 stale；已有 pin 仍持不可变对象直到 close。
-     * 屏障可早于 catalog publish 建立，因为提交结果不确定时宁可要求重启裁决，也不能重载旧 ACTIVE 快照。
+     * DDL recovery 判定 catalog 仍引用旧 aggregate 后，清除该次未提交 DDL 建立的准入屏障并恢复旧版本。
+     * 普通 publish 不允许越过更高 barrier 回退；只有持久 marker 与 committed DD 已完成二选一裁决的恢复路径
+     * 可以调用本入口。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 committed table 与被回滚 DDL 版本，空输入不触碰 cache。</li>
+     *     <li>取得 cache 短锁，核对旧 table 版本早于回滚版本，且运行期 barrier 若存在必须精确匹配。</li>
+     *     <li>移除已裁决 barrier，并通过统一 publish 逻辑恢复 committed old aggregate。</li>
+     *     <li>释放 cache 锁并唤醒后续正常 pin；失败保持 barrier/current 原状。</li>
+     * </ol>
+     *
+     * @param table committed DD 中仍然有效的旧 ACTIVE aggregate；不得为 {@code null}
+     * @param rolledBackVersion 被恢复判定未提交的 DDL 版本；必须晚于 table 版本；若当前进程存在 barrier 则必须精确相等
+     * @throws DictionaryVersionConflictException barrier、身份或版本不匹配时抛出；恢复必须保持 fail-closed
+     */
+    public void restoreTableAfterDdlRollback(
+            TableDefinition table, DictionaryVersion rolledBackVersion) {
+        // 1、恢复输入来自 committed DD 与 marker，任何空值都早于共享状态修改拒绝。
+        if (table == null || rolledBackVersion == null) {
+            throw new DatabaseValidationException(
+                    "DDL rollback cache restore table/version must not be null");
+        }
+        // 2、cache lock 串行 barrier 核对与 current 发布，避免普通 loader 插入旧版本。
+        lock.lock();
+        try {
+            DictionaryVersion barrier = invalidatedAt.get(table.id());
+            if (table.version().compareTo(rolledBackVersion) >= 0
+                    || barrier != null && !rolledBackVersion.equals(barrier)) {
+                throw new DictionaryVersionConflictException(
+                        "DDL rollback cache barrier does not match committed old table: table="
+                                + table.id().value() + " tableVersion=" + table.version().value()
+                                + " rollbackVersion=" + rolledBackVersion.value()
+                                + " barrier=" + (barrier == null ? "none" : barrier.value()));
+            }
+            Entry currentEntry = current.get(table.id());
+            if (currentEntry != null) {
+                int comparison = table.version().compareTo(currentEntry.value.version());
+                if (comparison < 0 || comparison == 0 && !table.equals(currentEntry.value)) {
+                    throw new DictionaryVersionConflictException(
+                            "DDL rollback cannot replace a newer or different current cache entry: table="
+                                    + table.id().value());
+                }
+            }
+            // 3、只有 old-DD 裁决成立才清 barrier；publish 仍复用版本/current/stale 不变量校验。
+            invalidatedAt.remove(table.id());
+            publishUnderLock(table);
+        } finally {
+            // 4、异常路径也释放短锁；校验失败发生在 barrier 删除前，调用方可保持 fail-closed。
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 建立 table DDL 本地准入屏障：移除 current 并把所有版本标 stale；已有 pin 仍持不可变对象直到 close。
+     * 屏障可早于 catalog publish 建立，因为提交结果不确定时宁可要求恢复裁决，也不能重载旧 ACTIVE 快照。
      *
      * @param tableId 目标表的稳定字典标识；不得为 {@code null}，且必须与当前元数据和物理绑定一致
-     * @param dropVersion 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+     * @param dropVersion 即将发布的 DDL 版本；必须严格晚于当前 cache 版本，成功 publish 同版本或更新版本时清除屏障
      * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      * @throws DictionaryVersionConflictException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
      */
@@ -327,8 +381,8 @@ public final class DictionaryObjectCache {
         // 1、校验 owner、目标资源、锁模式与等待时限，在共享或持久副作用前拒绝非法状态。
         DictionaryVersion barrier = invalidatedAt.get(table.id());
         if (barrier != null) {
-            if (table.version().compareTo(barrier) <= 0) {
-                throw new DictionaryObjectNotFoundException("dictionary table version is blocked by DROP: table="
+            if (table.version().compareTo(barrier) < 0) {
+                throw new DictionaryObjectNotFoundException("dictionary table version is blocked by DDL: table="
                         + table.id().value() + " version=" + table.version().value()
                         + " barrier=" + barrier.value());
             }

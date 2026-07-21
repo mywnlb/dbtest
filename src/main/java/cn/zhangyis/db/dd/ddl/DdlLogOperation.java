@@ -17,7 +17,12 @@ public enum DdlLogOperation {
     /** 校验外部 DISCARDED 文件并重新挂载为 ACTIVE 表空间。 */
     IMPORT_TABLESPACE(5),
     /** 先发布不含目标二级索引的 ACTIVE aggregate，再回收其 leaf/non-leaf segment。 */
-    DROP_INDEX(6);
+    DROP_INDEX(6),
+    /**
+     * 阻塞式结构 ALTER：path/spaceId 是旧 binding，auxiliaryPath/secondaryObjectId 是新 shadow
+     * path/space id；committed DD 是交换裁决点。
+     */
+    REBUILD_TABLE(7);
 
     /** DDL log key/payload 使用且跨版本不可重排的持久码。 */
     private final int stableCode;

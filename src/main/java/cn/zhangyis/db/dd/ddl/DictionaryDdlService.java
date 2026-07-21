@@ -4,6 +4,8 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.dd.cache.DictionaryObjectCache;
 import cn.zhangyis.db.dd.domain.ColumnDefinition;
 import cn.zhangyis.db.dd.domain.ColumnTypeDefinition;
+import cn.zhangyis.db.dd.domain.ColumnDefaultDefinition;
+import cn.zhangyis.db.dd.domain.DictionaryTypeId;
 import cn.zhangyis.db.dd.domain.DdlId;
 import cn.zhangyis.db.dd.domain.DictionaryVersion;
 import cn.zhangyis.db.dd.domain.IndexDefinition;
@@ -17,6 +19,7 @@ import cn.zhangyis.db.dd.domain.SchemaId;
 import cn.zhangyis.db.dd.domain.TableDefinition;
 import cn.zhangyis.db.dd.domain.TableId;
 import cn.zhangyis.db.dd.domain.TableState;
+import cn.zhangyis.db.dd.domain.TableOptions;
 import cn.zhangyis.db.dd.exception.DictionaryObjectNotFoundException;
 import cn.zhangyis.db.dd.mdl.MdlDuration;
 import cn.zhangyis.db.dd.mdl.MdlKey;
@@ -47,6 +50,10 @@ import cn.zhangyis.db.storage.api.ddl.SecondaryIndexBuildDescriptor;
 import cn.zhangyis.db.storage.api.ddl.SecondaryIndexBuildDuplicateKeyException;
 import cn.zhangyis.db.storage.api.ddl.SecondaryIndexDropDescriptor;
 import cn.zhangyis.db.storage.api.ddl.IndexStorageBinding;
+import cn.zhangyis.db.storage.api.ddl.StorageColumnRewrite;
+import cn.zhangyis.db.storage.api.ddl.StorageDefaultValue;
+import cn.zhangyis.db.storage.api.ddl.StorageTableRebuildRequest;
+import cn.zhangyis.db.storage.api.ddl.TableRebuildException;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;
@@ -58,6 +65,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * MDL、ID/version control、持久 DD、cache 与物理 storage DDL 的唯一协调器。锁顺序固定为 schema→table；
@@ -337,7 +345,8 @@ public final class DictionaryDdlService {
 
             // 4、最终 binding 已确定后先写 durable SDI；ACTIVE 仍是字典提交裁决点，SDI 不反向决定 catalog。
             TableDefinition table = new TableDefinition(tableId, schema.id(), command.name().table(), version,
-                    TableState.ACTIVE, columns, indexes, java.util.Optional.of(binding));
+                    TableState.ACTIVE, columns, indexes, java.util.Optional.of(binding),
+                    new TableOptions("", schema.defaultCharsetId(), schema.defaultCollationId()));
             sdi.write(table, timeout);
             try {
                 try (DictionaryTransaction transaction = repository.begin(version)) {
@@ -487,8 +496,10 @@ public final class DictionaryDdlService {
                     oldBinding.rowFormatVersion(), bindings, oldBinding.lobSegment());
             TableDefinition published = new TableDefinition(
                     active.id(), active.schemaId(), active.name(), version, TableState.ACTIVE,
-                    active.columns(), indexes, java.util.Optional.of(newBinding));
+                    active.columns(), indexes, java.util.Optional.of(newBinding), active.options());
             sdi.write(published, timeout);
+            // 新 index 已进入 target SDI；DD 响应不确定时必须阻断旧 aggregate，避免后续 DML 漏维护新索引。
+            cache.invalidateTable(active.id(), version);
             try {
                 commitUpdate(version, published);
             } catch (RuntimeException publishFailure) {
@@ -619,8 +630,10 @@ public final class DictionaryDdlService {
                     oldBinding.rowFormatVersion(), bindings, oldBinding.lobSegment());
             TableDefinition published = new TableDefinition(
                     active.id(), active.schemaId(), active.name(), version, TableState.ACTIVE,
-                    active.columns(), indexes, Optional.of(newBinding));
+                    active.columns(), indexes, Optional.of(newBinding), active.options());
             sdi.write(published, timeout);
+            // 提交点前建立 publication barrier；未知结果下旧 cache 不得继续把已删除索引视为权威 binding。
+            cache.invalidateTable(active.id(), version);
             try {
                 commitUpdate(version, published);
             } catch (RuntimeException publishFailure) {
@@ -786,6 +799,11 @@ public final class DictionaryDdlService {
             }
             TableStorageBinding binding = active.storageBinding().orElseThrow(() ->
                     new DictionaryDdlException("ACTIVE table has no physical binding: " + active.id().value()));
+            Path expectedQuarantine = transferPath("discarded", active.id(), binding);
+            if (!quarantine.equals(expectedQuarantine)) {
+                throw new DatabaseValidationException(
+                        "DISCARD target must match current table/space identity: " + expectedQuarantine);
+            }
             purgeBarrier.awaitUnreferenced(active.id().value(), timeout);
             DictionaryIdAllocation ids = control.reserve(new DictionaryIdRequest(0, 0, 0, 0, 1, 2));
             DictionaryVersion pendingVersion = DictionaryVersion.of(ids.dictionaryVersion());
@@ -853,6 +871,11 @@ public final class DictionaryDdlService {
             }
             TableStorageBinding binding = discarded.storageBinding().orElseThrow(() ->
                     new DictionaryDdlException("DISCARDED table has no physical binding: " + discarded.id().value()));
+            Path expectedSource = transferPath("incoming", discarded.id(), binding);
+            if (!source.equals(expectedSource)) {
+                throw new DatabaseValidationException(
+                        "IMPORT source must match current table/space identity: " + expectedSource);
+            }
             DictionaryIdAllocation ids = control.reserve(new DictionaryIdRequest(0, 0, 0, 0, 1, 2));
             DictionaryVersion pendingVersion = DictionaryVersion.of(ids.dictionaryVersion());
             DictionaryVersion activeVersion = DictionaryVersion.of(ids.dictionaryVersion() + 1);
@@ -866,10 +889,585 @@ public final class DictionaryDdlService {
             repository.ddlLog().transition(ddlId, DdlLogPhase.PREPARED, DdlLogPhase.DICTIONARY_COMMITTED);
             physical.importTablespace(binding, source, identity, timeout);
             repository.ddlLog().transition(ddlId, DdlLogPhase.DICTIONARY_COMMITTED, DdlLogPhase.ENGINE_DONE);
-            commitUpdate(activeVersion, lifecycle(discarded, activeVersion, TableState.ACTIVE));
+            TableDefinition active = lifecycle(discarded, activeVersion, TableState.ACTIVE);
+            commitUpdate(activeVersion, active);
+            cache.publishTable(active);
             repository.ddlLog().transition(ddlId, DdlLogPhase.ENGINE_DONE, DdlLogPhase.COMMITTED);
             cleanSnapshotPublisher.publish();
         }
+    }
+
+    /**
+     * 使用实例固定 quarantine 路径执行 DISCARD；SQL 层只能提交逻辑表名，不能影响主机文件路径。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>只读解析 committed table identity，为受控文件名提供 table/space 诊断信息。</li>
+     *     <li>创建 {@code tablespace-transfer/discarded} 目录并规范化固定目标路径。</li>
+     *     <li>进入既有 DISCARD 状态机；其在 table MDL X 下重读 identity 并拒绝并发 drop/recreate 造成的不匹配。</li>
+     *     <li>成功后文件与 DD 均处于 DISCARDED；失败保留 DDL log 供恢复续作。</li>
+     * </ol>
+     *
+     * @param owner 独立 DDL statement owner；不得复用 Session transaction owner
+     * @param name 已由 Binder 限定的逻辑表名
+     * @param timeout 本条 statement 剩余正有界时间
+     */
+    public void discardTablespace(MdlOwnerId owner, QualifiedTableName name, Duration timeout) {
+        // 1、预读只用于路径命名；权威状态仍由下游 table X 内重验。
+        TransferTarget target = transferTarget(name);
+        // 2、固定目录与文件名不接受 SQL 输入。
+        Path quarantine = transferPath("discarded", target.tableId(), target.binding());
+        ensureTransferDirectory(quarantine.getParent());
+        // 3、原有状态机在锁内复核同一个 tableId/spaceId。
+        discardTablespace(owner, name, quarantine, timeout);
+        // 4、终态与恢复证据由被调用状态机完整发布。
+    }
+
+    /**
+     * 从实例固定 incoming 路径执行 IMPORT；page0 identity 在任何物理复制前由 storage inspector 读取。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>解析 DISCARDED 表的稳定 table/space binding，构造不可由 SQL 改写的 incoming 路径。</li>
+     *     <li>只读检查候选文件 page0，校验 checksum、page size、space id、类型和版本。</li>
+     *     <li>进入既有 IMPORT 状态机，并在 table MDL X 下重验状态、binding 与固定路径。</li>
+     *     <li>成功后 canonical 文件恢复 NORMAL 且 DD 发布 ACTIVE；失败由 DDL log 保留可恢复阶段。</li>
+     * </ol>
+     *
+     * @param owner 独立 DDL statement owner；不得复用 Session transaction owner
+     * @param name 已由 Binder 限定的逻辑表名
+     * @param timeout 本条 statement 剩余正有界时间
+     */
+    public void importTablespace(MdlOwnerId owner, QualifiedTableName name, Duration timeout) {
+        // 1、路径只由 committed binding 派生，最终 identity 在 table X 下再次核对。
+        TransferTarget target = transferTarget(name);
+        Path source = transferPath("incoming", target.tableId(), target.binding());
+        ensureTransferDirectory(source.getParent());
+        // 2、检查阶段不复制、不打开为在线 tablespace，也不产生 redo。
+        TablespaceFileIdentity identity =
+                physical.inspectTablespaceFile(source, target.binding().spaceId());
+        // 3、原状态机负责 MDL、DDL log、物理挂载与字典发布。
+        importTablespace(owner, name, source, identity, timeout);
+        // 4、所有 durable 终态均由原状态机在 clean snapshot 发布后对外可见。
+    }
+
+    /**
+     * 按 SQL 声明顺序执行一次通用阻塞式 ALTER。metadata-only action 原地保留 row format；涉及列布局、
+     * CONVERT 或复合索引 action 时只建立一个 shadow space，并以 committed DD 作为交换裁决点。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>按 canonical schema/table key 全序取得全部源/rename 目标 MDL，在锁内重读 ACTIVE aggregate。</li>
+     *     <li>依次作用 action 到 staged columns/indexes/options/name，验证主键、相对位置、名称和目标 schema。</li>
+     *     <li>metadata-only 先 durable SDI 再一次提交 DD；结构变化则写 PREPARED、构建/force shadow 与 SDI，
+     *     写 ENGINE_DONE 后一次提交新 binding。</li>
+     *     <li>发布 cache 并回收旧空间；后置失败保留新 DD/marker，启动恢复按 committed binding 收敛。</li>
+     * </ol>
+     *
+     * @param owner 独立 DDL statement owner；不得复用 Session transaction owner
+     * @param command 已完成纯 SQL 类型/default 校验的保序 command
+     * @param timeout MDL、purge/pin、rebuild、WAL 与 drop 共用的正有界时限
+     * @return 唯一一次提交后可见的 ACTIVE table aggregate
+     * @throws DictionaryDdlException staged action、shadow 构建或持久化失败时抛出；若 DD 已提交不得回滚
+     */
+    public TableDefinition alterTable(
+            MdlOwnerId owner, AlterTableCommand command, Duration timeout) {
+        // 1、锁集合完全来自逻辑名称，等待期间不持 page/file/MTR 资源。
+        validateOwnerTimeout(owner, timeout);
+        cleanSnapshotPublisher.assertAvailable();
+        if (command == null) {
+            throw new DatabaseValidationException("ALTER TABLE command must not be null");
+        }
+        try (AlterMdlTickets ignored = acquireAlterTickets(owner, command, timeout)) {
+            SchemaDefinition sourceSchema = repository.findSchema(command.table().schema())
+                    .orElseThrow(() -> new DictionaryObjectNotFoundException(
+                            "schema does not exist: "
+                                    + command.table().schema().displayName()));
+            TableDefinition active = repository.findTable(
+                            sourceSchema.id(), command.table().table())
+                    .orElseThrow(() -> new DictionaryObjectNotFoundException(
+                            "table does not exist: " + command.table().canonicalKey()));
+            if (active.state() != TableState.ACTIVE) {
+                throw new DictionaryDdlException(
+                        "ALTER TABLE target is not ACTIVE: " + active.id().value());
+            }
+
+            // 2、draft 中的 sourceOrdinal/default 同步随列移动，最终直接形成 storage row projection。
+            AlterDraft draft = stageAlter(active, command.actions());
+            ensureAlterTargetNameAvailable(active, draft.schemaId(), draft.name());
+            long finalAddedIndexes = draft.indexes().stream()
+                    .filter(StagedIndex::requiresIdentity).count();
+            boolean structural = draft.structural();
+            DictionaryIdAllocation ids = control.reserve(new DictionaryIdRequest(
+                    0, 0, Math.toIntExact(finalAddedIndexes),
+                    structural ? 1 : 0, structural ? 1 : 0, 1));
+            DictionaryVersion version = DictionaryVersion.of(ids.dictionaryVersion());
+            List<IndexDefinition> indexes = assignAlterIndexIds(
+                    draft.indexes(), ids.firstIndexId());
+            List<ColumnDefinition> columns = draft.columns().stream()
+                    .map(StagedColumn::definition).toList();
+
+            if (!structural) {
+                TableDefinition published = new TableDefinition(
+                        active.id(), draft.schemaId(), draft.name(), version, TableState.ACTIVE,
+                        columns, indexes, active.storageBinding(), draft.options());
+                ensureAlterTargetNameAvailable(active, published);
+                sdi.write(published, timeout);
+                // DD append 的成功响应可能丢失；先阻断旧 cache，避免 durable 新名称/选项与旧内存版本并行服务。
+                cache.invalidateTable(active.id(), version);
+                commitUpdate(version, published);
+                cache.publishTable(published);
+                cleanSnapshotPublisher.publish();
+                return published;
+            }
+
+            purgeBarrier.awaitUnreferenced(active.id().value(), timeout);
+            if (!cache.awaitUnpinned(active.id(), timeout)) {
+                throw new DictionaryDdlException(
+                        "timed out waiting old metadata pins before ALTER rebuild: "
+                                + active.id().value());
+            }
+            TableStorageBinding oldBinding = active.storageBinding().orElseThrow(() ->
+                    new DictionaryDdlException(
+                            "ALTER source has no physical binding: " + active.id().value()));
+            int targetSpaceId = ids.firstSpaceId();
+            Path targetPath = tablePath(active.id(), targetSpaceId);
+            ensureTablesDirectory();
+            // 任何 schema/key/charset 不可实现性必须在 durable marker 与 shadow 文件之前拒绝。
+            StorageTableDefinition sourceDefinition = storageDefinition(active);
+            StorageTableDefinition targetDefinition = storageDefinition(
+                    active.id(), targetSpaceId, targetPath, version,
+                    columns, indexes);
+            List<StorageColumnRewrite> rewrites = draft.columns().stream()
+                    .map(column -> column.sourceOrdinal() >= 0
+                            ? StorageColumnRewrite.source(column.sourceOrdinal())
+                            : StorageColumnRewrite.added(column.storageDefault()))
+                    .toList();
+            physical.validateTableDefinition(sourceDefinition);
+            physical.validateTableDefinition(targetDefinition);
+
+            DdlId ddlId = DdlId.of(ids.firstDdlId());
+            DdlLogRecord prepared = new DdlLogRecord(
+                    new DdlUndoMarker(
+                            ddlId.value(), version.value(), active.id().value()),
+                    targetSpaceId, DdlLogOperation.REBUILD_TABLE, DdlLogPhase.PREPARED,
+                    oldBinding.spaceId(), oldBinding.path(),
+                    Optional.of(targetPath), Optional.empty());
+            repository.ddlLog().prepare(prepared);
+            faultInjector.afterAlterPrepared(prepared);
+
+            // 3、shadow 未被 DD 引用；全部行、索引、SDI 和 force 成功后才发布 ENGINE_DONE。
+            TableStorageBinding targetBinding = null;
+            TableDefinition published;
+            DdlLogRecord engineDone;
+            try {
+                targetBinding = physical.rebuildTable(
+                        new StorageTableRebuildRequest(
+                                sourceDefinition, oldBinding, targetDefinition, rewrites),
+                        timeout);
+                published = new TableDefinition(
+                        active.id(), draft.schemaId(), draft.name(), version, TableState.ACTIVE,
+                        columns, indexes, Optional.of(targetBinding), draft.options());
+                ensureAlterTargetNameAvailable(active, published);
+                sdi.write(published, timeout);
+                engineDone = repository.ddlLog().transition(
+                        ddlId, DdlLogPhase.PREPARED, DdlLogPhase.ENGINE_DONE);
+            } catch (RuntimeException failure) {
+                TableStorageBinding cleanupBinding = targetBinding;
+                if (cleanupBinding == null
+                        && failure instanceof TableRebuildException rebuildFailure) {
+                    cleanupBinding = rebuildFailure.shadowBinding();
+                }
+                rollbackAlterShadow(ddlId, cleanupBinding, timeout, failure);
+                throw failure;
+            }
+            // fault hook 位于补偿作用域之外，用异常模拟进程立即退出；真实普通失败已在上方完成精确 cleanup。
+            // ENGINE_DONE 后 shadow 已完整可恢复；DD 提交前先阻断旧 cache，未知提交结果只能由恢复裁决。
+            cache.invalidateTable(active.id(), version);
+            faultInjector.afterAlterEngineDone(engineDone);
+
+            try {
+                commitUpdate(version, published);
+            } catch (RuntimeException uncertain) {
+                // 一旦开始 catalog append，就不能用“方法抛错”推断 DD 未提交；删除 shadow 会让 durable
+                // 新 aggregate 指向缺失文件。保留 ENGINE_DONE，由启动恢复重读 committed DD 决定前滚/回滚。
+                log.warn("ALTER TABLE DD publish outcome is uncertain; retaining shadow marker: "
+                                + "tableId={} ddlId={} oldSpace={} newSpace={}",
+                        active.id().value(), ddlId.value(), oldBinding.spaceId().value(),
+                        targetBinding.spaceId().value(), uncertain);
+                throw uncertain;
+            }
+            repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.ENGINE_DONE, DdlLogPhase.DICTIONARY_COMMITTED);
+            faultInjector.afterAlterDictionaryCommitted(published);
+            cache.publishTable(published);
+
+            // 4、新 DD 已是唯一真相；旧空间回收失败只能前滚恢复，绝不能把 shadow 当临时文件删除。
+            physical.dropTable(oldBinding, timeout);
+            repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.DICTIONARY_COMMITTED, DdlLogPhase.COMMITTED);
+            cleanSnapshotPublisher.publish();
+            return published;
+        }
+    }
+
+    /**
+     * 在内存 staged aggregate 上顺序应用 actions；本方法不预留 identity、不写 catalog/SDI/文件。
+     * sourceOrdinal 始终指向 ALTER 开始时的物理列，新增列携带已经类型化的 storage default。
+     */
+    private AlterDraft stageAlter(
+            TableDefinition active, List<AlterTableAction> actions) {
+        List<StagedColumn> columns = new ArrayList<>();
+        for (ColumnDefinition column : active.columns()) {
+            columns.add(new StagedColumn(column, column.ordinal(), Optional.empty()));
+        }
+        List<StagedIndex> indexes = active.indexes().stream()
+                .map(index -> new StagedIndex(index, false))
+                .collect(java.util.stream.Collectors.toCollection(ArrayList::new));
+        SchemaId schemaId = active.schemaId();
+        ObjectName tableName = active.name();
+        TableOptions options = active.options();
+        long nextColumnId = active.columns().stream()
+                .mapToLong(ColumnDefinition::columnId).max().orElse(0L) + 1L;
+        long nextTemporaryIndexId = active.indexes().stream()
+                .mapToLong(index -> index.id().value()).max().orElse(0L) + 1L;
+        boolean structural = false;
+
+        for (AlterTableAction action : actions) {
+            switch (action) {
+                case AlterTableAction.AddColumn add -> {
+                    if (findColumn(columns, add.name()).isPresent()) {
+                        throw new DictionaryDdlException(
+                                "ALTER ADD COLUMN already exists: " + add.name().displayName());
+                    }
+                    ColumnTypeDefinition type = inheritCharacterDefaults(add.type(), options);
+                    int position = switch (add.position().kind()) {
+                        case LAST -> columns.size();
+                        case FIRST -> 0;
+                        case AFTER -> findColumnIndex(
+                                columns, add.position().afterColumn().orElseThrow()) + 1;
+                    };
+                    ColumnDefinition definition = new ColumnDefinition(
+                            nextColumnId++, add.name(), type, position, add.defaultDefinition());
+                    columns.add(position, new StagedColumn(
+                            definition, -1, add.storageDefault()));
+                    columns = renumberColumns(columns);
+                    structural = true;
+                }
+                case AlterTableAction.DropColumn drop -> {
+                    int ordinal = findColumnIndex(columns, drop.name());
+                    long columnId = columns.get(ordinal).definition().columnId();
+                    boolean clusteredKey = indexes.stream().map(StagedIndex::definition)
+                            .filter(IndexDefinition::clustered)
+                            .flatMap(index -> index.keyParts().stream())
+                            .anyMatch(part -> part.columnId() == columnId);
+                    if (clusteredKey) {
+                        throw new DictionaryDdlException(
+                                "ALTER DROP COLUMN cannot remove clustered key column: "
+                                        + drop.name().displayName());
+                    }
+                    columns.remove(ordinal);
+                    if (columns.isEmpty()) {
+                        throw new DictionaryDdlException(
+                                "ALTER TABLE cannot remove the final column");
+                    }
+                    columns = renumberColumns(columns);
+                    List<StagedIndex> rewritten = new ArrayList<>();
+                    for (StagedIndex staged : indexes) {
+                        List<IndexKeyPart> parts = staged.definition().keyParts().stream()
+                                .filter(part -> part.columnId() != columnId).toList();
+                        if (parts.isEmpty()) {
+                            if (staged.definition().clustered()) {
+                                throw new DictionaryDdlException(
+                                        "clustered index became empty during DROP COLUMN");
+                            }
+                            continue;
+                        }
+                        rewritten.add(new StagedIndex(new IndexDefinition(
+                                staged.definition().id(), staged.definition().name(),
+                                staged.definition().unique(), staged.definition().clustered(),
+                                parts), staged.requiresIdentity()));
+                    }
+                    indexes = rewritten;
+                    structural = true;
+                }
+                case AlterTableAction.AddIndex add -> {
+                    if (indexes.stream().anyMatch(index ->
+                            index.definition().name().equals(add.index().name()))) {
+                        throw new DictionaryDdlException(
+                                "ALTER ADD INDEX already exists: "
+                                        + add.index().name().displayName());
+                    }
+                    Map<ObjectName, Long> columnIds = new LinkedHashMap<>();
+                    columns.forEach(column -> columnIds.put(
+                            column.definition().name(), column.definition().columnId()));
+                    List<IndexKeyPart> parts = add.index().keyParts().stream()
+                            .map(part -> new IndexKeyPart(
+                                    requireColumnId(columnIds, part.columnName()),
+                                    part.order(), part.prefixBytes())).toList();
+                    indexes.add(new StagedIndex(new IndexDefinition(
+                            IndexId.of(nextTemporaryIndexId++), add.index().name(),
+                            add.index().unique(), false, parts), true));
+                    structural = true;
+                }
+                case AlterTableAction.DropIndex drop -> {
+                    int ordinal = findIndexIndex(indexes, drop.name());
+                    if (indexes.get(ordinal).definition().clustered()) {
+                        throw new DictionaryDdlException(
+                                "ALTER DROP INDEX cannot remove clustered primary index: "
+                                        + drop.name().displayName());
+                    }
+                    indexes.remove(ordinal);
+                    structural = true;
+                }
+                case AlterTableAction.Rename rename -> {
+                    if (!rename.target().catalog().equals(ObjectName.of("def"))) {
+                        throw new DictionaryDdlException(
+                                "ALTER RENAME only supports catalog def");
+                    }
+                    SchemaDefinition targetSchema = repository.findSchema(rename.target().schema())
+                            .orElseThrow(() -> new DictionaryObjectNotFoundException(
+                                    "rename target schema does not exist: "
+                                            + rename.target().schema().displayName()));
+                    schemaId = targetSchema.id();
+                    tableName = rename.target().table();
+                }
+                case AlterTableAction.Comment comment ->
+                        options = new TableOptions(
+                                comment.value(), options.defaultCharsetId(),
+                                options.defaultCollationId());
+                case AlterTableAction.DefaultCharset charset ->
+                        options = new TableOptions(
+                                options.comment(), charset.charsetId(), charset.collationId());
+                case AlterTableAction.ConvertCharset charset -> {
+                    options = new TableOptions(
+                            options.comment(), charset.charsetId(), charset.collationId());
+                    List<StagedColumn> converted = new ArrayList<>(columns.size());
+                    for (StagedColumn column : columns) {
+                        ColumnTypeDefinition before = column.definition().type();
+                        ColumnTypeDefinition after = isCharacterType(before.typeId())
+                                ? new ColumnTypeDefinition(
+                                before.typeId(), before.unsigned(), before.nullable(),
+                                before.length(), before.scale(), charset.charsetId(),
+                                charset.collationId(), before.symbols()) : before;
+                        converted.add(new StagedColumn(new ColumnDefinition(
+                                column.definition().columnId(), column.definition().name(),
+                                after, column.definition().ordinal(),
+                                column.definition().defaultDefinition()),
+                                column.sourceOrdinal(), column.storageDefault()));
+                    }
+                    columns = converted;
+                    structural = true;
+                }
+            }
+        }
+        return new AlterDraft(schemaId, tableName, options,
+                List.copyOf(columns), List.copyOf(indexes), structural);
+    }
+
+    /** 给最终仍存在的 ADD INDEX 分配 control 预留的连续全局 identity。 */
+    private static List<IndexDefinition> assignAlterIndexIds(
+            List<StagedIndex> staged, long firstIndexId) {
+        long next = firstIndexId;
+        List<IndexDefinition> result = new ArrayList<>(staged.size());
+        for (StagedIndex index : staged) {
+            IndexDefinition definition = index.definition();
+            result.add(index.requiresIdentity() ? new IndexDefinition(
+                    IndexId.of(next++), definition.name(), definition.unique(),
+                    definition.clustered(), definition.keyParts()) : definition);
+        }
+        return List.copyOf(result);
+    }
+
+    /** 目标逻辑名必须为空或仍指向本 table id。 */
+    private void ensureAlterTargetNameAvailable(
+            TableDefinition active, SchemaId schemaId, ObjectName name) {
+        repository.findTable(schemaId, name).ifPresent(existing -> {
+            if (!existing.id().equals(active.id())) {
+                throw new cn.zhangyis.db.dd.exception.DictionaryObjectExistsException(
+                        "ALTER target table name already exists: " + name.displayName());
+            }
+        });
+    }
+
+    /** 已组装 published aggregate 时复用目标名称校验。 */
+    private void ensureAlterTargetNameAvailable(
+            TableDefinition active, TableDefinition published) {
+        ensureAlterTargetNameAvailable(active, published.schemaId(), published.name());
+    }
+
+    /** 物理 shadow 成功但 DD 尚未提交时精确清理；失败保留非终态 marker 供恢复。 */
+    private void rollbackAlterShadow(
+            DdlId ddlId, TableStorageBinding shadow, Duration timeout,
+            RuntimeException original) {
+        if (shadow == null) {
+            return;
+        }
+        try {
+            physical.dropTable(shadow, timeout);
+            DdlLogPhase phase = repository.ddlLog().find(ddlId).orElseThrow().phase();
+            if (phase == DdlLogPhase.PREPARED || phase == DdlLogPhase.ENGINE_DONE) {
+                repository.ddlLog().transition(ddlId, phase, DdlLogPhase.ROLLED_BACK);
+            }
+        } catch (RuntimeException cleanupFailure) {
+            original.addSuppressed(cleanupFailure);
+        }
+    }
+
+    /** 获取源与全部 rename 目标的 schema IX/table X，按 MdlKey 全序避免跨 schema 双向 rename 死锁。 */
+    private AlterMdlTickets acquireAlterTickets(
+            MdlOwnerId owner, AlterTableCommand command, Duration timeout) {
+        Set<MdlKey> schemaKeys = new java.util.TreeSet<>();
+        Set<MdlKey> tableKeys = new java.util.TreeSet<>();
+        schemaKeys.add(MdlKey.schema(command.table().schema().canonicalName()));
+        tableKeys.add(MdlKey.table(command.table().canonicalKey()));
+        for (AlterTableAction action : command.actions()) {
+            if (action instanceof AlterTableAction.Rename rename) {
+                schemaKeys.add(MdlKey.schema(rename.target().schema().canonicalName()));
+                tableKeys.add(MdlKey.table(rename.target().canonicalKey()));
+            }
+        }
+        List<MdlTicket> acquired = new ArrayList<>();
+        try {
+            for (MdlKey key : schemaKeys) {
+                acquired.add(locks.acquire(new MdlRequest(
+                        owner, key, MdlMode.INTENTION_EXCLUSIVE,
+                        MdlDuration.TRANSACTION), timeout));
+            }
+            for (MdlKey key : tableKeys) {
+                acquired.add(locks.acquire(new MdlRequest(
+                        owner, key, MdlMode.EXCLUSIVE,
+                        MdlDuration.TRANSACTION), timeout));
+            }
+            return new AlterMdlTickets(acquired);
+        } catch (RuntimeException failure) {
+            closeTickets(acquired, failure);
+            throw failure;
+        }
+    }
+
+    /** 新字符列的 0/0 继承哨兵在 action 当时的 staged table options 下解析。 */
+    private static ColumnTypeDefinition inheritCharacterDefaults(
+            ColumnTypeDefinition type, TableOptions options) {
+        if (!isCharacterType(type.typeId())) {
+            return type;
+        }
+        int charset = type.charsetId() == 0
+                ? options.defaultCharsetId() : type.charsetId();
+        int collation = type.collationId() == 0
+                ? options.defaultCollationId() : type.collationId();
+        return new ColumnTypeDefinition(
+                type.typeId(), type.unsigned(), type.nullable(), type.length(),
+                type.scale(), charset, collation, type.symbols());
+    }
+
+    /** DD 字符类型集合；binary/blob 不参与 character set conversion。 */
+    private static boolean isCharacterType(DictionaryTypeId type) {
+        return switch (type) {
+            case CHAR, VARCHAR, TINYTEXT, TEXT, MEDIUMTEXT, LONGTEXT, JSON -> true;
+            default -> false;
+        };
+    }
+
+    private static Optional<StagedColumn> findColumn(
+            List<StagedColumn> columns, ObjectName name) {
+        return columns.stream().filter(column ->
+                column.definition().name().equals(name)).findFirst();
+    }
+
+    private static int findColumnIndex(
+            List<StagedColumn> columns, ObjectName name) {
+        for (int index = 0; index < columns.size(); index++) {
+            if (columns.get(index).definition().name().equals(name)) {
+                return index;
+            }
+        }
+        throw new DictionaryObjectNotFoundException(
+                "ALTER column does not exist: " + name.displayName());
+    }
+
+    private static int findIndexIndex(
+            List<StagedIndex> indexes, ObjectName name) {
+        for (int index = 0; index < indexes.size(); index++) {
+            if (indexes.get(index).definition().name().equals(name)) {
+                return index;
+            }
+        }
+        throw new DictionaryObjectNotFoundException(
+                "ALTER index does not exist: " + name.displayName());
+    }
+
+    /** 列移动后只重建 ordinal，稳定 column id/source projection/default 不变。 */
+    private static List<StagedColumn> renumberColumns(
+            List<StagedColumn> columns) {
+        List<StagedColumn> result = new ArrayList<>(columns.size());
+        for (int ordinal = 0; ordinal < columns.size(); ordinal++) {
+            StagedColumn column = columns.get(ordinal);
+            ColumnDefinition definition = column.definition();
+            result.add(new StagedColumn(new ColumnDefinition(
+                    definition.columnId(), definition.name(), definition.type(),
+                    ordinal, definition.defaultDefinition()),
+                    column.sourceOrdinal(), column.storageDefault()));
+        }
+        return result;
+    }
+
+    /** 关闭部分取得的动态 MDL ticket，并把 cleanup failure 附到原异常。 */
+    private static void closeTickets(
+            List<MdlTicket> tickets, RuntimeException original) {
+        for (int index = tickets.size() - 1; index >= 0; index--) {
+            try {
+                tickets.get(index).close();
+            } catch (RuntimeException closeFailure) {
+                original.addSuppressed(closeFailure);
+            }
+        }
+    }
+
+    /** 动态多名称 ALTER 的 RAII ticket owner。 */
+    private static final class AlterMdlTickets implements AutoCloseable {
+        private final List<MdlTicket> tickets;
+
+        private AlterMdlTickets(List<MdlTicket> tickets) {
+            this.tickets = List.copyOf(tickets);
+        }
+
+        @Override
+        public void close() {
+            RuntimeException failure = null;
+            for (int index = tickets.size() - 1; index >= 0; index--) {
+                try {
+                    tickets.get(index).close();
+                } catch (RuntimeException closeFailure) {
+                    if (failure == null) {
+                        failure = closeFailure;
+                    } else {
+                        failure.addSuppressed(closeFailure);
+                    }
+                }
+            }
+            if (failure != null) {
+                throw failure;
+            }
+        }
+    }
+
+    /** staged 列同时保存源物理 ordinal 或新增列 default。 */
+    private record StagedColumn(
+            ColumnDefinition definition, int sourceOrdinal,
+            Optional<StorageDefaultValue> storageDefault) {
+    }
+
+    /** requiresIdentity 区分本语句新建索引与既有稳定索引。 */
+    private record StagedIndex(
+            IndexDefinition definition, boolean requiresIdentity) {
+    }
+
+    /** 一次保序 action 求值后的纯内存结果。 */
+    private record AlterDraft(
+            SchemaId schemaId, ObjectName name, TableOptions options,
+            List<StagedColumn> columns, List<StagedIndex> indexes,
+            boolean structural) {
     }
 
     /**
@@ -887,7 +1485,7 @@ public final class DictionaryDdlService {
 
     private static TableDefinition lifecycle(TableDefinition before, DictionaryVersion version, TableState state) {
         return new TableDefinition(before.id(), before.schemaId(), before.name(), version, state,
-                before.columns(), before.indexes(), before.storageBinding());
+                before.columns(), before.indexes(), before.storageBinding(), before.options());
     }
 
     private static List<ColumnDefinition> columns(CreateTableCommand command) {
@@ -939,6 +1537,38 @@ public final class DictionaryDdlService {
                         part.prefixBytes())).toList())).toList();
         return new StorageTableDefinition(tableId.value(), cn.zhangyis.db.domain.SpaceId.of(spaceId), path,
                 version.value(), command.initialSizeInPages(), storageColumns, storageIndexes);
+    }
+
+    /** 为 shadow target 组装全新 space/version 的完整 storage schema。 */
+    private static StorageTableDefinition storageDefinition(
+            TableId tableId, int spaceId, Path path, DictionaryVersion version,
+            List<ColumnDefinition> columns, List<IndexDefinition> indexes) {
+        List<StorageColumnDefinition> storageColumns = columns.stream().map(column ->
+                new StorageColumnDefinition(
+                        column.columnId(), column.name().displayName(), column.ordinal(),
+                        storageType(column.type()))).toList();
+        List<StorageIndexDefinition> storageIndexes = indexes.stream()
+                .map(DictionaryDdlService::storageIndex).toList();
+        return new StorageTableDefinition(
+                tableId.value(), cn.zhangyis.db.domain.SpaceId.of(spaceId), path,
+                version.value(), cn.zhangyis.db.domain.PageNo.of(64),
+                storageColumns, storageIndexes);
+    }
+
+    /** 将 committed table/binding 映射为 shadow scan 使用的 exact source row format。 */
+    private static StorageTableDefinition storageDefinition(TableDefinition table) {
+        TableStorageBinding binding = table.storageBinding().orElseThrow(() ->
+                new DictionaryDdlException(
+                        "ALTER source has no storage binding: " + table.id().value()));
+        List<StorageColumnDefinition> columns = table.columns().stream().map(column ->
+                new StorageColumnDefinition(
+                        column.columnId(), column.name().displayName(), column.ordinal(),
+                        storageType(column.type()))).toList();
+        return new StorageTableDefinition(
+                table.id().value(), binding.spaceId(), binding.path(),
+                binding.rowFormatVersion(), cn.zhangyis.db.domain.PageNo.of(1),
+                columns, table.indexes().stream()
+                .map(DictionaryDdlService::storageIndex).toList());
     }
 
     private static StorageColumnType storageType(ColumnTypeDefinition type) {
@@ -995,12 +1625,60 @@ public final class DictionaryDdlService {
         }
     }
 
-    /** 限制 DISCARD/IMPORT 外部路径在受控 tables 目录内，防止 DDL marker 携带任意文件路径。 */
+    /** 限制 DISCARD/IMPORT 外部路径在实例 transfer 根内，防止 DDL marker 携带任意文件路径。 */
     private Path checkedTransferPath(Path path) {
         Path normalized = path.toAbsolutePath().normalize();
-        if (!normalized.startsWith(tablesDirectory)) {
-            throw new DatabaseValidationException("tablespace transfer path escapes tables directory: " + normalized);
+        Path transferRoot = transferRoot();
+        if (!normalized.startsWith(transferRoot)) {
+            throw new DatabaseValidationException(
+                    "tablespace transfer path escapes controlled root: " + normalized);
         }
         return normalized;
+    }
+
+    /** 根据恢复可见 catalog 解析 table/space identity；调用方必须在后续 table X 内重新校验。 */
+    private TransferTarget transferTarget(QualifiedTableName name) {
+        if (name == null) {
+            throw new DatabaseValidationException("tablespace transfer table name must not be null");
+        }
+        SchemaDefinition schema = repository.findSchema(name.schema()).orElseThrow(() ->
+                new DictionaryObjectNotFoundException(
+                        "schema does not exist: " + name.schema().displayName()));
+        TableDefinition table = repository.findTableForRecovery(schema.id(), name.table()).orElseThrow(() ->
+                new DictionaryObjectNotFoundException("table does not exist: " + name.canonicalKey()));
+        TableStorageBinding binding = table.storageBinding().orElseThrow(() ->
+                new DictionaryDdlException(
+                        "tablespace transfer table has no physical binding: " + table.id().value()));
+        return new TransferTarget(table.id(), binding);
+    }
+
+    /** 形成携带 table/space identity 的固定文件名，避免管理员误把另一张表文件放入 incoming。 */
+    private Path transferPath(String bucket, TableId tableId, TableStorageBinding binding) {
+        return transferRoot().resolve(bucket).resolve(
+                "table_" + tableId.value() + "_space_" + binding.spaceId().value() + ".ibd");
+    }
+
+    /** transfer 根与 tables 目录同属实例目录，但不允许 canonical 在线文件与交换文件相互覆盖。 */
+    private Path transferRoot() {
+        Path instanceRoot = tablesDirectory.getParent();
+        if (instanceRoot == null) {
+            throw new DatabaseValidationException(
+                    "tables directory has no instance parent: " + tablesDirectory);
+        }
+        return instanceRoot.resolve("tablespace-transfer").toAbsolutePath().normalize();
+    }
+
+    /** 创建固定 transfer bucket；IO 失败必须阻止 DDL marker 引用尚不可用的目录。 */
+    private static void ensureTransferDirectory(Path directory) {
+        try {
+            Files.createDirectories(directory);
+        } catch (IOException failure) {
+            throw new DictionaryDdlException(
+                    "create tablespace transfer directory failed: " + directory, failure);
+        }
+    }
+
+    /** 路径预计算使用的不可变 identity；不是锁内权威状态。 */
+    private record TransferTarget(TableId tableId, TableStorageBinding binding) {
     }
 }

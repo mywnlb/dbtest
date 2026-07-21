@@ -20,13 +20,15 @@ import java.util.Optional;
  * @param columns 参与 {@code 构造} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
  * @param indexes 参与 {@code 构造} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
  * @param storageBinding 可选的 {@code storageBinding}；参数本身不得为 {@code null}，空 {@code Optional} 明确表示调用方未提供该领域值
+ * @param options 表级 comment 与默认 charset/collation
  */
 public record TableDefinition(TableId id, SchemaId schemaId, ObjectName name, DictionaryVersion version,
                               TableState state, List<ColumnDefinition> columns,
-                              List<IndexDefinition> indexes, Optional<TableStorageBinding> storageBinding) {
+                              List<IndexDefinition> indexes, Optional<TableStorageBinding> storageBinding,
+                              TableOptions options) {
     public TableDefinition {
         if (id == null || schemaId == null || name == null || version == null || state == null
-                || columns == null || indexes == null || storageBinding == null
+                || columns == null || indexes == null || storageBinding == null || options == null
                 || columns.isEmpty() || indexes.isEmpty()) {
             throw new DatabaseValidationException("table definition fields/columns/indexes must not be null or empty");
         }
@@ -73,10 +75,19 @@ public record TableDefinition(TableId id, SchemaId schemaId, ObjectName name, Di
         }
     }
 
+    /** 兼容旧 8 参调用点；新建生产表应显式使用 schema defaults。 */
+    public TableDefinition(TableId id, SchemaId schemaId, ObjectName name, DictionaryVersion version,
+                           TableState state, List<ColumnDefinition> columns,
+                           List<IndexDefinition> indexes, Optional<TableStorageBinding> storageBinding) {
+        this(id, schemaId, name, version, state, columns, indexes, storageBinding,
+                TableOptions.legacyDefaults());
+    }
+
     /** 兼容纯逻辑定义的构造器；只有物理 CREATE 完成后才由 DDL 协调器填入 binding。 */
     public TableDefinition(TableId id, SchemaId schemaId, ObjectName name, DictionaryVersion version,
                            TableState state, List<ColumnDefinition> columns, List<IndexDefinition> indexes) {
-        this(id, schemaId, name, version, state, columns, indexes, Optional.empty());
+        this(id, schemaId, name, version, state, columns, indexes, Optional.empty(),
+                TableOptions.legacyDefaults());
     }
 
     /** 返回唯一聚簇主键；构造器已经保证恰好一个。 */

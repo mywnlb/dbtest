@@ -178,6 +178,42 @@ public final class MvccReader {
     }
 
     /**
+     * READ UNCOMMITTED 聚簇读。它仍用短只读 MTR 物化结构稳定的当前记录，但不创建 ReadView、
+     * 不遍历 undo，也不等待事务锁；因此可能观察到其他 ACTIVE 事务尚未提交的最新版本。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验聚簇索引与完整搜索键，非法输入早于任何 page fix。</li>
+     *     <li>通过既有 including-deleted 点查在短 MTR 内复制当前记录并释放页资源。</li>
+     *     <li>当前记录不存在或已 delete-marked 时返回 empty，不尝试重建旧版本。</li>
+     *     <li>返回最新未标删记录快照；LOB hydration 仍由 gateway 在返回 SQL 行前完成。</li>
+     * </ol>
+     *
+     * @param index exact-version 聚簇索引；不得为 {@code null} 且必须为 clustered
+     * @param key 完整聚簇搜索键；不得为 {@code null}
+     * @return 当前最新未标删记录；不存在或当前已标删时为空
+     * @throws DatabaseValidationException 参数缺失或索引不是聚簇索引时抛出
+     */
+    public Optional<LogicalRecord> readUncommitted(BTreeIndex index, SearchKey key) {
+        // 1、RU 只改变版本选择，不放宽索引身份和 key 形状校验。
+        if (index == null || key == null) {
+            throw new DatabaseValidationException("read-uncommitted index/key must not be null");
+        }
+        if (!index.clustered()) {
+            throw new DatabaseValidationException(
+                    "read-uncommitted requires a clustered index: " + index.indexId());
+        }
+        // 2、复用短 MTR 当前版本物化纪律，返回前不持有 page latch/fix。
+        LogicalRecord current = lookupCurrentIncludingDeleted(index, key);
+        // 3、RU 不沿 undo 回退；最新 delete-mark 对它直接表示该行当前不存在。
+        if (current == null || current.deleted()) {
+            return Optional.empty();
+        }
+        // 4、LogicalRecord 已是物化快照，可安全交给 gateway 做 residual 与 LOB hydration。
+        return Optional.of(current);
+    }
+
+    /**
      * MTR-1：物化聚簇当前版本（含 delete-marked，T1.3f）。读完即提交释放 index latch；异常时
      * {@code rollbackUncommitted} 释放 MTR，避免线程残留绑定 MTR 致后续 {@code begin()} 失败。
      * <p>数据流：</p>

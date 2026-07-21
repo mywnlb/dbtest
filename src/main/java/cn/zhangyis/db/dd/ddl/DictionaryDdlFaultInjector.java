@@ -131,4 +131,28 @@ public interface DictionaryDdlFaultInjector {
      */
     default void afterDropDictionaryCommitted(TableDefinition dropped) {
     }
+
+    /**
+     * REBUILD PREPARED marker 已 durable、shadow 文件尚未创建。
+     *
+     * @param prepared 同时携带旧 binding 与新 space/path identity 的 marker
+     */
+    default void afterAlterPrepared(DdlLogRecord prepared) {
+    }
+
+    /**
+     * shadow rows/indexes/SDI 与 ENGINE_DONE marker 已 durable、committed DD 仍引用旧 binding。
+     *
+     * @param engineDone 恢复时可按旧 DD 精确删除 shadow 的 marker
+     */
+    default void afterAlterEngineDone(DdlLogRecord engineDone) {
+    }
+
+    /**
+     * 新 table aggregate 与 DICTIONARY_COMMITTED marker 已 durable、旧空间尚未删除。
+     *
+     * @param active committed DD 已引用 shadow binding 的 ACTIVE 表版本
+     */
+    default void afterAlterDictionaryCommitted(TableDefinition active) {
+    }
 }

@@ -45,10 +45,10 @@ import java.util.Optional;
  * marker MTR + redo fsync → 全局 flush/checkpoint barrier → Buffer Pool drain/invalidate → 物理 truncate+force →
  * page0/page2 空基线重建并持久化 → 最终状态持久化 → Registry 缩小快照发布。
  *
- * <p>与 MySQL/InnoDB 的简化差异：目标固定为新建时 initial size；不选择轮换 undo space，不实现 purge scheduler，
- * 也不迁移旧 UNDO（无生命周期头的文件明确拒绝）。
+ * <p>与 MySQL/InnoDB 的简化差异：目标固定为新建时 initial size；不选择轮换 undo space，purge scheduler 作为
+ * 独立协作者只调用本服务的稳定 attempt 端口；不迁移旧 UNDO（无生命周期头的文件明确拒绝）。
  */
-public final class UndoTablespaceTruncationService {
+public final class UndoTablespaceTruncationService implements UndoTruncationAttemptTarget {
 
     /**
      * 本对象持有的 {@code bufferPool} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
@@ -165,6 +165,98 @@ public final class UndoTablespaceTruncationService {
         this.rebuilder = new UndoTablespaceFspRebuilder(bufferPool, pageSize);
         // 4、完成初始状态发布；失败以领域异常终止构造，成功对象满足类级生命周期不变量。
         this.cachedSegmentCoordinator = cachedSegmentCoordinator;
+    }
+
+    /**
+     * 为后台 purge maintenance 零等待尝试自动截断当前单 UNDO 表空间。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验候选阈值并立即尝试 lifecycle X lease；普通访问或公平队列忙时不等待，返回 access deferred。</li>
+     *     <li>在 X lease 内读取 page0 持久 lifecycle 和物理文件大小；稳定空间按 persisted initial size 计算增长，
+     *     未达 extent 门槛直接跳过，已有 TRUNCATING 证据则忽略门槛继续续作。</li>
+     *     <li>对稳定候选非阻塞取得 reuse drain gate；history、active slot 或 transition busy 均在 marker/物理副作用前
+     *     返回具体 deferred，cache/free owner 则按既有有界批次真正回收。</li>
+     *     <li>复用严格 {@link #truncate(SpaceId, TablespaceState)} 协议完成 inode 复核、marker、flush、物理收缩与发布；
+     *     嵌套 X lease 是同线程可重入，异常继续保留原有 crash/fail-stop 边界。</li>
+     * </ol>
+     *
+     * @param spaceId 配置的系统 UNDO 表空间稳定身份；必须已打开并具有 lifecycle header
+     * @param minReclaimableExtents 相对持久 initial size 的最小增长 extent 数；必须严格为正
+     * @return 本轮完成、阈值跳过或无物理副作用 deferred 的不可变结果
+     * @throws DatabaseValidationException spaceId 为空或 extent 阈值非法时抛出，调用方应修正配置
+     * @throws UndoTablespaceTruncationException lifecycle、owner、WAL、flush 或物理 IO 无法安全继续时抛出；
+     *         调度器不得把这类错误降级为 deferred
+     */
+    @Override
+    public UndoTruncationAttemptResult tryTruncate(SpaceId spaceId, int minReclaimableExtents) {
+        // 1、自动维护不能排队阻塞普通 IO；配置错误必须在访问锁表前失败。
+        validateRequest(spaceId, TablespaceState.ACTIVE);
+        if (minReclaimableExtents <= 0) {
+            throw new DatabaseValidationException(
+                    "undo truncate min reclaimable extents must be positive: " + minReclaimableExtents);
+        }
+        var optionalLease = accessController.tryAcquireExclusive(spaceId);
+        if (optionalLease.isEmpty()) {
+            return UndoTruncationAttemptResult.incomplete(
+                    UndoTruncationAttemptStatus.DEFERRED_ACCESS_BUSY, 0L);
+        }
+
+        try (TablespaceAccessLease ignored = optionalLease.orElseThrow()) {
+            // 2、阈值只信任持久 initial size；配置中的 fresh size 不能覆盖 existing 文件创建时的真相。
+            Tablespace runtime = registry.requireForRecovery(spaceId).tablespace();
+            if (runtime.type() != TablespaceType.UNDO) {
+                throw new UndoTablespaceTruncationException(
+                        "only UNDO tablespace can use automatic undo truncation: " + spaceId.value());
+            }
+            ReadState read = readState(spaceId);
+            TablespaceLifecycleHeader lifecycle = read.lifecycle().orElseThrow(() ->
+                    new UndoTablespaceTruncationException(
+                            "legacy UNDO tablespace has no lifecycle header; offline migration is required: "
+                                    + spaceId.value()));
+            validateTarget(lifecycle);
+            long physicalPages = pageStore.currentSizeInPages(spaceId).value();
+            long initialPages = lifecycle.initialSizeInPages().value();
+            if (physicalPages < initialPages) {
+                throw new UndoTablespaceTruncationException(
+                        "UNDO file is smaller than persisted initial size: current=" + physicalPages
+                                + ", initial=" + initialPages);
+            }
+            long reclaimablePages = physicalPages - initialPages;
+            long thresholdPages;
+            try {
+                thresholdPages = Math.multiplyExact((long) minReclaimableExtents, pageSize.pagesPerExtent());
+            } catch (ArithmeticException overflow) {
+                throw new DatabaseValidationException("undo truncate extent threshold overflows page count", overflow);
+            }
+            boolean continuing = lifecycle.state() == TablespaceState.TRUNCATING
+                    || runtime.state() == TablespaceState.TRUNCATING;
+            if (!continuing && reclaimablePages < thresholdPages) {
+                return UndoTruncationAttemptResult.incomplete(
+                        UndoTruncationAttemptStatus.BELOW_THRESHOLD, reclaimablePages);
+            }
+
+            TablespaceState finishState = lifecycle.state() == TablespaceState.TRUNCATING
+                    ? lifecycle.finishState() : lifecycle.state();
+            if (!continuing) {
+                ensureStableSourceState(finishState);
+                // 3、normal deferral 与真实存储错误分流；只有 DRAINED 才能进入 marker 协议。
+                UndoReusableSegmentDrainStatus drain = cachedSegmentCoordinator.tryDrainStableSpace(spaceId);
+                UndoTruncationAttemptStatus deferred = switch (drain) {
+                    case DRAINED -> null;
+                    case DEFERRED_HISTORY -> UndoTruncationAttemptStatus.DEFERRED_HISTORY;
+                    case DEFERRED_ACTIVE_SLOTS -> UndoTruncationAttemptStatus.DEFERRED_ACTIVE_SLOTS;
+                    case DEFERRED_REUSE_BUSY -> UndoTruncationAttemptStatus.DEFERRED_REUSE_BUSY;
+                };
+                if (deferred != null) {
+                    return UndoTruncationAttemptResult.incomplete(deferred, reclaimablePages);
+                }
+            }
+
+            // 4、严格入口在同线程重入 X lease并重新校验全部物理证据；完成结果携带 durable epoch。
+            UndoTablespaceTruncationResult completion = truncate(spaceId, finishState);
+            return UndoTruncationAttemptResult.completed(reclaimablePages, completion);
+        }
     }
 
     /**

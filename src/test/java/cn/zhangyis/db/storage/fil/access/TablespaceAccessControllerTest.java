@@ -53,6 +53,24 @@ class TablespaceAccessControllerTest {
         }
     }
 
+    /** maintenance 的零等待 X lease 在普通 S owner 存在时必须立即返回 empty，且不能影响 owner 后续释放。 */
+    @Test
+    void tryExclusiveReturnsEmptyWithoutWaitingForSharedOwner() {
+        TablespaceAccessController controller = new TablespaceAccessController(Duration.ofSeconds(2));
+        SpaceId spaceId = SpaceId.of(80);
+        try (TablespaceAccessLease ignored = controller.acquireShared(spaceId)) {
+            long started = System.nanoTime();
+
+            assertTrue(controller.tryAcquireExclusive(spaceId).isEmpty());
+            assertTrue(System.nanoTime() - started < Duration.ofMillis(250).toNanos(),
+                    "zero-wait maintenance lease must not consume the configured two-second timeout");
+        }
+
+        try (TablespaceAccessLease ignored = controller.tryAcquireExclusive(spaceId).orElseThrow()) {
+            // 共享 owner 释放后应立即取得独占 lease；try-with-resources 同时验证 owner 线程释放路径。
+        }
+    }
+
     /** 跨线程 close 必须被拒绝且不能把 lease 标成已释放，owner 随后仍能正常关闭。 */
     @Test
     void leaseCannotBeClosedByAnotherThread() {

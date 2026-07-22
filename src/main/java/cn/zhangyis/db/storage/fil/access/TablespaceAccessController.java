@@ -4,6 +4,7 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.SpaceId;
 
 import java.time.Duration;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
@@ -100,6 +101,37 @@ public final class TablespaceAccessController {
     }
 
     /**
+     * 为后台维护立即尝试取得公平独占 lease。
+     *
+     * <p>该入口使用零时长 timed {@code tryLock}，既不进入无界等待，也遵守公平锁上已经排队的普通 owner；
+     * 返回 empty 表示本轮维护应释放其它短资源并在未来 cycle 重试，不能把竞争解释为存储错误。</p>
+     *
+     * @param spaceId 待维护表空间的稳定标识；不得为 {@code null}
+     * @return 当前线程取得的独占 lease，竞争存在时为空；从不返回 Java {@code null}
+     * @throws DatabaseValidationException spaceId 为空时抛出，调用方应修正请求
+     * @throws TablespaceAccessTimeoutException 零等待过程中线程被中断时抛出；中断标志被恢复且未取得 lease
+     */
+    public Optional<TablespaceAccessLease> tryAcquireExclusive(SpaceId spaceId) {
+        // 1、在创建分片锁前拒绝无身份请求，避免锁表残留无领域意义的键。
+        requireSpaceId(spaceId);
+        // 2、复用同一公平锁；timed tryLock(0) 不越过已排队 owner，也不等待当前共享 owner。
+        ReentrantReadWriteLock rw = locks.computeIfAbsent(spaceId, ignored -> new ReentrantReadWriteLock(true));
+        Lock lock = rw.writeLock();
+        try {
+            if (!lock.tryLock(0L, TimeUnit.NANOSECONDS)) {
+                return Optional.empty();
+            }
+        } catch (InterruptedException interrupted) {
+            // 3、中断没有获得 ownership；保留标志并把取消边界交给后台 driver。
+            Thread.currentThread().interrupt();
+            throw new TablespaceAccessTimeoutException(
+                    "interrupted trying exclusive tablespace lease: " + spaceId.value(), interrupted);
+        }
+        // 4、成功路径与阻塞 API 共用 owner-bound lease，确保异常和重复 close 只解锁一次。
+        return Optional.of(lease(lock));
+    }
+
+    /**
      * 在目标表空间的公平读写锁上获取指定模式，并把解锁动作封装为线程绑定 lease。
      *
      * <p>数据流：</p>
@@ -120,9 +152,7 @@ public final class TablespaceAccessController {
      */
     private TablespaceAccessLease acquire(SpaceId spaceId, boolean exclusive) {
         // 1. 无效标识没有可保护的物理资源，必须在创建分片锁之前失败。
-        if (spaceId == null) {
-            throw new DatabaseValidationException("tablespace access space id must not be null");
-        }
+        requireSpaceId(spaceId);
 
         // 2. 同一 SpaceId 始终复用公平锁；不同表空间的普通 IO 与维护操作可并行。
         ReentrantReadWriteLock rw = locks.computeIfAbsent(spaceId, ignored -> new ReentrantReadWriteLock(true));
@@ -141,6 +171,11 @@ public final class TablespaceAccessController {
         }
 
         // 4. 将 owner 和一次性释放门封装进 lease，保证异常清理及重复 close 的解锁语义稳定。
+        return lease(lock);
+    }
+
+    /** 把已经取得的锁封装为线程绑定、幂等关闭 lease；调用方必须先成功获得对应锁。 */
+    private static TablespaceAccessLease lease(Lock lock) {
         Thread owner = Thread.currentThread();
         AtomicBoolean closed = new AtomicBoolean();
         return () -> {
@@ -151,5 +186,12 @@ public final class TablespaceAccessController {
                 lock.unlock();
             }
         };
+    }
+
+    /** 在访问分片锁映射前验证物理身份，失败不留下锁实例。 */
+    private static void requireSpaceId(SpaceId spaceId) {
+        if (spaceId == null) {
+            throw new DatabaseValidationException("tablespace access space id must not be null");
+        }
     }
 }

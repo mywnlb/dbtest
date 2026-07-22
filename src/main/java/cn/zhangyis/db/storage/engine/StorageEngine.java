@@ -28,9 +28,11 @@ import cn.zhangyis.db.storage.api.lob.LobStorage;
 import cn.zhangyis.db.storage.api.dml.ClusteredDmlService;
 import cn.zhangyis.db.storage.api.dml.TableDmlService;
 import cn.zhangyis.db.storage.api.tablespace.PageZeroTablespaceMetadataLoader;
+import cn.zhangyis.db.storage.api.undotruncate.PurgeDrivenUndoTruncationScheduler;
 import cn.zhangyis.db.storage.api.undotruncate.UndoTablespaceTruncationRecovery;
 import cn.zhangyis.db.storage.api.undotruncate.UndoTablespaceTruncationService;
 import cn.zhangyis.db.storage.api.undotruncate.UndoTruncationFaultInjector;
+import cn.zhangyis.db.storage.api.undotruncate.UndoTruncationMetricsSnapshot;
 import cn.zhangyis.db.storage.api.undotruncate.UndoReusableSegmentTruncationCoordinator;
 import cn.zhangyis.db.storage.btree.BTreeIndex;
 import cn.zhangyis.db.storage.btree.BTreeCurrentReadService;
@@ -332,6 +334,12 @@ public final class StorageEngine {
     private PurgeDriverWorker purgeDriverWorker;
     /** 前台测试、后台 driver 与 recovery RESUME_PURGE 共用的单线程协调器；无索引 metadata 时为空。 */
     private PurgeCoordinator purgeCoordinator;
+    /** recovery 与 live 自动截断共享的 cache/free drain 协调器，避免各自维护不同的 reuse owner 视图。 */
+    private UndoReusableSegmentTruncationCoordinator undoReusableSegmentTruncationCoordinator;
+    /** recovery 续作与 purge cycle 尝试共享的 crash-safe truncate service。 */
+    private UndoTablespaceTruncationService undoTablespaceTruncationService;
+    /** 复用 purge driver 线程的自动截断调度器；只保存内存 cooldown 与原子观测快照。 */
+    private PurgeDrivenUndoTruncationScheduler undoTruncationScheduler;
     /**
      * 本对象持有的 {@code flushService} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
      */
@@ -624,6 +632,16 @@ public final class StorageEngine {
                 config.maxExternalUndoPayloadPages());
         this.undoSegmentFinalizer = new UndoSegmentFinalizer(miniTransactionManager, undoAccess, undoAllocator,
                 rsegHeaderRepo, rollbackSlots, undoSegmentReuse);
+        this.undoReusableSegmentTruncationCoordinator = new UndoReusableSegmentTruncationCoordinator(
+                miniTransactionManager, undoAccess, undoAllocator, rsegHeaderRepo,
+                rollbackSlots.rollbackSegmentId(), config.slotCapacity(),
+                config.undoCachedSegmentsPerKind(), undoSegmentReuse);
+        this.undoTablespaceTruncationService = new UndoTablespaceTruncationService(
+                pool, store, config.pageSize(), registry, accessController, miniTransactionManager,
+                flushService, config.flushTimeout(), UndoTruncationFaultInjector.none(),
+                undoReusableSegmentTruncationCoordinator);
+        this.undoTruncationScheduler = new PurgeDrivenUndoTruncationScheduler(
+                config.undoTruncationConfig(), config.undoSpaceId(), undoTablespaceTruncationService);
         this.undoLogManager = new UndoLogManager(undoAccess, rollbackSlots, config.undoSpaceId(), history,
                 rsegHeaderRepo, undoSegmentFinalizer, undoSegmentReuse);
         this.indexPageAccess = new IndexPageAccess(pool, config.pageSize(), registry);
@@ -1568,15 +1586,8 @@ public final class StorageEngine {
      * 最后发布 registry 状态；若这些依赖不是同一实例，普通准入看到的生命周期状态会与恢复写入脱节。
      */
     private UndoTablespaceTruncationRecovery buildUndoTablespaceRecovery() {
-        UndoReusableSegmentTruncationCoordinator cachedSegmentCoordinator =
-                new UndoReusableSegmentTruncationCoordinator(miniTransactionManager, undoAccess, undoAllocator,
-                        rsegHeaderRepo, rollbackSlots.rollbackSegmentId(), config.slotCapacity(),
-                        config.undoCachedSegmentsPerKind(), undoSegmentReuse);
-        UndoTablespaceTruncationService truncationService = new UndoTablespaceTruncationService(
-                pool, store, config.pageSize(), registry, accessController, miniTransactionManager,
-                flushService, config.flushTimeout(), UndoTruncationFaultInjector.none(), cachedSegmentCoordinator);
         return new UndoTablespaceTruncationRecovery(Set.of(config.undoSpaceId()), store, config.pageSize(),
-                registry, redo, truncationService);
+                registry, redo, undoTablespaceTruncationService);
     }
 
     /**
@@ -1648,7 +1659,8 @@ public final class StorageEngine {
             return;
         }
         purgeDriverWorker = new PurgeDriverWorker(
-                purgeCoordinator, config.slotCapacity(), config.backgroundFlushInterval());
+                purgeCoordinator, config.slotCapacity(), config.backgroundFlushInterval(),
+                undoTruncationScheduler);
         purgeDriverWorker.start();
     }
 
@@ -2352,6 +2364,19 @@ public final class StorageEngine {
             return new PageCleanerMetricsSnapshot(PageCleanerState.NEW, 0, 0, 0, false, "", 0, 0);
         }
         return pageCleanerSupervisor.metricsSnapshot();
+    }
+
+    /**
+     * 返回 purge 驱动自动 undo 截断的原子观测快照。查询不要求 engine 已 OPEN；构造前返回与配置一致的
+     * NEVER_RUN/DISABLED 初始状态，close 后仍保留最后完成 epoch 或失败诊断。
+     *
+     * @return 自洽的候选检查、延期、完成、失败与累计回收页统计
+     */
+    public UndoTruncationMetricsSnapshot undoTruncationMetrics() {
+        if (undoTruncationScheduler == null) {
+            return UndoTruncationMetricsSnapshot.initial(config.undoTruncationConfig().enabled());
+        }
+        return undoTruncationScheduler.metricsSnapshot();
     }
 
     /**

@@ -17,7 +17,8 @@ import java.util.concurrent.locks.ReentrantLock;
  *
  * <p>形态沿用 page cleaner / redo flusher worker：单 daemon 线程 + {@code ReentrantLock} + {@code Condition} +
  * 状态枚举，无 {@code synchronized}。{@code runBatch} 无工作时是廉价 no-op（空队列 + boundary 停批），故不设空转跳过。
- * runBatch 抛领域异常即 FAILED 停机，不重试自旋。
+ * runBatch 抛领域异常即 FAILED 停机，不重试自旋。成功 batch 后的 maintenance 仍属于同一 in-flight cycle：
+ * STOPPING 与 maintenance claim 在 worker 锁下定序，已 claim 回调不接受强制中断，真实失败必须保留为 FAILED。
  *
  * <p><b>并发归属</b>：{@code state}/{@code purgeRequested}/{@code inFlight}/{@code lastSummary}/{@code failure} 由
  * {@code lock} 保护；{@link PurgeTarget#runBatch} 在锁外执行（其内部 MTR/页 latch 不嵌套 worker 锁）。
@@ -31,6 +32,8 @@ public final class PurgeDriverWorker implements AutoCloseable {
 
     /** purge 驱动端口。 */
     private final PurgeTarget target;
+    /** 成功 batch 后、全部 purge 物理资源释放后的维护回调；由同一 driver 线程执行。 */
+    private final PurgeCycleMaintenance maintenance;
     /** 每批最多处理的 committed undo log 数。 */
     private final int maxPerBatch;
     /** 空闲等待间隔；即使无 signal 也周期醒来跑一批并检查停止。 */
@@ -87,9 +90,23 @@ public final class PurgeDriverWorker implements AutoCloseable {
      * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public PurgeDriverWorker(PurgeTarget target, int maxPerBatch, Duration idleWait) {
+        this(target, maxPerBatch, idleWait, ignored -> { });
+    }
+
+    /**
+     * 创建带 post-batch maintenance 的 purge driver；maintenance 与 batch 共用 in-flight/stop 生命周期。
+     *
+     * @param target purge 批次端口；不得为 {@code null}
+     * @param maxPerBatch 每批最多处理的 committed history log 数；必须为正
+     * @param idleWait 周期 tick 的正等待间隔
+     * @param maintenance 成功批次后的维护回调；不得为 {@code null}，失败会使 driver 进入 FAILED
+     * @throws DatabaseValidationException 依赖为空或边界非法时抛出，不创建线程
+     */
+    public PurgeDriverWorker(PurgeTarget target, int maxPerBatch, Duration idleWait,
+                             PurgeCycleMaintenance maintenance) {
         // 1、校验必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝非法组合。
-        if (target == null || idleWait == null) {
-            throw new DatabaseValidationException("purge driver target/idle wait must not be null");
+        if (target == null || idleWait == null || maintenance == null) {
+            throw new DatabaseValidationException("purge driver target/idle wait/maintenance must not be null");
         }
         // 2、完成跨参数校验并推导不可变配置；后续失败仍由当前构造路径收口已创建资源。
         if (maxPerBatch <= 0) {
@@ -100,6 +117,7 @@ public final class PurgeDriverWorker implements AutoCloseable {
         }
         // 3、绑定已校验协作者并初始化本对象拥有的状态、显式锁、队列或缓存，不允许半初始化实例逃逸。
         this.target = target;
+        this.maintenance = maintenance;
         this.maxPerBatch = maxPerBatch;
         // 4、完成初始状态发布；失败以领域异常终止构造，成功对象满足类级生命周期不变量。
         this.idleWaitNanos = timeoutNanos(idleWait);
@@ -256,14 +274,35 @@ public final class PurgeDriverWorker implements AutoCloseable {
         stop(Duration.ofSeconds(5));
     }
 
+    /**
+     * 周期驱动 purge 与 post-batch maintenance，并在线程终止时发布唯一终态。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>在 worker 锁下等待请求、周期 tick 或 STOPPING；只有取得 batch ownership 才把 inFlight 置位。</li>
+     *     <li>锁外调用 purge target；成功返回意味着 worker token、row guard、history lease 与 MTR 已释放。</li>
+     *     <li>重新取得 worker 锁线性化 maintenance claim；STOPPING 先发布则保留 summary 并直接结束线程。</li>
+     *     <li>锁外运行 maintenance 后发布完整 cycle；purge/maintenance 领域失败按停止原因区分正常取消与 FAILED。</li>
+     *     <li>finally 在 worker 锁下清理 inFlight、发布 STOPPED（除非已经 FAILED）并唤醒全部有界等待者。</li>
+     * </ol>
+     */
     private void runLoop() {
         try {
             while (true) {
+                // 1、等待阶段不持任何 purge/FSP 资源；返回 false 表示 STOPPING 已先取得线性化顺序。
                 if (!takeWorkOrStop()) {
                     return;
                 }
                 try {
+                    // 2、purge target 完整释放记录级资源后才返回稳定 summary，maintenance 不与 worker token 交叠。
                     PurgeSummary summary = target.runBatch(maxPerBatch);
+                    // 3、stop 先发布时不再开始新的物理维护；summary 仍作为最后一个成功 purge batch 发布。
+                    if (!claimMaintenance()) {
+                        markCycleComplete(summary);
+                        return;
+                    }
+                    // 4、已 claim 回调自然完成；其真实失败即使与随后 STOPPING 交叠也不能被吞掉。
+                    maintenance.afterSuccessfulBatch(summary);
                     markCycleComplete(summary);
                 } catch (DatabaseRuntimeException e) {
                     markFailedUnlessStopping(e);
@@ -271,6 +310,7 @@ public final class PurgeDriverWorker implements AutoCloseable {
                 }
             }
         } finally {
+            // 5、终止信号只发布一次；FAILED 保留根因，普通 STOPPING/自然退出统一收敛为 STOPPED。
             lock.lock();
             try {
                 if (state != PurgeDriverWorkerState.FAILED) {
@@ -282,6 +322,21 @@ public final class PurgeDriverWorker implements AutoCloseable {
             } finally {
                 lock.unlock();
             }
+        }
+    }
+
+    /**
+     * 在线性化锁下决定本轮是否开始 post-batch maintenance。STOPPING 先发布则拒绝；claim 先完成则 shutdown
+     * 只等待该维护自然结束，不能在线程进入 truncate 物理阶段后中断。
+     *
+     * @return 当前 cycle 已取得 maintenance ownership 时为 {@code true}；STOPPING 已先发布时为 {@code false}
+     */
+    private boolean claimMaintenance() {
+        lock.lock();
+        try {
+            return state != PurgeDriverWorkerState.STOPPING;
+        } finally {
+            lock.unlock();
         }
     }
 
@@ -331,11 +386,16 @@ public final class PurgeDriverWorker implements AutoCloseable {
         }
     }
 
-    /** shutdown 已先发布 STOPPING 时，target 的取消异常属于正常退出，不得覆盖为业务 FAILED。 */
+    /**
+     * 发布 purge 或 maintenance 失败。只有 shutdown 已先发布 STOPPING 且错误是 worker 取消时才按正常退出；
+     * 其它错误都保留根因并进入 FAILED，防止物理 truncate 错误被关闭流程掩盖。
+     *
+     * @param error target 或 maintenance 抛出的项目领域异常；不得为 {@code null}
+     */
     private void markFailedUnlessStopping(DatabaseRuntimeException error) {
         lock.lock();
         try {
-            if (state == PurgeDriverWorkerState.STOPPING) {
+            if (state == PurgeDriverWorkerState.STOPPING && error instanceof PurgeWorkerStoppedException) {
                 inFlight = false;
                 idleChanged.signalAll();
                 return;

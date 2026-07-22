@@ -383,6 +383,21 @@ class UndoTablespaceTruncationServiceTest {
                     mtrManager, flushService, Duration.ofSeconds(2), faultInjector, undo.coordinator());
         }
 
+        /** 读取 page0 持久 lifecycle；返回前提交只读 MTR，测试断言不继承 page latch 或 tablespace lease。 */
+        private TablespaceLifecycleHeader readLifecycle() {
+            MiniTransaction read = mtrManager.beginReadOnly();
+            try {
+                TablespaceLifecycleHeader lifecycle = headerRepo.readLifecycle(read, SPACE).orElseThrow();
+                mtrManager.commit(read);
+                return lifecycle;
+            } catch (RuntimeException failure) {
+                if (read.state() == cn.zhangyis.db.storage.mtr.MiniTransactionState.ACTIVE) {
+                    mtrManager.rollbackUncommitted(read);
+                }
+                throw failure;
+            }
+        }
+
         @Override
         public void close() {
             pool.close();
@@ -480,6 +495,128 @@ class UndoTablespaceTruncationServiceTest {
             assertEquals(1L, unchanged.historyBase().length(),
                     "history 拒绝必须发生在 truncate marker 与物理文件收缩之前");
             assertEquals(sizeBefore, fixture.store.currentSizeInPages(SPACE));
+        }
+    }
+
+    /** 自动尝试在未增长到一个 extent 时只返回阈值跳过，不推进 epoch 或写 marker。 */
+    @Test
+    void tryTruncateSkipsSpaceBelowExtentThreshold() {
+        try (Fixture fixture = new Fixture(dir.resolve("auto-threshold"))) {
+            UndoTruncationAttemptResult result = fixture.service(UndoTruncationFaultInjector.none())
+                    .tryTruncate(SPACE, 1);
+
+            assertEquals(UndoTruncationAttemptStatus.BELOW_THRESHOLD, result.status());
+            assertEquals(0L, result.observedReclaimablePages());
+            assertTrue(result.completion().isEmpty());
+            assertEquals(0L, fixture.readLifecycle().truncateEpoch());
+        }
+    }
+
+    /** 自动尝试遇到 active slot 时返回 deferred，并且不能为了候选检查先清掉已有 cache owner。 */
+    @Test
+    void tryTruncateDefersActiveSlotsWithoutDrainingCache() {
+        try (Fixture fixture = new Fixture(dir.resolve("auto-active"))) {
+            fixture.growUndoSpace();
+            fixture.undo.appendActiveInsert(31);
+            Transaction cached = fixture.undo.appendActiveInsert(30);
+            var cachedPage = cached.undoContext().binding(UndoLogKind.INSERT).firstPageId();
+            fixture.undo.commit(cached);
+
+            UndoTruncationAttemptResult result = fixture.service(UndoTruncationFaultInjector.none())
+                    .tryTruncate(SPACE, 1);
+
+            assertEquals(UndoTruncationAttemptStatus.DEFERRED_ACTIVE_SLOTS, result.status());
+            assertEquals(List.of(cachedPage), fixture.undo.snapshot().cachedInsertSegments());
+            assertEquals(0L, fixture.readLifecycle().truncateEpoch());
+        }
+    }
+
+    /** 自动尝试遇到 persistent history 时返回 deferred，history 与物理文件都保持原状。 */
+    @Test
+    void tryTruncateDefersPersistentHistory() {
+        try (Fixture fixture = new Fixture(dir.resolve("auto-history"))) {
+            fixture.growUndoSpace();
+            Transaction update = fixture.undo.appendActiveUpdate(32);
+            fixture.undo.commit(update);
+            PageNo before = fixture.store.currentSizeInPages(SPACE);
+
+            UndoTruncationAttemptResult result = fixture.service(UndoTruncationFaultInjector.none())
+                    .tryTruncate(SPACE, 1);
+
+            assertEquals(UndoTruncationAttemptStatus.DEFERRED_HISTORY, result.status());
+            assertEquals(1L, fixture.undo.snapshot().historyBase().length());
+            assertEquals(before, fixture.store.currentSizeInPages(SPACE));
+        }
+    }
+
+    /** reuse transition 已跨出短锁时只返回 deferred，不能在 lifecycle X 下等待形成锁环。 */
+    @Test
+    void tryTruncateDefersBusyReuseTransition() {
+        try (Fixture fixture = new Fixture(dir.resolve("auto-reuse-busy"))) {
+            fixture.growUndoSpace();
+            try (UndoSegmentReuseDirectory.DrainLease ignored =
+                         fixture.undo.cache().tryBeginDrain().orElseThrow()) {
+                UndoTruncationAttemptResult result = fixture.service(UndoTruncationFaultInjector.none())
+                        .tryTruncate(SPACE, 1);
+
+                assertEquals(UndoTruncationAttemptStatus.DEFERRED_REUSE_BUSY, result.status());
+                assertEquals(0L, fixture.readLifecycle().truncateEpoch());
+            }
+        }
+    }
+
+    /** 普通访问占有 S lease 时自动维护必须零等待返回，而不是消耗 service 的 flush timeout。 */
+    @Test
+    void tryTruncateDefersBusyTablespaceLease() {
+        try (Fixture fixture = new Fixture(dir.resolve("auto-access-busy"))) {
+            fixture.growUndoSpace();
+            try (var ignored = fixture.accessController.acquireShared(SPACE)) {
+                UndoTruncationAttemptResult result = fixture.service(UndoTruncationFaultInjector.none())
+                        .tryTruncate(SPACE, 1);
+
+                assertEquals(UndoTruncationAttemptStatus.DEFERRED_ACCESS_BUSY, result.status());
+                assertEquals(0L, fixture.readLifecycle().truncateEpoch());
+            }
+        }
+    }
+
+    /** 空 page3 候选应复用既有 crash-safe 协议完成截断并返回 epoch 与回收页数。 */
+    @Test
+    void tryTruncateCompletesEligibleSpace() {
+        try (Fixture fixture = new Fixture(dir.resolve("auto-complete"))) {
+            fixture.growUndoSpace();
+            long before = fixture.store.currentSizeInPages(SPACE).value();
+
+            UndoTruncationAttemptResult result = fixture.service(UndoTruncationFaultInjector.none())
+                    .tryTruncate(SPACE, 1);
+
+            assertEquals(UndoTruncationAttemptStatus.COMPLETED, result.status());
+            assertEquals(before - 64L, result.observedReclaimablePages());
+            assertEquals(1L, result.completion().orElseThrow().truncateEpoch());
+            assertEquals(PageNo.of(64), fixture.store.currentSizeInPages(SPACE));
+        }
+    }
+
+    /** durable TRUNCATING marker 的续作优先于当前阈值；配置收紧不能把半完成物理协议永久搁置。 */
+    @Test
+    void tryTruncateResumesDurableMarkerEvenBelowCurrentThreshold() {
+        try (Fixture fixture = new Fixture(dir.resolve("auto-resume-marker"))) {
+            fixture.growUndoSpace();
+            UndoTruncationFaultInjector stopAfterMarker = phase -> {
+                if (phase == UndoTruncationPhase.AFTER_MARKER_DURABLE) {
+                    throw new SimulatedTruncationCrashException("stop after durable marker");
+                }
+            };
+            assertThrows(SimulatedTruncationCrashException.class,
+                    () -> fixture.service(stopAfterMarker).truncate(SPACE, TablespaceState.ACTIVE));
+            assertEquals(TablespaceState.TRUNCATING, fixture.readLifecycle().state());
+
+            UndoTruncationAttemptResult result = fixture.service(UndoTruncationFaultInjector.none())
+                    .tryTruncate(SPACE, 100);
+
+            assertEquals(UndoTruncationAttemptStatus.COMPLETED, result.status());
+            assertEquals(1L, result.completion().orElseThrow().truncateEpoch());
+            assertEquals(PageNo.of(64), fixture.store.currentSizeInPages(SPACE));
         }
     }
 

@@ -4,6 +4,8 @@ import cn.zhangyis.db.common.exception.DatabaseRuntimeException;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
 
@@ -90,6 +92,96 @@ class PurgeDriverWorkerTest {
         }
     }
 
+    /** 成功 batch 即使没有 purge 进展也必须调用 maintenance，随后才发布完整 cycle summary。 */
+    @Test
+    void successfulBatchInvokesMaintenance() {
+        FakeTarget target = new FakeTarget();
+        AtomicInteger maintenanceCalls = new AtomicInteger();
+        PurgeDriverWorker worker = new PurgeDriverWorker(target, 16, Duration.ofMillis(20),
+                summary -> maintenanceCalls.incrementAndGet());
+        worker.start();
+        try {
+            assertTrue(awaitUntil(() -> maintenanceCalls.get() >= 1 && worker.lastSummary().isPresent(),
+                    Duration.ofSeconds(2)));
+            assertTrue(worker.lastSummary().isPresent());
+        } finally {
+            worker.stop(Duration.ofSeconds(2));
+        }
+    }
+
+    /** purge batch 自身失败时没有稳定 post-batch 边界，maintenance 不得运行。 */
+    @Test
+    void purgeFailureSkipsMaintenance() {
+        FakeTarget target = new FakeTarget();
+        target.failWith = new DatabaseRuntimeException("induced purge failure");
+        AtomicInteger maintenanceCalls = new AtomicInteger();
+        PurgeDriverWorker worker = new PurgeDriverWorker(target, 16, Duration.ofMillis(20),
+                summary -> maintenanceCalls.incrementAndGet());
+        worker.start();
+        try {
+            assertTrue(awaitUntil(() -> worker.state() == PurgeDriverWorkerState.FAILED,
+                    Duration.ofSeconds(2)));
+            assertEquals(0, maintenanceCalls.get());
+        } finally {
+            worker.stop(Duration.ofSeconds(2));
+        }
+    }
+
+    /** STOPPING 先于 purge 返回线性化时跳过尚未 claim 的 truncate maintenance。 */
+    @Test
+    void stopPublishedBeforeBatchReturnsSkipsMaintenance() throws Exception {
+        CountDownLatch batchEntered = new CountDownLatch(1);
+        CountDownLatch releaseBatch = new CountDownLatch(1);
+        PurgeTarget target = maxLogs -> {
+            batchEntered.countDown();
+            awaitLatch(releaseBatch);
+            return new PurgeSummary(0, 0, 0, 0, 0);
+        };
+        AtomicInteger maintenanceCalls = new AtomicInteger();
+        PurgeDriverWorker worker = new PurgeDriverWorker(target, 16, Duration.ofMillis(20),
+                summary -> maintenanceCalls.incrementAndGet());
+        worker.start();
+        try {
+            assertTrue(batchEntered.await(2, TimeUnit.SECONDS));
+
+            worker.requestStop();
+            releaseBatch.countDown();
+
+            assertTrue(worker.awaitStopped(Duration.ofSeconds(2)));
+            assertEquals(PurgeDriverWorkerState.STOPPED, worker.state());
+            assertEquals(0, maintenanceCalls.get());
+        } finally {
+            releaseBatch.countDown();
+            worker.stop(Duration.ofSeconds(2));
+        }
+    }
+
+    /** 已 claim 的 maintenance 不接受 stop 中断；其真实失败即使发生于 STOPPING 也必须保留为 FAILED。 */
+    @Test
+    void maintenanceFailureDuringStopRemainsFailed() throws Exception {
+        CountDownLatch maintenanceEntered = new CountDownLatch(1);
+        CountDownLatch releaseMaintenance = new CountDownLatch(1);
+        PurgeDriverWorker worker = new PurgeDriverWorker(new FakeTarget(), 16, Duration.ofMillis(20), summary -> {
+            maintenanceEntered.countDown();
+            awaitLatch(releaseMaintenance);
+            throw new DatabaseRuntimeException("truncate failed after claim");
+        });
+        worker.start();
+        try {
+            assertTrue(maintenanceEntered.await(2, TimeUnit.SECONDS));
+
+            worker.requestStop();
+            releaseMaintenance.countDown();
+
+            assertTrue(worker.awaitStopped(Duration.ofSeconds(2)));
+            assertEquals(PurgeDriverWorkerState.FAILED, worker.state());
+            assertTrue(worker.failure().orElseThrow().getMessage().contains("truncate failed"));
+        } finally {
+            releaseMaintenance.countDown();
+            worker.stop(Duration.ofSeconds(2));
+        }
+    }
+
     private static boolean awaitUntil(BooleanSupplier cond, Duration timeout) {
         long deadline = System.nanoTime() + timeout.toNanos();
         while (System.nanoTime() < deadline) {
@@ -104,6 +196,18 @@ class PurgeDriverWorkerTest {
             }
         }
         return cond.getAsBoolean();
+    }
+
+    /** 测试线程等待显式闩锁；中断恢复标志并以项目异常结束，避免静默继续场景。 */
+    private static void awaitLatch(CountDownLatch latch) {
+        try {
+            if (!latch.await(2, TimeUnit.SECONDS)) {
+                throw new DatabaseRuntimeException("test latch timed out");
+            }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new DatabaseRuntimeException("test latch interrupted", interrupted);
+        }
     }
 
     /** 测试用 purge 端口：计数 runBatch，可注入失败。 */

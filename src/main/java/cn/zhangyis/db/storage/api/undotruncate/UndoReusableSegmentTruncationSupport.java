@@ -115,20 +115,54 @@ class UndoReusableSegmentTruncationSupport {
      * @throws UndoTablespaceNotEmptyException 日志或数据持久化协作失败时抛出；调用方不得确认提交、推进安全边界或清除未完成状态
      */
     public void drainStableSpace(SpaceId spaceId) {
+        UndoReusableSegmentDrainStatus status = tryDrainStableSpace(spaceId);
+        switch (status) {
+            case DRAINED -> {
+                return;
+            }
+            case DEFERRED_HISTORY -> throw new UndoTablespaceNotEmptyException(
+                    "UNDO rollback segment history is not empty: space=" + spaceId.value());
+            case DEFERRED_ACTIVE_SLOTS -> throw new UndoTablespaceNotEmptyException(
+                    "UNDO rollback segment still owns active slots: space=" + spaceId.value());
+            case DEFERRED_REUSE_BUSY -> throw new UndoTablespaceTruncationException(
+                    "undo reuse transition is in progress; release lifecycle X lease and retry truncate");
+        }
+    }
+
+    /**
+     * 为后台调度非阻塞地判断并排空 stable space reusable owner。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>零等待取得 reuse directory 全局 drain gate；竞争失败不读取或修改 page3。</li>
+     *     <li>读取 page3 持久快照，history/active 任一非空即在物理修改前释放 gate并返回 deferred。</li>
+     *     <li>交叉校验运行期 cache/free 投影，按有界批次 drop FSP owner 并原子更新 page3。</li>
+     *     <li>复核持久 owner 全空后发布 drain 完成；越过物理边界的失败继续沿既有 fatal fence 抛出。</li>
+     * </ol>
+     *
+     * @param spaceId 当前单 rseg 所属的 UNDO 表空间；不得为 {@code null}
+     * @return DRAINED 或无物理副作用的具体 deferred 原因
+     * @throws UndoReusableSegmentDrainException FSP/page3 修改越过物理边界后失败时抛出，owner 必须 fail-stop
+     * @throws UndoTablespaceTruncationException owner 格式、运行期投影或持久证据不一致时抛出
+     */
+    UndoReusableSegmentDrainStatus tryDrainStableSpace(SpaceId spaceId) {
+        // 1、候选只接受当前显式 undo space；gate busy 是正常并发结果，不能在 lifecycle X 下等待。
         requireSpace(spaceId);
-        UndoSegmentReuseDirectory.DrainLease drain = reuseDirectory.tryBeginDrain().orElseThrow(() ->
-                new UndoTablespaceTruncationException(
-                        "undo reuse transition is in progress; release lifecycle X lease and retry truncate"));
+        var optionalDrain = reuseDirectory.tryBeginDrain();
+        if (optionalDrain.isEmpty()) {
+            return UndoReusableSegmentDrainStatus.DEFERRED_REUSE_BUSY;
+        }
+        UndoSegmentReuseDirectory.DrainLease drain = optionalDrain.orElseThrow();
         try (drain) {
+            // 2、page3 是 active/history 权威；返回前 close 会撤销尚未物理修改的 drain gate。
             RollbackSegmentHeaderSnapshot snapshot = readHeader(spaceId);
             if (snapshot.historyBase().length() != 0L) {
-                throw new UndoTablespaceNotEmptyException("UNDO rollback segment history is not empty: space="
-                        + spaceId.value() + ", length=" + snapshot.historyBase().length());
+                return UndoReusableSegmentDrainStatus.DEFERRED_HISTORY;
             }
             if (!snapshot.occupiedSlots().isEmpty()) {
-                throw new UndoTablespaceNotEmptyException("UNDO rollback segment still owns active slots: space="
-                        + spaceId.value() + ", count=" + snapshot.occupiedSlots().size());
+                return UndoReusableSegmentDrainStatus.DEFERRED_ACTIVE_SLOTS;
             }
+            // 3、只有持久 active/history 全空才允许消费 cache/free；批次失败保留原有 fail-stop 语义。
             requireRuntimeStacksMatch(snapshot);
 
             while (true) {
@@ -138,8 +172,10 @@ class UndoReusableSegmentTruncationSupport {
                 }
                 drainBatch(spaceId, drain, optionalBatch.orElseThrow());
             }
+            // 4、最终复核 page3 全空后才释放全局 gate，防止 marker 建立在残留 owner 之上。
             requirePersistentEmpty(spaceId);
             drain.finish();
+            return UndoReusableSegmentDrainStatus.DRAINED;
         }
     }
 

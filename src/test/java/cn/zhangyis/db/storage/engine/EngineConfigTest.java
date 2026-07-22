@@ -6,6 +6,7 @@ import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.recovery.RecoveryMode;
 import cn.zhangyis.db.storage.flush.doublewrite.DoublewriteMode;
+import cn.zhangyis.db.storage.api.undotruncate.UndoTruncationConfig;
 import cn.zhangyis.db.storage.trx.PurgeConfig;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -53,6 +54,7 @@ class EngineConfigTest {
         assertEquals(Duration.ofSeconds(5), c.undoHistoryTransitionTimeout());
         assertEquals(DoublewriteMode.DETECT_AND_RECOVER, c.doublewriteMode());
         assertEquals(PurgeConfig.defaults(), c.purgeConfig());
+        assertEquals(UndoTruncationConfig.defaults(), c.undoTruncationConfig());
         assertEquals(dir.resolve("doublewrite-flush-list.dwb"), c.flushListDoublewriteFile());
         assertEquals(dir.resolve("doublewrite-lru.dwb"), c.lruDoublewriteFile());
     }
@@ -192,6 +194,25 @@ class EngineConfigTest {
         assertEquals(custom, configured.purgeConfig());
         assertEquals(PurgeConfig.defaults(), original.purgeConfig());
         assertThrows(DatabaseValidationException.class, () -> original.withPurgeConfig(null));
+    }
+
+    /** 自动 undo 截断策略通过不可变 wither 接入组合根，且其它后台维护策略必须原样保留。 */
+    @Test
+    void undoTruncationConfigDefaultsAndIsImmutableAndConfigurable() {
+        EngineConfig original = valid();
+        UndoTruncationConfig custom = new UndoTruncationConfig(false, 4, Duration.ofSeconds(7));
+
+        EngineConfig configured = original.withUndoTruncationConfig(custom);
+
+        assertEquals(custom, configured.undoTruncationConfig());
+        assertEquals(UndoTruncationConfig.defaults(), original.undoTruncationConfig());
+        assertEquals(original.purgeConfig(), configured.purgeConfig(),
+                "undo 截断策略不能意外改变 purge worker 资源边界");
+        assertEquals(custom, configured.withPurgeConfig(new PurgeConfig(
+                2, 8, Duration.ofMillis(250))).undoTruncationConfig(),
+                "其它 wither 必须保留已经选择的自动截断策略");
+        assertThrows(DatabaseValidationException.class,
+                () -> original.withUndoTruncationConfig(null));
     }
 
     /**

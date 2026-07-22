@@ -13,8 +13,11 @@ import cn.zhangyis.db.domain.UndoSlotId;
 import cn.zhangyis.db.server.lockobs.api.SnapshotRequest;
 import cn.zhangyis.db.server.lockobs.snapshot.LockDiagnosticSnapshot;
 import cn.zhangyis.db.storage.api.DiskSpaceManager;
+import cn.zhangyis.db.storage.api.SegmentDropPlan;
 import cn.zhangyis.db.storage.api.SegmentRef;
 import cn.zhangyis.db.storage.api.trx.PrepareTransactionCommand;
+import cn.zhangyis.db.storage.api.undotruncate.UndoTruncationConfig;
+import cn.zhangyis.db.storage.api.undotruncate.UndoTruncationCycleStatus;
 import cn.zhangyis.db.storage.btree.BTreeIndex;
 import cn.zhangyis.db.storage.btree.BTreeLookupResult;
 import cn.zhangyis.db.storage.btree.BTreeRedoBudgetEstimator;
@@ -53,6 +56,7 @@ import cn.zhangyis.db.storage.trx.UndoSegmentAcquisition;
 import cn.zhangyis.db.storage.trx.UndoTestWrites;
 import cn.zhangyis.db.storage.trx.UndoWritePlan;
 import cn.zhangyis.db.storage.undo.UndoLogKind;
+import cn.zhangyis.db.storage.undo.UndoSegmentDropPlan;
 import cn.zhangyis.db.storage.trx.lock.RecordLockKey;
 import cn.zhangyis.db.storage.trx.lock.TransactionLockMode;
 import cn.zhangyis.db.storage.record.format.HiddenColumns;
@@ -1169,6 +1173,94 @@ class StorageEngineTest {
         assertTrue(awaitUntil(() -> lookupIncludingDeletedEmpty(e2, index, 1), Duration.ofSeconds(3)),
                 "background purge driver physically removed the committed delete-marked row");
         e2.close();
+    }
+
+    /**
+     * purge driver 的成功空批次也必须驱动自动 undo 截断候选检查；初始大小不足门槛时只发布可观察 skip，
+     * 不改写 page0、page3 或文件长度。该用例固定生产组合根接线，而非只验证独立 scheduler fake。
+     */
+    @Test
+    void backgroundPurgeCycleRunsUndoTruncationSchedulerAndPublishesMetrics() {
+        Path dataPath = dir.resolve("data-purge-undo-truncate-metrics.ibd");
+        EngineConfig cfg = configWithRecoveryTablespaceAndTick(dataPath, Duration.ofMillis(40))
+                .withUndoTruncationConfig(new UndoTruncationConfig(true, 1, Duration.ofMillis(10)));
+
+        StorageEngine first = new StorageEngine(cfg);
+        first.open();
+        BTreeIndex index = createClusteredIndex(first, dataPath);
+        first.close();
+
+        StorageEngine reopened = new StorageEngine(cfg);
+        reopened.configureClusteredIndex(index);
+        reopened.open();
+        try {
+            assertTrue(awaitUntil(() -> reopened.undoTruncationMetrics().checks() > 0,
+                            Duration.ofSeconds(3)),
+                    "成功的 purge 空批次应最终越过 cooldown 并执行一次候选检查");
+            assertEquals(UndoTruncationCycleStatus.BELOW_THRESHOLD,
+                    reopened.undoTruncationMetrics().lastStatus());
+            assertTrue(reopened.undoTruncationMetrics().skipped() > 0);
+            assertEquals(0, reopened.undoTruncationMetrics().completed());
+        } finally {
+            reopened.close();
+        }
+    }
+
+    /**
+     * 整栈验证 page0 autoextend 留下的空闲尾部由 purge driver 自动截回持久 initial size。测试先用正常 FSP
+     * API 分配并完整 drop 一个临时 undo segment，禁止直接改文件伪造候选；重启后再由共享 live/recovery service
+     * 完成 marker、flush、文件缩短、FSP rebuild 与 ACTIVE 发布。
+     */
+    @Test
+    void backgroundPurgeCycleAutomaticallyTruncatesReleasedUndoExtent() throws Exception {
+        Path dataPath = dir.resolve("data-purge-undo-truncate.ibd");
+        EngineConfig cfg = configWithRecoveryTablespaceAndTick(dataPath, Duration.ofMillis(40))
+                .withUndoTruncationConfig(new UndoTruncationConfig(true, 1, Duration.ofSeconds(30)));
+
+        // 1、fresh engine 尚未配置 purge 索引，因此可确定性地用普通 FSP 路径扩容到第二个 extent。
+        StorageEngine first = new StorageEngine(cfg);
+        first.open();
+        BTreeIndex index = createClusteredIndex(first, dataPath);
+        MiniTransactionManager firstMtr = first.miniTransactionManager();
+        DiskSpaceManager disk = first.diskSpaceManager();
+        MiniTransaction allocate = firstMtr.begin(firstMtr.budgetFor(RedoBudgetPurpose.ENGINE_BOOT));
+        SegmentRef temporary = disk.createSegment(allocate, cfg.undoSpaceId(), SegmentPurpose.UNDO);
+        disk.allocatePage(allocate, temporary);
+        firstMtr.commit(allocate);
+
+        // 2、先以只读 MTR 物化 drop 预算，再在独立写 MTR 清空 inode/FSP owner；物理文件仍保持扩容后的 128 页。
+        MiniTransaction inspect = firstMtr.beginReadOnly();
+        SegmentDropPlan dropPlan = disk.inspectDropSegmentPlan(inspect, temporary);
+        firstMtr.commit(inspect);
+        MiniTransaction drop = firstMtr.begin(firstMtr.budgetFor(
+                RedoBudgetPurpose.UNDO_FINALIZATION,
+                UndoRedoBudgetEstimator.finalization(new UndoSegmentDropPlan(
+                        dropPlan.fragmentPageCount(), dropPlan.extentCount(), dropPlan.usedPageCount()), false)));
+        disk.dropSegment(drop, temporary);
+        firstMtr.commit(drop);
+        first.close();
+        long initialBytes = Math.multiplyExact(cfg.undoSpaceInitialPages().value(), (long) PS.bytes());
+        assertTrue(Files.size(cfg.undoFile()) >= initialBytes + 64L * PS.bytes(),
+                "普通 segment drop 只归还 FSP owner，不应自行缩短物理文件");
+
+        // 3、existing open 配置聚簇索引后启动 purge driver；成功空批次应触发共享 truncate service 完成物理回收。
+        StorageEngine reopened = new StorageEngine(cfg);
+        reopened.configureClusteredIndex(index);
+        reopened.open();
+        try {
+            assertTrue(awaitUntil(() -> reopened.undoTruncationMetrics().completed() > 0,
+                            Duration.ofSeconds(5)),
+                    "空闲第二个 extent 应在 purge cycle 中进入 crash-safe 自动截断协议");
+            assertEquals(initialBytes, Files.size(cfg.undoFile()));
+            assertEquals(64, reopened.undoTruncationMetrics().reclaimedPages());
+            assertTrue(reopened.undoTruncationMetrics().lastCompletedEpoch() > 0);
+        } finally {
+            // 4、close 停止 driver 后仍保留最后完成快照，且不会在关闭窗口开始新的维护 cycle。
+            reopened.close();
+        }
+        assertEquals(1, reopened.undoTruncationMetrics().completed());
+        assertEquals(UndoTruncationCycleStatus.COMPLETED,
+                reopened.undoTruncationMetrics().lastStatus());
     }
 
     /**

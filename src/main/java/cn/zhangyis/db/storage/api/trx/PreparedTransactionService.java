@@ -5,6 +5,7 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.Lsn;
 import cn.zhangyis.db.domain.TransactionId;
 import cn.zhangyis.db.storage.recovery.RecoveryState;
+import cn.zhangyis.db.storage.api.ddl.online.OnlineDdlTableGate;
 import cn.zhangyis.db.storage.recovery.RecoveryTrafficGate;
 import cn.zhangyis.db.storage.redo.RedoLogManager;
 import cn.zhangyis.db.storage.trx.RollbackService;
@@ -39,6 +40,8 @@ public final class PreparedTransactionService {
     private final RecoveryTrafficGate recoveryGate;
     /** terminal durable 后统一释放事务锁。 */
     private final LockManager lockManager;
+    /** XA phase one/phase two 与普通 DML 共用的 candidate durability 和 table 引用 gate。 */
+    private final OnlineDdlTableGate onlineDdlTableGate;
 
     /**
      * 构造共享生产组合根协作者的 prepared transaction facade。
@@ -57,6 +60,7 @@ public final class PreparedTransactionService {
      * @param redo 与 MTR 共用的 durable redo manager
      * @param recoveryGate 启动恢复流量门控
      * @param lockManager 与 DML/current-read 共用的事务锁管理器
+     * @param onlineDdlTableGate 组合根唯一 Online DDL table gate
      * @throws DatabaseValidationException 任一协作者缺失时抛出
      */
     public PreparedTransactionService(TransactionManager transactionManager,
@@ -64,10 +68,12 @@ public final class PreparedTransactionService {
                                       RollbackService rollbackService,
                                       RedoLogManager redo,
                                       RecoveryTrafficGate recoveryGate,
-                                      LockManager lockManager) {
+                                      LockManager lockManager,
+                                      OnlineDdlTableGate onlineDdlTableGate) {
         // 1、校验必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝非法组合。
         if (transactionManager == null || undoLogManager == null || rollbackService == null
-                || redo == null || recoveryGate == null || lockManager == null) {
+                || redo == null || recoveryGate == null || lockManager == null
+                || onlineDdlTableGate == null) {
             throw new DatabaseValidationException(
                     "prepared transaction service collaborators must not be null");
         }
@@ -80,6 +86,7 @@ public final class PreparedTransactionService {
         this.recoveryGate = recoveryGate;
         // 4、完成初始状态发布；失败以领域异常终止构造，成功对象满足类级生命周期不变量。
         this.lockManager = lockManager;
+        this.onlineDdlTableGate = onlineDdlTableGate;
     }
 
     /**
@@ -106,7 +113,9 @@ public final class PreparedTransactionService {
         }
         Transaction transaction = command.transaction();
         try {
-            // 2、先持久化物理证据；失败时事务仍 ACTIVE，不发布半个 PREPARED。
+            // 2、candidate 必须先于 PREPARE undo MTR force；失败时事务仍 ACTIVE，不发布半个 PREPARED。
+            onlineDdlTableGate.forceTransactionCandidates(
+                    transaction.transactionId(), command.durabilityTimeout());
             Lsn preparedTo = undoLogManager.onPrepare(transaction);
             // 3、物理 MTR 已提交后才发布运行态；锁与 active owner 刻意保留。
             transactionManager.finishPrepare(transaction);
@@ -157,7 +166,8 @@ public final class PreparedTransactionService {
             Lsn terminalLsn = redo.currentLsn();
             // 3、终态不等于外部确认；fsync 未完成前仍保留锁。
             forceDurable(terminalLsn, command.durabilityTimeout(), "commit prepared");
-            // 4、只有 durable 决议才允许其它事务取得这些资源。
+            // 4、只有 durable 决议才解除 table 引用并允许其它事务取得这些资源。
+            onlineDdlTableGate.completeCommit(transactionId, terminalLsn);
             int released = lockManager.releaseAll(transactionId);
             return new PreparedTransactionCompletionResult(transactionId, transaction.transactionNo(),
                     TransactionState.COMMITTED, terminalLsn, true, released, 0);
@@ -246,7 +256,8 @@ public final class PreparedTransactionService {
             Lsn terminalLsn = redo.currentLsn();
             // 3、终态 redo 未 durable 时不能对外确认或释放隔离资源。
             forceDurable(terminalLsn, timeout, "rollback prepared");
-            // 4、锁清理最后发生；失败可用相同 ROLLED_BACK 命令幂等重试。
+            // 4、先解除 Online DDL table 引用，再清理锁；失败可用相同 ROLLED_BACK 命令幂等重试。
+            onlineDdlTableGate.completeRollback(transactionId);
             int released = lockManager.releaseAll(transactionId);
             return new PreparedTransactionCompletionResult(transactionId, transaction.transactionNo(),
                     TransactionState.ROLLED_BACK, terminalLsn, true, released, applied);

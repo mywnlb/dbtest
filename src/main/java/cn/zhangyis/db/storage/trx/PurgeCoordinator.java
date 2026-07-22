@@ -1,5 +1,6 @@
 package cn.zhangyis.db.storage.trx;
 
+import cn.zhangyis.db.common.exception.DatabaseRuntimeException;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.RollPointer;
@@ -36,9 +37,12 @@ import cn.zhangyis.db.storage.record.type.ColumnValue;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.time.Duration;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * 单线程 purge 协调器（设计 §5.7/§7.7）。{@link #runBatch} 同步处理一批已提交 undo：
+ * purge dispatcher 与多 worker 协调器（设计 §5.7/§7.7）。{@link #runBatch} 同步编排一批已提交 undo：
  * <ol>
  *   <li>按 purge boundary（= {@link TransactionSystem#purgeLowWaterNo()}，最老 live ReadView 低水位）FIFO 处理 committed
  *       history：UPDATE 先用聚簇版本链证明旧 secondary identity 可删，DELETE 先删全部 secondary 再删聚簇；
@@ -55,9 +59,9 @@ import java.util.Optional;
  * identity 摘队首。task 中途失败保留 page3 COMMITTED slot，重启可重建并 stale-skip 已完成任务；finalization 的
  * cache/free/drop + page3 owner 转移同批提交后，即使在内存 complete 前 crash，恢复也只依据持久 owner 重建。
  *
- * <p><b>当前范围</b>：协调器自身同步串行，生产由单 daemon driver 周期调用；history 是 page3/undo first-page
- * 持久链的运行时投影，恢复会重建 affected-table 引用并在 OPEN_TRAFFIC 前真实执行 RESUME_PURGE。
- * 仍未实现多 worker、多 rseg 与 purge→undo tablespace truncate 自动调度。
+ * <p><b>当前范围</b>：生产完整表级 wiring 使用有界 worker pool，按 affected table completion dependency 保持
+ * 同表 FIFO；legacy 单索引构造仍在调用线程串行。worker 只推进持久 logical head，dispatcher 严格按物理 head
+ * finalization。仍未实现多 rseg 与 purge→undo tablespace truncate 自动调度。
  */
 public final class PurgeCoordinator implements PurgeTarget {
 
@@ -83,8 +87,20 @@ public final class PurgeCoordinator implements PurgeTarget {
     private final SecondaryPurgeSafetyChecker secondarySafety;
     /** 消费 LV purge-old ownership 的页链服务；legacy/无 LOB binding 模式允许为空，但遇 ownership 必须 fail-closed。 */
     private final LobStorage lobStorage;
-    /** 仅包内测试可替换的 task-commit 故障接缝；生产始终为 no-op。 */
-    private PurgeProgressFaultInjector faultInjector = PurgeProgressFaultInjector.NO_OP;
+    /** 兼容构造使用的单 worker 有界窗口；不创建平台线程。 */
+    private static final PurgeConfig DIRECT_CONFIG = new PurgeConfig(1, 16, Duration.ofSeconds(5));
+    /** worker 只处理 logical chain；history finalization 仍由持有 batch gate 的 dispatcher 执行。 */
+    private final PurgeWorkerPool workerPool;
+    /** 单批最多冻结的物理 history 前缀，阻止 blocked head 后方无限投机。 */
+    private final int maxInFlightLogs;
+    /**
+     * 合并后台、恢复与显式入口的唯一批次 gate；当前 dispatcher 会跨 worker 有界等待持有，但不嵌套 history/page
+     * 锁，竞争 dispatcher 只 tryLock 并立即合并为空结果，绝不在该锁上阻塞。
+     */
+    private final ReentrantLock batchGate = new ReentrantLock();
+    /** 仅包内测试可替换的 task-commit 故障接缝；原子发布供多个 worker 安全读取。 */
+    private final AtomicReference<PurgeProgressFaultInjector> faultInjector =
+            new AtomicReference<>(PurgeProgressFaultInjector.NO_OP);
 
     /**
      * 构造只处理显式单聚簇索引、没有 secondary mutation 的兼容 purge 协调器。
@@ -186,9 +202,53 @@ public final class PurgeCoordinator implements PurgeTarget {
                             PurgeDmlRowGuardManager rowGuards,
                             SecondaryPurgeSafetyChecker secondarySafety,
                             LobStorage lobStorage) {
+        this(mgr, system, history, undoAccess, finalizer, btree, targetResolver, rootSnapshots,
+                rowGuards, secondarySafety, lobStorage, DIRECT_CONFIG, false);
+    }
+
+    /**
+     * 构造完整表级多 worker purge 协调器。只有该签名创建平台 worker；legacy 构造继续使用 direct executor。
+     *
+     * @param mgr undo/index/progress 短 MTR 工厂
+     * @param system purge boundary 与 creator active 状态权威来源
+     * @param history persistent history 运行时投影
+     * @param undoAccess committed undo logical chain 访问端口
+     * @param finalizer EMPTY log 的 history/segment 原子终结器
+     * @param btree secondary/clustered purge-safe B+Tree 服务
+     * @param targetResolver exact-version 表级 metadata resolver
+     * @param rootSnapshots B+Tree root level 权威刷新服务
+     * @param rowGuards 与前台 DML/rollback 共享的同行物理 guard
+     * @param secondarySafety secondary old identity 版本链证明器
+     * @param lobStorage purge-old LOB ownership 释放服务
+     * @param purgeConfig worker 数、在途 history 窗口与批次 timeout
+     * @throws DatabaseValidationException 任一协作者/配置缺失或 secondary wiring 不完整时抛出
+     */
+    public PurgeCoordinator(MiniTransactionManager mgr, TransactionSystem system, HistoryList history,
+                            UndoLogSegmentAccess undoAccess, UndoSegmentFinalizer finalizer,
+                            SplitCapableBTreeIndexService btree,
+                            UndoTargetMetadataResolver targetResolver,
+                            BTreeRootSnapshotService rootSnapshots,
+                            PurgeDmlRowGuardManager rowGuards,
+                            SecondaryPurgeSafetyChecker secondarySafety,
+                            LobStorage lobStorage,
+                            PurgeConfig purgeConfig) {
+        this(mgr, system, history, undoAccess, finalizer, btree, targetResolver, rootSnapshots,
+                rowGuards, secondarySafety, lobStorage, purgeConfig, true);
+    }
+
+    private PurgeCoordinator(MiniTransactionManager mgr, TransactionSystem system, HistoryList history,
+                             UndoLogSegmentAccess undoAccess, UndoSegmentFinalizer finalizer,
+                             SplitCapableBTreeIndexService btree,
+                             UndoTargetMetadataResolver targetResolver,
+                             BTreeRootSnapshotService rootSnapshots,
+                             PurgeDmlRowGuardManager rowGuards,
+                             SecondaryPurgeSafetyChecker secondarySafety,
+                             LobStorage lobStorage,
+                             PurgeConfig purgeConfig,
+                             boolean parallel) {
         // 1、校验必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝非法组合。
         if (mgr == null || system == null || history == null || undoAccess == null || finalizer == null
-                || btree == null || targetResolver == null) {
+                || btree == null || targetResolver == null || purgeConfig == null) {
             throw new DatabaseValidationException("purge coordinator collaborators must not be null");
         }
         if ((rootSnapshots == null) != (rowGuards == null)
@@ -210,6 +270,8 @@ public final class PurgeCoordinator implements PurgeTarget {
         this.secondarySafety = secondarySafety;
         // 4、完成初始状态发布；失败以领域异常终止构造，成功对象满足类级生命周期不变量。
         this.lobStorage = lobStorage;
+        this.maxInFlightLogs = purgeConfig.maxInFlightLogs();
+        this.workerPool = parallel ? PurgeWorkerPool.parallel(purgeConfig) : PurgeWorkerPool.direct(purgeConfig);
     }
 
     /**
@@ -217,51 +279,83 @@ public final class PurgeCoordinator implements PurgeTarget {
      *
      * <p>数据流：</p>
      * <ol>
-     *     <li>校验正批次上限，非法请求不读取 history 或页面。</li>
-     *     <li>初始化统计并循环 peek 物理队首；空队列或 transaction/read-view boundary 不满足时立即停止，绝不越过队首。</li>
-     *     <li>处理一条 eligible log；row guard busy 时记录 deferred 并保留队首，完成时累加 secondary/clustered 删除数。</li>
-     *     <li>返回只描述本批已完成/延后事实的不可变统计，不以统计值反向修改 history。</li>
+     *     <li>校验正批次上限并零等待取得唯一 dispatcher gate；并发调用合并为空结果，不重复提交物理任务。</li>
+     *     <li>冻结有界物理前缀并逐条检查 purge boundary；遇首个不安全节点即截断，不能从后方挑选。</li>
+     *     <li>按 affected table dependency 派发 worker；同表 FIFO，互不相关表可并发，worker 只推进 logical head。</li>
+     *     <li>收集稳定结果后严格从当前物理 head finalization READY 连续前缀；DEFERRED/FAILED/BLOCKED 后方不得摘链。</li>
+     *     <li>汇总实际物理动作与 finalization 数；先发布安全前缀，再传播 worker 首因和 suppressed failures。</li>
      * </ol>
      *
      * @param maxLogs 本批最多完成 finalization 的 committed undo log 正数上限。
      * @return 完成日志、物理删除 clustered/secondary 数和 row-guard 延后数的统计。
      * @throws DatabaseValidationException {@code maxLogs <= 0} 时抛出。
-     * @throws RuntimeException undo/metadata/版本链/B+Tree/finalization 任一步失败时抛出；失败日志保持在 history 队首。
+     * @throws DatabaseRuntimeException undo/metadata/版本链/B+Tree/worker/finalization 任一步失败时抛出；
+     *                                  已提交 progress 保留，未 finalization 日志继续占有 segment
      */
     public PurgeSummary runBatch(int maxLogs) {
-        // 1. 批次 admission 先于 history/IO 访问。
+        // 1、批次 admission 先于 history/IO 访问；另一个 dispatcher 已运行时合并请求，不进入 worker pool。
         if (maxLogs <= 0) {
             throw new DatabaseValidationException("purge maxLogs must be positive: " + maxLogs);
         }
-        // 2. 只从物理队首推进；purge eligibility 不满足时不能跳到后续 transaction no。
-        int purgedLogs = 0;
-        int removedClustered = 0;
-        int removedSecondary = 0;
-        int deferredLogs = 0;
-        int skippedUnavailable = 0;
-        while (purgedLogs < maxLogs) {
-            Optional<HistoryEntry> headOpt = history.peekCommitted();
-            if (headOpt.isEmpty()) {
-                break;
-            }
-            HistoryEntry head = headOpt.get();
-            if (!system.isPurgeEligible(head.transactionNo(), head.creatorTrxId())) {
-                break; // 不越过物理 head；creator 非 active、提交号边界与 live ReadView 可见性必须同时成立
-            }
-            // 3. 单 log 内 secondary/clustered task 与 finalization 全部完成才计为 purged；busy 明确延后。
-            PurgeLogOutcome outcome = purgeCommittedLog(head);
-            if (!outcome.completed()) {
-                deferredLogs++;
-                break;
-            }
-            removedClustered += outcome.removedClustered();
-            removedSecondary += outcome.removedSecondary();
-            skippedUnavailable += outcome.skippedUnavailable();
-            purgedLogs++;
+        if (workerPool.state() != PurgeWorkerPoolState.RUNNING) {
+            throw new PurgeWorkerStoppedException("purge coordinator worker pool is not running: "
+                    + workerPool.state());
         }
-        // 4. 统计是诊断快照，history 已由各成功 finalization 自身原子发布。
-        return new PurgeSummary(purgedLogs, removedClustered, removedSecondary, deferredLogs,
-                skippedUnavailable);
+        if (!batchGate.tryLock()) {
+            return new PurgeSummary(0, 0, 0, 0, 0);
+        }
+        try {
+            // 2、快照只覆盖本批有界窗口；物理顺序不按 TransactionNo 排序，首个不安全节点截断后续候选。
+            int candidateLimit = Math.min(maxLogs, maxInFlightLogs);
+            List<HistoryEntry> candidates = new ArrayList<>(candidateLimit);
+            for (HistoryEntry entry : history.snapshotPrefix(candidateLimit)) {
+                if (!system.isPurgeEligible(entry.transactionNo(), entry.creatorTrxId())) {
+                    break;
+                }
+                candidates.add(entry);
+            }
+            if (candidates.isEmpty()) {
+                return new PurgeSummary(0, 0, 0, 0, 0);
+            }
+
+            // 3、worker pool 以 affected table completion stage 表达 token；等待 predecessor 不占 worker 线程。
+            List<PurgeLogWork> works = candidates.stream()
+                    .map(entry -> new PurgeLogWork(entry, () -> processCommittedLog(entry)))
+                    .toList();
+            List<PurgeLogTaskResult> results = workerPool.execute(works);
+
+            int removedClustered = 0;
+            int removedSecondary = 0;
+            int deferredLogs = 0;
+            int skippedUnavailable = 0;
+            for (PurgeLogTaskResult result : results) {
+                removedClustered += result.removedClustered();
+                removedSecondary += result.removedSecondary();
+                skippedUnavailable += result.skippedUnavailable();
+                if (result.status() == PurgeLogTaskStatus.DEFERRED) {
+                    deferredLogs++;
+                }
+            }
+
+            // 4、所有 worker 已释放 row guard/MTR；dispatcher 此时才按物理 head 连续取得 removal lease。
+            int purgedLogs = 0;
+            for (PurgeLogTaskResult result : results) {
+                if (result.status() != PurgeLogTaskStatus.READY) {
+                    break;
+                }
+                try (HistoryList.HeadRemovalLease lease = history.beginHeadRemoval(result.entry())) {
+                    finalizer.finalizePurgedHistory(result.entry(), lease);
+                }
+                purgedLogs++;
+            }
+
+            // 5、先保留已安全 finalization 的连续前缀，再把 worker 领域失败按物理顺序传播给 driver/recovery。
+            throwWorkerFailures(results);
+            return new PurgeSummary(purgedLogs, removedClustered, removedSecondary, deferredLogs,
+                    skippedUnavailable);
+        } finally {
+            batchGate.unlock();
+        }
     }
 
     /**
@@ -274,27 +368,35 @@ public final class PurgeCoordinator implements PurgeTarget {
      *     <li>只物化当前 head record 及其直接前驱，冻结 exact-version secondary、LOB 和下一 logical-head 计划。</li>
      *     <li>表级模式零等待取得共享 row guard，在 guard 内按 secondary、clustered 顺序执行幂等单树物理任务。</li>
      *     <li>在独立记录进度 MTR 中先预检 logical-head CAS，再批量释放 purge-old LOB，最后写入前驱 head 并提交。</li>
-     *     <li>持久 head 为空后取得 history removal lease，由 finalizer 原子回收 undo owner 并发布队首摘除。</li>
+     *     <li>持久 head 为空后返回 READY；history removal 只能由 dispatcher 按物理 head 顺序执行。</li>
      * </ol>
      *
-     * @param entry 当前物理 history 队首；creator、slot、first-page identity 必须与 page3/undo owner 一致。
-     * @return completed 时携带本 log 实际删除计数；row guard busy 时返回 deferred，已提交的记录级进度不会回退。
+     * @param entry 当前候选 history log；creator、slot、first-page identity 必须与 page3/undo owner 一致。
+     * @return READY 时 logical head 已空；row guard busy 返回 DEFERRED，已提交的记录级进度不会回退。
      * @throws DatabaseValidationException LV ownership 缺少 LOB wiring/binding 或表级任务缺共享 row guard 时抛出。
      * @throws UndoLogFormatException undo state、creator、head、前驱单调性、metadata 或 old image 损坏时抛出。
      * @throws PurgeProgressException LOB free 或 logical-head 写入已越过无 content-undo 边界后失败时抛出，worker 必须停止。
      */
-    private PurgeLogOutcome purgeCommittedLog(HistoryEntry entry) {
+    private PurgeLogTaskResult processCommittedLog(HistoryEntry entry) {
         int removedClustered = 0;
         int removedSecondary = 0;
         int skippedUnavailable = 0;
         while (true) {
-            // 1. 每轮重新读取持久 head，使 crash 重试和本轮已提交 progress 使用完全相同的权威入口。
+            if (workerPool.state() != PurgeWorkerPoolState.RUNNING
+                    || Thread.currentThread().isInterrupted()) {
+                throw new PurgeWorkerStoppedException(
+                        "purge worker stopped before next undo record: entry=" + entry);
+            }
+            if (!system.isPurgeEligible(entry.transactionNo(), entry.creatorTrxId())) {
+                return PurgeLogTaskResult.blocked(entry);
+            }
+            // 1、每轮重新读取持久 head，使 crash 重试和本轮已提交 progress 使用完全相同的权威入口。
             UndoLogicalHead head = readLogicalChainStart(entry).head();
             if (head.isEmpty()) {
                 break;
             }
 
-            // 2. 单条 task 冻结当前 record、直接前驱和所有 ownership；不把整条大事务 undo 链装入内存。
+            // 2、单条 task 冻结当前 record、直接前驱和所有 ownership；不把整条大事务 undo 链装入内存。
             PurgeRecordTask task = buildHeadTask(entry, head);
             if (task.recoveryUnavailable()) {
                 // 隔离分支发生在 row guard、B+Tree root refresh、secondary/LOB 计划之前；只写系统 undo 进度。
@@ -309,12 +411,13 @@ public final class PurgeCoordinator implements PurgeTarget {
                 continue;
             }
 
-            // 3. purge 不等待前台 DML/rollback；busy 时保留当前持久 head，下一批从同一 record 继续。
+            // 3、purge 不等待前台 DML/rollback；busy 时保留当前持久 head，下一批从同一 record 继续。
             requireTableLevelWiring(task);
             Optional<PurgeDmlRowGuard> guard = rowGuards.tryAcquireForPurge(
                     task.record().tableId(), task.clusterKey());
             if (guard.isEmpty()) {
-                return PurgeLogOutcome.deferred(removedClustered, removedSecondary, skippedUnavailable);
+                return PurgeLogTaskResult.deferred(
+                        entry, removedClustered, removedSecondary, skippedUnavailable);
             }
             try (PurgeDmlRowGuard ignored = guard.orElseThrow()) {
                 for (SecondaryTask secondaryTask : task.secondaryTasks()) {
@@ -327,16 +430,32 @@ public final class PurgeCoordinator implements PurgeTarget {
                 if (task.deleteClustered()) {
                     removedClustered += purgeClustered(entry, task);
                 }
-                // 4. row guard 覆盖索引清理到 head progress，防止同一主键在 ownership 交接窗口被前台重写。
+                // 4、row guard 覆盖索引清理到 head progress，防止同一主键在 ownership 交接窗口被前台重写。
                 persistRecordProgress(entry, head, task);
             }
         }
 
-        // 5. finalizer 只接收 EMPTY logical head；记录级进度未完全持久化时不得释放 undo segment/slot。
-        try (HistoryList.HeadRemovalLease lease = history.beginHeadRemoval(entry)) {
-            finalizer.finalizePurgedHistory(entry, lease);
+        // 5、worker 不取得 history transition；EMPTY segment 继续存在，直到 dispatcher 按物理 head finalization。
+        return PurgeLogTaskResult.ready(entry, removedClustered, removedSecondary, skippedUnavailable);
+    }
+
+    /** 按物理候选顺序传播第一个 worker 失败，其余失败作为 suppressed 保留完整诊断图。 */
+    private static void throwWorkerFailures(List<PurgeLogTaskResult> results) {
+        DatabaseRuntimeException primary = null;
+        for (PurgeLogTaskResult result : results) {
+            if (result.failureOptional().isEmpty()) {
+                continue;
+            }
+            DatabaseRuntimeException failure = result.failureOptional().orElseThrow();
+            if (primary == null) {
+                primary = failure;
+            } else if (failure != primary) {
+                primary.addSuppressed(failure);
+            }
         }
-        return PurgeLogOutcome.completed(removedClustered, removedSecondary, skippedUnavailable);
+        if (primary != null) {
+            throw primary;
+        }
     }
 
     /**
@@ -437,6 +556,11 @@ public final class PurgeCoordinator implements PurgeTarget {
         // 3. 健康对象才从 old image 与 exact-version secondary layout 产生 physical identity。
         List<SecondaryTask> secondaryTasks = new ArrayList<>();
         for (SecondaryUndoMutation mutation : record.secondaryMutations()) {
+            if (current.target().retiredSecondaryIndex(mutation.indexId())) {
+                // Online DROP已在final X后让该index对新DD不可达；逐entry purge没有必要且当前metadata不再保留其layout。
+                // 整棵树仍由descriptor+retirement fence持有，只有本history entry完成后才会整体drop segment。
+                continue;
+            }
             SecondaryIndexMetadata metadata = current.target().tableIndexes().requireSecondary(mutation.indexId());
             LogicalRecord oldRow = new LogicalRecord(current.target().tableIndexes().schemaVersion(),
                     record.oldColumnValues(), false,
@@ -553,7 +677,7 @@ public final class PurgeCoordinator implements PurgeTarget {
             }
             throw error;
         }
-        faultInjector.onBoundary(PurgeProgressPhase.AFTER_RECORD_PROGRESS_COMMIT,
+        faultInjector.get().onBoundary(PurgeProgressPhase.AFTER_RECORD_PROGRESS_COMMIT,
                 task.target().clusteredIndex().indexId());
     }
 
@@ -584,7 +708,7 @@ public final class PurgeCoordinator implements PurgeTarget {
             }
             throw error;
         }
-        faultInjector.onBoundary(PurgeProgressPhase.AFTER_RECORD_PROGRESS_COMMIT,
+        faultInjector.get().onBoundary(PurgeProgressPhase.AFTER_RECORD_PROGRESS_COMMIT,
                 task.target().clusteredIndex().indexId());
     }
 
@@ -620,7 +744,7 @@ public final class PurgeCoordinator implements PurgeTarget {
             }
             // 4. commit 已发布 redo/pageLSN/dirty 与结构变化，之后故障由 ABSENT 状态幂等收敛。
             mgr.commit(ix);
-            faultInjector.onBoundary(PurgeProgressPhase.AFTER_SECONDARY_COMMIT, index.indexId());
+            faultInjector.get().onBoundary(PurgeProgressPhase.AFTER_SECONDARY_COMMIT, index.indexId());
             return result.status() == SecondaryEntryRemovalStatus.REMOVED ? 1 : 0;
         } catch (RuntimeException error) {
             rollbackReadMtr(ix, error);
@@ -660,7 +784,7 @@ public final class PurgeCoordinator implements PurgeTarget {
                     entry.creatorTrxId(), task.rollPointer());
             // 4. 提交后页修改已发布，故障重试通过 stale/absent 状态继续；测试接缝只能位于此稳定边界。
             mgr.commit(ix);
-            faultInjector.onBoundary(PurgeProgressPhase.AFTER_CLUSTERED_COMMIT, index.indexId());
+            faultInjector.get().onBoundary(PurgeProgressPhase.AFTER_CLUSTERED_COMMIT, index.indexId());
             return result.removed() ? 1 : 0;
         } catch (RuntimeException error) {
             rollbackReadMtr(ix, error);
@@ -856,7 +980,32 @@ public final class PurgeCoordinator implements PurgeTarget {
         if (faultInjector == null) {
             throw new DatabaseValidationException("purge progress fault injector must not be null");
         }
-        this.faultInjector = faultInjector;
+        if (!batchGate.tryLock()) {
+            throw new DatabaseValidationException(
+                    "purge progress fault injector cannot change during an active batch");
+        }
+        try {
+            this.faultInjector.set(faultInjector);
+        } finally {
+            batchGate.unlock();
+        }
+    }
+
+    /**
+     * 非阻塞停止内部 worker pool。必须与后台 driver 的 requestStop 一起先发布，再由组合根共享 deadline 等待。
+     */
+    public void requestStopWorkers() {
+        workerPool.requestStop();
+    }
+
+    /**
+     * 有界等待内部平台线程退出；direct legacy executor 在 requestStop 后立即满足。
+     *
+     * @param timeout 组合根绝对关闭 deadline 的剩余非负预算
+     * @return 所有 worker 已退出时为 true，预算耗尽或等待线程中断时为 false
+     */
+    public boolean awaitWorkersStopped(Duration timeout) {
+        return workerPool.awaitStopped(timeout);
     }
 
     /**
@@ -895,26 +1044,6 @@ public final class PurgeCoordinator implements PurgeTarget {
      * @param target 与 record 固定 table/index identity 精确匹配的表级恢复目标。
      */
     private record ResolvedUndo(UndoRecord record, UndoTargetMetadata target) {
-    }
-
-    /**
-     * 单条 history log 的内部处理结果。
-     *
-     * @param completed        全部物理任务与 finalization 已完成时为 true；row guard busy 时为 false。
-     * @param removedClustered 本 log 已真实删除的聚簇记录数。
-     * @param removedSecondary 本 log 已真实删除的二级 entry 数。
-     */
-    private record PurgeLogOutcome(boolean completed, int removedClustered, int removedSecondary,
-                                   int skippedUnavailable) {
-        private static PurgeLogOutcome completed(int removedClustered, int removedSecondary,
-                                                 int skippedUnavailable) {
-            return new PurgeLogOutcome(true, removedClustered, removedSecondary, skippedUnavailable);
-        }
-
-        private static PurgeLogOutcome deferred(int removedClustered, int removedSecondary,
-                                                int skippedUnavailable) {
-            return new PurgeLogOutcome(false, removedClustered, removedSecondary, skippedUnavailable);
-        }
     }
 
     /** 一次短读取得的持久逻辑链入口。

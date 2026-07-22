@@ -10,29 +10,30 @@
 > `innodb-redo-log-design.md`(Redo)。
 > 其余模块（DD/DDL、lock observability）只在作为依赖出现时引用。
 >
-> 最近校对：2026-07-21（基于当前源码与 `current-implementation-map.md`：comparison/composite/full-scan、
+> 最近校对：2026-07-22（基于当前源码与 `current-implementation-map.md`：comparison/composite/full-scan、
 > 四隔离级别、命名 SAVEPOINT、persistent server XA、受控 DISCARD/IMPORT、table options/defaults 与
-> general blocking ALTER shadow rebuild、对象级 force recovery + trusted replacement 均已进入生产链；
-> temporary undo、online DDL 与主键/类型变更仍未完成）。
+> general blocking ALTER shadow rebuild、对象级 force recovery + trusted replacement、Online ADD/DROP INDEX、
+> marker v4 digest/control/可观察取消、instant metadata、multi-index INPLACE与online shadow ALTER均已进入
+> 生产链；temporary undo、复制binlog与主键/类型/foreign/generated变更仍未完成）。
 
 ## 九份文档的当前完成度（粗估，表达"核心在、外围缺"）
 
 | 文档 | 已闭环的核心 | 主要缺口 | 粗估 |
 | --- | --- | --- | --- |
 | F flush/checkpoint/doublewrite | FLUSH_LIST / SINGLE_PAGE / SHUTDOWN / **LRU_FLUSH(WAL 安全淘汰)**、WAL gate、recoverable doublewrite 生产接线、**bounded doublewrite slot reuse（0.5）**、仓储级 `DoublewriteBatch` 连续 slot 原语、**生产 FlushList/LRU batch dispatch（v1）**、**FlushList/LRU 双物理 doublewrite channel**、**engine 配置化 `DoublewriteMode`**、**DETECT_ONLY metadata/report（0.7）**、fuzzy checkpoint + 持久 label、PageCleanerWorker、**速率/IO capacity adaptive flush（v1）**、**0.6b 前台 reservation throttle**、**legacy BufferPool flush API 移除（2026-07-05）** | 全空间 doublewrite discovery、动态 slot/IO 配置 | ~88% |
-| U undo/purge | 既有 undo/history/finalization 能力 + **secondary/LOB tail、statement/named-savepoint/full/recovery inverse、version-safe purge、affected-table history、real recovery resume 与 unavailable-target recovery skip** | 多 worker、多 rseg/tablespace、多页 free shrink、purge→truncate 调度、temporary undo | ~95% |
+| U undo/purge | 既有 undo/history/finalization 能力 + **secondary/LOB tail、statement/named-savepoint/full/recovery inverse、version-safe multi-worker purge、affected-table history、real recovery resume 与 unavailable-target recovery skip** | 多 rseg/tablespace、多页 free shrink、purge→truncate 调度、temporary undo | ~96% |
 | T transaction/mvcc | 既有事务/ReadView/LockManager 能力 + **四隔离级别、命名 SAVEPOINT retention boundary、comparison/composite/full-scan read/locking DML、persistent server XA + storage PREPARED** | RC residual-miss 提前释放、global gap 精确化、XA active branch migration/compaction | ~98% |
-| R crash-recovery | 既有恢复阶段 + **catalog-loss recovery、persistent XA 决议、multi-index rollback、real RESUME_PURGE、table/index/transfer/rebuild DDL recovery、ACTIVE SDI reconcile、对象级 force isolation/export/trusted replacement** | worker/lock diagnostics、全实例/系统与 undo 空间 checksum scrub、online DDL row-log recovery | ~99% |
+| R crash-recovery | 既有恢复阶段 + **catalog-loss recovery、persistent XA决议、multi-index rollback、real RESUME_PURGE、table/index/transfer/rebuild/Online ADD/DROP、通用INPLACE/SHADOW ALTER recovery、ACTIVE SDI reconcile、对象级force isolation/export/trusted replacement** | worker/lock diagnostics、全实例/系统与undo空间checksum scrub | ~99% |
 | B btree | 既有多层结构能力 + **紧凑 secondary layout、insert/mark/revive/remove/prefix scan、root snapshot、multi-level secondary shrink** | B-link/OLC、global gap 精确化、PAGE_MAX_TRX_ID/segment header、leaf row semantic redo | ~89% |
 | BP buffer-pool | get/new/fix、page latch、`PageGuard`、page hash/free/flush list、WAL-safe eviction、DIRTY_PENDING/EVICTING/STALE、midpoint LRU、LOADING IO 边界、read-ahead、多 instance、**DROP/DISCARD/IMPORT/rebuild stale-frame generation 与 drain/invalidate** | read-ahead/warmup 动态配置与更细 IO 调度 | ~95% |
 | D disk-manager | fil/fsp/segment/extent/page 分配、page0/FSP checksum、autoextend、undo truncation、GENERAL lifecycle、reservation、fsync/preallocation seam、FSP redo、**DD discovery + DROP/DISCARD/IMPORT exact identity/path lifecycle + fixed page3 SDI** | 平台 native preallocation、动态 reserveFactor/IO capacity、跨设备 transfer 由 admin 预处理 | ~95% |
 | Rec record | `TableSchema`/`IndexKeyDef`/**28 类 `TypeId`**、字段 codec、record header/PageDirectory/hidden columns、页内全套原语、undo old image codec、**0.21a-h validator/排序/inline scalar/BIT/ENUM/SET/Unicode weight/TEXT-BLOB-JSON envelope/off-page LOB chain**、**LOB UPDATE/DELETE replacement ownership+purge** | 完整 UCA/更多 charset、MySQL binary JSON、PAGE_MAX_TRX_ID/segment header | ~94% |
 | Redo redo-log | `RedoLogManager` 内存/durable 双模式、9 类 redo record 编码、append/write/flush、后台 flusher、written/closed tracker、WAL/checkpoint、LogBlock v1、ring/control v2、连续恢复扫描、page/trx handlers、capacity throttle、DurabilityPolicy、operation budget、**B+Tree sibling/node/root page-local delta** | 按 height/segment plan snapshot 收紧预算 profile、leaf row 等更细 semantic redo | ~88% |
-| DD/DDL | 既有 DD/DDL 能力 + **catalog-loss recovery、table options/defaults、purge-aware DROP、受控 transfer、blocking ALTER/rebuild recovery、recovery unavailable/discarded lifecycle、op8/9/10 与 HMAC backup/import** | online DDL/binlog、主键/类型/foreign/generated ALTER、marker schema digest、catalog B+Tree/redo 化、跨实例 recovery trust | ~98% |
+| DD/DDL | 既有DD/DDL能力 + **catalog-loss recovery、table options/defaults、purge-aware DROP、受控transfer、marker v4 schema digest/control、Online DDL可观察取消、Online ADD/DROP INDEX、instant metadata、multi-index INPLACE、online shadow ALTER/recovery、recovery unavailable/discarded lifecycle、op8/9/10与HMAC backup/import** | binlog、主键/类型/foreign/generated ALTER、catalog B+Tree/redo化、跨实例recovery trust | ~99% |
 
 当前 storage、DD、进程内 SQL Session 与 persistent XA 组合根已经闭环。SQL 支持 comparison/composite/full
-scan、四隔离级别、命名 SAVEPOINT、XA、受控 tablespace transfer 和 general blocking ALTER。主要跨层卡点转为：
-online DDL row log/binlog、主键/类型/foreign/generated ALTER，以及必须等待临时表
+scan、四隔离级别、命名 SAVEPOINT、XA、受控 tablespace transfer 和通用Online ALTER。主要跨层卡点转为：
+复制binlog、主键/类型/foreign/generated ALTER，以及必须等待临时表
 owner/lifecycle 的 **temporary undo**。
 
 ## Tier 0 — 现在可独立做（storage 内闭环，无新上层依赖）
@@ -44,7 +45,7 @@ owner/lifecycle 的 **temporary undo**。
 | 0.1 | ✅ **后台 redo flusher 已接**（`RedoFlushWorker`，2026-06-24）——周期/on-demand 驱动 `redo.flush()`，淘汰/flush 不再因 redo 未 durable 长时间跳过。✅ **append/fsync 拆锁 + recent_written/recent_closed tracker + closedLsn checkpoint 修正已接**（2026-06-29）：`RedoLogManager` 以 state lock 分配 LSN/维护 pending，以 `ioLock` 串行 write/fsync；append 不再被 fsync 持有状态锁阻塞；MTR dirty 发布后 `markClosed`，checkpoint 读 `closedLsn`。✅ **commit durability 原语已下沉到 0.20a DurabilityPolicy 并由 2.1 storage DML facade 消费**（2026-07-04），不再作为 Tier 0 独立项 | F/T/Redo | — | 后台 flush、并发边界、checkpoint 边界与 commit durability 策略抽象已闭合 |
 | 0.2 | ✅ **recoverable doublewrite 已接进 engine**（2026-06-24~07-18）：前向 strategy + E2 scanner、候选过滤、`DoublewriteMode` engine 配置与双 channel 均已接；e2e torn-page 恢复通过。**剩余**：全空间 discovery | F | — | R 的 1.1 REPAIR_DOUBLEWRITE 已随本片落地 |
 | 0.3 | ✅ **持久 rseg page3 v4 + owner/history/free CAS + batch atomic finalization 已接**（2026-06-24~2026-07-15）：active slots、双 cache 栈、history base/high-water 与 free head/tail/length 同页持久；单页 segment 按 cache→free→drop 终结、按 same-kind cache→free FIFO→fresh 获取；恢复严格校验 history/free 双链、FSP identity 与 owner 去重；truncate 统一 drain cache/free 并 rebuild page3 v4。**剩余**：多页 free shrink、多 rseg | U/T | — | active/cache/free owner 唯一；mixed commit、rollback、purge、recovery 与 truncate 不暴露无归属 inode |
-| 0.4 | ✅ **后台/恢复 purge 已接**（2026-06-24~2026-07-17）：`PurgeTarget` + worker；DD table resolver 驱动 secondary safety/physical tasks，history finalization 后发布 table counters；recovery RESUME_PURGE 真正运行 batch。剩余：多 worker、purge→truncate、跨 rseg blocked-head 调度 | U/T | — | 二级索引协调和 DROP barrier 已闭环 |
+| 0.4 | ✅ **后台/恢复 purge 已接**（2026-06-24~2026-07-22）：`PurgeTarget` + driver；DD table resolver 驱动 secondary safety/physical tasks；`PurgeWorkerPool` 以 affected-table completion DAG 执行有界物理前缀，dispatcher strict-head finalization 后发布 table counters；recovery RESUME_PURGE 真正运行 batch。剩余：purge→truncate、跨 rseg blocked-head 调度 | U/T | — | 二级索引协调、multi-worker 与 DROP barrier 已闭环 |
 | 0.5 | ✅ **bounded doublewrite slot reuse + 仓储级 `DoublewriteBatch` 已接**（2026-06-29），✅ **生产 FlushList/LRU batch dispatch v1 已接**（2026-07-18），✅ **双物理 channel + source-aware recovery + 部分失败 reservation 回收已接**（2026-07-18）：两文件独立 slot/force，恢复按最高 pageLSN 合并副本，旧单文件只作兼容输入。**剩余**：全空间 discovery、动态 slot/IO 配置 |
 | 0.6 | ✅ **0.6a 比例 adaptive flush**、✅ **0.6b 前台 reservation throttle**、✅ **0.20c operation budget**，✅ **redo/flush 速率 + IO capacity adaptive v1 已接**（2026-07-18）：采样器、速率缺口补偿、ASYNC idle cap、free ratio LRU 分配；neighbor 和动态 engine config 留后续 | F | — | admission 仍早于 page latch/fix/FSP lease；WAL/checkpoint 边界不变 |
 | 0.7 | 碎片打包：✅ `DETECT_ONLY` metadata/report 已接（2026-07-03：`DetectOnlyDoublewriteStrategy` + detect-only slot 枚举 + `DoublewriteRecoveryScanner.scanPageIfNeeded` + `RecoveryReport.detectedOnlyPageCount`；scanner 兼容 v1 full-copy，新写 full-copy/detect-only 统一 v2 header；engine 默认仍 recoverable full-copy）、✅ PageCleaner supervisor 重启 + metrics snapshot 已接（2026-07-03：`PageCleanerSupervisor` 托管/有限重启 worker，`PageCleanerMetricsSnapshot` 暴露诊断并保留历史 lastCycle 语义）、✅ legacy `BufferPool.flush/flushAll` API 已移除（2026-07-05：dirty page 物理写出统一走 FlushCoordinator；无 flusher 脏 victim 显式失败）、✅ `drainTablespace` busy-wait 已改 dirty-state condition 唤醒（2026-07-03：`BufferPool.awaitDirtyStateChange`，guard release/flush/reset signal；等待 timeout 后回环重扫 dirty 谓词；`flushThrough` 仍保留短 park）、✅ `RecoveryMode.READ_ONLY_VALIDATE` 已接（2026-07-06：scan-only doublewrite/redo、`RecoveryState.READ_ONLY`、`EngineConfig.withRecoveryMode`、`StorageEngine` read-only lifecycle）、✅ `RecoveryMode.FORCE_SKIP_CORRUPT_TABLESPACE` 显式 SpaceId 集合已接（2026-07-08：`RecoverySkipPolicy`、redo apply skip summary、doublewrite/redo/reconcile 过滤、`EngineConfig.withForceSkipRecovery`、StorageEngine 只打开 non-skipped recovery tablespace） | F/R | — | 0.7 恢复/诊断碎片包已收束；剩余对象级 force recovery 依赖 DD/discovery，不再归入 Tier 0 |
@@ -77,9 +78,9 @@ owner/lifecycle 的 **temporary undo**。
 | --- | --- | --- | --- | --- |
 | 1.1 | ✅ **REPAIR_DOUBLEWRITE 生产阶段**（随 0.2 落地：恢复期 scanner + `dwRepo.pageIds()` 真正修复 torn 页）| R | 0.2 | — |
 | 1.2 | ✅ **formal multi-index UNDO_ROLLBACK + PREPARED resolution 已接**：恢复按 creator 聚合双 ACTIVE/PREPARED slot；ACTIVE 从双 head 归并 rollback，PREPARED 由外部 provider 决议后复用 prepared commit/rollback，终点 atomic finalizer/terminal | R/T | 0.3 | — |
-| 1.3 | ✅ **formal RESUME_PURGE 已接**：恢复先重建 persistent history、决议 PREPARED、rollback ACTIVE，再独立执行 version-safe secondary/clustered purge，并在 OPEN 前 flush/force。剩余多 worker | R/U/T | 0.3 + 0.4 | — |
+| 1.3 | ✅ **formal RESUME_PURGE 已接**：恢复先重建 persistent history、决议 PREPARED、rollback ACTIVE，再以 production multi-worker coordinator 执行 version-safe secondary/clustered purge，并在 OPEN 前 flush/force | R/U/T | 0.3 + 0.4 | — |
 | 1.4 | ✅ **statement/named-savepoint/full/recovery rollback + persistent progress + atomic finalization 已接（2026-07-10~20）**：Session 名称映射 opaque boundary；同名替换、ROLLBACK TO 保留目标、RELEASE 单目标；undo partial/full/recovery 与 lock retention 白名单均闭环 | U/T | 现有 rollback | — |
-| 1.5 | 多 worker purge 分片（table/index/page） | U/T | 0.4 | 中 |
+| 1.5 | ✅ **有界 multi-worker purge 已接（2026-07-22）**：默认 4 worker、16-log window、5s batch timeout；整 history log 为 task，affected-table token 保证同表 FIFO/多表联合 fence，异表并行；secondary→clustered→LOB/head progress 保持记录内串行，worker 不摘 history，dispatcher 只 finalization 连续 READY 物理前缀；关闭不强制中断记录内 MTR | U/T | 0.4 | index/page 内细分、自适应 IO 限速和跨 rseg 选择 deferred |
 | 1.6 | ✅ **extern payload + 独立 INSERT/UPDATE Undo Log + cache/free reuse 已落（2026-07-13~15）**：payload chain/CRC/owner、immutable plan、精确 reservation/redo workload；每事务最多两 slot/segment，事务全局 undoNo + kind-local predecessor；单 fragment 段先进入按 kind 固定容量 LIFO，cache 不接纳时尾插跨 kind 持久 FIFO，重启恢复并可由另一 kind 摘头激活；truncate 统一 drain/rebuild，多页仍 drop。**剩余**：多 rseg / 多 undo tablespace（`RollPointer` 编码扩展）、改聚簇 PK | U/T | storage 扩展 | 当前单 rseg/reuse owner 边界闭环；其余大，可拆 |
 | 1.7 | ✅ **page0 checksum/trailer 校验已落（2026-07-06）**：`PageZeroTablespaceMetadataLoader` 在 FSP_HDR 信封校验后调用 `PageImageChecksum.verify`，校验 header checksum、trailer checksum 与 trailer low32 LSN；历史未盖 checksum 的 page0 仅在 header/trailer checksum 同为 0 时兼容 | D | — | 已有 flush 路径盖 `PageImageChecksum`，新页走严格校验；兼容分支只为早期切片文件 |
 | 1.8 | ✅ **typed page access lease 后 Registry 状态复核已落（2026-07-06）**：生产 `StorageEngine` 给 `IndexPageAccess` / `UndoLogSegmentAccess` 注入共享 `TablespaceRegistry`；INDEX/UNDO open/create 先持 S lease，再 `registry.require`，稳定 INACTIVE/CORRUPTED/DISCARDED 不再进入 Buffer Pool | D | — | 两参低层测试构造仍保留，专注页格式与链路行为 |
@@ -91,17 +92,17 @@ owner/lifecycle 的 **temporary undo**。
 | # | 项 | 源 | 阻塞于 |
 | --- | --- | --- | --- |
 | 2.1 | ✅ **table-level DML + SQL point/range INSERT/UPDATE/DELETE 已接**：typed patch 在 FOR_UPDATE/current range 锁定后应用；先物化 identity 防 Halloween/partial；全部 secondary、LOB、statement/named/full/recovery rollback 与 purge progress 闭环 | U/T | 剩余主键更新 |
-| 2.2 | ✅ **二级索引 purge / 回表 MVCC / comparison-composite range 已接（2026-07-17~20）**：logical-prefix S/X、multi-index undo/purge、unique point、open/closed/unbounded composite range、full scan、current/read-view residual 与 real RESUME_PURGE | U/T | 多 worker purge 与更贴近 InnoDB 的 marked-key 可见唯一检查 |
-| 2.3 | 🟡 **DDL undo marker + atomic DDL log 已接（2026-07-20）**：CREATE/DROP TABLE/INDEX、DISCARD/IMPORT、REBUILD_TABLE operation-specific identity/phase、exact-path rollback/finish、legacy marker 兼容；REBUILD v1 未单列 schema digest；**temporary undo 仍保留** | U/T/R | 临时表 owner/lifecycle 与独立 temporary tablespace 尚未建立，禁止塞入普通 history/page3 |
+| 2.2 | ✅ **二级索引 purge / 回表 MVCC / comparison-composite range 已接（2026-07-17~22）**：logical-prefix S/X、multi-index undo/purge、unique point、open/closed/unbounded composite range、full scan、current/read-view residual、multi-worker 与 real RESUME_PURGE | U/T | 更贴近 InnoDB 的 marked-key 可见唯一检查 |
+| 2.3 | 🟡 **DDL marker v4 + atomic DDL log已接（2026-07-20~21）**：operation 1..11的identity/phase、source/intermediate/target schema digest、protocol与`OPEN→CANCEL_REQUESTED/FORWARD_ONLY`单调CAS、retirement fence、exact-path rollback/finish、legacy v1-v3兼容；**temporary undo仍保留** | U/T/R | 临时表owner/lifecycle与独立temporary tablespace尚未建立，禁止塞入普通history/page3 |
 | 2.4 | ✅ **DD DISCOVER_TABLESPACE v1 已接（2026-07-15）**：ACTIVE/DROP_PENDING binding 生成 recovery spaces，ACTIVE 缺文件 fail-closed；2.9 离线工具另对 manifest ACTIVE file-per-table 做全页扫描 | R | 普通启动不做全 data-dir checksum scrub；系统/undo/未受 manifest 管理空间的离线 scrub 仍未接 |
-| 2.5 | ✅ **RECOVER_DDL atomic + SDI reconcile 已接（2026-07-20~21）**：独立 marker 裁决 table/index/transfer/rebuild 与 recovery-object op8/9/10 rollback/finish；REBUILD 以 committed old/new binding 裁决，可信 replacement 以 HMAC/hash/identity 裁决；兼容 legacy pending/orphan | R | online DDL row-log recovery、marker schema digest |
+| 2.5 | ✅ **RECOVER_DDL atomic + SDI reconcile已接（2026-07-20~22）**：独立marker裁决table/index/transfer/rebuild/Online ADD/DROP、通用INPLACE/SHADOW ALTER与recovery-object op8/9/10；通用恢复交叉验证manifest/journal/descriptor/fence，按source/target与OPEN/CANCEL/FORWARD_ONLY单向收敛 | R | legacy pending/orphan继续兼容；全实例离线scrub另列 |
 | 2.6 | ✅ **四隔离级别、named savepoint 与 persistent server XA 已接（2026-07-20，07-21 复审加固）**：RU current read、RR/RC ReadView、SERIALIZABLE promotion、lock retention boundary、fsync XID registry、XA SQL/RECOVER/startup gate/offline decision；per-XID phase 共用绝对 deadline，registry I/O 失败 fail-stop | T/R | RC residual-miss 提前释放、XA compaction/heuristic/active migration |
 | 2.7a | ✅ **B+Tree point current-read + logical key 锁接入已落**（2026-07-01~20）：短 MTR 定位 -> 无 page latch 等锁 -> 重定位；SQL DML、显式 point locking SELECT 与 SERIALIZABLE promotion 共用 physical/logical locks | B/T | 普通非锁定 point SELECT 按隔离级别走 MVCC/RU current；global gap 精确化另列 |
 | 2.7b | ✅ **B+Tree range current-read + SQL comparison/composite range/range DML 已落**（2026-07-01~20，07-21 复审加固）：open/closed/unbounded、256-row continuation、最长连续复合前缀/full scan、MVCC/RU/current 回表、locking read 与 Halloween/partial 防线均接线；逐行锁/terminal gap/relocation 共享单一绝对预算 | B/T | global gap 精确化、RC residual-miss 提前解锁 |
 | 2.8 | ✅ **General SQL / Session transaction v1 已接线（2026-07-16~20）**：DML、point/comparison/composite/full-scan、explicit locking、四隔离级别、named savepoint、persistent XA、28 类型、MDL、LOB、rollback 与 engine gate | B/T | optimizer/network/prepared statement、SET TRANSACTION ISOLATION LEVEL |
 | 2.9 | ✅ **catalog-loss recovery v1 已闭环并完成复审加固（2026-07-20）**：普通启动 fail-closed；独立 durable clean manifest/witness 保存 schema、完整目录与高水位；离线 API 完整枚举并 full-page scrub 候选，NOFOLLOW channel 与 XDES state/owner/list/bitmap 均严格校验，token 绑定全部证据；零长度 manifest 先保留，管理员显式隔离冲突后，以 safe control + clean-digest 稳定临时 baseline 原子发布 catalog，随后仍由普通引擎严格打开 | D | v1 不从无 manifest 的散落 SDI 猜 schema、不自动启动、不修 torn page、不承诺 Java/Windows 不可移植的目录 fsync |
 | 2.10 | ✅ **DROP + controlled DISCARD/IMPORT lifecycle 已接**：purge barrier、DD pending states、exact transfer paths、page0/SDI/file identity、spaceVersion、flush/invalidate 与 startup resume 均闭环 | D/DD/R | 跨设备来源由 admin 预复制；完整目录 fsync 可移植性不承诺 |
-| 2.11 | ✅ **general blocking ALTER v1 已接（2026-07-20，07-21 复审加固）**：ordered multi-action、table X、metadata-only 或 one shadow rebuild、256-row continuation、target LOB reallocation/all-index unique rebuild、DD binding swap 与 old/new crash recovery；ALTER/CREATE INDEX/DROP INDEX 在 DD commit 前建立 publication barrier，未知结果不再放行旧 aggregate | DD/B/T/R | online row log/binlog、主键/类型/foreign/generated、prefix syntax、FULLTEXT/SPATIAL、并行/外排/断点续作、marker digest |
+| 2.11 | ✅ **Online ALTER evolution A-F已接（2026-07-21~22）**：单ADD/DROP与instant metadata之外，通用INPLACE以versioned descriptor chain+multi-target capture原子发布多个secondary action；通用SHADOW以clustered identity journal、bounded copy、两遍reconcile、ReadView/purge barrier和old-space retirement发布row-layout/mixed action；两路均有digest/control/tracker/cancel/recovery | DD/B/T/R | binlog、主键/任意类型/foreign/generated、prefix/FULLTEXT/SPATIAL、并行/外排/持久断点仍待 |
 | 2.12 | ✅ **object-level force recovery v1 已接（2026-07-21）**：DD 原子隔离、管理员/DD union exclusion、redo/doublewrite/reconcile/undo/purge skip、导出只读写闸门、raw DISCARD/DROP、实例 HMAC clean backup 与固定 incoming trusted replacement | DD/R/U/T/D | v1 仅用户 file-per-table；系统/undo/共享空间、跨实例 trust、自动 repair 与 SQL/权限管理语法不支持 |
 
 ## 推荐路线
@@ -120,12 +121,19 @@ PAGE_INIT/PAGE_BYTES 通用 recovery 和 external reference undo 往返都有测
 普通超大旧行可经独立 `UNDO_PAYLOAD` 页链保存；同事务两类 log 独立占 slot/segment，并用全局 undoNo 归并回滚；
 空单 fragment 段可按 kind 跨事务/重启复用，truncate 与恢复 owner 边界已闭环。
 持久 free undo segment list 与 DD/catalog/MDL/physical CREATE-DROP/discovery/index resolver v1 都已完成。
+**1.5 multi-worker purge 已完成**：生产完整 DD resolver 路径使用可配置有界线程池，legacy 低层构造保持
+direct 串行；table-token DAG 允许异表并行并阻止同表/多表日志越序，history removal 仍严格按物理 head。
+undo/purge 下一条独立切片优先是 **purge→undo tablespace truncate 自动调度**；跨 rseg blocked-head 选择必须
+等待多 rseg/多 undo tablespace identity 设计，不能在当前单 rseg `RollPointer` 上伪造。
 **2.8 Primary-point SQL / Session、2.2 secondary closure 与 point-write LOB lifecycle 均已完成**：SQL INSERT/UPDATE/DELETE 维护全部索引；唯一二级点查走真实回表 MVCC；replacement 新链由 rollback 回收，旧链由逐记录 purge progress 回收；affected-table history、real RESUME_PURGE 与 DROP barrier 已进入生产组合根。
 **comparison/composite/full-scan、四隔离级别、named SAVEPOINT、persistent server XA、受控
-DISCARD/IMPORT、table options/defaults、general blocking ALTER 与 object-level force recovery 均已完成（2026-07-21）**。
-下一条高价值跨层主线建议推进 online DDL row log/binlog：先定义 DML 捕获、row-log durable phase、重启 replay
-与最终 MDL cutover，再实现最小 ADD INDEX online slice。temporary undo 仍必须等待临时表 owner/lifecycle 与
-独立 temporary tablespace，不能塞进普通 history/page3。
+DISCARD/IMPORT、table options/defaults、Online ADD/DROP INDEX、marker v4 digest/control/可观察取消、
+通用multi-index INPLACE/online shadow ALTER与object-level force recovery均已完成（2026-07-22）**。
+下一条高价值切片可从复制binlog参与者、主键/类型/foreign/generated ALTER，或Online DDL并行/外排与持久
+scan continuation中选择；这些能力都需要独立设计其提交、恢复与兼容边界。
+复制binlog应先补独立server/replication设计和提交参与者，
+不应塞进 row-log。temporary undo 仍必须等待临时表 owner/lifecycle 与独立 temporary tablespace，不能塞进普通
+history/page3。
 
 **btree / buffer-pool / record 的 Tier 0 项（0.8–0.13、0.21–0.23）与上面这条路线并行、互不阻塞**，但不是当前 crash-safety 主线，按需挑：
 若转向"让 buffer pool 更接近生产质量"，0.8/0.9、0.10a/b/c/d（linear + warmup + random read-ahead + 多 instance 分片）、0.22 stale-frame 版本语义、13.1a/13.1b-pre/13.1c/13.1d 锁边界与真实 flush list、legacy `BufferPool.flush/flushAll` API 移除、0.23a MTR page latch ordering 与 0.23b MTR/Redo 剩余纪律已落；下一步可处理 warmup IO 速率控制、random read-ahead 生产 config，或继续细化 `DIRTY_PENDING`/`EVICTING`/`STALE` 状态；

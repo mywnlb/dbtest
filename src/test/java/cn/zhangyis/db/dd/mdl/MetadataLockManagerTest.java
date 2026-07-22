@@ -3,6 +3,7 @@ package cn.zhangyis.db.dd.mdl;
 import cn.zhangyis.db.dd.domain.MdlOwnerId;
 import cn.zhangyis.db.dd.exception.MetadataDeadlockException;
 import cn.zhangyis.db.dd.exception.MetadataLockTimeoutException;
+import cn.zhangyis.db.dd.exception.MetadataLockStateException;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
@@ -15,6 +16,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertSame;
 
 /** MDL 六模式、队列公平性、upgrade、timeout 和独立 metadata wait graph 的 TDD。 */
 class MetadataLockManagerTest {
@@ -88,6 +90,97 @@ class MetadataLockManagerTest {
             assertEquals(MdlMode.EXCLUSIVE, upgrader.mode());
         } finally {
             upgrader.close();
+        }
+    }
+
+    /** X 原地降级 SU 必须保留 ticket identity，并唤醒兼容 SR/SW，且不创建 wait-graph 边。 */
+    @Test
+    void downgradesExclusiveInPlaceAndWakesCompatibleReadersAndWriters() throws Exception {
+        MetadataLockManager manager = new MetadataLockManager(8, 64);
+        MdlKey key = MdlKey.table("def.app.orders");
+        MdlTicket exclusive = manager.acquire(request(1, key, MdlMode.EXCLUSIVE), Duration.ofSeconds(1));
+        long requestId = exclusive.requestId();
+        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            Future<MdlTicket> reader = executor.submit(() -> manager.acquire(
+                    request(2, key, MdlMode.SHARED_READ), Duration.ofSeconds(2)));
+            Future<MdlTicket> writer = executor.submit(() -> manager.acquire(
+                    request(3, key, MdlMode.SHARED_WRITE), Duration.ofSeconds(2)));
+            await(() -> manager.snapshot().waiting().size() == 2);
+
+            MdlTicket downgraded = manager.downgrade(exclusive, MdlMode.SHARED_UPGRADABLE);
+
+            assertSame(exclusive, downgraded);
+            assertEquals(requestId, downgraded.requestId());
+            assertEquals(MdlOwnerId.of(1), downgraded.owner());
+            assertEquals(MdlDuration.EXPLICIT, downgraded.duration());
+            assertEquals(MdlMode.SHARED_UPGRADABLE, downgraded.mode());
+            try (MdlTicket ignoredReader = reader.get(1, java.util.concurrent.TimeUnit.SECONDS);
+                 MdlTicket ignoredWriter = writer.get(1, java.util.concurrent.TimeUnit.SECONDS)) {
+                assertTrue(manager.snapshot().waiting().isEmpty());
+                assertTrue(manager.snapshot().waitEdges().isEmpty());
+            }
+        } finally {
+            exclusive.close();
+        }
+    }
+
+    /** SU 降级结果仍排斥第二个 SU 与 X；错误 source/target 和 closed ticket 必须无副作用拒绝。 */
+    @Test
+    void rejectsInvalidDowngradeAndKeepsStrongCompatibilityBoundary() {
+        MetadataLockManager manager = new MetadataLockManager(8, 64);
+        MdlKey key = MdlKey.table("def.app.orders");
+        MdlTicket exclusive = manager.acquire(request(1, key, MdlMode.EXCLUSIVE), Duration.ofSeconds(1));
+
+        manager.downgrade(exclusive, MdlMode.SHARED_UPGRADABLE);
+
+        assertThrows(MetadataLockTimeoutException.class, () -> manager.acquire(
+                request(2, key, MdlMode.SHARED_UPGRADABLE), Duration.ofMillis(30)));
+        assertThrows(MetadataLockTimeoutException.class, () -> manager.acquire(
+                request(3, key, MdlMode.EXCLUSIVE), Duration.ofMillis(30)));
+        assertThrows(MetadataLockStateException.class,
+                () -> manager.downgrade(exclusive, MdlMode.SHARED_READ));
+        exclusive.close();
+        assertThrows(MetadataLockStateException.class,
+                () -> manager.downgrade(exclusive, MdlMode.SHARED_UPGRADABLE));
+        assertTrue(manager.snapshot().waitEdges().isEmpty());
+    }
+
+    /**
+     * Online DDL 取消只能唤醒尚在等待的 final-X upgrade；已授予的 SU 与其它 owner 的 SW 都必须保留，
+     * 否则控制线程会在 coordinator 尚未到达安全点时强拆其资源所有权。
+     *
+     * @throws Exception virtual-thread future 在断言前传播意外执行失败时抛出
+     */
+    @Test
+    void cancelsOnlyPendingRequestsAndKeepsGrantedTickets() throws Exception {
+        MetadataLockManager manager = new MetadataLockManager(8, 64);
+        MdlKey key = MdlKey.table("def.app.orders");
+        MdlOwnerId ddlOwner = MdlOwnerId.of(2);
+        MdlTicket ddlSharedUpgradable = manager.acquire(
+                request(ddlOwner.value(), key, MdlMode.SHARED_UPGRADABLE), Duration.ofSeconds(2));
+        MdlTicket blockingWriter = manager.acquire(
+                request(1, key, MdlMode.SHARED_WRITE), Duration.ofSeconds(2));
+        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            Future<MdlTicket> finalUpgrade = executor.submit(() -> manager.upgrade(
+                    ddlSharedUpgradable, MdlMode.EXCLUSIVE, Duration.ofSeconds(5)));
+            await(() -> manager.snapshot().waiting().size() == 1);
+
+            assertEquals(1, manager.cancelPending(ddlOwner));
+            assertThrows(java.util.concurrent.ExecutionException.class, finalUpgrade::get);
+
+            MetadataLockSnapshot snapshot = manager.snapshot();
+            assertTrue(snapshot.waiting().isEmpty());
+            assertTrue(snapshot.waitEdges().isEmpty());
+            assertEquals(2, snapshot.granted().size());
+            assertTrue(snapshot.granted().stream().anyMatch(lock ->
+                    lock.owner().equals(ddlOwner) && lock.mode() == MdlMode.SHARED_UPGRADABLE));
+            assertTrue(snapshot.granted().stream().anyMatch(lock ->
+                    lock.owner().equals(MdlOwnerId.of(1)) && lock.mode() == MdlMode.SHARED_WRITE));
+            assertFalse(ddlSharedUpgradable.isClosed());
+            assertFalse(blockingWriter.isClosed());
+        } finally {
+            blockingWriter.close();
+            ddlSharedUpgradable.close();
         }
     }
 

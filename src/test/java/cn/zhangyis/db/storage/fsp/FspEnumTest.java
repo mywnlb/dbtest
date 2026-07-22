@@ -37,6 +37,7 @@ class FspEnumTest {
         assertEquals(2, SegmentPurpose.LOB.ordinal());
         assertEquals(3, SegmentPurpose.UNDO.ordinal());
         assertEquals(4, SegmentPurpose.SYSTEM.ordinal());
+        assertEquals(5, SegmentPurpose.DDL_DESCRIPTOR.ordinal());
     }
 
     /**

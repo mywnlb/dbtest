@@ -13,5 +13,7 @@ public enum SegmentPurpose {
     /** undo segment。 */
     UNDO,
     /** 系统 segment。 */
-    SYSTEM
+    SYSTEM,
+    /** 通用Online ALTER的短期descriptor chain；追加在尾部以保持既有INODE ordinal。 */
+    DDL_DESCRIPTOR
 }

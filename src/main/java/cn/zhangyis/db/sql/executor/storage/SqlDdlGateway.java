@@ -53,7 +53,8 @@ public interface SqlDdlGateway {
     }
 
     /**
-     * 执行按用户顺序 staged 的通用阻塞式 ALTER。
+     * 执行通用 ALTER。DD coordinator负责选择instant metadata、单索引在线协议或有明确能力缺口的
+     * blocking fallback；gateway不得在SQL层拆分action list。
      *
      * @param statement 已完成纯 SQL 类型/default 校验的 DD command
      * @param timeout statement 剩余正有界时间

@@ -11,6 +11,11 @@ import cn.zhangyis.db.domain.UndoNo;
 import cn.zhangyis.db.domain.UndoSlotId;
 import cn.zhangyis.db.storage.api.DiskSpaceManager;
 import cn.zhangyis.db.storage.api.SegmentRef;
+import cn.zhangyis.db.storage.api.ddl.online.OnlineDdlTablePhase;
+import cn.zhangyis.db.storage.api.ddl.online.OnlineIndexBuildId;
+import cn.zhangyis.db.storage.api.ddl.online.OnlineIndexCaptureTarget;
+import cn.zhangyis.db.storage.api.ddl.online.OnlineIndexLogHeader;
+import cn.zhangyis.db.storage.api.ddl.online.OnlineIndexLogRecordType;
 import cn.zhangyis.db.storage.api.trx.CommitPreparedTransactionCommand;
 import cn.zhangyis.db.storage.api.trx.PrepareTransactionCommand;
 import cn.zhangyis.db.storage.api.trx.PreparedTransactionCompletionResult;
@@ -24,6 +29,7 @@ import cn.zhangyis.db.storage.btree.IndexMetadataResolver;
 import cn.zhangyis.db.storage.btree.TableIndexMetadata;
 import cn.zhangyis.db.storage.engine.EngineConfig;
 import cn.zhangyis.db.storage.engine.StorageEngine;
+import cn.zhangyis.db.storage.fil.online.FileOnlineIndexChangeLog;
 import cn.zhangyis.db.storage.fsp.segment.SegmentPurpose;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.recovery.RecoveryTrafficGate;
@@ -37,7 +43,9 @@ import cn.zhangyis.db.storage.record.schema.ColumnType;
 import cn.zhangyis.db.storage.record.schema.IndexKeyDef;
 import cn.zhangyis.db.storage.record.schema.KeyOrder;
 import cn.zhangyis.db.storage.record.schema.KeyPartDef;
+import cn.zhangyis.db.storage.record.schema.SecondaryIndexLayout;
 import cn.zhangyis.db.storage.record.schema.TableSchema;
+import cn.zhangyis.db.storage.record.online.SecondaryIndexCandidateCodec;
 import cn.zhangyis.db.storage.record.type.ColumnValue;
 import cn.zhangyis.db.storage.redo.DurabilityPolicy;
 import cn.zhangyis.db.storage.redo.RedoBudgetPurpose;
@@ -90,6 +98,140 @@ class ClusteredDmlServiceTest {
 
     @TempDir
     Path dir;
+
+    /** INSERT candidate 必须在业务 MTR 前写入，普通 COMMIT 必须在 undo terminal 前 force 其 sequence。 */
+    @Test
+    void onlineCaptureInsertIsForcedByCommitAndReleasesSealReference() {
+        StorageEngine engine = new StorageEngine(config(dir));
+        engine.open();
+        try {
+            BTreeIndex index = createClusteredIndex(engine, dir.resolve("online-capture-insert.ibd"));
+            try (FileOnlineIndexChangeLog log = activateCapture(engine, 301, 20, payloadLayout(),
+                    "online-capture-insert.log")) {
+                Transaction txn = engine.transactionManager().begin(TransactionOptions.defaults());
+
+                engine.dmlService().insert(new ClusteredInsertCommand(txn, index, search(1), row(1, "v1"),
+                        TABLE_ID, Optional.empty(), Duration.ofSeconds(1)));
+
+                long candidate = log.readAll().stream()
+                        .filter(record -> record.type() == OnlineIndexLogRecordType.CANDIDATE)
+                        .findFirst().orElseThrow().sequence();
+                assertEquals(0, log.highestForcedSequence());
+                engine.dmlService().commit(new DmlCommitCommand(txn, DurabilityPolicy.FLUSH_ON_COMMIT,
+                        Duration.ofSeconds(2)));
+                assertTrue(log.highestForcedSequence() >= candidate);
+
+                engine.onlineDdlTableGate().beginSeal(OnlineIndexBuildId.of(301), Duration.ofSeconds(1));
+                assertEquals(OnlineDdlTablePhase.SEALED, engine.onlineDdlTableGate().phase(TABLE_ID));
+            }
+        } finally {
+            engine.close();
+        }
+    }
+
+    /** 非目标列 UPDATE 不得产生 candidate；目标物理 key 变化和 DELETE 分别产生 before/after 与 before。 */
+    @Test
+    void onlineCaptureSkipsNonKeyUpdateAndCapturesDelete() {
+        StorageEngine engine = new StorageEngine(config(dir));
+        engine.open();
+        try {
+            BTreeIndex index = createClusteredIndex(engine, dir.resolve("online-capture-update.ibd"));
+            insertAndCommit(engine, index, 2, "before");
+            try (FileOnlineIndexChangeLog log = activateCapture(engine, 302, 21, idOnlyLayout(),
+                    "online-capture-update.log")) {
+                Transaction update = engine.transactionManager().begin(TransactionOptions.defaults());
+                engine.dmlService().update(new ClusteredUpdateCommand(update, index, search(2), row(2, "after"),
+                        TABLE_ID, Optional.empty(), Duration.ofSeconds(1)));
+                engine.dmlService().commit(new DmlCommitCommand(update, DurabilityPolicy.FLUSH_ON_COMMIT,
+                        Duration.ofSeconds(2)));
+                assertEquals(0, log.readAll().stream()
+                        .filter(record -> record.type() == OnlineIndexLogRecordType.CANDIDATE).count());
+
+                Transaction delete = engine.transactionManager().begin(TransactionOptions.defaults());
+                engine.dmlService().delete(new ClusteredDeleteCommand(delete, index, search(2), TABLE_ID,
+                        Optional.empty(), Duration.ofSeconds(1)));
+                engine.dmlService().commit(new DmlCommitCommand(delete, DurabilityPolicy.FLUSH_ON_COMMIT,
+                        Duration.ofSeconds(2)));
+                assertEquals(1, log.readAll().stream()
+                        .filter(record -> record.type() == OnlineIndexLogRecordType.CANDIDATE).count());
+            }
+        } finally {
+            engine.close();
+        }
+    }
+
+    /** XA PREPARE 的返回边界必须已经覆盖 candidate，phase-two durable 后才能解除 seal 的事务引用。 */
+    @Test
+    void onlineCaptureIsForcedBeforeXaPrepareAndReleasedAfterPhaseTwo() {
+        StorageEngine engine = new StorageEngine(config(dir));
+        engine.open();
+        try {
+            BTreeIndex index = createClusteredIndex(engine, dir.resolve("online-capture-xa.ibd"));
+            try (FileOnlineIndexChangeLog log = activateCapture(engine, 303, 20, payloadLayout(),
+                    "online-capture-xa.log")) {
+                Transaction txn = engine.transactionManager().begin(TransactionOptions.defaults());
+                engine.dmlService().insert(new ClusteredInsertCommand(txn, index, search(3), row(3, "xa"),
+                        TABLE_ID, Optional.empty(), Duration.ofSeconds(1)));
+                long candidate = log.highestAppendedSequence();
+
+                engine.preparedTransactionService().prepare(
+                        new PrepareTransactionCommand(txn, Duration.ofSeconds(2)));
+                assertTrue(log.highestForcedSequence() >= candidate);
+                engine.preparedTransactionService().commitPrepared(
+                        new CommitPreparedTransactionCommand(txn, Duration.ofSeconds(2)));
+
+                engine.onlineDdlTableGate().beginSeal(OnlineIndexBuildId.of(303), Duration.ofSeconds(1));
+                assertEquals(OnlineDdlTablePhase.SEALED, engine.onlineDdlTableGate().phase(TABLE_ID));
+            }
+        } finally {
+            engine.close();
+        }
+    }
+
+    /** candidate 用尽普通容量后必须以 reserve 持久 ABORT_REQUIRED；触发该边界的业务 DML 及后续 DML 仍可提交。 */
+    @Test
+    void onlineCaptureCapacityAbortDoesNotRollbackBusinessDml() {
+        StorageEngine engine = new StorageEngine(config(dir));
+        engine.open();
+        try {
+            BTreeIndex index = createClusteredIndex(
+                    engine, dir.resolve("online-capture-capacity.ibd"));
+            OnlineIndexBuildId buildId = OnlineIndexBuildId.of(304);
+            try (FileOnlineIndexChangeLog log = FileOnlineIndexChangeLog.create(
+                    dir.resolve("online-capture-capacity.log"),
+                    new OnlineIndexLogHeader(buildId, TABLE_ID, 20,
+                            1, 2, clusteredSchema().schemaVersion(), new byte[]{1, 2, 3}),
+                    8192, 4096)) {
+                log.appendState(OnlineIndexLogRecordType.GENERATION_STARTED, new byte[0]);
+                log.appendState(OnlineIndexLogRecordType.CAPTURING, new byte[0]);
+                engine.onlineDdlTableGate().beginActivation(
+                        TABLE_ID, buildId, Duration.ofSeconds(1));
+                engine.onlineDdlTableGate().publishCapture(new OnlineIndexCaptureTarget(
+                        buildId, TABLE_ID, 20, log,
+                        new SecondaryIndexCandidateCodec(payloadLayout(),
+                                new cn.zhangyis.db.storage.record.type.TypeCodecRegistry())));
+                Transaction transaction = engine.transactionManager().begin(TransactionOptions.defaults());
+
+                for (int id = 1; id <= 100; id++) {
+                    engine.dmlService().insert(new ClusteredInsertCommand(
+                            transaction, index, search(id), row(id, "payload-" + id),
+                            TABLE_ID, Optional.empty(), Duration.ofSeconds(1)));
+                }
+
+                assertTrue(log.abortRequired());
+                assertEquals(OnlineDdlTablePhase.ABORTING,
+                        engine.onlineDdlTableGate().phase(TABLE_ID));
+                engine.dmlService().commit(new DmlCommitCommand(
+                        transaction, DurabilityPolicy.FLUSH_ON_COMMIT, Duration.ofSeconds(2)));
+                assertEquals("payload-100", payloadOf(lookup(engine, index, 100).orElseThrow()));
+                engine.onlineDdlTableGate().awaitAbortQuiescence(
+                        buildId, Duration.ofSeconds(1));
+                engine.onlineDdlTableGate().clearBuild(buildId);
+            }
+        } finally {
+            engine.close();
+        }
+    }
 
     /**
      * 验证 {@code commandObjectsRejectNullRequiredFields} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
@@ -1130,6 +1272,38 @@ class ClusteredDmlServiceTest {
         return new TransactionManager(new TransactionSystem()).begin(TransactionOptions.defaults());
     }
 
+    /** 创建 header 已 durable、gate 已 CAPTURING 的真实 row log fixture。 */
+    private FileOnlineIndexChangeLog activateCapture(StorageEngine engine, long buildId, long indexId,
+                                                      SecondaryIndexLayout layout, String fileName) {
+        FileOnlineIndexChangeLog log = FileOnlineIndexChangeLog.create(dir.resolve(fileName),
+                new OnlineIndexLogHeader(OnlineIndexBuildId.of(buildId), TABLE_ID, indexId,
+                        1, 2, clusteredSchema().schemaVersion(), new byte[]{1, 2, 3}),
+                64 * 1024, 4096);
+        log.appendState(OnlineIndexLogRecordType.GENERATION_STARTED, new byte[0]);
+        log.appendState(OnlineIndexLogRecordType.CAPTURING, new byte[0]);
+        engine.onlineDdlTableGate().beginActivation(
+                TABLE_ID, OnlineIndexBuildId.of(buildId), Duration.ofSeconds(1));
+        engine.onlineDdlTableGate().publishCapture(new OnlineIndexCaptureTarget(
+                OnlineIndexBuildId.of(buildId), TABLE_ID, indexId, log,
+                new SecondaryIndexCandidateCodec(layout,
+                        new cn.zhangyis.db.storage.record.type.TypeCodecRegistry())));
+        return log;
+    }
+
+    /** payload 列作为 logical secondary、聚簇 id 作为物理后缀的测试 layout。 */
+    private static SecondaryIndexLayout payloadLayout() {
+        return SecondaryIndexLayout.create(clusteredSchema(),
+                new IndexKeyDef(20, List.of(new KeyPartDef(new ColumnId(1), KeyOrder.ASC, 0))),
+                idKey());
+    }
+
+    /** id 同时作为 logical secondary 与聚簇后缀，用于验证非索引 payload 更新不产生日志。 */
+    private static SecondaryIndexLayout idOnlyLayout() {
+        return SecondaryIndexLayout.create(clusteredSchema(),
+                new IndexKeyDef(21, List.of(new KeyPartDef(new ColumnId(0), KeyOrder.ASC, 0))),
+                idKey());
+    }
+
     private static EngineConfig config(Path dir) {
         return new EngineConfig(dir, PS, 256, SpaceId.of(5), PageNo.of(64), 64, 100,
                 Duration.ofSeconds(10), 64L * 1024 * 1024);
@@ -1222,14 +1396,16 @@ class ClusteredDmlServiceTest {
         gate.openForUserTraffic();
         return new ClusteredDmlService(engine.transactionManager(), engine.undoLogManager(),
                 engine.miniTransactionManager(), engine.btreeService(), engine.btreeCurrentReadService(),
-                engine.rollbackService(), engine.lockManager(), redo, gate, engine.lobStorage());
+                engine.rollbackService(), engine.lockManager(), redo, gate, engine.lobStorage(),
+                engine.onlineDdlTableGate());
     }
 
     private static ClusteredDmlService serviceWithGate(StorageEngine engine, RecoveryTrafficGate gate) {
         return new ClusteredDmlService(engine.transactionManager(), engine.undoLogManager(),
                 engine.miniTransactionManager(), engine.btreeService(), engine.btreeCurrentReadService(),
                 engine.rollbackService(), engine.lockManager(),
-                engine.miniTransactionManager().redoLogManager(), gate, engine.lobStorage());
+                engine.miniTransactionManager().redoLogManager(), gate, engine.lobStorage(),
+                engine.onlineDdlTableGate());
     }
 
     /** 用指定 redo durability 端口装饰同一生产事务/undo/rollback/lock 组合根。 */
@@ -1239,7 +1415,7 @@ class ClusteredDmlServiceTest {
         gate.openForUserTraffic();
         return new PreparedTransactionService(
                 engine.transactionManager(), engine.undoLogManager(), engine.rollbackService(),
-                redo, gate, engine.lockManager());
+                redo, gate, engine.lockManager(), engine.onlineDdlTableGate());
     }
 
     private static BTreeIndex clusteredIndex() {

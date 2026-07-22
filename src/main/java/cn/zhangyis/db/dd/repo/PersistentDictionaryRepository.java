@@ -325,10 +325,11 @@ public final class PersistentDictionaryRepository {
                 && validLifecycleTransition(before.state(), after.state());
         boolean addSecondaryIndex = exactSecondaryIndexAddition(before, after);
         boolean removeSecondaryIndex = exactSecondaryIndexRemoval(before, after);
+        boolean alterSecondaryIndexes = exactSecondaryIndexSetAlter(before, after);
         boolean metadataAlter = exactMetadataAlter(before, after);
         boolean blockingRebuild = exactBlockingRebuild(before, after);
         if (!lifecycle && !addSecondaryIndex && !removeSecondaryIndex
-                && !metadataAlter && !blockingRebuild) {
+                && !alterSecondaryIndexes && !metadataAlter && !blockingRebuild) {
             throw new DictionaryVersionConflictException("invalid table lifecycle transition: "
                     + before.state() + " -> " + after.state());
         }
@@ -456,6 +457,101 @@ public final class PersistentDictionaryRepository {
             }
         }
         return false;
+    }
+
+    /**
+     * 精确识别通用 INPLACE_INDEX 对二级索引集合的一次原子替换。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>先冻结非索引 aggregate 与表空间级 binding；任何列、名称、options、row format、LOB 或文件变化都拒绝。</li>
+     *     <li>按 ordinal 交叉核对每个逻辑索引及其物理 binding identity，防止 DD 与 root/segment 列表错位。</li>
+     *     <li>要求聚簇索引和所有保留二级索引逐值不变；只有新增或删除的对象可不同，且两侧差集都禁止聚簇索引。</li>
+     *     <li>要求集合确实变化，并保持所有保留索引的相对次序，避免借通用 ALTER 隐式重排稳定 binding。</li>
+     * </ol>
+     *
+     * @param before 提交前 ACTIVE aggregate，提供稳定表空间与旧索引集合
+     * @param after 同一事务计划发布的 ACTIVE aggregate，包含最终完整索引集合
+     * @return 仅当差异可被解释为同一表空间内的一个或多个 secondary ADD/DROP 时返回 {@code true}
+     */
+    private static boolean exactSecondaryIndexSetAlter(
+            TableDefinition before, TableDefinition after) {
+        // 1、通用 INPLACE 只替换索引集合；shadow 与 metadata ALTER 继续由各自严格分支裁决。
+        if (before.state() != cn.zhangyis.db.dd.domain.TableState.ACTIVE
+                || after.state() != cn.zhangyis.db.dd.domain.TableState.ACTIVE
+                || !before.schemaId().equals(after.schemaId())
+                || !before.name().equals(after.name())
+                || !before.columns().equals(after.columns())
+                || !before.options().equals(after.options())
+                || before.storageBinding().isEmpty() || after.storageBinding().isEmpty()) {
+            return false;
+        }
+        var oldBinding = before.storageBinding().orElseThrow();
+        var newBinding = after.storageBinding().orElseThrow();
+        if (oldBinding.tableId() != newBinding.tableId()
+                || !oldBinding.spaceId().equals(newBinding.spaceId())
+                || !oldBinding.path().equals(newBinding.path())
+                || oldBinding.rowFormatVersion() != newBinding.rowFormatVersion()
+                || !oldBinding.lobSegment().equals(newBinding.lobSegment())
+                || before.indexes().size() != oldBinding.indexes().size()
+                || after.indexes().size() != newBinding.indexes().size()) {
+            return false;
+        }
+
+        // 2、逻辑定义与物理 binding 在每个 aggregate 内必须保持同一 index identity 和 ordinal。
+        Map<Long, cn.zhangyis.db.dd.domain.IndexDefinition> oldDefinitions = new LinkedHashMap<>();
+        Map<Long, cn.zhangyis.db.storage.api.ddl.IndexStorageBinding> oldBindings =
+                new LinkedHashMap<>();
+        Map<Long, cn.zhangyis.db.dd.domain.IndexDefinition> newDefinitions = new LinkedHashMap<>();
+        Map<Long, cn.zhangyis.db.storage.api.ddl.IndexStorageBinding> newBindings =
+                new LinkedHashMap<>();
+        for (int ordinal = 0; ordinal < before.indexes().size(); ordinal++) {
+            var definition = before.indexes().get(ordinal);
+            var binding = oldBinding.indexes().get(ordinal);
+            if (definition.id().value() != binding.indexId()) {
+                return false;
+            }
+            oldDefinitions.put(definition.id().value(), definition);
+            oldBindings.put(binding.indexId(), binding);
+        }
+        for (int ordinal = 0; ordinal < after.indexes().size(); ordinal++) {
+            var definition = after.indexes().get(ordinal);
+            var binding = newBinding.indexes().get(ordinal);
+            if (definition.id().value() != binding.indexId()) {
+                return false;
+            }
+            newDefinitions.put(definition.id().value(), definition);
+            newBindings.put(binding.indexId(), binding);
+        }
+
+        // 3、交集是不可变稳定对象；差集只能包含 secondary，聚簇 root/definition 永不通过本分支替换。
+        for (Map.Entry<Long, cn.zhangyis.db.dd.domain.IndexDefinition> entry
+                : oldDefinitions.entrySet()) {
+            var replacement = newDefinitions.get(entry.getKey());
+            if (replacement != null && (!replacement.equals(entry.getValue())
+                    || !newBindings.get(entry.getKey()).equals(oldBindings.get(entry.getKey())))) {
+                return false;
+            }
+            if (replacement == null && entry.getValue().clustered()) {
+                return false;
+            }
+        }
+        for (Map.Entry<Long, cn.zhangyis.db.dd.domain.IndexDefinition> entry
+                : newDefinitions.entrySet()) {
+            if (!oldDefinitions.containsKey(entry.getKey()) && entry.getValue().clustered()) {
+                return false;
+            }
+        }
+
+        // 4、排除无变化与稳定索引重排；新增索引可按 ALTER action 顺序追加到最终 aggregate。
+        if (oldDefinitions.keySet().equals(newDefinitions.keySet())) {
+            return false;
+        }
+        List<Long> retainedBefore = oldDefinitions.keySet().stream()
+                .filter(newDefinitions::containsKey).toList();
+        List<Long> retainedAfter = newDefinitions.keySet().stream()
+                .filter(oldDefinitions::containsKey).toList();
+        return retainedBefore.equals(retainedAfter);
     }
 
     private DictionarySnapshot rebuild(List<CatalogBatch> batches) {

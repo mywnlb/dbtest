@@ -60,6 +60,18 @@ class PurgeDriverWorkerTest {
         assertTrue(worker.stop(Duration.ofSeconds(2)), "second stop idempotent");
     }
 
+    /** 分离的 stop request/await 允许组合根先同时取消 driver 与内部 worker pool，再共享一个关闭预算。 */
+    @Test
+    void requestStopAndAwaitStoppedShareExistingStateMachine() {
+        PurgeDriverWorker worker = new PurgeDriverWorker(new FakeTarget(), 16, Duration.ofSeconds(30));
+        worker.start();
+
+        worker.requestStop();
+
+        assertTrue(worker.awaitStopped(Duration.ofSeconds(2)));
+        assertEquals(PurgeDriverWorkerState.STOPPED, worker.state());
+    }
+
     /**
      * 验证 {@code runBatchFailureMovesToFailedState} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
      */

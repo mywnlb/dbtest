@@ -152,24 +152,51 @@ public final class PurgeDriverWorker implements AutoCloseable {
      * @return true 表示已停止。
      */
     public boolean stop(Duration timeout) {
-        long nanos = validateWaitTimeout(timeout, "purge driver stop timeout");
-        CountDownLatch latch;
+        requestStop();
+        return awaitStopped(timeout);
+    }
+
+    /**
+     * 非阻塞请求 driver 停止。组合根先调用本方法，再同时停止 coordinator 内部 worker pool，避免 driver 在
+     * {@link PurgeTarget#runBatch(int)} 中等待而内部 worker 尚未收到取消。
+     */
+    public void requestStop() {
         lock.lock();
         try {
             if (state == PurgeDriverWorkerState.NEW) {
                 state = PurgeDriverWorkerState.STOPPED;
                 terminated.countDown();
                 idleChanged.signalAll();
-                return true;
+                return;
+            }
+            if (state == PurgeDriverWorkerState.STOPPED || state == PurgeDriverWorkerState.FAILED) {
+                return;
+            }
+            state = PurgeDriverWorkerState.STOPPING;
+            purgeRequested = false;
+            workAvailable.signalAll();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 有界等待已请求停止的 driver 线程退出；本方法不重新发停止信号，便于组合根共享一个绝对 deadline。
+     *
+     * @param timeout 当前关闭 deadline 的剩余非负预算
+     * @return 线程已终止时为 true，超时或调用线程中断时为 false
+     */
+    public boolean awaitStopped(Duration timeout) {
+        long nanos = validateWaitTimeout(timeout, "purge driver stop timeout");
+        CountDownLatch latch;
+        lock.lock();
+        try {
+            if (state == PurgeDriverWorkerState.NEW) {
+                throw new DatabaseValidationException("purge driver stop must be requested before await");
             }
             if (state == PurgeDriverWorkerState.STOPPED) {
                 return true;
             }
-            if (state != PurgeDriverWorkerState.FAILED) {
-                state = PurgeDriverWorkerState.STOPPING;
-            }
-            purgeRequested = false;
-            workAvailable.signalAll();
             latch = terminated;
         } finally {
             lock.unlock();
@@ -239,7 +266,7 @@ public final class PurgeDriverWorker implements AutoCloseable {
                     PurgeSummary summary = target.runBatch(maxPerBatch);
                     markCycleComplete(summary);
                 } catch (DatabaseRuntimeException e) {
-                    markFailed(e);
+                    markFailedUnlessStopping(e);
                     return;
                 }
             }
@@ -304,9 +331,15 @@ public final class PurgeDriverWorker implements AutoCloseable {
         }
     }
 
-    private void markFailed(DatabaseRuntimeException error) {
+    /** shutdown 已先发布 STOPPING 时，target 的取消异常属于正常退出，不得覆盖为业务 FAILED。 */
+    private void markFailedUnlessStopping(DatabaseRuntimeException error) {
         lock.lock();
         try {
+            if (state == PurgeDriverWorkerState.STOPPING) {
+                inFlight = false;
+                idleChanged.signalAll();
+                return;
+            }
             failure = error;
             purgeRequested = false;
             inFlight = false;

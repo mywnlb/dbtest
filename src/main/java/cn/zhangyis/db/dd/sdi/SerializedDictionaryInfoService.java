@@ -6,9 +6,11 @@ import cn.zhangyis.db.storage.api.ddl.SerializedDictionaryInfo;
 import cn.zhangyis.db.storage.api.ddl.SerializedDictionaryInfoException;
 import cn.zhangyis.db.storage.api.ddl.TableDdlStorageService;
 import cn.zhangyis.db.storage.api.ddl.TableStorageBinding;
+import cn.zhangyis.db.domain.SpaceId;
 import lombok.extern.slf4j.Slf4j;
 
 import java.time.Duration;
+import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Optional;
 
@@ -66,6 +68,102 @@ public final class SerializedDictionaryInfoService {
 
         // 3. physical 返回即代表 SDI redo 与数据页均 durable；异常原样阻断后续 DD publish。
         physical.writeSerializedDictionaryInfo(binding, information, timeout);
+    }
+
+    /**
+     * 读取并解码exact binding上的SDI，供已由marker决定恢复方向的DDL恢复器重建目标aggregate。
+     * 本方法本身不允许把SDI反向发布到catalog；调用方必须先完成marker/control/digest裁决。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验binding并通过storage facade读取完整envelope；空footer返回empty。</li>
+     *     <li>解码opaque payload，并交叉验证envelope table/version与payload aggregate。</li>
+     *     <li>要求payload携带的物理binding与调用者exact binding相同，拒绝错表或旧space证据。</li>
+     * </ol>
+     *
+     * @param binding 已由committed DD与DDL marker共同验证的exact tablespace binding
+     * @return 解码后的完整ACTIVE aggregate；SDI尚不存在时为空
+     * @throws DatabaseValidationException binding缺失时抛出且不访问storage
+     * @throws SerializedDictionaryInfoException envelope、payload或binding identity损坏时抛出，恢复必须fail-closed
+     */
+    public Optional<TableDefinition> read(TableStorageBinding binding) {
+        // 1、读取只经过稳定storage API，不暴露page3或BufferFrame。
+        if (binding == null) {
+            throw new DatabaseValidationException("SDI read requires a table binding");
+        }
+        Optional<SerializedDictionaryInfo> actual = physical.readSerializedDictionaryInfo(binding);
+        if (actual.isEmpty()) {
+            return Optional.empty();
+        }
+
+        // 2、envelope与payload分别编码identity；任一漂移都不能作为前滚manifest。
+        SerializedDictionaryInfo information = actual.orElseThrow();
+        TableDefinition decoded = codec.decode(information.payload());
+        if (decoded.id().value() != information.tableId()
+                || decoded.version().value() != information.dictionaryVersion()) {
+            throw new SerializedDictionaryInfoException(
+                    "SDI envelope/payload table or version mismatch");
+        }
+
+        // 3、marker已经选择exact物理owner，SDI不能把恢复引向另一个space/path/index binding。
+        if (decoded.storageBinding().isEmpty()
+                || !decoded.storageBinding().orElseThrow().equals(binding)) {
+            throw new SerializedDictionaryInfoException(
+                    "SDI payload does not match requested table binding");
+        }
+        return Optional.of(decoded);
+    }
+
+    /**
+     * 解码已挂载但尚未发布进 DD 的 Online ALTER shadow SDI；方向必须由调用方先通过 marker/control/journal 裁决。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>把 marker/manifest 的 table、space、path 交给 storage envelope 入口，读取时不伪造未知索引 binding。</li>
+     *     <li>解码完整 aggregate，并交叉验证 envelope 与 payload 的 table/version 双写 identity。</li>
+     *     <li>要求 payload 自带 binding 精确命中请求的 table/space/path；索引、segment 和 row format 保留给上层 digest/descriptor 校验。</li>
+     * </ol>
+     *
+     * @param tableId marker 与 manifest 共同冻结的正表标识
+     * @param spaceId shadow target 的正表空间标识
+     * @param path shadow target 的规范绝对路径
+     * @return 解码后的完整 target aggregate；SDI 尚未写入时为空
+     * @throws DatabaseValidationException identity/path 缺失时抛出且不访问 storage
+     * @throws SerializedDictionaryInfoException envelope、payload 或 exact binding 身份不一致时抛出并阻止前滚
+     */
+    public Optional<TableDefinition> readUnpublished(
+            long tableId, SpaceId spaceId, Path path) {
+        // 1、raw入口只在恢复方向已经持久确定后使用，参数必须完整。
+        if (tableId <= 0 || spaceId == null || path == null) {
+            throw new DatabaseValidationException(
+                    "unpublished SDI read requires table/space/path identity");
+        }
+        Optional<SerializedDictionaryInfo> actual =
+                physical.readSerializedDictionaryInfo(tableId, spaceId, path);
+        if (actual.isEmpty()) {
+            return Optional.empty();
+        }
+
+        // 2、envelope/payload双写值必须一致，不能让损坏payload改变恢复目标。
+        SerializedDictionaryInfo information = actual.orElseThrow();
+        TableDefinition decoded = codec.decode(information.payload());
+        if (decoded.id().value() != information.tableId()
+                || decoded.version().value() != information.dictionaryVersion()) {
+            throw new SerializedDictionaryInfoException(
+                    "unpublished SDI envelope/payload identity mismatch");
+        }
+
+        // 3、只接受manifest指定的物理owner；完整binding随后仍由schema digest与descriptor验证。
+        TableStorageBinding decodedBinding = decoded.storageBinding().orElseThrow(() ->
+                new SerializedDictionaryInfoException(
+                        "unpublished SDI payload has no storage binding"));
+        if (decodedBinding.tableId() != tableId
+                || !decodedBinding.spaceId().equals(spaceId)
+                || !decodedBinding.path().equals(path.toAbsolutePath().normalize())) {
+            throw new SerializedDictionaryInfoException(
+                    "unpublished SDI payload does not match requested shadow identity");
+        }
+        return Optional.of(decoded);
     }
 
     /**

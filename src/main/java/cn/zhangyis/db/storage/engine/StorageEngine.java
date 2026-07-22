@@ -19,7 +19,9 @@ import cn.zhangyis.db.storage.api.DiskSpaceManager;
 import cn.zhangyis.db.storage.api.trx.PreparedTransactionService;
 import cn.zhangyis.db.storage.api.DiskSpaceUndoAllocator;
 import cn.zhangyis.db.storage.api.TablePurgeBarrier;
+import cn.zhangyis.db.storage.api.IndexRetirementHistoryBarrier;
 import cn.zhangyis.db.storage.api.ddl.TableDdlStorageService;
+import cn.zhangyis.db.storage.api.ddl.online.OnlineDdlTableGate;
 import cn.zhangyis.db.storage.api.index.IndexPageAccess;
 import cn.zhangyis.db.storage.btree.IndexMetadataResolver;
 import cn.zhangyis.db.storage.api.lob.LobStorage;
@@ -104,6 +106,7 @@ import cn.zhangyis.db.storage.redo.RedoLogManagerFlushTarget;
 import cn.zhangyis.db.storage.trx.HistoryEntry;
 import cn.zhangyis.db.storage.trx.HistoryList;
 import cn.zhangyis.db.storage.trx.HistoryTablePurgeBarrier;
+import cn.zhangyis.db.storage.trx.HistoryIndexRetirementBarrier;
 import cn.zhangyis.db.storage.trx.PurgeCoordinator;
 import cn.zhangyis.db.storage.trx.PurgeDriverWorker;
 import cn.zhangyis.db.storage.trx.PurgeSummary;
@@ -274,6 +277,8 @@ public final class StorageEngine {
     private PurgeDmlRowGuardManager purgeDmlRowGuards;
     /** 组合根共享的类型/排序 registry，保证 DD、record 与 secondary comparator 使用同一语义。 */
     private TypeCodecRegistry typeRegistry;
+    /** 组合根唯一 Online DDL table gate；DML、XA 和 DDL coordinator 不得各自创建旁路实例。 */
+    private OnlineDdlTableGate onlineDdlTableGate;
     /**
      * 本对象持有的 {@code indexPageAccess} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
      */
@@ -319,6 +324,8 @@ public final class StorageEngine {
     private HistoryList history;
     /** DD DROP 只依赖的稳定表级 barrier；计数权威态仍由 history 在同一锁内维护。 */
     private TablePurgeBarrier tablePurgeBarrier;
+    /** Online DROP使用的提交号高水位与有限history屏障；与transaction system/history共享唯一owner。 */
+    private IndexRetirementHistoryBarrier indexRetirementHistoryBarrier;
     /** undo 段分配/回收端口；purge dropUndoSegment 用。 */
     private DiskSpaceUndoAllocator undoAllocator;
     /** E3a 后台 purge driver（0.4）；配置聚簇索引时启动，周期驱动 PurgeCoordinator.runBatch。 */
@@ -603,6 +610,7 @@ public final class StorageEngine {
                 accessController, redo, redoCapacityThrottle, config.pageSize(), writeAdmission);
 
         this.typeRegistry = new TypeCodecRegistry();
+        this.onlineDdlTableGate = new OnlineDdlTableGate();
         this.lobStorage = new LobStorage(diskSpaceManager, pool, config.pageSize(), typeRegistry);
         this.transactionManager = new TransactionManager(txnSystem);
         this.rollbackSlots = new RollbackSegmentSlotManager(RollbackSegmentId.of(0), config.slotCapacity());
@@ -610,6 +618,7 @@ public final class StorageEngine {
         this.rsegHeaderRepo = new RollbackSegmentHeaderRepository(pool, config.pageSize());
         this.history = new HistoryList(config.undoHistoryTransitionTimeout());
         this.tablePurgeBarrier = new HistoryTablePurgeBarrier(history);
+        this.indexRetirementHistoryBarrier = new HistoryIndexRetirementBarrier(txnSystem, history);
         this.undoAllocator = new DiskSpaceUndoAllocator(diskSpaceManager);
         this.undoAccess = new UndoLogSegmentAccess(pool, config.pageSize(), undoAllocator, typeRegistry, registry,
                 config.maxExternalUndoPayloadPages());
@@ -646,10 +655,11 @@ public final class StorageEngine {
                         : new RollbackService(btreeService, undoAccess, transactionManager,
                                 miniTransactionManager, undoSegmentFinalizer, indexMetadataResolver);
         this.preparedTransactionService = new PreparedTransactionService(
-                transactionManager, undoLogManager, rollbackService, redo, recoveryGate, lockManager);
+                transactionManager, undoLogManager, rollbackService, redo, recoveryGate, lockManager,
+                onlineDdlTableGate);
         this.dmlService = new ClusteredDmlService(transactionManager, undoLogManager, miniTransactionManager,
                 btreeService, btreeCurrentReadService, rollbackService, lockManager, redo, recoveryGate,
-                lobStorage);
+                lobStorage, onlineDdlTableGate);
         this.tableDmlService = new TableDmlService(dmlService, transactionManager, miniTransactionManager,
                 btreeService, btreeCurrentReadService, lockManager,
                 btreeRootSnapshots, typeRegistry, purgeDmlRowGuards, redo);
@@ -658,7 +668,7 @@ public final class StorageEngine {
                         undoSegmentFinalizer, btreeService, targetResolver, btreeRootSnapshots,
                         purgeDmlRowGuards, new SecondaryPurgeSafetyChecker(miniTransactionManager,
                                 btreeService, undoAccess, config.undoSpaceId(),
-                                config.maxVersionHops(), typeRegistry), lobStorage)
+                                config.maxVersionHops(), typeRegistry), lobStorage, config.purgeConfig())
                 : indexMetadataResolver != null
                         ? new PurgeCoordinator(miniTransactionManager, txnSystem, history, undoAccess,
                                 undoSegmentFinalizer, btreeService, indexMetadataResolver)
@@ -1629,7 +1639,8 @@ public final class StorageEngine {
 
     /**
      * 0.4：启动后台 purge driver。DD 组合根传入 resolver 时，每条 undo 按 tableId/indexId 定位聚簇索引；
-     * 低层兼容构造则仍可使用单显式索引。后台未启用或两种元数据来源都缺失时不启动，
+     * 完整 DD 路径的 coordinator 再按 {@link EngineConfig#purgeConfig()} 使用有界 table-token worker pool；低层兼容
+     * 构造仍使用 direct 串行。后台未启用或两种元数据来源都缺失时不启动 driver（pool 在 close 仍会显式停止），
      * 避免在不能确认目标索引的情况下物理移除记录。
      */
     private void startBackgroundPurgeDriver() {
@@ -1667,8 +1678,9 @@ public final class StorageEngine {
     }
 
     /**
-     * 关闭引擎。先 {@link FlushService#flushThrough}（WAL 顺序持久 + 清空 dirty），再依次关闭 pool（此时 dirty 已空，
-     * legacy flushAll 为 no-op，不绕 WAL gate）、store、redoRepo、redo/transaction checkpoint stores。幂等：
+     * 关闭引擎。先停 read-ahead，再同时请求 purge driver/pool 停止并在共享 deadline 内等到记录边界；随后停止
+     * page cleaner/redo flusher，调用 {@link FlushService#flushThrough} 按 WAL 顺序持久并清空 dirty，最后关闭
+     * buffer pool、store、redo repository 和 checkpoint stores。任一后台组件超时都不释放其依赖的底层句柄。
      * CLOSED 再 close 为 no-op。
      * <p>数据流：</p>
      * <ol>
@@ -1686,6 +1698,7 @@ public final class StorageEngine {
             return;
         }
         if (state == EngineState.READ_ONLY) {
+            stopBackgroundPurgeDriver();
             closeOpenedHandles();
             return;
         }
@@ -1694,10 +1707,10 @@ public final class StorageEngine {
         }
         // 2、继续完成范围、身份与候选校验；通过后，按 session、transaction、MDL 与 metadata scope 顺序取得受控资源，保持处理顺序与资源边界。
         stopBackgroundReadAhead();
+        stopBackgroundPurgeDriver();
         stopBackgroundPageCleaner();
         stopBackgroundRedoFlusher();
         // 3、在中间分支复核阶段性结果；满足条件后，调用 binder、executor、字典或 storage 稳定接口完成领域动作，并维持领域不变量。
-        stopBackgroundPurgeDriver();
         flushService.flushThrough(redo.currentLsn(), config.flushTimeout());
         // FORCE 导出模式不写 warmup sidecar；普通实例才保存热页定位。
         if (writeAdmission.mode() != StorageWriteAdmission.Mode.EXPORT_READ_ONLY) {
@@ -1761,10 +1774,10 @@ public final class StorageEngine {
         // 1、校验语法/命令、会话状态与元数据身份，在共享或持久副作用前拒绝非法状态。
         stopAfterFailedOpen(this::stopBackgroundReadAhead, original);
         // 2、继续完成范围、身份与候选校验；通过后，按 session、transaction、MDL 与 metadata scope 顺序取得受控资源，保持处理顺序与资源边界。
+        stopAfterFailedOpen(this::stopBackgroundPurgeDriver, original);
         stopAfterFailedOpen(this::stopBackgroundPageCleaner, original);
         // 3、在中间分支复核阶段性结果；满足条件后，调用 binder、executor、字典或 storage 稳定接口完成领域动作，并维持领域不变量。
         stopAfterFailedOpen(this::stopBackgroundRedoFlusher, original);
-        stopAfterFailedOpen(this::stopBackgroundPurgeDriver, original);
         // 4、关闭 scope 并返回不可变结果，以稳定返回或领域异常完成收口。
         try {
             closeOpenedHandles();
@@ -1836,19 +1849,70 @@ public final class StorageEngine {
         }
     }
 
-    /** 在 final flush 前停止后台 purge driver；worker 正跑批次会等其完成，超时中止关闭。
+    /**
+     * 在 final flush 前停止后台 purge driver 与 coordinator worker pool；先向二者发布停止，再共享同一等待预算。
+     * 即使 driver 从未启动，组合根仍必须停止惰性 pool，避免 READ_ONLY/失败 open 释放底层句柄后遗留平台线程。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>记录单一等待预算并向 driver 发布停止，使其不再发起新批次；该阶段不阻塞。</li>
+     *     <li>向 coordinator pool 发布取消，排队任务不会再启动，运行任务在 record 边界观察线程中断。</li>
+     *     <li>先等待 driver、再用同一预算的剩余时间等待 worker；任何一方超时都保留引擎句柄并拒绝继续关闭。</li>
+     * </ol>
      *
      * @throws DatabaseRuntimeException 可恢复的数据库运行期协作失败时抛出；调用方应依据当前事务状态选择回滚、重试或关闭资源
      */
     private void stopBackgroundPurgeDriver() {
-        if (purgeDriverWorker == null) {
-            return;
+        // 1、先记录共享预算并停止 dispatcher；不能先等待，否则 dispatcher 可能仍阻塞在尚未取消的 worker 批次。
+        long budgetNanos = saturatedNanos(config.backgroundFlushStopTimeout());
+        long startedNanos = System.nanoTime();
+        if (purgeDriverWorker != null) {
+            purgeDriverWorker.requestStop();
         }
-        boolean stopped = purgeDriverWorker.stop(config.backgroundFlushStopTimeout());
-        if (!stopped) {
-            throw new DatabaseRuntimeException("purge driver did not stop within "
+
+        // 2、pool 与 driver 在任何等待前都收到停止；pool 取消排队 stage，但记录内物理修改不接受线程中断。
+        if (purgeCoordinator != null) {
+            purgeCoordinator.requestStopWorkers();
+        }
+
+        // 3、两个 await 消耗同一预算，避免分别等待完整 timeout 后把 close 最坏时延翻倍。
+        boolean driverStopped = purgeDriverWorker == null
+                || purgeDriverWorker.awaitStopped(remainingDuration(startedNanos, budgetNanos));
+        boolean workersStopped = purgeCoordinator == null
+                || purgeCoordinator.awaitWorkersStopped(remainingDuration(startedNanos, budgetNanos));
+        if (!driverStopped || !workersStopped) {
+            throw new DatabaseRuntimeException("purge background components did not stop within "
                     + config.backgroundFlushStopTimeout());
         }
+    }
+
+    /**
+     * 将配置等待时间转换为不溢出的纳秒预算，供多个后台组件共享同一次 close 上限。
+     *
+     * @param timeout 已由 {@link EngineConfig} 校验为正的后台停止时长
+     * @return 可参与单调时钟差值计算的纳秒数；超出 {@code long} 时饱和为最大值
+     */
+    private static long saturatedNanos(Duration timeout) {
+        try {
+            return timeout.toNanos();
+        } catch (ArithmeticException overflow) {
+            return Long.MAX_VALUE;
+        }
+    }
+
+    /**
+     * 根据同一开始时刻计算剩余关闭预算；{@link System#nanoTime()} 的差值计算允许计时器跨符号位回绕。
+     *
+     * @param startedNanos 第一次发布停止前读取的单调时钟值
+     * @param budgetNanos 配置转换后的非负、饱和纳秒预算
+     * @return 尚可用于下一次有界等待的时长；预算耗尽时为 {@link Duration#ZERO}
+     */
+    private static Duration remainingDuration(long startedNanos, long budgetNanos) {
+        long elapsed = System.nanoTime() - startedNanos;
+        if (elapsed <= 0) {
+            return Duration.ofNanos(budgetNanos);
+        }
+        return Duration.ofNanos(elapsed >= budgetNanos ? 0L : budgetNanos - elapsed);
     }
 
     /**
@@ -1986,6 +2050,27 @@ public final class StorageEngine {
     }
 
     /**
+     * 返回Online DROP使用的提交号/history退休屏障；API不暴露事务counter锁、HistoryEntry或undo page。
+     *
+     * @return 与当前实例TransactionSystem、HistoryList和purge worker共享owner的稳定屏障
+     * @throws EngineStateException 引擎尚未OPEN或已经关闭时抛出
+     */
+    public IndexRetirementHistoryBarrier indexRetirementHistoryBarrier() {
+        requireOpen();
+        return indexRetirementHistoryBarrier;
+    }
+
+    /**
+     * 返回与事务ReadView登记表共享owner的generation屏障；仅供Online shadow ALTER final quiescence。
+     *
+     * @return 当前OPEN实例的稳定storage API，不暴露TransactionSystem内部集合
+     */
+    public cn.zhangyis.db.storage.api.ReadViewRetentionBarrier readViewRetentionBarrier() {
+        requireOpen();
+        return txnSystem;
+    }
+
+    /**
      * 仅供组合根注入的 recovery completion hook 在普通 OPEN 发布前取得物理 DDL facade。
      *
      * <p>StorageEngine 在 {@link #open()} 内部仍保持 NEW，直到 DDL/SDI/orphan 收敛、flush 和写闸门封存全部完成；
@@ -2017,6 +2102,50 @@ public final class StorageEngine {
                     "table purge recovery barrier is unavailable: state=" + state);
         }
         return tablePurgeBarrier;
+    }
+
+    /**
+     * 仅供DDL recovery completion hook取得已由事务恢复重建的索引退休屏障。
+     *
+     * @return 当前启动实例的transaction high-water/history组合屏障
+     * @throws EngineStateException 不在RECOVERY_INTERNAL completion窗口时抛出
+     */
+    public IndexRetirementHistoryBarrier indexRetirementHistoryBarrierForRecoveryCompletion() {
+        if (state != EngineState.NEW || indexRetirementHistoryBarrier == null
+                || writeAdmission.mode() != StorageWriteAdmission.Mode.RECOVERY_INTERNAL) {
+            throw new EngineStateException(
+                    "index retirement recovery barrier is unavailable: state=" + state);
+        }
+        return indexRetirementHistoryBarrier;
+    }
+
+    /**
+     * startup completion hook在流量开放前取得同一ReadView屏障；此时通常没有live view，但仍复用相同接口。
+     *
+     * @return 已构造且尚未发布OPEN的TransactionSystem屏障
+     */
+    public cn.zhangyis.db.storage.api.ReadViewRetentionBarrier
+    readViewRetentionBarrierForRecoveryCompletion() {
+        if (state != EngineState.NEW || txnSystem == null) {
+            throw new EngineStateException(
+                    "recovery completion read-view barrier requires initialized NEW engine");
+        }
+        return txnSystem;
+    }
+
+    /**
+     * 仅供 recovery completion hook 构造 Online ADD INDEX candidate/manifest 解码器；registry 已在 open 初始化，
+     * 但普通用户 accessor 此时仍必须保持关闭。
+     *
+     * @return 本次 StorageEngine open 的唯一只读类型 registry
+     */
+    public TypeCodecRegistry typeCodecRegistryForRecoveryCompletion() {
+        if (state != EngineState.NEW || typeRegistry == null
+                || writeAdmission.mode() != StorageWriteAdmission.Mode.RECOVERY_INTERNAL) {
+            throw new EngineStateException(
+                    "type registry recovery accessor is unavailable: state=" + state);
+        }
+        return typeRegistry;
     }
 
     /**
@@ -2120,6 +2249,27 @@ public final class StorageEngine {
     public PreparedTransactionService preparedTransactionService() {
         requireOpen();
         return preparedTransactionService;
+    }
+
+    /**
+     * 返回 DML、XA 与 Online ADD INDEX coordinator 共用的唯一 table gate。
+     *
+     * @return 当前 OPEN 引擎实例拥有的 gate；调用方不得关闭或替换它
+     * @throws EngineStateException 引擎尚未完成打开或已经关闭时抛出
+     */
+    public OnlineDdlTableGate onlineDdlTableGate() {
+        requireOpen();
+        return onlineDdlTableGate;
+    }
+
+    /**
+     * 返回 record、B+Tree、DML candidate codec 共用的 immutable 类型与 collation registry。
+     *
+     * @return 当前 OPEN 引擎组合根持有的只读 registry
+     */
+    public TypeCodecRegistry typeCodecRegistry() {
+        requireOpen();
+        return typeRegistry;
     }
 
     /** 返回与后台 driver/recovery 共用的 purge 协调器；只有配置可解析索引 metadata 时可用。

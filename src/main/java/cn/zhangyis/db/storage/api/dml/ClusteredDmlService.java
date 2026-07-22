@@ -20,6 +20,8 @@ import cn.zhangyis.db.storage.btree.PreparedClusteredUpdate;
 import cn.zhangyis.db.storage.btree.PreparedUpdateStateException;
 import cn.zhangyis.db.storage.btree.SplitCapableBTreeIndexService;
 import cn.zhangyis.db.storage.api.lob.LobStorage;
+import cn.zhangyis.db.storage.api.ddl.online.OnlineDdlTableGate;
+import cn.zhangyis.db.storage.api.ddl.online.OnlineDmlAdmission;
 import cn.zhangyis.db.storage.api.lob.LobWriteAllocation;
 import cn.zhangyis.db.storage.api.lob.LobWritePlan;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
@@ -89,6 +91,8 @@ public final class ClusteredDmlService {
     private final RecoveryTrafficGate recoveryGate;
     /** LOB 纯规划、segment purpose 预检、同 MTR allocation 与异常补偿入口。 */
     private final LobStorage lobStorage;
+    /** 所有 clustered mutation 与普通事务终态共用的 Online DDL gate；生产禁止 no-op 实例。 */
+    private final OnlineDdlTableGate onlineDdlTableGate;
 
     /**
      * 构造 DML facade。所有 collaborator 都来自 {@code StorageEngine} 组合根，保证 DML 与测试/恢复/后台 purge
@@ -103,16 +107,18 @@ public final class ClusteredDmlService {
      * @param redo 由组合根提供的 {@code RedoLogManager} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
      * @param recoveryGate 由组合根提供的 {@code RecoveryTrafficGate} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
      * @param lobStorage 由组合根提供的 {@code LobStorage} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param onlineDdlTableGate 组合根唯一 table gate；用于 DML capture 与事务 terminal 发布
      * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public ClusteredDmlService(TransactionManager transactionManager, UndoLogManager undoLogManager,
                                MiniTransactionManager mtrManager, SplitCapableBTreeIndexService btree,
                                BTreeCurrentReadService currentRead, RollbackService rollbackService,
                                LockManager lockManager, RedoLogManager redo, RecoveryTrafficGate recoveryGate,
-                               LobStorage lobStorage) {
+                               LobStorage lobStorage, OnlineDdlTableGate onlineDdlTableGate) {
         if (transactionManager == null || undoLogManager == null || mtrManager == null || btree == null
                 || currentRead == null || rollbackService == null || lockManager == null
-                || redo == null || recoveryGate == null || lobStorage == null) {
+                || redo == null || recoveryGate == null || lobStorage == null
+                || onlineDdlTableGate == null) {
             throw new DatabaseValidationException("clustered DML service collaborators must not be null");
         }
         this.transactionManager = transactionManager;
@@ -125,6 +131,7 @@ public final class ClusteredDmlService {
         this.redo = redo;
         this.recoveryGate = recoveryGate;
         this.lobStorage = lobStorage;
+        this.onlineDdlTableGate = onlineDdlTableGate;
     }
 
     /**
@@ -211,11 +218,15 @@ public final class ClusteredDmlService {
         requireOpenForDml();
         Transaction txn = command.transaction();
         TransactionId txnId = transactionManager.assignWriteId(txn);
+        try (OnlineDmlAdmission onlineAdmission = onlineDdlTableGate.admit(
+                txnId, command.tableId(), command.lockWaitTimeout())) {
         BTreeCurrentReadRequest request = currentReadRequest(txn, txnId, command.lockWaitTimeout());
         BTreeUniqueCheckResult unique = currentRead.checkUniqueForInsert(command.index(), command.key(), request);
         if (unique.duplicate()) {
             throw new DmlDuplicateKeyException("duplicate clustered key for index " + command.index().indexId());
         }
+
+        captureInsert(onlineAdmission, command.record());
 
         // 2. 冻结 LOB、undo secondary tail 与总 redo workload，admission 成功后才接触可写页。
         PlannedInsertLobs plannedLobs = planInsertLobs(command);
@@ -273,6 +284,7 @@ public final class ClusteredDmlService {
             }
             throw new DmlOperationException("clustered insert failed", failure);
         }
+        }
     }
 
     /**
@@ -320,6 +332,8 @@ public final class ClusteredDmlService {
         requireOpenForDml();
         Transaction txn = command.transaction();
         TransactionId txnId = transactionManager.assignWriteId(txn);
+        try (OnlineDmlAdmission onlineAdmission = onlineDdlTableGate.admit(
+                txnId, command.tableId(), command.lockWaitTimeout())) {
         BTreeCurrentReadRequest request = currentReadRequest(txn, txnId, command.lockWaitTimeout());
         Optional<BTreeLookupResult> locked = currentRead.lockPoint(command.index(), command.key(),
                 request, BTreeCurrentReadMode.FOR_UPDATE);
@@ -329,6 +343,7 @@ public final class ClusteredDmlService {
         // 2. 旧隐藏列是版本 CAS 与 undo 链前驱；同时冻结 LOB replacement ownership、secondary tail 与 redo 上界。
         BTreeLookupResult old = locked.orElseThrow();
         HiddenColumns oldHidden = requireHiddenColumns(old.record(), "update");
+        captureUpdate(onlineAdmission, old.record(), command.newRecord());
         PlannedUpdateLobs plannedLobs = planUpdateLobs(command, old.record());
         preflightLobSegment(command.lobSegment(), plannedLobs.requiresLobSegment());
         if (!plannedLobs.values().isEmpty()) {
@@ -364,6 +379,7 @@ public final class ClusteredDmlService {
                 throw databaseError;
             }
             throw new DmlOperationException("clustered update failed", e);
+        }
         }
     }
 
@@ -504,6 +520,8 @@ public final class ClusteredDmlService {
         requireOpenForDml();
         Transaction txn = command.transaction();
         TransactionId txnId = transactionManager.assignWriteId(txn);
+        try (OnlineDmlAdmission onlineAdmission = onlineDdlTableGate.admit(
+                txnId, command.tableId(), command.lockWaitTimeout())) {
         BTreeCurrentReadRequest request = currentReadRequest(txn, txnId, command.lockWaitTimeout());
         Optional<BTreeLookupResult> locked = currentRead.lockPoint(command.index(), command.key(),
                 request, BTreeCurrentReadMode.FOR_UPDATE);
@@ -513,6 +531,7 @@ public final class ClusteredDmlService {
         // 2. 删除前隐藏列/全量旧 image/secondary tail 共同定义 rollback revive 所需的完整证据。
         BTreeLookupResult old = locked.orElseThrow();
         HiddenColumns oldHidden = requireHiddenColumns(old.record(), "delete");
+        captureDelete(onlineAdmission, old.record());
 
         List<LobVersionOwnership> lobOwnerships = planDeleteLobOwnerships(command, old.record());
         preflightLobSegment(command.lobSegment(), !lobOwnerships.isEmpty());
@@ -542,6 +561,7 @@ public final class ClusteredDmlService {
                 throw databaseError;
             }
             throw new DmlOperationException("clustered delete failed", e);
+        }
         }
     }
 
@@ -578,10 +598,13 @@ public final class ClusteredDmlService {
         // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         try {
             transactionManager.prepareCommit(txn);
+            // candidate 必须先于 undo terminal MTR durable；force 失败时事务仍 ACTIVE，可安全走 rollback。
+            onlineDdlTableGate.forceTransactionCandidates(txnId, command.durabilityTimeout());
             undoLogManager.onCommit(txn);
             transactionManager.commit(txn);
             transactionCommitted = true;
             Lsn commitLsn = redo.currentLsn();
+            onlineDdlTableGate.completeCommit(txnId, commitLsn);
             boolean durable = command.durabilityPolicy()
                     .awaitCommitDurable(redo, commitLsn, command.durabilityTimeout());
             if (!durable) {
@@ -630,6 +653,7 @@ public final class ClusteredDmlService {
         // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         try {
             RollbackSummary summary = rollbackService.rollback(txn, command.clusteredIndex());
+            onlineDdlTableGate.completeRollback(txnId);
             int released = releaseLocks(txnId);
             return new DmlRollbackResult(summary, released);
         } catch (RuntimeException e) {
@@ -674,6 +698,7 @@ public final class ClusteredDmlService {
         // 4、发布 live 状态或返回持久结果并逆序释放资源，以稳定返回或领域异常完成收口。
         try {
             RollbackSummary summary = rollbackService.rollback(txn);
+            onlineDdlTableGate.completeRollback(txnId);
             int released = releaseLocks(txnId);
             return new DmlRollbackResult(summary, released);
         } catch (RuntimeException error) {
@@ -698,6 +723,41 @@ public final class ClusteredDmlService {
                                                              java.time.Duration lockWaitTimeout) {
         return new BTreeCurrentReadRequest(txnId, txn.isolationLevel(), lockWaitTimeout,
                 DEFAULT_RELOCATION_RETRIES);
+    }
+
+    /**
+     * 把已通过 clustered unique current-read 的 INSERT 投影为 after candidate；append 在业务 MTR/undo 前完成。
+     *
+     * @param admission 当前 mutation 的短 gate guard；ABSENT/ABORTING 时无 target
+     * @param after 调用方完整用户行；target codec 只投影目标 secondary physical entry
+     */
+    private static void captureInsert(OnlineDmlAdmission admission, LogicalRecord after) {
+        admission.capture().ifPresent(target -> target.candidateCodec().encodeInsert(after)
+                .ifPresent(admission::appendCandidate));
+    }
+
+    /**
+     * 用 current-read 权威旧行和命令新行生成变键 candidate；codec 在 physical key 未变化时返回空。
+     *
+     * @param admission 当前 mutation 的短 gate guard
+     * @param before 已持事务行锁读取的旧聚簇版本
+     * @param after 尚未写入 undo/MTR 的目标完整用户行
+     */
+    private static void captureUpdate(OnlineDmlAdmission admission, LogicalRecord before,
+                                      LogicalRecord after) {
+        admission.capture().ifPresent(target -> target.candidateCodec().encodeUpdate(before, after)
+                .ifPresent(admission::appendCandidate));
+    }
+
+    /**
+     * 用 current-read 权威旧行生成 DELETE before candidate；append 完成后才允许创建 delete undo/MTR。
+     *
+     * @param admission 当前 mutation 的短 gate guard
+     * @param before 已持事务行锁读取的旧聚簇版本
+     */
+    private static void captureDelete(OnlineDmlAdmission admission, LogicalRecord before) {
+        admission.capture().ifPresent(target -> target.candidateCodec().encodeDelete(before)
+                .ifPresent(admission::appendCandidate));
     }
 
     /**

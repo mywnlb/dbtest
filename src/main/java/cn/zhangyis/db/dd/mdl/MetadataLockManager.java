@@ -224,6 +224,58 @@ public final class MetadataLockManager {
         }
     }
 
+    /**
+     * 把已授予的 EXCLUSIVE ticket 原地降级为 SHARED_UPGRADABLE。降级不等待、不创建新 request，也不改变
+     * owner/key/duration；发布弱模式后按既有 FIFO 规则唤醒队首连续兼容请求。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>在进入 shard 前校验 ticket、目标模式和未关闭状态，拒绝其它转换。</li>
+     *     <li>取得目标 key 的 shard 锁并重新定位原 granted request，防止与 close/release 竞争。</li>
+     *     <li>在同一临界区同时更新 internal grant 与 ticket volatile mode，保持快照和调用方视图一致。</li>
+     *     <li>按 FIFO 兼容性授予等待者并释放 shard 锁；本路径不创建或遗留 metadata wait edge。</li>
+     * </ol>
+     *
+     * @param ticket 当前 manager 已授予且尚未关闭的 EXCLUSIVE ticket
+     * @param targetMode 唯一支持的目标 {@link MdlMode#SHARED_UPGRADABLE}
+     * @return 与输入相同的 ticket 实例，其 request id、owner、key 和 duration 均保持不变
+     * @throws DatabaseValidationException ticket 或目标模式为 {@code null} 时抛出；调用方应修正输入
+     * @throws MetadataLockStateException ticket 已关闭、已释放、不是 EXCLUSIVE 或目标不是 SU 时抛出
+     */
+    public MdlTicket downgrade(MdlTicket ticket, MdlMode targetMode) {
+        // 1. 降级是严格的 X→SU 原地转换，不能被当作任意“改弱”接口绕过兼容矩阵。
+        if (ticket == null || targetMode == null) {
+            throw new DatabaseValidationException("metadata downgrade ticket/mode required");
+        }
+        if (ticket.isClosed()) {
+            throw new MetadataLockStateException("cannot downgrade closed metadata lock ticket");
+        }
+        if (ticket.mode() != MdlMode.EXCLUSIVE || targetMode != MdlMode.SHARED_UPGRADABLE) {
+            throw new MetadataLockStateException("only EXCLUSIVE -> SHARED_UPGRADABLE is supported");
+        }
+
+        // 2. shard 锁内重新核对 grant identity；close 若先获锁会让 findGranted 明确失败。
+        LockShard shard = shardFor(ticket.key());
+        shard.lock.lock();
+        try {
+            LockQueue queue = requireQueue(shard, ticket.key());
+            InternalRequest original = findGranted(queue, ticket.requestId());
+            if (ticket.isClosed() || original == null || original.ticket != ticket
+                    || original.mode != MdlMode.EXCLUSIVE) {
+                throw new MetadataLockStateException("metadata downgrade ticket is no longer exclusive/granted");
+            }
+
+            // 3. internal request 与对外 ticket 在同一锁内发布，snapshot 不会观察到分裂模式。
+            publishUpgrade(original, targetMode);
+
+            // 4. SU 与 SR/SW 兼容，FIFO 队首可连续通过；第二个 SU/SNW/X 仍由矩阵阻塞。
+            grantCompatibleWaiters(shard, queue);
+            return ticket;
+        } finally {
+            shard.lock.unlock();
+        }
+    }
+
     /** 释放单 ticket；同一 ticket 重复 close 或 releaseAll 后 close 均为 no-op。
      *
      * <p>数据流：</p>
@@ -334,6 +386,70 @@ public final class MetadataLockManager {
             released += releaseAll(owner, duration);
         }
         return released;
+    }
+
+    /**
+     * 取消 owner 当前所有尚未授予的 acquire/upgrade 请求，但不释放已授予 ticket。
+     *
+     * <p>该入口专供 Online DDL 持久取消后唤醒 final-MDL 等待。对 upgrade 请求，等待者与已授予
+     * SU 共用同一 ticket，因此本方法只终止 upgrade waiter，不关闭该 ticket。coordinator 被唤醒后会在自身
+     * 安全点退出，再由原有 RAII 路径释放已授予锁。</p>
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>先校验 owner，避免空身份导致跨会话队列扫描。</li>
+     *     <li>逐 shard 取得显式短锁，精确移除该 owner 的 pending request 并删除 wait-graph 边。</li>
+     *     <li>对独立 acquire ticket 发布 manager-close；对 upgrade 保留原 granted ticket，随后唤醒等待线程。</li>
+     *     <li>重新执行 FIFO 授予并清理空队列；全路径不触及其他 owner 或任何已授予请求。</li>
+     * </ol>
+     *
+     * @param owner 已经完成 durable cancel 裁决的 DDL MDL owner；不得为 {@code null}
+     * @return 本次从 FIFO 队列中精确移除并唤醒的 pending request 数量
+     * @throws DatabaseValidationException owner 为 {@code null} 时抛出，且不修改任何队列
+     */
+    public int cancelPending(MdlOwnerId owner) {
+        // 1. 控制面必须携带精确 owner，不允许使用空值表示广播取消。
+        if (owner == null) {
+            throw new DatabaseValidationException("metadata pending-cancel owner must not be null");
+        }
+
+        int cancelled = 0;
+        // 2. shard 之间不同时持锁；该 owner 的全部 pending 都会在返回前被移除。
+        for (LockShard shard : shards) {
+            shard.lock.lock();
+            try {
+                Iterator<Map.Entry<MdlKey, LockQueue>> queues = shard.queues.entrySet().iterator();
+                while (queues.hasNext()) {
+                    Map.Entry<MdlKey, LockQueue> entry = queues.next();
+                    LockQueue queue = entry.getValue();
+                    Iterator<InternalRequest> waiting = queue.waiting.iterator();
+                    while (waiting.hasNext()) {
+                        InternalRequest request = waiting.next();
+                        if (!request.owner.equals(owner)) {
+                            continue;
+                        }
+                        waiting.remove();
+                        request.state = MdlRequestState.KILLED;
+                        waitGraph.removeWaiter(owner);
+                        // 3. upgrade waiter 共用原 SU ticket；只有独立 acquire waiter 才能在此关闭。
+                        if (request.upgradeTarget == null) {
+                            request.ticket.closeByManager();
+                        }
+                        request.condition.signal();
+                        cancelled++;
+                    }
+
+                    // 4. 取消可能移除 FIFO 队首，必须立即让后续兼容请求获得授予机会。
+                    grantCompatibleWaiters(shard, queue);
+                    if (queue.granted.isEmpty() && queue.waiting.isEmpty()) {
+                        queues.remove();
+                    }
+                }
+            } finally {
+                shard.lock.unlock();
+            }
+        }
+        return cancelled;
     }
 
     /** kill owner：取消所有 pending 并释放 granted，保证 wait graph 无残留。

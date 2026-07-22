@@ -1,229 +1,527 @@
 package cn.zhangyis.db.dd.repo;
 
+import cn.zhangyis.db.common.exception.DatabaseValidationException;
+import cn.zhangyis.db.dd.ddl.DdlCancellation;
+import cn.zhangyis.db.dd.ddl.DdlCancellationReason;
+import cn.zhangyis.db.dd.ddl.DdlControlState;
+import cn.zhangyis.db.dd.ddl.DdlDigestAlgorithm;
+import cn.zhangyis.db.dd.ddl.DdlExecutionProtocol;
 import cn.zhangyis.db.dd.ddl.DdlLogOperation;
 import cn.zhangyis.db.dd.ddl.DdlLogPhase;
 import cn.zhangyis.db.dd.ddl.DdlLogRecord;
+import cn.zhangyis.db.dd.ddl.DdlRetiredResource;
+import cn.zhangyis.db.dd.ddl.DdlRetiredResourceKind;
+import cn.zhangyis.db.dd.ddl.DdlRetirementFence;
+import cn.zhangyis.db.dd.ddl.DdlSchemaCanonicalFormat;
+import cn.zhangyis.db.dd.ddl.DdlSchemaDigest;
 import cn.zhangyis.db.dd.exception.DictionaryCatalogCorruptionException;
+import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.api.catalog.CatalogBatch;
 import cn.zhangyis.db.storage.api.catalog.CatalogRecord;
 import cn.zhangyis.db.storage.api.ddl.DdlUndoMarker;
 import cn.zhangyis.db.storage.api.tablespace.TablespaceFileIdentity;
 import cn.zhangyis.db.storage.fil.state.TablespaceType;
-import cn.zhangyis.db.domain.PageSize;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.CharBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.InvalidPathException;
+import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 
 /**
- * DDL phase marker 与 InternalCatalogStore 无语义 record 的版本化 codec。key/payload 重复 identity，
- * 解码逐字段交叉校验，避免单侧损坏被恢复状态机接受。
+ * DDL marker 与 InternalCatalogStore 无语义record之间的版本化codec。v4首次启用key中的chunk ordinal：
+ * 一个逻辑marker的全部chunks位于同一catalog batch，frame CRC与batch SHA共同保护原子性。
  */
 final class DdlLogCatalogCodec {
 
-    /** kind/operation/ddl/version/phase/chunk 的固定 big-endian key 长度。 */
+    /** v1 key没有secondary identity。 */
     private static final int KEY_V1_BYTES = 1 + Long.BYTES * 3 + Integer.BYTES * 2;
-    /**
-     * 稳定布局常量，参与页内偏移、长度或位域计算；编解码两端必须保持完全一致。
-     */
+    /** v2+ key加入secondary identity并保留末尾chunk ordinal。 */
     private static final int KEY_V2_BYTES = KEY_V1_BYTES + Long.BYTES;
-    /** payload v1 魔数 "DDL1"。 */
-    private static final int MAGIC = 0x44444C31; // DDL1
-    /** 当前写格式；v2 在 key/payload 同时加入 secondaryObjectId。 */
-    private static final int FORMAT_VERSION = 3;
-    /** CREATE/DROP TABLE 历史 marker 的兼容读格式。 */
+    /** payload magic "DDL1"；format byte紧随其后。 */
+    private static final int MAGIC = 0x44444C31;
+    /** 当前写格式：digest checkpoint、protocol、control与monotonic扩展。 */
+    private static final int FORMAT_VERSION = 4;
+    /** 最老可读table marker格式。 */
     private static final int LEGACY_FORMAT_VERSION = 1;
-    /** 为 catalog record payload 头与未来扩展保留空间后的 UTF-8 路径上限。 */
+    /** catalog物理层单record payload上限；必须与FileInternalCatalogStore一致。 */
+    private static final int MAX_CHUNK_BYTES = 1024;
+    /** 防止损坏chunk count造成无界聚合分配；当前完整fence/双path可容纳。 */
+    private static final int MAX_LOGICAL_PAYLOAD_BYTES = 16 * 1024;
+    /** 由逻辑上限与单块上限共同确定的最大chunk数。 */
+    private static final int MAX_CHUNKS = MAX_LOGICAL_PAYLOAD_BYTES / MAX_CHUNK_BYTES;
+    /** 主路径和辅助路径各自沿用v3的UTF-8上限。 */
     private static final int MAX_PATH_BYTES = 900;
 
     /**
-     * 编码单条 DDL marker；InternalCatalogStore 的一个 append 批次即一个 phase 原子提交。
+     * 把一个完整marker编码为同一catalog batch中的连续chunks。
      *
      * <p>数据流：</p>
      * <ol>
-     *     <li>读取输入长度、游标边界与必要标识，损坏、截断或超限数据在创建结果前失败。</li>
-     *     <li>按稳定字段或 token 顺序推进游标并调用对应编解码分支，任何分支都不得越过输入边界。</li>
-     *     <li>交叉校验聚合计数、类型、校验值和剩余输入，防止截断或多余内容形成半解析对象。</li>
-     *     <li>完成剩余字段写入或稳定领域结果构造；失败只保留领域异常与根因，不修改调用方输入或其他持久状态。</li>
+     *     <li>严格编码两条路径并按v4 grammar生成有界逻辑payload。</li>
+     *     <li>在任何catalog副作用前校验总长度和所有optional/fixed-width领域字段。</li>
+     *     <li>按1024-byte上限连续切块，每个key重复immutable/phase并写从0开始的ordinal。</li>
+     *     <li>返回不可变record列表；repository必须把整组交给一次store.append。</li>
      * </ol>
      *
-     * @param record 已验证且路径规范化的 marker。
-     * @return key/payload 均独立复制的 catalog record。
-     * @throws cn.zhangyis.db.common.exception.DatabaseValidationException UTF-8 路径超过 v1 上限时抛出。
+     * @param record 已由领域构造器验证、路径已规范化的完整marker
+     * @return 非空、chunk ordinal连续的catalog records
+     * @throws DatabaseValidationException 路径UTF-8、总长度或字段超出v4上限时抛出
      */
-    CatalogRecord encode(DdlLogRecord record) {
-        // 1、读取输入长度、游标边界与必要标识，在共享或持久副作用前拒绝非法状态。
-        byte[] path = record.path().toString().getBytes(StandardCharsets.UTF_8);
-        if (path.length > MAX_PATH_BYTES) {
-            throw new cn.zhangyis.db.common.exception.DatabaseValidationException(
-                    "DDL log path exceeds v1 limit: " + path.length);
+    List<CatalogRecord> encode(DdlLogRecord record) {
+        if (record == null) {
+            throw new DatabaseValidationException("DDL log record must not be null");
         }
+        if (record.executionProtocol() == DdlExecutionProtocol.LEGACY_PHASE_ONLY) {
+            throw new DatabaseValidationException(
+                    "DDL legacy protocol is decode-only and cannot be encoded as v4");
+        }
+        // 1、路径必须使用REPORT，不能把未配对surrogate替换成相同的U+FFFD后持久化。
+        byte[] path = strictUtf8(record.path().toString(), "path");
+        byte[] auxiliary = record.auxiliaryPath()
+                .map(value -> strictUtf8(value.toString(), "auxiliary path"))
+                .orElseGet(() -> new byte[0]);
+        requirePathBound(path, "path");
+        requirePathBound(auxiliary, "auxiliary path");
+
+        // 2、先在内存形成有明确总上限的逻辑payload；失败不会留下部分catalog batch。
+        byte[] payload = encodeLogical(record, path, auxiliary);
+        if (payload.length <= 0 || payload.length > MAX_LOGICAL_PAYLOAD_BYTES) {
+            throw new DatabaseValidationException(
+                    "DDL log v4 logical payload exceeds bound: " + payload.length);
+        }
+
+        // 3、chunk key重复identity并携带ordinal；batch顺序就是重组顺序。
+        int chunkCount = (payload.length + MAX_CHUNK_BYTES - 1) / MAX_CHUNK_BYTES;
+        List<CatalogRecord> records = new ArrayList<>(chunkCount);
+        for (int ordinal = 0; ordinal < chunkCount; ordinal++) {
+            int from = ordinal * MAX_CHUNK_BYTES;
+            int to = Math.min(payload.length, from + MAX_CHUNK_BYTES);
+            records.add(new CatalogRecord(key(record, ordinal),
+                    java.util.Arrays.copyOfRange(payload, from, to)));
+        }
+        // 4、List.copyOf避免repository append前被调用方替换任一chunk。
+        return List.copyOf(records);
+    }
+
+    /**
+     * 尝试解码一个committed batch。普通DD batch返回empty；DDL batch任一key/chunk/payload损坏均fail-closed。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>识别首key kind并解析全部chunk key，要求identity完全相同且ordinal从0连续。</li>
+     *     <li>限制chunk数、单块和总字节后重组逻辑payload；legacy格式仍只允许单块。</li>
+     *     <li>按format分支读取字段并与key逐项交叉校验，所有flag/stable code严格拒绝未知值。</li>
+     *     <li>要求逻辑payload精确EOF后构造不可变record；异常统一转换为catalog corruption。</li>
+     * </ol>
+     *
+     * @param batch storage已经完成frame CRC与batch SHA校验的非空原子批次
+     * @return 解码后的DDL marker，或batch不属于DDL log时为空
+     * @throws DictionaryCatalogCorruptionException DDL batch缺块、漂移、截断或语义非法时抛出
+     */
+    Optional<DdlLogRecord> decode(CatalogBatch batch) {
+        if (batch == null || batch.records().isEmpty()) {
+            throw new DictionaryCatalogCorruptionException("DDL log batch must not be null/empty");
+        }
+        // 1、只看首key决定kind；一旦属于DDL，后续任一混入record都按损坏处理。
+        byte[] firstKeyBytes = batch.records().getFirst().key();
+        if (firstKeyBytes.length == 0
+                || Byte.toUnsignedInt(firstKeyBytes[0]) != CatalogEntityKind.DDL_LOG.stableCode()) {
+            return Optional.empty();
+        }
+        if (batch.records().size() > MAX_CHUNKS) {
+            throw new DictionaryCatalogCorruptionException("DDL log v4 chunk count exceeds bound");
+        }
+        KeyFields firstKey = parseKey(firstKeyBytes);
+        if (firstKey.chunkOrdinal() != 0) {
+            throw new DictionaryCatalogCorruptionException("DDL log first chunk ordinal must be zero");
+        }
+        ByteArrayOutputStream logical = new ByteArrayOutputStream();
+        for (int ordinal = 0; ordinal < batch.records().size(); ordinal++) {
+            CatalogRecord chunk = batch.records().get(ordinal);
+            KeyFields current = parseKey(chunk.key());
+            if (!firstKey.sameIdentityAndPhase(current) || current.chunkOrdinal() != ordinal
+                    || chunk.payload().length <= 0 || chunk.payload().length > MAX_CHUNK_BYTES) {
+                throw new DictionaryCatalogCorruptionException(
+                        "DDL log chunks are missing, reordered or identity-mismatched");
+            }
+            logical.writeBytes(chunk.payload());
+            if (logical.size() > MAX_LOGICAL_PAYLOAD_BYTES) {
+                throw new DictionaryCatalogCorruptionException(
+                        "DDL log logical payload exceeds v4 bound");
+            }
+        }
+
+        // 2、format位于chunk0固定header；v1-v3永远是单record/chunk0。
+        byte[] payload = logical.toByteArray();
+        if (payload.length < Integer.BYTES + 1) {
+            throw new DictionaryCatalogCorruptionException("truncated DDL log payload header");
+        }
+        int format = Byte.toUnsignedInt(payload[Integer.BYTES]);
+        if (format != FORMAT_VERSION && batch.records().size() != 1) {
+            throw new DictionaryCatalogCorruptionException("legacy DDL log cannot use chunks");
+        }
+
+        // 3、所有底层解析/领域异常都保留cause并提升为启动期catalog corruption。
+        try {
+            return Optional.of(decodeLogical(payload, format, firstKey));
+        } catch (DictionaryCatalogCorruptionException error) {
+            throw error;
+        } catch (IOException | InvalidPathException | DatabaseValidationException error) {
+            throw new DictionaryCatalogCorruptionException(
+                    "truncated/invalid DDL log payload", error);
+        }
+    }
+
+    /** 写出v4逻辑payload；DataOutputStream固定big-endian。 */
+    private static byte[] encodeLogical(DdlLogRecord record, byte[] path, byte[] auxiliary) {
+        try {
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            try (DataOutputStream out = new DataOutputStream(bytes)) {
+                DdlUndoMarker marker = record.marker();
+                out.writeInt(MAGIC);
+                out.writeByte(FORMAT_VERSION);
+                out.writeLong(marker.ddlOperationId());
+                out.writeLong(marker.dictionaryVersion());
+                out.writeLong(marker.affectedObjectId());
+                out.writeLong(record.secondaryObjectId());
+                out.writeByte(record.operation().stableCode());
+                out.writeByte(record.phase().stableCode());
+                out.writeByte(record.executionProtocol().stableCode());
+                out.writeByte(record.controlState().stableCode());
+                out.writeInt(record.spaceId().value());
+                writeShortBytes(out, path);
+                writeOptionalPath(out, record.auxiliaryPath().isPresent(), auxiliary);
+                writeFileIdentity(out, record.fileIdentity());
+                writeDigest(out, record.sourceSchemaDigest());
+                writeDigest(out, record.intermediateSchemaDigest());
+                writeDigest(out, record.targetSchemaDigest());
+                writeCancellation(out, record.cancellation());
+                writeRetirementFence(out, record.retirementFence());
+            }
+            return bytes.toByteArray();
+        } catch (IOException error) {
+            throw new DatabaseValidationException("failed to encode DDL log v4 payload", error);
+        }
+    }
+
+    /** 按format读取逻辑payload并与key交叉校验。 */
+    private static DdlLogRecord decodeLogical(byte[] bytes, int format, KeyFields key) throws IOException {
+        try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(bytes))) {
+            if (in.readInt() != MAGIC || format != Byte.toUnsignedInt(in.readByte())
+                    || format < LEGACY_FORMAT_VERSION || format > FORMAT_VERSION) {
+                throw new DictionaryCatalogCorruptionException("invalid DDL log payload header/version");
+            }
+            if (format == LEGACY_FORMAT_VERSION && key.keyLength() != KEY_V1_BYTES
+                    || format >= 2 && key.keyLength() != KEY_V2_BYTES) {
+                throw new DictionaryCatalogCorruptionException("DDL key length does not match format");
+            }
+            long ddlId = in.readLong();
+            long dictionaryVersion = in.readLong();
+            long objectId = in.readLong();
+            long secondaryObjectId = format >= 2 ? in.readLong() : 0L;
+            int operationCode = in.readUnsignedByte();
+            int phaseCode = in.readUnsignedByte();
+            DdlExecutionProtocol protocol = format >= 4
+                    ? DdlExecutionProtocol.fromStableCode(in.readUnsignedByte())
+                    : DdlExecutionProtocol.LEGACY_PHASE_ONLY;
+            if (format >= 4 && protocol == DdlExecutionProtocol.LEGACY_PHASE_ONLY) {
+                throw new DictionaryCatalogCorruptionException(
+                        "DDL v4 payload cannot declare decode-only legacy protocol");
+            }
+            DdlControlState control = format >= 4
+                    ? DdlControlState.fromStableCode(in.readUnsignedByte())
+                    : DdlControlState.OPEN;
+            int spaceId = in.readInt();
+            Path path = Path.of(strictUtf8(readShortBytes(in, "path"), "path"));
+            Optional<Path> auxiliary = format >= 3 ? readOptionalPath(in) : Optional.empty();
+            Optional<TablespaceFileIdentity> identity = format >= 3
+                    ? readFileIdentity(in, spaceId) : Optional.empty();
+            Optional<DdlSchemaDigest> source = format >= 4 ? readDigest(in, "source") : Optional.empty();
+            Optional<DdlSchemaDigest> intermediate = format >= 4
+                    ? readDigest(in, "intermediate") : Optional.empty();
+            Optional<DdlSchemaDigest> target = format >= 4 ? readDigest(in, "target") : Optional.empty();
+            Optional<DdlCancellation> cancellation = format >= 4
+                    ? readCancellation(in) : Optional.empty();
+            Optional<DdlRetirementFence> retirementFence = format >= 4
+                    ? readRetirementFence(in) : Optional.empty();
+
+            if (in.available() != 0) {
+                throw new DictionaryCatalogCorruptionException("DDL log payload has trailing bytes");
+            }
+            if (key.operationCode() != operationCode || key.ddlId() != ddlId
+                    || key.dictionaryVersion() != dictionaryVersion
+                    || key.secondaryObjectId() != secondaryObjectId || key.phaseCode() != phaseCode) {
+                throw new DictionaryCatalogCorruptionException("DDL log key/payload identity mismatch");
+            }
+            return new DdlLogRecord(new DdlUndoMarker(ddlId, dictionaryVersion, objectId),
+                    secondaryObjectId, DdlLogOperation.fromStableCode(operationCode),
+                    DdlLogPhase.fromStableCode(phaseCode), SpaceId.of(spaceId), path,
+                    auxiliary, identity, protocol, source, intermediate, target,
+                    control, cancellation, retirementFence);
+        }
+    }
+
+    /** 构造一个重复identity且携带chunk ordinal的v2 key。 */
+    private static byte[] key(DdlLogRecord record, int chunkOrdinal) {
         DdlUndoMarker marker = record.marker();
-        ByteBuffer key = ByteBuffer.allocate(KEY_V2_BYTES).order(ByteOrder.BIG_ENDIAN)
+        return ByteBuffer.allocate(KEY_V2_BYTES).order(ByteOrder.BIG_ENDIAN)
                 .put((byte) CatalogEntityKind.DDL_LOG.stableCode())
                 .putLong(record.operation().stableCode())
                 .putLong(marker.ddlOperationId())
                 .putLong(marker.dictionaryVersion())
                 .putLong(record.secondaryObjectId())
                 .putInt(record.phase().stableCode())
-                .putInt(0);
-        byte[] auxiliary = record.auxiliaryPath().map(value -> value.toString().getBytes(StandardCharsets.UTF_8)).orElse(new byte[0]);
-        // 2、继续完成范围、身份与候选校验；通过后，按稳定字段或 token 顺序推进游标并调用对应编解码分支，保持处理顺序与资源边界。
-        if (auxiliary.length > MAX_PATH_BYTES) {
-            throw new cn.zhangyis.db.common.exception.DatabaseValidationException("DDL log auxiliary path exceeds v3 limit");
-        }
-        int identityBytes = record.fileIdentity().isPresent() ? 1 + Integer.BYTES + Integer.BYTES + Integer.BYTES + Long.BYTES : 1;
-        ByteBuffer payload = ByteBuffer.allocate(Integer.BYTES + 1 + Long.BYTES * 4 + 1 + 1
-                        + Integer.BYTES + Short.BYTES + path.length + 1 + Short.BYTES + auxiliary.length + identityBytes)
-                .order(ByteOrder.BIG_ENDIAN);
-        payload.putInt(MAGIC).put((byte) FORMAT_VERSION)
-                .putLong(marker.ddlOperationId()).putLong(marker.dictionaryVersion())
-                .putLong(marker.affectedObjectId())
-                .putLong(record.secondaryObjectId())
-                .put((byte) record.operation().stableCode()).put((byte) record.phase().stableCode())
-                .putInt(record.spaceId().value()).putShort((short) path.length).put(path)
-                .put((byte) (record.auxiliaryPath().isPresent() ? 1 : 0));
-        if (record.auxiliaryPath().isPresent()) {
-            payload.putShort((short) auxiliary.length).put(auxiliary);
-        }
-        // 3、在中间分支复核阶段性结果；满足条件后，交叉校验聚合计数、类型、校验值和剩余输入，并维持领域不变量。
-        payload.put((byte) (record.fileIdentity().isPresent() ? 1 : 0));
-        if (record.fileIdentity().isPresent()) {
-            TablespaceFileIdentity identity = record.fileIdentity().orElseThrow();
-            payload.putInt(identity.pageSize().bytes()).putInt(identity.type().code())
-                    .putInt(identity.serverVersion()).putLong(identity.spaceVersion());
-        }
-        byte[] encoded = new byte[payload.position()];
-        payload.flip();
-        payload.get(encoded);
-        // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
-        return new CatalogRecord(key.array(), encoded);
+                .putInt(chunkOrdinal).array();
     }
 
-    /**
-     * 尝试解码一个 committed batch。普通 DD/future batch 返回 empty；DDL_LOG 形状损坏则 fail-closed。
-     *
-     * <p>数据流：</p>
-     * <ol>
-     *     <li>读取输入长度、游标边界与必要标识，损坏、截断或超限数据在创建结果前失败。</li>
-     *     <li>按稳定字段或 token 顺序推进游标并调用对应编解码分支，任何分支都不得越过输入边界。</li>
-     *     <li>交叉校验聚合计数、类型、校验值和剩余输入，防止截断或多余内容形成半解析对象。</li>
-     *     <li>完成剩余字段写入或稳定领域结果构造；失败只保留领域异常与根因，不修改调用方输入或其他持久状态。</li>
-     * </ol>
-     *
-     * @param batch 已经 storage frame CRC/SHA/header 边界验证的原子批次。
-     * @return DDL marker，或当前批次不属于 DDL log 时为空。
-     * @throws DictionaryCatalogCorruptionException DDL key/payload/version/identity/path 不可解释时抛出。
-     */
-    Optional<DdlLogRecord> decode(CatalogBatch batch) {
-        // 1、读取输入长度、游标边界与必要标识，在共享或持久副作用前拒绝非法状态。
-        List<CatalogRecord> records = batch.records();
-        byte[] firstKey = records.getFirst().key();
-        if (Byte.toUnsignedInt(firstKey[0]) != CatalogEntityKind.DDL_LOG.stableCode()) {
-            return Optional.empty();
+    /** 解析v1/v2 key；未知长度、kind或负chunk均按catalog损坏处理。 */
+    private static KeyFields parseKey(byte[] bytes) {
+        if (bytes == null || bytes.length != KEY_V1_BYTES && bytes.length != KEY_V2_BYTES) {
+            throw new DictionaryCatalogCorruptionException(
+                    "DDL log key length is invalid: " + (bytes == null ? -1 : bytes.length));
         }
-        if (firstKey.length != KEY_V1_BYTES && firstKey.length != KEY_V2_BYTES) {
-            throw new DictionaryCatalogCorruptionException("DDL log key length is invalid: " + firstKey.length);
+        ByteBuffer key = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN);
+        if (Byte.toUnsignedInt(key.get()) != CatalogEntityKind.DDL_LOG.stableCode()) {
+            throw new DictionaryCatalogCorruptionException("DDL log batch mixes catalog entity kinds");
         }
-        if (records.size() != 1) {
-            throw new DictionaryCatalogCorruptionException("DDL log batch must contain exactly one record");
-        }
-        // 2、继续完成范围、身份与候选校验；通过后，按稳定字段或 token 顺序推进游标并调用对应编解码分支，保持处理顺序与资源边界。
-        ByteBuffer key = ByteBuffer.wrap(firstKey).order(ByteOrder.BIG_ENDIAN);
-        key.get();
-        long keyOperation = key.getLong();
-        long keyDdlId = key.getLong();
-        long keyVersion = key.getLong();
-        // 3、在中间分支复核阶段性结果；满足条件后，交叉校验聚合计数、类型、校验值和剩余输入，并维持领域不变量。
-        long keySecondaryObjectId = firstKey.length == KEY_V2_BYTES ? key.getLong() : 0L;
-        int keyPhase = key.getInt();
+        long operation = key.getLong();
+        long ddlId = key.getLong();
+        long version = key.getLong();
+        long secondary = bytes.length == KEY_V2_BYTES ? key.getLong() : 0L;
+        int phase = key.getInt();
         int chunk = key.getInt();
-        if (chunk != 0) {
-            throw new DictionaryCatalogCorruptionException("DDL log v1 does not support payload chunks");
+        if (chunk < 0) {
+            throw new DictionaryCatalogCorruptionException("DDL log chunk ordinal must be non-negative");
         }
+        return new KeyFields(bytes.length, operation, ddlId, version, secondary, phase, chunk);
+    }
 
-        byte[] bytes = records.getFirst().payload();
-        // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
+    /** 严格编码path；未配对surrogate必须在进入catalog前失败。 */
+    private static byte[] strictUtf8(String value, String field) {
         try {
-            ByteBuffer payload = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN);
-            if (payload.remaining() < Integer.BYTES + 1 + Long.BYTES * 3 + 1 + 1
-                    + Integer.BYTES + Short.BYTES || payload.getInt() != MAGIC) {
-                throw new DictionaryCatalogCorruptionException("invalid DDL log payload header/version");
-            }
-            int format = Byte.toUnsignedInt(payload.get());
-            if (format != LEGACY_FORMAT_VERSION && format != 2 && format != FORMAT_VERSION
-                    || format == LEGACY_FORMAT_VERSION && firstKey.length != KEY_V1_BYTES
-                    || format >= 2 && firstKey.length != KEY_V2_BYTES) {
-                throw new DictionaryCatalogCorruptionException("invalid DDL log payload header/version");
-            }
-            long ddlId = payload.getLong();
-            long version = payload.getLong();
-            long objectId = payload.getLong();
-            long secondaryObjectId = format == FORMAT_VERSION ? payload.getLong() : 0L;
-            int operationCode = Byte.toUnsignedInt(payload.get());
-            int phaseCode = Byte.toUnsignedInt(payload.get());
-            int spaceId = payload.getInt();
-            int pathLength = Short.toUnsignedInt(payload.getShort());
-            if (pathLength > MAX_PATH_BYTES || format < 3 && pathLength != payload.remaining()
-                    || format >= 3 && pathLength > payload.remaining()) {
-                throw new DictionaryCatalogCorruptionException("DDL log path length/trailing bytes mismatch");
-            }
-            byte[] pathBytes = new byte[pathLength];
-            payload.get(pathBytes);
-            if (keyOperation != operationCode || keyDdlId != ddlId || keyVersion != version
-                    || keySecondaryObjectId != secondaryObjectId || keyPhase != phaseCode) {
-                throw new DictionaryCatalogCorruptionException("DDL log key/payload identity mismatch");
-            }
-            String path = StandardCharsets.UTF_8.newDecoder()
+            ByteBuffer encoded = StandardCharsets.UTF_8.newEncoder()
                     .onMalformedInput(CodingErrorAction.REPORT)
                     .onUnmappableCharacter(CodingErrorAction.REPORT)
-                    .decode(ByteBuffer.wrap(pathBytes)).toString();
-            Optional<java.nio.file.Path> auxiliaryPath = Optional.empty();
-            Optional<TablespaceFileIdentity> identity = Optional.empty();
-            if (format >= 3) {
-                if (payload.remaining() < 1) {
-                    throw new DictionaryCatalogCorruptionException("missing DDL auxiliary path flag");
-                }
-                if (payload.get() != 0) {
-                    int auxiliaryLength = Short.toUnsignedInt(payload.getShort());
-                    if (auxiliaryLength > MAX_PATH_BYTES || auxiliaryLength > payload.remaining()) {
-                        throw new DictionaryCatalogCorruptionException("invalid DDL auxiliary path length");
-                    }
-                    byte[] auxiliaryBytes = new byte[auxiliaryLength];
-                    payload.get(auxiliaryBytes);
-                    auxiliaryPath = Optional.of(java.nio.file.Path.of(StandardCharsets.UTF_8.newDecoder()
-                            .onMalformedInput(CodingErrorAction.REPORT).onUnmappableCharacter(CodingErrorAction.REPORT)
-                            .decode(ByteBuffer.wrap(auxiliaryBytes)).toString()));
-                }
-                if (payload.remaining() < 1) {
-                    throw new DictionaryCatalogCorruptionException("missing DDL identity flag");
-                }
-                if (payload.get() != 0) {
-                    if (payload.remaining() < Integer.BYTES * 3 + Long.BYTES) {
-                        throw new DictionaryCatalogCorruptionException("truncated DDL tablespace identity");
-                    }
-                    identity = Optional.of(new TablespaceFileIdentity(SpaceId.of(spaceId),
-                            PageSize.ofBytes(payload.getInt()), TablespaceType.fromCode(payload.getInt()),
-                            payload.getInt(), payload.getLong()));
-                }
+                    .encode(CharBuffer.wrap(value));
+            byte[] bytes = new byte[encoded.remaining()];
+            encoded.get(bytes);
+            return bytes;
+        } catch (CharacterCodingException error) {
+            throw new DatabaseValidationException(
+                    "DDL log " + field + " is not strict UTF-8 encodable", error);
+        }
+    }
+
+    /** 严格解码path bytes；损坏序列不能由replacement字符掩盖。 */
+    private static String strictUtf8(byte[] bytes, String field) {
+        try {
+            return StandardCharsets.UTF_8.newDecoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT)
+                    .decode(ByteBuffer.wrap(bytes)).toString();
+        } catch (CharacterCodingException error) {
+            throw new DictionaryCatalogCorruptionException(
+                    "DDL log " + field + " is malformed UTF-8", error);
+        }
+    }
+
+    /** 校验单条path限制；auxiliary absent的空数组合法。 */
+    private static void requirePathBound(byte[] bytes, String field) {
+        if (bytes.length > MAX_PATH_BYTES) {
+            throw new DatabaseValidationException(
+                    "DDL log " + field + " exceeds UTF-8 bound: " + bytes.length);
+        }
+    }
+
+    /** 写入unsigned-short长度与bytes。 */
+    private static void writeShortBytes(DataOutputStream out, byte[] bytes) throws IOException {
+        out.writeShort(bytes.length);
+        out.write(bytes);
+    }
+
+    /** 读取有界unsigned-short长度与bytes。 */
+    private static byte[] readShortBytes(DataInputStream in, String field) throws IOException {
+        int length = in.readUnsignedShort();
+        if (length > MAX_PATH_BYTES || length > in.available()) {
+            throw new DictionaryCatalogCorruptionException(
+                    "invalid DDL log " + field + " length: " + length);
+        }
+        return in.readNBytes(length);
+    }
+
+    /** 写入0/1 auxiliary path。 */
+    private static void writeOptionalPath(DataOutputStream out, boolean present,
+                                          byte[] bytes) throws IOException {
+        out.writeByte(present ? 1 : 0);
+        if (present) {
+            writeShortBytes(out, bytes);
+        }
+    }
+
+    /** 读取0/1 auxiliary path并严格UTF-8解码。 */
+    private static Optional<Path> readOptionalPath(DataInputStream in) throws IOException {
+        if (!readFlag(in, "auxiliary path")) {
+            return Optional.empty();
+        }
+        return Optional.of(Path.of(strictUtf8(
+                readShortBytes(in, "auxiliary path"), "auxiliary path")));
+    }
+
+    /** 写入0/1 file identity与固定字段。 */
+    private static void writeFileIdentity(DataOutputStream out,
+                                          Optional<TablespaceFileIdentity> identity) throws IOException {
+        out.writeByte(identity.isPresent() ? 1 : 0);
+        if (identity.isPresent()) {
+            TablespaceFileIdentity value = identity.orElseThrow();
+            out.writeInt(value.pageSize().bytes());
+            out.writeInt(value.type().code());
+            out.writeInt(value.serverVersion());
+            out.writeLong(value.spaceVersion());
+        }
+    }
+
+    /** 读取0/1 file identity并绑定marker space id。 */
+    private static Optional<TablespaceFileIdentity> readFileIdentity(
+            DataInputStream in, int spaceId) throws IOException {
+        if (!readFlag(in, "file identity")) {
+            return Optional.empty();
+        }
+        return Optional.of(new TablespaceFileIdentity(SpaceId.of(spaceId),
+                PageSize.ofBytes(in.readInt()), TablespaceType.fromCode(in.readInt()),
+                in.readInt(), in.readLong()));
+    }
+
+    /** 写入0/1 digest及algorithm/format/length/bytes。 */
+    private static void writeDigest(DataOutputStream out,
+                                    Optional<DdlSchemaDigest> digest) throws IOException {
+        out.writeByte(digest.isPresent() ? 1 : 0);
+        if (digest.isPresent()) {
+            DdlSchemaDigest value = digest.orElseThrow();
+            byte[] bytes = value.bytes();
+            out.writeByte(value.algorithm().stableCode());
+            out.writeByte(value.canonicalFormat().stableCode());
+            out.writeByte(bytes.length);
+            out.write(bytes);
+        }
+    }
+
+    /** 读取0/1 digest并校验算法固定输出长度。 */
+    private static Optional<DdlSchemaDigest> readDigest(
+            DataInputStream in, String checkpoint) throws IOException {
+        if (!readFlag(in, checkpoint + " schema digest")) {
+            return Optional.empty();
+        }
+        DdlDigestAlgorithm algorithm = DdlDigestAlgorithm.fromStableCode(in.readUnsignedByte());
+        DdlSchemaCanonicalFormat format = DdlSchemaCanonicalFormat.fromStableCode(in.readUnsignedByte());
+        int length = in.readUnsignedByte();
+        if (length != algorithm.digestBytes() || length > in.available()) {
+            throw new DictionaryCatalogCorruptionException(
+                    "invalid " + checkpoint + " DDL schema digest length: " + length);
+        }
+        return Optional.of(new DdlSchemaDigest(algorithm, format, in.readNBytes(length)));
+    }
+
+    /** 写入0/1 cancellation与固定宽度诊断字段。 */
+    private static void writeCancellation(DataOutputStream out,
+                                          Optional<DdlCancellation> cancellation) throws IOException {
+        out.writeByte(cancellation.isPresent() ? 1 : 0);
+        if (cancellation.isPresent()) {
+            DdlCancellation value = cancellation.orElseThrow();
+            out.writeByte(value.reasonCode().stableCode());
+            out.writeLong(value.requestedAtEpochMillis());
+            out.writeLong(value.requesterId());
+        }
+    }
+
+    /** 读取0/1 cancellation。 */
+    private static Optional<DdlCancellation> readCancellation(DataInputStream in) throws IOException {
+        if (!readFlag(in, "cancellation")) {
+            return Optional.empty();
+        }
+        return Optional.of(new DdlCancellation(
+                DdlCancellationReason.fromStableCode(in.readUnsignedByte()),
+                in.readLong(), in.readLong()));
+    }
+
+    /** 写入0/1 retirement fence及有序resource集合。 */
+    private static void writeRetirementFence(DataOutputStream out,
+                                             Optional<DdlRetirementFence> fence) throws IOException {
+        out.writeByte(fence.isPresent() ? 1 : 0);
+        if (fence.isPresent()) {
+            DdlRetirementFence value = fence.orElseThrow();
+            out.writeLong(value.tableId());
+            out.writeLong(value.sourceDictionaryVersion());
+            out.writeLong(value.retireThroughTransactionNo());
+            out.writeLong(value.sourceMetadataPinVersion());
+            out.writeLong(value.descriptorGeneration());
+            out.writeLong(value.ownerDdlId());
+            out.writeInt(value.resources().size());
+            for (DdlRetiredResource resource : value.resources()) {
+                out.writeByte(resource.kind().stableCode());
+                out.writeLong(resource.resourceId());
             }
-            if (payload.hasRemaining()) {
-                throw new DictionaryCatalogCorruptionException("DDL log payload has trailing bytes");
-            }
-            return Optional.of(new DdlLogRecord(new DdlUndoMarker(ddlId, version, objectId), secondaryObjectId,
-                    DdlLogOperation.fromStableCode(operationCode), DdlLogPhase.fromStableCode(phaseCode),
-                    SpaceId.of(spaceId), java.nio.file.Path.of(path), auxiliaryPath, identity));
-        } catch (CharacterCodingException | java.nio.BufferUnderflowException | java.nio.InvalidMarkException error) {
-            throw new DictionaryCatalogCorruptionException("truncated/invalid DDL log payload", error);
-        } catch (java.nio.file.InvalidPathException error) {
-            throw new DictionaryCatalogCorruptionException("invalid DDL log path", error);
-        } catch (cn.zhangyis.db.common.exception.DatabaseValidationException error) {
-            throw new DictionaryCatalogCorruptionException("invalid DDL log domain identity", error);
+        }
+    }
+
+    /** 读取0/1 retirement fence并在分配前限制resource count。 */
+    private static Optional<DdlRetirementFence> readRetirementFence(DataInputStream in) throws IOException {
+        if (!readFlag(in, "retirement fence")) {
+            return Optional.empty();
+        }
+        long tableId = in.readLong();
+        long sourceVersion = in.readLong();
+        long transactionNo = in.readLong();
+        long metadataVersion = in.readLong();
+        long generation = in.readLong();
+        long ownerDdlId = in.readLong();
+        int count = in.readInt();
+        if (count <= 0 || count > DdlRetirementFence.MAX_RESOURCES
+                || (long) count * (1 + Long.BYTES) > in.available()) {
+            throw new DictionaryCatalogCorruptionException(
+                    "invalid DDL retirement resource count: " + count);
+        }
+        List<DdlRetiredResource> resources = new ArrayList<>(count);
+        for (int index = 0; index < count; index++) {
+            resources.add(new DdlRetiredResource(
+                    DdlRetiredResourceKind.fromStableCode(in.readUnsignedByte()), in.readLong()));
+        }
+        return Optional.of(new DdlRetirementFence(tableId, sourceVersion, transactionNo,
+                metadataVersion, generation, ownerDdlId, resources));
+    }
+
+    /** 读取只允许0/1的optional flag。 */
+    private static boolean readFlag(DataInputStream in, String field) throws IOException {
+        int flag = in.readUnsignedByte();
+        if (flag != 0 && flag != 1) {
+            throw new DictionaryCatalogCorruptionException(
+                    "unknown DDL log " + field + " flag: " + flag);
+        }
+        return flag == 1;
+    }
+
+    /** key中重复保存的immutable/phase字段。 */
+    private record KeyFields(int keyLength, long operationCode, long ddlId,
+                             long dictionaryVersion, long secondaryObjectId,
+                             int phaseCode, int chunkOrdinal) {
+        /** @return 除chunk ordinal外的key字段是否逐项相同。 */
+        private boolean sameIdentityAndPhase(KeyFields other) {
+            return other != null && keyLength == other.keyLength
+                    && operationCode == other.operationCode && ddlId == other.ddlId
+                    && dictionaryVersion == other.dictionaryVersion
+                    && secondaryObjectId == other.secondaryObjectId && phaseCode == other.phaseCode;
         }
     }
 }

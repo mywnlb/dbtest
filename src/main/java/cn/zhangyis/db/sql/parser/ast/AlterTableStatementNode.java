@@ -6,8 +6,9 @@ import java.util.List;
 import java.util.Optional;
 
 /**
- * 通用阻塞式 {@code ALTER TABLE} 语法树。actions 保留用户声明顺序，Binder/DD 必须依次作用于同一个
- * staged definition，不能重排后改变 FIRST/AFTER、DROP 后 ADD 等可观察语义。
+ * 通用 {@code ALTER TABLE} 语法树。actions 保留用户声明顺序；DD可将受支持形状映射到在线协议，
+ * 其余形状仍必须依次作用于同一个staged definition，不能重排后改变FIRST/AFTER、DROP后ADD等
+ * 可观察语义。
  *
  * @param table 源表限定名
  * @param actions 一个或多个按 SQL 顺序排列的 action

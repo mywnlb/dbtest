@@ -106,6 +106,22 @@ class HistoryListTest {
         assertEquals(TransactionNo.of(20), history.peekCommitted().orElseThrow().transactionNo());
     }
 
+    /** 有界前缀只复制物理 head 开始的指定数量，返回后不持有 history lock。 */
+    @Test
+    void snapshotPrefixIsBoundedAndPreservesPhysicalOrder() {
+        HistoryList history = new HistoryList();
+        HistoryEntry first = entry(20, 100, 65, 0);
+        HistoryEntry second = entry(10, 101, 66, 1);
+        HistoryEntry third = entry(30, 102, 67, 2);
+        history.restore(List.of(first, second, third));
+
+        List<HistoryEntry> prefix = history.snapshotPrefix(2);
+        assertEquals(List.of(first, second), prefix);
+        assertThrows(UnsupportedOperationException.class, () -> prefix.add(third));
+        assertEquals(List.of(first, second, third), history.snapshotPrefix(10));
+        assertThrows(DatabaseValidationException.class, () -> history.snapshotPrefix(0));
+    }
+
     /**
      * 验证 {@code prePhysicalCloseReleasesTransitionButPostPhysicalCloseFencesWriters} 所描述的组件生命周期，并断言状态转换、后台线程停止和资源恰好释放一次。
      */
@@ -213,5 +229,33 @@ class HistoryListTest {
 
         assertEquals(0, barrier.referenceCount(11L));
         assertEquals(0, barrier.referenceCount(12L));
+    }
+
+    /** Online DROP只等待fence高水位及以前的history；cutover后的同表提交不得延长退休集合。 */
+    @Test
+    void retirementBarrierIgnoresSameTableHistoryAfterCapturedHighWater() throws Exception {
+        HistoryList history = new HistoryList(Duration.ofSeconds(1));
+        TransactionSystem transactions = new TransactionSystem();
+        HistoryIndexRetirementBarrier barrier = new HistoryIndexRetirementBarrier(transactions, history);
+        HistoryEntry sourceHistory = entry(1, 100, 65, 0, 11L);
+        HistoryEntry targetHistory = entry(2, 101, 66, 1, 11L);
+        history.restore(List.of(sourceHistory, targetHistory));
+
+        assertEquals(0L, barrier.captureTransactionHighWater());
+        assertThrows(TablePurgeBarrierTimeoutException.class,
+                () -> barrier.awaitIndexHistorySafe(11L, 23L, 1L, Duration.ofMillis(20)));
+
+        try (var executor = Executors.newSingleThreadExecutor()) {
+            var waiter = executor.submit(() ->
+                    barrier.awaitIndexHistorySafe(11L, 23L, 1L, Duration.ofSeconds(1)));
+            try (HistoryList.HeadRemovalLease removal = history.beginHeadRemoval(sourceHistory)) {
+                removal.physicalMutationStarted();
+                removal.complete();
+            }
+            waiter.get(1, TimeUnit.SECONDS);
+        }
+
+        assertEquals(List.of(targetHistory), history.snapshot(),
+                "transactionNo above the fence remains purgeable but no longer blocks index retirement");
     }
 }

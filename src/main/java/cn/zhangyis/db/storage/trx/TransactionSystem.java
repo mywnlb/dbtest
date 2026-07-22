@@ -2,9 +2,17 @@ package cn.zhangyis.db.storage.trx;
 
 import cn.zhangyis.db.domain.TransactionId;
 import cn.zhangyis.db.domain.TransactionNo;
+import cn.zhangyis.db.common.exception.DatabaseFatalException;
+import cn.zhangyis.db.common.exception.DatabaseValidationException;
+import cn.zhangyis.db.storage.api.ReadViewRetentionInterruptedException;
+import cn.zhangyis.db.storage.api.ReadViewRetentionTimeoutException;
 
-import java.util.HashSet;
+import java.time.Duration;
+import java.util.IdentityHashMap;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -15,10 +23,12 @@ import java.util.concurrent.locks.ReentrantLock;
  * 拷贝后立即释放锁。**持锁期间不访问 Buffer Pool、不持 page latch、不等待**（§17 锁顺序约束），故该锁不会卷入
  * 任何可阻塞路径。禁止 {@code synchronized}。
  */
-public final class TransactionSystem {
+public final class TransactionSystem implements cn.zhangyis.db.storage.api.ReadViewRetentionBarrier {
 
     /** 保护下列三项全局状态的短锁。 */
     private final ReentrantLock lock = new ReentrantLock();
+    /** ReadView关闭时唤醒SHADOW finalization；只与{@link #lock}配合，不参与页或事务锁等待。 */
+    private final Condition readViewClosed = lock.newCondition();
     /** 下一个待分配事务 id（从 1 起；0 保留给 NONE）。 */
     private long nextTransactionId = 1;
     /** 下一个待分配提交序号（从 1 起；0 保留给 NONE）。 */
@@ -30,7 +40,9 @@ public final class TransactionSystem {
      * 故按对象身份去重——同一快照对象登记一次、注销一次。RR 由 {@link ReadViewManager#release} 注销，
      * RC 由调用方语句末经 {@link ReadViewManager#closeReadView} 注销；未注销表示该快照仍可能需要旧版本。
      */
-    private final Set<ReadView> liveReadViews = new HashSet<>();
+    private final Map<ReadView, Long> liveReadViews = new IdentityHashMap<>();
+    /** 下一个ReadView generation；generation 0表示尚未创建快照。 */
+    private long nextReadViewGeneration = 1;
 
     /** 分配单调事务写 id 并登记为活跃读写事务（首次写入时调用）。
      *
@@ -190,7 +202,10 @@ public final class TransactionSystem {
             }
             // lowLimitNo = 当前下一个待分配 TransactionNo：此刻之前提交的事务其 TransactionNo 必 < 它。
             ReadView view = new ReadView(txn.transactionId(), up, low, ids, nextTransactionNo);
-            liveReadViews.add(view);
+            if (nextReadViewGeneration == Long.MAX_VALUE) {
+                throw new DatabaseFatalException("ReadView generation exhausted");
+            }
+            liveReadViews.put(view, nextReadViewGeneration++);
             return view;
         } finally {
             lock.unlock();
@@ -210,10 +225,133 @@ public final class TransactionSystem {
         }
         lock.lock();
         try {
-            liveReadViews.remove(view);
+            if (liveReadViews.remove(view) != null) {
+                readViewClosed.signalAll();
+            }
         } finally {
             lock.unlock();
         }
+    }
+
+    /**
+     * 捕获调用时刻最后一个已登记ReadView的generation，供table X下冻结SHADOW cutover边界。
+     * 本操作不创建快照、不等待且不访问page/undo；返回0表示实例尚未产生ReadView。
+     *
+     * @return 非负generation fence，之后新建的ReadView不会被该fence等待
+     */
+    public long captureReadViewGeneration() {
+        lock.lock();
+        try {
+            return nextReadViewGeneration - 1;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public long captureGeneration() {
+        return captureReadViewGeneration();
+    }
+
+    /**
+     * 有界等待generation不晚于fence的全部ReadView退出。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>把timeout转换为单一绝对deadline，并在该预算内取得事务系统短锁。</li>
+     *     <li>扫描identity map中的generation；只要存在旧快照就在Condition上释放锁等待。</li>
+     *     <li>每次唤醒重新扫描以容忍虚假唤醒；超时或中断均释放锁且不修改ReadView集合。</li>
+     * </ol>
+     *
+     * @param generationFence final table X下捕获的非负generation；0表示无需等待历史快照
+     * @param timeout 取得协调锁及全部Condition等待共用的正预算
+     * @throws DatabaseValidationException fence或timeout非法时抛出，不进入等待
+     * @throws ReadViewRetentionTimeoutException 预算耗尽仍有旧快照时抛出，调用方可恢复capture重试
+     * @throws ReadViewRetentionInterruptedException 等待被中断时抛出并恢复线程中断标志
+     */
+    public void awaitReadViewsClosedThrough(long generationFence, Duration timeout) {
+        // 1. 一个绝对deadline覆盖短锁竞争和全部Condition等待，不能在虚假唤醒后重置预算。
+        if (generationFence < 0 || timeout == null || timeout.isZero() || timeout.isNegative()) {
+            throw new DatabaseValidationException(
+                    "ReadView retention requires non-negative fence and positive timeout");
+        }
+        if (generationFence == 0) {
+            return;
+        }
+        long budgetNanos = boundedTimeoutNanos(timeout);
+        long deadline = saturatedDeadline(budgetNanos);
+        try {
+            if (!lock.tryLock(budgetNanos, TimeUnit.NANOSECONDS)) {
+                throw new ReadViewRetentionTimeoutException(
+                        "timed out acquiring ReadView retention lock: fence=" + generationFence);
+            }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new ReadViewRetentionInterruptedException(
+                    "interrupted acquiring ReadView retention lock: fence=" + generationFence,
+                    interrupted);
+        }
+        try {
+            // 2. Condition等待原子释放短锁，ReadView close可取得同一锁并signal；期间不持任何page资源。
+            while (hasReadViewAtOrBefore(generationFence)) {
+                long remaining = remainingNanos(deadline);
+                if (remaining <= 0) {
+                    throw new ReadViewRetentionTimeoutException(
+                            "timed out waiting old ReadViews: fence=" + generationFence);
+                }
+                try {
+                    readViewClosed.awaitNanos(remaining);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new ReadViewRetentionInterruptedException(
+                            "interrupted waiting old ReadViews: fence=" + generationFence,
+                            interrupted);
+                }
+            }
+            // 3. 正常返回证明fence前集合为空；finally统一释放协调锁。
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public void awaitClosedThrough(long generationFence, Duration timeout) {
+        awaitReadViewsClosedThrough(generationFence, timeout);
+    }
+
+    /** 只在事务系统锁内扫描有界live集合，不执行IO或调用外部协作者。 */
+    private boolean hasReadViewAtOrBefore(long generationFence) {
+        for (long generation : liveReadViews.values()) {
+            if (generation <= generationFence) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 超大正Duration饱和到long纳秒上界。 */
+    private static long boundedTimeoutNanos(Duration timeout) {
+        try {
+            return timeout.toNanos();
+        } catch (ArithmeticException overflow) {
+            return Long.MAX_VALUE;
+        }
+    }
+
+    /** 单调时钟加法饱和，避免deadline回绕成已超时。 */
+    private static long saturatedDeadline(long budgetNanos) {
+        long now = System.nanoTime();
+        if (budgetNanos == Long.MAX_VALUE || Long.MAX_VALUE - now < budgetNanos) {
+            return Long.MAX_VALUE;
+        }
+        return now + budgetNanos;
+    }
+
+    /** Long.MAX_VALUE deadline保持近似无界，其余使用单调时钟计算剩余预算。 */
+    private static long remainingNanos(long deadline) {
+        return deadline == Long.MAX_VALUE ? Long.MAX_VALUE : deadline - System.nanoTime();
     }
 
     /**
@@ -229,7 +367,7 @@ public final class TransactionSystem {
         lock.lock();
         try {
             long low = nextTransactionNo;
-            for (ReadView v : liveReadViews) {
+            for (ReadView v : liveReadViews.keySet()) {
                 if (v.lowLimitNo() < low) {
                     low = v.lowLimitNo();
                 }
@@ -263,7 +401,7 @@ public final class TransactionSystem {
                 return false;
             }
             long low = nextTransactionNo;
-            for (ReadView view : liveReadViews) {
+            for (ReadView view : liveReadViews.keySet()) {
                 if (view.lowLimitNo() < low) {
                     low = view.lowLimitNo();
                 }

@@ -509,8 +509,9 @@ public final class DefaultSqlSession implements SqlSession {
     }
 
     /**
-     * 执行通用阻塞式 ALTER。Binder 在 implicit commit 前完成类型/default 等纯 SQL 校验，DD 则在
-     * table MDL X 下按 action 顺序构造并一次发布 staged definition。
+     * 执行通用 ALTER。Binder 在 implicit commit 前完成类型/default 等纯 SQL 校验，DD coordinator
+     * 再按action形状选择instant metadata、单索引在线协议或blocking fallback；多action始终作为一个
+     * 不可拆分命令交给coordinator。
      *
      * <p>数据流：</p>
      * <ol>

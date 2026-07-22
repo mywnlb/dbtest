@@ -27,7 +27,9 @@ public enum PageType {
     /** Off-page TEXT/BLOB/JSON payload chain 页（0.21h）。 */
     BLOB(8),
     /** 超出单张 UNDO 页容量的完整 UndoRecord 编码 payload 页链（1.6）。 */
-    UNDO_PAYLOAD(9);
+    UNDO_PAYLOAD(9),
+    /** 通用Online ALTER的版本化物理descriptor chain页；只由DDL专属segment拥有。 */
+    DDL_DESCRIPTOR(10);
 
     /**
      * 记录 {@code code} 的权威数值状态；仅由本类受控路径更新，取值范围和特殊值遵循所属格式或状态机，溢出必须拒绝。

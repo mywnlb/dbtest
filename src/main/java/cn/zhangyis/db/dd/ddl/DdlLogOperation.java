@@ -28,7 +28,9 @@ public enum DdlLogOperation {
     /** 无需读取损坏 page0，删除 RECOVERY_UNAVAILABLE 的原始物理文件并保留 DD tombstone。 */
     DROP_RECOVERY_UNAVAILABLE(9),
     /** 校验可信 clean backup 后，以新物理文件替换 RECOVERY_DISCARDED 对象并重新激活。 */
-    IMPORT_RECOVERY_REPLACEMENT(10);
+    IMPORT_RECOVERY_REPLACEMENT(10),
+    /** 表级原地ALTER：metadata-only与未来multi-index共享单aggregate、无shadow-space的恢复语义。 */
+    ALTER_TABLE_INPLACE(11);
 
     /** DDL log key/payload 使用且跨版本不可重排的持久码。 */
     private final int stableCode;

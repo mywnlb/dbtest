@@ -210,6 +210,78 @@ public final class HistoryList {
     }
 
     /**
+     * 有界等待目标表在指定提交号高水位及以前的 committed history 全部完成 purge。
+     *
+     * <p>这是 Online DROP v1 的保守安全投影：当前 {@link HistoryEntry} 持久重建到表级 identity，尚未把每条
+     * secondary mutation 单独索引到内存。因此本方法等待该表在高水位内的全部 UPDATE history，而不只等待某个
+     * index；它比设计要求更保守但不会过早回收 segment。高水位之后的新 DD 事务不参与等待，保证退休集合有限。</p>
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 table id、高水位与 timeout；高水位 0 表示捕获时没有既有提交，立即满足 history 条件。</li>
+     *     <li>持 history lock 扫描不可变 entry identity，查找 table匹配且transactionNo不超过高水位的条目。</li>
+     *     <li>存在时通过同一 Condition 有界等待 purge finalization；后续高水位以上的 append 只会唤醒复核，不会扩大谓词。</li>
+     * </ol>
+     *
+     * @param tableId retirement fence 中的稳定正表 identity
+     * @param retireThroughTransactionNo final X 捕获的已分配提交号高水位；允许 0 表示空集合
+     * @param timeout 最大等待时长，必须为正；等待期间调用方不得持 page latch、MTR 或文件锁
+     * @throws DatabaseValidationException identity、高水位或 timeout 非法时抛出
+     * @throws TablePurgeBarrierTimeoutException 超时仍存在高水位内表 history 时抛出，segment 必须保留
+     * @throws TablePurgeBarrierInterruptedException 等待线程被中断时抛出并恢复 interrupt flag
+     */
+    void awaitTableUnreferencedThrough(long tableId, long retireThroughTransactionNo, Duration timeout) {
+        // 1. 校验发生在 history lock 外；0 高水位仍需要合法 timeout，保持所有 public barrier 一致契约。
+        requireTableId(tableId);
+        if (retireThroughTransactionNo < 0L || timeout == null
+                || timeout.isZero() || timeout.isNegative()) {
+            throw new DatabaseValidationException(
+                    "index retirement table/high-water/positive timeout required");
+        }
+        long remaining;
+        try {
+            remaining = timeout.toNanos();
+        } catch (ArithmeticException overflow) {
+            remaining = Long.MAX_VALUE;
+        }
+
+        // 2. entry identity 与队列增删均由同一锁保护，扫描不会观察到已摘除一半的 purge transition。
+        lock.lock();
+        try {
+            while (hasTableReferenceThrough(tableId, retireThroughTransactionNo)) {
+                if (remaining <= 0L) {
+                    throw new TablePurgeBarrierTimeoutException(
+                            "timed out waiting for index retirement history: table=" + tableId
+                                    + ", throughTransactionNo=" + retireThroughTransactionNo
+                                    + ", timeout=" + timeout);
+                }
+                try {
+                    // 3. Condition 释放 lock；新提交即使属于同表，只要超过 fence 就不会延长下一轮谓词。
+                    remaining = tableReferencesChanged.awaitNanos(remaining);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new TablePurgeBarrierInterruptedException(
+                            "interrupted while waiting for index retirement history: table=" + tableId,
+                            interrupted);
+                }
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** 当前已持 history lock；v1按表级投影保守覆盖目标 index 的全部历史变化。 */
+    private boolean hasTableReferenceThrough(long tableId, long retireThroughTransactionNo) {
+        for (HistoryEntry entry : committed) {
+            if (entry.transactionNo().value() <= retireThroughTransactionNo
+                    && entry.affectedTableIds().contains(tableId)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * 返回按物理 prev/next 链顺序冻结的不可变快照，供诊断和持久 preflight 使用。
      *
      * @return head→tail 顺序的不可变 entry 列表；返回后不持 history lock。
@@ -218,6 +290,44 @@ public final class HistoryList {
         lock.lock();
         try {
             return List.copyOf(committed);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 返回从物理 head 开始的有界不可变前缀，避免 purge dispatcher 为一个小批次复制完整 history backlog。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>在接触共享锁前校验正上限，非法请求不观察或修改队列。</li>
+     *     <li>持 history lock 按持久 prev/next 投影顺序复制至多 maxEntries 个不可变 entry。</li>
+     *     <li>释放锁后返回不可变列表；后续 append/remove 不改变本快照，也不会被本快照阻塞。</li>
+     * </ol>
+     *
+     * @param maxEntries 从当前 head 开始最多复制的正日志数量
+     * @return head→tail 顺序、长度不超过 maxEntries 的不可变列表；空 history 返回空列表
+     * @throws DatabaseValidationException maxEntries 非正时抛出
+     */
+    public List<HistoryEntry> snapshotPrefix(int maxEntries) {
+        // 1、容量错误发生在锁外，调用方可修正批次配置后重试。
+        if (maxEntries <= 0) {
+            throw new DatabaseValidationException("history snapshot prefix must be positive: " + maxEntries);
+        }
+        // 2、ArrayDeque 迭代顺序就是持久 head→tail 投影；复制期间 append/remove 由同一显式锁排斥。
+        lock.lock();
+        try {
+            java.util.ArrayList<HistoryEntry> prefix = new java.util.ArrayList<>(
+                    Math.min(maxEntries, committed.size()));
+            int copied = 0;
+            for (HistoryEntry entry : committed) {
+                if (copied++ >= maxEntries) {
+                    break;
+                }
+                prefix.add(entry);
+            }
+            // 3、List.copyOf 断开可变容器；返回后不再持 history lock。
+            return List.copyOf(prefix);
         } finally {
             lock.unlock();
         }

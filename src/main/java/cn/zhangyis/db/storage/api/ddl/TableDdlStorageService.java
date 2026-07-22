@@ -6,6 +6,7 @@ import cn.zhangyis.db.domain.Lsn;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
+import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.api.DiskSpaceManager;
 import cn.zhangyis.db.storage.api.SegmentRef;
 import cn.zhangyis.db.storage.api.SegmentDropPlan;
@@ -18,6 +19,8 @@ import cn.zhangyis.db.storage.fil.io.TablespaceFileTransfer;
 import cn.zhangyis.db.storage.api.tablespace.TablespaceFileIdentity;
 import cn.zhangyis.db.storage.api.tablespace.TablespaceFileInspection;
 import cn.zhangyis.db.storage.api.lob.LobStorage;
+import cn.zhangyis.db.storage.api.lob.LobFreeBatchPlan;
+import cn.zhangyis.db.storage.api.lob.LobFreeTarget;
 import cn.zhangyis.db.storage.api.lob.LobWriteAllocation;
 import cn.zhangyis.db.storage.api.lob.LobWritePlan;
 import cn.zhangyis.db.storage.fil.state.TablespaceType;
@@ -38,8 +41,16 @@ import cn.zhangyis.db.storage.sdi.SdiPageRepository;
 import cn.zhangyis.db.storage.sdi.SdiIndexBuildDescriptor;
 import cn.zhangyis.db.storage.sdi.SdiIndexDdlAction;
 import cn.zhangyis.db.storage.sdi.SdiIndexDdlDescriptor;
+import cn.zhangyis.db.storage.sdi.SdiOnlineAlterAnchor;
+import cn.zhangyis.db.storage.sdi.SdiOnlineAlterDescriptorAction;
+import cn.zhangyis.db.storage.sdi.SdiOnlineAlterDescriptorEntry;
+import cn.zhangyis.db.storage.sdi.SdiOnlineAlterDescriptorPage;
+import cn.zhangyis.db.storage.sdi.SdiOnlineAlterDescriptorPageCodec;
+import cn.zhangyis.db.storage.sdi.SdiOnlineAlterDescriptorPageRepository;
 import cn.zhangyis.db.storage.btree.BTreeIndex;
+import cn.zhangyis.db.storage.btree.BTreeDeleteResult;
 import cn.zhangyis.db.storage.btree.BTreeInsertResult;
+import cn.zhangyis.db.storage.btree.BTreeSecondaryRemovalResult;
 import cn.zhangyis.db.storage.btree.BTreeRedoBudgetEstimator;
 import cn.zhangyis.db.storage.btree.BTreeRootSnapshotService;
 import cn.zhangyis.db.storage.btree.BTreeScanRange;
@@ -68,7 +79,9 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -111,6 +124,8 @@ public final class TableDdlStorageService {
     private final TablespaceAccessController accessController;
     /** 固定 page3 SDI 物理仓储；只处理 opaque payload 和页级完整性。 */
     private final SdiPageRepository sdiPages;
+    /** 通用Online ALTER专用页仓储；只格式化已由FSP分配的descriptor页。 */
+    private final SdiOnlineAlterDescriptorPageRepository onlineAlterDescriptorPages;
     /**
      * 本对象拥有的 {@code schemaMapper} 受控集合；元素生命周期与外层对象一致，仅由本类方法更新，对外暴露时必须返回副本或不可变视图。
      */
@@ -204,6 +219,8 @@ public final class TableDdlStorageService {
         this.accessController = accessController;
         this.pageSize = pageSize;
         this.sdiPages = new SdiPageRepository(pool, pageSize);
+        this.onlineAlterDescriptorPages =
+                new SdiOnlineAlterDescriptorPageRepository(pool, pageSize);
         this.btree = btree;
         this.rootSnapshots = rootSnapshots;
         this.lobStorage = lobStorage;
@@ -422,6 +439,737 @@ public final class TableDdlStorageService {
     }
 
     /**
+     * 从已由恢复器按 exact identity 挂载、但尚未发布进 DD 的表空间读取 SDI envelope。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 table/space/path，并要求当前打开句柄与 marker 路径完全一致，拒绝用同 space id 指向别的文件。</li>
+     *     <li>在只读 MTR 中读取 page3 SDI，不解析 DD payload，也不构造未知的索引 binding。</li>
+     *     <li>交叉验证 envelope table identity；成功提交只读 MTR，失败回滚 fix/latch 并保留原始 cause。</li>
+     * </ol>
+     *
+     * @param tableId marker 与 manifest 共同确认的正表标识
+     * @param spaceId 未发布 shadow 的正表空间标识
+     * @param path marker manifest 中的规范绝对路径，必须与已打开句柄一致
+     * @return 完成 envelope/CRC 校验的 SDI，尚未写入时为空
+     * @throws DatabaseValidationException identity 或路径缺失时抛出，不取得页面资源
+     * @throws SerializedDictionaryInfoException 路径错绑、SDI 损坏或 table identity 漂移时抛出，恢复必须 fail-closed
+     */
+    public Optional<SerializedDictionaryInfo> readSerializedDictionaryInfo(
+            long tableId, SpaceId spaceId, Path path) {
+        // 1、恢复只提供marker级identity，不能为了复用普通入口伪造index/segment binding。
+        if (tableId <= 0 || spaceId == null || path == null) {
+            throw new DatabaseValidationException(
+                    "recovery SDI read requires table/space/path identity");
+        }
+        Path expected = path.toAbsolutePath().normalize();
+        Path opened = store.pathOf(spaceId).toAbsolutePath().normalize();
+        if (!opened.equals(expected)) {
+            throw new SerializedDictionaryInfoException(
+                    "recovery SDI path does not match opened tablespace: space="
+                            + spaceId.value() + " expected=" + expected + " opened=" + opened);
+        }
+
+        // 2、storage层只解释envelope；完整TableDefinition仍由DD层codec负责。
+        MiniTransaction mtr = mtrManager.beginReadOnly();
+        try {
+            Optional<SerializedDictionaryInfo> result = sdiPages.read(mtr, spaceId)
+                    .map(snapshot -> new SerializedDictionaryInfo(snapshot.tableId(),
+                            snapshot.dictionaryVersion(), snapshot.payload()));
+            // 3、双写table identity防止路径正确但文件属于另一个表。
+            if (result.isPresent() && result.orElseThrow().tableId() != tableId) {
+                throw new SerializedDictionaryInfoException(
+                        "recovery SDI table identity mismatch: expected=" + tableId
+                                + " actual=" + result.orElseThrow().tableId());
+            }
+            mtrManager.commit(mtr);
+            return result;
+        } catch (RuntimeException failure) {
+            rollbackIfBound(mtr, failure);
+            throw translateSdiFailure(
+                    "read recovery SDI page failed: table=" + tableId, failure);
+        }
+    }
+
+    /**
+     * 为一次通用INPLACE ALTER原子创建全部ADD root、引用全部DROP binding、descriptor chain和page3 anchor。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>验证table/path、operation identity、manifest digest、action ordinal与ADD/DROP均属于当前source。</li>
+     *     <li>预读page3确认无其它DDL owner，并按ADD资源与descriptor页数申请单个动态redo budget。</li>
+     *     <li>同一MTR创建所有ADD leaf/non-leaf/root与一个DDL_DESCRIPTOR segment，分配并格式化完整page chain。</li>
+     *     <li>最后在page3写ALT anchor，提交后等待WAL/dirty并force tablespace；只有整套owner durable才返回。</li>
+     * </ol>
+     *
+     * @param table source committed aggregate的完整物理binding
+     * @param ddlOperationId marker/journal/descriptor共用的正operation identity
+     * @param targetDictionaryVersion 单次target aggregate的正字典版本
+     * @param generation capture与descriptor共用的正代际
+     * @param additions manifest中所有ADD INDEX请求；允许为空
+     * @param drops manifest中所有DROP INDEX请求；允许为空
+     * @param manifestDigest journal immutable manifest的32字节SHA-256
+     * @param timeout redo/dirty/file force共用的正预算
+     * @return durable descriptor set；entry严格按manifest ordinal排序
+     * @throws DatabaseValidationException identity、action或source binding非法时抛出且不开始物理修改
+     * @throws SerializedDictionaryInfoException footer占用、页/segment损坏或持久化失败时抛出
+     */
+    public OnlineAlterDescriptorSet beginOnlineAlterIndexDescriptors(
+            TableStorageBinding table, long ddlOperationId, long targetDictionaryVersion,
+            long generation, List<OnlineAlterIndexAddRequest> additions,
+            List<OnlineAlterIndexDropRequest> drops, byte[] manifestDigest,
+            Duration timeout) {
+        // 1. 先完成全部纯identity验证，避免创建第一个segment后才发现重复ordinal或错误DROP owner。
+        validateOnlineAlterDescriptorRequest(table, ddlOperationId, targetDictionaryVersion,
+                generation, additions, drops, manifestDigest, timeout);
+        requireOpenedPath(table, "online ALTER descriptor stage");
+        if (readOnlineAlterDescriptorSet(table).isPresent()) {
+            throw new SerializedDictionaryInfoException(
+                    "table already has an online ALTER descriptor owner: " + table.tableId());
+        }
+        int descriptorCount = additions.size() + drops.size();
+        int perPage = new SdiOnlineAlterDescriptorPageCodec(pageSize).maxEntriesPerPage();
+        int descriptorPageCount = Math.floorDiv(descriptorCount + perPage - 1, perPage);
+
+        // 2. 每个ADD最多触及两个inode/root/FSP镜像，descriptor segment/page/anchor另计；溢出在begin前拒绝。
+        long pageImages;
+        try {
+            pageImages = Math.addExact(8L,
+                    Math.addExact(Math.multiplyExact(10L, additions.size()),
+                            Math.multiplyExact(3L, descriptorPageCount)));
+        } catch (ArithmeticException overflow) {
+            throw new DatabaseValidationException(
+                    "online ALTER descriptor redo workload overflows", overflow);
+        }
+        MiniTransaction mtr = mtrManager.begin(mtrManager.budgetFor(
+                RedoBudgetPurpose.DDL_TABLE_CREATE,
+                RedoBudgetWorkload.pageImages(pageImages)));
+        Lsn commitLsn;
+        OnlineAlterDescriptorSet result;
+        try {
+            // 3. 所有物理资源先进入同一MTR，page3只有在完整chain可解释后才得到root指针。
+            List<OnlineAlterIndexDescriptor> descriptors = new ArrayList<>(descriptorCount);
+            for (OnlineAlterIndexAddRequest addition : additions) {
+                StorageIndexDefinition definition = addition.definition();
+                SegmentRef leaf = disk.createSegment(
+                        mtr, table.spaceId(), SegmentPurpose.INDEX_LEAF);
+                SegmentRef nonLeaf = disk.createSegment(
+                        mtr, table.spaceId(), SegmentPurpose.INDEX_NON_LEAF);
+                PageId root = disk.allocatePage(mtr, leaf);
+                indexPages.createIndexPage(mtr, root, definition.indexId(), 0);
+                descriptors.add(new OnlineAlterIndexDescriptor(
+                        OnlineAlterIndexDescriptorAction.ADD, addition.actionOrdinal(),
+                        new IndexStorageBinding(definition.indexId(), root, 0, leaf, nonLeaf)));
+            }
+            for (OnlineAlterIndexDropRequest drop : drops) {
+                descriptors.add(new OnlineAlterIndexDescriptor(
+                        OnlineAlterIndexDescriptorAction.DROP,
+                        drop.actionOrdinal(), drop.binding()));
+            }
+            descriptors.sort(java.util.Comparator.comparingInt(
+                    OnlineAlterIndexDescriptor::actionOrdinal));
+
+            SegmentRef descriptorSegment = disk.createSegment(
+                    mtr, table.spaceId(), SegmentPurpose.DDL_DESCRIPTOR);
+            List<PageId> descriptorPages = new ArrayList<>(descriptorPageCount);
+            for (int index = 0; index < descriptorPageCount; index++) {
+                // 通用allocator只建立ALLOCATED envelope；专用仓储随后在同一MTR重写type/body。
+                descriptorPages.add(disk.allocatePage(mtr, descriptorSegment));
+            }
+            for (int pageOrdinal = 0; pageOrdinal < descriptorPages.size(); pageOrdinal++) {
+                int from = pageOrdinal * perPage;
+                int to = Math.min(descriptors.size(), from + perPage);
+                List<SdiOnlineAlterDescriptorEntry> entries = descriptors.subList(from, to)
+                        .stream().map(TableDdlStorageService::toSdiOnlineAlterEntry).toList();
+                long nextPageNo = pageOrdinal + 1 < descriptorPages.size()
+                        ? descriptorPages.get(pageOrdinal + 1).pageNo().value() : 0L;
+                onlineAlterDescriptorPages.formatAllocated(mtr,
+                        descriptorPages.get(pageOrdinal),
+                        new SdiOnlineAlterDescriptorPage(ddlOperationId,
+                                targetDictionaryVersion, table.tableId(), generation,
+                                descriptorSegment, pageOrdinal, nextPageNo, entries));
+            }
+            SdiOnlineAlterAnchor anchor = new SdiOnlineAlterAnchor(
+                    ddlOperationId, targetDictionaryVersion, table.tableId(), generation,
+                    descriptorPages.getFirst().pageNo().value(), descriptorCount,
+                    manifestDigest);
+            try (var ignored = mtr.allowOutOfOrderPageLatch(
+                    "online ALTER stage owns table SU and writes page3 only after all new descriptor/index pages")) {
+                sdiPages.writeOnlineAlterAnchor(mtr, table.spaceId(), anchor);
+            }
+            result = new OnlineAlterDescriptorSet(ddlOperationId,
+                    targetDictionaryVersion, table.tableId(), generation,
+                    descriptorSegment, descriptorPages, descriptors, manifestDigest);
+            commitLsn = mtrManager.commit(mtr);
+        } catch (RuntimeException failure) {
+            rollbackIfBound(mtr, failure);
+            throw translateSdiFailure(
+                    "stage online ALTER descriptor set failed: table=" + table.tableId(), failure);
+        }
+
+        // 4. descriptor是恢复删除权限，redo和数据文件未共同durable前不能写引用它的DDL marker阶段。
+        try {
+            flush.flushThrough(commitLsn, timeout);
+            store.force(table.spaceId());
+            return result;
+        } catch (RuntimeException failure) {
+            throw translateSdiFailure(
+                    "make online ALTER descriptor set durable failed: table=" + table.tableId(),
+                    failure);
+        }
+    }
+
+    /**
+     * 从page3 anchor有界遍历完整descriptor chain，交叉验证owner、ordinal、segment、entry数量和终止指针。
+     *
+     * @param table source或target committed aggregate提供的table/space/path identity
+     * @return 完整descriptor set，或footer全零时为空
+     * @throws SerializedDictionaryInfoException anchor/chain任一字段漂移或页损坏时抛出，恢复不得盲删资源
+     */
+    public Optional<OnlineAlterDescriptorSet> readOnlineAlterDescriptorSet(
+            TableStorageBinding table) {
+        if (table == null) {
+            throw new DatabaseValidationException(
+                    "online ALTER descriptor read table must not be null");
+        }
+        requireOpenedPath(table, "online ALTER descriptor read");
+        MiniTransaction mtr = mtrManager.beginReadOnly();
+        try {
+            Optional<SdiOnlineAlterAnchor> anchorOptional =
+                    sdiPages.readOnlineAlterAnchor(mtr, table.spaceId());
+            if (anchorOptional.isEmpty()) {
+                mtrManager.commit(mtr);
+                return Optional.empty();
+            }
+            SdiOnlineAlterAnchor anchor = anchorOptional.orElseThrow();
+            if (anchor.tableId() != table.tableId() || anchor.descriptorCount() <= 0) {
+                throw new SerializedDictionaryInfoException(
+                        "online ALTER anchor table/count mismatch: table=" + table.tableId());
+            }
+            int perPage = new SdiOnlineAlterDescriptorPageCodec(pageSize).maxEntriesPerPage();
+            int expectedPages = Math.floorDiv(anchor.descriptorCount() + perPage - 1, perPage);
+            List<PageId> pages = new ArrayList<>(expectedPages);
+            List<OnlineAlterIndexDescriptor> descriptors = new ArrayList<>(anchor.descriptorCount());
+            java.util.Set<Long> visited = new java.util.HashSet<>();
+            long pageNo = anchor.descriptorRootPageNo();
+            SegmentRef descriptorSegment = null;
+            for (int ordinal = 0; ordinal < expectedPages; ordinal++) {
+                if (pageNo <= 0 || !visited.add(pageNo)) {
+                    throw new SerializedDictionaryInfoException(
+                            "online ALTER descriptor chain is short/cyclic: page=" + pageNo);
+                }
+                PageId pageId = PageId.of(table.spaceId(), PageNo.of(pageNo));
+                SdiOnlineAlterDescriptorPage page = onlineAlterDescriptorPages.read(mtr, pageId);
+                if (page.ddlOperationId() != anchor.ddlOperationId()
+                        || page.targetDictionaryVersion() != anchor.targetDictionaryVersion()
+                        || page.tableId() != anchor.tableId()
+                        || page.generation() != anchor.generation()
+                        || page.pageOrdinal() != ordinal
+                        || descriptorSegment != null
+                        && !descriptorSegment.equals(page.descriptorSegment())) {
+                    throw new SerializedDictionaryInfoException(
+                            "online ALTER descriptor page owner mismatch: page=" + pageId);
+                }
+                descriptorSegment = page.descriptorSegment();
+                pages.add(pageId);
+                page.entries().stream().map(TableDdlStorageService::fromSdiOnlineAlterEntry)
+                        .forEach(descriptors::add);
+                pageNo = page.nextPageNo();
+            }
+            if (pageNo != 0 || descriptors.size() != anchor.descriptorCount()
+                    || descriptorSegment == null) {
+                throw new SerializedDictionaryInfoException(
+                        "online ALTER descriptor chain length/count mismatch");
+            }
+            OnlineAlterDescriptorSet result = new OnlineAlterDescriptorSet(
+                    anchor.ddlOperationId(), anchor.targetDictionaryVersion(), anchor.tableId(),
+                    anchor.generation(), descriptorSegment, pages, descriptors,
+                    anchor.manifestDigest());
+            mtrManager.commit(mtr);
+            return Optional.of(result);
+        } catch (RuntimeException failure) {
+            rollbackIfBound(mtr, failure);
+            throw translateSdiFailure(
+                    "read online ALTER descriptor set failed: table=" + table.tableId(), failure);
+        }
+    }
+
+    /**
+     * source DD仍为权威时回滚通用INPLACE：只释放ADD资源和descriptor segment，DROP资源保持可达。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>exact-read完整anchor/chain并与expected逐字段比较，错配时禁止释放任何segment。</li>
+     *     <li>在独立短读MTR中冻结全部ADD与descriptor segment的drop plan，再申请动态redo预算。</li>
+     *     <li>单写MTR释放ADD leaf/non-leaf与descriptor segment，最后exact-CAS清page3 anchor。</li>
+     *     <li>提交后满足WAL并force；返回后旧DD的DROP binding仍完整有效。</li>
+     * </ol>
+     *
+     * @param table 仍由source committed DD引用的物理aggregate
+     * @param expected 与marker/journal交叉验证的descriptor set
+     * @param timeout segment free、anchor clear和force共用的正预算
+     */
+    public void rollbackOnlineAlterIndexDescriptors(
+            TableStorageBinding table, OnlineAlterDescriptorSet expected,
+            Duration timeout) {
+        // 1. descriptor是物理删除权限；完整owner不相等时保持所有资源供人工/恢复诊断。
+        validateOnlineAlterDescriptorCleanup(table, expected, timeout, "rollback");
+        OnlineAlterDescriptorSet durable = readOnlineAlterDescriptorSet(table).orElseThrow(() ->
+                new SerializedDictionaryInfoException(
+                        "online ALTER descriptor set is absent before rollback"));
+        if (!sameOnlineAlterDescriptorSet(durable, expected)) {
+            throw new SerializedDictionaryInfoException(
+                    "online ALTER descriptor set changed before rollback");
+        }
+
+        // 2. redo admission等待前释放全部plan读取页；DROP binding不进入回滚释放集合。
+        List<SegmentRef> segments = new ArrayList<>();
+        for (OnlineAlterIndexDescriptor descriptor : expected.descriptors()) {
+            if (descriptor.action() == OnlineAlterIndexDescriptorAction.ADD) {
+                segments.add(descriptor.indexBinding().leafSegment());
+                segments.add(descriptor.indexBinding().nonLeafSegment());
+            }
+        }
+        segments.add(expected.descriptorSegment());
+        RedoBudgetWorkload workload = onlineAlterDropWorkload(
+                segments.stream().map(this::inspectDropPlan).toList());
+
+        // 3. 页/segment free intents与anchor clear是一个物理收敛单元。
+        MiniTransaction cleanup = mtrManager.begin(mtrManager.budgetFor(
+                RedoBudgetPurpose.DDL_INDEX_DROP, workload));
+        Lsn commitLsn;
+        try {
+            for (SegmentRef segment : segments) {
+                disk.dropSegment(cleanup, segment);
+            }
+            sdiPages.clearOnlineAlterAnchor(
+                    cleanup, table.spaceId(), toSdiOnlineAlterAnchor(expected));
+            commitLsn = mtrManager.commit(cleanup);
+        } catch (RuntimeException failure) {
+            rollbackIfBound(cleanup, failure);
+            throw translateSdiFailure(
+                    "rollback online ALTER descriptors failed: table=" + table.tableId(), failure);
+        }
+
+        // 4. WAL-safe force后才能让上层写ROLLED_BACK并删除journal。
+        try {
+            flush.flushThrough(commitLsn, timeout);
+            store.force(table.spaceId());
+        } catch (RuntimeException failure) {
+            throw translateSdiFailure(
+                    "make online ALTER descriptor rollback durable: table=" + table.tableId(),
+                    failure);
+        }
+    }
+
+    /**
+     * target DD已提交且retirement barrier安全后前滚收敛：释放DROP资源与descriptor segment，ADD保持可达。
+     *
+     * @param table target committed aggregate；可已不包含被DROP的binding
+     * @param expected 与marker/journal交叉验证的descriptor set
+     * @param timeout 物理回收与force共用的正预算
+     */
+    public void finishOnlineAlterIndexDescriptors(
+            TableStorageBinding table, OnlineAlterDescriptorSet expected,
+            Duration timeout) {
+        validateOnlineAlterDescriptorCleanup(table, expected, timeout, "finish");
+        OnlineAlterDescriptorSet durable = readOnlineAlterDescriptorSet(table).orElseThrow(() ->
+                new SerializedDictionaryInfoException(
+                        "online ALTER descriptor set is absent before finish"));
+        if (!sameOnlineAlterDescriptorSet(durable, expected)) {
+            throw new SerializedDictionaryInfoException(
+                    "online ALTER descriptor set changed before finish");
+        }
+        List<SegmentRef> segments = new ArrayList<>();
+        for (OnlineAlterIndexDescriptor descriptor : expected.descriptors()) {
+            if (descriptor.action() == OnlineAlterIndexDescriptorAction.DROP) {
+                segments.add(descriptor.indexBinding().leafSegment());
+                segments.add(descriptor.indexBinding().nonLeafSegment());
+            }
+        }
+        segments.add(expected.descriptorSegment());
+        RedoBudgetWorkload workload = onlineAlterDropWorkload(
+                segments.stream().map(this::inspectDropPlan).toList());
+        MiniTransaction cleanup = mtrManager.begin(mtrManager.budgetFor(
+                RedoBudgetPurpose.DDL_INDEX_DROP, workload));
+        Lsn commitLsn;
+        try {
+            for (SegmentRef segment : segments) {
+                disk.dropSegment(cleanup, segment);
+            }
+            sdiPages.clearOnlineAlterAnchor(
+                    cleanup, table.spaceId(), toSdiOnlineAlterAnchor(expected));
+            commitLsn = mtrManager.commit(cleanup);
+        } catch (RuntimeException failure) {
+            rollbackIfBound(cleanup, failure);
+            throw translateSdiFailure(
+                    "finish online ALTER descriptors failed: table=" + table.tableId(), failure);
+        }
+        try {
+            flush.flushThrough(commitLsn, timeout);
+            store.force(table.spaceId());
+        } catch (RuntimeException failure) {
+            throw translateSdiFailure(
+                    "make online ALTER descriptor finish durable: table=" + table.tableId(), failure);
+        }
+    }
+
+    /**
+     * 逐个ADD目标执行有界聚簇扫描并构建staged tree，最后一次性刷新descriptor chain中的root level。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>交叉校验source definition、descriptor owner与ADD请求一一对应，不读取DROP target。</li>
+     *     <li>每个ADD复用成熟的256行continuation backfill；不同目标可重复扫描source但不持跨批页资源。</li>
+     *     <li>汇总每棵树的最终root level，构造owner/segment/page不变的replacement set。</li>
+     *     <li>单MTR对全部descriptor页执行exact-CAS replacement，WAL/force后返回durable set。</li>
+     * </ol>
+     *
+     * @param sourceDefinition source committed表的完整storage schema
+     * @param existing source committed binding
+     * @param staged begin阶段durable的通用descriptor set
+     * @param additions 与manifest ordinal/index identity一致的全部ADD定义
+     * @param timeout 每棵backfill与最终descriptor force使用的正预算
+     * @return ADD root level已刷新、其它owner字段不变的durable descriptor set
+     */
+    public OnlineAlterDescriptorSet backfillOnlineAlterIndexes(
+            StorageTableDefinition sourceDefinition, TableStorageBinding existing,
+            OnlineAlterDescriptorSet staged,
+            List<OnlineAlterIndexAddRequest> additions, Duration timeout) {
+        // 1. DROP-only operation无需扫描；有ADD时每个请求必须命中唯一descriptor。
+        if (sourceDefinition == null || existing == null || staged == null
+                || additions == null || timeout == null
+                || timeout.isZero() || timeout.isNegative()
+                || sourceDefinition.tableId() != existing.tableId()
+                || staged.tableId() != existing.tableId()
+                || sourceDefinition.schemaVersion() != existing.rowFormatVersion()) {
+            throw new DatabaseValidationException(
+                    "online ALTER backfill metadata/owner/timeout is invalid");
+        }
+        if (additions.isEmpty()) {
+            return staged;
+        }
+        java.util.Map<Integer, OnlineAlterIndexDescriptor> byOrdinal =
+                staged.descriptors().stream().collect(java.util.stream.Collectors.toMap(
+                        OnlineAlterIndexDescriptor::actionOrdinal,
+                        java.util.function.Function.identity()));
+        List<OnlineAlterIndexDescriptor> replacements = new ArrayList<>(staged.descriptors());
+
+        // 2. 单target临时definition严格等于source indexes + 当前ADD，避免把另一棵未发布root混入metadata。
+        for (OnlineAlterIndexAddRequest addition : additions) {
+            OnlineAlterIndexDescriptor descriptor = byOrdinal.get(addition.actionOrdinal());
+            if (descriptor == null || descriptor.action() != OnlineAlterIndexDescriptorAction.ADD
+                    || descriptor.indexBinding().indexId() != addition.definition().indexId()) {
+                throw new DatabaseValidationException(
+                        "online ALTER ADD request does not match durable descriptor");
+            }
+            List<StorageIndexDefinition> indexes = new ArrayList<>(sourceDefinition.indexes());
+            indexes.add(addition.definition());
+            StorageTableDefinition singleTarget = new StorageTableDefinition(
+                    sourceDefinition.tableId(), sourceDefinition.spaceId(),
+                    sourceDefinition.path(), sourceDefinition.schemaVersion(),
+                    sourceDefinition.initialSizeInPages(), sourceDefinition.columns(), indexes);
+            SecondaryIndexBuildDescriptor singleDescriptor = new SecondaryIndexBuildDescriptor(
+                    staged.ddlOperationId(), staged.targetDictionaryVersion(), staged.tableId(),
+                    descriptor.indexBinding());
+            IndexStorageBinding finalBinding = backfillSecondaryIndexInternal(
+                    singleTarget, existing, singleDescriptor, timeout, false);
+            replacements.set(replacements.indexOf(descriptor),
+                    new OnlineAlterIndexDescriptor(
+                            OnlineAlterIndexDescriptorAction.ADD,
+                            descriptor.actionOrdinal(), finalBinding));
+        }
+
+        // 3. replacement只改变ADD root level，descriptor segment/pages、DROP bindings与manifest digest完全不变。
+        OnlineAlterDescriptorSet replacement = new OnlineAlterDescriptorSet(
+                staged.ddlOperationId(), staged.targetDictionaryVersion(), staged.tableId(),
+                staged.generation(), staged.descriptorSegment(), staged.descriptorPages(),
+                replacements, staged.manifestDigest());
+
+        // 4. 所有页exact-CAS成功才提交；崩溃在此之前仍可按旧level读取root页刷新或安全回滚segments。
+        MiniTransaction update = mtrManager.begin(mtrManager.budgetFor(
+                RedoBudgetPurpose.DDL_TABLE_CREATE,
+                RedoBudgetWorkload.pageImages(staged.descriptorPages().size() + 2L)));
+        Lsn commitLsn;
+        try {
+            int perPage = new SdiOnlineAlterDescriptorPageCodec(pageSize).maxEntriesPerPage();
+            for (int pageOrdinal = 0; pageOrdinal < staged.descriptorPages().size(); pageOrdinal++) {
+                onlineAlterDescriptorPages.replace(update,
+                        staged.descriptorPages().get(pageOrdinal),
+                        descriptorPage(staged, pageOrdinal, perPage),
+                        descriptorPage(replacement, pageOrdinal, perPage));
+            }
+            commitLsn = mtrManager.commit(update);
+        } catch (RuntimeException failure) {
+            rollbackIfBound(update, failure);
+            throw translateSdiFailure(
+                    "refresh online ALTER descriptor roots failed: table=" + existing.tableId(),
+                    failure);
+        }
+        flush.flushThrough(commitLsn, timeout);
+        store.force(existing.spaceId());
+        return replacement;
+    }
+
+    /**
+     * 通用INPLACE两遍reconciliation的删除阶段：按candidate完整physical entry幂等移除一个ADD target。
+     * root shrink与descriptor chain root-level在同一MTR exact-CAS提交。
+     *
+     * @param sourceDefinition committed source storage schema
+     * @param existing committed source binding
+     * @param staged 当前durable descriptor set
+     * @param addition manifest中与descriptor ordinal一致的ADD定义
+     * @param entry candidate nested codec解码出的before或after完整secondary entry
+     * @return 删除后root level已同步到descriptor chain的新set；ABSENT保持原set
+     */
+    public OnlineAlterDescriptorSet removeOnlineAlterIndexEntryExact(
+            StorageTableDefinition sourceDefinition, TableStorageBinding existing,
+            OnlineAlterDescriptorSet staged, OnlineAlterIndexAddRequest addition,
+            LogicalRecord entry) {
+        OnlineAlterBuildMetadata build = onlineAlterBuildMetadata(
+                sourceDefinition, existing, staged, addition);
+        SecondaryIndexMetadata metadata = build.secondary();
+        BTreeIndex current = refreshRoot(metadata.index());
+        SearchKey key = metadata.layout().physicalKey(entry);
+        MiniTransaction read = mtrManager.beginReadOnly();
+        Optional<cn.zhangyis.db.storage.btree.BTreeLookupResult> found;
+        try {
+            found = btree.lookupIncludingDeleted(read, current, key);
+            mtrManager.commit(read);
+        } catch (RuntimeException failure) {
+            rollbackIfBound(read, failure);
+            throw failure;
+        }
+        if (found.isEmpty()) {
+            return staged;
+        }
+
+        RedoBudgetWorkload workload = BTreeRedoBudgetEstimator.structuralDelete(
+                        current.rootLevel())
+                .plus(RedoBudgetWorkload.pageImages(staged.descriptorPages().size() + 1L));
+        MiniTransaction remove = mtrManager.begin(mtrManager.budgetFor(
+                RedoBudgetPurpose.SECONDARY_INDEX, workload));
+        try {
+            BTreeSecondaryRemovalResult removed = found.orElseThrow().record().deleted()
+                    ? btree.purgeDeleteMarkedSecondary(remove, current, key)
+                    : btree.deletePublishedSecondary(remove, current, key);
+            OnlineAlterDescriptorSet replacement = replaceOnlineAlterIndexBinding(
+                    staged, addition.actionOrdinal(), indexBinding(removed.indexAfter()));
+            try (var ignored = remove.allowOutOfOrderPageLatch(
+                    "online ALTER reconciliation owns staged index before descriptor chain exact-CAS")) {
+                replaceOnlineAlterDescriptorPages(remove, staged, replacement);
+            }
+            mtrManager.commit(remove);
+            return replacement;
+        } catch (RuntimeException failure) {
+            rollbackIfBound(remove, failure);
+            throw failure;
+        }
+    }
+
+    /**
+     * 通用INPLACE两遍reconciliation的ensure阶段：由candidate聚簇后缀回读source current truth，
+     * DELETE保持target absent，live行执行UNIQUE裁决后插入或复活exact entry。
+     *
+     * @param sourceDefinition committed source storage schema
+     * @param existing committed source binding
+     * @param staged 当前durable descriptor set
+     * @param addition manifest ADD目标
+     * @param candidateEntry before/after任一完整entry，用其聚簇后缀定位source
+     * @return current truth收敛后的descriptor set
+     */
+    public OnlineAlterDescriptorSet ensureOnlineAlterIndexCurrentForEntry(
+            StorageTableDefinition sourceDefinition, TableStorageBinding existing,
+            OnlineAlterDescriptorSet staged, OnlineAlterIndexAddRequest addition,
+            LogicalRecord candidateEntry) {
+        OnlineAlterBuildMetadata build = onlineAlterBuildMetadata(
+                sourceDefinition, existing, staged, addition);
+        SearchKey clusteredKey = build.secondary().layout().clusterKey(candidateEntry);
+        MiniTransaction sourceRead = mtrManager.beginReadOnly();
+        Optional<cn.zhangyis.db.storage.btree.BTreeLookupResult> currentSource;
+        try {
+            currentSource = btree.lookup(sourceRead,
+                    refreshRoot(build.clustered()), clusteredKey);
+            mtrManager.commit(sourceRead);
+        } catch (RuntimeException failure) {
+            rollbackIfBound(sourceRead, failure);
+            throw failure;
+        }
+        if (currentSource.isEmpty()) {
+            return staged;
+        }
+        return ensureOnlineAlterIndexLive(sourceDefinition, existing, staged,
+                addition, currentSource.orElseThrow().record());
+    }
+
+    /**
+     * 对一个ADD target执行既有source↔target双向验证；验证不读取或修改legacy单slot footer。
+     *
+     * @param sourceDefinition committed source storage schema
+     * @param existing committed binding
+     * @param staged reconciliation后的descriptor set
+     * @param addition 待验证ADD目标
+     * @param batchSize 正有界扫描批次
+     */
+    public void verifyOnlineAlterIndex(
+            StorageTableDefinition sourceDefinition, TableStorageBinding existing,
+            OnlineAlterDescriptorSet staged, OnlineAlterIndexAddRequest addition,
+            int batchSize) {
+        OnlineAlterBuildMetadata build = onlineAlterBuildMetadata(
+                sourceDefinition, existing, staged, addition);
+        OnlineAlterIndexDescriptor descriptor = requireOnlineAlterAddDescriptor(
+                staged, addition);
+        verifySecondaryIndexBuild(build.definition(), existing,
+                new SecondaryIndexBuildDescriptor(staged.ddlOperationId(),
+                        staged.targetDictionaryVersion(), staged.tableId(),
+                        descriptor.indexBinding()), batchSize);
+    }
+
+    /** 由一条稳定source row确保通用ADD target存在live entry，并把结构root变化原子写入descriptor chain。 */
+    private OnlineAlterDescriptorSet ensureOnlineAlterIndexLive(
+            StorageTableDefinition sourceDefinition, TableStorageBinding existing,
+            OnlineAlterDescriptorSet staged, OnlineAlterIndexAddRequest addition,
+            LogicalRecord clusteredRow) {
+        OnlineAlterBuildMetadata build = onlineAlterBuildMetadata(
+                sourceDefinition, existing, staged, addition);
+        SecondaryIndexMetadata metadata = build.secondary();
+        BTreeIndex current = refreshRoot(metadata.index());
+        LogicalRecord entry = metadata.layout().toEntry(clusteredRow, false);
+        SearchKey physicalKey = metadata.layout().physicalKey(entry);
+        MiniTransaction read = mtrManager.beginReadOnly();
+        Optional<cn.zhangyis.db.storage.btree.BTreeLookupResult> found;
+        try {
+            found = btree.lookupIncludingDeleted(read, current, physicalKey);
+            mtrManager.commit(read);
+        } catch (RuntimeException failure) {
+            rollbackIfBound(read, failure);
+            throw failure;
+        }
+        if (found.isPresent() && !found.orElseThrow().record().deleted()) {
+            return staged;
+        }
+        if (found.isEmpty() && metadata.logicalUnique()
+                && metadata.layout().logicalKey(entry).values().stream()
+                .noneMatch(ColumnValue.NullValue.class::isInstance)) {
+            MiniTransaction uniqueRead = mtrManager.beginReadOnly();
+            try {
+                boolean duplicate = btree.scanSecondaryPrefixIncludingDeleted(
+                                uniqueRead, new SecondaryIndexMetadata(
+                                        current, metadata.layout(), true),
+                                metadata.layout().logicalKey(entry), 2).stream()
+                        .anyMatch(candidate -> !candidate.record().deleted());
+                mtrManager.commit(uniqueRead);
+                if (duplicate) {
+                    throw new SecondaryIndexBuildDuplicateKeyException(
+                            "online ALTER found duplicate UNIQUE key: index=" + current.indexId());
+                }
+            } catch (RuntimeException failure) {
+                rollbackIfBound(uniqueRead, failure);
+                throw failure;
+            }
+        }
+        RedoBudgetWorkload workload = BTreeRedoBudgetEstimator.insert(current.rootLevel())
+                .plus(RedoBudgetWorkload.pageImages(staged.descriptorPages().size() + 1L));
+        MiniTransaction write = mtrManager.begin(mtrManager.budgetFor(
+                RedoBudgetPurpose.SECONDARY_INDEX, workload));
+        try {
+            BTreeIndex after;
+            if (found.isPresent()) {
+                btree.setSecondaryDeleteMark(write, current, physicalKey, false);
+                after = current;
+            } else {
+                after = btree.insertSecondary(write, current, entry).indexAfterInsert();
+            }
+            OnlineAlterDescriptorSet replacement = replaceOnlineAlterIndexBinding(
+                    staged, addition.actionOrdinal(), indexBinding(after));
+            try (var ignored = write.allowOutOfOrderPageLatch(
+                    "online ALTER ensure owns staged index before descriptor chain exact-CAS")) {
+                replaceOnlineAlterDescriptorPages(write, staged, replacement);
+            }
+            mtrManager.commit(write);
+            return replacement;
+        } catch (RuntimeException failure) {
+            rollbackIfBound(write, failure);
+            throw failure;
+        }
+    }
+
+    /** 构造source indexes + 单ADD的临时exact metadata，避免把其它未发布root或待DROP定义混入。 */
+    private OnlineAlterBuildMetadata onlineAlterBuildMetadata(
+            StorageTableDefinition sourceDefinition, TableStorageBinding existing,
+            OnlineAlterDescriptorSet staged, OnlineAlterIndexAddRequest addition) {
+        if (sourceDefinition == null || existing == null || staged == null || addition == null
+                || sourceDefinition.tableId() != existing.tableId()
+                || staged.tableId() != existing.tableId()
+                || sourceDefinition.schemaVersion() != existing.rowFormatVersion()) {
+            throw new DatabaseValidationException(
+                    "online ALTER mutation metadata/owner is invalid");
+        }
+        OnlineAlterIndexDescriptor descriptor = requireOnlineAlterAddDescriptor(staged, addition);
+        List<StorageIndexDefinition> definitions = new ArrayList<>(sourceDefinition.indexes());
+        definitions.add(addition.definition());
+        StorageTableDefinition definition = new StorageTableDefinition(
+                sourceDefinition.tableId(), sourceDefinition.spaceId(), sourceDefinition.path(),
+                sourceDefinition.schemaVersion(), sourceDefinition.initialSizeInPages(),
+                sourceDefinition.columns(), definitions);
+        List<IndexStorageBinding> bindings = new ArrayList<>(existing.indexes());
+        bindings.add(descriptor.indexBinding());
+        TableStorageBinding binding = new TableStorageBinding(
+                existing.tableId(), existing.spaceId(), existing.path(),
+                existing.rowFormatVersion(), bindings, existing.lobSegment());
+        TableIndexMetadata metadata = indexMetadataFactory.createTable(definition, binding);
+        return new OnlineAlterBuildMetadata(definition, metadata.clusteredIndex(),
+                metadata.requireSecondary(addition.definition().indexId()));
+    }
+
+    /** 精确定位ADD descriptor并核对manifest ordinal/index identity。 */
+    private static OnlineAlterIndexDescriptor requireOnlineAlterAddDescriptor(
+            OnlineAlterDescriptorSet staged, OnlineAlterIndexAddRequest addition) {
+        return staged.descriptors().stream().filter(descriptor ->
+                        descriptor.actionOrdinal() == addition.actionOrdinal())
+                .findFirst().filter(descriptor ->
+                        descriptor.action() == OnlineAlterIndexDescriptorAction.ADD
+                                && descriptor.indexBinding().indexId()
+                                == addition.definition().indexId())
+                .orElseThrow(() -> new DatabaseValidationException(
+                        "online ALTER ADD request does not match descriptor owner"));
+    }
+
+    /** 只替换一个ADD descriptor的root binding，其余owner、顺序与manifest digest保持不变。 */
+    private static OnlineAlterDescriptorSet replaceOnlineAlterIndexBinding(
+            OnlineAlterDescriptorSet staged, int actionOrdinal,
+            IndexStorageBinding binding) {
+        List<OnlineAlterIndexDescriptor> descriptors = staged.descriptors().stream()
+                .map(descriptor -> descriptor.actionOrdinal() == actionOrdinal
+                        ? new OnlineAlterIndexDescriptor(descriptor.action(),
+                        descriptor.actionOrdinal(), binding)
+                        : descriptor).toList();
+        return new OnlineAlterDescriptorSet(staged.ddlOperationId(),
+                staged.targetDictionaryVersion(), staged.tableId(), staged.generation(),
+                staged.descriptorSegment(), staged.descriptorPages(), descriptors,
+                staged.manifestDigest());
+    }
+
+    /** 在调用方写MTR中对chain全部页执行exact-CAS；任一页漂移使整个MTR失败。 */
+    private void replaceOnlineAlterDescriptorPages(
+            MiniTransaction mtr, OnlineAlterDescriptorSet expected,
+            OnlineAlterDescriptorSet replacement) {
+        int perPage = new SdiOnlineAlterDescriptorPageCodec(pageSize).maxEntriesPerPage();
+        for (int pageOrdinal = 0; pageOrdinal < expected.descriptorPages().size(); pageOrdinal++) {
+            onlineAlterDescriptorPages.replace(mtr,
+                    expected.descriptorPages().get(pageOrdinal),
+                    descriptorPage(expected, pageOrdinal, perPage),
+                    descriptorPage(replacement, pageOrdinal, perPage));
+        }
+    }
+
+    /** 单ADD临时definition、source clustered与target secondary的不可变内部聚合。 */
+    private record OnlineAlterBuildMetadata(StorageTableDefinition definition,
+                                            BTreeIndex clustered,
+                                            SecondaryIndexMetadata secondary) {
+    }
+
+    /**
      * 在既有表空间原子创建二级索引的两个 segment、稳定 root 与 page3 build descriptor。
      *
      * <p>数据流：</p>
@@ -581,7 +1329,7 @@ public final class TableDdlStorageService {
      * <ol>
      *     <li>校验 table、DDL/version、timeout 与索引 binding；目标必须是当前 binding 中非首位的精确成员，
      *     避免物理层接受聚簇索引删除。</li>
-     *     <li>用短只读 MTR 确认 footer 为空；调用方的 table MDL X 排除同表 CREATE/DROP INDEX 竞争。</li>
+     *     <li>用短只读 MTR 确认 footer 为空；调用方的 table MDL SU 排除另一个同表结构修改者，普通DML仍可继续。</li>
      *     <li>以 DDL_SDI_WRITE 预算写入带 DROP action 的 v2 descriptor，不修改 index page 或 segment inode。</li>
      *     <li>等待 footer redo/dirty 满足 WAL 并 force 表空间；只有恢复所有权 durable 后才允许上层提交新 DD。</li>
      * </ol>
@@ -787,16 +1535,436 @@ public final class TableDdlStorageService {
     }
 
     /**
+     * 以 exclusive continuation 扫描 staged secondary build 的一批聚簇 live rows。返回前提交只读 MTR，
+     * 因此结果不携带页资源，可在批次之间执行 row-log 检查、取消或二级写 MTR。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>交叉校验 definition、committed binding 与 staged descriptor，拒绝错误 owner 或已发布索引。</li>
+     *     <li>用“旧 binding + staged binding”构造 exact-version 临时 metadata，只读取其中聚簇 descriptor。</li>
+     *     <li>在短只读 MTR 内按 unbounded/after range 物化至多 limit 行，并在返回前提交释放全部 page guard。</li>
+     *     <li>从最后一行提取完整聚簇物理键作为 continuation；不足 limit 的批次标记 complete。</li>
+     * </ol>
+     *
+     * @param definition 包含本次新 secondary 定义的完整目标 storage schema
+     * @param existing 当前 committed 表物理 binding，不得已含 staged index
+     * @param staged page3 durable 的 build owner/root/segment descriptor
+     * @param continuation 上批最后完整聚簇键；首批为空
+     * @param limit 本批最大 live row 数，必须为正；生产默认使用 OnlineDdlConfig.scanBatchRows
+     * @return 完全物化且不持页资源的批次、exclusive continuation 与尾批次标志
+     * @throws DatabaseValidationException identity/version/continuation/limit 不合法时抛出
+     */
+    public OnlineIndexScanBatch scanSecondaryIndexBuildBatch(
+            StorageTableDefinition definition,
+            TableStorageBinding existing,
+            SecondaryIndexBuildDescriptor staged,
+            Optional<SearchKey> continuation,
+            int limit) {
+        // 1. 所有 identity/版本校验早于 MTR 与页访问，失败不推进 scan 或 staged tree。
+        if (definition == null || existing == null || staged == null || continuation == null
+                || limit <= 0 || definition.tableId() != existing.tableId()
+                || definition.tableId() != staged.tableId()
+                || definition.schemaVersion() != existing.rowFormatVersion()
+                || existing.indexes().stream().anyMatch(
+                index -> index.indexId() == staged.indexBinding().indexId())) {
+            throw new DatabaseValidationException("online secondary scan metadata/identity/limit is invalid");
+        }
+        requireOpenedPath(existing, "online CREATE INDEX scan");
+
+        // 2. 临时 aggregate 只加入当前 staged owner，不把其它未发布 root 当作 source metadata。
+        List<IndexStorageBinding> bindings = new ArrayList<>(existing.indexes());
+        bindings.add(staged.indexBinding());
+        TableStorageBinding building = new TableStorageBinding(
+                existing.tableId(), existing.spaceId(), existing.path(), existing.rowFormatVersion(),
+                bindings, existing.lobSegment());
+        BTreeIndex clustered = indexMetadataFactory.createTable(definition, building).clusteredIndex();
+
+        // 3. scan 结果已物化；提交 read-only MTR 后调用方才获得列表，禁止跨批次保留 page latch/fix。
+        MiniTransaction scan = mtrManager.beginReadOnly();
+        List<cn.zhangyis.db.storage.btree.BTreeLookupResult> results;
+        try {
+            BTreeScanRange range = continuation
+                    .map(key -> BTreeScanRange.after(key, limit))
+                    .orElseGet(() -> BTreeScanRange.unbounded(limit));
+            results = btree.scan(scan, clustered, range);
+            mtrManager.commit(scan);
+        } catch (RuntimeException failure) {
+            rollbackIfBound(scan, failure);
+            throw failure;
+        }
+
+        // 4. 完整聚簇键唯一且 exclusive lower，因此下一批不会重复或遗漏上一批最后一行。
+        List<LogicalRecord> rows = results.stream().map(result -> result.record()).toList();
+        Optional<SearchKey> next = rows.isEmpty() ? continuation
+                : Optional.of(physicalKey(rows.getLast(), clustered));
+        return new OnlineIndexScanBatch(rows, next, rows.size() < limit);
+    }
+
+    /**
+     * 确保 staged tree 存在给定当前聚簇行对应的 live physical entry。ABSENT 插入、delete-marked 复活、
+     * 已 live no-op 三种状态均幂等；结构变化后的 root binding 与 page3 descriptor 在同一 MTR 发布。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>重建 exact staged metadata、刷新 root level并把完整聚簇行投影为 secondary entry。</li>
+     *     <li>短只读 MTR 检查完整 physical key；live 直接返回，marked 进入等长 revive 写路径。</li>
+     *     <li>ABSENT 时对非 NULL logical UNIQUE 扫描 live 冲突，再执行一次 split-capable insert。</li>
+     *     <li>写 MTR 内同步更新 page3 build descriptor 后提交，返回新的 root level/segment owner 快照。</li>
+     * </ol>
+     *
+     * @param definition 含 staged index 的完整目标 schema
+     * @param existing 当前 committed binding
+     * @param staged 当前 page3 owner/root binding
+     * @param clusteredRow cutover current-read 或 base scan 得到的完整 live 聚簇行
+     * @return 与实际 staged root level 一致的新 descriptor
+     */
+    public SecondaryIndexBuildDescriptor ensureSecondaryIndexLive(
+            StorageTableDefinition definition, TableStorageBinding existing,
+            SecondaryIndexBuildDescriptor staged, LogicalRecord clusteredRow) {
+        return ensureSecondaryIndexLiveInternal(
+                definition, existing, staged, clusteredRow, true);
+    }
+
+    /**
+     * base scan 专用幂等写入口。扫描期间可能看到尚未提交、随后回滚的物理版本，因此这里只构造完整 physical
+     * entry，不提前裁决 logical UNIQUE；sealed 后的 current-read reconciliation 与双向验证负责最终唯一性。
+     *
+     * @param definition 含 staged index 的完整目标 schema
+     * @param existing 当前 committed binding
+     * @param staged 当前 page3 owner/root binding
+     * @param clusteredRow base scan 物化的聚簇物理 live row
+     * @return 与实际 staged root level 一致的新 descriptor
+     */
+    public SecondaryIndexBuildDescriptor ensureSecondaryIndexLiveForBaseScan(
+            StorageTableDefinition definition, TableStorageBinding existing,
+            SecondaryIndexBuildDescriptor staged, LogicalRecord clusteredRow) {
+        return ensureSecondaryIndexLiveInternal(
+                definition, existing, staged, clusteredRow, false);
+    }
+
+    /** 共享 absent/live/deleted 幂等写实现；enforceUnique 只允许 cutover 或 legacy blocking 路径启用。 */
+    private SecondaryIndexBuildDescriptor ensureSecondaryIndexLiveInternal(
+            StorageTableDefinition definition, TableStorageBinding existing,
+            SecondaryIndexBuildDescriptor staged, LogicalRecord clusteredRow,
+            boolean enforceUnique) {
+        // 1. helper 统一交叉校验 identity 并构造唯一 staged metadata，row 投影不访问页。
+        SecondaryIndexMetadata metadata = secondaryBuildMetadata(definition, existing, staged);
+        BTreeIndex current = refreshRoot(metadata.index());
+        LogicalRecord entry = metadata.layout().toEntry(clusteredRow, false);
+        SearchKey physicalKey = metadata.layout().physicalKey(entry);
+
+        // 2. 先在短只读 MTR 分类 live/marked/absent，返回后不持 leaf guard。
+        MiniTransaction read = mtrManager.beginReadOnly();
+        Optional<cn.zhangyis.db.storage.btree.BTreeLookupResult> found;
+        try {
+            found = btree.lookupIncludingDeleted(read, current, physicalKey);
+            mtrManager.commit(read);
+        } catch (RuntimeException failure) {
+            rollbackIfBound(read, failure);
+            throw failure;
+        }
+        if (found.isPresent() && !found.orElseThrow().record().deleted()) {
+            return descriptorFor(staged, current);
+        }
+
+        // 3. 只有 ABSENT 才检查 logical UNIQUE；marked 同 identity 直接 revive，不与自身冲突。
+        if (enforceUnique && found.isEmpty() && metadata.logicalUnique()
+                && metadata.layout().logicalKey(entry).values().stream()
+                .noneMatch(ColumnValue.NullValue.class::isInstance)) {
+            MiniTransaction uniqueRead = mtrManager.beginReadOnly();
+            try {
+                boolean duplicate = btree.scanSecondaryPrefixIncludingDeleted(
+                                uniqueRead, new SecondaryIndexMetadata(current, metadata.layout(), true),
+                                metadata.layout().logicalKey(entry), 2).stream()
+                        .anyMatch(candidate -> !candidate.record().deleted());
+                if (duplicate) {
+                    throw new SecondaryIndexBuildDuplicateKeyException(
+                            "online CREATE UNIQUE INDEX found committed duplicate logical key: index="
+                                    + current.indexId());
+                }
+                mtrManager.commit(uniqueRead);
+            } catch (RuntimeException failure) {
+                rollbackIfBound(uniqueRead, failure);
+                throw failure;
+            }
+        }
+
+        // 4. 结构写与 page3 descriptor 属于同一 MTR；crash 不会留下新 level 配旧 footer。
+        MiniTransaction write = mtrManager.begin(mtrManager.budgetFor(
+                RedoBudgetPurpose.SECONDARY_INDEX, BTreeRedoBudgetEstimator.insert(current.rootLevel())));
+        try {
+            BTreeIndex after;
+            if (found.isPresent()) {
+                btree.setSecondaryDeleteMark(write, current, physicalKey, false);
+                after = current;
+            } else {
+                after = btree.insertSecondary(write, current, entry).indexAfterInsert();
+            }
+            SecondaryIndexBuildDescriptor result = descriptorFor(staged, after);
+            try (var ignored = write.allowOutOfOrderPageLatch(
+                    "online CREATE INDEX mutation: table gate owns staged tree and permits index-to-page3 order")) {
+                sdiPages.updateIndexBuild(write, existing.spaceId(), toSdi(staged), toSdi(result));
+            }
+            mtrManager.commit(write);
+            return result;
+        } catch (RuntimeException failure) {
+            rollbackIfBound(write, failure);
+            throw failure;
+        }
+    }
+
+    /**
+     * 精确移除一个 candidate physical entry，无论它当前为 live、delete-marked 还是 absent。删除可能触发
+     * merge/root shrink，新的 root level 与 page3 descriptor 在同一 MTR 提交。
+     *
+     * @param definition 含 staged index 的目标 schema
+     * @param existing committed binding
+     * @param staged 当前 descriptor
+     * @param entry candidate codec 解码出的完整 secondary physical entry
+     * @return 删除后 descriptor；ABSENT 时保持结构 identity
+     */
+    public SecondaryIndexBuildDescriptor removeSecondaryIndexEntryExact(
+            StorageTableDefinition definition, TableStorageBinding existing,
+            SecondaryIndexBuildDescriptor staged, LogicalRecord entry) {
+        SecondaryIndexMetadata metadata = secondaryBuildMetadata(definition, existing, staged);
+        BTreeIndex current = refreshRoot(metadata.index());
+        SearchKey key = metadata.layout().physicalKey(entry);
+
+        MiniTransaction read = mtrManager.beginReadOnly();
+        Optional<cn.zhangyis.db.storage.btree.BTreeLookupResult> found;
+        try {
+            found = btree.lookupIncludingDeleted(read, current, key);
+            mtrManager.commit(read);
+        } catch (RuntimeException failure) {
+            rollbackIfBound(read, failure);
+            throw failure;
+        }
+        if (found.isEmpty()) {
+            return descriptorFor(staged, current);
+        }
+
+        MiniTransaction remove = mtrManager.begin(mtrManager.budgetFor(
+                RedoBudgetPurpose.SECONDARY_INDEX,
+                BTreeRedoBudgetEstimator.structuralDelete(current.rootLevel())));
+        try {
+            BTreeSecondaryRemovalResult removal = found.orElseThrow().record().deleted()
+                    ? btree.purgeDeleteMarkedSecondary(remove, current, key)
+                    : btree.deletePublishedSecondary(remove, current, key);
+            SecondaryIndexBuildDescriptor result = descriptorFor(staged, removal.indexAfter());
+            try (var ignored = remove.allowOutOfOrderPageLatch(
+                    "online CREATE INDEX remove: sealed gate excludes staged writers and permits index-to-page3 order")) {
+                sdiPages.updateIndexBuild(remove, existing.spaceId(), toSdi(staged), toSdi(result));
+            }
+            mtrManager.commit(remove);
+            return result;
+        } catch (RuntimeException failure) {
+            rollbackIfBound(remove, failure);
+            throw failure;
+        }
+    }
+
+    /**
+     * 有界扫描 staged tree 的 live 与 delete-marked 完整物理视图，供 final 双向验证发现 extra/deleted entry。
+     *
+     * @param definition 含 staged index 的目标 schema
+     * @param existing committed binding
+     * @param staged 当前 descriptor
+     * @param continuation 上批最后完整 secondary physical key
+     * @param limit 正批次上限
+     * @return 不持页资源的 including-deleted entry 批次
+     */
+    public OnlineIndexEntryBatch scanSecondaryIndexBuildEntriesIncludingDeleted(
+            StorageTableDefinition definition, TableStorageBinding existing,
+            SecondaryIndexBuildDescriptor staged, Optional<SearchKey> continuation, int limit) {
+        if (continuation == null || limit <= 0) {
+            throw new DatabaseValidationException("online secondary entry scan continuation/limit is invalid");
+        }
+        SecondaryIndexMetadata metadata = secondaryBuildMetadata(definition, existing, staged);
+        BTreeIndex current = refreshRoot(metadata.index());
+        MiniTransaction scan = mtrManager.beginReadOnly();
+        List<cn.zhangyis.db.storage.btree.BTreeLookupResult> results;
+        try {
+            BTreeScanRange range = continuation.map(key -> BTreeScanRange.after(key, limit))
+                    .orElseGet(() -> BTreeScanRange.unbounded(limit));
+            results = btree.scanIncludingDeleted(scan, current, range);
+            mtrManager.commit(scan);
+        } catch (RuntimeException failure) {
+            rollbackIfBound(scan, failure);
+            throw failure;
+        }
+        List<LogicalRecord> entries = results.stream().map(result -> result.record()).toList();
+        Optional<SearchKey> next = entries.isEmpty() ? continuation
+                : Optional.of(metadata.layout().physicalKey(entries.getLast()));
+        return new OnlineIndexEntryBatch(entries, next, entries.size() < limit);
+    }
+
+    /**
+     * 以 candidate entry 携带的完整聚簇后缀读取 cutover 当前行；行仍 live 时投影并确保 target live，行已删除
+     * 时保持 target absent。PK UPDATE 不在 v1 SQL 范围，因此 before/after 任一 entry 都给出相同 cluster key。
+     *
+     * @param definition 含 staged index 的目标 schema
+     * @param existing committed binding
+     * @param staged 当前 descriptor
+     * @param candidateEntry before 或 after physical entry
+     * @return 按当前聚簇真相修正后的 descriptor
+     */
+    public SecondaryIndexBuildDescriptor ensureSecondaryIndexCurrentForEntry(
+            StorageTableDefinition definition, TableStorageBinding existing,
+            SecondaryIndexBuildDescriptor staged, LogicalRecord candidateEntry) {
+        SecondaryIndexMetadata metadata = secondaryBuildMetadata(definition, existing, staged);
+        SearchKey clusteredKey = metadata.layout().clusterKey(candidateEntry);
+        BTreeIndex clustered = clusteredBuildIndex(definition, existing, staged);
+        MiniTransaction read = mtrManager.beginReadOnly();
+        Optional<cn.zhangyis.db.storage.btree.BTreeLookupResult> current;
+        try {
+            current = btree.lookup(read, clustered, clusteredKey);
+            mtrManager.commit(read);
+        } catch (RuntimeException failure) {
+            rollbackIfBound(read, failure);
+            throw failure;
+        }
+        return current.isEmpty() ? staged
+                : ensureSecondaryIndexLive(definition, existing, staged,
+                current.orElseThrow().record());
+    }
+
+    /**
+     * 双向验证 cutover source 与 staged target 完全等价：每个 live 聚簇行有唯一 live entry，target 不含
+     * delete-marked/extra/wrong entry。方法只读、批次有界，失败不修改树或 descriptor。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>按聚簇 continuation 分批扫描 source，把每行投影为完整 physical key 并在 staged tree 点查。</li>
+     *     <li>反向分批扫描 staged tree（含 delete-marked），按聚簇后缀回读 source 并校验 entry 精确相等。</li>
+     * </ol>
+     *
+     * @param definition 含 staged index 的目标 schema
+     * @param existing committed binding
+     * @param staged reconciliation 后 descriptor
+     * @param batchSize 正扫描批次上限
+     * @throws DatabaseRuntimeException 发现 missing、extra、deleted 或 wrong entry 时抛出
+     */
+    public void verifySecondaryIndexBuild(StorageTableDefinition definition,
+                                          TableStorageBinding existing,
+                                          SecondaryIndexBuildDescriptor staged,
+                                          int batchSize) {
+        if (batchSize <= 0) {
+            throw new DatabaseValidationException("online secondary verify batch size must be positive");
+        }
+        SecondaryIndexMetadata metadata = secondaryBuildMetadata(definition, existing, staged);
+        BTreeIndex target = refreshRoot(metadata.index());
+        BTreeIndex clustered = clusteredBuildIndex(definition, existing, staged);
+
+        // 1. source→target：逐个聚簇 live row 点查完整 physical key，缺失或 marked 立即拒绝发布。
+        Optional<SearchKey> sourceContinuation = Optional.empty();
+        while (true) {
+            OnlineIndexScanBatch source = scanSecondaryIndexBuildBatch(
+                    definition, existing, staged, sourceContinuation, batchSize);
+            for (LogicalRecord row : source.rows()) {
+                LogicalRecord expected = metadata.layout().toEntry(row, false);
+                MiniTransaction read = mtrManager.beginReadOnly();
+                try {
+                    Optional<cn.zhangyis.db.storage.btree.BTreeLookupResult> actual =
+                            btree.lookupIncludingDeleted(read, target, metadata.layout().physicalKey(expected));
+                    mtrManager.commit(read);
+                    if (actual.isEmpty() || actual.orElseThrow().record().deleted()
+                            || !actual.orElseThrow().record().equals(expected)) {
+                        throw new TableDdlStorageException(
+                                "online secondary verification found missing/deleted/wrong target entry");
+                    }
+                } catch (RuntimeException failure) {
+                    rollbackIfBound(read, failure);
+                    throw failure;
+                }
+            }
+            if (source.complete()) {
+                break;
+            }
+            sourceContinuation = source.continuation();
+        }
+
+        // 2. target→source：including-deleted 扫描可发现多余或残留 marked entry，并按 cluster key 回读 source。
+        Optional<SearchKey> targetContinuation = Optional.empty();
+        while (true) {
+            OnlineIndexEntryBatch entries = scanSecondaryIndexBuildEntriesIncludingDeleted(
+                    definition, existing, staged, targetContinuation, batchSize);
+            for (LogicalRecord entry : entries.entries()) {
+                if (entry.deleted()) {
+                    throw new TableDdlStorageException(
+                            "online secondary verification found delete-marked target entry");
+                }
+                SearchKey logicalKey = metadata.layout().logicalKey(entry);
+                if (metadata.logicalUnique() && logicalKey.values().stream()
+                        .noneMatch(ColumnValue.NullValue.class::isInstance)) {
+                    MiniTransaction uniqueRead = mtrManager.beginReadOnly();
+                    try {
+                        long matching = btree.scanSecondaryPrefixIncludingDeleted(
+                                        uniqueRead, new SecondaryIndexMetadata(
+                                                target, metadata.layout(), true), logicalKey, 2).stream()
+                                .filter(candidate -> !candidate.record().deleted()).count();
+                        mtrManager.commit(uniqueRead);
+                        if (matching > 1) {
+                            throw new SecondaryIndexBuildDuplicateKeyException(
+                                    "online CREATE UNIQUE INDEX found committed duplicate logical key: index="
+                                            + target.indexId());
+                        }
+                    } catch (RuntimeException failure) {
+                        rollbackIfBound(uniqueRead, failure);
+                        throw failure;
+                    }
+                }
+                MiniTransaction read = mtrManager.beginReadOnly();
+                try {
+                    Optional<cn.zhangyis.db.storage.btree.BTreeLookupResult> row =
+                            btree.lookup(read, clustered, metadata.layout().clusterKey(entry));
+                    mtrManager.commit(read);
+                    if (row.isEmpty() || !metadata.layout().toEntry(
+                            row.orElseThrow().record(), false).equals(entry)) {
+                        throw new TableDdlStorageException(
+                                "online secondary verification found extra/wrong target entry");
+                    }
+                } catch (RuntimeException failure) {
+                    rollbackIfBound(read, failure);
+                    throw failure;
+                }
+            }
+            if (entries.complete()) {
+                break;
+            }
+            targetContinuation = entries.continuation();
+        }
+    }
+
+    /**
+     * final publish 前等待事务 terminal high-water 与全部 staged redo/dirty 页安全落盘，再 force tablespace。
+     *
+     * @param existing build 所属 committed tablespace binding
+     * @param transactionHighWater gate 记录的最大 committed terminal redo LSN
+     * @param timeout WAL/dirty/file force 的正等待上限
+     */
+    public void makeSecondaryIndexBuildDurable(TableStorageBinding existing,
+                                                Lsn transactionHighWater,
+                                                Duration timeout) {
+        if (existing == null || transactionHighWater == null || timeout == null
+                || timeout.isZero() || timeout.isNegative()) {
+            throw new DatabaseValidationException("online secondary durable barrier args are invalid");
+        }
+        Lsn current = mtrManager.redoLogManager().currentLsn();
+        Lsn target = current.value() >= transactionHighWater.value() ? current : transactionHighWater;
+        flush.flushThrough(target, timeout);
+        store.force(existing.spaceId());
+    }
+
+    /**
      * 扫描聚簇 live rows 并填充已 staged 的二级 B+Tree；不发布 DD，也不清 page3 descriptor。
      *
      * <p>数据流：</p>
      * <ol>
      *     <li>校验完整 storage definition、旧 binding 与 staged descriptor，并组装包含新 binding 的临时
      *     exact-version metadata；定义的 schema version 必须等于旧 binding 的 row format version。</li>
-     *     <li>短只读 MTR 从聚簇最左 leaf 物化全部 live rows后释放所有 page latch/fix；v1 使用有界
-     *     {@code Integer.MAX_VALUE} 内存列表，后续大型构建改 continuation batch。</li>
+     *     <li>以 256 行 exclusive continuation 批次物化聚簇 live rows，每批提交只读 MTR 后才开始二级写。</li>
      *     <li>逐行投影紧凑 entry；UNIQUE 且 logical key 不含 NULL 时先扫描新树拒绝重复，再用独立写 MTR
-     *     插入。每轮在 begin 前刷新 root level 并据此申请 split redo budget。</li>
+     *     插入。每轮在 begin 前刷新 root level并据此申请 split redo budget。</li>
      *     <li>最后刷新 root level，等待最后一批 redo/dirty/checkpoint 并 force 表空间，返回可写入 DD 的最终 binding。</li>
      * </ol>
      *
@@ -812,6 +1980,15 @@ public final class TableDdlStorageService {
                                                        TableStorageBinding existing,
                                                        SecondaryIndexBuildDescriptor staged,
                                                        Duration timeout) {
+        return backfillSecondaryIndexInternal(
+                definition, existing, staged, timeout, true);
+    }
+
+    /** 共享blocking/online backfill；online base copy延后logical UNIQUE裁决到sealed reconciliation。 */
+    private IndexStorageBinding backfillSecondaryIndexInternal(
+            StorageTableDefinition definition, TableStorageBinding existing,
+            SecondaryIndexBuildDescriptor staged, Duration timeout,
+            boolean enforceUniqueDuringScan) {
         // 1. 临时 aggregate 必须精确等于“旧 binding + staged binding”，禁止误把其它未提交 root 带入构建。
         if (definition == null || existing == null || staged == null || timeout == null
                 || timeout.isZero() || timeout.isNegative()
@@ -832,53 +2009,50 @@ public final class TableDdlStorageService {
         SecondaryIndexMetadata secondary =
                 tableIndexes.requireSecondary(staged.indexBinding().indexId());
 
-        // 2. 物化完成后提交只读 MTR，任何二级写入都不会同时持有聚簇 leaf latch。
-        MiniTransaction scanMtr = mtrManager.beginReadOnly();
-        List<LogicalRecord> rows;
-        try {
-            rows = btree.scanAll(scanMtr, tableIndexes.clusteredIndex(), Integer.MAX_VALUE).stream()
-                    .map(result -> result.record()).toList();
-            mtrManager.commit(scanMtr);
-        } catch (RuntimeException failure) {
-            rollbackIfBound(scanMtr, failure);
-            throw failure;
-        }
-
-        // 3. table MDL X 排除了并发 DML；每行短 MTR 仍按真实 root level 独立预算并保持 page latch 生命周期。
+        // 2、3. 每批 read MTR 已先提交；二级写从不同时持有聚簇 leaf latch，内存上界固定为 256 行。
         BTreeIndex current = secondary.index();
         Lsn lastCommit = null;
-        for (LogicalRecord row : rows) {
-            LogicalRecord entry = secondary.layout().toEntry(row, false);
-            var logicalKey = secondary.layout().logicalKey(entry);
-            boolean containsNull =
-                    logicalKey.values().stream().anyMatch(ColumnValue.NullValue.class::isInstance);
-            if (secondary.logicalUnique() && !containsNull) {
-                MiniTransaction uniqueRead = mtrManager.beginReadOnly();
-                try {
-                    if (!btree.scanSecondaryPrefixIncludingDeleted(
-                            uniqueRead, new SecondaryIndexMetadata(current, secondary.layout(), true),
-                            logicalKey, 1).isEmpty()) {
-                        throw new SecondaryIndexBuildDuplicateKeyException(
-                                "CREATE UNIQUE INDEX found duplicate logical key: index="
-                                        + current.indexId());
+        Optional<SearchKey> continuation = Optional.empty();
+        while (true) {
+            OnlineIndexScanBatch batch = scanSecondaryIndexBuildBatch(
+                    definition, existing, staged, continuation, REBUILD_SCAN_BATCH_SIZE);
+            for (LogicalRecord row : batch.rows()) {
+                LogicalRecord entry = secondary.layout().toEntry(row, false);
+                var logicalKey = secondary.layout().logicalKey(entry);
+                boolean containsNull =
+                        logicalKey.values().stream().anyMatch(ColumnValue.NullValue.class::isInstance);
+                if (enforceUniqueDuringScan && secondary.logicalUnique() && !containsNull) {
+                    MiniTransaction uniqueRead = mtrManager.beginReadOnly();
+                    try {
+                        if (!btree.scanSecondaryPrefixIncludingDeleted(
+                                uniqueRead, new SecondaryIndexMetadata(current, secondary.layout(), true),
+                                logicalKey, 1).isEmpty()) {
+                            throw new SecondaryIndexBuildDuplicateKeyException(
+                                    "CREATE UNIQUE INDEX found duplicate logical key: index="
+                                            + current.indexId());
+                        }
+                        mtrManager.commit(uniqueRead);
+                    } catch (RuntimeException failure) {
+                        rollbackIfBound(uniqueRead, failure);
+                        throw failure;
                     }
-                    mtrManager.commit(uniqueRead);
+                }
+                current = refreshRoot(current);
+                MiniTransaction insert = mtrManager.begin(mtrManager.budgetFor(
+                        RedoBudgetPurpose.SECONDARY_INDEX, BTreeRedoBudgetEstimator.insert(current.rootLevel())));
+                try {
+                    BTreeInsertResult inserted = btree.insertSecondary(insert, current, entry);
+                    lastCommit = mtrManager.commit(insert);
+                    current = inserted.indexAfterInsert();
                 } catch (RuntimeException failure) {
-                    rollbackIfBound(uniqueRead, failure);
+                    rollbackIfBound(insert, failure);
                     throw failure;
                 }
             }
-            current = refreshRoot(current);
-            MiniTransaction insert = mtrManager.begin(mtrManager.budgetFor(
-                    RedoBudgetPurpose.SECONDARY_INDEX, BTreeRedoBudgetEstimator.insert(current.rootLevel())));
-            try {
-                BTreeInsertResult inserted = btree.insertSecondary(insert, current, entry);
-                lastCommit = mtrManager.commit(insert);
-                current = inserted.indexAfterInsert();
-            } catch (RuntimeException failure) {
-                rollbackIfBound(insert, failure);
-                throw failure;
+            if (batch.complete()) {
+                break;
             }
+            continuation = batch.continuation();
         }
 
         // 4. 最终 root page header 是 binding level 的权威；最后一条插入的 LSN 覆盖全部先前提交。
@@ -917,8 +2091,52 @@ public final class TableDdlStorageService {
      */
     public TableStorageBinding rebuildTable(
             StorageTableRebuildRequest request, Duration timeout) {
+        return rebuildTableInternal(
+                request, timeout, true, OnlineShadowCopyObserver.NO_OP);
+    }
+
+    /**
+     * 在Online ALTER的CAPTURING阶段执行有界shadow copy。与阻塞rebuild共用物理投影和LOB ownership协议，
+     * 但不在base copy阶段裁决logical UNIQUE；并发写产生的暂态旧像由sealed reconciliation删除，最终双向验证
+     * 才对稳定source truth执行唯一性检查。
+     *
+     * @param request source/target exact schema、binding与列投影；source必须仍是committed aggregate
+     * @param timeout shadow WAL与tablespace force的正有界时限
+     * @return 已完成base copy并携带全部最新root level的未发布shadow binding
+     * @throws DatabaseValidationException 请求、路径、schema或时限非法时抛出；调用方不得发布shadow
+     * @throws TableRebuildException copy或force失败时抛出并携带精确shadow binding，调用方应按marker回收
+     */
+    public TableStorageBinding rebuildTableOnline(
+            StorageTableRebuildRequest request, Duration timeout) {
+        return rebuildTableOnline(
+                request, timeout, OnlineShadowCopyObserver.NO_OP);
+    }
+
+    /**
+     * 执行可观察、可取消的 Online shadow base copy。observer 只在完整批次释放所有 page/MTR 资源后调用，
+     * 因此上层抛出取消异常不会把 latch/fix 带入 DDL rollback 或 MDL 协作。
+     *
+     * @param request source/target exact schema、binding 与列投影
+     * @param timeout shadow WAL 与 tablespace force 的正有界时限
+     * @param observer 批次终点观察者；不得为空，抛出的领域异常会包装进携带 shadow binding 的异常
+     * @return 完成全部 base copy 后的未发布 shadow binding
+     * @throws DatabaseValidationException 请求、时限或 observer 无效时抛出
+     * @throws TableRebuildException copy、observer 取消或 force 失败时抛出并携带 shadow binding
+     */
+    public TableStorageBinding rebuildTableOnline(
+            StorageTableRebuildRequest request, Duration timeout,
+            OnlineShadowCopyObserver observer) {
+        return rebuildTableInternal(request, timeout, false, observer);
+    }
+
+    /** 共享blocking/online copy实现；enforceUniqueDuringCopy只允许无并发source writer的blocking路径启用。 */
+    private TableStorageBinding rebuildTableInternal(
+            StorageTableRebuildRequest request, Duration timeout,
+            boolean enforceUniqueDuringCopy,
+            OnlineShadowCopyObserver observer) {
         // 1、所有无副作用校验早于目标 tablespace 创建。
-        if (request == null || timeout == null || timeout.isZero() || timeout.isNegative()) {
+        if (request == null || timeout == null || timeout.isZero() || timeout.isNegative()
+                || observer == null) {
             throw new DatabaseValidationException(
                     "table rebuild requires request and positive timeout");
         }
@@ -985,7 +2203,8 @@ public final class TableDdlStorageService {
                         var logicalKey = secondary.layout().logicalKey(entry);
                         boolean containsNull = logicalKey.values().stream()
                                 .anyMatch(ColumnValue.NullValue.class::isInstance);
-                        if (secondary.logicalUnique() && !containsNull) {
+                        if (enforceUniqueDuringCopy
+                                && secondary.logicalUnique() && !containsNull) {
                             MiniTransaction uniqueRead =
                                     mtrManager.beginReadOnly();
                             try {
@@ -1029,6 +2248,8 @@ public final class TableDdlStorageService {
                 continuation = Optional.of(physicalKey(
                         batch.getLast().record(),
                         sourceIndexes.clusteredIndex()));
+                // 批次read MTR与逐行target MTR均已提交；回调可安全等待控制面或抛出取消。
+                observer.onBatchCompleted(batch.size(), continuation.orElseThrow());
                 if (batch.size() < REBUILD_SCAN_BATCH_SIZE) {
                     break;
                 }
@@ -1061,6 +2282,681 @@ public final class TableDdlStorageService {
                     "ALTER TABLE shadow rebuild failed: table=" + target.tableId()
                             + " space=" + target.spaceId().value(),
                     target, failure);
+        }
+    }
+
+    /**
+     * Shadow reconciliation 第一遍只删除 candidate identity 的旧像；不读取 source current truth，也不重插。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 source/target schema、exact binding 与聚簇 identity，并点查 shadow 当前旧像。</li>
+     *     <li>若旧像存在，先幂等删除其派生的全部 secondary；重复 identity 观察 ABSENT 时直接成功。</li>
+     *     <li>按隐藏列 ownership 删除聚簇旧像，并在同一短 MTR 释放该旧像拥有的 target LOB。</li>
+     *     <li>刷新全部 root/level，按 target definition 顺序返回 binding；本阶段保证 identity 最终 absent。</li>
+     * </ol>
+     *
+     * @param request 本次 shadow operation 冻结的 source/target schema 与列投影
+     * @param shadowBinding 未发布 shadow 当前物理 binding
+     * @param clusteredIdentity journal 解码出的稳定聚簇物理键
+     * @return 删除后包含最新 root/level 的 shadow binding
+     * @throws DatabaseValidationException identity、binding 或 schema 错配时抛出且不发布结果
+     * @throws TableDdlStorageException ownership、LOB 或 B+Tree 删除无法收敛时抛出
+     */
+    public TableStorageBinding deleteOnlineShadowIdentity(
+            StorageTableRebuildRequest request,
+            TableStorageBinding shadowBinding,
+            SearchKey clusteredIdentity) {
+        // 1、只建立target元数据；delete pass故意不读取source，避免在第一遍重新引入current truth。
+        validateOnlineShadow(request, shadowBinding, clusteredIdentity);
+        TableIndexMetadata targetMetadata = indexMetadataFactory.createTable(
+                request.targetDefinition(), shadowBinding);
+        BTreeIndex targetClustered = refreshRoot(targetMetadata.clusteredIndex());
+        List<SecondaryIndexMetadata> targetSecondaries = targetMetadata.secondaryIndexes().stream()
+                .map(secondary -> new SecondaryIndexMetadata(
+                        refreshRoot(secondary.index()), secondary.layout(), secondary.logicalUnique()))
+                .collect(java.util.stream.Collectors.toCollection(ArrayList::new));
+        MiniTransaction shadowRead = mtrManager.beginReadOnly();
+        Optional<cn.zhangyis.db.storage.btree.BTreeLookupResult> oldShadow;
+        try {
+            oldShadow = btree.lookupIncludingDeleted(
+                    shadowRead, targetClustered, clusteredIdentity);
+            mtrManager.commit(shadowRead);
+        } catch (RuntimeException failure) {
+            rollbackIfBound(shadowRead, failure);
+            throw failure;
+        }
+        if (oldShadow.isEmpty()) {
+            return shadowBinding(request.targetDefinition(), shadowBinding,
+                    targetClustered, targetSecondaries);
+        }
+
+        LogicalRecord oldRow = oldShadow.orElseThrow().record();
+        // 2、secondary先删使其不再指向即将删除的聚簇行；ABSENT支持重复candidate与重试。
+        for (int index = 0; index < targetSecondaries.size(); index++) {
+            SecondaryIndexMetadata secondary = targetSecondaries.get(index);
+            BTreeIndex after = removeShadowSecondaryIfPresent(secondary, oldRow);
+            targetSecondaries.set(index, new SecondaryIndexMetadata(
+                    after, secondary.layout(), secondary.logicalUnique()));
+        }
+
+        // 3、clustered ownership与target LOB释放属于同一MTR，不能留下记录已删但LOB仍归属它的状态。
+        Optional<LobFreeBatchPlan> lobFree = planShadowLobFree(
+                oldRow, targetClustered, shadowBinding);
+        RedoBudgetWorkload deleteWorkload = BTreeRedoBudgetEstimator.structuralDelete(
+                targetClustered.rootLevel());
+        if (lobFree.isPresent()) {
+            deleteWorkload = deleteWorkload.plus(lobFree.orElseThrow().workload());
+        }
+        MiniTransaction delete = mtrManager.begin(mtrManager.budgetFor(
+                RedoBudgetPurpose.CLUSTERED_DELETE, deleteWorkload));
+        try {
+            BTreeDeleteResult deleted = btree.deleteClustered(
+                    delete, targetClustered, clusteredIdentity,
+                    oldRow.hiddenColumns().dbTrxId(), oldRow.hiddenColumns().dbRollPtr());
+            if (!deleted.removed()) {
+                throw new TableDdlStorageException(
+                        "online shadow clustered ownership changed during delete pass");
+            }
+            targetClustered = deleted.indexAfter();
+            if (lobFree.isPresent()) {
+                try (var ignored = delete.allowOutOfOrderPageLatch(
+                        "online shadow delete pass owns clustered leaf before target LOB/FSP cleanup")) {
+                    lobStorage.freePlannedBatch(delete, lobFree.orElseThrow());
+                }
+            }
+            mtrManager.commit(delete);
+        } catch (RuntimeException failure) {
+            rollbackIfBound(delete, failure);
+            throw failure;
+        }
+        // 4、root grow/shrink结果必须沿binding传给第二遍和最终DD。
+        return shadowBinding(request.targetDefinition(), shadowBinding,
+                targetClustered, targetSecondaries);
+    }
+
+    /**
+     * Shadow reconciliation 第二遍从 source current truth 幂等确保 candidate identity；第一遍已保证旧像 absent。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 exact binding，并分别建立 source/current 与 target 索引元数据。</li>
+     *     <li>current source 不存在时保持 shadow absent；存在时在 page guard 外完成 LOB hydrate/列投影。</li>
+     *     <li>shadow 聚簇不存在则插入投影行；重复 candidate 已插入时复用该 current 行。</li>
+     *     <li>逐个 secondary 先幂等清除再按 current 行插入并裁决 UNIQUE，刷新 binding 后返回。</li>
+     * </ol>
+     *
+     * @param request 本次 shadow operation 的不可变 schema/transform
+     * @param shadowBinding delete pass 后的当前 shadow binding
+     * @param clusteredIdentity candidate 的稳定聚簇物理键
+     * @return current truth 已存在或保持 absent 后的最新 binding
+     * @throws DatabaseValidationException 参数或 binding 错配时抛出
+     * @throws TableDdlStorageException current truth 无法唯一投影或索引/LOB 写入失败时抛出
+     */
+    public TableStorageBinding ensureOnlineShadowIdentityCurrent(
+            StorageTableRebuildRequest request,
+            TableStorageBinding shadowBinding,
+            SearchKey clusteredIdentity) {
+        // 1、final X下source current truth稳定；两个metadata对象只在短MTR间传不可变root身份。
+        validateOnlineShadow(request, shadowBinding, clusteredIdentity);
+        TableIndexMetadata sourceMetadata = indexMetadataFactory.createTable(
+                request.sourceDefinition(), request.sourceBinding());
+        TableIndexMetadata targetMetadata = indexMetadataFactory.createTable(
+                request.targetDefinition(), shadowBinding);
+        BTreeIndex sourceClustered = refreshRoot(sourceMetadata.clusteredIndex());
+        BTreeIndex targetClustered = refreshRoot(targetMetadata.clusteredIndex());
+        List<SecondaryIndexMetadata> targetSecondaries = targetMetadata.secondaryIndexes().stream()
+                .map(secondary -> new SecondaryIndexMetadata(
+                        refreshRoot(secondary.index()), secondary.layout(), secondary.logicalUnique()))
+                .collect(java.util.stream.Collectors.toCollection(ArrayList::new));
+
+        MiniTransaction sourceRead = mtrManager.beginReadOnly();
+        Optional<cn.zhangyis.db.storage.btree.BTreeLookupResult> currentSource;
+        try {
+            currentSource = btree.lookup(sourceRead, sourceClustered, clusteredIdentity);
+            mtrManager.commit(sourceRead);
+        } catch (RuntimeException failure) {
+            rollbackIfBound(sourceRead, failure);
+            throw failure;
+        }
+        // 2、DELETE truth保持第一遍建立的ABSENT；不会从undo或candidate payload复活记录。
+        if (currentSource.isEmpty()) {
+            return shadowBinding(request.targetDefinition(), shadowBinding,
+                    targetClustered, targetSecondaries);
+        }
+
+        LogicalRecord targetRow;
+        MiniTransaction targetRead = mtrManager.beginReadOnly();
+        Optional<cn.zhangyis.db.storage.btree.BTreeLookupResult> existing;
+        try {
+            existing = btree.lookupIncludingDeleted(
+                    targetRead, targetClustered, clusteredIdentity);
+            mtrManager.commit(targetRead);
+        } catch (RuntimeException failure) {
+            rollbackIfBound(targetRead, failure);
+            throw failure;
+        }
+        if (existing.isPresent()) {
+            // 3、只可能来自本ensure pass中的重复candidate；delete pass已在本轮开始时清除了历史旧像。
+            targetRow = existing.orElseThrow().record();
+        } else {
+            LogicalRecord sourceRow = currentSource.orElseThrow().record();
+            RebuildProjection projection = projectRebuildRow(
+                    sourceRow, request.rewrites(), sourceClustered,
+                    request.sourceBinding(), targetClustered, shadowBinding);
+            RebuildClusteredInsert inserted = insertRebuildClusteredRow(
+                    targetClustered, sourceRow, projection,
+                    request.targetDefinition().schemaVersion());
+            targetClustered = inserted.index();
+            targetRow = inserted.row();
+        }
+
+        // 4、先删后插让重复candidate与“clustered已写、secondary部分失败”的重试都收敛到exact current entry。
+        for (int index = 0; index < targetSecondaries.size(); index++) {
+            SecondaryIndexMetadata secondary = targetSecondaries.get(index);
+            BTreeIndex removed = removeShadowSecondaryIfPresent(secondary, targetRow);
+            SecondaryIndexMetadata refreshed = new SecondaryIndexMetadata(
+                    removed, secondary.layout(), secondary.logicalUnique());
+            BTreeIndex inserted = insertShadowSecondary(refreshed, targetRow, true);
+            targetSecondaries.set(index, new SecondaryIndexMetadata(
+                    inserted, secondary.layout(), secondary.logicalUnique()));
+        }
+        return shadowBinding(request.targetDefinition(), shadowBinding,
+                targetClustered, targetSecondaries);
+    }
+
+    /**
+     * 以一个clustered identity把未发布shadow修正到source current truth。该入口只允许final X、source writer和
+     * capture lease均排空后调用；它不自行取得事务锁，也不读取undo版本。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>按exact target binding点查shadow旧像；存在时先幂等移除由旧像派生的全部secondary。</li>
+     *     <li>在同一短MTR中按隐藏列所有权物理删除旧聚簇记录并释放它拥有的target LOB，避免遗留孤儿页。</li>
+     *     <li>从committed source聚簇树执行current read；不存在表示DELETE，存在则重新hydrate、transform并写shadow。</li>
+     *     <li>为新shadow行重建全部target secondary，刷新root level并按target definition顺序返回新binding。</li>
+     * </ol>
+     *
+     * @param request 本次shadow operation冻结的source/target schema与列投影
+     * @param shadowBinding 未发布shadow当前root/segment binding；路径和space必须与target definition精确一致
+     * @param clusteredIdentity change-log解码出的完整、稳定聚簇物理键
+     * @return 本次删除/插入后携带全部最新root level的新shadow binding
+     * @throws DatabaseValidationException identity、binding或schema错配时抛出；调用方必须保留marker并fail closed
+     * @throws TableDdlStorageException 发现所有权漂移、重复键或物理树不一致时抛出；不得发布shadow
+     */
+    public TableStorageBinding reconcileOnlineShadowIdentity(
+            StorageTableRebuildRequest request,
+            TableStorageBinding shadowBinding,
+            SearchKey clusteredIdentity) {
+        // 1、exact schema/binding先完成交叉校验，再读取shadow；失败不触碰任一表空间。
+        validateOnlineShadow(request, shadowBinding, clusteredIdentity);
+        TableIndexMetadata sourceMetadata = indexMetadataFactory.createTable(
+                request.sourceDefinition(), request.sourceBinding());
+        TableIndexMetadata targetMetadata = indexMetadataFactory.createTable(
+                request.targetDefinition(), shadowBinding);
+        BTreeIndex targetClustered = refreshRoot(targetMetadata.clusteredIndex());
+        List<SecondaryIndexMetadata> targetSecondaries = targetMetadata.secondaryIndexes().stream()
+                .map(secondary -> new SecondaryIndexMetadata(
+                        refreshRoot(secondary.index()), secondary.layout(), secondary.logicalUnique()))
+                .collect(java.util.stream.Collectors.toCollection(ArrayList::new));
+        MiniTransaction shadowRead = mtrManager.beginReadOnly();
+        Optional<cn.zhangyis.db.storage.btree.BTreeLookupResult> oldShadow;
+        try {
+            oldShadow = btree.lookupIncludingDeleted(
+                    shadowRead, targetClustered, clusteredIdentity);
+            mtrManager.commit(shadowRead);
+        } catch (RuntimeException failure) {
+            rollbackIfBound(shadowRead, failure);
+            throw failure;
+        }
+
+        if (oldShadow.isPresent()) {
+            LogicalRecord oldRow = oldShadow.orElseThrow().record();
+            // 1、secondary先行删除；重试时ABSENT是合法收敛态，不能因部分reconciliation重复消费而失败。
+            for (int index = 0; index < targetSecondaries.size(); index++) {
+                SecondaryIndexMetadata secondary = targetSecondaries.get(index);
+                BTreeIndex after = removeShadowSecondaryIfPresent(secondary, oldRow);
+                targetSecondaries.set(index, new SecondaryIndexMetadata(
+                        after, secondary.layout(), secondary.logicalUnique()));
+            }
+
+            // 2、聚簇ownership与LOB free共享一个MTR；任一身份错配均拒绝继续插入current truth。
+            Optional<LobFreeBatchPlan> lobFree = planShadowLobFree(
+                    oldRow, targetClustered, shadowBinding);
+            RedoBudgetWorkload deleteWorkload = BTreeRedoBudgetEstimator.structuralDelete(
+                    targetClustered.rootLevel());
+            if (lobFree.isPresent()) {
+                deleteWorkload = deleteWorkload.plus(lobFree.orElseThrow().workload());
+            }
+            MiniTransaction delete = mtrManager.begin(mtrManager.budgetFor(
+                    RedoBudgetPurpose.CLUSTERED_DELETE, deleteWorkload));
+            try {
+                BTreeDeleteResult deleted = btree.deleteClustered(
+                        delete, targetClustered, clusteredIdentity,
+                        oldRow.hiddenColumns().dbTrxId(), oldRow.hiddenColumns().dbRollPtr());
+                if (!deleted.removed()) {
+                    throw new TableDdlStorageException(
+                            "online shadow clustered ownership changed during reconciliation");
+                }
+                targetClustered = deleted.indexAfter();
+                if (lobFree.isPresent()) {
+                    try (var ignored = delete.allowOutOfOrderPageLatch(
+                            "online shadow reconciliation owns clustered leaf before target LOB/FSP cleanup")) {
+                        lobStorage.freePlannedBatch(delete, lobFree.orElseThrow());
+                    }
+                }
+                mtrManager.commit(delete);
+            } catch (RuntimeException failure) {
+                rollbackIfBound(delete, failure);
+                throw failure;
+            }
+        }
+
+        // 3、final X保证点查后source不会再变化；DELETE只留下shadow absent，INSERT/UPDATE重新走完整LOB投影。
+        BTreeIndex sourceClustered = refreshRoot(sourceMetadata.clusteredIndex());
+        MiniTransaction sourceRead = mtrManager.beginReadOnly();
+        Optional<cn.zhangyis.db.storage.btree.BTreeLookupResult> currentSource;
+        try {
+            currentSource = btree.lookup(sourceRead, sourceClustered, clusteredIdentity);
+            mtrManager.commit(sourceRead);
+        } catch (RuntimeException failure) {
+            rollbackIfBound(sourceRead, failure);
+            throw failure;
+        }
+        if (currentSource.isPresent()) {
+            LogicalRecord sourceRow = currentSource.orElseThrow().record();
+            RebuildProjection projection = projectRebuildRow(
+                    sourceRow, request.rewrites(), sourceClustered,
+                    request.sourceBinding(), targetClustered, shadowBinding);
+            RebuildClusteredInsert inserted = insertRebuildClusteredRow(
+                    refreshRoot(targetClustered), sourceRow, projection,
+                    request.targetDefinition().schemaVersion());
+            targetClustered = inserted.index();
+
+            // 4、此时source truth稳定，logical UNIQUE必须在插入前裁决；不能沿用base-copy的宽松模式。
+            for (int index = 0; index < targetSecondaries.size(); index++) {
+                SecondaryIndexMetadata secondary = targetSecondaries.get(index);
+                BTreeIndex after = insertShadowSecondary(
+                        secondary, inserted.row(), true);
+                targetSecondaries.set(index, new SecondaryIndexMetadata(
+                        after, secondary.layout(), secondary.logicalUnique()));
+            }
+        }
+        return shadowBinding(request.targetDefinition(), shadowBinding,
+                targetClustered, targetSecondaries);
+    }
+
+    /**
+     * 在FORWARD_ONLY之前双向验证source与shadow的聚簇逻辑值及全部target secondary集合完全一致。
+     * 所有扫描都按exclusive continuation分批返回，不持page guard跨行比较或LOB读取。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>source→shadow分批点查每个clustered identity，hydrate两侧LOB并比较transform后的逻辑值。</li>
+     *     <li>对每个匹配shadow行点查全部target secondary physical entry，拒绝missing、marked或wrong entry。</li>
+     *     <li>shadow clustered→source反向点查，拒绝copy或rollback遗留的extra row。</li>
+     *     <li>逐棵扫描target secondary including-deleted视图并回查shadow clustered，拒绝extra、marked及UNIQUE重复。</li>
+     * </ol>
+     *
+     * @param request 本次operation冻结的source/target schema、binding与transform
+     * @param shadowBinding reconciliation后的未发布shadow exact binding
+     * @param batchSize 每次物化的最大行或entry数，必须为正
+     * @throws DatabaseValidationException 参数或binding错配时抛出
+     * @throws TableDdlStorageException 任一方向不等价时抛出，调用方不得越过forward fence
+     */
+    public void verifyOnlineShadow(StorageTableRebuildRequest request,
+                                   TableStorageBinding shadowBinding,
+                                   int batchSize) {
+        // 1、验证入口不接受空identity，基础binding校验复用一个合法的空值无关SearchKey不可行，故显式校验aggregate。
+        if (request == null || shadowBinding == null || batchSize <= 0
+                || request.targetDefinition().tableId() != shadowBinding.tableId()
+                || !request.targetDefinition().spaceId().equals(shadowBinding.spaceId())
+                || !request.targetDefinition().path().toAbsolutePath().normalize()
+                .equals(shadowBinding.path().toAbsolutePath().normalize())) {
+            throw new DatabaseValidationException(
+                    "online shadow verification request/binding/batch is invalid");
+        }
+        requireOpenedPath(request.sourceBinding(), "online shadow verification source");
+        requireOpenedPath(shadowBinding, "online shadow verification target");
+        TableIndexMetadata sourceMetadata = indexMetadataFactory.createTable(
+                request.sourceDefinition(), request.sourceBinding());
+        TableIndexMetadata targetMetadata = indexMetadataFactory.createTable(
+                request.targetDefinition(), shadowBinding);
+        BTreeIndex sourceClustered = refreshRoot(sourceMetadata.clusteredIndex());
+        BTreeIndex targetClustered = refreshRoot(targetMetadata.clusteredIndex());
+        List<SecondaryIndexMetadata> secondaries = targetMetadata.secondaryIndexes().stream()
+                .map(secondary -> new SecondaryIndexMetadata(refreshRoot(secondary.index()),
+                        secondary.layout(), secondary.logicalUnique())).toList();
+
+        // 1、source→shadow：目标行必须存在，且比较hydrate后的逻辑值而不是tablespace-specific LOB reference。
+        Optional<SearchKey> sourceContinuation = Optional.empty();
+        while (true) {
+            List<cn.zhangyis.db.storage.btree.BTreeLookupResult> batch = scanTreeBatch(
+                    sourceClustered, sourceContinuation, batchSize, false);
+            for (var sourceResult : batch) {
+                LogicalRecord sourceRow = sourceResult.record();
+                SearchKey identity = physicalKey(sourceRow, sourceClustered);
+                LogicalRecord targetRow = lookupRequiredLive(
+                        targetClustered, identity, "missing shadow clustered row");
+                List<ColumnValue> expected = projectLogicalValues(
+                        sourceRow, request.rewrites(), sourceClustered,
+                        request.sourceBinding());
+                List<ColumnValue> actual = hydrateLogicalValues(
+                        targetRow, targetClustered, shadowBinding);
+                if (!expected.equals(actual)) {
+                    throw new TableDdlStorageException(
+                            "online shadow verification found wrong clustered row");
+                }
+                // 2、每棵target secondary都必须恰有由当前shadow行派生的live exact entry。
+                for (SecondaryIndexMetadata secondary : secondaries) {
+                    LogicalRecord expectedEntry = secondary.layout().toEntry(targetRow, false);
+                    LogicalRecord actualEntry = lookupRequiredIncludingDeleted(
+                            secondary.index(), secondary.layout().physicalKey(expectedEntry),
+                            "missing shadow secondary entry");
+                    if (actualEntry.deleted() || !actualEntry.equals(expectedEntry)) {
+                        throw new TableDdlStorageException(
+                                "online shadow verification found marked/wrong secondary entry");
+                    }
+                }
+            }
+            if (batch.size() < batchSize) {
+                break;
+            }
+            sourceContinuation = Optional.of(physicalKey(
+                    batch.getLast().record(), sourceClustered));
+        }
+
+        // 3、shadow→source：任一target extra clustered row都会在此被发现。
+        Optional<SearchKey> targetContinuation = Optional.empty();
+        while (true) {
+            List<cn.zhangyis.db.storage.btree.BTreeLookupResult> batch = scanTreeBatch(
+                    targetClustered, targetContinuation, batchSize, true);
+            for (var targetResult : batch) {
+                if (targetResult.record().deleted()) {
+                    throw new TableDdlStorageException(
+                            "online shadow verification found delete-marked clustered row");
+                }
+                SearchKey identity = physicalKey(targetResult.record(), targetClustered);
+                lookupRequiredLive(sourceClustered, identity,
+                        "extra shadow clustered row");
+            }
+            if (batch.size() < batchSize) {
+                break;
+            }
+            targetContinuation = Optional.of(physicalKey(
+                    batch.getLast().record(), targetClustered));
+        }
+
+        // 4、secondary→clustered反向扫描封闭extra/marked entry；logical UNIQUE在稳定集合上最终裁决。
+        for (SecondaryIndexMetadata secondary : secondaries) {
+            verifyShadowSecondary(secondary, targetClustered, batchSize);
+        }
+    }
+
+    /** 在任何页访问前交叉校验online shadow的逻辑与物理owner。 */
+    private void validateOnlineShadow(StorageTableRebuildRequest request,
+                                      TableStorageBinding shadowBinding,
+                                      SearchKey clusteredIdentity) {
+        if (request == null || shadowBinding == null || clusteredIdentity == null
+                || request.targetDefinition().tableId() != shadowBinding.tableId()
+                || !request.targetDefinition().spaceId().equals(shadowBinding.spaceId())
+                || request.targetDefinition().schemaVersion()
+                != shadowBinding.rowFormatVersion()
+                || !request.targetDefinition().path().toAbsolutePath().normalize()
+                .equals(shadowBinding.path().toAbsolutePath().normalize())) {
+            throw new DatabaseValidationException(
+                    "online shadow request/binding/identity is invalid");
+        }
+        requireOpenedPath(request.sourceBinding(), "online shadow reconciliation source");
+        requireOpenedPath(shadowBinding, "online shadow reconciliation target");
+    }
+
+    /** 按旧shadow行投影physical key，并幂等删除一棵target secondary中的对应entry。 */
+    private BTreeIndex removeShadowSecondaryIfPresent(
+            SecondaryIndexMetadata metadata, LogicalRecord oldRow) {
+        BTreeIndex current = refreshRoot(metadata.index());
+        LogicalRecord entry = metadata.layout().toEntry(oldRow, false);
+        SearchKey key = metadata.layout().physicalKey(entry);
+        MiniTransaction read = mtrManager.beginReadOnly();
+        Optional<cn.zhangyis.db.storage.btree.BTreeLookupResult> found;
+        try {
+            found = btree.lookupIncludingDeleted(read, current, key);
+            mtrManager.commit(read);
+        } catch (RuntimeException failure) {
+            rollbackIfBound(read, failure);
+            throw failure;
+        }
+        if (found.isEmpty()) {
+            return current;
+        }
+        MiniTransaction remove = mtrManager.begin(mtrManager.budgetFor(
+                RedoBudgetPurpose.SECONDARY_INDEX,
+                BTreeRedoBudgetEstimator.structuralDelete(current.rootLevel())));
+        try {
+            BTreeSecondaryRemovalResult result = found.orElseThrow().record().deleted()
+                    ? btree.purgeDeleteMarkedSecondary(remove, current, key)
+                    : btree.deletePublishedSecondary(remove, current, key);
+            mtrManager.commit(remove);
+            return result.indexAfter();
+        } catch (RuntimeException failure) {
+            rollbackIfBound(remove, failure);
+            throw failure;
+        }
+    }
+
+    /** 从shadow聚簇旧像冻结LOB ownership释放计划；空计划不申请FSP redo admission。 */
+    private Optional<LobFreeBatchPlan> planShadowLobFree(
+            LogicalRecord oldRow, BTreeIndex targetClustered,
+            TableStorageBinding shadowBinding) {
+        List<LobFreeTarget> targets = new ArrayList<>();
+        for (int ordinal = 0; ordinal < oldRow.columnValues().size(); ordinal++) {
+            ColumnValue value = oldRow.columnValues().get(ordinal);
+            if (value instanceof ColumnValue.ExternalValue external) {
+                targets.add(new LobFreeTarget(ordinal,
+                        targetClustered.schema().column(ordinal).type(), external));
+            }
+        }
+        if (targets.isEmpty()) {
+            return Optional.empty();
+        }
+        SegmentRef segment = shadowBinding.lobSegment().orElseThrow(() ->
+                new DatabaseValidationException(
+                        "online shadow external row has no authoritative LOB segment"));
+        return Optional.of(lobStorage.planFreeBatch(segment, targets));
+    }
+
+    /** 在稳定source truth下执行logical UNIQUE检查并插入一个target secondary entry。 */
+    private BTreeIndex insertShadowSecondary(
+            SecondaryIndexMetadata metadata, LogicalRecord targetRow,
+            boolean enforceUnique) {
+        BTreeIndex current = refreshRoot(metadata.index());
+        LogicalRecord entry = metadata.layout().toEntry(targetRow, false);
+        SearchKey logicalKey = metadata.layout().logicalKey(entry);
+        boolean containsNull = logicalKey.values().stream()
+                .anyMatch(ColumnValue.NullValue.class::isInstance);
+        if (enforceUnique && metadata.logicalUnique() && !containsNull) {
+            MiniTransaction uniqueRead = mtrManager.beginReadOnly();
+            try {
+                boolean duplicate = btree.scanSecondaryPrefixIncludingDeleted(
+                                uniqueRead, new SecondaryIndexMetadata(
+                                        current, metadata.layout(), true), logicalKey, 1)
+                        .stream().anyMatch(candidate -> !candidate.record().deleted());
+                mtrManager.commit(uniqueRead);
+                if (duplicate) {
+                    throw new SecondaryIndexBuildDuplicateKeyException(
+                            "online shadow reconciliation found duplicate UNIQUE key: index="
+                                    + current.indexId());
+                }
+            } catch (RuntimeException failure) {
+                rollbackIfBound(uniqueRead, failure);
+                throw failure;
+            }
+        }
+        MiniTransaction insert = mtrManager.begin(mtrManager.budgetFor(
+                RedoBudgetPurpose.SECONDARY_INDEX,
+                BTreeRedoBudgetEstimator.insert(current.rootLevel())));
+        try {
+            BTreeInsertResult result = btree.insertSecondary(insert, current, entry);
+            mtrManager.commit(insert);
+            return result.indexAfterInsert();
+        } catch (RuntimeException failure) {
+            rollbackIfBound(insert, failure);
+            throw failure;
+        }
+    }
+
+    /** 把结构写后的B+Tree快照按target definition逻辑顺序重新投影为DD可发布binding。 */
+    private TableStorageBinding shadowBinding(
+            StorageTableDefinition definition, TableStorageBinding owner,
+            BTreeIndex clustered, List<SecondaryIndexMetadata> secondaries) {
+        Map<Long, IndexStorageBinding> bindings = new LinkedHashMap<>();
+        BTreeIndex currentClustered = refreshRoot(clustered);
+        bindings.put(currentClustered.indexId(), indexBinding(currentClustered));
+        for (SecondaryIndexMetadata secondary : secondaries) {
+            BTreeIndex current = refreshRoot(secondary.index());
+            bindings.put(current.indexId(), indexBinding(current));
+        }
+        List<IndexStorageBinding> ordered = definition.indexes().stream()
+                .map(index -> Optional.ofNullable(bindings.get(index.indexId())).orElseThrow(() ->
+                        new DatabaseValidationException(
+                                "online shadow binding misses target index " + index.indexId())))
+                .toList();
+        return new TableStorageBinding(owner.tableId(), owner.spaceId(), owner.path(),
+                owner.rowFormatVersion(), ordered, owner.lobSegment());
+    }
+
+    /** 在短只读MTR中扫描一批live或including-deleted记录，并在返回前释放全部页资源。 */
+    private List<cn.zhangyis.db.storage.btree.BTreeLookupResult> scanTreeBatch(
+            BTreeIndex index, Optional<SearchKey> continuation,
+            int batchSize, boolean includingDeleted) {
+        MiniTransaction scan = mtrManager.beginReadOnly();
+        try {
+            BTreeScanRange range = continuation
+                    .map(key -> BTreeScanRange.after(key, batchSize))
+                    .orElseGet(() -> BTreeScanRange.unbounded(batchSize));
+            List<cn.zhangyis.db.storage.btree.BTreeLookupResult> result =
+                    includingDeleted && !index.clustered()
+                            ? btree.scanIncludingDeleted(scan, index, range)
+                            : btree.scan(scan, index, range);
+            mtrManager.commit(scan);
+            return result;
+        } catch (RuntimeException failure) {
+            rollbackIfBound(scan, failure);
+            throw failure;
+        }
+    }
+
+    /** 点查一条live聚簇记录；缺失时用调用方提供的领域上下文拒绝发布。 */
+    private LogicalRecord lookupRequiredLive(
+            BTreeIndex index, SearchKey key, String failureMessage) {
+        MiniTransaction read = mtrManager.beginReadOnly();
+        try {
+            Optional<cn.zhangyis.db.storage.btree.BTreeLookupResult> result =
+                    btree.lookup(read, index, key);
+            mtrManager.commit(read);
+            return result.orElseThrow(() ->
+                    new TableDdlStorageException(failureMessage)).record();
+        } catch (RuntimeException failure) {
+            rollbackIfBound(read, failure);
+            throw failure;
+        }
+    }
+
+    /** 点查including-deleted索引视图，使验证能够区分缺失与残留marked entry。 */
+    private LogicalRecord lookupRequiredIncludingDeleted(
+            BTreeIndex index, SearchKey key, String failureMessage) {
+        MiniTransaction read = mtrManager.beginReadOnly();
+        try {
+            Optional<cn.zhangyis.db.storage.btree.BTreeLookupResult> result =
+                    btree.lookupIncludingDeleted(read, index, key);
+            mtrManager.commit(read);
+            return result.orElseThrow(() ->
+                    new TableDdlStorageException(failureMessage)).record();
+        } catch (RuntimeException failure) {
+            rollbackIfBound(read, failure);
+            throw failure;
+        }
+    }
+
+    /** hydrate源行后按冻结rewrite生成不含物理LOB reference的target逻辑值。 */
+    private List<ColumnValue> projectLogicalValues(
+            LogicalRecord sourceRow, List<StorageColumnRewrite> rewrites,
+            BTreeIndex sourceIndex, TableStorageBinding sourceBinding) {
+        List<ColumnValue> sourceValues = hydrateLogicalValues(
+                sourceRow, sourceIndex, sourceBinding);
+        List<ColumnValue> projected = new ArrayList<>(rewrites.size());
+        for (StorageColumnRewrite rewrite : rewrites) {
+            projected.add(rewrite.sourceOrdinal() >= 0
+                    ? sourceValues.get(rewrite.sourceOrdinal())
+                    : toColumnValue(rewrite.defaultValue().orElseThrow(() ->
+                    new DatabaseValidationException(
+                            "online shadow verification cannot materialize REQUIRED added column"))));
+        }
+        return List.copyOf(projected);
+    }
+
+    /** 把一行中所有external值读取为逻辑值；每次LOB读取均在独立短只读MTR结束后返回。 */
+    private List<ColumnValue> hydrateLogicalValues(
+            LogicalRecord row, BTreeIndex index,
+            TableStorageBinding binding) {
+        List<ColumnValue> values = new ArrayList<>(row.columnValues().size());
+        for (int ordinal = 0; ordinal < row.columnValues().size(); ordinal++) {
+            ColumnValue value = row.columnValues().get(ordinal);
+            values.add(value instanceof ColumnValue.ExternalValue external
+                    ? hydrateRebuildLob(index.schema().column(ordinal).type(), binding, external)
+                    : value);
+        }
+        return List.copyOf(values);
+    }
+
+    /** 反向验证一棵target secondary不含extra/marked/wrong entry，并最终裁决logical UNIQUE。 */
+    private void verifyShadowSecondary(
+            SecondaryIndexMetadata secondary, BTreeIndex targetClustered,
+            int batchSize) {
+        Optional<SearchKey> continuation = Optional.empty();
+        while (true) {
+            List<cn.zhangyis.db.storage.btree.BTreeLookupResult> batch = scanTreeBatch(
+                    secondary.index(), continuation, batchSize, true);
+            for (var result : batch) {
+                LogicalRecord entry = result.record();
+                if (entry.deleted()) {
+                    throw new TableDdlStorageException(
+                            "online shadow verification found marked secondary entry");
+                }
+                LogicalRecord row = lookupRequiredLive(targetClustered,
+                        secondary.layout().clusterKey(entry),
+                        "online shadow secondary points to absent clustered row");
+                if (!secondary.layout().toEntry(row, false).equals(entry)) {
+                    throw new TableDdlStorageException(
+                            "online shadow verification found wrong secondary entry");
+                }
+                SearchKey logicalKey = secondary.layout().logicalKey(entry);
+                if (secondary.logicalUnique() && logicalKey.values().stream()
+                        .noneMatch(ColumnValue.NullValue.class::isInstance)) {
+                    MiniTransaction uniqueRead = mtrManager.beginReadOnly();
+                    try {
+                        long duplicates = btree.scanSecondaryPrefixIncludingDeleted(
+                                        uniqueRead, new SecondaryIndexMetadata(
+                                                secondary.index(), secondary.layout(), true),
+                                        logicalKey, 2).stream()
+                                .filter(candidate -> !candidate.record().deleted()).count();
+                        mtrManager.commit(uniqueRead);
+                        if (duplicates != 1L) {
+                            throw new SecondaryIndexBuildDuplicateKeyException(
+                                    "online shadow verification found duplicate UNIQUE key: index="
+                                            + secondary.index().indexId());
+                        }
+                    } catch (RuntimeException failure) {
+                        rollbackIfBound(uniqueRead, failure);
+                        throw failure;
+                    }
+                }
+            }
+            if (batch.size() < batchSize) {
+                break;
+            }
+            continuation = Optional.of(secondary.layout().physicalKey(
+                    batch.getLast().record()));
         }
     }
 
@@ -1275,6 +3171,58 @@ public final class TableDdlStorageService {
         return new SearchKey(values);
     }
 
+    /**
+     * 从 committed binding 与单个 staged descriptor 构造 online build 的 exact secondary metadata。
+     *
+     * @param definition 必须同时包含 committed indexes 与本次 staged secondary
+     * @param existing 当前 committed binding
+     * @param staged page3 owner/root/segment 快照
+     * @return 与 staged index id 精确对应的 secondary descriptor/layout
+     * @throws DatabaseValidationException identity、版本或索引集合不一致时抛出
+     */
+    private SecondaryIndexMetadata secondaryBuildMetadata(
+            StorageTableDefinition definition, TableStorageBinding existing,
+            SecondaryIndexBuildDescriptor staged) {
+        if (definition == null || existing == null || staged == null
+                || definition.tableId() != existing.tableId()
+                || definition.tableId() != staged.tableId()
+                || definition.schemaVersion() != existing.rowFormatVersion()
+                || existing.indexes().stream().anyMatch(
+                binding -> binding.indexId() == staged.indexBinding().indexId())) {
+            throw new DatabaseValidationException("online secondary build metadata/identity is invalid");
+        }
+        requireOpenedPath(existing, "online CREATE INDEX mutation");
+        List<IndexStorageBinding> bindings = new ArrayList<>(existing.indexes());
+        bindings.add(staged.indexBinding());
+        TableStorageBinding building = new TableStorageBinding(
+                existing.tableId(), existing.spaceId(), existing.path(), existing.rowFormatVersion(),
+                bindings, existing.lobSegment());
+        return indexMetadataFactory.createTable(definition, building)
+                .requireSecondary(staged.indexBinding().indexId());
+    }
+
+    /** 返回与 staged aggregate 同次映射的聚簇 descriptor，供 candidate current-read 与验证使用。 */
+    private BTreeIndex clusteredBuildIndex(StorageTableDefinition definition,
+                                           TableStorageBinding existing,
+                                           SecondaryIndexBuildDescriptor staged) {
+        // 复用 secondary helper 的完整交叉校验，再构造同一 binding aggregate，避免两个 helper 产生不同准入规则。
+        secondaryBuildMetadata(definition, existing, staged);
+        List<IndexStorageBinding> bindings = new ArrayList<>(existing.indexes());
+        bindings.add(staged.indexBinding());
+        TableStorageBinding building = new TableStorageBinding(
+                existing.tableId(), existing.spaceId(), existing.path(), existing.rowFormatVersion(),
+                bindings, existing.lobSegment());
+        return indexMetadataFactory.createTable(definition, building).clusteredIndex();
+    }
+
+    /** 从结构写返回的 BTree descriptor 构造同 owner/version 的 page3 build descriptor。 */
+    private static SecondaryIndexBuildDescriptor descriptorFor(
+            SecondaryIndexBuildDescriptor owner, BTreeIndex index) {
+        return new SecondaryIndexBuildDescriptor(owner.ddlOperationId(), owner.dictionaryVersion(),
+                owner.tableId(), new IndexStorageBinding(index.indexId(), index.rootPageId(),
+                index.rootLevel(), index.leafSegment(), index.nonLeafSegment()));
+    }
+
     /** 一列目标 externalization 的 ordinal 与冻结写计划。 */
     private record PlannedRebuildLob(int ordinal, LobWritePlan plan) {
         private PlannedRebuildLob {
@@ -1428,6 +3376,126 @@ public final class TableDdlStorageService {
                 descriptor.dictionaryVersion(), descriptor.tableId(), descriptor.indexBinding());
     }
 
+    /** storage.api descriptor到页格式entry的无损映射。 */
+    private static SdiOnlineAlterDescriptorEntry toSdiOnlineAlterEntry(
+            OnlineAlterIndexDescriptor descriptor) {
+        SdiOnlineAlterDescriptorAction action = switch (descriptor.action()) {
+            case ADD -> SdiOnlineAlterDescriptorAction.ADD;
+            case DROP -> SdiOnlineAlterDescriptorAction.DROP;
+        };
+        return new SdiOnlineAlterDescriptorEntry(
+                action, descriptor.actionOrdinal(), descriptor.indexBinding());
+    }
+
+    /** 已完成页级CRC/space校验的entry到稳定storage.api视图的无损映射。 */
+    private static OnlineAlterIndexDescriptor fromSdiOnlineAlterEntry(
+            SdiOnlineAlterDescriptorEntry descriptor) {
+        OnlineAlterIndexDescriptorAction action = switch (descriptor.action()) {
+            case ADD -> OnlineAlterIndexDescriptorAction.ADD;
+            case DROP -> OnlineAlterIndexDescriptorAction.DROP;
+        };
+        return new OnlineAlterIndexDescriptor(
+                action, descriptor.actionOrdinal(), descriptor.indexBinding());
+    }
+
+    /** descriptor set到page3 anchor的精确owner映射。 */
+    private static SdiOnlineAlterAnchor toSdiOnlineAlterAnchor(
+            OnlineAlterDescriptorSet descriptors) {
+        return new SdiOnlineAlterAnchor(
+                descriptors.ddlOperationId(), descriptors.targetDictionaryVersion(),
+                descriptors.tableId(), descriptors.generation(),
+                descriptors.descriptorPages().getFirst().pageNo().value(),
+                descriptors.descriptors().size(), descriptors.manifestDigest());
+    }
+
+    /** 按固定per-page容量从aggregate重建exact descriptor页，供CAS刷新与恢复比较共用。 */
+    private static SdiOnlineAlterDescriptorPage descriptorPage(
+            OnlineAlterDescriptorSet descriptors, int pageOrdinal, int perPage) {
+        if (pageOrdinal < 0 || pageOrdinal >= descriptors.descriptorPages().size()
+                || perPage <= 0) {
+            throw new DatabaseValidationException(
+                    "online ALTER descriptor page ordinal/capacity is invalid");
+        }
+        int from = Math.multiplyExact(pageOrdinal, perPage);
+        int to = Math.min(descriptors.descriptors().size(), from + perPage);
+        long next = pageOrdinal + 1 < descriptors.descriptorPages().size()
+                ? descriptors.descriptorPages().get(pageOrdinal + 1).pageNo().value() : 0L;
+        return new SdiOnlineAlterDescriptorPage(
+                descriptors.ddlOperationId(), descriptors.targetDictionaryVersion(),
+                descriptors.tableId(), descriptors.generation(),
+                descriptors.descriptorSegment(), pageOrdinal, next,
+                descriptors.descriptors().subList(from, to).stream()
+                        .map(TableDdlStorageService::toSdiOnlineAlterEntry).toList());
+    }
+
+    /** 比较全部恢复删除权限字段；manifest digest使用常量时间内容比较而非数组identity。 */
+    private static boolean sameOnlineAlterDescriptorSet(
+            OnlineAlterDescriptorSet left, OnlineAlterDescriptorSet right) {
+        return left.ddlOperationId() == right.ddlOperationId()
+                && left.targetDictionaryVersion() == right.targetDictionaryVersion()
+                && left.tableId() == right.tableId()
+                && left.generation() == right.generation()
+                && left.descriptorSegment().equals(right.descriptorSegment())
+                && left.descriptorPages().equals(right.descriptorPages())
+                && left.descriptors().equals(right.descriptors())
+                && MessageDigest.isEqual(left.manifestDigest(), right.manifestDigest());
+    }
+
+    /** rollback/finish共用的纯参数、table与space owner校验。 */
+    private static void validateOnlineAlterDescriptorCleanup(
+            TableStorageBinding table, OnlineAlterDescriptorSet expected,
+            Duration timeout, String operation) {
+        if (table == null || expected == null || timeout == null
+                || timeout.isZero() || timeout.isNegative()
+                || table.tableId() != expected.tableId()
+                || !table.spaceId().equals(expected.descriptorSegment().spaceId())) {
+            throw new DatabaseValidationException(
+                    "online ALTER descriptor " + operation
+                            + " requires matching table/owner/positive timeout");
+        }
+    }
+
+    /**
+     * 在MTR/页副作用前验证通用descriptor请求的完整source ownership与ordinal唯一性。
+     */
+    private static void validateOnlineAlterDescriptorRequest(
+            TableStorageBinding table, long ddlOperationId, long targetDictionaryVersion,
+            long generation, List<OnlineAlterIndexAddRequest> additions,
+            List<OnlineAlterIndexDropRequest> drops, byte[] manifestDigest,
+            Duration timeout) {
+        if (table == null || ddlOperationId <= 0 || targetDictionaryVersion <= 0
+                || generation <= 0 || additions == null || drops == null
+                || additions.isEmpty() && drops.isEmpty()
+                || manifestDigest == null || manifestDigest.length != 32
+                || timeout == null || timeout.isZero() || timeout.isNegative()
+                || table.indexes().isEmpty()) {
+            throw new DatabaseValidationException(
+                    "online ALTER descriptor request identity/actions/digest/timeout is invalid");
+        }
+        java.util.Set<Integer> ordinals = new java.util.HashSet<>();
+        java.util.Set<Long> indexIds = new java.util.HashSet<>();
+        for (IndexStorageBinding existing : table.indexes()) {
+            indexIds.add(existing.indexId());
+        }
+        for (OnlineAlterIndexAddRequest addition : additions) {
+            if (addition == null || !ordinals.add(addition.actionOrdinal())
+                    || !indexIds.add(addition.definition().indexId())) {
+                throw new DatabaseValidationException(
+                        "online ALTER ADD ordinal/index identity is duplicate");
+            }
+        }
+        IndexStorageBinding clustered = table.indexes().getFirst();
+        for (OnlineAlterIndexDropRequest drop : drops) {
+            if (drop == null || !ordinals.add(drop.actionOrdinal())
+                    || drop.binding().equals(clustered)
+                    || !table.indexes().contains(drop.binding())
+                    || !drop.binding().rootPageId().spaceId().equals(table.spaceId())) {
+                throw new DatabaseValidationException(
+                        "online ALTER DROP must reference a current non-clustered binding");
+            }
+        }
+    }
+
     /** 使用独立短读 MTR 刷新 root level，结束后调用方才能申请下一条结构写 redo budget。 */
     private BTreeIndex refreshRoot(BTreeIndex index) {
         MiniTransaction read = mtrManager.beginReadOnly();
@@ -1486,6 +3554,31 @@ public final class TableDdlStorageService {
             return RedoBudgetWorkload.pageImages(images);
         } catch (ArithmeticException overflow) {
             throw new DatabaseValidationException("secondary index drop redo workload overflows", overflow);
+        }
+    }
+
+    /** 任意数量segment回收的保守redo预算；等待前已由短读MTR冻结每个plan。 */
+    private static RedoBudgetWorkload onlineAlterDropWorkload(
+            List<SegmentDropPlan> plans) {
+        if (plans == null || plans.isEmpty() || plans.stream().anyMatch(java.util.Objects::isNull)) {
+            throw new DatabaseValidationException(
+                    "online ALTER segment drop plans must not be empty/null");
+        }
+        try {
+            long images = 8L;
+            for (SegmentDropPlan plan : plans) {
+                images = Math.addExact(images,
+                        Math.multiplyExact(plan.fragmentPageCount(), 4L));
+                images = Math.addExact(images,
+                        Math.multiplyExact(plan.extentCount(), 6L));
+                images = Math.addExact(images,
+                        Math.multiplyExact(plan.usedPageCount(), 2L));
+                images = Math.addExact(images, 4L);
+            }
+            return RedoBudgetWorkload.pageImages(images);
+        } catch (ArithmeticException overflow) {
+            throw new DatabaseValidationException(
+                    "online ALTER descriptor cleanup redo workload overflows", overflow);
         }
     }
 
@@ -1751,6 +3844,86 @@ public final class TableDdlStorageService {
                 throw new TableDdlStorageException(
                         "recovery replacement page0 is not NORMAL: " + binding.spaceId().value());
             }
+        }
+    }
+
+    /**
+     * 挂载尚未进入 committed DD 的 Online ALTER shadow，只供启动 DDL recovery 读取 target SDI。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验正 identity 与离线规范路径；不创建文件、不解析 SDI，也不申请 redo。</li>
+     *     <li>取得该 space 的独占访问 lease 并证明尚未在线，避免与已发现表空间重名。</li>
+     *     <li>按 recovery 模式打开文件并要求 page0 生命周期为 NORMAL；失败关闭刚打开句柄。</li>
+     * </ol>
+     *
+     * @param tableId manifest 中冻结的正表标识，仅用于错误上下文与后续 SDI 交叉验证
+     * @param spaceId manifest 中冻结且未被 committed DD 使用的 shadow space
+     * @param path 受控 tables 目录内由 marker/manifest 双重验证的 exact shadow 路径
+     * @throws DatabaseValidationException identity/path 缺失或路径含符号链接时抛出
+     * @throws TableDdlStorageException space 已在线、page0 非 NORMAL 或文件无法打开时抛出并阻止 OPEN
+     */
+    public void mountOnlineAlterShadowForRecovery(
+            long tableId, SpaceId spaceId, Path path) {
+        // 1、该入口不接受完整binding，因为恢复读取SDI前尚不知道target indexes/segments。
+        if (tableId <= 0 || spaceId == null || path == null) {
+            throw new DatabaseValidationException(
+                    "online ALTER recovery mount requires table/space/path");
+        }
+        Path checked = checkedOfflinePath(path, "online ALTER recovery shadow");
+        // 2、exclusive lease与offline断言阻止覆盖已由discovery打开的committed空间。
+        try (TablespaceAccessLease ignored = accessController.acquireExclusive(spaceId)) {
+            assertOffline(spaceId, "online ALTER recovery shadow mount");
+            // 3、只有NORMAL shadow可作为READY/RECONCILED的发布候选。
+            disk.openTablespaceForRecovery(spaceId, checked);
+            if (disk.tablespaceState(spaceId) != TablespaceState.NORMAL) {
+                disk.closeTablespace(spaceId);
+                throw new TableDdlStorageException(
+                        "online ALTER recovery shadow is not NORMAL: table=" + tableId
+                                + " space=" + spaceId.value());
+            }
+        }
+    }
+
+    /**
+     * 删除未被 committed DD 引用且未打开的 Online ALTER 残留表空间。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 marker 级 identity、正 timeout 与离线规范路径，拒绝符号链接目标。</li>
+     *     <li>取得 space 独占 lease 并证明未在线；恢复器必须已用 DD/control/digest 决定回滚或退休。</li>
+     *     <li>幂等删除 exact 文件；不存在视为已完成，IO 失败保留文件并阻止 marker 终结。</li>
+     * </ol>
+     *
+     * @param tableId marker 中的正表标识，仅用于稳定诊断
+     * @param spaceId 待清理文件的正表空间标识
+     * @param path 已由 DD recovery 限制在 tables 根内的 exact 路径
+     * @param timeout 调用方统一的正恢复预算；当前无等待 IO，但保留以稳定恢复 API 契约
+     * @throws DatabaseValidationException 参数或路径无效时抛出且不删除文件
+     * @throws TableDdlStorageException space 仍在线或 exact 文件删除失败时抛出
+     */
+    public void deleteUnopenedOnlineAlterTablespace(
+            long tableId, SpaceId spaceId, Path path, Duration timeout) {
+        // 1、删除资格来自上层持久状态机，本层只验证物理identity与边界。
+        if (tableId <= 0 || spaceId == null || path == null || timeout == null
+                || timeout.isZero() || timeout.isNegative()) {
+            throw new DatabaseValidationException(
+                    "online ALTER recovery delete requires table/space/path/positive timeout");
+        }
+        writeAdmission.assertWriteAllowed();
+        Path checked = checkedOfflinePath(path, "online ALTER recovery delete");
+        // 2、绝不关闭一个已在线的同space句柄；调用方必须改走普通dropTable。
+        try (TablespaceAccessLease ignored = accessController.acquireExclusive(spaceId)) {
+            assertOffline(spaceId, "online ALTER recovery delete");
+            // 3、缺失是允许的崩溃重入状态；其余IO错误保持marker未终结。
+            try {
+                Files.deleteIfExists(checked);
+            } catch (IOException failure) {
+                throw new TableDdlStorageException(
+                        "delete online ALTER recovery tablespace failed: " + checked, failure);
+            }
+            log.info("deleted unopened online ALTER tablespace: table={} space={} path={}",
+                    tableId, spaceId.value(), checked);
         }
     }
 

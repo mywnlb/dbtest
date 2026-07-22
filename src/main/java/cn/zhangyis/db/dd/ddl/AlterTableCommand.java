@@ -6,7 +6,8 @@ import cn.zhangyis.db.dd.domain.QualifiedTableName;
 import java.util.List;
 
 /**
- * 一条通用阻塞式 ALTER 命令；actions 必须以用户声明顺序在同一个 staged definition 上求值。
+ * 一条通用 ALTER 命令；coordinator先按action形状选择instant/in-place或blocking策略，未被在线策略
+ * 接受的actions必须以用户声明顺序在同一个staged definition上求值。
  *
  * @param table 语句开始时的逻辑表名
  * @param actions 非空有序 action

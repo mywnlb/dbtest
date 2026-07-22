@@ -21,6 +21,7 @@ import cn.zhangyis.db.dd.domain.TableId;
 import cn.zhangyis.db.dd.domain.TableState;
 import cn.zhangyis.db.dd.domain.TableOptions;
 import cn.zhangyis.db.dd.exception.DictionaryObjectNotFoundException;
+import cn.zhangyis.db.dd.exception.MetadataLockTimeoutException;
 import cn.zhangyis.db.dd.mdl.MdlDuration;
 import cn.zhangyis.db.dd.mdl.MdlKey;
 import cn.zhangyis.db.dd.mdl.MdlMode;
@@ -54,6 +55,36 @@ import cn.zhangyis.db.storage.api.ddl.StorageColumnRewrite;
 import cn.zhangyis.db.storage.api.ddl.StorageDefaultValue;
 import cn.zhangyis.db.storage.api.ddl.StorageTableRebuildRequest;
 import cn.zhangyis.db.storage.api.ddl.TableRebuildException;
+import cn.zhangyis.db.storage.api.ddl.OnlineIndexScanBatch;
+import cn.zhangyis.db.storage.api.ddl.OnlineAlterDescriptorSet;
+import cn.zhangyis.db.storage.api.ddl.OnlineAlterIndexAddRequest;
+import cn.zhangyis.db.storage.api.ddl.OnlineAlterIndexDescriptor;
+import cn.zhangyis.db.storage.api.ddl.OnlineAlterIndexDescriptorAction;
+import cn.zhangyis.db.storage.api.ddl.OnlineAlterIndexDropRequest;
+import cn.zhangyis.db.storage.api.ddl.BTreeIndexMetadataFactory;
+import cn.zhangyis.db.storage.api.ddl.online.OnlineDdlAbortReason;
+import cn.zhangyis.db.storage.api.ddl.online.OnlineDdlTablePhase;
+import cn.zhangyis.db.storage.api.ddl.online.OnlineIndexBuildId;
+import cn.zhangyis.db.storage.api.ddl.online.OnlineIndexCaptureTarget;
+import cn.zhangyis.db.storage.api.ddl.online.OnlineIndexCandidate;
+import cn.zhangyis.db.storage.api.ddl.online.OnlineIndexLogHeader;
+import cn.zhangyis.db.storage.api.ddl.online.OnlineIndexLogRecordType;
+import cn.zhangyis.db.storage.api.ddl.online.OnlineAlterCaptureTarget;
+import cn.zhangyis.db.storage.api.ddl.online.OnlineAlterCandidate;
+import cn.zhangyis.db.storage.api.ddl.online.OnlineAlterCandidateEntry;
+import cn.zhangyis.db.storage.api.ddl.online.OnlineAlterIndexTarget;
+import cn.zhangyis.db.storage.api.ddl.online.OnlineAlterLogHeader;
+import cn.zhangyis.db.storage.api.ddl.online.OnlineAlterLogRecordType;
+import cn.zhangyis.db.storage.api.ddl.online.OnlineClusteredIdentityCodec;
+import cn.zhangyis.db.storage.api.ddl.online.OnlineDdlCaptureId;
+import cn.zhangyis.db.storage.api.ddl.online.NoOpOnlineDdlCandidateCodec;
+import cn.zhangyis.db.storage.fil.online.FileOnlineIndexChangeLog;
+import cn.zhangyis.db.storage.fil.online.FileOnlineAlterChangeLog;
+import cn.zhangyis.db.storage.record.online.SecondaryIndexCandidateCodec;
+import cn.zhangyis.db.storage.record.online.MultiIndexAlterCandidateCodec;
+import cn.zhangyis.db.storage.record.online.ClusteredIdentityCandidateCodec;
+import cn.zhangyis.db.storage.record.format.LogicalRecord;
+import cn.zhangyis.db.storage.record.page.SearchKey;
 import cn.zhangyis.db.dd.recovery.backup.RecoveryBackupArtifact;
 import cn.zhangyis.db.dd.recovery.backup.RecoveryBackupService;
 import cn.zhangyis.db.dd.recovery.backup.ValidatedRecoveryBackup;
@@ -63,6 +94,10 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -113,6 +148,20 @@ public final class DictionaryDdlService {
     private final DictionaryCleanSnapshotPublisher cleanSnapshotPublisher;
     /** 可信 clean backup 的 lazy identity、固定路径、HMAC 与物理副本协调器。 */
     private final RecoveryBackupService recoveryBackups;
+    /** 生产组合根注入时 CREATE INDEX 走 online 链；null 仅表示低层 legacy/恢复兼容测试。 */
+    private final OnlineIndexBuildRuntime onlineIndexRuntime;
+    /** live coordinator 发布阶段与终点的轻量 registry；不拥有 MDL/gate/文件资源。 */
+    private final OnlineDdlOperationRegistry onlineDdlRegistry;
+    /** 非null时DROP INDEX启用Online retirement协议；legacy/test构造继续保留blocking fallback。 */
+    private final IndexRetirementBarrier indexRetirementBarrier;
+    /** 通用multi-index与shadow capture运行期；null表示兼容构造未启用Slice E/F。 */
+    private final OnlineAlterRuntime onlineAlterRuntime;
+    /** 多INDEX或source TABLESPACE的table-level退休屏障；与通用runtime成对注入。 */
+    private final OnlineAlterRetirementBarrier onlineAlterRetirementBarrier;
+    /** 对initial/final MDL内冻结的逻辑aggregate生成恢复可验证的canonical schema checkpoint。 */
+    private final DdlSchemaDigestService schemaDigests = new DdlSchemaDigestService();
+    /** 通用ALTER在任何identity或物理副作用前冻结策略；当前打开instant与单index在线能力。 */
+    private final OnlineAlterStrategySelector alterStrategySelector;
 
     /**
      * 构造不接 persistent history barrier、也不注入故障的低层 DDL 服务；仅供孤立组件测试使用。
@@ -215,9 +264,126 @@ public final class DictionaryDdlService {
                                 TablePurgeBarrier purgeBarrier,
                                 DictionaryDdlFaultInjector faultInjector,
                                 DictionaryCleanSnapshotPublisher cleanSnapshotPublisher) {
+        this(control, repository, cache, locks, physical, tablesDirectory, purgeBarrier,
+                faultInjector, cleanSnapshotPublisher, null);
+    }
+
+    /**
+     * 构造生产 DDL 服务并强制 CREATE INDEX 使用 Online ADD INDEX runtime。
+     *
+     * @param control durable identity/version allocator
+     * @param repository committed catalog 与 DDL log repository
+     * @param cache metadata pin/invalidation cache
+     * @param locks schema/table MDL manager
+     * @param physical storage DDL facade
+     * @param tablesDirectory 受控 tablespace 目录
+     * @param purgeBarrier persistent history barrier
+     * @param faultInjector durable phase fault seam
+     * @param cleanSnapshotPublisher clean recovery manifest publisher
+     * @param onlineIndexRuntime DML gate、row-log、scan config 与 record codec 组合根
+     */
+    public DictionaryDdlService(DictionaryControlStore control, PersistentDictionaryRepository repository,
+                                DictionaryObjectCache cache, MetadataLockManager locks,
+                                TableDdlStorageService physical, Path tablesDirectory,
+                                TablePurgeBarrier purgeBarrier,
+                                DictionaryDdlFaultInjector faultInjector,
+                                DictionaryCleanSnapshotPublisher cleanSnapshotPublisher,
+                                OnlineIndexBuildRuntime onlineIndexRuntime) {
+        this(control, repository, cache, locks, physical, tablesDirectory, purgeBarrier,
+                faultInjector, cleanSnapshotPublisher, onlineIndexRuntime,
+                new OnlineDdlOperationRegistry(256));
+    }
+
+    /**
+     * 构造共享 Online DDL registry 的生产服务；只有组合根与需要验证控制面的协作测试使用此入口。
+     *
+     * @param control durable identity/version allocator
+     * @param repository committed catalog 与 DDL marker repository
+     * @param cache metadata cache
+     * @param locks schema/table MDL manager
+     * @param physical storage DDL facade
+     * @param tablesDirectory 受控 tablespace 目录
+     * @param purgeBarrier persistent history barrier
+     * @param faultInjector durable phase fault seam
+     * @param cleanSnapshotPublisher clean recovery manifest publisher
+     * @param onlineIndexRuntime Online ADD INDEX gate/log/codec runtime；阻塞兼容路径允许为空
+     * @param onlineDdlRegistry live/recovery/control facade 共享的轻量 operation registry
+     */
+    public DictionaryDdlService(DictionaryControlStore control, PersistentDictionaryRepository repository,
+                                DictionaryObjectCache cache, MetadataLockManager locks,
+                                TableDdlStorageService physical, Path tablesDirectory,
+                                TablePurgeBarrier purgeBarrier,
+                                DictionaryDdlFaultInjector faultInjector,
+                                DictionaryCleanSnapshotPublisher cleanSnapshotPublisher,
+                                 OnlineIndexBuildRuntime onlineIndexRuntime,
+                                 OnlineDdlOperationRegistry onlineDdlRegistry) {
+        this(control, repository, cache, locks, physical, tablesDirectory, purgeBarrier,
+                faultInjector, cleanSnapshotPublisher, onlineIndexRuntime, onlineDdlRegistry, null);
+    }
+
+    /**
+     * 构造同时启用Online ADD与Online DROP的生产coordinator；blocking DROP仍由不注入retirement barrier的旧构造保留。
+     *
+     * @param control durable identity/version allocator
+     * @param repository committed catalog与DDL marker repository
+     * @param cache metadata cache
+     * @param locks schema/table MDL manager
+     * @param physical storage DDL facade
+     * @param tablesDirectory 受控tablespace目录
+     * @param purgeBarrier blocking table DDL使用的persistent history barrier
+     * @param faultInjector durable边界故障接缝
+     * @param cleanSnapshotPublisher clean recovery manifest publisher
+     * @param onlineIndexRuntime Online DDL gate与ADD row-log runtime
+     * @param onlineDdlRegistry live/recovery/control共享registry
+     * @param indexRetirementBarrier Online DROP的history high-water与exact source pin屏障
+     */
+    public DictionaryDdlService(DictionaryControlStore control, PersistentDictionaryRepository repository,
+                                DictionaryObjectCache cache, MetadataLockManager locks,
+                                TableDdlStorageService physical, Path tablesDirectory,
+                                TablePurgeBarrier purgeBarrier,
+                                DictionaryDdlFaultInjector faultInjector,
+                                DictionaryCleanSnapshotPublisher cleanSnapshotPublisher,
+                                OnlineIndexBuildRuntime onlineIndexRuntime,
+                                OnlineDdlOperationRegistry onlineDdlRegistry,
+                                IndexRetirementBarrier indexRetirementBarrier) {
+        this(control, repository, cache, locks, physical, tablesDirectory, purgeBarrier,
+                faultInjector, cleanSnapshotPublisher, onlineIndexRuntime, onlineDdlRegistry,
+                indexRetirementBarrier, null, null);
+    }
+
+    /**
+     * 构造完整Online ALTER生产coordinator；只有组合根与端到端协作测试应使用该入口。
+     *
+     * @param control durable identity/version allocator
+     * @param repository committed catalog与DDL marker repository
+     * @param cache exact-version dictionary cache
+     * @param locks schema/table MDL manager
+     * @param physical 物理DDL facade
+     * @param tablesDirectory 受控tablespace目录
+     * @param purgeBarrier persistent table history屏障
+     * @param faultInjector durable阶段故障接缝
+     * @param cleanSnapshotPublisher clean recovery manifest publisher
+     * @param onlineIndexRuntime legacy单ADD/DROP runtime
+     * @param onlineDdlRegistry live/recovery/control共享operation registry
+     * @param indexRetirementBarrier legacy单DROP retirement barrier
+     * @param onlineAlterRuntime 通用journal/capture/ReadView barrier runtime
+     * @param onlineAlterRetirementBarrier 多资源table-level retirement barrier
+     */
+    public DictionaryDdlService(DictionaryControlStore control, PersistentDictionaryRepository repository,
+                                DictionaryObjectCache cache, MetadataLockManager locks,
+                                TableDdlStorageService physical, Path tablesDirectory,
+                                TablePurgeBarrier purgeBarrier,
+                                DictionaryDdlFaultInjector faultInjector,
+                                DictionaryCleanSnapshotPublisher cleanSnapshotPublisher,
+                                OnlineIndexBuildRuntime onlineIndexRuntime,
+                                OnlineDdlOperationRegistry onlineDdlRegistry,
+                                IndexRetirementBarrier indexRetirementBarrier,
+                                OnlineAlterRuntime onlineAlterRuntime,
+                                OnlineAlterRetirementBarrier onlineAlterRetirementBarrier) {
         if (control == null || repository == null || cache == null || locks == null || physical == null
                 || tablesDirectory == null || purgeBarrier == null || faultInjector == null
-                || cleanSnapshotPublisher == null) {
+                || cleanSnapshotPublisher == null || onlineDdlRegistry == null
+                || (onlineAlterRuntime == null) != (onlineAlterRetirementBarrier == null)) {
             throw new DatabaseValidationException("dictionary DDL collaborators/path must not be null");
         }
         this.control = control;
@@ -236,6 +402,14 @@ public final class DictionaryDdlService {
                     "tables directory has no instance root for recovery backups");
         }
         this.recoveryBackups = new RecoveryBackupService(instanceRoot, physical);
+        this.onlineIndexRuntime = onlineIndexRuntime;
+        this.onlineDdlRegistry = onlineDdlRegistry;
+        this.indexRetirementBarrier = indexRetirementBarrier;
+        this.onlineAlterRuntime = onlineAlterRuntime;
+        this.onlineAlterRetirementBarrier = onlineAlterRetirementBarrier;
+        this.alterStrategySelector = onlineAlterRuntime == null
+                ? OnlineAlterStrategySelector.productionV1()
+                : OnlineAlterStrategySelector.productionComplete();
     }
 
     /**
@@ -340,11 +514,20 @@ public final class DictionaryDdlService {
             StorageTableDefinition storageRequest = storageDefinition(tableId, ids.firstSpaceId(), path,
                     version, command, columns, indexes);
             DdlId ddlId = DdlId.of(ids.firstDdlId());
+            TableOptions options = new TableOptions(
+                    "", schema.defaultCharsetId(), schema.defaultCollationId());
+            TableDefinition plannedTarget = new TableDefinition(
+                    tableId, schema.id(), command.name().table(), version, TableState.ACTIVE,
+                    columns, indexes, Optional.empty(), options);
             // PREPARED 早于物理 CREATE；marker outcome 不确定时立即停止，由恢复按 exact path 裁决。
             DdlLogRecord prepared = new DdlLogRecord(
                     new DdlUndoMarker(ddlId.value(), version.value(), tableId.value()),
-                    DdlLogOperation.CREATE_TABLE, DdlLogPhase.PREPARED,
-                    cn.zhangyis.db.domain.SpaceId.of(ids.firstSpaceId()), path);
+                    0L, DdlLogOperation.CREATE_TABLE, DdlLogPhase.PREPARED,
+                    cn.zhangyis.db.domain.SpaceId.of(ids.firstSpaceId()), path,
+                    Optional.empty(), Optional.empty(), DdlExecutionProtocol.ATOMIC_BLOCKING_V1,
+                    Optional.empty(), Optional.empty(),
+                    Optional.of(schemaDigests.digest(schema, plannedTarget, version.value())),
+                    DdlControlState.OPEN, Optional.empty(), Optional.empty());
             repository.ddlLog().prepare(prepared);
             faultInjector.afterCreatePrepared(prepared);
 
@@ -357,7 +540,7 @@ public final class DictionaryDdlService {
             // 4、最终 binding 已确定后先写 durable SDI；ACTIVE 仍是字典提交裁决点，SDI 不反向决定 catalog。
             TableDefinition table = new TableDefinition(tableId, schema.id(), command.name().table(), version,
                     TableState.ACTIVE, columns, indexes, java.util.Optional.of(binding),
-                    new TableOptions("", schema.defaultCharsetId(), schema.defaultCollationId()));
+                    options);
             sdi.write(table, timeout);
             try {
                 try (DictionaryTransaction transaction = repository.begin(version)) {
@@ -424,6 +607,9 @@ public final class DictionaryDdlService {
         if (command == null) {
             throw new DatabaseValidationException("create secondary index command must not be null");
         }
+        if (onlineIndexRuntime != null) {
+            return createSecondaryIndexOnline(owner, command, timeout);
+        }
         QualifiedTableName name = command.table();
         try (MdlTicket schemaTicket = locks.acquire(new MdlRequest(owner,
                 MdlKey.schema(name.schema().canonicalName()), MdlMode.INTENTION_EXCLUSIVE,
@@ -467,10 +653,19 @@ public final class DictionaryDdlService {
                     IndexId.of(ids.firstIndexId()), command.index().name(), command.index().unique(),
                     false, keyParts);
             DdlId ddlId = DdlId.of(ids.firstDdlId());
+            List<IndexDefinition> targetIndexes = appendIndex(active.indexes(), newIndex);
+            TableDefinition plannedTarget = logicalVersion(
+                    active, version, TableState.ACTIVE, targetIndexes);
             DdlLogRecord prepared = new DdlLogRecord(
                     new DdlUndoMarker(ddlId.value(), version.value(), active.id().value()),
                     newIndex.id().value(), DdlLogOperation.CREATE_INDEX, DdlLogPhase.PREPARED,
-                    oldBinding.spaceId(), oldBinding.path());
+                    oldBinding.spaceId(), oldBinding.path(), Optional.empty(), Optional.empty(),
+                    DdlExecutionProtocol.ATOMIC_BLOCKING_V1,
+                    Optional.of(schemaDigests.digest(schema, active, oldBinding.rowFormatVersion())),
+                    Optional.empty(),
+                    Optional.of(schemaDigests.digest(
+                            schema, plannedTarget, oldBinding.rowFormatVersion())),
+                    DdlControlState.OPEN, Optional.empty(), Optional.empty());
             repository.ddlLog().prepare(prepared);
             faultInjector.afterCreateIndexPrepared(prepared);
 
@@ -498,8 +693,6 @@ public final class DictionaryDdlService {
             faultInjector.afterCreateIndexEngineDone(engineDone);
 
             // 4. metadata-only publish 保持 row format version；SDI 先于 catalog，catalog 仍是唯一提交真相。
-            List<IndexDefinition> indexes = new ArrayList<>(active.indexes());
-            indexes.add(newIndex);
             List<IndexStorageBinding> bindings = new ArrayList<>(oldBinding.indexes());
             bindings.add(completed);
             TableStorageBinding newBinding = new TableStorageBinding(
@@ -507,7 +700,7 @@ public final class DictionaryDdlService {
                     oldBinding.rowFormatVersion(), bindings, oldBinding.lobSegment());
             TableDefinition published = new TableDefinition(
                     active.id(), active.schemaId(), active.name(), version, TableState.ACTIVE,
-                    active.columns(), indexes, java.util.Optional.of(newBinding), active.options());
+                    active.columns(), targetIndexes, java.util.Optional.of(newBinding), active.options());
             sdi.write(published, timeout);
             // 新 index 已进入 target SDI；DD 响应不确定时必须阻断旧 aggregate，避免后续 DML 漏维护新索引。
             cache.invalidateTable(active.id(), version);
@@ -534,6 +727,542 @@ public final class DictionaryDdlService {
             cleanSnapshotPublisher.publish();
             return published;
         }
+    }
+
+    /**
+     * 生产 Online ADD INDEX 协调器。initial/final X 仅覆盖状态冻结与发布，base scan 在 SU 下允许 SR/SW；
+     * candidate 不是提交事件，final 两遍 reconciliation 始终回读 cutover 当前聚簇真相。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>schema IX/table X 下重读并验证旧 aggregate，预留 identity，冻结 table gate并持久化 manifest/marker。</li>
+     *     <li>创建 staged root/segments，force CAPTURING frame，发布 gate target并把同一 MDL ticket X→SU。</li>
+     *     <li>以配置批次扫描聚簇 live rows，逐行幂等 ensure target；每个批次边界检查 durable abort。</li>
+     *     <li>SU→X 后 seal gate、force row log，对 candidate 先删 before/after，再按当前聚簇行重新 ensure。</li>
+     *     <li>双向验证、WAL/表空间 force 与 RECONCILED durable 后写 ENGINE_DONE；此后只允许前滚 DD。</li>
+     *     <li>按 SDI→cache invalidate→DD→DICTIONARY_COMMITTED→cache publish→footer clear→COMMITTED 发布，最后清 gate/log。</li>
+     * </ol>
+     *
+     * @param owner 本次 DDL 独立 MDL owner
+     * @param command 已通过 SQL/binder 归一化的 secondary index 命令
+     * @param timeout 所有 MDL、gate、row-log、WAL 与 file force 的正等待上限
+     * @return 已发布新 secondary binding 的 ACTIVE table aggregate
+     * @throws DictionaryDdlException ENGINE_DONE 前失败且已完成补偿，或 ENGINE_DONE 后需重启前滚时抛出
+     */
+    private TableDefinition createSecondaryIndexOnline(MdlOwnerId owner,
+                                                       CreateSecondaryIndexCommand command,
+                                                       Duration timeout) {
+        QualifiedTableName name = command.table();
+        OnlineIndexBuildId buildId = null;
+        FileOnlineIndexChangeLog changeLog = null;
+        SecondaryIndexBuildDescriptor staged = null;
+        TableStorageBinding oldBinding = null;
+        DdlId ddlId = null;
+        OnlineDdlOperationTracker tracker = null;
+        boolean markerPrepared = false;
+        boolean engineDone = false;
+        boolean reconciledDurable = false;
+        boolean forwardOnly = false;
+
+        try (MdlTicket schemaTicket = locks.acquire(new MdlRequest(owner,
+                MdlKey.schema(name.schema().canonicalName()), MdlMode.INTENTION_EXCLUSIVE,
+                MdlDuration.TRANSACTION), timeout);
+             MdlTicket tableTicket = locks.acquire(new MdlRequest(owner,
+                     MdlKey.table(name.canonicalKey()), MdlMode.SHARED_UPGRADABLE,
+                     MdlDuration.TRANSACTION), timeout)) {
+            // 1. X 下冻结本次 command 的所有 DD identity；失败早于 staged segment/page 创建。
+            locks.upgrade(tableTicket, MdlMode.EXCLUSIVE, timeout);
+            SchemaDefinition schema = repository.findSchema(name.schema()).orElseThrow(() ->
+                    new DictionaryObjectNotFoundException(
+                            "schema does not exist: " + name.schema().displayName()));
+            TableDefinition active = repository.findTable(schema.id(), name.table()).orElseThrow(() ->
+                    new DictionaryObjectNotFoundException("table does not exist: " + name.canonicalKey()));
+            if (active.indexes().stream().anyMatch(index -> index.name().equals(command.index().name()))) {
+                throw new cn.zhangyis.db.dd.exception.DictionaryObjectExistsException(
+                        "index already exists: " + command.index().name().displayName());
+            }
+            Map<ObjectName, Long> columnIds = new LinkedHashMap<>();
+            for (ColumnDefinition column : active.columns()) {
+                columnIds.put(column.name(), column.columnId());
+            }
+            List<IndexKeyPart> keyParts = command.index().keyParts().stream()
+                    .map(part -> new IndexKeyPart(requireColumnId(columnIds, part.columnName()),
+                            part.order(), part.prefixBytes())).toList();
+            if (keyParts.stream().map(IndexKeyPart::columnId).distinct().count() != keyParts.size()) {
+                throw new DatabaseValidationException("CREATE INDEX key parts must not repeat a column");
+            }
+            purgeBarrier.awaitUnreferenced(active.id().value(), timeout);
+            if (!cache.awaitUnpinned(active.id(), timeout)) {
+                throw new DictionaryDdlException(
+                        "timed out waiting old dictionary pins before online CREATE INDEX: "
+                                + active.id().value());
+            }
+            oldBinding = active.storageBinding().orElseThrow(() ->
+                    new DictionaryDdlException("ACTIVE table has no physical binding: " + active.id().value()));
+            DictionaryIdAllocation ids = control.reserve(new DictionaryIdRequest(0, 0, 1, 0, 1, 1));
+            DictionaryVersion version = DictionaryVersion.of(ids.dictionaryVersion());
+            IndexDefinition newIndex = new IndexDefinition(IndexId.of(ids.firstIndexId()),
+                    command.index().name(), command.index().unique(), false, keyParts);
+            ddlId = DdlId.of(ids.firstDdlId());
+            buildId = OnlineIndexBuildId.of(ddlId.value());
+            List<IndexDefinition> targetIndexes = appendIndex(active.indexes(), newIndex);
+            TableDefinition plannedTarget = logicalVersion(
+                    active, version, TableState.ACTIVE, targetIndexes);
+            tracker = onlineDdlRegistry.register(new OnlineDdlOperationIdentity(
+                    ddlId, DdlLogOperation.CREATE_INDEX, active.id().value(),
+                    newIndex.id().value(), name.canonicalKey(),
+                    newIndex.name().canonicalName(), active.version().value(),
+                    version.value(), owner.value(), false, java.util.OptionalLong.empty()),
+                    DdlExecutionProtocol.ONLINE_INDEX_V1);
+            tracker.advanceRuntime(OnlineDdlRuntimePhase.ACTIVATING, OnlineDdlWaitReason.NONE);
+            if (!tracker.beginDurablePrepare()) {
+                throw new OnlineDdlCancellationException(
+                        "online CREATE INDEX cancelled before durable prepare: ddl=" + ddlId.value());
+            }
+            OnlineIndexBuildManifest manifest = new OnlineIndexBuildManifest(buildId, active.id(),
+                    active.version(), version, newIndex);
+            byte[] manifestBytes = new OnlineIndexBuildManifestCodec().encode(manifest);
+            Path rowLogPath = onlineIndexRuntime.logFiles().pathFor(buildId);
+            DdlLogRecord prepared = new DdlLogRecord(
+                    new DdlUndoMarker(ddlId.value(), version.value(), active.id().value()),
+                    newIndex.id().value(), DdlLogOperation.CREATE_INDEX, DdlLogPhase.PREPARED,
+                    oldBinding.spaceId(), oldBinding.path(), Optional.of(rowLogPath), Optional.empty(),
+                    DdlExecutionProtocol.ONLINE_INDEX_V1,
+                    Optional.of(schemaDigests.digest(schema, active, oldBinding.rowFormatVersion())),
+                    Optional.empty(),
+                    Optional.of(schemaDigests.digest(
+                            schema, plannedTarget, oldBinding.rowFormatVersion())),
+                    DdlControlState.OPEN, Optional.empty(), Optional.empty());
+            try {
+                repository.ddlLog().prepare(prepared);
+            } catch (RuntimeException prepareFailure) {
+                tracker.failDurablePrepare("MARKER_PREPARE_FAILED");
+                throw prepareFailure;
+            }
+            markerPrepared = true;
+            tracker.markDurablePrepared(prepared);
+            faultInjector.afterCreateIndexPrepared(prepared);
+            requireOnlineDdlNotCancelled(ddlId, "after durable prepare");
+
+            // marker先于gate/row-log/descriptor：若此后任一点崩溃，source+OPEN恢复分支可以确定性清理或回滚。
+            onlineIndexRuntime.gate().beginActivation(active.id().value(), buildId, timeout);
+            sampleOnlineDdl(tracker, active.id().value(), null);
+            physical.makeSecondaryIndexBuildDurable(oldBinding,
+                    onlineIndexRuntime.gate().terminalRedoHighWater(active.id().value()), timeout);
+            changeLog = onlineIndexRuntime.logFiles().create(new OnlineIndexLogHeader(
+                    buildId, active.id().value(), newIndex.id().value(), active.version().value(),
+                    version.value(), oldBinding.rowFormatVersion(), manifestBytes));
+            requireOnlineDdlNotCancelled(ddlId, "after change-log creation");
+
+            // 2. descriptor 与 CAPTURING frame durable 后才发布 target；MDL ticket 原地降级，不释放 owner identity。
+            StorageIndexDefinition storageIndex = storageIndex(newIndex);
+            staged = physical.beginSecondaryIndexBuild(
+                    oldBinding, ddlId.value(), version.value(), storageIndex, timeout);
+            requireOnlineDdlNotCancelled(ddlId, "after staged index creation");
+            StorageTableDefinition buildingDefinition = storageDefinition(active, newIndex);
+            List<IndexStorageBinding> buildingBindings = new ArrayList<>(oldBinding.indexes());
+            buildingBindings.add(staged.indexBinding());
+            TableStorageBinding buildingBinding = new TableStorageBinding(oldBinding.tableId(),
+                    oldBinding.spaceId(), oldBinding.path(), oldBinding.rowFormatVersion(),
+                    buildingBindings, oldBinding.lobSegment());
+            var secondary = new BTreeIndexMetadataFactory().createTable(
+                    buildingDefinition, buildingBinding).requireSecondary(newIndex.id().value());
+            SecondaryIndexCandidateCodec candidateCodec = new SecondaryIndexCandidateCodec(
+                    secondary.layout(), onlineIndexRuntime.typeRegistry());
+            changeLog.appendState(OnlineIndexLogRecordType.GENERATION_STARTED, new byte[0]);
+            long capturingSequence = changeLog.appendState(
+                    OnlineIndexLogRecordType.CAPTURING, new byte[0]);
+            changeLog.forceThrough(capturingSequence, timeout);
+            onlineIndexRuntime.gate().publishCapture(new OnlineIndexCaptureTarget(
+                    buildId, active.id().value(), newIndex.id().value(), changeLog, candidateCodec));
+            locks.downgrade(tableTicket, MdlMode.SHARED_UPGRADABLE);
+            tracker.advanceRuntime(OnlineDdlRuntimePhase.CAPTURING, OnlineDdlWaitReason.NONE);
+            sampleOnlineDdl(tracker, active.id().value(), changeLog);
+            faultInjector.afterCreateIndexCaptureDurable(prepared);
+
+            // 3. 批次之间没有 page guard；并发 DML candidate 会由事务 commit/prepare force，不阻塞 base scan。
+            tracker.advanceRuntime(OnlineDdlRuntimePhase.BASE_SCAN, OnlineDdlWaitReason.NONE);
+            Optional<SearchKey> continuation = Optional.empty();
+            while (true) {
+                requireOnlineDdlNotCancelled(ddlId, "before base-scan batch");
+                if (changeLog.abortRequired()
+                        || onlineIndexRuntime.gate().phase(active.id().value())
+                        == OnlineDdlTablePhase.ABORTING) {
+                    throw new DictionaryDdlException("online CREATE INDEX capture requested abort");
+                }
+                OnlineIndexScanBatch batch = physical.scanSecondaryIndexBuildBatch(
+                        buildingDefinition, oldBinding, staged, continuation,
+                        onlineIndexRuntime.config().scanBatchRows());
+                for (var row : batch.rows()) {
+                    staged = physical.ensureSecondaryIndexLiveForBaseScan(
+                            buildingDefinition, oldBinding, staged, row);
+                }
+                tracker.addScanBatch(batch.rows().size(), Optional.empty());
+                sampleOnlineDdl(tracker, active.id().value(), changeLog);
+                requireOnlineDdlNotCancelled(ddlId, "after base-scan batch");
+                if (batch.complete()) {
+                    break;
+                }
+                continuation = batch.continuation();
+            }
+
+            // 4. final X 与 gate seal 排除新的 clustered mutation；两遍处理把多余 candidate 收敛到当前聚簇真相。
+            tracker.advanceRuntime(
+                    OnlineDdlRuntimePhase.WAITING_FINAL_MDL, OnlineDdlWaitReason.METADATA_LOCK);
+            requireOnlineDdlNotCancelled(ddlId, "before final MDL wait");
+            try {
+                locks.upgrade(tableTicket, MdlMode.EXCLUSIVE, timeout);
+            } catch (MetadataLockTimeoutException waitFailure) {
+                if (onlineDdlCancelled(ddlId)) {
+                    throw new OnlineDdlCancellationException(
+                            "online CREATE INDEX cancelled during final MDL wait: ddl="
+                                    + ddlId.value(), waitFailure);
+                }
+                throw waitFailure;
+            }
+            requireOnlineDdlNotCancelled(ddlId, "after final MDL wait");
+            TableDefinition finalSource = repository.findTable(schema.id(), name.table())
+                    .orElseThrow(() -> new DictionaryDdlException(
+                            "online CREATE INDEX source disappeared before final X"));
+            requireLiveDigest(prepared.sourceSchemaDigest().orElseThrow(),
+                    schemaDigests.digest(schema, finalSource, oldBinding.rowFormatVersion()),
+                    ddlId, "source at final X");
+            tracker.advanceRuntime(
+                    OnlineDdlRuntimePhase.FINALIZING, OnlineDdlWaitReason.GATE_QUIESCENCE);
+            onlineIndexRuntime.gate().beginSeal(buildId, timeout);
+            requireOnlineDdlNotCancelled(ddlId, "after gate finalization");
+            long appended = changeLog.highestAppendedSequence();
+            if (appended > changeLog.highestForcedSequence()) {
+                changeLog.forceThrough(appended, timeout);
+            }
+            long sealedSequence = changeLog.appendState(OnlineIndexLogRecordType.SEALED, new byte[0]);
+            changeLog.forceThrough(sealedSequence, timeout);
+            List<cn.zhangyis.db.storage.api.ddl.online.OnlineIndexLogRecord> candidates =
+                    changeLog.readAll().stream()
+                            .filter(record -> record.type() == OnlineIndexLogRecordType.CANDIDATE)
+                            .toList();
+            tracker.advanceRuntime(OnlineDdlRuntimePhase.RECONCILING, OnlineDdlWaitReason.NONE);
+            int reconciliationBatch = onlineIndexRuntime.config().scanBatchRows();
+            for (int start = 0; start < candidates.size(); start += reconciliationBatch) {
+                requireOnlineDdlNotCancelled(ddlId, "before reconciliation delete batch");
+                int end = Math.min(candidates.size(), start + reconciliationBatch);
+                for (var record : candidates.subList(start, end)) {
+                    OnlineIndexCandidate candidate = candidateCodec.decode(record.payload());
+                    if (candidate.beforeEntry().isPresent()) {
+                        staged = physical.removeSecondaryIndexEntryExact(
+                                buildingDefinition, oldBinding, staged,
+                                candidate.beforeEntry().orElseThrow());
+                    }
+                    if (candidate.afterEntry().isPresent()) {
+                        staged = physical.removeSecondaryIndexEntryExact(
+                                buildingDefinition, oldBinding, staged,
+                                candidate.afterEntry().orElseThrow());
+                    }
+                }
+            }
+            for (int start = 0; start < candidates.size(); start += reconciliationBatch) {
+                requireOnlineDdlNotCancelled(ddlId, "before reconciliation ensure batch");
+                int end = Math.min(candidates.size(), start + reconciliationBatch);
+                for (var record : candidates.subList(start, end)) {
+                    OnlineIndexCandidate candidate = candidateCodec.decode(record.payload());
+                    var identityEntry = candidate.afterEntry().orElseGet(
+                            () -> candidate.beforeEntry().orElseThrow());
+                    staged = physical.ensureSecondaryIndexCurrentForEntry(
+                            buildingDefinition, oldBinding, staged, identityEntry);
+                }
+            }
+
+            // 5. 两向只读验证与物理force完成后竞争forward fence；只有胜者才能写RECONCILED/ENGINE_DONE。
+            tracker.advanceRuntime(OnlineDdlRuntimePhase.VERIFYING, OnlineDdlWaitReason.NONE);
+            physical.verifySecondaryIndexBuild(buildingDefinition, oldBinding, staged,
+                    onlineIndexRuntime.config().scanBatchRows());
+            requireOnlineDdlNotCancelled(ddlId, "after verification before forward fence");
+            physical.makeSecondaryIndexBuildDurable(oldBinding,
+                    onlineIndexRuntime.gate().terminalRedoHighWater(active.id().value()), timeout);
+            requireOnlineDdlNotCancelled(ddlId, "after physical force before forward fence");
+            DdlControlCasResult direction = repository.ddlLog().compareAndSetControl(
+                    ddlId, DdlLogPhase.PREPARED, DdlControlState.OPEN,
+                    DdlControlState.FORWARD_ONLY, Optional.empty());
+            if (!direction.changed()) {
+                if (direction.observedRecord().controlState() == DdlControlState.CANCEL_REQUESTED) {
+                    throw new DictionaryDdlException(
+                            "online CREATE INDEX cancellation won before publish fence: ddl="
+                                    + ddlId.value());
+                }
+                throw new DictionaryDdlLogStateException(
+                        "online CREATE INDEX observed unexpected control CAS result: ddl="
+                                + ddlId.value() + " control="
+                                + direction.observedRecord().controlState());
+            }
+            forwardOnly = true;
+            tracker.observeDurable(direction.observedRecord());
+            tracker.advanceRuntime(OnlineDdlRuntimePhase.FORWARD_FENCED, OnlineDdlWaitReason.NONE);
+            long reconciled = changeLog.appendState(
+                    OnlineIndexLogRecordType.RECONCILED, new byte[0]);
+            changeLog.forceThrough(reconciled, timeout);
+            reconciledDurable = true;
+            DdlLogRecord engineDoneRecord = repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.PREPARED, DdlLogPhase.ENGINE_DONE);
+            engineDone = true;
+            tracker.observeDurable(engineDoneRecord);
+            tracker.advanceRuntime(OnlineDdlRuntimePhase.PUBLISHING, OnlineDdlWaitReason.NONE);
+            faultInjector.afterCreateIndexEngineDone(engineDoneRecord);
+
+            // 6. ENGINE_DONE 后 staged tree 已是完整发布候选；任何失败保留 descriptor/log/gate 供同步重启前滚。
+            List<IndexStorageBinding> bindings = new ArrayList<>(oldBinding.indexes());
+            bindings.add(staged.indexBinding());
+            TableStorageBinding newBinding = new TableStorageBinding(oldBinding.tableId(), oldBinding.spaceId(),
+                    oldBinding.path(), oldBinding.rowFormatVersion(), bindings, oldBinding.lobSegment());
+            TableDefinition published = new TableDefinition(active.id(), active.schemaId(), active.name(),
+                    version, TableState.ACTIVE, active.columns(), targetIndexes,
+                    Optional.of(newBinding), active.options());
+            sdi.write(published, timeout);
+            cache.invalidateTable(active.id(), version);
+            commitUpdate(version, published);
+            DdlLogRecord dictionaryCommitted = repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.ENGINE_DONE, DdlLogPhase.DICTIONARY_COMMITTED);
+            tracker.observeDurable(dictionaryCommitted);
+            faultInjector.afterCreateIndexDictionaryCommitted(published);
+            cache.publishTable(published);
+            physical.clearSecondaryIndexBuild(oldBinding, staged, timeout);
+            DdlLogRecord committed = repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.DICTIONARY_COMMITTED, DdlLogPhase.COMMITTED);
+            tracker.observeDurable(committed);
+            onlineIndexRuntime.gate().clearBuild(buildId);
+            changeLog.close();
+            onlineIndexRuntime.logFiles().delete(buildId, rowLogPath);
+            cleanSnapshotPublisher.publish();
+            onlineDdlRegistry.complete(ddlId, OnlineDdlTerminalResult.COMPLETED,
+                    Optional.empty(), false);
+            log.info("created online secondary index: table={} index={} indexId={} ddlId={} version={}",
+                    name.canonicalKey(), newIndex.name().canonicalName(), newIndex.id().value(),
+                    ddlId.value(), version.value());
+            return published;
+        } catch (RuntimeException failure) {
+            if (forwardOnly || engineDone || reconciledDurable) {
+                completeOnlineDdlFailed(tracker, ddlId, onlineErrorCode(failure), true);
+                log.error("online CREATE INDEX failed at/after durable FORWARD_ONLY; restart must resolve marker and finish forward: ddlId={}",
+                        ddlId == null ? 0 : ddlId.value(), failure);
+                throw failure;
+            }
+
+            // ENGINE_DONE 前全部证据仍可回滚；abort gate 先阻止迟到 append，再回收 descriptor/segments。
+            if (tracker != null && !tracker.snapshot().terminal()) {
+                tracker.advanceRuntime(OnlineDdlRuntimePhase.ABORTING, OnlineDdlWaitReason.NONE);
+            }
+            OnlineDdlAbortReason abortReason = onlineAbortReason(failure);
+            boolean cleanupSafe = true;
+            if (buildId != null) {
+                try {
+                    if (changeLog != null && !changeLog.abortRequired()) {
+                        changeLog.markAbortRequired(abortReason, timeout);
+                    }
+                    OnlineDdlTablePhase phase = oldBinding == null
+                            ? OnlineDdlTablePhase.ABSENT
+                            : onlineIndexRuntime.gate().phase(oldBinding.tableId());
+                    if (phase != OnlineDdlTablePhase.ABSENT && phase != OnlineDdlTablePhase.ABORTING) {
+                        onlineIndexRuntime.gate().beginAbort(buildId, abortReason);
+                    }
+                    if (phase != OnlineDdlTablePhase.ABSENT) {
+                        onlineIndexRuntime.gate().awaitAbortQuiescence(buildId, timeout);
+                    }
+                } catch (RuntimeException abortFailure) {
+                    failure.addSuppressed(abortFailure);
+                    cleanupSafe = false;
+                }
+            }
+            SecondaryIndexBuildDescriptor cleanupStaged = staged;
+            if (cleanupSafe && cleanupStaged == null && markerPrepared && oldBinding != null) {
+                try {
+                    Optional<SecondaryIndexBuildDescriptor> durable =
+                            physical.readSecondaryIndexBuild(oldBinding);
+                    if (durable.isPresent()) {
+                        SecondaryIndexBuildDescriptor observed = durable.orElseThrow();
+                        DdlLogRecord marker = repository.ddlLog().find(ddlId).orElseThrow();
+                        if (observed.ddlOperationId() != ddlId.value()
+                                || observed.dictionaryVersion() != marker.marker().dictionaryVersion()
+                                || observed.tableId() != oldBinding.tableId()
+                                || observed.indexBinding().indexId() != marker.secondaryObjectId()) {
+                            throw new DictionaryDdlException(
+                                    "online CREATE INDEX cleanup observed another descriptor owner");
+                        }
+                        cleanupStaged = observed;
+                    }
+                } catch (RuntimeException descriptorFailure) {
+                    failure.addSuppressed(descriptorFailure);
+                    cleanupSafe = false;
+                }
+            }
+            if (cleanupSafe && cleanupStaged != null && oldBinding != null) {
+                try {
+                    physical.rollbackSecondaryIndexBuild(oldBinding, cleanupStaged, timeout);
+                } catch (RuntimeException cleanupFailure) {
+                    failure.addSuppressed(cleanupFailure);
+                    cleanupSafe = false;
+                }
+            }
+            boolean markerRolledBack = !markerPrepared;
+            if (cleanupSafe && markerPrepared && ddlId != null) {
+                try {
+                    repository.ddlLog().transition(
+                            ddlId, DdlLogPhase.PREPARED, DdlLogPhase.ROLLED_BACK);
+                    markerRolledBack = true;
+                } catch (RuntimeException markerFailure) {
+                    failure.addSuppressed(markerFailure);
+                    cleanupSafe = false;
+                }
+            }
+            if (cleanupSafe && markerRolledBack && buildId != null && oldBinding != null) {
+                try {
+                    if (onlineIndexRuntime.gate().phase(oldBinding.tableId()) != OnlineDdlTablePhase.ABSENT) {
+                        onlineIndexRuntime.gate().clearBuild(buildId);
+                    }
+                } catch (RuntimeException gateFailure) {
+                    failure.addSuppressed(gateFailure);
+                    cleanupSafe = false;
+                }
+            }
+            if (cleanupSafe && markerRolledBack && changeLog != null) {
+                Path path = changeLog.path();
+                try {
+                    changeLog.close();
+                    onlineIndexRuntime.logFiles().delete(buildId, path);
+                } catch (RuntimeException fileFailure) {
+                    failure.addSuppressed(fileFailure);
+                }
+            } else if (cleanupSafe && markerRolledBack && buildId != null) {
+                try {
+                    Path path = onlineIndexRuntime.logFiles().pathFor(buildId);
+                    onlineIndexRuntime.logFiles().delete(buildId, path);
+                } catch (RuntimeException fileFailure) {
+                    failure.addSuppressed(fileFailure);
+                }
+            }
+            if (tracker != null) {
+                if (cleanupSafe && markerRolledBack) {
+                    onlineDdlRegistry.complete(ddlId, OnlineDdlTerminalResult.ROLLED_BACK,
+                            Optional.of(onlineErrorCode(failure)), false);
+                } else {
+                    completeOnlineDdlFailed(
+                            tracker, ddlId, onlineErrorCode(failure), false);
+                }
+            }
+            throw failure;
+        }
+    }
+
+    /**
+     * 检查 marker 的 durable control；只有 CANCEL_REQUESTED 会触发反向收敛，FORWARD_ONLY 由后续前滚路径消费。
+     *
+     * @param ddlId 当前 live Online DDL 的精确 marker identity
+     * @param checkpoint 有界安全点名称，用于领域异常诊断
+     * @throws DictionaryDdlLogStateException marker 意外消失时抛出，调用方必须 fail-closed
+     * @throws OnlineDdlCancellationException durable cancel 已经胜出时抛出，coordinator 应进入回滚
+     */
+    private void requireOnlineDdlNotCancelled(DdlId ddlId, String checkpoint) {
+        DdlLogRecord marker = repository.ddlLog().find(ddlId).orElseThrow(() ->
+                new DictionaryDdlLogStateException(
+                        "online DDL marker disappeared at " + checkpoint + ": ddl=" + ddlId.value()));
+        if (marker.controlState() == DdlControlState.CANCEL_REQUESTED) {
+            throw new OnlineDdlCancellationException(
+                    "online DDL observed durable cancellation at " + checkpoint
+                            + ": ddl=" + ddlId.value());
+        }
+    }
+
+    /** @return marker 当前是否已持久进入 CANCEL_REQUESTED；marker 不存在时返回 false 保留原等待异常。 */
+    private boolean onlineDdlCancelled(DdlId ddlId) {
+        return repository.ddlLog().find(ddlId)
+                .map(record -> record.controlState() == DdlControlState.CANCEL_REQUESTED)
+                .orElse(false);
+    }
+
+    /**
+     * 分别从 gate 和 row-log 取得单锁快照，再写入 tracker；两个下游锁从不嵌套。
+     *
+     * @param tracker 当前 operation 的轻量诊断 owner
+     * @param tableId gate 中的精确正 table identity
+     * @param changeLog 已创建的 row-log；创建前为 {@code null}
+     */
+    private void sampleOnlineDdl(
+            OnlineDdlOperationTracker tracker, long tableId,
+            FileOnlineIndexChangeLog changeLog) {
+        var gate = onlineIndexRuntime.gate().snapshot(tableId);
+        tracker.updateGate(gate.phase(), gate.inFlightAdmissions(),
+                gate.ioLeases(), gate.terminalRedoHighWater().value());
+        if (changeLog != null) {
+            var logSnapshot = changeLog.snapshot();
+            tracker.updateChangeLog(logSnapshot.candidateCount(),
+                    logSnapshot.sizeBytes(), logSnapshot.maxBytes(),
+                    logSnapshot.terminalReserveBytes(),
+                    logSnapshot.highestAppendedSequence(),
+                    logSnapshot.highestForcedSequence(), logSnapshot.generation());
+        }
+    }
+
+    /**
+     * 从通用 ALTER gate 与 journal 分别采样，不在两个内部锁之间形成嵌套等待。
+     *
+     * @param tracker 当前 DDL 的进程内可观察状态 owner
+     * @param tableId gate 使用的正表标识，必须与 journal header 一致
+     * @param changeLog 通用 ALTER journal；创建前允许为 {@code null}
+     */
+    private void sampleOnlineAlterDdl(
+            OnlineDdlOperationTracker tracker, long tableId,
+            FileOnlineAlterChangeLog changeLog) {
+        var gate = onlineAlterRuntime.gate().snapshot(tableId);
+        tracker.updateGate(gate.phase(), gate.inFlightAdmissions(),
+                gate.ioLeases(), gate.terminalRedoHighWater().value());
+        if (changeLog != null) {
+            var logSnapshot = changeLog.snapshot();
+            tracker.updateChangeLog(logSnapshot.candidateCount(),
+                    logSnapshot.sizeBytes(), logSnapshot.maxBytes(),
+                    logSnapshot.terminalReserveBytes(),
+                    logSnapshot.highestAppendedSequence(),
+                    logSnapshot.highestForcedSequence(), logSnapshot.generation());
+        }
+    }
+
+    /** 把未能在本进程收敛的 active tracker 移入 FAILED_CLOSED history，保留恢复需求。 */
+    private void completeOnlineDdlFailed(
+            OnlineDdlOperationTracker tracker, DdlId ddlId,
+            String errorCode, boolean forwardRecoveryRequired) {
+        if (tracker == null || ddlId == null) {
+            return;
+        }
+        onlineDdlRegistry.complete(ddlId, OnlineDdlTerminalResult.FAILED_CLOSED,
+                Optional.of(errorCode), forwardRecoveryRequired);
+    }
+
+    /** @return 有界稳定诊断码，不把异常 message/stack 放入 tracker history。 */
+    private static String onlineErrorCode(RuntimeException failure) {
+        if (failure instanceof OnlineDdlCancellationException) {
+            return "CANCEL_REQUESTED";
+        }
+        if (failure instanceof SecondaryIndexBuildDuplicateKeyException) {
+            return "UNIQUE_CONFLICT";
+        }
+        if (failure instanceof MetadataLockTimeoutException) {
+            return "METADATA_LOCK_TIMEOUT";
+        }
+        return "ONLINE_DDL_FAILED";
+    }
+
+    /** 按故障类型选择 durable abort 分类；未知的调用方取消仍归入 CANCELLED。 */
+    private static OnlineDdlAbortReason onlineAbortReason(RuntimeException failure) {
+        if (failure instanceof OnlineDdlCancellationException) {
+            return OnlineDdlAbortReason.CANCELLED;
+        }
+        if (failure instanceof SecondaryIndexBuildDuplicateKeyException) {
+            return OnlineDdlAbortReason.UNIQUE_CONFLICT;
+        }
+        if (failure instanceof MetadataLockTimeoutException) {
+            return OnlineDdlAbortReason.METADATA_LOCK_TIMEOUT;
+        }
+        if (failure instanceof cn.zhangyis.db.storage.api.ddl.TableDdlStorageException) {
+            return OnlineDdlAbortReason.VALIDATION_FAILED;
+        }
+        return OnlineDdlAbortReason.CANCELLED;
     }
 
     /**
@@ -568,6 +1297,9 @@ public final class DictionaryDdlService {
         cleanSnapshotPublisher.assertAvailable();
         if (command == null) {
             throw new DatabaseValidationException("drop secondary index command must not be null");
+        }
+        if (onlineIndexRuntime != null && indexRetirementBarrier != null) {
+            return dropSecondaryIndexOnline(owner, command, timeout);
         }
         QualifiedTableName name = command.table();
         try (MdlTicket schemaTicket = locks.acquire(new MdlRequest(owner,
@@ -621,10 +1353,20 @@ public final class DictionaryDdlService {
                     new DictionaryIdRequest(0, 0, 0, 0, 1, 1));
             DictionaryVersion version = DictionaryVersion.of(ids.dictionaryVersion());
             DdlId ddlId = DdlId.of(ids.firstDdlId());
+            List<IndexDefinition> targetIndexes = new ArrayList<>(active.indexes());
+            targetIndexes.remove(indexOrdinal);
+            targetIndexes = List.copyOf(targetIndexes);
+            TableDefinition plannedTarget = logicalVersion(
+                    active, version, TableState.ACTIVE, targetIndexes);
             DdlLogRecord prepared = new DdlLogRecord(
                     new DdlUndoMarker(ddlId.value(), version.value(), active.id().value()),
                     removedIndex.id().value(), DdlLogOperation.DROP_INDEX, DdlLogPhase.PREPARED,
-                    oldBinding.spaceId(), oldBinding.path());
+                    oldBinding.spaceId(), oldBinding.path(), Optional.empty(), Optional.empty(),
+                    DdlExecutionProtocol.ATOMIC_BLOCKING_V1,
+                    Optional.of(schemaDigests.digest(schema, active, oldBinding.rowFormatVersion())),
+                    Optional.empty(), Optional.of(schemaDigests.digest(
+                            schema, plannedTarget, oldBinding.rowFormatVersion())),
+                    DdlControlState.OPEN, Optional.empty(), Optional.empty());
             repository.ddlLog().prepare(prepared);
             faultInjector.afterDropIndexPrepared(prepared);
             SecondaryIndexDropDescriptor staged = physical.beginSecondaryIndexDrop(
@@ -632,8 +1374,6 @@ public final class DictionaryDdlService {
             faultInjector.afterDropIndexStaged(staged);
 
             // 3. 新 aggregate 精确删除同 ordinal 的 definition/binding；SDI 可先写，但 committed DD 是唯一裁决点。
-            List<IndexDefinition> indexes = new ArrayList<>(active.indexes());
-            indexes.remove(indexOrdinal);
             List<IndexStorageBinding> bindings = new ArrayList<>(oldBinding.indexes());
             bindings.remove(indexOrdinal);
             TableStorageBinding newBinding = new TableStorageBinding(
@@ -641,7 +1381,7 @@ public final class DictionaryDdlService {
                     oldBinding.rowFormatVersion(), bindings, oldBinding.lobSegment());
             TableDefinition published = new TableDefinition(
                     active.id(), active.schemaId(), active.name(), version, TableState.ACTIVE,
-                    active.columns(), indexes, Optional.of(newBinding), active.options());
+                    active.columns(), targetIndexes, Optional.of(newBinding), active.options());
             sdi.write(published, timeout);
             // 提交点前建立 publication barrier；未知结果下旧 cache 不得继续把已删除索引视为权威 binding。
             cache.invalidateTable(active.id(), version);
@@ -674,6 +1414,357 @@ public final class DictionaryDdlService {
                     removedIndex.id().value(), ddlId.value(), version.value());
             cleanSnapshotPublisher.publish();
             return published;
+        }
+    }
+
+    /**
+     * Online删除一个普通二级索引。prepare期持SU并允许DML继续维护source index；短final X只负责冻结source、
+     * 安装retirement fence和发布target DD，随后降回SU并在不阻塞业务DML的情况下延迟回收segment。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>取得schema IX/table SU，重读ACTIVE aggregate并定位exact non-clustered definition/binding；预留DDL/version、
+     *     注册tracker并写ONLINE_DROP_INDEX_V1 PREPARED/OPEN marker。</li>
+     *     <li>在gate声明RETIREMENT_OPEN后写durable DROP descriptor；source DD仍可达，普通DML不写row-log并继续维护旧索引。</li>
+     *     <li>等待SU→X，重新计算source digest，再让gate排空跨界admission/write transaction；取消在本阶段仍可胜出。</li>
+     *     <li>final X下捕获transaction high-water与source pin version，先一次性安装fence，再竞争OPEN→FORWARD_ONLY；
+     *     取消先胜出则转入确定性descriptor回滚。</li>
+     *     <li>前滚胜出后写target SDI、exact commit不含索引的新DD、推进DICTIONARY_COMMITTED并发布cache；提交后绝不重新加入索引。</li>
+     *     <li>X降回SU并清gate，使target DML继续；有界等待history/pin fence，安全后单MTR回收两个segment并清descriptor。</li>
+     *     <li>推进ENGINE_DONE/COMMITTED、发布clean snapshot与terminal tracker；forward后的任一失败只保留证据供恢复续作。</li>
+     * </ol>
+     *
+     * @param owner 本次独立DDL statement的MDL owner；不能复用用户事务owner
+     * @param command 完整表名与待删二级索引名称；不存在或聚簇索引会在持久副作用前拒绝
+     * @param timeout MDL、gate、WAL、history与pin等待的正有界时限
+     * @return 已逻辑删除目标索引且物理retirement完成的新ACTIVE aggregate
+     * @throws DatabaseValidationException owner、command或timeout无效时抛出
+     * @throws DictionaryObjectNotFoundException schema、table或index不存在时抛出
+     * @throws OnlineDdlCancellationException durable取消在forward fence前胜出时抛出，descriptor与marker已回滚或保留恢复证据
+     * @throws OnlineDdlRetirementTimeoutException target DD已提交但旧资源尚不安全时抛出，只允许前滚恢复
+     * @throws DictionaryDdlException binding/digest/physical协作失败时抛出；forward后调用方必须重启续作
+     */
+    private TableDefinition dropSecondaryIndexOnline(MdlOwnerId owner,
+                                                     DropSecondaryIndexCommand command,
+                                                     Duration timeout) {
+        QualifiedTableName name = command.table();
+        OnlineIndexBuildId buildId = null;
+        SecondaryIndexDropDescriptor staged = null;
+        TableStorageBinding sourceBinding = null;
+        DdlId ddlId = null;
+        OnlineDdlOperationTracker tracker = null;
+        boolean markerPrepared = false;
+        boolean forwardOnly = false;
+        boolean targetPublished = false;
+        boolean gateCleared = false;
+
+        try (MdlTicket schemaTicket = locks.acquire(new MdlRequest(owner,
+                MdlKey.schema(name.schema().canonicalName()), MdlMode.INTENTION_EXCLUSIVE,
+                MdlDuration.TRANSACTION), timeout);
+             MdlTicket tableTicket = locks.acquire(new MdlRequest(owner,
+                     MdlKey.table(name.canonicalKey()), MdlMode.SHARED_UPGRADABLE,
+                     MdlDuration.TRANSACTION), timeout)) {
+            // 1. SU排除同表DDL但兼容普通DML；所有logical/physical identity在prepare前从同一aggregate冻结。
+            SchemaDefinition schema = repository.findSchema(name.schema()).orElseThrow(() ->
+                    new DictionaryObjectNotFoundException(
+                            "schema does not exist: " + name.schema().displayName()));
+            TableDefinition source = repository.findTable(schema.id(), name.table()).orElseThrow(() ->
+                    new DictionaryObjectNotFoundException(
+                            "table does not exist: " + name.canonicalKey()));
+            int indexOrdinal = -1;
+            for (int ordinal = 0; ordinal < source.indexes().size(); ordinal++) {
+                if (source.indexes().get(ordinal).name().equals(command.indexName())) {
+                    indexOrdinal = ordinal;
+                    break;
+                }
+            }
+            if (indexOrdinal < 0) {
+                throw new DictionaryObjectNotFoundException(
+                        "index does not exist: " + command.indexName().displayName());
+            }
+            IndexDefinition removedIndex = source.indexes().get(indexOrdinal);
+            if (removedIndex.clustered()) {
+                throw new DictionaryDdlException(
+                        "DROP INDEX cannot remove clustered primary index: "
+                                + removedIndex.name().displayName());
+            }
+            sourceBinding = source.storageBinding().orElseThrow(() ->
+                    new DictionaryDdlException(
+                            "ACTIVE table has no physical binding: " + source.id().value()));
+            if (indexOrdinal >= sourceBinding.indexes().size()
+                    || sourceBinding.indexes().get(indexOrdinal).indexId() != removedIndex.id().value()) {
+                throw new DictionaryDdlException(
+                        "DROP INDEX logical/physical ordinal identity mismatch: index="
+                                + removedIndex.id().value());
+            }
+            IndexStorageBinding removedBinding = sourceBinding.indexes().get(indexOrdinal);
+            DictionaryIdAllocation ids = control.reserve(
+                    new DictionaryIdRequest(0, 0, 0, 0, 1, 1));
+            DictionaryVersion targetVersion = DictionaryVersion.of(ids.dictionaryVersion());
+            ddlId = DdlId.of(ids.firstDdlId());
+            buildId = OnlineIndexBuildId.of(ddlId.value());
+            List<IndexDefinition> targetIndexes = new ArrayList<>(source.indexes());
+            targetIndexes.remove(indexOrdinal);
+            targetIndexes = List.copyOf(targetIndexes);
+            TableDefinition plannedTarget = logicalVersion(
+                    source, targetVersion, TableState.ACTIVE, targetIndexes);
+            tracker = onlineDdlRegistry.register(new OnlineDdlOperationIdentity(
+                            ddlId, DdlLogOperation.DROP_INDEX, source.id().value(),
+                            removedIndex.id().value(), name.canonicalKey(),
+                            removedIndex.name().canonicalName(), source.version().value(),
+                            targetVersion.value(), owner.value(), false,
+                            java.util.OptionalLong.empty()),
+                    DdlExecutionProtocol.ONLINE_DROP_INDEX_V1);
+            tracker.advanceRuntime(OnlineDdlRuntimePhase.ACTIVATING, OnlineDdlWaitReason.NONE);
+            if (!tracker.beginDurablePrepare()) {
+                throw new OnlineDdlCancellationException(
+                        "online DROP INDEX cancelled before durable prepare: ddl=" + ddlId.value());
+            }
+            DdlLogRecord prepared = new DdlLogRecord(
+                    new DdlUndoMarker(ddlId.value(), targetVersion.value(), source.id().value()),
+                    removedIndex.id().value(), DdlLogOperation.DROP_INDEX, DdlLogPhase.PREPARED,
+                    sourceBinding.spaceId(), sourceBinding.path(), Optional.empty(), Optional.empty(),
+                    DdlExecutionProtocol.ONLINE_DROP_INDEX_V1,
+                    Optional.of(schemaDigests.digest(
+                            schema, source, sourceBinding.rowFormatVersion())),
+                    Optional.empty(), Optional.of(schemaDigests.digest(
+                            schema, plannedTarget, sourceBinding.rowFormatVersion())),
+                    DdlControlState.OPEN, Optional.empty(), Optional.empty());
+            try {
+                repository.ddlLog().prepare(prepared);
+            } catch (RuntimeException prepareFailure) {
+                tracker.failDurablePrepare("MARKER_PREPARE_FAILED");
+                throw prepareFailure;
+            }
+            markerPrepared = true;
+            tracker.markDurablePrepared(prepared);
+            faultInjector.afterDropIndexPrepared(prepared);
+            requireOnlineDdlNotCancelled(ddlId, "after online DROP prepare");
+
+            // 2. gate只声明owner，不冻结DML；page3 descriptor不修改index页，SU足以排除其它DDL footer竞争。
+            onlineIndexRuntime.gate().beginRetirement(
+                    source.id().value(), buildId, timeout);
+            sampleOnlineDdl(tracker, source.id().value(), null);
+            staged = physical.beginSecondaryIndexDrop(
+                    sourceBinding, ddlId.value(), targetVersion.value(), removedBinding, timeout);
+            faultInjector.afterDropIndexStaged(staged);
+            requireOnlineDdlNotCancelled(ddlId, "after online DROP descriptor");
+
+            // 3. final X排除旧metadata lease；gate随后复核DML admission/transaction投影，二者共同封闭source writer集合。
+            tracker.advanceRuntime(
+                    OnlineDdlRuntimePhase.WAITING_FINAL_MDL, OnlineDdlWaitReason.METADATA_LOCK);
+            try {
+                locks.upgrade(tableTicket, MdlMode.EXCLUSIVE, timeout);
+            } catch (MetadataLockTimeoutException waitFailure) {
+                if (onlineDdlCancelled(ddlId)) {
+                    throw new OnlineDdlCancellationException(
+                            "online DROP INDEX cancelled during final MDL wait: ddl="
+                                    + ddlId.value(), waitFailure);
+                }
+                throw waitFailure;
+            }
+            requireOnlineDdlNotCancelled(ddlId, "after online DROP final MDL");
+            TableDefinition finalSource = repository.findTable(schema.id(), name.table())
+                    .orElseThrow(() -> new DictionaryDdlException(
+                            "online DROP INDEX source disappeared before final X"));
+            requireLiveDigest(prepared.sourceSchemaDigest().orElseThrow(),
+                    schemaDigests.digest(schema, finalSource, sourceBinding.rowFormatVersion()),
+                    ddlId, "DROP source at final X");
+            tracker.advanceRuntime(
+                    OnlineDdlRuntimePhase.FINALIZING, OnlineDdlWaitReason.GATE_QUIESCENCE);
+            onlineIndexRuntime.gate().beginSeal(buildId, timeout);
+            requireOnlineDdlNotCancelled(ddlId, "after online DROP gate finalization");
+
+            // 4. 当前page3格式没有独立generation字段；target dictionary version是单slot descriptor的单调代际并与owner精确CAS。
+            DdlRetirementFence fence = indexRetirementBarrier.captureIndexFence(
+                    source.id().value(), source.version().value(), removedIndex.id().value(),
+                    staged.dictionaryVersion(), ddlId.value());
+            DdlLogRecord fenced = repository.ddlLog().installRetirementFence(
+                    ddlId, DdlLogPhase.PREPARED, DdlControlState.OPEN, fence);
+            tracker.observeDurable(fenced);
+            tracker.updateRetirement(true, false);
+            requireOnlineDdlNotCancelled(ddlId, "after online DROP retirement fence");
+            DdlControlCasResult direction = repository.ddlLog().compareAndSetControl(
+                    ddlId, DdlLogPhase.PREPARED, DdlControlState.OPEN,
+                    DdlControlState.FORWARD_ONLY, Optional.empty());
+            if (!direction.changed()) {
+                if (direction.observedRecord().controlState() == DdlControlState.CANCEL_REQUESTED) {
+                    throw new OnlineDdlCancellationException(
+                            "online DROP INDEX cancellation won before publish fence: ddl="
+                                    + ddlId.value());
+                }
+                throw new DictionaryDdlLogStateException(
+                        "online DROP INDEX observed unexpected control CAS result: ddl="
+                                + ddlId.value() + " control="
+                                + direction.observedRecord().controlState());
+            }
+            forwardOnly = true;
+            tracker.observeDurable(direction.observedRecord());
+            tracker.advanceRuntime(OnlineDdlRuntimePhase.FORWARD_FENCED, OnlineDdlWaitReason.NONE);
+            faultInjector.afterDropIndexForwardFenced(direction.observedRecord());
+
+            // 5. FORWARD_ONLY之后DD是唯一方向；publication outcome不确定时保留marker/fence/descriptor供恢复分类。
+            List<IndexStorageBinding> targetBindings = new ArrayList<>(sourceBinding.indexes());
+            targetBindings.remove(indexOrdinal);
+            TableStorageBinding publishedBinding = new TableStorageBinding(
+                    sourceBinding.tableId(), sourceBinding.spaceId(), sourceBinding.path(),
+                    sourceBinding.rowFormatVersion(), targetBindings, sourceBinding.lobSegment());
+            TableDefinition published = new TableDefinition(
+                    source.id(), source.schemaId(), source.name(), targetVersion, TableState.ACTIVE,
+                    source.columns(), targetIndexes, Optional.of(publishedBinding), source.options());
+            tracker.advanceRuntime(OnlineDdlRuntimePhase.PUBLISHING, OnlineDdlWaitReason.NONE);
+            sdi.write(published, timeout);
+            cache.invalidateTable(source.id(), targetVersion);
+            try {
+                commitUpdate(targetVersion, published);
+                targetPublished = true;
+            } catch (RuntimeException publishFailure) {
+                log.warn("online DROP INDEX DD publish outcome is uncertain; retaining retirement evidence: "
+                                + "tableId={} indexId={} ddlId={}",
+                        source.id().value(), removedIndex.id().value(), ddlId.value(), publishFailure);
+                throw publishFailure;
+            }
+            faultInjector.afterDropIndexDictionaryPublished(published);
+            DdlLogRecord dictionaryCommitted = repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.PREPARED, DdlLogPhase.DICTIONARY_COMMITTED);
+            tracker.observeDurable(dictionaryCommitted);
+            faultInjector.afterDropIndexDictionaryCommitted(published);
+            cache.publishTable(published);
+
+            // 6. target已发布后先恢复业务DML；SU继续排除其它DDL，retirement等待不持MDL manager mutex或storage页资源。
+            locks.downgrade(tableTicket, MdlMode.SHARED_UPGRADABLE);
+            onlineIndexRuntime.gate().clearBuild(buildId);
+            gateCleared = true;
+            tracker.advanceRuntime(
+                    OnlineDdlRuntimePhase.RETIRING, OnlineDdlWaitReason.RETIREMENT_FENCE);
+            sampleOnlineDdl(tracker, source.id().value(), null);
+            indexRetirementBarrier.awaitIndexSafe(fence, timeout);
+            tracker.updateRetirement(true, true);
+            tracker.advanceRuntime(OnlineDdlRuntimePhase.RETIRING, OnlineDdlWaitReason.NONE);
+            physical.finishSecondaryIndexDrop(publishedBinding, staged, timeout);
+
+            // 7. segment与descriptor已在单MTR收敛，最后只推进审计阶段并把弱一致tracker转入terminal history。
+            DdlLogRecord engineDone = repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.DICTIONARY_COMMITTED, DdlLogPhase.ENGINE_DONE);
+            tracker.observeDurable(engineDone);
+            faultInjector.afterDropIndexEngineDone(engineDone);
+            DdlLogRecord committed = repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.ENGINE_DONE, DdlLogPhase.COMMITTED);
+            tracker.observeDurable(committed);
+            cleanSnapshotPublisher.publish();
+            onlineDdlRegistry.complete(ddlId, OnlineDdlTerminalResult.COMPLETED,
+                    Optional.empty(), false);
+            log.info("dropped online secondary index: table={} index={} indexId={} ddlId={} version={}",
+                    name.canonicalKey(), removedIndex.name().canonicalName(),
+                    removedIndex.id().value(), ddlId.value(), targetVersion.value());
+            return published;
+        } catch (RuntimeException failure) {
+            if (forwardOnly) {
+                // target提交后即使retirement timeout也必须让新DML继续；这里只清运行期gate，不触碰descriptor/segment。
+                if (targetPublished && !gateCleared && buildId != null && sourceBinding != null) {
+                    try {
+                        if (onlineIndexRuntime.gate().phase(sourceBinding.tableId())
+                                != OnlineDdlTablePhase.ABSENT) {
+                            onlineIndexRuntime.gate().clearBuild(buildId);
+                        }
+                    } catch (RuntimeException gateFailure) {
+                        failure.addSuppressed(gateFailure);
+                    }
+                }
+                completeOnlineDdlFailed(tracker, ddlId, onlineErrorCode(failure), true);
+                log.error("online DROP INDEX failed after durable FORWARD_ONLY; restart must continue retirement: ddlId={}",
+                        ddlId == null ? 0 : ddlId.value(), failure);
+                throw failure;
+            }
+
+            // forward fence前只有source DD可达；先阻止迟到gate用户，再exact清descriptor，最后写ROLLED_BACK。
+            if (tracker != null && !tracker.snapshot().terminal()) {
+                tracker.advanceRuntime(OnlineDdlRuntimePhase.ABORTING, OnlineDdlWaitReason.NONE);
+            }
+            boolean cleanupSafe = true;
+            if (buildId != null && sourceBinding != null) {
+                try {
+                    OnlineDdlTablePhase phase = onlineIndexRuntime.gate().phase(sourceBinding.tableId());
+                    if (phase != OnlineDdlTablePhase.ABSENT && phase != OnlineDdlTablePhase.ABORTING) {
+                        onlineIndexRuntime.gate().beginAbort(
+                                buildId, onlineAbortReason(failure));
+                    }
+                    if (phase != OnlineDdlTablePhase.ABSENT) {
+                        onlineIndexRuntime.gate().awaitAbortQuiescence(buildId, timeout);
+                    }
+                } catch (RuntimeException gateFailure) {
+                    failure.addSuppressed(gateFailure);
+                    cleanupSafe = false;
+                }
+            }
+            SecondaryIndexDropDescriptor cleanupStaged = staged;
+            if (cleanupSafe && cleanupStaged == null && markerPrepared
+                    && sourceBinding != null && ddlId != null) {
+                try {
+                    Optional<SecondaryIndexDropDescriptor> durable =
+                            physical.readSecondaryIndexDrop(sourceBinding);
+                    if (durable.isPresent()) {
+                        SecondaryIndexDropDescriptor observed = durable.orElseThrow();
+                        DdlLogRecord marker = repository.ddlLog().find(ddlId).orElseThrow();
+                        if (observed.ddlOperationId() != ddlId.value()
+                                || observed.dictionaryVersion()
+                                != marker.marker().dictionaryVersion()
+                                || observed.tableId() != sourceBinding.tableId()
+                                || observed.indexBinding().indexId()
+                                != marker.secondaryObjectId()) {
+                            throw new DictionaryDdlException(
+                                    "online DROP INDEX cleanup observed another descriptor owner");
+                        }
+                        cleanupStaged = observed;
+                    }
+                } catch (RuntimeException descriptorFailure) {
+                    failure.addSuppressed(descriptorFailure);
+                    cleanupSafe = false;
+                }
+            }
+            if (cleanupSafe && cleanupStaged != null && sourceBinding != null) {
+                try {
+                    physical.rollbackSecondaryIndexDrop(sourceBinding, cleanupStaged, timeout);
+                } catch (RuntimeException cleanupFailure) {
+                    failure.addSuppressed(cleanupFailure);
+                    cleanupSafe = false;
+                }
+            }
+            boolean markerRolledBack = !markerPrepared;
+            if (cleanupSafe && markerPrepared && ddlId != null) {
+                try {
+                    DdlLogRecord rolledBack = repository.ddlLog().transition(
+                            ddlId, DdlLogPhase.PREPARED, DdlLogPhase.ROLLED_BACK);
+                    if (tracker != null) {
+                        tracker.observeDurable(rolledBack);
+                    }
+                    markerRolledBack = true;
+                } catch (RuntimeException markerFailure) {
+                    failure.addSuppressed(markerFailure);
+                    cleanupSafe = false;
+                }
+            }
+            if (cleanupSafe && markerRolledBack && buildId != null && sourceBinding != null) {
+                try {
+                    if (onlineIndexRuntime.gate().phase(sourceBinding.tableId())
+                            != OnlineDdlTablePhase.ABSENT) {
+                        onlineIndexRuntime.gate().clearBuild(buildId);
+                    }
+                } catch (RuntimeException gateFailure) {
+                    failure.addSuppressed(gateFailure);
+                    cleanupSafe = false;
+                }
+            }
+            if (tracker != null) {
+                if (cleanupSafe && markerRolledBack) {
+                    onlineDdlRegistry.complete(ddlId, OnlineDdlTerminalResult.ROLLED_BACK,
+                            Optional.of(onlineErrorCode(failure)), false);
+                } else {
+                    completeOnlineDdlFailed(
+                            tracker, ddlId, onlineErrorCode(failure), false);
+                }
+            }
+            throw failure;
         }
     }
 
@@ -721,7 +1812,7 @@ public final class DictionaryDdlService {
 
             if (active.state() == TableState.RECOVERY_UNAVAILABLE
                     || active.state() == TableState.RECOVERY_DISCARDED) {
-                dropRecoveryIsolatedLocked(active, binding, timeout);
+                dropRecoveryIsolatedLocked(schema, active, binding, timeout);
                 return;
             }
             if (active.state() != TableState.ACTIVE) {
@@ -737,10 +1828,17 @@ public final class DictionaryDdlService {
             DictionaryVersion pendingVersion = DictionaryVersion.of(ids.dictionaryVersion());
             DictionaryVersion droppedVersion = DictionaryVersion.of(ids.dictionaryVersion() + 1);
             TableDefinition pending = lifecycle(active, pendingVersion, TableState.DROP_PENDING);
+            TableDefinition dropped = lifecycle(pending, droppedVersion, TableState.DROPPED);
             DdlId ddlId = DdlId.of(ids.firstDdlId());
             DdlLogRecord prepared = new DdlLogRecord(
                     new DdlUndoMarker(ddlId.value(), pendingVersion.value(), active.id().value()),
-                    DdlLogOperation.DROP_TABLE, DdlLogPhase.PREPARED, binding.spaceId(), binding.path());
+                    0L, DdlLogOperation.DROP_TABLE, DdlLogPhase.PREPARED,
+                    binding.spaceId(), binding.path(), Optional.empty(), Optional.empty(),
+                    DdlExecutionProtocol.ATOMIC_BLOCKING_V1,
+                    Optional.of(schemaDigests.digest(schema, active, binding.rowFormatVersion())),
+                    Optional.of(schemaDigests.digest(schema, pending, binding.rowFormatVersion())),
+                    Optional.of(schemaDigests.digest(schema, dropped, binding.rowFormatVersion())),
+                    DdlControlState.OPEN, Optional.empty(), Optional.empty());
             repository.ddlLog().prepare(prepared);
             faultInjector.afterDropPrepared(prepared);
             // 先阻断本地重载。append 报错无法证明 DROP_PENDING 未 durable，失败后只能由重启读取 catalog 裁决。
@@ -768,7 +1866,6 @@ public final class DictionaryDdlService {
             faultInjector.afterDropEngineDone(engineDone);
 
             // 5、物理删除完成后发布 DROPPED，普通 lookup 从此永久不可见。
-            TableDefinition dropped = lifecycle(pending, droppedVersion, TableState.DROPPED);
             commitUpdate(droppedVersion, dropped);
             faultInjector.afterDropDictionaryCommitted(dropped);
             repository.ddlLog().transition(ddlId, DdlLogPhase.ENGINE_DONE, DdlLogPhase.COMMITTED);
@@ -829,20 +1926,30 @@ public final class DictionaryDdlService {
             DictionaryIdAllocation ids = control.reserve(new DictionaryIdRequest(0, 0, 0, 0, 1, 2));
             DictionaryVersion pendingVersion = DictionaryVersion.of(ids.dictionaryVersion());
             DictionaryVersion discardedVersion = DictionaryVersion.of(ids.dictionaryVersion() + 1);
+            TableDefinition pending = lifecycle(
+                    active, pendingVersion, TableState.DISCARD_PENDING);
+            TableDefinition discarded = lifecycle(
+                    active, discardedVersion, TableState.DISCARDED);
             DdlId ddlId = DdlId.of(ids.firstDdlId());
-            DdlLogRecord prepared = new DdlLogRecord(new DdlUndoMarker(ddlId.value(), pendingVersion.value(), active.id().value()),
-                    DdlLogOperation.DISCARD_TABLESPACE, DdlLogPhase.PREPARED, binding.spaceId(), binding.path(),
-                    Optional.of(quarantine), Optional.<TablespaceFileIdentity>empty());
+            DdlLogRecord prepared = new DdlLogRecord(
+                    new DdlUndoMarker(ddlId.value(), pendingVersion.value(), active.id().value()),
+                    0L, DdlLogOperation.DISCARD_TABLESPACE, DdlLogPhase.PREPARED,
+                    binding.spaceId(), binding.path(), Optional.of(quarantine), Optional.empty(),
+                    DdlExecutionProtocol.ATOMIC_BLOCKING_V1,
+                    Optional.of(schemaDigests.digest(schema, active, binding.rowFormatVersion())),
+                    Optional.of(schemaDigests.digest(schema, pending, binding.rowFormatVersion())),
+                    Optional.of(schemaDigests.digest(schema, discarded, binding.rowFormatVersion())),
+                    DdlControlState.OPEN, Optional.empty(), Optional.empty());
             repository.ddlLog().prepare(prepared);
             cache.invalidateTable(active.id(), pendingVersion);
-            commitUpdate(pendingVersion, lifecycle(active, pendingVersion, TableState.DISCARD_PENDING));
+            commitUpdate(pendingVersion, pending);
             repository.ddlLog().transition(ddlId, DdlLogPhase.PREPARED, DdlLogPhase.DICTIONARY_COMMITTED);
             if (!cache.awaitUnpinned(active.id(), timeout)) {
                 throw new DictionaryDdlException("timed out waiting dictionary pins before DISCARD: " + active.id().value());
             }
             physical.discardTablespace(binding, quarantine, timeout);
             repository.ddlLog().transition(ddlId, DdlLogPhase.DICTIONARY_COMMITTED, DdlLogPhase.ENGINE_DONE);
-            commitUpdate(discardedVersion, lifecycle(active, discardedVersion, TableState.DISCARDED));
+            commitUpdate(discardedVersion, discarded);
             repository.ddlLog().transition(ddlId, DdlLogPhase.ENGINE_DONE, DdlLogPhase.COMMITTED);
             cleanSnapshotPublisher.publish();
         }
@@ -900,17 +2007,26 @@ public final class DictionaryDdlService {
             DictionaryIdAllocation ids = control.reserve(new DictionaryIdRequest(0, 0, 0, 0, 1, 2));
             DictionaryVersion pendingVersion = DictionaryVersion.of(ids.dictionaryVersion());
             DictionaryVersion activeVersion = DictionaryVersion.of(ids.dictionaryVersion() + 1);
+            TableDefinition pending = lifecycle(
+                    discarded, pendingVersion, TableState.IMPORT_PENDING);
+            TableDefinition active = lifecycle(
+                    discarded, activeVersion, TableState.ACTIVE);
             DdlId ddlId = DdlId.of(ids.firstDdlId());
-            DdlLogRecord prepared = new DdlLogRecord(new DdlUndoMarker(ddlId.value(), pendingVersion.value(), discarded.id().value()),
-                    DdlLogOperation.IMPORT_TABLESPACE, DdlLogPhase.PREPARED, binding.spaceId(), binding.path(),
-                    Optional.of(source), Optional.of(identity));
+            DdlLogRecord prepared = new DdlLogRecord(
+                    new DdlUndoMarker(ddlId.value(), pendingVersion.value(), discarded.id().value()),
+                    0L, DdlLogOperation.IMPORT_TABLESPACE, DdlLogPhase.PREPARED,
+                    binding.spaceId(), binding.path(), Optional.of(source), Optional.of(identity),
+                    DdlExecutionProtocol.ATOMIC_BLOCKING_V1,
+                    Optional.of(schemaDigests.digest(schema, discarded, binding.rowFormatVersion())),
+                    Optional.of(schemaDigests.digest(schema, pending, binding.rowFormatVersion())),
+                    Optional.of(schemaDigests.digest(schema, active, binding.rowFormatVersion())),
+                    DdlControlState.OPEN, Optional.empty(), Optional.empty());
             repository.ddlLog().prepare(prepared);
             cache.invalidateTable(discarded.id(), pendingVersion);
-            commitUpdate(pendingVersion, lifecycle(discarded, pendingVersion, TableState.IMPORT_PENDING));
+            commitUpdate(pendingVersion, pending);
             repository.ddlLog().transition(ddlId, DdlLogPhase.PREPARED, DdlLogPhase.DICTIONARY_COMMITTED);
             physical.importTablespace(binding, source, identity, timeout);
             repository.ddlLog().transition(ddlId, DdlLogPhase.DICTIONARY_COMMITTED, DdlLogPhase.ENGINE_DONE);
-            TableDefinition active = lifecycle(discarded, activeVersion, TableState.ACTIVE);
             commitUpdate(activeVersion, active);
             cache.publishTable(active);
             repository.ddlLog().transition(ddlId, DdlLogPhase.ENGINE_DONE, DdlLogPhase.COMMITTED);
@@ -1007,10 +2123,18 @@ public final class DictionaryDdlService {
                     new DictionaryIdRequest(0, 0, 0, 0, 1, 1));
             DictionaryVersion finalVersion = DictionaryVersion.of(ids.dictionaryVersion());
             DdlId ddlId = DdlId.of(ids.firstDdlId());
+            TableDefinition discarded = lifecycle(
+                    unavailable, finalVersion, TableState.RECOVERY_DISCARDED);
             DdlLogRecord prepared = new DdlLogRecord(
                     new DdlUndoMarker(ddlId.value(), finalVersion.value(), unavailable.id().value()),
-                    DdlLogOperation.DISCARD_RECOVERY_UNAVAILABLE, DdlLogPhase.PREPARED,
-                    binding.spaceId(), binding.path(), Optional.of(target), Optional.empty());
+                    0L, DdlLogOperation.DISCARD_RECOVERY_UNAVAILABLE, DdlLogPhase.PREPARED,
+                    binding.spaceId(), binding.path(), Optional.of(target), Optional.empty(),
+                    DdlExecutionProtocol.ATOMIC_BLOCKING_V1,
+                    Optional.of(schemaDigests.digest(
+                            schema, unavailable, binding.rowFormatVersion())),
+                    Optional.empty(), Optional.of(schemaDigests.digest(
+                            schema, discarded, binding.rowFormatVersion())),
+                    DdlControlState.OPEN, Optional.empty(), Optional.empty());
             repository.ddlLog().prepare(prepared);
             cache.invalidateTable(unavailable.id(), finalVersion);
             if (!cache.awaitUnpinned(unavailable.id(), timeout)) {
@@ -1024,8 +2148,6 @@ public final class DictionaryDdlService {
                     ddlId, DdlLogPhase.PREPARED, DdlLogPhase.ENGINE_DONE);
 
             // 4. DD 终态晚于物理终点，重启可依据 marker 确定重试方向。
-            TableDefinition discarded = lifecycle(
-                    unavailable, finalVersion, TableState.RECOVERY_DISCARDED);
             commitUpdate(finalVersion, discarded);
             repository.ddlLog().transition(
                     ddlId, DdlLogPhase.ENGINE_DONE, DdlLogPhase.DICTIONARY_COMMITTED);
@@ -1038,12 +2160,14 @@ public final class DictionaryDdlService {
     /**
      * table X 已持有时删除 recovery-isolated canonical 文件并发布 DROPPED；可信备份不在删除所有权内。
      *
+     * @param schema isolated所属且由外层schema/table MDL共同冻结的exact schema
      * @param isolated 锁内重读的 RECOVERY_UNAVAILABLE/RECOVERY_DISCARDED aggregate
      * @param binding 与 aggregate 同版本的稳定物理绑定
      * @param timeout history、pin 与物理 lease 共用的正上界
      */
     private void dropRecoveryIsolatedLocked(
-            TableDefinition isolated, TableStorageBinding binding, Duration timeout) {
+            SchemaDefinition schema, TableDefinition isolated,
+            TableStorageBinding binding, Duration timeout) {
         // 1. 先清空所有可能仍携带 table identity 的事务历史与 metadata pin。
         purgeBarrier.awaitUnreferenced(isolated.id().value(), timeout);
         DictionaryIdAllocation ids = control.reserve(
@@ -1053,12 +2177,18 @@ public final class DictionaryDdlService {
         Path deletionPath = isolated.state() == TableState.RECOVERY_DISCARDED
                 ? transferPath("discarded", isolated.id(), binding)
                 : binding.path();
+        TableDefinition dropped = lifecycle(isolated, finalVersion, TableState.DROPPED);
         DdlLogRecord prepared = new DdlLogRecord(
                 new DdlUndoMarker(ddlId.value(), finalVersion.value(), isolated.id().value()),
-                DdlLogOperation.DROP_RECOVERY_UNAVAILABLE, DdlLogPhase.PREPARED,
+                0L, DdlLogOperation.DROP_RECOVERY_UNAVAILABLE, DdlLogPhase.PREPARED,
                 binding.spaceId(), binding.path(),
                 isolated.state() == TableState.RECOVERY_DISCARDED
-                        ? Optional.of(deletionPath) : Optional.empty(), Optional.empty());
+                        ? Optional.of(deletionPath) : Optional.empty(), Optional.empty(),
+                DdlExecutionProtocol.ATOMIC_BLOCKING_V1,
+                Optional.of(schemaDigests.digest(schema, isolated, binding.rowFormatVersion())),
+                Optional.empty(), Optional.of(schemaDigests.digest(
+                        schema, dropped, binding.rowFormatVersion())),
+                DdlControlState.OPEN, Optional.empty(), Optional.empty());
         repository.ddlLog().prepare(prepared);
         cache.invalidateTable(isolated.id(), finalVersion);
         if (!cache.awaitUnpinned(isolated.id(), timeout)) {
@@ -1072,7 +2202,6 @@ public final class DictionaryDdlService {
                 ddlId, DdlLogPhase.PREPARED, DdlLogPhase.ENGINE_DONE);
 
         // 3. 物理终点之后才发布 tombstone，任何中断均能从 PREPARED/ENGINE_DONE 继续。
-        TableDefinition dropped = lifecycle(isolated, finalVersion, TableState.DROPPED);
         commitUpdate(finalVersion, dropped);
         repository.ddlLog().transition(
                 ddlId, DdlLogPhase.ENGINE_DONE, DdlLogPhase.DICTIONARY_COMMITTED);
@@ -1226,11 +2355,18 @@ public final class DictionaryDdlService {
                     new DictionaryIdRequest(0, 0, 0, 0, 1, 1));
             DictionaryVersion activeVersion = DictionaryVersion.of(ids.dictionaryVersion());
             DdlId ddlId = DdlId.of(ids.firstDdlId());
+            TableDefinition active = lifecycle(
+                    discarded, activeVersion, TableState.ACTIVE);
             DdlLogRecord prepared = new DdlLogRecord(
                     new DdlUndoMarker(ddlId.value(), activeVersion.value(), discarded.id().value()),
-                    DdlLogOperation.IMPORT_RECOVERY_REPLACEMENT, DdlLogPhase.PREPARED,
+                    0L, DdlLogOperation.IMPORT_RECOVERY_REPLACEMENT, DdlLogPhase.PREPARED,
                     binding.spaceId(), binding.path(), Optional.of(backup.dataPath()),
-                    Optional.of(backup.fileIdentity()));
+                    Optional.of(backup.fileIdentity()), DdlExecutionProtocol.ATOMIC_BLOCKING_V1,
+                    Optional.of(schemaDigests.digest(
+                            schema, discarded, binding.rowFormatVersion())),
+                    Optional.empty(), Optional.of(schemaDigests.digest(
+                            schema, active, binding.rowFormatVersion())),
+                    DdlControlState.OPEN, Optional.empty(), Optional.empty());
             repository.ddlLog().prepare(prepared);
             cache.invalidateTable(discarded.id(), activeVersion);
             if (!cache.awaitUnpinned(discarded.id(), timeout)) {
@@ -1246,7 +2382,6 @@ public final class DictionaryDdlService {
                     ddlId, DdlLogPhase.PREPARED, DdlLogPhase.ENGINE_DONE);
 
             // 4. catalog ACTIVE 是逻辑可见性的唯一发布点，晚于全部物理持久化。
-            TableDefinition active = lifecycle(discarded, activeVersion, TableState.ACTIVE);
             commitUpdate(activeVersion, active);
             repository.ddlLog().transition(
                     ddlId, DdlLogPhase.ENGINE_DONE, DdlLogPhase.DICTIONARY_COMMITTED);
@@ -1258,12 +2393,12 @@ public final class DictionaryDdlService {
     }
 
     /**
-     * 按 SQL 声明顺序执行一次通用阻塞式 ALTER。metadata-only action 原地保留 row format；涉及列布局、
-     * CONVERT 或复合索引 action 时只建立一个 shadow space，并以 committed DD 作为交换裁决点。
+     * 按 SQL 声明顺序执行一次通用 ALTER。selector先冻结instant/inplace/blocking方向；单index action复用
+     * 已接线的Online ADD/DROP，metadata-only原地保留row format，其余能力缺口显式进入既有单shadow阻塞实现。
      *
      * <p>数据流：</p>
      * <ol>
-     *     <li>按 canonical schema/table key 全序取得全部源/rename 目标 MDL，在锁内重读 ACTIVE aggregate。</li>
+     *     <li>在副作用前冻结策略；生产单index action直接委托已实现的online协议，其余路径再取得完整MDL集合。</li>
      *     <li>依次作用 action 到 staged columns/indexes/options/name，验证主键、相对位置、名称和目标 schema。</li>
      *     <li>metadata-only 先 durable SDI 再一次提交 DD；结构变化则写 PREPARED、构建/force shadow 与 SDI，
      *     写 ENGINE_DONE 后一次提交新 binding。</li>
@@ -1278,12 +2413,44 @@ public final class DictionaryDdlService {
      */
     public TableDefinition alterTable(
             MdlOwnerId owner, AlterTableCommand command, Duration timeout) {
-        // 1、锁集合完全来自逻辑名称，等待期间不持 page/file/MTR 资源。
+        // 1、纯策略决策早于锁、identity与IO；online分支将资源生命周期完整委托给单index协调器。
         validateOwnerTimeout(owner, timeout);
         cleanSnapshotPublisher.assertAvailable();
         if (command == null) {
             throw new DatabaseValidationException("ALTER TABLE command must not be null");
         }
+        OnlineAlterDecision decision = alterStrategySelector.select(command);
+        if (decision.strategy() == OnlineAlterStrategy.INPLACE_INDEX
+                && command.actions().size() == 1
+                && command.actions().getFirst() instanceof AlterTableAction.AddIndex add
+                && onlineIndexRuntime != null) {
+            // 1、单ADD不拆分aggregate；委托方法拥有完整marker/gate/row-log/取消/恢复生命周期。
+            return createSecondaryIndex(owner,
+                    new CreateSecondaryIndexCommand(command.table(), add.index()), timeout);
+        }
+        if (decision.strategy() == OnlineAlterStrategy.INPLACE_INDEX
+                && command.actions().size() == 1
+                && command.actions().getFirst() instanceof AlterTableAction.DropIndex drop
+                && onlineIndexRuntime != null && indexRetirementBarrier != null) {
+            // 1、单DROP复用retirement fence；target DD发布与segment回收仍是一个online operation。
+            return dropSecondaryIndex(owner,
+                    new DropSecondaryIndexCommand(command.table(), drop.name()), timeout);
+        }
+        if (decision.strategy() == OnlineAlterStrategy.INPLACE_INDEX
+                && decision.reason() == OnlineAlterReason.GENERAL_INPLACE_MANIFEST
+                && onlineAlterRuntime != null && onlineAlterRetirementBarrier != null) {
+            return alterTableOnline(owner, command, decision, timeout);
+        }
+        if (decision.strategy() == OnlineAlterStrategy.SHADOW_REBUILD_V1
+                && onlineAlterRuntime != null && onlineAlterRetirementBarrier != null) {
+            return alterTableOnline(owner, command, decision, timeout);
+        }
+        if (decision.strategy() == OnlineAlterStrategy.BLOCKING) {
+            log.info("ALTER TABLE selected explicit blocking fallback: table={} reason={} rejected={}",
+                    command.table().canonicalKey(), decision.reason(),
+                    decision.rejectedCapabilities());
+        }
+        // 1、非单index路径的锁集合完全来自逻辑名称，等待期间不持page/file/MTR资源。
         try (AlterMdlTickets ignored = acquireAlterTickets(owner, command, timeout)) {
             SchemaDefinition sourceSchema = repository.findSchema(command.table().schema())
                     .orElseThrow(() -> new DictionaryObjectNotFoundException(
@@ -1306,7 +2473,10 @@ public final class DictionaryDdlService {
             boolean structural = draft.structural();
             DictionaryIdAllocation ids = control.reserve(new DictionaryIdRequest(
                     0, 0, Math.toIntExact(finalAddedIndexes),
-                    structural ? 1 : 0, structural ? 1 : 0, 1));
+                    structural ? 1 : 0,
+                    structural || decision.strategy() == OnlineAlterStrategy.INSTANT_METADATA
+                            ? 1 : 0,
+                    1));
             DictionaryVersion version = DictionaryVersion.of(ids.dictionaryVersion());
             List<IndexDefinition> indexes = assignAlterIndexIds(
                     draft.indexes(), ids.firstIndexId());
@@ -1318,6 +2488,14 @@ public final class DictionaryDdlService {
                         active.id(), draft.schemaId(), draft.name(), version, TableState.ACTIVE,
                         columns, indexes, active.storageBinding(), draft.options());
                 ensureAlterTargetNameAvailable(active, published);
+                if (decision.strategy() == OnlineAlterStrategy.INSTANT_METADATA) {
+                    SchemaDefinition targetSchema = repository.findSchema(draft.schemaId())
+                            .orElseThrow(() -> new DictionaryObjectNotFoundException(
+                                    "ALTER metadata target schema disappeared: "
+                                            + draft.schemaId().value()));
+                    return alterTableInstantMetadata(owner, command, sourceSchema, targetSchema,
+                            active, published, DdlId.of(ids.firstDdlId()), timeout);
+                }
                 sdi.write(published, timeout);
                 // DD append 的成功响应可能丢失；先阻断旧 cache，避免 durable 新名称/选项与旧内存版本并行服务。
                 cache.invalidateTable(active.id(), version);
@@ -1353,12 +2531,25 @@ public final class DictionaryDdlService {
             physical.validateTableDefinition(targetDefinition);
 
             DdlId ddlId = DdlId.of(ids.firstDdlId());
+            SchemaDefinition targetSchema = repository.findSchema(draft.schemaId())
+                    .orElseThrow(() -> new DictionaryObjectNotFoundException(
+                            "ALTER target schema disappeared before marker: "
+                                    + draft.schemaId().value()));
+            TableDefinition plannedTarget = new TableDefinition(
+                    active.id(), draft.schemaId(), draft.name(), version, TableState.ACTIVE,
+                    columns, indexes, Optional.empty(), draft.options());
             DdlLogRecord prepared = new DdlLogRecord(
                     new DdlUndoMarker(
                             ddlId.value(), version.value(), active.id().value()),
                     targetSpaceId, DdlLogOperation.REBUILD_TABLE, DdlLogPhase.PREPARED,
                     oldBinding.spaceId(), oldBinding.path(),
-                    Optional.of(targetPath), Optional.empty());
+                    Optional.of(targetPath), Optional.empty(),
+                    DdlExecutionProtocol.ATOMIC_BLOCKING_V1,
+                    Optional.of(schemaDigests.digest(
+                            sourceSchema, active, oldBinding.rowFormatVersion())),
+                    Optional.empty(), Optional.of(schemaDigests.digest(
+                            targetSchema, plannedTarget, version.value())),
+                    DdlControlState.OPEN, Optional.empty(), Optional.empty());
             repository.ddlLog().prepare(prepared);
             faultInjector.afterAlterPrepared(prepared);
 
@@ -1414,6 +2605,1047 @@ public final class DictionaryDdlService {
                     ddlId, DdlLogPhase.DICTIONARY_COMMITTED, DdlLogPhase.COMMITTED);
             cleanSnapshotPublisher.publish();
             return published;
+        }
+    }
+
+    /**
+     * 通用INPLACE_INDEX与SHADOW_REBUILD_V1共享的生产协调器。两种策略使用同一manifest、journal、gate、
+     * cancel/forward竞争与registry；差异只在物理prepare、candidate codec、final barrier和retired resource。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>table X下顺序stage全部action、一次预留identity/version并force immutable manifest+journal与marker。</li>
+     *     <li>建立descriptor chain或shadow capture，force CAPTURING后把source X降为SU；base work按有界批次执行。</li>
+     *     <li>SU升回X并seal gate；shadow额外用同一deadline等待final ReadView generation与table history。</li>
+     *     <li>两遍流式reconciliation与双向验证后写target SDI、force物理结果并持久安装retirement fence。</li>
+     *     <li>OPEN→FORWARD_ONLY胜出后写RECONCILED/ENGINE_DONE，一次提交target aggregate并发布cache。</li>
+     *     <li>清gate并降回SU，等待旧INDEX/SPACE安全退休，物理清理后写COMMITTED并删除journal。</li>
+     * </ol>
+     *
+     * @param owner 独立DDL statement owner
+     * @param command binder产生的有序完整ALTER命令
+     * @param decision 已在任何副作用前冻结的通用online策略
+     * @param timeout MDL、gate、barrier、WAL与文件操作的正上界
+     * @return 单次DD提交后可见的target ACTIVE aggregate
+     * @throws DictionaryDdlException pre-forward失败完成精确回滚，或post-forward失败需启动恢复前滚时抛出
+     */
+    private TableDefinition alterTableOnline(
+            MdlOwnerId owner, AlterTableCommand command,
+            OnlineAlterDecision decision, Duration timeout) {
+        OnlineDdlCaptureId captureId = null;
+        FileOnlineAlterChangeLog changeLog = null;
+        OnlineAlterDescriptorSet descriptors = null;
+        TableStorageBinding shadowBinding = null;
+        TableDefinition source = null;
+        TableDefinition targetWithBinding = null;
+        DdlId ddlId = null;
+        OnlineDdlOperationTracker tracker = null;
+        boolean markerPrepared = false;
+        boolean targetSdiWritten = false;
+        boolean forwardOnly = false;
+        boolean gateCleared = false;
+        boolean journalClosed = false;
+
+        try (AlterMdlTickets tickets = acquireAlterTickets(owner, command, timeout)) {
+            // 1、initial X内重读source并一次性冻结全部逻辑identity；任何格式/能力错误早于journal、marker和segment。
+            MdlTicket sourceTableTicket = tickets.require(
+                    MdlKey.table(command.table().canonicalKey()));
+            SchemaDefinition sourceSchema = repository.findSchema(command.table().schema())
+                    .orElseThrow(() -> new DictionaryObjectNotFoundException(
+                            "schema does not exist: "
+                                    + command.table().schema().displayName()));
+            source = repository.findTable(sourceSchema.id(), command.table().table())
+                    .orElseThrow(() -> new DictionaryObjectNotFoundException(
+                            "table does not exist: " + command.table().canonicalKey()));
+            if (source.state() != TableState.ACTIVE) {
+                throw new DictionaryDdlException(
+                        "online ALTER target is not ACTIVE: " + source.id().value());
+            }
+            AlterDraft draft = stageAlter(source, command.actions());
+            ensureAlterTargetNameAvailable(source, draft.schemaId(), draft.name());
+            long addedCount = draft.indexes().stream()
+                    .filter(StagedIndex::requiresIdentity).count();
+            boolean shadow = decision.strategy() == OnlineAlterStrategy.SHADOW_REBUILD_V1;
+            DictionaryIdAllocation ids = control.reserve(new DictionaryIdRequest(
+                    0, 0, Math.toIntExact(addedCount), shadow ? 1 : 0, 1, 1));
+            DictionaryVersion targetVersion = DictionaryVersion.of(ids.dictionaryVersion());
+            List<IndexDefinition> targetIndexes = assignAlterIndexIds(
+                    draft.indexes(), ids.firstIndexId());
+            List<ColumnDefinition> targetColumns = draft.columns().stream()
+                    .map(StagedColumn::definition).toList();
+            TableStorageBinding sourceBinding = source.storageBinding().orElseThrow(() ->
+                    new DictionaryDdlException(
+                            "online ALTER source has no binding: "
+                                    + command.table().canonicalKey()));
+            SchemaDefinition targetSchema = repository.findSchema(draft.schemaId())
+                    .orElseThrow(() -> new DictionaryObjectNotFoundException(
+                            "online ALTER target schema disappeared: "
+                                    + draft.schemaId().value()));
+            TableDefinition plannedTarget = new TableDefinition(
+                    source.id(), draft.schemaId(), draft.name(), targetVersion,
+                    TableState.ACTIVE, targetColumns, targetIndexes,
+                    Optional.empty(), draft.options());
+            StorageTableDefinition sourceStorage = storageDefinition(source);
+            int targetSpaceId = shadow ? ids.firstSpaceId() : 0;
+            Path shadowPath = shadow ? tablePath(source.id(), targetSpaceId) : null;
+            StorageTableDefinition targetStorage = shadow
+                    ? storageDefinition(source.id(), targetSpaceId, shadowPath,
+                    targetVersion, targetColumns, targetIndexes)
+                    : onlineInplaceDefinition(sourceStorage, targetIndexes);
+            List<StorageColumnRewrite> rewrites = draft.columns().stream()
+                    .map(column -> column.sourceOrdinal() >= 0
+                            ? StorageColumnRewrite.source(column.sourceOrdinal())
+                            : StorageColumnRewrite.added(column.storageDefault()))
+                    .toList();
+            physical.validateTableDefinition(sourceStorage);
+            physical.validateTableDefinition(targetStorage);
+            List<OnlineAlterIndexAddRequest> additions = onlineAlterAdditions(
+                    command.actions(), targetIndexes);
+            List<OnlineAlterIndexDropRequest> drops = onlineAlterDrops(
+                    command.actions(), source, sourceBinding);
+
+            ddlId = DdlId.of(ids.firstDdlId());
+            captureId = OnlineDdlCaptureId.of(ddlId.value());
+            DdlExecutionProtocol protocol = shadow
+                    ? DdlExecutionProtocol.ONLINE_ALTER_SHADOW_V1
+                    : DdlExecutionProtocol.ONLINE_ALTER_INPLACE_V1;
+            DdlLogOperation operation = shadow
+                    ? DdlLogOperation.REBUILD_TABLE
+                    : DdlLogOperation.ALTER_TABLE_INPLACE;
+            DdlSchemaDigest sourceDigest = schemaDigests.digest(
+                    sourceSchema, source, sourceBinding.rowFormatVersion());
+            long targetRowFormat = shadow
+                    ? targetVersion.value() : sourceBinding.rowFormatVersion();
+            DdlSchemaDigest targetDigest = schemaDigests.digest(
+                    targetSchema, plannedTarget, targetRowFormat);
+            long captureReadViewBaseline = onlineAlterRuntime.readViewBarrier()
+                    .captureGeneration();
+            List<OnlineAlterActionDescriptor> actionDescriptors =
+                    new OnlineAlterActionPayloadCodec().encode(
+                            command.actions(), source, plannedTarget, targetSchema);
+            OnlineAlterManifest manifest = new OnlineAlterManifest(
+                    ddlId.value(), source.id(), source.version(), targetVersion,
+                    protocol, sourceDigest, targetDigest,
+                    sourceBinding.rowFormatVersion(), targetRowFormat,
+                    captureReadViewBaseline, actionDescriptors,
+                    shadow ? Optional.of(new OnlineAlterShadowTarget(
+                            cn.zhangyis.db.domain.SpaceId.of(targetSpaceId), shadowPath))
+                            : Optional.empty());
+            byte[] manifestBytes = new OnlineAlterManifestCodec().encode(manifest);
+            byte[] manifestDigest = sha256(manifestBytes);
+
+            tracker = onlineDdlRegistry.register(new OnlineDdlOperationIdentity(
+                    ddlId, operation, source.id().value(), 0L,
+                    command.table().canonicalKey(), "", source.version().value(),
+                    targetVersion.value(), owner.value(), false,
+                    java.util.OptionalLong.empty()), protocol);
+            tracker.advanceRuntime(OnlineDdlRuntimePhase.ACTIVATING,
+                    OnlineDdlWaitReason.NONE);
+            if (!tracker.beginDurablePrepare()) {
+                throw new OnlineDdlCancellationException(
+                        "online ALTER cancelled before durable prepare: ddl=" + ddlId.value());
+            }
+            changeLog = onlineAlterRuntime.logFiles().create(
+                    new OnlineAlterLogHeader(captureId, source.id().value(),
+                            source.version().value(), targetVersion.value(),
+                            sourceBinding.rowFormatVersion(), targetRowFormat,
+                            protocol.stableCode(), shadow ? targetSpaceId : 0,
+                            captureReadViewBaseline, manifestBytes));
+            Path journalPath = changeLog.path();
+            DdlLogRecord prepared = new DdlLogRecord(
+                    new DdlUndoMarker(ddlId.value(), targetVersion.value(),
+                            source.id().value()),
+                    shadow ? targetSpaceId : 0L, operation, DdlLogPhase.PREPARED,
+                    sourceBinding.spaceId(), sourceBinding.path(),
+                    Optional.of(journalPath), Optional.empty(), protocol,
+                    Optional.of(sourceDigest), Optional.empty(),
+                    Optional.of(targetDigest), DdlControlState.OPEN,
+                    Optional.empty(), Optional.empty());
+            try {
+                repository.ddlLog().prepare(prepared);
+            } catch (RuntimeException prepareFailure) {
+                tracker.failDurablePrepare("MARKER_PREPARE_FAILED");
+                throw prepareFailure;
+            }
+            markerPrepared = true;
+            tracker.markDurablePrepared(prepared);
+            faultInjector.afterGeneralAlterPrepared(prepared);
+            requireOnlineDdlNotCancelled(ddlId, "after general ALTER prepare");
+            onlineAlterRuntime.gate().beginActivation(
+                    source.id().value(), captureId, timeout);
+
+            cn.zhangyis.db.storage.api.ddl.online.OnlineDdlCandidateCodec candidateCodec;
+            Map<Integer, SecondaryIndexCandidateCodec> nestedCodecs = new LinkedHashMap<>();
+            if (shadow) {
+                var sourceClustered = new BTreeIndexMetadataFactory()
+                        .createTable(sourceStorage, sourceBinding).clusteredIndex();
+                candidateCodec = new ClusteredIdentityCandidateCodec(
+                        sourceClustered, onlineAlterRuntime.typeRegistry());
+            } else {
+                descriptors = physical.beginOnlineAlterIndexDescriptors(
+                        sourceBinding, ddlId.value(), targetVersion.value(), 1L,
+                        additions, drops, manifestDigest, timeout);
+                if (additions.isEmpty()) {
+                    candidateCodec = new NoOpOnlineDdlCandidateCodec();
+                } else {
+                    TableStorageBinding buildingBinding = onlineInplaceBinding(
+                            sourceBinding, descriptors);
+                    StorageTableDefinition buildingDefinition = onlineInplaceStorageDefinition(
+                            sourceStorage, appendAddedStorageIndexes(
+                                    sourceStorage.indexes(), additions));
+                    var buildingMetadata = new BTreeIndexMetadataFactory()
+                            .createTable(buildingDefinition, buildingBinding);
+                    List<OnlineAlterIndexTarget> targets = new ArrayList<>();
+                    for (OnlineAlterIndexAddRequest addition : additions) {
+                        var secondary = buildingMetadata.requireSecondary(
+                                addition.definition().indexId());
+                        SecondaryIndexCandidateCodec nested =
+                                new SecondaryIndexCandidateCodec(
+                                        secondary.layout(), onlineAlterRuntime.typeRegistry());
+                        nestedCodecs.put(addition.actionOrdinal(), nested);
+                        targets.add(new OnlineAlterIndexTarget(
+                                addition.actionOrdinal(), addition.definition().indexId(), nested));
+                    }
+                    candidateCodec = new MultiIndexAlterCandidateCodec(targets);
+                }
+            }
+
+            // 2、capture frame、descriptor/shadow owner全部durable后才向DML发布target并降级X→SU。
+            changeLog.appendState(OnlineAlterLogRecordType.GENERATION_STARTED, new byte[0]);
+            long capturing = changeLog.appendState(
+                    OnlineAlterLogRecordType.CAPTURING, new byte[0]);
+            changeLog.forceThrough(capturing, timeout);
+            onlineAlterRuntime.gate().publishCapture(new OnlineAlterCaptureTarget(
+                    captureId, source.id().value(), changeLog, candidateCodec));
+            locks.downgrade(sourceTableTicket, MdlMode.SHARED_UPGRADABLE);
+            tracker.advanceRuntime(OnlineDdlRuntimePhase.BASE_SCAN,
+                    OnlineDdlWaitReason.NONE);
+            if (shadow) {
+                ensureTablesDirectory();
+                StorageTableRebuildRequest rebuildRequest =
+                        new StorageTableRebuildRequest(sourceStorage, sourceBinding,
+                                targetStorage, rewrites);
+                OnlineDdlOperationTracker activeTracker = tracker;
+                DdlId activeDdlId = ddlId;
+                FileOnlineAlterChangeLog activeLog = changeLog;
+                long activeTableId = source.id().value();
+                try {
+                    shadowBinding = physical.rebuildTableOnline(
+                            rebuildRequest, timeout, (rowsInBatch, continuation) -> {
+                                requireOnlineDdlNotCancelled(
+                                        activeDdlId, "after shadow base-copy batch");
+                                if (activeLog.abortRequired()
+                                        || onlineAlterRuntime.gate().phase(activeTableId)
+                                        == OnlineDdlTablePhase.ABORTING) {
+                                    throw new DictionaryDdlException(
+                                            "online shadow base copy observed durable abort");
+                                }
+                                activeTracker.addScanBatch(
+                                        rowsInBatch, Optional.empty());
+                                sampleOnlineAlterDdl(
+                                        activeTracker, activeTableId, activeLog);
+                            });
+                } catch (TableRebuildException rebuildFailure) {
+                    shadowBinding = rebuildFailure.shadowBinding();
+                    throw rebuildFailure;
+                }
+            } else {
+                descriptors = physical.backfillOnlineAlterIndexes(
+                        sourceStorage, sourceBinding, descriptors, additions, timeout);
+            }
+
+            // 3、final X排空source writer；shadow barrier失败时先恢复CAPTURING再交统一pre-forward abort清理。
+            tracker.advanceRuntime(OnlineDdlRuntimePhase.WAITING_FINAL_MDL,
+                    OnlineDdlWaitReason.METADATA_LOCK);
+            requireOnlineDdlNotCancelled(ddlId, "before general ALTER final MDL wait");
+            try {
+                locks.upgrade(sourceTableTicket, MdlMode.EXCLUSIVE, timeout);
+            } catch (MetadataLockTimeoutException waitFailure) {
+                if (onlineDdlCancelled(ddlId)) {
+                    throw new OnlineDdlCancellationException(
+                            "online ALTER cancelled during final MDL wait: ddl="
+                                    + ddlId.value(), waitFailure);
+                }
+                throw waitFailure;
+            }
+            requireOnlineDdlNotCancelled(ddlId, "after general ALTER final MDL wait");
+            TableDefinition finalSource = repository.findTableForRecovery(source.id())
+                    .orElseThrow(() -> new DictionaryDdlException(
+                            "online ALTER source disappeared before final X"));
+            requireLiveDigest(sourceDigest, schemaDigests.digest(
+                    sourceSchema, finalSource, sourceBinding.rowFormatVersion()),
+                    ddlId, "general ALTER source at final X");
+            tracker.advanceRuntime(OnlineDdlRuntimePhase.FINALIZING,
+                    OnlineDdlWaitReason.GATE_QUIESCENCE);
+            onlineAlterRuntime.gate().beginSeal(captureId, timeout);
+            long finalReadViewFence = captureReadViewBaseline;
+            if (shadow) {
+                finalReadViewFence = onlineAlterRuntime.readViewBarrier().captureGeneration();
+                long started = System.nanoTime();
+                long budget = boundedTimeoutNanos(timeout);
+                try {
+                    onlineAlterRuntime.readViewBarrier().awaitClosedThrough(
+                            finalReadViewFence, Duration.ofNanos(budget));
+                    purgeBarrier.awaitUnreferenced(source.id().value(),
+                            remainingDuration(started, budget,
+                                    "shadow table history barrier"));
+                } catch (RuntimeException barrierFailure) {
+                    onlineAlterRuntime.gate().resumeCapture(captureId);
+                    locks.downgrade(sourceTableTicket, MdlMode.SHARED_UPGRADABLE);
+                    throw new OnlineAlterFinalizationTimeoutException(
+                            "online shadow final ReadView/history barrier did not converge: ddl="
+                                    + ddlId.value(), barrierFailure);
+                }
+            }
+            long appended = changeLog.highestAppendedSequence();
+            if (appended > changeLog.highestForcedSequence()) {
+                changeLog.forceThrough(appended, timeout);
+            }
+            long sealed = changeLog.appendState(
+                    OnlineAlterLogRecordType.SEALED, new byte[0]);
+            changeLog.forceThrough(sealed, timeout);
+
+            // 4、两遍都从journal按批次流式读取；每批结束前所有B+Tree/LOB MTR均已释放。
+            tracker.advanceRuntime(OnlineDdlRuntimePhase.RECONCILING,
+                    OnlineDdlWaitReason.NONE);
+            if (shadow) {
+                StorageTableRebuildRequest request = new StorageTableRebuildRequest(
+                        sourceStorage, sourceBinding, targetStorage, rewrites);
+                shadowBinding = reconcileOnlineShadow(
+                        changeLog, (OnlineClusteredIdentityCodec) candidateCodec,
+                        request, shadowBinding, tracker, ddlId);
+                tracker.advanceRuntime(OnlineDdlRuntimePhase.VERIFYING,
+                        OnlineDdlWaitReason.NONE);
+                physical.verifyOnlineShadow(request, shadowBinding,
+                        onlineAlterRuntime.config().scanBatchRows());
+                targetWithBinding = new TableDefinition(
+                        source.id(), draft.schemaId(), draft.name(), targetVersion,
+                        TableState.ACTIVE, targetColumns, targetIndexes,
+                        Optional.of(shadowBinding), draft.options());
+            } else {
+                if (!additions.isEmpty()) {
+                    descriptors = reconcileOnlineAlterIndexes(
+                            changeLog, (MultiIndexAlterCandidateCodec) candidateCodec,
+                            nestedCodecs, sourceStorage, sourceBinding, descriptors,
+                            additions, tracker, ddlId);
+                }
+                tracker.advanceRuntime(OnlineDdlRuntimePhase.VERIFYING,
+                        OnlineDdlWaitReason.NONE);
+                for (OnlineAlterIndexAddRequest addition : additions) {
+                    physical.verifyOnlineAlterIndex(sourceStorage, sourceBinding,
+                            descriptors, addition,
+                            onlineAlterRuntime.config().scanBatchRows());
+                }
+                TableStorageBinding targetBinding = onlineInplaceTargetBinding(
+                        sourceBinding, targetIndexes, descriptors);
+                targetWithBinding = new TableDefinition(
+                        source.id(), draft.schemaId(), draft.name(), targetVersion,
+                        TableState.ACTIVE, targetColumns, targetIndexes,
+                        Optional.of(targetBinding), draft.options());
+            }
+            requireOnlineDdlNotCancelled(ddlId, "after general ALTER verification");
+            sdi.write(targetWithBinding, timeout);
+            targetSdiWritten = true;
+            physical.makeSecondaryIndexBuildDurable(
+                    shadow ? shadowBinding : sourceBinding,
+                    onlineAlterRuntime.gate().terminalRedoHighWater(source.id().value()), timeout);
+            byte[] readyPayload = shadow
+                    ? ByteBuffer.allocate(Long.BYTES).order(ByteOrder.BIG_ENDIAN)
+                    .putLong(finalReadViewFence).array()
+                    : new byte[0];
+            long ready = changeLog.appendState(
+                    OnlineAlterLogRecordType.READY_TO_PUBLISH, readyPayload);
+            changeLog.forceThrough(ready, timeout);
+            faultInjector.afterGeneralAlterReady(
+                    repository.ddlLog().find(ddlId).orElseThrow());
+
+            List<DdlRetiredResource> resources = shadow
+                    ? List.of(new DdlRetiredResource(
+                    DdlRetiredResourceKind.TABLESPACE, sourceBinding.spaceId().value()))
+                    : drops.stream().map(drop -> new DdlRetiredResource(
+                                    DdlRetiredResourceKind.INDEX,
+                                    drop.binding().indexId()))
+                    .sorted().toList();
+            if (!resources.isEmpty()) {
+                long generation = shadow ? 1L : descriptors.generation();
+                DdlRetirementFence fence = onlineAlterRetirementBarrier.captureFence(
+                        source.id().value(), source.version().value(), generation,
+                        ddlId.value(), resources);
+                DdlLogRecord fenced = repository.ddlLog().installRetirementFence(
+                        ddlId, DdlLogPhase.PREPARED, DdlControlState.OPEN, fence);
+                tracker.observeDurable(fenced);
+            }
+            DdlControlCasResult direction = repository.ddlLog().compareAndSetControl(
+                    ddlId, DdlLogPhase.PREPARED, DdlControlState.OPEN,
+                    DdlControlState.FORWARD_ONLY, Optional.empty());
+            if (!direction.changed()) {
+                if (direction.observedRecord().controlState()
+                        == DdlControlState.CANCEL_REQUESTED) {
+                    throw new OnlineDdlCancellationException(
+                            "online ALTER cancellation won before forward fence: ddl="
+                                    + ddlId.value());
+                }
+                throw new DictionaryDdlLogStateException(
+                        "online ALTER observed unexpected control state: "
+                                + direction.observedRecord().controlState());
+            }
+            forwardOnly = true;
+            tracker.observeDurable(direction.observedRecord());
+            faultInjector.afterGeneralAlterForwardFenced(
+                    direction.observedRecord());
+            tracker.advanceRuntime(OnlineDdlRuntimePhase.FORWARD_FENCED,
+                    OnlineDdlWaitReason.NONE);
+            long reconciled = changeLog.appendState(
+                    OnlineAlterLogRecordType.RECONCILED, new byte[0]);
+            changeLog.forceThrough(reconciled, timeout);
+            DdlLogRecord engineDone = repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.PREPARED, DdlLogPhase.ENGINE_DONE);
+            tracker.observeDurable(engineDone);
+            faultInjector.afterGeneralAlterEngineDone(engineDone);
+
+            // 5、target SDI/physical truth均已durable，DD只提交一次完整aggregate，不暴露逐action中间版本。
+            tracker.advanceRuntime(OnlineDdlRuntimePhase.PUBLISHING,
+                    OnlineDdlWaitReason.NONE);
+            cache.invalidateTable(source.id(), targetVersion);
+            commitUpdate(targetVersion, targetWithBinding);
+            DdlLogRecord dictionaryCommitted = repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.ENGINE_DONE,
+                    DdlLogPhase.DICTIONARY_COMMITTED);
+            tracker.observeDurable(dictionaryCommitted);
+            faultInjector.afterGeneralAlterDictionaryCommitted(targetWithBinding);
+            cache.publishTable(targetWithBinding);
+            onlineAlterRuntime.gate().clearCapture(captureId);
+            gateCleared = true;
+            changeLog.close();
+            journalClosed = true;
+            locks.downgrade(sourceTableTicket, MdlMode.SHARED_UPGRADABLE);
+
+            // 6、logical publish后DML使用target metadata继续运行；这里只等待并回收source物理资源。
+            tracker.advanceRuntime(OnlineDdlRuntimePhase.RETIRING,
+                    OnlineDdlWaitReason.RETIREMENT_FENCE);
+            DdlRetirementFence fence = dictionaryCommitted.retirementFence().orElse(null);
+            if (fence != null) {
+                onlineAlterRetirementBarrier.awaitSafe(fence, timeout);
+            }
+            if (shadow) {
+                physical.dropTable(sourceBinding, timeout);
+            } else {
+                physical.finishOnlineAlterIndexDescriptors(
+                        targetWithBinding.storageBinding().orElseThrow(), descriptors, timeout);
+            }
+            DdlLogRecord committed = repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.DICTIONARY_COMMITTED, DdlLogPhase.COMMITTED);
+            tracker.observeDurable(committed);
+            onlineAlterRuntime.logFiles().delete(captureId, changeLog.path());
+            cleanSnapshotPublisher.publish();
+            onlineDdlRegistry.complete(ddlId, OnlineDdlTerminalResult.COMPLETED,
+                    Optional.empty(), false);
+            return targetWithBinding;
+        } catch (RuntimeException failure) {
+            // FORWARD_ONLY之后任何反向动作都会破坏单向恢复；保留marker/journal/资源并让startup按target方向续作。
+            if (forwardOnly) {
+                completeOnlineDdlFailed(tracker, ddlId,
+                        onlineErrorCode(failure), true);
+                throw failure;
+            }
+            rollbackOnlineAlterBeforeForward(captureId, changeLog, descriptors,
+                    shadowBinding, source, targetSdiWritten, markerPrepared,
+                    gateCleared, journalClosed, tracker, ddlId, timeout, failure);
+            throw failure;
+        }
+    }
+
+    /** 两遍流式消费多ADD candidate；第一遍删全部before/after，第二遍按source current truth确保最终entry。 */
+    private OnlineAlterDescriptorSet reconcileOnlineAlterIndexes(
+            FileOnlineAlterChangeLog changeLog,
+            MultiIndexAlterCandidateCodec outerCodec,
+            Map<Integer, SecondaryIndexCandidateCodec> nestedCodecs,
+            StorageTableDefinition sourceDefinition,
+            TableStorageBinding sourceBinding,
+            OnlineAlterDescriptorSet descriptors,
+            List<OnlineAlterIndexAddRequest> additions,
+            OnlineDdlOperationTracker tracker,
+            DdlId ddlId) {
+        Map<Integer, OnlineAlterIndexAddRequest> additionsByOrdinal = additions.stream()
+                .collect(java.util.stream.Collectors.toMap(
+                        OnlineAlterIndexAddRequest::actionOrdinal,
+                        java.util.function.Function.identity()));
+        int batchSize = onlineAlterRuntime.config().scanBatchRows();
+
+        // 1、delete pass只保留当前批次payload；每个结构变化与descriptor exact-CAS已在storage短MTR内完成。
+        long cursor = 0L;
+        while (true) {
+            List<cn.zhangyis.db.storage.api.ddl.online.OnlineAlterLogRecord> batch =
+                    changeLog.readCandidatesAfter(cursor, batchSize);
+            if (batch.isEmpty()) {
+                break;
+            }
+            requireOnlineDdlNotCancelled(ddlId,
+                    "before general ALTER reconciliation delete batch");
+            for (var record : batch) {
+                OnlineAlterCandidate candidate = outerCodec.decode(record.payload());
+                for (OnlineAlterCandidateEntry entry : candidate.entries()) {
+                    SecondaryIndexCandidateCodec nested = requireNestedCodec(
+                            nestedCodecs, entry);
+                    OnlineIndexCandidate decoded = nested.decode(entry.payload());
+                    OnlineAlterIndexAddRequest addition = requireAddition(
+                            additionsByOrdinal, entry);
+                    if (decoded.beforeEntry().isPresent()) {
+                        descriptors = physical.removeOnlineAlterIndexEntryExact(
+                                sourceDefinition, sourceBinding, descriptors, addition,
+                                decoded.beforeEntry().orElseThrow());
+                    }
+                    if (decoded.afterEntry().isPresent()) {
+                        descriptors = physical.removeOnlineAlterIndexEntryExact(
+                                sourceDefinition, sourceBinding, descriptors, addition,
+                                decoded.afterEntry().orElseThrow());
+                    }
+                }
+            }
+            cursor = batch.getLast().sequence();
+            sampleOnlineAlterDdl(tracker, sourceBinding.tableId(), changeLog);
+        }
+
+        // 2、ensure pass rewind到sequence 0；rollback/重复identity只增加幂等点查，不会把candidate当commit event。
+        cursor = 0L;
+        while (true) {
+            List<cn.zhangyis.db.storage.api.ddl.online.OnlineAlterLogRecord> batch =
+                    changeLog.readCandidatesAfter(cursor, batchSize);
+            if (batch.isEmpty()) {
+                break;
+            }
+            requireOnlineDdlNotCancelled(ddlId,
+                    "before general ALTER reconciliation ensure batch");
+            for (var record : batch) {
+                OnlineAlterCandidate candidate = outerCodec.decode(record.payload());
+                for (OnlineAlterCandidateEntry entry : candidate.entries()) {
+                    OnlineIndexCandidate decoded = requireNestedCodec(
+                            nestedCodecs, entry).decode(entry.payload());
+                    LogicalRecord identity = decoded.afterEntry().orElseGet(() ->
+                            decoded.beforeEntry().orElseThrow());
+                    descriptors = physical.ensureOnlineAlterIndexCurrentForEntry(
+                            sourceDefinition, sourceBinding, descriptors,
+                            requireAddition(additionsByOrdinal, entry), identity);
+                }
+            }
+            cursor = batch.getLast().sequence();
+            sampleOnlineAlterDdl(tracker, sourceBinding.tableId(), changeLog);
+        }
+        return descriptors;
+    }
+
+    /** 两遍流式消费clustered identity；delete pass清旧像，ensure pass回读source current truth。 */
+    private TableStorageBinding reconcileOnlineShadow(
+            FileOnlineAlterChangeLog changeLog,
+            OnlineClusteredIdentityCodec codec,
+            StorageTableRebuildRequest request,
+            TableStorageBinding shadow,
+            OnlineDdlOperationTracker tracker,
+            DdlId ddlId) {
+        int batchSize = onlineAlterRuntime.config().scanBatchRows();
+        long cursor = 0L;
+
+        // 1、首遍只删除全部candidate旧像；在完整delete pass结束前绝不重插current truth。
+        while (true) {
+            List<cn.zhangyis.db.storage.api.ddl.online.OnlineAlterLogRecord> batch =
+                    changeLog.readCandidatesAfter(cursor, batchSize);
+            if (batch.isEmpty()) {
+                break;
+            }
+            requireOnlineDdlNotCancelled(ddlId,
+                    "before shadow reconciliation delete batch");
+            for (var record : batch) {
+                shadow = physical.deleteOnlineShadowIdentity(
+                        request, shadow, codec.decode(record.payload()));
+            }
+            cursor = batch.getLast().sequence();
+            sampleOnlineAlterDdl(tracker, request.sourceBinding().tableId(), changeLog);
+        }
+
+        // 2、rewind后才从source current truth幂等ensure；final X下source不再变化。
+        cursor = 0L;
+        while (true) {
+            List<cn.zhangyis.db.storage.api.ddl.online.OnlineAlterLogRecord> batch =
+                    changeLog.readCandidatesAfter(cursor, batchSize);
+            if (batch.isEmpty()) {
+                break;
+            }
+            requireOnlineDdlNotCancelled(ddlId,
+                    "before shadow reconciliation ensure batch");
+            for (var record : batch) {
+                shadow = physical.ensureOnlineShadowIdentityCurrent(
+                        request, shadow, codec.decode(record.payload()));
+            }
+            cursor = batch.getLast().sequence();
+            sampleOnlineAlterDdl(tracker, request.sourceBinding().tableId(), changeLog);
+        }
+        return shadow;
+    }
+
+    /** candidate的ordinal/index id必须同时命中冻结codec，防止manifest内目标串线。 */
+    private static SecondaryIndexCandidateCodec requireNestedCodec(
+            Map<Integer, SecondaryIndexCandidateCodec> codecs,
+            OnlineAlterCandidateEntry entry) {
+        SecondaryIndexCandidateCodec codec = codecs.get(entry.actionOrdinal());
+        if (codec == null) {
+            throw new DictionaryDdlException(
+                    "online ALTER candidate references unknown action ordinal: "
+                            + entry.actionOrdinal());
+        }
+        return codec;
+    }
+
+    /** candidate entry与manifest ADD request执行ordinal/index双重交叉验证。 */
+    private static OnlineAlterIndexAddRequest requireAddition(
+            Map<Integer, OnlineAlterIndexAddRequest> additions,
+            OnlineAlterCandidateEntry entry) {
+        OnlineAlterIndexAddRequest addition = additions.get(entry.actionOrdinal());
+        if (addition == null || addition.definition().indexId() != entry.indexId()) {
+            throw new DictionaryDdlException(
+                    "online ALTER candidate index identity does not match manifest: ordinal="
+                            + entry.actionOrdinal() + " index=" + entry.indexId());
+        }
+        return addition;
+    }
+
+    /**
+     * 在FORWARD_ONLY之前统一回滚通用ALTER，并把原始异常作为主失败保留。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>把tracker、journal与gate推进到ABORTING；用户取消保持CANCELLED诊断，其余失败标记INTERNAL_FAILURE。</li>
+     *     <li>等待gate中已admit的DML/candidate写入退出后，再恢复source SDI并回收descriptor或shadow space。</li>
+     *     <li>仅在全部物理补偿成功时把PREPARED marker推进ROLLED_BACK并恢复source cache。</li>
+     *     <li>marker终态成立后清gate、关闭并精确删除journal；任一步失败均保留未决证据供启动恢复。</li>
+     *     <li>向registry发布ROLLED_BACK或FAILED_CLOSED；所有cleanup异常作为suppressed附着于原始异常。</li>
+     * </ol>
+     *
+     * @param captureId 已建立时的通用capture identity；prepare前失败可为空
+     * @param changeLog 已创建的operation-owned journal；创建前失败可为空
+     * @param descriptors INPLACE已经分配的完整descriptor集合；尚未分配或SHADOW时为空
+     * @param shadow SHADOW已经创建的目标binding；尚未创建或INPLACE时为空
+     * @param source initial X冻结的source aggregate；冻结前失败可为空
+     * @param targetSdiWritten 是否已经把未获发布权的target image写入source或shadow SDI
+     * @param markerPrepared PREPARED marker是否已经durable
+     * @param gateCleared 正常路径是否已经清除capture，避免重复操作owner
+     * @param journalClosed 正常路径是否已经关闭journal channel
+     * @param tracker 已注册的运行期tracker；注册前失败可为空
+     * @param ddlId 已预留的DDL identity；预留前失败可为空
+     * @param timeout 每个有界清理协作者可使用的正等待预算
+     * @param original 触发回滚的原始领域异常；cleanup异常附加为suppressed且不得替换它
+     */
+    private void rollbackOnlineAlterBeforeForward(
+            OnlineDdlCaptureId captureId,
+            FileOnlineAlterChangeLog changeLog,
+            OnlineAlterDescriptorSet descriptors,
+            TableStorageBinding shadow,
+            TableDefinition source,
+            boolean targetSdiWritten,
+            boolean markerPrepared,
+            boolean gateCleared,
+            boolean journalClosed,
+            OnlineDdlOperationTracker tracker,
+            DdlId ddlId,
+            Duration timeout,
+            RuntimeException original) {
+        boolean cleanupComplete = true;
+        OnlineDdlAbortReason abortReason = original instanceof OnlineDdlCancellationException
+                ? OnlineDdlAbortReason.CANCELLED : OnlineDdlAbortReason.INTERNAL_FAILURE;
+        // 1. 先发布abort并等待既有DML退出，禁止在candidate仍可能追加时删除journal或物理target。
+        if (tracker != null) {
+            tracker.advanceRuntime(OnlineDdlRuntimePhase.ABORTING,
+                    OnlineDdlWaitReason.NONE);
+        }
+        if (changeLog != null && !journalClosed) {
+            try {
+                changeLog.markAbortRequired(abortReason, timeout);
+            } catch (RuntimeException cleanupFailure) {
+                original.addSuppressed(cleanupFailure);
+                cleanupComplete = false;
+            }
+        }
+        if (captureId != null && !gateCleared && source != null
+                && onlineAlterRuntime.gate().phase(source.id().value())
+                != OnlineDdlTablePhase.ABSENT) {
+            try {
+                if (onlineAlterRuntime.gate().phase(source.id().value())
+                        != OnlineDdlTablePhase.ABORTING) {
+                    onlineAlterRuntime.gate().beginAbort(
+                            captureId, abortReason);
+                }
+                onlineAlterRuntime.gate().awaitAbortQuiescence(captureId, timeout);
+            } catch (RuntimeException cleanupFailure) {
+                original.addSuppressed(cleanupFailure);
+                cleanupComplete = false;
+            }
+        }
+        // 2. gate已静止后才恢复source持久image并删除本operation拥有的descriptor/shadow资源。
+        if (targetSdiWritten && source != null) {
+            try {
+                sdi.write(source, timeout);
+            } catch (RuntimeException cleanupFailure) {
+                original.addSuppressed(cleanupFailure);
+                cleanupComplete = false;
+            }
+        }
+        if (descriptors != null && source != null) {
+            try {
+                physical.rollbackOnlineAlterIndexDescriptors(
+                        source.storageBinding().orElseThrow(), descriptors, timeout);
+            } catch (RuntimeException cleanupFailure) {
+                original.addSuppressed(cleanupFailure);
+                cleanupComplete = false;
+            }
+        }
+        if (shadow != null) {
+            try {
+                physical.dropTable(shadow, timeout);
+            } catch (RuntimeException cleanupFailure) {
+                original.addSuppressed(cleanupFailure);
+                cleanupComplete = false;
+            }
+        }
+        // 3. 物理与SDI均收敛后才发布ROLLED_BACK；否则保留PREPARED让启动恢复重试。
+        if (markerPrepared && ddlId != null && cleanupComplete) {
+            try {
+                DdlLogRecord current = repository.ddlLog().find(ddlId).orElseThrow(() ->
+                        new DictionaryDdlLogStateException(
+                                "online ALTER marker disappeared during rollback: ddl="
+                                        + ddlId.value()));
+                if (current.phase() == DdlLogPhase.PREPARED
+                        && current.controlState() != DdlControlState.FORWARD_ONLY) {
+                    repository.ddlLog().transition(
+                            ddlId, DdlLogPhase.PREPARED, DdlLogPhase.ROLLED_BACK);
+                }
+                if (source != null) {
+                    cache.restoreTableAfterDdlRollback(source,
+                            DictionaryVersion.of(current.marker().dictionaryVersion()));
+                }
+            } catch (RuntimeException cleanupFailure) {
+                original.addSuppressed(cleanupFailure);
+                cleanupComplete = false;
+            }
+        }
+        // 4. 只有durable/physical补偿完整时才清gate并删除journal；失败时保留两者阻止误继续。
+        if (captureId != null && !gateCleared && source != null && cleanupComplete
+                && onlineAlterRuntime.gate().phase(source.id().value())
+                != OnlineDdlTablePhase.ABSENT) {
+            try {
+                onlineAlterRuntime.gate().clearCapture(captureId);
+            } catch (RuntimeException cleanupFailure) {
+                original.addSuppressed(cleanupFailure);
+                cleanupComplete = false;
+            }
+        }
+        if (changeLog != null && !journalClosed) {
+            try {
+                changeLog.close();
+            } catch (RuntimeException cleanupFailure) {
+                original.addSuppressed(cleanupFailure);
+                cleanupComplete = false;
+            }
+        }
+        if (changeLog != null && captureId != null && cleanupComplete) {
+            try {
+                onlineAlterRuntime.logFiles().delete(captureId, changeLog.path());
+            } catch (RuntimeException cleanupFailure) {
+                original.addSuppressed(cleanupFailure);
+                cleanupComplete = false;
+            }
+        }
+        // 5. registry仅投影最终补偿结果，不改变durable裁决；suppressed链保留所有清理根因。
+        if (tracker != null && ddlId != null) {
+            onlineDdlRegistry.complete(ddlId,
+                    cleanupComplete ? OnlineDdlTerminalResult.ROLLED_BACK
+                            : OnlineDdlTerminalResult.FAILED_CLOSED,
+                    Optional.of(onlineErrorCode(original)), false);
+        }
+    }
+
+    /** 从有序actions和最终index集合建立ADD请求；任一ADD最终不可见时在side effect前拒绝。 */
+    private static List<OnlineAlterIndexAddRequest> onlineAlterAdditions(
+            List<AlterTableAction> actions, List<IndexDefinition> targetIndexes) {
+        List<OnlineAlterIndexAddRequest> result = new ArrayList<>();
+        for (int ordinal = 0; ordinal < actions.size(); ordinal++) {
+            if (actions.get(ordinal) instanceof AlterTableAction.AddIndex add) {
+                IndexDefinition target = targetIndexes.stream()
+                        .filter(index -> index.name().equals(add.index().name()))
+                        .findFirst().orElseThrow(() -> new DatabaseValidationException(
+                                "online ALTER ADD INDEX is absent from final aggregate: "
+                                        + add.index().name().displayName()));
+                result.add(new OnlineAlterIndexAddRequest(
+                        ordinal, storageIndex(target)));
+            }
+        }
+        return List.copyOf(result);
+    }
+
+    /** 从source committed aggregate建立DROP exact binding请求；不能删除同语句临时ADD或聚簇索引。 */
+    private static List<OnlineAlterIndexDropRequest> onlineAlterDrops(
+            List<AlterTableAction> actions, TableDefinition source,
+            TableStorageBinding sourceBinding) {
+        Map<Long, IndexStorageBinding> bindings = sourceBinding.indexes().stream()
+                .collect(java.util.stream.Collectors.toMap(
+                        IndexStorageBinding::indexId,
+                        java.util.function.Function.identity()));
+        List<OnlineAlterIndexDropRequest> result = new ArrayList<>();
+        for (int ordinal = 0; ordinal < actions.size(); ordinal++) {
+            if (actions.get(ordinal) instanceof AlterTableAction.DropIndex drop) {
+                IndexDefinition sourceIndex = source.indexes().stream()
+                        .filter(index -> index.name().equals(drop.name()))
+                        .findFirst().orElseThrow(() -> new DatabaseValidationException(
+                                "online ALTER DROP INDEX is absent from source aggregate: "
+                                        + drop.name().displayName()));
+                if (sourceIndex.clustered()) {
+                    throw new DatabaseValidationException(
+                            "online ALTER cannot drop clustered index");
+                }
+                IndexStorageBinding binding = Optional.ofNullable(
+                        bindings.get(sourceIndex.id().value())).orElseThrow(() ->
+                        new DatabaseValidationException(
+                                "online ALTER DROP INDEX has no source binding: "
+                                        + sourceIndex.id().value()));
+                result.add(new OnlineAlterIndexDropRequest(ordinal, binding));
+            }
+        }
+        return List.copyOf(result);
+    }
+
+    /** INPLACE保留source row-format/space/path，只替换最终索引逻辑定义。 */
+    private static StorageTableDefinition onlineInplaceDefinition(
+            StorageTableDefinition source, List<IndexDefinition> indexes) {
+        return onlineInplaceStorageDefinition(source,
+                indexes.stream().map(DictionaryDdlService::storageIndex).toList());
+    }
+
+    /** 使用已经映射的storage index集合构造同row-format INPLACE definition。 */
+    private static StorageTableDefinition onlineInplaceStorageDefinition(
+            StorageTableDefinition source, List<StorageIndexDefinition> indexes) {
+        return new StorageTableDefinition(source.tableId(), source.spaceId(), source.path(),
+                source.schemaVersion(), source.initialSizeInPages(), source.columns(), indexes);
+    }
+
+    /** source definition后追加全部ADD定义，供capture codec解析source row到staged secondary layout。 */
+    private static List<StorageIndexDefinition> appendAddedStorageIndexes(
+            List<StorageIndexDefinition> source,
+            List<OnlineAlterIndexAddRequest> additions) {
+        List<StorageIndexDefinition> result = new ArrayList<>(source);
+        additions.stream().map(OnlineAlterIndexAddRequest::definition)
+                .forEach(result::add);
+        return List.copyOf(result);
+    }
+
+    /** source全部binding后追加ADD descriptors，构造base-scan/candidate用临时aggregate。 */
+    private static TableStorageBinding onlineInplaceBinding(
+            TableStorageBinding source, OnlineAlterDescriptorSet descriptors) {
+        List<IndexStorageBinding> bindings = new ArrayList<>(source.indexes());
+        descriptors.descriptors().stream()
+                .filter(descriptor -> descriptor.action()
+                        == OnlineAlterIndexDescriptorAction.ADD)
+                .map(OnlineAlterIndexDescriptor::indexBinding).forEach(bindings::add);
+        return new TableStorageBinding(source.tableId(), source.spaceId(), source.path(),
+                source.rowFormatVersion(), bindings, source.lobSegment());
+    }
+
+    /** 按最终DD index逻辑顺序从source与ADD descriptor组合唯一target binding，DROP自然不再可达。 */
+    private static TableStorageBinding onlineInplaceTargetBinding(
+            TableStorageBinding source, List<IndexDefinition> targetIndexes,
+            OnlineAlterDescriptorSet descriptors) {
+        Map<Long, IndexStorageBinding> byId = new LinkedHashMap<>();
+        source.indexes().forEach(binding -> byId.put(binding.indexId(), binding));
+        descriptors.descriptors().stream()
+                .filter(descriptor -> descriptor.action()
+                        == OnlineAlterIndexDescriptorAction.ADD)
+                .map(OnlineAlterIndexDescriptor::indexBinding)
+                .forEach(binding -> byId.put(binding.indexId(), binding));
+        List<IndexStorageBinding> ordered = targetIndexes.stream()
+                .map(index -> Optional.ofNullable(byId.get(index.id().value()))
+                        .orElseThrow(() -> new DatabaseValidationException(
+                                "online ALTER target binding misses index "
+                                        + index.id().value())))
+                .toList();
+        return new TableStorageBinding(source.tableId(), source.spaceId(), source.path(),
+                source.rowFormatVersion(), ordered, source.lobSegment());
+    }
+
+    /** SHA-256绑定manifest bytes与descriptor anchor；算法缺失属于JVM致命配置错误。 */
+    private static byte[] sha256(byte[] value) {
+        if (value == null) {
+            throw new DatabaseValidationException(
+                    "online ALTER manifest bytes must not be null");
+        }
+        try {
+            return MessageDigest.getInstance("SHA-256").digest(value);
+        } catch (NoSuchAlgorithmException unavailable) {
+            throw new cn.zhangyis.db.common.exception.DatabaseFatalException(
+                    "SHA-256 is unavailable for online ALTER manifest", unavailable);
+        }
+    }
+
+    /** Duration过大时饱和为Condition可表达的正纳秒预算。 */
+    private static long boundedTimeoutNanos(Duration timeout) {
+        try {
+            return timeout.toNanos();
+        } catch (ArithmeticException overflow) {
+            return Long.MAX_VALUE;
+        }
+    }
+
+    /** 从单一finalization deadline计算下一屏障剩余预算。 */
+    private static Duration remainingDuration(
+            long started, long budget, String stage) {
+        long elapsed = System.nanoTime() - started;
+        if (elapsed < 0 || elapsed >= budget) {
+            throw new OnlineAlterFinalizationTimeoutException(
+                    "online ALTER finalization deadline expired before " + stage);
+        }
+        return Duration.ofNanos(budget - elapsed);
+    }
+
+    /**
+     * 用target SDI作为持久manifest执行metadata-only ALTER；target SDI先于FORWARD_ONLY，因此source+OPEN或
+     * CANCEL_REQUESTED恢复可以从committed source DD重写SDI，source+FORWARD_ONLY则可从SDI重建target DD。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>冻结source/target digest并写PREPARED/OPEN marker，向统一registry发布cancel-capable identity。</li>
+     *     <li>在table X下先写target SDI；取消若胜出则用source aggregate恢复SDI并写ROLLED_BACK。</li>
+     *     <li>target SDI durable后竞争OPEN→FORWARD_ONLY，胜出后一次提交target DD并推进DICTIONARY_COMMITTED。</li>
+     *     <li>发布target cache和COMMITTED；forward后的任一失败保留marker/SDI供启动恢复，不逆向提交source。</li>
+     * </ol>
+     *
+     * @param owner 当前独立DDL statement owner，用于诊断但不进入持久格式
+     * @param command 已冻结策略的metadata-only有序命令
+     * @param sourceSchema source aggregate所属schema checkpoint
+     * @param targetSchema rename后的target schema checkpoint；未跨schema时与source相同
+     * @param source table X下重读的committed ACTIVE aggregate
+     * @param target 已应用全部metadata action且携带同一物理binding的目标aggregate
+     * @param ddlId 本次control reserve固定的正DDL identity
+     * @param timeout SDI、DD与marker写入共用的正等待上界
+     * @return 已提交并发布cache的target aggregate
+     * @throws DictionaryDdlException marker、SDI或DD发布失败时抛出；FORWARD_ONLY后调用方只能重启前滚
+     */
+    private TableDefinition alterTableInstantMetadata(
+            MdlOwnerId owner, AlterTableCommand command,
+            SchemaDefinition sourceSchema, SchemaDefinition targetSchema,
+            TableDefinition source, TableDefinition target,
+            DdlId ddlId, Duration timeout) {
+        TableStorageBinding binding = source.storageBinding().orElseThrow(() ->
+                new DictionaryDdlException(
+                        "metadata ALTER source has no physical binding: " + source.id().value()));
+        OnlineDdlOperationTracker tracker = onlineDdlRegistry.register(
+                new OnlineDdlOperationIdentity(ddlId, DdlLogOperation.ALTER_TABLE_INPLACE,
+                        source.id().value(), 0L, command.table().canonicalKey(), "",
+                        source.version().value(), target.version().value(), owner.value(), false,
+                        java.util.OptionalLong.empty()),
+                DdlExecutionProtocol.ONLINE_ALTER_INPLACE_V1);
+        boolean markerPrepared = false;
+        boolean forwardOnly = false;
+        try {
+            // 1、marker把两个canonical image固定到同一owner；prepare handoff允许取消在线程真正写catalog前胜出。
+            tracker.advanceRuntime(OnlineDdlRuntimePhase.ACTIVATING, OnlineDdlWaitReason.NONE);
+            if (!tracker.beginDurablePrepare()) {
+                throw new OnlineDdlCancellationException(
+                        "metadata ALTER cancelled before durable prepare: ddl=" + ddlId.value());
+            }
+            DdlLogRecord prepared = new DdlLogRecord(
+                    new DdlUndoMarker(ddlId.value(), target.version().value(), source.id().value()),
+                    0L, DdlLogOperation.ALTER_TABLE_INPLACE, DdlLogPhase.PREPARED,
+                    binding.spaceId(), binding.path(), Optional.empty(), Optional.empty(),
+                    DdlExecutionProtocol.ONLINE_ALTER_INPLACE_V1,
+                    Optional.of(schemaDigests.digest(
+                            sourceSchema, source, binding.rowFormatVersion())),
+                    Optional.empty(), Optional.of(schemaDigests.digest(
+                    targetSchema, target, binding.rowFormatVersion())),
+                    DdlControlState.OPEN, Optional.empty(), Optional.empty());
+            try {
+                repository.ddlLog().prepare(prepared);
+            } catch (RuntimeException prepareFailure) {
+                tracker.failDurablePrepare("MARKER_PREPARE_FAILED");
+                throw prepareFailure;
+            }
+            markerPrepared = true;
+            tracker.markDurablePrepared(prepared);
+            requireOnlineDdlNotCancelled(ddlId, "after metadata ALTER prepare");
+
+            // 2、SDI是metadata-only恢复manifest；仍为OPEN时它没有反向发布DD的权力，取消/普通失败会重写source。
+            tracker.advanceRuntime(OnlineDdlRuntimePhase.PUBLISHING, OnlineDdlWaitReason.NONE);
+            sdi.write(target, timeout);
+            faultInjector.afterInplaceAlterTargetSdi(prepared);
+            requireOnlineDdlNotCancelled(ddlId, "after metadata ALTER target SDI");
+
+            // 3、FORWARD_ONLY只有在target SDI已durable后才能发布；恢复因此总能从page3解码完整target aggregate。
+            DdlControlCasResult direction = repository.ddlLog().compareAndSetControl(
+                    ddlId, DdlLogPhase.PREPARED, DdlControlState.OPEN,
+                    DdlControlState.FORWARD_ONLY, Optional.empty());
+            if (!direction.changed()) {
+                if (direction.observedRecord().controlState()
+                        == DdlControlState.CANCEL_REQUESTED) {
+                    throw new OnlineDdlCancellationException(
+                            "metadata ALTER cancellation won before forward fence: ddl="
+                                    + ddlId.value());
+                }
+                throw new DictionaryDdlLogStateException(
+                        "metadata ALTER observed unexpected control direction: ddl="
+                                + ddlId.value());
+            }
+            forwardOnly = true;
+            tracker.observeDurable(direction.observedRecord());
+            tracker.advanceRuntime(
+                    OnlineDdlRuntimePhase.FORWARD_FENCED, OnlineDdlWaitReason.NONE);
+            faultInjector.afterInplaceAlterForwardFenced(direction.observedRecord());
+            cache.invalidateTable(source.id(), target.version());
+            commitUpdate(target.version(), target);
+            DdlLogRecord dictionaryCommitted = repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.PREPARED, DdlLogPhase.DICTIONARY_COMMITTED);
+            tracker.observeDurable(dictionaryCommitted);
+            faultInjector.afterInplaceAlterDictionaryCommitted(target);
+
+            // 4、cache只发布committed aggregate；terminal append失败不改变target DD已经获胜的事实。
+            cache.publishTable(target);
+            DdlLogRecord committed = repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.DICTIONARY_COMMITTED, DdlLogPhase.COMMITTED);
+            tracker.observeDurable(committed);
+            cleanSnapshotPublisher.publish();
+            onlineDdlRegistry.complete(ddlId, OnlineDdlTerminalResult.COMPLETED,
+                    Optional.empty(), false);
+            log.info("completed instant metadata ALTER: table={} ddlId={} version={}",
+                    command.table().canonicalKey(), ddlId.value(), target.version().value());
+            return target;
+        } catch (RuntimeException failure) {
+            if (forwardOnly) {
+                completeOnlineDdlFailed(tracker, ddlId, onlineErrorCode(failure), true);
+                throw failure;
+            }
+            if (!markerPrepared && tracker.snapshot().terminalResult()
+                    == OnlineDdlTerminalResult.FAILED_CLOSED) {
+                // marker append outcome未形成可回滚证据；保持原失败并把同一FAILED_CLOSED投影移入有界history。
+                completeOnlineDdlFailed(tracker, ddlId, onlineErrorCode(failure), false);
+                throw failure;
+            }
+            // 2、未越过forward fence时committed source仍是权威；重写SDI后才允许把marker终结为ROLLED_BACK。
+            if (markerPrepared) {
+                try {
+                    sdi.write(source, timeout);
+                    DdlLogRecord current = repository.ddlLog().find(ddlId).orElseThrow(() ->
+                            new DictionaryDdlLogStateException(
+                                    "metadata ALTER marker disappeared: ddl=" + ddlId.value()));
+                    if (current.phase() == DdlLogPhase.PREPARED
+                            && current.controlState() != DdlControlState.FORWARD_ONLY) {
+                        DdlLogRecord rolledBack = repository.ddlLog().transition(
+                                ddlId, DdlLogPhase.PREPARED, DdlLogPhase.ROLLED_BACK);
+                        tracker.observeDurable(rolledBack);
+                    }
+                } catch (RuntimeException rollbackFailure) {
+                    failure.addSuppressed(rollbackFailure);
+                    completeOnlineDdlFailed(tracker, ddlId,
+                            "METADATA_ROLLBACK_FAILED", false);
+                    throw failure;
+                }
+            }
+            onlineDdlRegistry.complete(ddlId, OnlineDdlTerminalResult.ROLLED_BACK,
+                    Optional.of(onlineErrorCode(failure)), false);
+            throw failure;
         }
     }
 
@@ -1738,6 +3970,21 @@ public final class DictionaryDdlService {
             this.tickets = List.copyOf(tickets);
         }
 
+        /**
+         * 返回本 owner 已持有的精确 MDL ticket，供在线阶段在同一 ticket 上降级或升级。
+         *
+         * @param key 已按全局名称顺序取得的 MDL key
+         * @return 与 key 完全相等且仍由本 owner 管理的 ticket
+         * @throws DictionaryDdlException 调用方请求了未取得的 key 时抛出；现有 ticket 保持持有并由 close 释放
+         */
+        private MdlTicket require(MdlKey key) {
+            return tickets.stream()
+                    .filter(ticket -> ticket.key().equals(key))
+                    .findFirst()
+                    .orElseThrow(() -> new DictionaryDdlException(
+                            "ALTER MDL ticket is not owned for key: " + key));
+        }
+
         @Override
         public void close() {
             RuntimeException failure = null;
@@ -1792,6 +4039,55 @@ public final class DictionaryDdlService {
     private static TableDefinition lifecycle(TableDefinition before, DictionaryVersion version, TableState state) {
         return new TableDefinition(before.id(), before.schemaId(), before.name(), version, state,
                 before.columns(), before.indexes(), before.storageBinding(), before.options());
+    }
+
+    /**
+     * 构造只用于canonical digest的逻辑版本；物理binding被digest语法排除，避免尚未创建的segment/root污染计划值。
+     *
+     * @param before initial X下读取的source aggregate，提供table/schema/name/columns/options
+     * @param version 已预留且将由target aggregate发布的dictionary version
+     * @param state operation策略规定的target lifecycle state
+     * @param indexes target按aggregate ordinal排列的完整索引集合
+     * @return 不携带物理binding、但逻辑字段与未来target完全一致的不可变aggregate
+     */
+    private static TableDefinition logicalVersion(
+            TableDefinition before, DictionaryVersion version, TableState state,
+            List<IndexDefinition> indexes) {
+        return new TableDefinition(before.id(), before.schemaId(), before.name(), version, state,
+                before.columns(), indexes, Optional.empty(), before.options());
+    }
+
+    /**
+     * 复制source索引顺序并在末尾追加新二级索引，保证digest与最终DD aggregate使用同一ordinal。
+     *
+     * @param source initial X下冻结的完整索引集合
+     * @param added 已分配稳定identity、尚未创建物理segment的新索引
+     * @return 保持source顺序并追加added的不可变target集合
+     */
+    private static List<IndexDefinition> appendIndex(
+            List<IndexDefinition> source, IndexDefinition added) {
+        List<IndexDefinition> target = new ArrayList<>(source);
+        target.add(added);
+        return List.copyOf(target);
+    }
+
+    /**
+     * final X下比较live source与PREPARED保存的canonical checkpoint；不一致时禁止越过forward fence。
+     *
+     * @param expected marker中initial X时已经durable的source digest
+     * @param actual final X下从当前committed source重新计算的digest
+     * @param ddlId 用于定位保留marker/sidecar的DDL identity
+     * @param checkpoint 诊断使用的固定checkpoint名称
+     * @throws DictionaryDdlException schema ownership或version被意外改写时抛出；control仍为OPEN，调用方可安全回滚
+     */
+    private static void requireLiveDigest(
+            DdlSchemaDigest expected, DdlSchemaDigest actual,
+            DdlId ddlId, String checkpoint) {
+        if (!expected.equals(actual)) {
+            throw new DictionaryDdlException(
+                    "DDL live schema digest mismatch: ddl=" + ddlId.value()
+                            + " checkpoint=" + checkpoint);
+        }
     }
 
     private static List<ColumnDefinition> columns(CreateTableCommand command) {

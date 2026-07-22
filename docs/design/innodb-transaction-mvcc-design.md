@@ -572,6 +572,18 @@ Lock request 状态图见 [transaction-lock-request-state.mmd](diagrams/transact
 7. 回收空 undo page 或 undo segment。
 8. 更新 history list 长度和 purge cursor。
 
+当前并发落点（2026-07-22）：`PurgeCoordinator` 先从物理 head 冻结有界 eligible 前缀，再由
+`PurgeWorkerPool` 按 affected-table completion DAG 派发完整 history log。相同 table id 的日志保持 FIFO，
+多表日志同时形成所有相关 table 的 fence，异表日志可以并行。worker 在同行 guard 内保持
+secondary→clustered→LOB/head progress 的记录级顺序，只把 logical head 推到 EMPTY；history/segment
+finalization 仍由 dispatcher 严格按物理 head 的连续 READY 前缀完成。因此并行不会改变 purge boundary、
+history table barrier 或 crash recovery 的权威顺序。
+
+关闭和超时采用 fail-stop：先停止 driver 与 pool 接纳、取消排队 stage，再共享 deadline 等待运行任务到下一
+undo record 边界。不能在线程位于 B+Tree/MTR 物理修改中间时强制中断；普通 close 等待超时必须拒绝进入后续
+句柄释放并报告失败。
+当前未做 index/page 内子任务并行、多 rseg blocked-head 选择或 purge→truncate 自动调度。
+
 purge 安全条件：
 
 - 不能删除任何仍可能被 active ReadView 构造旧版本需要的 undo。
@@ -745,11 +757,11 @@ purge 安全条件：
 ### 16.6 Purge
 
 1. PurgeCoordinator 读取最老 ReadView。
-2. 从 history list 取候选 update undo。
-3. 判断该 undo 是否仍可能用于旧版本构造。
-4. 对安全的 delete-mark 记录执行物理删除。
-5. 回收 undo record/page/segment。
-6. 推进 purge cursor 和 history list length。
+2. 从 history list 取有界物理前缀，并在首个不可清理节点截断。
+3. 按 affected-table token 并行执行互不相关的完整 update undo log，同表保持 FIFO。
+4. worker 对安全的 delete-mark/secondary/LOB ownership 执行记录级短 MTR，并持久化 logical head。
+5. dispatcher 只为连续 READY 物理 head 回收 undo segment/slot 并摘除 history。
+6. 推进 purge cursor 和 history list length；DEFERRED/FAILED 后方不得越序 finalization。
 
 ## 17. 并发与锁顺序
 

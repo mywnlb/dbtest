@@ -257,6 +257,56 @@ public final class DictionaryObjectCache {
     }
 
     /**
+     * 有界等待指定表的精确字典版本不再被 pin。
+     *
+     * <p>Online DROP 在 target version 发布后仍允许新语句持续 pin 新版本，因此不能使用表级
+     * {@link #awaitUnpinned(TableId, Duration)}。本方法只观察 source version；旧版本已经因最后一个 pin
+     * 释放而从 cache 移除时同样视为安全。</p>
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 table/version/timeout，并把超大等待时长饱和为可供 Condition 使用的纳秒预算。</li>
+     *     <li>持 cache 短锁定位 exact version；只要该 entry 仍有 pin 就释放锁有界等待。</li>
+     *     <li>exact entry 不存在或 pin 归零即返回；target version 的并发 pin 不参与该谓词。</li>
+     * </ol>
+     *
+     * @param tableId retirement fence 中的稳定正表 identity
+     * @param version final X 捕获的 source dictionary version，必须为正版本
+     * @param timeout 最大等待时长，必须为正；等待期间不持 MDL、页 latch、MTR 或文件锁
+     * @return source version 已无 pin 时返回 {@code true}；超时或线程中断时返回 {@code false}，中断标记会恢复
+     * @throws DatabaseValidationException 任一参数缺失或 timeout 非正时抛出，cache 状态保持不变
+     */
+    public boolean awaitVersionUnpinned(TableId tableId, DictionaryVersion version, Duration timeout) {
+        // 1. fence identity 在进入共享锁前完成校验，非法请求不参与任何 cache 等待队列。
+        if (tableId == null || version == null || timeout == null
+                || timeout.isZero() || timeout.isNegative()) {
+            throw new DatabaseValidationException(
+                    "await-version-unpinned table/version/positive timeout required");
+        }
+        long remaining = timeoutNanos(timeout);
+
+        // 2. Condition 只保护内存 pin 投影；等待会原子释放 cache lock，不阻塞 loader 或 pin close。
+        lock.lock();
+        try {
+            while (hasVersionPins(tableId, version)) {
+                if (remaining <= 0L) {
+                    return false;
+                }
+                try {
+                    remaining = pinsChanged.awaitNanos(remaining);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+            }
+            // 3. target version 可以继续被 pin；只要 source entry 已释放，retirement 的 metadata 条件即闭合。
+            return true;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
      * 采集 {@code snapshot} 对应的数据字典稳定快照；返回对象与后续内部修改隔离，不转移内部可变状态的所有权。
      *
      * @return {@code snapshot} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
@@ -492,6 +542,16 @@ public final class DictionaryObjectCache {
     private boolean hasPins(TableId tableId) {
         NavigableMap<Long, Entry> tableVersions = versions.get(tableId);
         return tableVersions != null && tableVersions.values().stream().anyMatch(entry -> entry.pinCount > 0);
+    }
+
+    /** 当前已持 cache lock；不存在的旧版本等价于其最后一个 pin 已释放。 */
+    private boolean hasVersionPins(TableId tableId, DictionaryVersion version) {
+        NavigableMap<Long, Entry> tableVersions = versions.get(tableId);
+        if (tableVersions == null) {
+            return false;
+        }
+        Entry entry = tableVersions.get(version.value());
+        return entry != null && entry.pinCount > 0;
     }
 
     private static void validatePinArguments(TableId tableId, Duration timeout,

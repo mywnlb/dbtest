@@ -228,6 +228,109 @@ public final class SdiPageRepository {
     }
 
     /**
+     * 读取page3 `ALT1` anchor；全零footer返回empty，旧IDX descriptor不会被误解释为通用owner。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>按page0→page3顺序取得共享页并验证SDI root/envelope/format。</li>
+     *     <li>确认footer未被legacy payload覆盖，复制固定96字节后立即脱离页视图。</li>
+     *     <li>全零返回empty；非空必须通过ALT magic/version/CRC/identity全部校验。</li>
+     * </ol>
+     *
+     * @param mtr 负责page0/page3 fix与S latch的只读MTR
+     * @param spaceId 当前committed表所属已打开空间
+     * @return 已验证anchor，或没有未决通用ALTER时为空
+     * @throws SdiPageCorruptionException footer属于其它格式或任一ALT字段损坏时抛出，恢复不得清理资源
+     */
+    public Optional<SdiOnlineAlterAnchor> readOnlineAlterAnchor(
+            MiniTransaction mtr, SpaceId spaceId) {
+        // 1. 复用SDI物理真相，不允许按裸page3 offset绕过root和信封检查。
+        require(mtr, spaceId);
+        SpaceHeaderSnapshot header = spaceHeaders.read(mtr, spaceId);
+        requireV1Root(header.sdiRootPageNo());
+        PageGuard page = mtr.getPage(pool, pageId(spaceId), PageLatchMode.SHARED);
+        validateEnvelope(page, spaceId);
+        validateFormat(page);
+
+        // 2. footer容量必须与当前SDI payload不重叠；复制后codec不持有PageGuard。
+        requireFooterAvailable(page);
+        byte[] footer = page.readBytes(SdiPageLayout.indexBuildFooterOffset(pageSize),
+                SdiPageLayout.INDEX_BUILD_FOOTER_BYTES);
+        if (java.util.Arrays.equals(footer, new byte[footer.length])) {
+            return Optional.empty();
+        }
+
+        // 3. 错格式与损坏都转换成SDI corruption，调用方不能把“不是ALT”当作空闲footer覆盖。
+        try {
+            return Optional.of(new SdiOnlineAlterAnchorCodec().decode(footer));
+        } catch (DatabaseValidationException invalid) {
+            throw new SdiPageCorruptionException(
+                    "SDI online ALTER anchor is invalid", invalid);
+        }
+    }
+
+    /**
+     * 在固定page3 footer写入通用ALTER anchor；只允许从全零状态建立owner。
+     *
+     * @param mtr 同时创建descriptor segment/pages的活动写MTR
+     * @param spaceId descriptor chain所属表空间
+     * @param anchor 已冻结ddl/table/version/generation/root/digest的owner
+     * @throws SdiPageCorruptionException footer已占用或SDI物理格式损坏时抛出
+     */
+    public void writeOnlineAlterAnchor(MiniTransaction mtr, SpaceId spaceId,
+                                       SdiOnlineAlterAnchor anchor) {
+        require(mtr, spaceId);
+        if (anchor == null) {
+            throw new DatabaseValidationException(
+                    "SDI online ALTER anchor must not be null");
+        }
+        SpaceHeaderSnapshot header = spaceHeaders.readForUpdate(mtr, spaceId);
+        requireV1Root(header.sdiRootPageNo());
+        PageGuard page = mtr.getPage(pool, pageId(spaceId), PageLatchMode.EXCLUSIVE);
+        validateEnvelope(page, spaceId);
+        validateFormat(page);
+        requireFooterAvailable(page);
+        int offset = SdiPageLayout.indexBuildFooterOffset(pageSize);
+        byte[] current = page.readBytes(offset, SdiPageLayout.INDEX_BUILD_FOOTER_BYTES);
+        if (!java.util.Arrays.equals(current, new byte[current.length])) {
+            throw new SdiPageCorruptionException(
+                    "SDI DDL footer is occupied before online ALTER anchor write");
+        }
+        page.writeBytes(offset, new SdiOnlineAlterAnchorCodec().encode(anchor));
+    }
+
+    /**
+     * 对通用ALTER anchor执行完整字节exact-CAS clear，防止迟到恢复任务擦除新owner。
+     *
+     * @param mtr 完成descriptor/segment回收的同一写MTR
+     * @param spaceId owner所在空间
+     * @param expected 已与marker、journal header和descriptor chain交叉校验的anchor
+     * @throws SdiPageCorruptionException footer缺失、损坏或identity改变时抛出，调用方必须保留资源
+     */
+    public void clearOnlineAlterAnchor(MiniTransaction mtr, SpaceId spaceId,
+                                       SdiOnlineAlterAnchor expected) {
+        require(mtr, spaceId);
+        if (expected == null) {
+            throw new DatabaseValidationException(
+                    "expected SDI online ALTER anchor must not be null");
+        }
+        SpaceHeaderSnapshot header = spaceHeaders.readForUpdate(mtr, spaceId);
+        requireV1Root(header.sdiRootPageNo());
+        PageGuard page = mtr.getPage(pool, pageId(spaceId), PageLatchMode.EXCLUSIVE);
+        validateEnvelope(page, spaceId);
+        validateFormat(page);
+        requireFooterAvailable(page);
+        int offset = SdiPageLayout.indexBuildFooterOffset(pageSize);
+        byte[] current = page.readBytes(offset, SdiPageLayout.INDEX_BUILD_FOOTER_BYTES);
+        byte[] expectedBytes = new SdiOnlineAlterAnchorCodec().encode(expected);
+        if (!java.util.Arrays.equals(current, expectedBytes)) {
+            throw new SdiPageCorruptionException(
+                    "SDI online ALTER anchor changed before clear");
+        }
+        page.writeBytes(offset, new byte[SdiPageLayout.INDEX_BUILD_FOOTER_BYTES]);
+    }
+
+    /**
      * 读取并校验通用索引 DDL footer；非空 descriptor 的动作必须与调用方预期完全一致。
      */
     private Optional<SdiIndexDdlDescriptor> readIndexDdl(
@@ -284,6 +387,68 @@ public final class SdiPageRepository {
         writeIndexDdl(mtr, spaceId, new SdiIndexDdlDescriptor(
                 SdiIndexDdlAction.BUILD, descriptor.ddlOperationId(), descriptor.dictionaryVersion(),
                 descriptor.tableId(), descriptor.indexBinding()));
+    }
+
+    /**
+     * 以 compare-and-replace 方式刷新既有 BUILD footer 的 root level。Online build 的 root page 和 segment
+     * owner 始终稳定，split/merge 只允许改变 level；expected 不匹配时拒绝覆盖，防止迟到任务擦写其它 DDL。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 expected/replacement 的 DDL、table、index、root 与 segment identity 完全一致。</li>
+     *     <li>按既有 page3 更新路径取得 space header 与 footer page X latch并验证 envelope/format。</li>
+     *     <li>逐字节比较当前 footer 与 expected 编码，错配作为持久所有权冲突 fail-closed。</li>
+     *     <li>写入 replacement 编码；redo、pageLSN 和 dirty 副作用归调用方同一 MTR。</li>
+     * </ol>
+     *
+     * @param mtr 同时拥有 staged index 结构写的活动 MTR
+     * @param spaceId build 所属既有 tablespace
+     * @param expected 调用方开始本次结构写前读取的完整 descriptor
+     * @param replacement 仅 root level 可变化的新 descriptor
+     * @throws DatabaseValidationException 参数或 immutable owner identity 改变时抛出
+     * @throws SdiPageCorruptionException footer 损坏或不等于 expected 时抛出，调用方不得覆盖
+     */
+    public void updateIndexBuild(MiniTransaction mtr, SpaceId spaceId,
+                                 SdiIndexBuildDescriptor expected,
+                                 SdiIndexBuildDescriptor replacement) {
+        // 1. replacement 只能刷新稳定 root 的 level，不能借更新路径偷换物理 owner。
+        if (expected == null || replacement == null
+                || expected.ddlOperationId() != replacement.ddlOperationId()
+                || expected.dictionaryVersion() != replacement.dictionaryVersion()
+                || expected.tableId() != replacement.tableId()
+                || expected.indexBinding().indexId() != replacement.indexBinding().indexId()
+                || !expected.indexBinding().rootPageId().equals(replacement.indexBinding().rootPageId())
+                || !expected.indexBinding().leafSegment().equals(replacement.indexBinding().leafSegment())
+                || !expected.indexBinding().nonLeafSegment().equals(replacement.indexBinding().nonLeafSegment())) {
+            throw new DatabaseValidationException("SDI index build update changes immutable owner identity");
+        }
+        require(mtr, spaceId);
+        if (!replacement.indexBinding().rootPageId().spaceId().equals(spaceId)) {
+            throw new DatabaseValidationException("SDI index build update belongs to another tablespace");
+        }
+
+        // 2. 与 create/clear 共用 page3 envelope 和格式真相，不能直接按裸 offset 绕过校验。
+        SpaceHeaderSnapshot header = spaceHeaders.readForUpdate(mtr, spaceId);
+        requireV1Root(header.sdiRootPageNo());
+        PageGuard page = mtr.getPage(pool, pageId(spaceId), PageLatchMode.EXCLUSIVE);
+        validateEnvelope(page, spaceId);
+        validateFormat(page);
+        requireFooterAvailable(page);
+
+        // 3. 完整 expected 比较令重复更新幂等且迟到 updater 可诊断，不接受“同 ddl id 即覆盖”。
+        int offset = SdiPageLayout.indexBuildFooterOffset(pageSize);
+        byte[] current = page.readBytes(offset, SdiPageLayout.INDEX_BUILD_FOOTER_BYTES);
+        byte[] expectedBytes = encodeIndexDdl(new SdiIndexDdlDescriptor(
+                SdiIndexDdlAction.BUILD, expected.ddlOperationId(), expected.dictionaryVersion(),
+                expected.tableId(), expected.indexBinding()));
+        if (!java.util.Arrays.equals(current, expectedBytes)) {
+            throw new SdiPageCorruptionException("SDI index build footer changed before root refresh");
+        }
+
+        // 4. 写入仍由调用方 MTR 记录 redo/pageLSN，和触发 level 变化的结构操作原子提交。
+        page.writeBytes(offset, encodeIndexDdl(new SdiIndexDdlDescriptor(
+                SdiIndexDdlAction.BUILD, replacement.ddlOperationId(), replacement.dictionaryVersion(),
+                replacement.tableId(), replacement.indexBinding())));
     }
 
     /**

@@ -6,11 +6,18 @@ import cn.zhangyis.db.dd.domain.TableId;
 import cn.zhangyis.db.dd.domain.TableState;
 import cn.zhangyis.db.dd.exception.DictionaryObjectNotFoundException;
 import cn.zhangyis.db.dd.repo.PersistentDictionaryRepository;
+import cn.zhangyis.db.dd.ddl.DdlControlState;
+import cn.zhangyis.db.dd.ddl.DdlExecutionProtocol;
+import cn.zhangyis.db.dd.ddl.DdlLogOperation;
+import cn.zhangyis.db.dd.ddl.DdlRetiredResourceKind;
 import cn.zhangyis.db.storage.btree.IndexMetadataResolver;
 import cn.zhangyis.db.storage.btree.BTreeIndex;
 import cn.zhangyis.db.storage.trx.UndoTargetMetadata;
 import cn.zhangyis.db.storage.trx.UndoTargetMetadataResolver;
 import cn.zhangyis.db.storage.trx.UndoTargetDisposition;
+
+import java.util.Set;
+import java.util.TreeSet;
 
 /** committed DD table/index 定义与物理 binding 的 rollback/purge adapter。无全局默认索引或名称猜测。 */
 public final class DictionaryIndexMetadataResolver implements IndexMetadataResolver, UndoTargetMetadataResolver {
@@ -77,6 +84,46 @@ public final class DictionaryIndexMetadataResolver implements IndexMetadataResol
                 || table.state() == TableState.RECOVERY_DISCARDED
                 ? UndoTargetDisposition.RECOVERY_UNAVAILABLE
                 : UndoTargetDisposition.AVAILABLE;
-        return new UndoTargetMetadata(mapped.tableIndexes(), mapped.lobSegment(), disposition);
+        return new UndoTargetMetadata(mapped.tableIndexes(), mapped.lobSegment(), disposition,
+                retiredSecondaryIndexes(table));
+    }
+
+    /**
+     * 从未决ONLINE_DROP marker投影当前target DD已移除、但仍由retirement fence持有的secondary identity。
+     *
+     * <p>只有target version、FORWARD_ONLY、fence owner/table/resource全部闭合才返回；误判会让purge跳过逐entry删除，
+     * 因而任何缺失或第三态都返回空集合并由普通metadata校验fail-closed。marker COMMITTED前barrier保证旧history
+     * 已清空，COMMITTED后无需继续保留该投影。</p>
+     *
+     * @param table 当前committed ACTIVE target aggregate
+     * @return 按index id排序的不可变退休集合；没有安全未决marker时为空
+     */
+    private Set<Long> retiredSecondaryIndexes(TableDefinition table) {
+        TreeSet<Long> retired = new TreeSet<>();
+        repository.ddlLog().unresolved().stream()
+                .filter(record -> record.operation() == DdlLogOperation.DROP_INDEX)
+                .filter(record -> record.executionProtocol()
+                        == DdlExecutionProtocol.ONLINE_DROP_INDEX_V1)
+                .filter(record -> record.controlState() == DdlControlState.FORWARD_ONLY)
+                .filter(record -> record.marker().affectedObjectId() == table.id().value())
+                .filter(record -> record.marker().dictionaryVersion() == table.version().value())
+                .filter(record -> table.indexes().stream().noneMatch(index ->
+                        index.id().value() == record.secondaryObjectId()))
+                .filter(record -> record.retirementFence().isPresent())
+                .filter(record -> {
+                    var fence = record.retirementFence().orElseThrow();
+                    return fence.tableId() == table.id().value()
+                            && fence.ownerDdlId() == record.marker().ddlOperationId()
+                            && fence.sourceDictionaryVersion() < table.version().value()
+                            && fence.sourceMetadataPinVersion()
+                            == fence.sourceDictionaryVersion()
+                            && fence.resources().size() == 1
+                            && fence.resources().getFirst().kind()
+                            == DdlRetiredResourceKind.INDEX
+                            && fence.resources().getFirst().resourceId()
+                            == record.secondaryObjectId();
+                })
+                .forEach(record -> retired.add(record.secondaryObjectId()));
+        return Set.copyOf(retired);
     }
 }

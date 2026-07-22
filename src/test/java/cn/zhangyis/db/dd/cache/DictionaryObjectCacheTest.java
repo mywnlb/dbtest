@@ -88,6 +88,27 @@ class DictionaryObjectCacheTest {
         assertTrue(cache.awaitUnpinned(TableId.of(2), Duration.ofSeconds(1)));
     }
 
+    /** Online DROP只等待source version；target version的新pin不得让退休集合变成无界等待。 */
+    @Test
+    void waitsForExactSourceVersionWithoutBeingBlockedByTargetPins() {
+        DictionaryObjectCache cache = new DictionaryObjectCache(16);
+        cache.publishTable(table(2));
+        DictionaryPin<TableDefinition> sourcePin = cache.pinTable(
+                TableId.of(2), Duration.ofSeconds(1), Optional::empty);
+        cache.publishTable(table(3));
+
+        try (DictionaryPin<TableDefinition> targetPin = cache.pinTable(
+                TableId.of(2), Duration.ofSeconds(1), Optional::empty)) {
+            assertFalse(cache.awaitVersionUnpinned(
+                    TableId.of(2), DictionaryVersion.of(2), Duration.ofMillis(20)));
+            sourcePin.close();
+            assertTrue(cache.awaitVersionUnpinned(
+                    TableId.of(2), DictionaryVersion.of(2), Duration.ofSeconds(1)));
+            assertFalse(cache.awaitUnpinned(TableId.of(2), Duration.ofMillis(20)),
+                    "table-wide barrier must still observe the target-version pin");
+        }
+    }
+
     /** leader 发生 JVM Error 时也必须清掉 LOADING 并原样传播，不得包装成可重试的字典运行异常。 */
     @Test
     void propagatesLoaderErrorAndClearsSingleFlightState() {

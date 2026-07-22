@@ -289,23 +289,31 @@ ALTER 策略：
 
 | 类型 | 策略 | 说明 |
 | --- | --- | --- |
-| metadata-only rename/comment | `MetadataOnlyAlterStrategy` | 只改字典和 cache |
-| add secondary index | `InplaceIndexBuildStrategy` | 扫描聚簇索引，构建新 B+Tree |
-| add/drop column | `CopyTableAlterStrategy` | 创建新物理表，搬迁记录，切换 binding |
+| metadata-only rename/comment/options | `INSTANT_METADATA` | target SDI作为恢复manifest，FORWARD_ONLY后提交字典/cache |
+| single add/drop secondary index | `INPLACE_INDEX` | 复用Online ADD row-log或Online DROP retirement协议 |
+| add/drop column、convert charset | `SHADOW_REBUILD_V1` | SU下bounded copy，clustered identity journal收敛并延迟回收旧space |
+| multi-index / mixed action | `INPLACE_INDEX`或`SHADOW_REBUILD_V1` | 一个manifest/descriptor generation/target DD version原子发布完整action集合 |
 | unsupported instant alter | `UnsupportedAlterStrategy` | 明确异常，不静默降级 |
 
 ### 8.4 CREATE INDEX
 
 流程：
 
-1. 获取 table `MDL_SHARED_UPGRADABLE`，构建阶段允许有限 DML。
-2. 进入 final publish 前升级到 `MDL_EXCLUSIVE`。
-3. 扫描聚簇索引，使用 Record codec 构造 secondary key。
-4. B+Tree 创建并填充 secondary index。
-5. 字典提交新 `IndexDefinition` 和 root binding。
-6. cache 发布新 table version。
+1. 获取 table `MDL_SHARED_UPGRADABLE`，短暂升级到 `MDL_EXCLUSIVE`，冻结旧 aggregate、table gate、
+   immutable manifest、DDL marker 和 staged descriptor。
+2. `CAPTURING` force 后把同一 ticket 降回 `MDL_SHARED_UPGRADABLE`；base scan 分批构建 B+Tree，
+   并发 DML 在事务提交/XA PREPARE 前把 before/after candidate force 到 row log。
+3. final cutover 再升级到 `MDL_EXCLUSIVE`，seal table gate 和 row log，按当前聚簇真相 reconcile candidate。
+4. 双向验证 source/target，满足 WAL 与表空间 force 后持久 `RECONCILED`，再推进 `ENGINE_DONE`。
+5. 按 SDI、DD exact add-one-index、cache、footer 和 terminal marker 的顺序发布新 version。
+6. crash recovery 在用户流量开放前重建 PREPARED generation，或对 ENGINE_DONE/committed DD 只前滚。
 
-简化点：第一阶段不实现 online DDL row log；因此默认可使用 `MDL_EXCLUSIVE` 全程阻塞 DML。保留 `OnlineIndexBuildStrategy` 扩展点。
+当前 Online ADD INDEX v1 的完整并发、row-log、事务/XA 与恢复协议见
+[mysql-online-add-index-design.md](mysql-online-add-index-design.md)。marker v4 schema digest、统一control CAS、
+Java/admin可观察/取消、Online DROP retirement以及通用ALTER策略矩阵见
+[mysql-online-ddl-evolution-design.md](mysql-online-ddl-evolution-design.md)。其中digest/control、Online DROP、
+instant metadata、版本化multi-index descriptor chain与online shadow rebuild均已进入生产；复制binlog、
+主键/任意类型/foreign/generated、外排/并行build与持久scan continuation仍未实现。
 
 ## 9. 与其它模块的协作
 
@@ -574,24 +582,30 @@ Atomic DDL recovery 流程见 [atomic-ddl-recovery-flow.mmd](diagrams/atomic-ddl
 | 14 | 异常与恢复 | 已给出异常类型、DDL log recovery、orphan cleanup、SDI mismatch 处理 |
 | 15 | 测试与顺序 | 已给出测试设计、后续实现顺序，并确认没有未完成标记或空白项 |
 
-## 19. 2026-07-20 当前实现落点
+## 19. 2026-07-21 当前实现落点
 
 本节只记录已从源码和测试核对的 v1 落点；前文仍是长期目标设计。
 
-- `cn.zhangyis.db.dd.domain/repo/tx/cache/mdl/service/ddl/recovery/sdi` 已落地 schema/table/index 不可变定义、repository、版本 cache、MDL、CREATE/DROP TABLE、blocking CREATE/ALTER ADD/DROP INDEX 与 SDI v1。
+- `cn.zhangyis.db.dd.domain/repo/tx/cache/mdl/service/ddl/recovery/sdi` 已落地 schema/table/index 不可变定义、repository、版本cache、MDL、CREATE/DROP TABLE、Online ADD/DROP INDEX、instant metadata、multi-index INPLACE、online shadow ALTER与SDI v1。
 - `mysql.dd.ctrl` 使用双 4 KiB CRC32C 槽保存 ID/version high-water；启动时以已提交 catalog 对象/space/version、最大 DDL marker 与 `dictionaryVersion-1` 保守下界反向校正 high-water，防止新槽损坏导致 ID 复用。
 - `mysql.ibd` v1 实际是页对齐 append-only catalog sidecar，使用 frame CRC 和 batch SHA manifest；它尚不是前文目标中经 Buffer Pool/MTR/redo 管理的 InnoDB 字典 B+Tree。
 - 公共 `DatabaseEngine` 在打开 catalog 前调用 `CatalogBootstrapAdmission`：非空 `mysql.ibd` 只走 existing 格式校验；missing/empty 状态只有在 DD control、single/ring redo、redo/transaction control、任意稳定 undo、三类 doublewrite 与受控表空间候选都不存在时才可初始化。任一证据或扫描失败均抛 `DictionaryCatalogAdmissionException`，且尚未创建 storage、运行 DDL recovery 或 orphan cleanup。
-- `PersistentDdlLogRepository` 与普通 DD repository 共享 `mysql.ibd` 物理 store，但分别只解释 `DDL_LOG(7)` 单记录批次与 `CATALOG_COMMIT` 批次；DDL log v3 为 CREATE_INDEX/DROP_INDEX 在 key/payload 双份保存 index id，并兼容读取 v1 table marker；identity、稳定 code、phase transition、辅助路径/文件 identity 与 UTF-8 path 形状全部 fail-closed。
+- `PersistentDdlLogRepository` 与普通DD repository共享`mysql.ibd`物理store，但分别只解释`DDL_LOG(7)`单记录批次与`CATALOG_COMMIT`批次；DDL log v4在v3 identity上增加execution protocol、source/intermediate/target schema digest、durable control/cancellation与retirement fence，并兼容解码v1-v3为`LEGACY_PHASE_ONLY`。identity、稳定code、checkpoint策略、phase/control转换、辅助路径/文件identity与UTF-8形状全部fail-closed。
 - 字典 version 只要比已发布版本大即合法；先保留后 crash 会留下可解释的版本间隙，不得回退复用。
 - `DataDictionaryService.openTable` 按 schema→table 获取 MDL，再持有 cache pin；`TableMetadataLease.close` 统一逆序释放。
 - `storage.api.ddl.DdlUndoMarker(ddlOperationId,dictionaryVersion,affectedObjectId)` 是 DD 与未来 dictionary-row undo 共用的稳定数值关联对象；当前 sidecar DD 不把 marker 混入普通用户 row undo/history。
 - CREATE 顺序为 `PREPARED -> physical CREATE/empty page3 durable -> ENGINE_DONE -> full SDI durable -> ACTIVE DD -> DICTIONARY_COMMITTED -> cache -> COMMITTED`。启动恢复对无 DD 的 PREPARED/ENGINE_DONE 只删除 marker identity 推导出的 exact path并写 ROLLED_BACK；匹配 ACTIVE 时补齐 terminal，错绑或缺文件阻止 OPEN。
 - DROP 在 table X 下先等待 `TablePurgeBarrier`，再按 `PREPARED -> DROP_PENDING -> DICTIONARY_COMMITTED -> physical DROP -> ENGINE_DONE -> DROPPED -> COMMITTED` 推进。恢复对 ACTIVE+PREPARED 回滚，对 DROP_PENDING 再过 barrier 后前滚，对 DROPPED 补 terminal。
-- CREATE INDEX v1 支持 `CREATE [UNIQUE] INDEX` 与 `ALTER TABLE ... ADD [UNIQUE] INDEX`，两种语法归一为同一 command。Session 在语法绑定后先隐式提交用户事务，再由独立 DDL owner 全程持有 schema IX/table X；物理层写 durable page3 stage descriptor、扫描聚簇索引并逐行用短 MTR 回填，随后按 `ENGINE_DONE -> SDI -> ACTIVE DD exact add-one-index -> DICTIONARY_COMMITTED -> cache -> clear descriptor -> COMMITTED` 发布。
-- CREATE INDEX recovery 只以 committed DD、marker 和 exact stage descriptor 裁决：旧 DD 不含 index 时回滚 descriptor 指向的 leaf/non-leaf segments；新 DD 精确包含 index/binding 时前滚并清 descriptor。descriptor 是清理证据，不得单独创建或发布 catalog 对象。
-- DROP INDEX v1 支持 `DROP INDEX index ON table` 与 `ALTER TABLE table DROP INDEX index`，不支持 `IF EXISTS`、多 action 或删除聚簇索引。Session 先绑定逻辑名称并隐式提交，再由独立 DDL owner 持 schema IX/table X；顺序固定为 `PREPARED -> durable DROP descriptor -> SDI -> ACTIVE DD exact remove-one-index -> DICTIONARY_COMMITTED -> cache -> segment/footer atomic reclaim -> ENGINE_DONE -> COMMITTED`。
-- DROP INDEX recovery 仍以 committed DD 为唯一提交裁决：旧 DD 含目标时只 exact-CAS 清 descriptor、保留 segment并写 ROLLED_BACK；新 DD 已删除目标时前滚回收 leaf/non-leaf segment。`PREPARED + 新 DD` 是合法 crash window，恢复会先补 DICTIONARY_COMMITTED，再完成物理收敛。
+- CREATE INDEX v1 支持 `CREATE [UNIQUE] INDEX` 与单动作 `ALTER TABLE ... ADD [UNIQUE] INDEX`，两种语法归一为同一 command。生产组合根默认注入 Online runtime：initial/final X 只冻结 capture/cutover，base scan 在 SU 下允许并发 SELECT/INSERT/UPDATE/DELETE；DML 物理修改后产生 before/after candidate，普通 commit 与 XA PREPARE 在事务终态前 force 自身 row-log high-water。
+- Online CREATE INDEX 持久顺序为 `manifest force -> PREPARED -> staged descriptor -> CAPTURING force -> base scan -> SEALED force -> current reconciliation -> source/target verify -> data/WAL force -> RECONCILED force -> ENGINE_DONE -> SDI -> ACTIVE DD exact add-one-index -> DICTIONARY_COMMITTED -> cache -> clear descriptor -> COMMITTED`。容量耗尽先用 terminal reserve force `ABORT_REQUIRED`，reserve格式下限同时覆盖最后一次force watermark；已成功的用户 DML 不随 DDL 回滚。
+- CREATE INDEX recovery 以 committed DD、marker、manifest、row-log generation/force watermark 和 exact stage descriptor 交叉裁决：PREPARED+旧 DD 在开放流量前清旧 tree/log generation并从当前聚簇真相重建；ENGINE_DONE+旧 DD 只发布已验证 tree；新 DD 精确包含 index/binding 时只前滚。没有 auxiliary row-log path 的 legacy marker 保留原 blocking recovery。
+- Online DROP INDEX v1支持`DROP INDEX index ON table`与单动作`ALTER TABLE table DROP INDEX index`，不支持`IF EXISTS`、多action或删除聚簇索引。prepare阶段持schema IX/table SU，final X排空旧admission/writer并捕获persistent history high-water与exact source metadata version；一次安装retirement fence后竞争`OPEN→FORWARD_ONLY`，target DD发布后降回SU等待history/pin共同安全，再原子回收segment/footer。
+- DROP INDEX recovery交叉验证committed DD、source/target digest、control、retirement fence和exact descriptor：source+OPEN/CANCEL回滚descriptor，source+FORWARD_ONLY前滚发布target，target DD只允许继续等待retirement并物理回收。共享绝对timeout覆盖history与pin，超时保留forward证据而不重新加入索引。
+- `OnlineDdlControlService`由`DatabaseEngine.onlineDdlControl()`暴露稳定Java/admin facade；`list/find`合并进程内active/history与durable marker，`requestCancel`先做privilege与prepare handoff，再用repository CAS持久化唯一方向，`awaitTerminal`只做有界等待。snapshot不持有MDL、page、文件或row-log资源。
+- metadata-only ALTER使用稳定`ALTER_TABLE_INPLACE(11)`与`ONLINE_ALTER_INPLACE_V1`：table X内先写target SDI，随后CAS到FORWARD_ONLY并提交target DD/cache；取消或OPEN恢复从committed source重写SDI，FORWARD_ONLY恢复从exact target SDI解码并校验digest后前滚。
+- `OnlineAlterStrategySelector`在任何持久副作用前按完整action集合冻结策略：metadata-only走instant；仅secondary集合走一个INPLACE manifest/descriptor generation；row-layout或mixed action走一个SHADOW manifest/tablespace。主键/任意类型/foreign/generated等未声明能力在副作用前拒绝，不在执行中静默降级。
+- 通用INPLACE使用专属versioned descriptor page chain原子拥有多个ADD/DROP资源；通用SHADOW使用clustered identity journal、bounded copy、严格delete/ensure两遍reconcile、双向验证与ReadView/purge retirement barrier。marker、journal、manifest、SDI和descriptor按digest/owner/generation交叉验证。
+- 通用ALTER恢复对source+OPEN/CANCEL回滚，对source+FORWARD_ONLY要求READY与RECONCILED后前滚，对target继续retirement/cleanup；任一path、digest、descriptor或fence第三态均保留证据并阻止OPEN。
 - `TableStorageBinding.rowFormatVersion` 已与字典对象版本分离；CREATE INDEX 只推进 dictionary version，不改变已有聚簇记录编码。catalog 与 SDI 新格式显式持久化该值，旧格式缺失时仅按旧 table version 兼容推导。
 - 任一 DD/marker append 向调用方报错都可能已经 durable，当前进程不猜测补偿；下一次启动从 committed batches 重建双方最新真相。无 DDL log 的旧 DROP_PENDING 与受控命名 orphan cleanup 仍兼容。
 - DD discovery 从 ACTIVE/DROP_PENDING table 只返回稳定 storage API binding；公共 `cn.zhangyis.db.engine.DatabaseEngine` 再转换 recovery tablespace 配置，在 storage rollback/RESUME_PURGE 后运行 logged DDL recovery 与 legacy cleanup，全部完成后才发布 OPEN。
@@ -615,12 +629,13 @@ Atomic DDL recovery 流程见 [atomic-ddl-recovery-flow.mmd](diagrams/atomic-ddl
 
 - SDI 仍是单页 v1，不支持多页/B+Tree 或在单表 payload 内保存 schema 默认属性。`mysql.ibd` 丢失后的
   catalog rebuild 已由独立 clean manifest + full-page scrub + 显式隔离/重建 API 闭环；普通启动仍只做
-  admission fail-closed，绝不自动采用 SDI。binlog participant、online DDL row log、除 ADD/DROP INDEX
-  外的部分 ALTER TABLE 和 foreign key 未实现；对象级 force recovery 已有 file-per-table v1，但系统/undo/
+  admission fail-closed，绝不自动采用 SDI。binlog participant、主键/任意类型/foreign/generated ALTER
+  未实现；对象级 force recovery 已有 file-per-table v1，但系统/undo/
   共享空间隔离、跨实例信任与自动 repair 不在该切片范围。
-- CREATE INDEX v1 全程持有 table X，并把聚簇扫描结果暂存在内存后逐条插入，不支持并发 DML、并行/外排 build、prefix key part、FULLTEXT/SPATIAL；这是教学版 blocking inplace build，不等同于 MySQL 8.0 online DDL。
-- 独立 DDL log v3 覆盖 CREATE/DROP TABLE、CREATE/DROP INDEX 与 DISCARD/IMPORT TABLESPACE；CREATE SCHEMA 尚无 marker，因此 control reconciliation 用 committed dictionary version 提供保守下界。temporary undo 也未接，在临时表 owner/lifecycle 与独立 temporary tablespace 完成前继续拒绝进入普通 undo。
-- DROP barrier 不持久化独立计数；恢复从 page3/undo first-page persistent history 重建 affected-table 引用。该简化保持单一恢复真相，但当前仍是单 rseg、单线程 purge。
+- CREATE INDEX v1 已实现持久 row-log 与 final cutover，但仍不支持复制 binlog、并行/外排 build、prefix key part、FULLTEXT/SPATIAL、异步 job/status SQL 或持久 scan continuation；它是教学型 online build，不承诺 MySQL 8.0 的完整 ALGORITHM/LOCK 兼容矩阵。
+- marker schema digest、durable cancel/control CAS、Online DROP、instant metadata、multi-index INPLACE与online shadow ALTER已进入生产；可观察性当前仅为Java/admin facade，尚无SQL/网络协议或完整权限系统。
+- 独立DDL log v4覆盖稳定operation 1..11并兼容v1-v3；CREATE SCHEMA尚无marker，因此control reconciliation仍用committed dictionary version提供保守下界。temporary undo也未接，在临时表owner/lifecycle与独立temporary tablespace完成前继续拒绝进入普通undo。
+- table DROP barrier不持久化独立计数；Online DROP INDEX则持久化history high-water、source version和retired index resource，但恢复仍从page3/undo first-page重建真实history引用。当前仍是单rseg、单线程purge。
 - orphan cleanup 只处理 `tables/` 下符合受控命名规则且未被 catalog 引用的文件，不扫描或删除任意路径；missing/empty catalog 遇到同一 glob 候选时会先被 admission guard 阻断，不能用空字典驱动删除。
 
 ## 20. 参考链接

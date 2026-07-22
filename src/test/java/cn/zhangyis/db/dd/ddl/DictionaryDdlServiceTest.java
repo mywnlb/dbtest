@@ -14,7 +14,10 @@ import cn.zhangyis.db.dd.mdl.MetadataLockManager;
 import cn.zhangyis.db.dd.repo.DictionaryControlStore;
 import cn.zhangyis.db.dd.repo.PersistentDictionaryRepository;
 import cn.zhangyis.db.dd.recovery.DictionaryDdlRecoveryService;
+import cn.zhangyis.db.dd.recovery.DictionaryCleanSnapshotPublisher;
 import cn.zhangyis.db.dd.recovery.DictionaryRecoveryException;
+import cn.zhangyis.db.dd.recovery.OnlineIndexRecoveryRuntime;
+import cn.zhangyis.db.dd.recovery.OnlineAlterRecoveryRuntime;
 import cn.zhangyis.db.dd.service.DataDictionaryService;
 import cn.zhangyis.db.dd.service.TableAccessIntent;
 import cn.zhangyis.db.dd.sdi.DictionarySdiCodec;
@@ -27,6 +30,7 @@ import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.engine.EngineConfig;
 import cn.zhangyis.db.storage.engine.StorageEngine;
+import cn.zhangyis.db.storage.engine.EngineTablespaceConfig;
 import cn.zhangyis.db.storage.engine.RecoveryExportWriteRejectedException;
 import cn.zhangyis.db.dd.exception.TableRecoveryUnavailableException;
 import cn.zhangyis.db.dd.recovery.backup.RecoveryBackupArtifact;
@@ -35,6 +39,10 @@ import cn.zhangyis.db.storage.api.TablePurgeBarrierTimeoutException;
 import cn.zhangyis.db.storage.api.ddl.SerializedDictionaryInfo;
 import cn.zhangyis.db.storage.api.ddl.SerializedDictionaryInfoException;
 import cn.zhangyis.db.storage.api.ddl.StorageDefaultValue;
+import cn.zhangyis.db.storage.api.ddl.online.OnlineIndexBuildId;
+import cn.zhangyis.db.storage.api.ddl.online.OnlineDdlCaptureId;
+import cn.zhangyis.db.storage.api.ddl.online.OnlineDdlAbortReason;
+import cn.zhangyis.db.storage.api.ddl.online.OnlineIndexLogHeader;
 import cn.zhangyis.db.storage.api.dml.DmlCommitCommand;
 import cn.zhangyis.db.storage.api.dml.TableInsertCommand;
 import cn.zhangyis.db.storage.api.dml.TableUpdateCommand;
@@ -49,6 +57,8 @@ import cn.zhangyis.db.storage.api.catalog.CatalogRecord;
 import cn.zhangyis.db.storage.api.catalog.InternalCatalogPersistenceException;
 import cn.zhangyis.db.storage.api.catalog.InternalCatalogStore;
 import cn.zhangyis.db.storage.fil.catalog.FileInternalCatalogStore;
+import cn.zhangyis.db.storage.fil.online.OnlineIndexChangeLogFiles;
+import cn.zhangyis.db.storage.fil.online.OnlineAlterChangeLogFiles;
 import cn.zhangyis.db.session.SessionOptions;
 import cn.zhangyis.db.sql.executor.QueryResult;
 import org.junit.jupiter.api.Test;
@@ -65,6 +75,7 @@ import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -241,6 +252,14 @@ class DictionaryDdlServiceTest {
             assertTrue(withoutIndex.version().compareTo(withIndex.version()) > 0);
             assertTrue(database.storage().tableDdlStorageService()
                     .readSecondaryIndexDrop(withoutIndex.storageBinding().orElseThrow()).isEmpty());
+            OnlineDdlOperationSnapshot marker = database.onlineDdlControl().list().stream()
+                    .filter(snapshot -> snapshot.identity().operation() == DdlLogOperation.DROP_INDEX)
+                    .findFirst().orElseThrow();
+            assertTrue(marker.cancelCapable());
+            assertEquals(DdlControlState.FORWARD_ONLY, marker.controlState());
+            assertTrue(marker.retirementFencePresent());
+            assertEquals(withIndex.version().value(),
+                    marker.identity().sourceVersion());
         }
 
         try (DatabaseEngine reopened = new DatabaseEngine(config())) {
@@ -313,12 +332,449 @@ class DictionaryDdlServiceTest {
                         () -> drop.get(200, TimeUnit.MILLISECONDS));
                 assertEquals(2, lease.table().indexes().size());
                 assertTrue(database.storage().tableDdlStorageService()
-                        .readSecondaryIndexDrop(withIndex.storageBinding().orElseThrow()).isEmpty());
+                        .readSecondaryIndexDrop(withIndex.storageBinding().orElseThrow()).isPresent(),
+                        "Online DROP prepares durable ownership while final X waits for the old lease");
 
                 lease.close();
                 assertEquals(1, drop.get(3, TimeUnit.SECONDS).indexes().size());
             } finally {
                 lease.close();
+            }
+        }
+    }
+
+    /** admin取消final X pending的Online DROP必须只移除DDL升级请求，回滚descriptor并保留source索引与读lease。 */
+    @Test
+    void cancelsOnlineDropWhileFinalMetadataLockIsPending() throws Exception {
+        try (DatabaseEngine database = new DatabaseEngine(config())) {
+            database.open();
+            database.ddl().createSchema(
+                    MdlOwnerId.of(122), ObjectName.of("app"), 1, 1, Duration.ofSeconds(5));
+            database.ddl().createTable(
+                    MdlOwnerId.of(122), updateCommand(), Duration.ofSeconds(5));
+            TableDefinition source = database.ddl().createSecondaryIndex(
+                    MdlOwnerId.of(123), secondaryIndexCommand(), Duration.ofSeconds(5));
+            var sourceLease = database.dictionary().openTable(
+                    MdlOwnerId.of(124), QualifiedTableName.of("app", "orders"),
+                    TableAccessIntent.READ, Duration.ofSeconds(5));
+            try (var executor = Executors.newSingleThreadExecutor()) {
+                var drop = executor.submit(() -> database.ddl().dropSecondaryIndex(
+                        MdlOwnerId.of(125), dropIndexCommand(), Duration.ofSeconds(5)));
+                long deadline = System.nanoTime() + Duration.ofSeconds(3).toNanos();
+                OnlineDdlOperationSnapshot pending = null;
+                while (System.nanoTime() < deadline) {
+                    pending = database.onlineDdlControl().list().stream()
+                            .filter(snapshot -> snapshot.identity().operation()
+                                    == DdlLogOperation.DROP_INDEX)
+                            .filter(snapshot -> snapshot.runtimePhase()
+                                    == OnlineDdlRuntimePhase.WAITING_FINAL_MDL)
+                            .findFirst().orElse(null);
+                    if (pending != null) {
+                        break;
+                    }
+                    Thread.sleep(10);
+                }
+                assertTrue(pending != null, "DROP must expose its pending final-MDL phase");
+                assertTrue(database.storage().tableDdlStorageService()
+                        .readSecondaryIndexDrop(source.storageBinding().orElseThrow()).isPresent());
+
+                OnlineDdlCancelResult cancel = database.onlineDdlControl().requestCancel(
+                        pending.identity().ddlId(), OnlineDdlCancelRequest.admin(
+                                DdlCancellationReason.USER_REQUEST, 12),
+                        Duration.ofSeconds(2));
+
+                assertEquals(OnlineDdlCancelOutcome.ACCEPTED_DURABLE, cancel.outcome());
+                var executionFailure = assertThrows(
+                        java.util.concurrent.ExecutionException.class,
+                        () -> drop.get(3, TimeUnit.SECONDS));
+                assertInstanceOf(OnlineDdlCancellationException.class,
+                        executionFailure.getCause());
+                assertEquals(2, sourceLease.table().indexes().size(),
+                        "cancel must not revoke the granted source metadata lease");
+                assertTrue(database.storage().tableDdlStorageService()
+                        .readSecondaryIndexDrop(source.storageBinding().orElseThrow()).isEmpty());
+                assertEquals(OnlineDdlTerminalResult.ROLLED_BACK,
+                        database.onlineDdlControl().find(pending.identity().ddlId())
+                                .orElseThrow().terminalResult());
+            } finally {
+                sourceLease.close();
+            }
+        }
+    }
+
+    /**
+     * target DD发布与segment回收必须分离：高水位内history尚在时descriptor/segment保留，但gate已经清除，
+     * 新DML可按不含旧索引的target metadata继续；purge越过fence后DROP才进入terminal。
+     *
+     * @throws Exception future、latch或测试线程调度失败时保留原始异常
+     */
+    @Test
+    void publishesOnlineDropBeforeRetiringIndexSegments() throws Exception {
+        Path tables = directory.resolve("online-drop-retirement-tables");
+        try (FileInternalCatalogStore catalog = FileInternalCatalogStore.openOrCreate(
+                directory.resolve("online-drop-retirement-mysql.ibd"));
+             DictionaryControlStore control = DictionaryControlStore.openOrCreate(
+                     directory.resolve("online-drop-retirement-mysql.dd.ctrl"),
+                     SpaceId.of(1), 1024)) {
+            PersistentDictionaryRepository repository = new PersistentDictionaryRepository(catalog);
+            StorageEngine storage = new StorageEngine(config());
+            storage.configureIndexMetadataResolver(new DictionaryIndexMetadataResolver(repository));
+            storage.open();
+            try {
+                DictionaryObjectCache cache = new DictionaryObjectCache(16);
+                MetadataLockManager locks = new MetadataLockManager(8, 128);
+                DictionaryDdlService base = new DictionaryDdlService(
+                        control, repository, cache, locks,
+                        storage.tableDdlStorageService(), tables);
+                base.createSchema(MdlOwnerId.of(119), ObjectName.of("app"),
+                        1, 1, Duration.ofSeconds(5));
+                base.createTable(MdlOwnerId.of(119), updateCommand(), Duration.ofSeconds(5));
+                TableDefinition source = base.createSecondaryIndex(
+                        MdlOwnerId.of(120), secondaryIndexCommand(), Duration.ofSeconds(5));
+                var sourceMetadata = new DictionaryStorageMetadataMapper().map(source);
+                long schemaVersion = sourceMetadata.tableIndexes().schemaVersion();
+                LogicalRecord before = new LogicalRecord(schemaVersion,
+                        List.of(new ColumnValue.IntValue(1), new ColumnValue.IntValue(10)),
+                        false, RecordType.CONVENTIONAL);
+                LogicalRecord after = new LogicalRecord(schemaVersion,
+                        List.of(new ColumnValue.IntValue(1), new ColumnValue.IntValue(20)),
+                        false, RecordType.CONVENTIONAL);
+                var insert = storage.transactionManager().begin(TransactionOptions.defaults());
+                storage.tableDmlService().insert(new TableInsertCommand(
+                        insert, sourceMetadata.tableIndexes(), before,
+                        Optional.empty(), Duration.ofSeconds(5)));
+                storage.tableDmlService().commit(new DmlCommitCommand(
+                        insert, DurabilityPolicy.FLUSH_ON_COMMIT, Duration.ofSeconds(5)));
+                var update = storage.transactionManager().begin(TransactionOptions.defaults());
+                storage.tableDmlService().update(new TableUpdateCommand(
+                        update, sourceMetadata.tableIndexes(),
+                        new SearchKey(List.of(new ColumnValue.IntValue(1))), after,
+                        Duration.ofSeconds(5)));
+                storage.tableDmlService().commit(new DmlCommitCommand(
+                        update, DurabilityPolicy.FLUSH_ON_COMMIT, Duration.ofSeconds(5)));
+                assertEquals(1, storage.tablePurgeBarrier().referenceCount(source.id().value()));
+
+                CountDownLatch retirementEntered = new CountDownLatch(1);
+                CountDownLatch inspectPublishedTarget = new CountDownLatch(1);
+                IndexRetirementBarrier delegate = new DefaultIndexRetirementBarrier(
+                        storage.indexRetirementHistoryBarrier(), cache);
+                IndexRetirementBarrier observed = new IndexRetirementBarrier() {
+                    @Override
+                    public DdlRetirementFence captureIndexFence(
+                            long tableId, long sourceVersion, long indexId,
+                            long descriptorGeneration, long ownerDdlId) {
+                        return delegate.captureIndexFence(tableId, sourceVersion, indexId,
+                                descriptorGeneration, ownerDdlId);
+                    }
+
+                    @Override
+                    public void awaitIndexSafe(DdlRetirementFence fence, Duration timeout) {
+                        retirementEntered.countDown();
+                        try {
+                            if (!inspectPublishedTarget.await(2, TimeUnit.SECONDS)) {
+                                throw new cn.zhangyis.db.common.exception.DatabaseRuntimeException(
+                                        "test did not release retirement inspection latch");
+                            }
+                        } catch (InterruptedException interrupted) {
+                            Thread.currentThread().interrupt();
+                            throw new cn.zhangyis.db.common.exception.DatabaseRuntimeException(
+                                    "test retirement wait interrupted", interrupted);
+                        }
+                        delegate.awaitIndexSafe(fence, timeout);
+                    }
+                };
+                OnlineDdlOperationRegistry registry = new OnlineDdlOperationRegistry(8);
+                DictionaryDdlService online = new DictionaryDdlService(
+                        control, repository, cache, locks, storage.tableDdlStorageService(), tables,
+                        storage.tablePurgeBarrier(), DictionaryDdlFaultInjector.NO_OP,
+                        DictionaryCleanSnapshotPublisher.noOp(), new OnlineIndexBuildRuntime(
+                        storage.onlineDdlTableGate(), config().onlineDdlConfig(),
+                        new OnlineIndexChangeLogFiles(
+                                config().onlineDdlDirectory(), config().onlineDdlConfig()),
+                        storage.typeCodecRegistry()), registry, observed);
+
+                try (var executor = Executors.newSingleThreadExecutor()) {
+                    var drop = executor.submit(() -> online.dropSecondaryIndex(
+                            MdlOwnerId.of(121), dropIndexCommand(), Duration.ofSeconds(5)));
+                    assertTrue(retirementEntered.await(3, TimeUnit.SECONDS));
+
+                    TableDefinition target = repository.findTable(source.id()).orElseThrow();
+                    assertEquals(1, target.indexes().size(),
+                            "logical target must commit before retirement wait");
+                    assertTrue(storage.tableDdlStorageService()
+                            .readSecondaryIndexDrop(target.storageBinding().orElseThrow()).isPresent(),
+                            "physical owner remains durable until fence becomes safe");
+                    assertEquals(cn.zhangyis.db.storage.api.ddl.online.OnlineDdlTablePhase.ABSENT,
+                            storage.onlineDdlTableGate().phase(source.id().value()),
+                            "target DML admission must be reopened before slow retirement");
+                    assertFalse(drop.isDone());
+
+                    var targetMetadata = new DictionaryStorageMetadataMapper().map(target);
+                    LogicalRecord targetRow = new LogicalRecord(
+                            targetMetadata.tableIndexes().schemaVersion(),
+                            List.of(new ColumnValue.IntValue(2), new ColumnValue.IntValue(30)),
+                            false, RecordType.CONVENTIONAL);
+                    var targetInsert = storage.transactionManager().begin(TransactionOptions.defaults());
+                    storage.tableDmlService().insert(new TableInsertCommand(
+                            targetInsert, targetMetadata.tableIndexes(), targetRow,
+                            Optional.empty(), Duration.ofSeconds(5)));
+                    storage.tableDmlService().commit(new DmlCommitCommand(
+                            targetInsert, DurabilityPolicy.FLUSH_ON_COMMIT, Duration.ofSeconds(5)));
+
+                    assertEquals(1, storage.purgeCoordinator().runBatch(1).purgedLogs());
+                    inspectPublishedTarget.countDown();
+                    assertEquals(1, drop.get(3, TimeUnit.SECONDS).indexes().size());
+                } finally {
+                    inspectPublishedTarget.countDown();
+                }
+
+                assertEquals(OnlineDdlTerminalResult.COMPLETED,
+                        registry.list().getFirst().terminalResult());
+            } finally {
+                storage.close();
+            }
+        }
+    }
+
+    /** target DD已durable而marker仍PREPARED时，恢复必须验证FORWARD_ONLY/fence后继续退休，不能把索引加回DD。 */
+    @Test
+    void recoversOnlineDropAfterTargetDictionaryPublishCrash() {
+        Path tables = directory.resolve("online-drop-target-crash-tables");
+        try (FileInternalCatalogStore catalog = FileInternalCatalogStore.openOrCreate(
+                directory.resolve("online-drop-target-crash-mysql.ibd"));
+             DictionaryControlStore control = DictionaryControlStore.openOrCreate(
+                     directory.resolve("online-drop-target-crash-mysql.dd.ctrl"),
+                     SpaceId.of(1), 1024)) {
+            PersistentDictionaryRepository repository = new PersistentDictionaryRepository(catalog);
+            StorageEngine storage = new StorageEngine(config());
+            storage.configureIndexMetadataResolver(new DictionaryIndexMetadataResolver(repository));
+            storage.open();
+            try {
+                DictionaryObjectCache cache = new DictionaryObjectCache(16);
+                MetadataLockManager locks = new MetadataLockManager(8, 128);
+                DictionaryDdlService base = new DictionaryDdlService(
+                        control, repository, cache, locks,
+                        storage.tableDdlStorageService(), tables);
+                base.createSchema(MdlOwnerId.of(126), ObjectName.of("app"),
+                        1, 1, Duration.ofSeconds(5));
+                base.createTable(MdlOwnerId.of(126), updateCommand(), Duration.ofSeconds(5));
+                TableDefinition source = base.createSecondaryIndex(
+                        MdlOwnerId.of(127), secondaryIndexCommand(), Duration.ofSeconds(5));
+                OnlineDdlOperationRegistry liveRegistry = new OnlineDdlOperationRegistry(8);
+                OnlineIndexChangeLogFiles logFiles = new OnlineIndexChangeLogFiles(
+                        config().onlineDdlDirectory(), config().onlineDdlConfig());
+                DictionaryDdlService crashing = new DictionaryDdlService(
+                        control, repository, cache, locks, storage.tableDdlStorageService(), tables,
+                        storage.tablePurgeBarrier(), new DictionaryDdlFaultInjector() {
+                    @Override public void afterDropPendingPublished(TableDefinition pending) { }
+                    @Override
+                    public void afterDropIndexDictionaryPublished(TableDefinition target) {
+                        throw new SimulatedProcessCrashError();
+                    }
+                }, DictionaryCleanSnapshotPublisher.noOp(), new OnlineIndexBuildRuntime(
+                        storage.onlineDdlTableGate(), config().onlineDdlConfig(), logFiles,
+                        storage.typeCodecRegistry()), liveRegistry,
+                        new DefaultIndexRetirementBarrier(
+                                storage.indexRetirementHistoryBarrier(), cache));
+
+                assertThrows(SimulatedProcessCrashError.class,
+                        () -> crashing.dropSecondaryIndex(
+                                MdlOwnerId.of(128), dropIndexCommand(), Duration.ofSeconds(5)));
+                DdlLogRecord crashed = repository.ddlLog().unresolved().stream()
+                        .filter(record -> record.operation() == DdlLogOperation.DROP_INDEX)
+                        .findFirst().orElseThrow();
+                assertEquals(DdlLogPhase.PREPARED, crashed.phase());
+                assertEquals(DdlControlState.FORWARD_ONLY, crashed.controlState());
+                assertTrue(crashed.retirementFence().isPresent());
+                assertEquals(1, repository.findTable(source.id()).orElseThrow().indexes().size());
+                assertTrue(storage.tableDdlStorageService().readSecondaryIndexDrop(
+                        source.storageBinding().orElseThrow()).isPresent());
+
+                OnlineDdlOperationRegistry recoveryRegistry = new OnlineDdlOperationRegistry(8);
+                new DictionaryDdlRecoveryService(
+                        control, repository, cache, storage.tableDdlStorageService(), tables,
+                        storage.tablePurgeBarrier(), new OnlineIndexRecoveryRuntime(
+                        config().onlineDdlConfig(), logFiles, storage.typeCodecRegistry()),
+                        recoveryRegistry, new DefaultIndexRetirementBarrier(
+                        storage.indexRetirementHistoryBarrier(), cache))
+                        .recover(Duration.ofSeconds(5));
+
+                TableDefinition recovered = repository.findTable(source.id()).orElseThrow();
+                assertEquals(1, recovered.indexes().size());
+                assertTrue(storage.tableDdlStorageService()
+                        .readSecondaryIndexDrop(recovered.storageBinding().orElseThrow()).isEmpty());
+                assertEquals(DdlLogPhase.COMMITTED, repository.ddlLog()
+                        .find(cn.zhangyis.db.dd.domain.DdlId.of(
+                                crashed.marker().ddlOperationId())).orElseThrow().phase());
+                assertEquals(OnlineDdlTerminalResult.COMPLETED,
+                        recoveryRegistry.list().getFirst().terminalResult());
+            } finally {
+                storage.close();
+            }
+        }
+    }
+
+    /** source DD仍可见但FORWARD_ONLY已durable时，恢复必须从source派生target并继续退休，禁止回滚descriptor。 */
+    @Test
+    void recoversOnlineDropFromSourceAfterForwardFenceCrash() {
+        Path tables = directory.resolve("online-drop-forward-crash-tables");
+        try (FileInternalCatalogStore catalog = FileInternalCatalogStore.openOrCreate(
+                directory.resolve("online-drop-forward-crash-mysql.ibd"));
+             DictionaryControlStore control = DictionaryControlStore.openOrCreate(
+                     directory.resolve("online-drop-forward-crash-mysql.dd.ctrl"),
+                     SpaceId.of(1), 1024)) {
+            PersistentDictionaryRepository repository = new PersistentDictionaryRepository(catalog);
+            StorageEngine storage = new StorageEngine(config());
+            storage.configureIndexMetadataResolver(new DictionaryIndexMetadataResolver(repository));
+            storage.open();
+            try {
+                DictionaryObjectCache cache = new DictionaryObjectCache(16);
+                MetadataLockManager locks = new MetadataLockManager(8, 128);
+                DictionaryDdlService base = new DictionaryDdlService(
+                        control, repository, cache, locks,
+                        storage.tableDdlStorageService(), tables);
+                base.createSchema(MdlOwnerId.of(129), ObjectName.of("app"),
+                        1, 1, Duration.ofSeconds(5));
+                base.createTable(MdlOwnerId.of(129), updateCommand(), Duration.ofSeconds(5));
+                TableDefinition source = base.createSecondaryIndex(
+                        MdlOwnerId.of(130), secondaryIndexCommand(), Duration.ofSeconds(5));
+                OnlineIndexChangeLogFiles logFiles = new OnlineIndexChangeLogFiles(
+                        config().onlineDdlDirectory(), config().onlineDdlConfig());
+                DictionaryDdlService crashing = new DictionaryDdlService(
+                        control, repository, cache, locks, storage.tableDdlStorageService(), tables,
+                        storage.tablePurgeBarrier(), new DictionaryDdlFaultInjector() {
+                    @Override public void afterDropPendingPublished(TableDefinition pending) { }
+                    @Override
+                    public void afterDropIndexForwardFenced(DdlLogRecord forwardFenced) {
+                        throw new SimulatedProcessCrashError();
+                    }
+                }, DictionaryCleanSnapshotPublisher.noOp(), new OnlineIndexBuildRuntime(
+                        storage.onlineDdlTableGate(), config().onlineDdlConfig(), logFiles,
+                        storage.typeCodecRegistry()), new OnlineDdlOperationRegistry(8),
+                        new DefaultIndexRetirementBarrier(
+                                storage.indexRetirementHistoryBarrier(), cache));
+
+                assertThrows(SimulatedProcessCrashError.class,
+                        () -> crashing.dropSecondaryIndex(
+                                MdlOwnerId.of(131), dropIndexCommand(), Duration.ofSeconds(5)));
+                DdlLogRecord forward = repository.ddlLog().unresolved().stream()
+                        .filter(record -> record.operation() == DdlLogOperation.DROP_INDEX)
+                        .findFirst().orElseThrow();
+                assertEquals(DdlLogPhase.PREPARED, forward.phase());
+                assertEquals(DdlControlState.FORWARD_ONLY, forward.controlState());
+                assertEquals(2, repository.findTable(source.id()).orElseThrow().indexes().size(),
+                        "crash boundary must still expose source DD");
+
+                new DictionaryDdlRecoveryService(
+                        control, repository, cache, storage.tableDdlStorageService(), tables,
+                        storage.tablePurgeBarrier(), new OnlineIndexRecoveryRuntime(
+                        config().onlineDdlConfig(), logFiles, storage.typeCodecRegistry()),
+                        new OnlineDdlOperationRegistry(8), new DefaultIndexRetirementBarrier(
+                        storage.indexRetirementHistoryBarrier(), cache))
+                        .recover(Duration.ofSeconds(5));
+
+                TableDefinition recovered = repository.findTable(source.id()).orElseThrow();
+                assertEquals(1, recovered.indexes().size());
+                assertTrue(storage.tableDdlStorageService()
+                        .readSecondaryIndexDrop(recovered.storageBinding().orElseThrow()).isEmpty());
+                assertEquals(DdlLogPhase.COMMITTED, repository.ddlLog()
+                        .find(cn.zhangyis.db.dd.domain.DdlId.of(
+                                forward.marker().ddlOperationId())).orElseThrow().phase());
+            } finally {
+                storage.close();
+            }
+        }
+    }
+
+    /** durable取消在descriptor后立即崩溃，恢复只能清footer并保留source索引，不能因descriptor存在而猜测前滚。 */
+    @Test
+    void recoversCancelledOnlineDropAfterDescriptorCrash() {
+        Path tables = directory.resolve("online-drop-cancel-crash-tables");
+        try (FileInternalCatalogStore catalog = FileInternalCatalogStore.openOrCreate(
+                directory.resolve("online-drop-cancel-crash-mysql.ibd"));
+             DictionaryControlStore control = DictionaryControlStore.openOrCreate(
+                     directory.resolve("online-drop-cancel-crash-mysql.dd.ctrl"),
+                     SpaceId.of(1), 1024)) {
+            PersistentDictionaryRepository repository = new PersistentDictionaryRepository(catalog);
+            StorageEngine storage = new StorageEngine(config());
+            storage.configureIndexMetadataResolver(new DictionaryIndexMetadataResolver(repository));
+            storage.open();
+            try {
+                DictionaryObjectCache cache = new DictionaryObjectCache(16);
+                MetadataLockManager locks = new MetadataLockManager(8, 128);
+                DictionaryDdlService base = new DictionaryDdlService(
+                        control, repository, cache, locks,
+                        storage.tableDdlStorageService(), tables);
+                base.createSchema(MdlOwnerId.of(132), ObjectName.of("app"),
+                        1, 1, Duration.ofSeconds(5));
+                base.createTable(MdlOwnerId.of(132), updateCommand(), Duration.ofSeconds(5));
+                TableDefinition source = base.createSecondaryIndex(
+                        MdlOwnerId.of(133), secondaryIndexCommand(), Duration.ofSeconds(5));
+                OnlineDdlOperationRegistry liveRegistry = new OnlineDdlOperationRegistry(8);
+                OnlineDdlControlService controlService = new OnlineDdlControlService(
+                        repository.ddlLog(), liveRegistry, identity -> {
+                    locks.cancelPending(MdlOwnerId.of(identity.ownerId()));
+                    var phase = storage.onlineDdlTableGate().phase(identity.tableId());
+                    if (phase != cn.zhangyis.db.storage.api.ddl.online.OnlineDdlTablePhase.ABSENT
+                            && phase != cn.zhangyis.db.storage.api.ddl.online.OnlineDdlTablePhase.ABORTING) {
+                        storage.onlineDdlTableGate().beginAbort(
+                                OnlineIndexBuildId.of(identity.ddlId().value()),
+                                OnlineDdlAbortReason.CANCELLED);
+                    }
+                });
+                AtomicReference<OnlineDdlCancelResult> accepted = new AtomicReference<>();
+                OnlineIndexChangeLogFiles logFiles = new OnlineIndexChangeLogFiles(
+                        config().onlineDdlDirectory(), config().onlineDdlConfig());
+                DictionaryDdlService crashing = new DictionaryDdlService(
+                        control, repository, cache, locks, storage.tableDdlStorageService(), tables,
+                        storage.tablePurgeBarrier(), new DictionaryDdlFaultInjector() {
+                    @Override public void afterDropPendingPublished(TableDefinition pending) { }
+                    @Override
+                    public void afterDropIndexStaged(
+                            cn.zhangyis.db.storage.api.ddl.SecondaryIndexDropDescriptor descriptor) {
+                        accepted.set(controlService.requestCancel(
+                                cn.zhangyis.db.dd.domain.DdlId.of(descriptor.ddlOperationId()),
+                                OnlineDdlCancelRequest.admin(
+                                        DdlCancellationReason.USER_REQUEST, 13),
+                                Duration.ofSeconds(2)));
+                        throw new SimulatedProcessCrashError();
+                    }
+                }, DictionaryCleanSnapshotPublisher.noOp(), new OnlineIndexBuildRuntime(
+                        storage.onlineDdlTableGate(), config().onlineDdlConfig(), logFiles,
+                        storage.typeCodecRegistry()), liveRegistry,
+                        new DefaultIndexRetirementBarrier(
+                                storage.indexRetirementHistoryBarrier(), cache));
+
+                assertThrows(SimulatedProcessCrashError.class,
+                        () -> crashing.dropSecondaryIndex(
+                                MdlOwnerId.of(134), dropIndexCommand(), Duration.ofSeconds(5)));
+                assertEquals(OnlineDdlCancelOutcome.ACCEPTED_DURABLE,
+                        accepted.get().outcome());
+                DdlLogRecord cancelled = repository.ddlLog().unresolved().stream()
+                        .filter(record -> record.operation() == DdlLogOperation.DROP_INDEX)
+                        .findFirst().orElseThrow();
+                assertEquals(DdlControlState.CANCEL_REQUESTED, cancelled.controlState());
+                assertTrue(storage.tableDdlStorageService()
+                        .readSecondaryIndexDrop(source.storageBinding().orElseThrow()).isPresent());
+
+                new DictionaryDdlRecoveryService(
+                        control, repository, cache, storage.tableDdlStorageService(), tables,
+                        storage.tablePurgeBarrier(), new OnlineIndexRecoveryRuntime(
+                        config().onlineDdlConfig(), logFiles, storage.typeCodecRegistry()),
+                        new OnlineDdlOperationRegistry(8), new DefaultIndexRetirementBarrier(
+                        storage.indexRetirementHistoryBarrier(), cache))
+                        .recover(Duration.ofSeconds(5));
+
+                assertEquals(2, repository.findTable(source.id()).orElseThrow().indexes().size());
+                assertTrue(storage.tableDdlStorageService()
+                        .readSecondaryIndexDrop(source.storageBinding().orElseThrow()).isEmpty());
+                DdlLogRecord rolledBack = repository.ddlLog().find(
+                        cn.zhangyis.db.dd.domain.DdlId.of(
+                                cancelled.marker().ddlOperationId())).orElseThrow();
+                assertEquals(DdlLogPhase.ROLLED_BACK, rolledBack.phase());
+                assertEquals(DdlControlState.CANCEL_REQUESTED, rolledBack.controlState());
+            } finally {
+                storage.close();
             }
         }
     }
@@ -479,6 +935,461 @@ class DictionaryDdlServiceTest {
                     .readSecondaryIndexBuild(table.storageBinding().orElseThrow()).isEmpty());
             assertEquals(DdlLogPhase.ROLLED_BACK, repository.ddlLog()
                     .find(cn.zhangyis.db.dd.domain.DdlId.of(3)).orElseThrow().phase());
+        } finally {
+            storage.close();
+        }
+    }
+
+    /**
+     * PREPARED marker force 后取消必须在创建 gate/row-log/descriptor 前被 coordinator 观察，并把
+     * durable marker 收敛为 ROLLED_BACK；tracker 终点不能把用户取消误报为发布失败。
+     */
+    @Test
+    void cancelsOnlineCreateIndexAfterDurablePrepareBeforePhysicalResources() {
+        StorageEngine storage = new StorageEngine(config());
+        storage.open();
+        Path tables = directory.resolve("online-index-cancel-prepared-tables");
+        OnlineIndexChangeLogFiles logFiles = new OnlineIndexChangeLogFiles(
+                config().onlineDdlDirectory(), config().onlineDdlConfig());
+        try (FileInternalCatalogStore catalog = FileInternalCatalogStore.openOrCreate(
+                directory.resolve("online-index-cancel-prepared-mysql.ibd"));
+             DictionaryControlStore control = DictionaryControlStore.openOrCreate(
+                     directory.resolve("online-index-cancel-prepared-mysql.dd.ctrl"),
+                     SpaceId.of(1), 1024)) {
+            PersistentDictionaryRepository repository = new PersistentDictionaryRepository(catalog);
+            DictionaryObjectCache cache = new DictionaryObjectCache(16);
+            MetadataLockManager locks = new MetadataLockManager(8, 128);
+            DictionaryDdlService base = new DictionaryDdlService(
+                    control, repository, cache, locks, storage.tableDdlStorageService(), tables);
+            base.createSchema(MdlOwnerId.of(160), ObjectName.of("app"), 1, 1,
+                    Duration.ofSeconds(5));
+            TableDefinition source = base.createTable(
+                    MdlOwnerId.of(160), updateCommand(), Duration.ofSeconds(5));
+            OnlineDdlOperationRegistry registry = new OnlineDdlOperationRegistry(8);
+            OnlineDdlControlService controlService = new OnlineDdlControlService(
+                    repository.ddlLog(), registry,
+                    identity -> locks.cancelPending(MdlOwnerId.of(identity.ownerId())));
+            AtomicReference<OnlineDdlCancelResult> accepted = new AtomicReference<>();
+            DictionaryDdlService cancellable = new DictionaryDdlService(
+                    control, repository, cache, locks, storage.tableDdlStorageService(), tables,
+                    TablePurgeBarrier.NONE, new DictionaryDdlFaultInjector() {
+                @Override public void afterDropPendingPublished(TableDefinition pending) { }
+                @Override
+                public void afterCreateIndexPrepared(DdlLogRecord prepared) {
+                    accepted.set(controlService.requestCancel(
+                            cn.zhangyis.db.dd.domain.DdlId.of(
+                                    prepared.marker().ddlOperationId()),
+                            OnlineDdlCancelRequest.admin(
+                                    DdlCancellationReason.USER_REQUEST, 7),
+                            Duration.ofSeconds(2)));
+                }
+            }, DictionaryCleanSnapshotPublisher.noOp(), new OnlineIndexBuildRuntime(
+                    storage.onlineDdlTableGate(), config().onlineDdlConfig(), logFiles,
+                    storage.typeCodecRegistry()), registry);
+
+            assertThrows(OnlineDdlCancellationException.class,
+                    () -> cancellable.createSecondaryIndex(
+                            MdlOwnerId.of(161), secondaryIndexCommand(), Duration.ofSeconds(5)));
+
+            assertEquals(OnlineDdlCancelOutcome.ACCEPTED_DURABLE,
+                    accepted.get().outcome());
+            DdlLogRecord marker = repository.ddlLog().records().stream()
+                    .filter(record -> record.operation() == DdlLogOperation.CREATE_INDEX)
+                    .findFirst().orElseThrow();
+            assertEquals(DdlLogPhase.ROLLED_BACK, marker.phase());
+            assertEquals(DdlControlState.CANCEL_REQUESTED, marker.controlState());
+            assertEquals(1, repository.findTable(source.id()).orElseThrow().indexes().size());
+            assertTrue(storage.tableDdlStorageService()
+                    .readSecondaryIndexBuild(source.storageBinding().orElseThrow()).isEmpty());
+            assertFalse(Files.exists(marker.auxiliaryPath().orElseThrow()));
+            assertEquals(OnlineDdlTerminalResult.ROLLED_BACK,
+                    registry.find(cn.zhangyis.db.dd.domain.DdlId.of(
+                            marker.marker().ddlOperationId())).orElseThrow().terminalResult());
+        } finally {
+            storage.close();
+        }
+    }
+
+    /**
+     * durable cancel 已成功但 coordinator 尚未把 ABORT_REQUIRED 写入 row-log 时立即崩溃，
+     * recovery 仍必须以 marker control 为真相回收 descriptor/segments，不得重建并前滚索引。
+     */
+    @Test
+    void recoversDurableCancelBeforeRowLogAbortFrame() {
+        StorageEngine storage = new StorageEngine(config());
+        storage.open();
+        Path tables = directory.resolve("online-index-cancel-crash-tables");
+        OnlineIndexChangeLogFiles logFiles = new OnlineIndexChangeLogFiles(
+                config().onlineDdlDirectory(), config().onlineDdlConfig());
+        try (FileInternalCatalogStore catalog = FileInternalCatalogStore.openOrCreate(
+                directory.resolve("online-index-cancel-crash-mysql.ibd"));
+             DictionaryControlStore control = DictionaryControlStore.openOrCreate(
+                     directory.resolve("online-index-cancel-crash-mysql.dd.ctrl"),
+                     SpaceId.of(1), 1024)) {
+            PersistentDictionaryRepository repository = new PersistentDictionaryRepository(catalog);
+            DictionaryObjectCache cache = new DictionaryObjectCache(16);
+            MetadataLockManager locks = new MetadataLockManager(8, 128);
+            DictionaryDdlService base = new DictionaryDdlService(
+                    control, repository, cache, locks, storage.tableDdlStorageService(), tables);
+            base.createSchema(MdlOwnerId.of(162), ObjectName.of("app"), 1, 1,
+                    Duration.ofSeconds(5));
+            TableDefinition source = base.createTable(
+                    MdlOwnerId.of(162), updateCommand(), Duration.ofSeconds(5));
+            OnlineDdlOperationRegistry liveRegistry = new OnlineDdlOperationRegistry(8);
+            OnlineDdlControlService controlService = new OnlineDdlControlService(
+                    repository.ddlLog(), liveRegistry, identity -> {
+                locks.cancelPending(MdlOwnerId.of(identity.ownerId()));
+                var phase = storage.onlineDdlTableGate().phase(identity.tableId());
+                if (phase != cn.zhangyis.db.storage.api.ddl.online.OnlineDdlTablePhase.ABSENT
+                        && phase != cn.zhangyis.db.storage.api.ddl.online.OnlineDdlTablePhase.ABORTING) {
+                    storage.onlineDdlTableGate().beginAbort(
+                            OnlineIndexBuildId.of(identity.ddlId().value()),
+                            OnlineDdlAbortReason.CANCELLED);
+                }
+            });
+            DictionaryDdlService crashing = new DictionaryDdlService(
+                    control, repository, cache, locks, storage.tableDdlStorageService(), tables,
+                    TablePurgeBarrier.NONE, new DictionaryDdlFaultInjector() {
+                @Override public void afterDropPendingPublished(TableDefinition pending) { }
+                @Override
+                public void afterCreateIndexCaptureDurable(DdlLogRecord prepared) {
+                    OnlineDdlCancelResult result = controlService.requestCancel(
+                            cn.zhangyis.db.dd.domain.DdlId.of(
+                                    prepared.marker().ddlOperationId()),
+                            OnlineDdlCancelRequest.admin(
+                                    DdlCancellationReason.USER_REQUEST, 8),
+                            Duration.ofSeconds(2));
+                    assertEquals(OnlineDdlCancelOutcome.ACCEPTED_DURABLE, result.outcome());
+                    throw new SimulatedProcessCrashError();
+                }
+            }, DictionaryCleanSnapshotPublisher.noOp(), new OnlineIndexBuildRuntime(
+                    storage.onlineDdlTableGate(), config().onlineDdlConfig(), logFiles,
+                    storage.typeCodecRegistry()), liveRegistry);
+
+            assertThrows(SimulatedProcessCrashError.class, () -> crashing.createSecondaryIndex(
+                    MdlOwnerId.of(163), secondaryIndexCommand(), Duration.ofSeconds(5)));
+            DdlLogRecord cancelled = repository.ddlLog().unresolved().getFirst();
+            assertEquals(DdlControlState.CANCEL_REQUESTED, cancelled.controlState());
+            assertTrue(storage.tableDdlStorageService()
+                    .readSecondaryIndexBuild(source.storageBinding().orElseThrow()).isPresent());
+            assertTrue(Files.exists(cancelled.auxiliaryPath().orElseThrow()));
+
+            OnlineDdlOperationRegistry recoveryRegistry = new OnlineDdlOperationRegistry(8);
+            new DictionaryDdlRecoveryService(
+                    control, repository, cache, storage.tableDdlStorageService(), tables,
+                    TablePurgeBarrier.NONE, new OnlineIndexRecoveryRuntime(
+                    config().onlineDdlConfig(), logFiles, storage.typeCodecRegistry()),
+                    recoveryRegistry).recover(Duration.ofSeconds(5));
+
+            DdlLogRecord rolledBack = repository.ddlLog().find(
+                    cn.zhangyis.db.dd.domain.DdlId.of(
+                            cancelled.marker().ddlOperationId())).orElseThrow();
+            assertEquals(DdlLogPhase.ROLLED_BACK, rolledBack.phase());
+            assertEquals(DdlControlState.CANCEL_REQUESTED, rolledBack.controlState());
+            assertEquals(1, repository.findTable(source.id()).orElseThrow().indexes().size());
+            assertTrue(storage.tableDdlStorageService()
+                    .readSecondaryIndexBuild(source.storageBinding().orElseThrow()).isEmpty());
+            assertFalse(Files.exists(cancelled.auxiliaryPath().orElseThrow()));
+            assertEquals(OnlineDdlTerminalResult.ROLLED_BACK,
+                    recoveryRegistry.find(cn.zhangyis.db.dd.domain.DdlId.of(
+                            cancelled.marker().ddlOperationId())).orElseThrow().terminalResult());
+        } finally {
+            storage.close();
+        }
+    }
+
+    /**
+     * Online CREATE INDEX 越过 ENGINE_DONE 后，旧 DD 不能再触发 staged rollback；同步启动恢复必须以
+     * durable RECONCILED 证据前滚 exact target DD，并在 footer 清空后删除 build-owned row-log。
+     */
+    @Test
+    void finishesOnlineCreateIndexFromEngineDoneDuringRecovery() {
+        StorageEngine storage = new StorageEngine(config());
+        storage.open();
+        Path tables = directory.resolve("online-index-engine-done-tables");
+        OnlineIndexChangeLogFiles logFiles = new OnlineIndexChangeLogFiles(
+                config().onlineDdlDirectory(), config().onlineDdlConfig());
+        try (FileInternalCatalogStore catalog = FileInternalCatalogStore.openOrCreate(
+                directory.resolve("online-index-engine-done-mysql.ibd"));
+             DictionaryControlStore control = DictionaryControlStore.openOrCreate(
+                     directory.resolve("online-index-engine-done-mysql.dd.ctrl"), SpaceId.of(1), 1024)) {
+            PersistentDictionaryRepository repository = new PersistentDictionaryRepository(catalog);
+            DictionaryObjectCache cache = new DictionaryObjectCache(16);
+            MetadataLockManager locks = new MetadataLockManager(8, 128);
+            DictionaryDdlService base = new DictionaryDdlService(
+                    control, repository, cache, locks, storage.tableDdlStorageService(), tables);
+            base.createSchema(MdlOwnerId.of(112), ObjectName.of("app"), 1, 1,
+                    Duration.ofSeconds(5));
+            TableDefinition table = base.createTable(
+                    MdlOwnerId.of(112), updateCommand(), Duration.ofSeconds(5));
+            OnlineIndexBuildRuntime buildRuntime = new OnlineIndexBuildRuntime(
+                    storage.onlineDdlTableGate(), config().onlineDdlConfig(), logFiles,
+                    storage.typeCodecRegistry());
+            DictionaryDdlService crashing = new DictionaryDdlService(
+                    control, repository, cache, locks, storage.tableDdlStorageService(), tables,
+                    TablePurgeBarrier.NONE, new DictionaryDdlFaultInjector() {
+                @Override
+                public void afterDropPendingPublished(TableDefinition pending) {
+                }
+
+                @Override
+                public void afterCreateIndexEngineDone(DdlLogRecord engineDone) {
+                    throw new DictionaryDdlException(
+                            "injected online crash after CREATE INDEX ENGINE_DONE");
+                }
+            }, DictionaryCleanSnapshotPublisher.noOp(), buildRuntime);
+
+            assertThrows(DictionaryDdlException.class, () -> crashing.createSecondaryIndex(
+                    MdlOwnerId.of(113), secondaryIndexCommand(), Duration.ofSeconds(5)));
+            DdlLogRecord unresolved = repository.ddlLog().unresolved().getFirst();
+            assertEquals(DdlLogPhase.ENGINE_DONE, unresolved.phase());
+            assertTrue(Files.exists(unresolved.auxiliaryPath().orElseThrow()));
+            assertTrue(storage.tableDdlStorageService()
+                    .readSecondaryIndexBuild(table.storageBinding().orElseThrow()).isPresent());
+
+            OnlineDdlOperationRegistry recoveryRegistry = new OnlineDdlOperationRegistry(8);
+            new DictionaryDdlRecoveryService(
+                    control, repository, cache, storage.tableDdlStorageService(), tables,
+                    TablePurgeBarrier.NONE, new OnlineIndexRecoveryRuntime(
+                    config().onlineDdlConfig(), logFiles, storage.typeCodecRegistry()),
+                    recoveryRegistry)
+                    .recover(Duration.ofSeconds(5));
+
+            TableDefinition recovered = repository.findTable(table.id()).orElseThrow();
+            assertEquals(ObjectName.of("idx_value"), recovered.indexes().getLast().name());
+            assertEquals(DdlLogPhase.COMMITTED, repository.ddlLog()
+                    .find(cn.zhangyis.db.dd.domain.DdlId.of(3)).orElseThrow().phase());
+            assertTrue(storage.tableDdlStorageService()
+                    .readSecondaryIndexBuild(recovered.storageBinding().orElseThrow()).isEmpty());
+            assertFalse(Files.exists(unresolved.auxiliaryPath().orElseThrow()));
+            assertEquals(OnlineDdlTerminalResult.COMPLETED,
+                    recoveryRegistry.find(cn.zhangyis.db.dd.domain.DdlId.of(3))
+                            .orElseThrow().terminalResult());
+        } finally {
+            storage.close();
+        }
+    }
+
+    /** committed DD 不得被损坏 row-log 推翻；恢复应以 exact DD binding 验证 B+Tree 后完成 footer/terminal 清理。 */
+    @Test
+    void finishesCommittedOnlineIndexWhenRowLogIsCorrupted() throws Exception {
+        StorageEngine storage = new StorageEngine(config());
+        storage.open();
+        Path tables = directory.resolve("online-index-corrupt-committed-tables");
+        OnlineIndexChangeLogFiles logFiles = new OnlineIndexChangeLogFiles(
+                config().onlineDdlDirectory(), config().onlineDdlConfig());
+        try (FileInternalCatalogStore catalog = FileInternalCatalogStore.openOrCreate(
+                directory.resolve("online-index-corrupt-committed-mysql.ibd"));
+             DictionaryControlStore control = DictionaryControlStore.openOrCreate(
+                     directory.resolve("online-index-corrupt-committed-mysql.dd.ctrl"),
+                     SpaceId.of(1), 1024)) {
+            PersistentDictionaryRepository repository = new PersistentDictionaryRepository(catalog);
+            DictionaryObjectCache cache = new DictionaryObjectCache(16);
+            MetadataLockManager locks = new MetadataLockManager(8, 128);
+            DictionaryDdlService base = new DictionaryDdlService(
+                    control, repository, cache, locks, storage.tableDdlStorageService(), tables);
+            base.createSchema(MdlOwnerId.of(118), ObjectName.of("app"), 1, 1,
+                    Duration.ofSeconds(5));
+            TableDefinition table = base.createTable(
+                    MdlOwnerId.of(118), updateCommand(), Duration.ofSeconds(5));
+            DictionaryDdlService crashing = new DictionaryDdlService(
+                    control, repository, cache, locks, storage.tableDdlStorageService(), tables,
+                    TablePurgeBarrier.NONE, new DictionaryDdlFaultInjector() {
+                @Override public void afterDropPendingPublished(TableDefinition pending) { }
+                @Override
+                public void afterCreateIndexDictionaryCommitted(TableDefinition active) {
+                    throw new DictionaryDdlException(
+                            "injected online crash after dictionary commit");
+                }
+            }, DictionaryCleanSnapshotPublisher.noOp(), new OnlineIndexBuildRuntime(
+                    storage.onlineDdlTableGate(), config().onlineDdlConfig(), logFiles,
+                    storage.typeCodecRegistry()));
+
+            assertThrows(DictionaryDdlException.class, () -> crashing.createSecondaryIndex(
+                    MdlOwnerId.of(119), secondaryIndexCommand(), Duration.ofSeconds(5)));
+            DdlLogRecord unresolved = repository.ddlLog().unresolved().getFirst();
+            assertEquals(DdlLogPhase.DICTIONARY_COMMITTED, unresolved.phase());
+            assertEquals(2, repository.findTable(table.id()).orElseThrow().indexes().size());
+            Files.write(unresolved.auxiliaryPath().orElseThrow(), new byte[]{1, 2, 3});
+
+            OnlineDdlOperationRegistry recoveryRegistry = new OnlineDdlOperationRegistry(8);
+            new DictionaryDdlRecoveryService(
+                    control, repository, cache, storage.tableDdlStorageService(), tables,
+                    TablePurgeBarrier.NONE, new OnlineIndexRecoveryRuntime(
+                    config().onlineDdlConfig(), logFiles, storage.typeCodecRegistry()),
+                    recoveryRegistry)
+                    .recover(Duration.ofSeconds(5));
+
+            TableDefinition recovered = repository.findTable(table.id()).orElseThrow();
+            assertEquals(ObjectName.of("idx_value"), recovered.indexes().getLast().name());
+            assertEquals(DdlLogPhase.COMMITTED, repository.ddlLog()
+                    .find(cn.zhangyis.db.dd.domain.DdlId.of(3)).orElseThrow().phase());
+            assertTrue(storage.tableDdlStorageService()
+                    .readSecondaryIndexBuild(recovered.storageBinding().orElseThrow()).isEmpty());
+            assertFalse(Files.exists(unresolved.auxiliaryPath().orElseThrow()));
+        } finally {
+            storage.close();
+        }
+    }
+
+    /**
+     * 模拟进程在 PREPARED marker 返回后立即消失：启动恢复不能依赖原 SQL 或内存 gate，必须从 durable
+     * manifest 创建全新 generation、重扫聚簇真相，并把同一预留 index/version 前滚到 COMMITTED。
+     */
+    @Test
+    void rebuildsOnlineCreateIndexFromPreparedManifestDuringRecovery() {
+        StorageEngine storage = new StorageEngine(config());
+        storage.open();
+        Path tables = directory.resolve("online-index-prepared-tables");
+        OnlineIndexChangeLogFiles logFiles = new OnlineIndexChangeLogFiles(
+                config().onlineDdlDirectory(), config().onlineDdlConfig());
+        try (FileInternalCatalogStore catalog = FileInternalCatalogStore.openOrCreate(
+                directory.resolve("online-index-prepared-mysql.ibd"));
+             DictionaryControlStore control = DictionaryControlStore.openOrCreate(
+                     directory.resolve("online-index-prepared-mysql.dd.ctrl"), SpaceId.of(1), 1024)) {
+            PersistentDictionaryRepository repository = new PersistentDictionaryRepository(catalog);
+            DictionaryObjectCache cache = new DictionaryObjectCache(16);
+            MetadataLockManager locks = new MetadataLockManager(8, 128);
+            DictionaryDdlService base = new DictionaryDdlService(
+                    control, repository, cache, locks, storage.tableDdlStorageService(), tables);
+            base.createSchema(MdlOwnerId.of(114), ObjectName.of("app"), 1, 1,
+                    Duration.ofSeconds(5));
+            TableDefinition table = base.createTable(
+                    MdlOwnerId.of(114), updateCommand(), Duration.ofSeconds(5));
+            OnlineIndexBuildRuntime buildRuntime = new OnlineIndexBuildRuntime(
+                    storage.onlineDdlTableGate(), config().onlineDdlConfig(), logFiles,
+                    storage.typeCodecRegistry());
+            DictionaryDdlService crashing = new DictionaryDdlService(
+                    control, repository, cache, locks, storage.tableDdlStorageService(), tables,
+                    TablePurgeBarrier.NONE, new DictionaryDdlFaultInjector() {
+                @Override
+                public void afterDropPendingPublished(TableDefinition pending) {
+                }
+
+                @Override
+                public void afterCreateIndexCaptureDurable(DdlLogRecord prepared) {
+                    throw new SimulatedProcessCrashError();
+                }
+            }, DictionaryCleanSnapshotPublisher.noOp(), buildRuntime);
+
+            assertThrows(SimulatedProcessCrashError.class, () -> crashing.createSecondaryIndex(
+                    MdlOwnerId.of(115), secondaryIndexCommand(), Duration.ofSeconds(5)));
+            DdlLogRecord unresolved = repository.ddlLog().unresolved().getFirst();
+            assertEquals(DdlLogPhase.PREPARED, unresolved.phase());
+            assertTrue(storage.tableDdlStorageService()
+                    .readSecondaryIndexBuild(table.storageBinding().orElseThrow()).isPresent());
+
+            new DictionaryDdlRecoveryService(
+                    control, repository, cache, storage.tableDdlStorageService(), tables,
+                    TablePurgeBarrier.NONE, new OnlineIndexRecoveryRuntime(
+                    config().onlineDdlConfig(), logFiles, storage.typeCodecRegistry()))
+                    .recover(Duration.ofSeconds(5));
+
+            TableDefinition recovered = repository.findTable(table.id()).orElseThrow();
+            assertEquals(ObjectName.of("idx_value"), recovered.indexes().getLast().name());
+            assertEquals(DdlLogPhase.COMMITTED, repository.ddlLog()
+                    .find(cn.zhangyis.db.dd.domain.DdlId.of(3)).orElseThrow().phase());
+            assertTrue(storage.tableDdlStorageService()
+                    .readSecondaryIndexBuild(recovered.storageBinding().orElseThrow()).isEmpty());
+            assertFalse(Files.exists(unresolved.auxiliaryPath().orElseThrow()));
+        } finally {
+            storage.close();
+        }
+    }
+
+    /** PREPARED row-log 已 durable ABORT_REQUIRED 时，恢复只能 exact rollback descriptor 并保留旧 DD。 */
+    @Test
+    void rollsBackPreparedOnlineIndexWhenDurableAbortExists() {
+        StorageEngine storage = new StorageEngine(config());
+        storage.open();
+        Path tables = directory.resolve("online-index-abort-tables");
+        OnlineIndexChangeLogFiles logFiles = new OnlineIndexChangeLogFiles(
+                config().onlineDdlDirectory(), config().onlineDdlConfig());
+        try (FileInternalCatalogStore catalog = FileInternalCatalogStore.openOrCreate(
+                directory.resolve("online-index-abort-mysql.ibd"));
+             DictionaryControlStore control = DictionaryControlStore.openOrCreate(
+                     directory.resolve("online-index-abort-mysql.dd.ctrl"), SpaceId.of(1), 1024)) {
+            PersistentDictionaryRepository repository = new PersistentDictionaryRepository(catalog);
+            DictionaryObjectCache cache = new DictionaryObjectCache(16);
+            MetadataLockManager locks = new MetadataLockManager(8, 128);
+            DictionaryDdlService base = new DictionaryDdlService(
+                    control, repository, cache, locks, storage.tableDdlStorageService(), tables);
+            base.createSchema(MdlOwnerId.of(116), ObjectName.of("app"), 1, 1,
+                    Duration.ofSeconds(5));
+            TableDefinition table = base.createTable(
+                    MdlOwnerId.of(116), updateCommand(), Duration.ofSeconds(5));
+            DictionaryDdlService crashing = new DictionaryDdlService(
+                    control, repository, cache, locks, storage.tableDdlStorageService(), tables,
+                    TablePurgeBarrier.NONE, new DictionaryDdlFaultInjector() {
+                @Override public void afterDropPendingPublished(TableDefinition pending) { }
+                @Override
+                public void afterCreateIndexCaptureDurable(DdlLogRecord prepared) {
+                    throw new SimulatedProcessCrashError();
+                }
+            }, DictionaryCleanSnapshotPublisher.noOp(), new OnlineIndexBuildRuntime(
+                    storage.onlineDdlTableGate(), config().onlineDdlConfig(), logFiles,
+                    storage.typeCodecRegistry()));
+
+            assertThrows(SimulatedProcessCrashError.class, () -> crashing.createSecondaryIndex(
+                    MdlOwnerId.of(117), secondaryIndexCommand(), Duration.ofSeconds(5)));
+            DdlLogRecord unresolved = repository.ddlLog().unresolved().getFirst();
+            OnlineIndexBuildId buildId = OnlineIndexBuildId.of(
+                    unresolved.marker().ddlOperationId());
+            try (var log = logFiles.open(buildId, unresolved.auxiliaryPath().orElseThrow())) {
+                log.markAbortRequired(OnlineDdlAbortReason.CANCELLED, Duration.ofSeconds(2));
+            }
+
+            OnlineDdlOperationRegistry recoveryRegistry = new OnlineDdlOperationRegistry(8);
+            new DictionaryDdlRecoveryService(
+                    control, repository, cache, storage.tableDdlStorageService(), tables,
+                    TablePurgeBarrier.NONE, new OnlineIndexRecoveryRuntime(
+                    config().onlineDdlConfig(), logFiles, storage.typeCodecRegistry()),
+                    recoveryRegistry)
+                    .recover(Duration.ofSeconds(5));
+
+            assertEquals(1, repository.findTable(table.id()).orElseThrow().indexes().size());
+            assertEquals(DdlLogPhase.ROLLED_BACK, repository.ddlLog()
+                    .find(cn.zhangyis.db.dd.domain.DdlId.of(buildId.value())).orElseThrow().phase());
+            assertTrue(storage.tableDdlStorageService()
+                    .readSecondaryIndexBuild(table.storageBinding().orElseThrow()).isEmpty());
+            assertFalse(Files.exists(unresolved.auxiliaryPath().orElseThrow()));
+            assertEquals(OnlineDdlTerminalResult.ROLLED_BACK,
+                    recoveryRegistry.find(cn.zhangyis.db.dd.domain.DdlId.of(buildId.value()))
+                            .orElseThrow().terminalResult());
+        } finally {
+            storage.close();
+        }
+    }
+
+    /** manifest force 早于 PREPARED marker；该窗口崩溃留下的 exact 日志没有 marker/page3 owner，应在启动时删除。 */
+    @Test
+    void deletesOwnerlessOnlineIndexManifestDuringRecovery() {
+        StorageEngine storage = new StorageEngine(config());
+        storage.open();
+        Path tables = directory.resolve("online-index-orphan-tables");
+        OnlineIndexChangeLogFiles logFiles = new OnlineIndexChangeLogFiles(
+                config().onlineDdlDirectory(), config().onlineDdlConfig());
+        OnlineIndexBuildId buildId = OnlineIndexBuildId.of(91);
+        Path orphan;
+        try (var changeLog = logFiles.create(new OnlineIndexLogHeader(
+                buildId, 92, 93, 94, 95, 96, new byte[]{1, 2, 3}))) {
+            orphan = changeLog.path();
+        }
+        assertTrue(Files.exists(orphan));
+
+        try (FileInternalCatalogStore catalog = FileInternalCatalogStore.openOrCreate(
+                directory.resolve("online-index-orphan-mysql.ibd"));
+             DictionaryControlStore control = DictionaryControlStore.openOrCreate(
+                     directory.resolve("online-index-orphan-mysql.dd.ctrl"), SpaceId.of(1), 1024)) {
+            PersistentDictionaryRepository repository = new PersistentDictionaryRepository(catalog);
+            new DictionaryDdlRecoveryService(
+                    control, repository, new DictionaryObjectCache(16),
+                    storage.tableDdlStorageService(), tables, TablePurgeBarrier.NONE,
+                    new OnlineIndexRecoveryRuntime(config().onlineDdlConfig(), logFiles,
+                            storage.typeCodecRegistry()))
+                    .recover(Duration.ofSeconds(5));
+
+            assertFalse(Files.exists(orphan));
         } finally {
             storage.close();
         }
@@ -847,8 +1758,8 @@ class DictionaryDdlServiceTest {
                     repository.findTableForRecovery(table.id()).orElseThrow().state());
             assertEquals(DdlLogPhase.COMMITTED,
                     repository.ddlLog().find(cn.zhangyis.db.dd.domain.DdlId.of(3)).orElseThrow().phase());
-            assertTrue(repository.snapshot().publishedVersion().value() > 5,
-                    "recovery version must remain monotonic even when reserved version 5 was never published");
+            assertEquals(5, repository.snapshot().publishedVersion().value(),
+                    "recovery must publish the target version already reserved and covered by marker digest");
         } finally {
             storage.close();
         }
@@ -1132,6 +2043,234 @@ class DictionaryDdlServiceTest {
         }
     }
 
+    /** target SDI已写但control仍OPEN时崩溃，恢复必须让committed source DD获胜并覆盖SDI。 */
+    @Test
+    void rollsBackInstantMetadataAlterFromOpenTargetSdi() {
+        StorageEngine storage = new StorageEngine(config());
+        storage.open();
+        Path tables = directory.resolve("instant-open-tables");
+        try (FileInternalCatalogStore catalog = FileInternalCatalogStore.openOrCreate(
+                directory.resolve("instant-open-mysql.ibd"));
+             DictionaryControlStore control = DictionaryControlStore.openOrCreate(
+                     directory.resolve("instant-open-mysql.dd.ctrl"), SpaceId.of(1), 1024)) {
+            PersistentDictionaryRepository repository = new PersistentDictionaryRepository(catalog);
+            DictionaryObjectCache cache = new DictionaryObjectCache(16);
+            MetadataLockManager locks = new MetadataLockManager(8, 128);
+            DictionaryDdlService ddl = new DictionaryDdlService(
+                    control, repository, cache, locks, storage.tableDdlStorageService(), tables);
+            ddl.createSchema(MdlOwnerId.of(77), ObjectName.of("app"),
+                    1, 2, Duration.ofSeconds(5));
+            TableDefinition source = ddl.createTable(
+                    MdlOwnerId.of(77), command(), Duration.ofSeconds(5));
+            DictionaryDdlService crashing = ddlWithFault(
+                    storage, control, repository, cache, locks, tables,
+                    new DictionaryDdlFaultInjector() {
+                        @Override
+                        public void afterDropPendingPublished(TableDefinition pending) {
+                        }
+
+                        @Override
+                        public void afterInplaceAlterTargetSdi(DdlLogRecord prepared) {
+                            throw new SimulatedProcessCrashError();
+                        }
+                    });
+
+            assertThrows(SimulatedProcessCrashError.class, () -> crashing.alterTable(
+                    MdlOwnerId.of(78), metadataAlterCommand(), Duration.ofSeconds(5)));
+            DdlLogRecord marker = repository.ddlLog().unresolved().getFirst();
+            assertEquals(DdlLogOperation.ALTER_TABLE_INPLACE, marker.operation());
+            assertEquals(DdlControlState.OPEN, marker.controlState());
+            assertEquals(source, repository.findTableForRecovery(source.id()).orElseThrow());
+
+            new DictionaryDdlRecoveryService(control, repository, new DictionaryObjectCache(16),
+                    storage.tableDdlStorageService(), tables).recover(Duration.ofSeconds(5));
+
+            TableDefinition recovered = repository.findTableForRecovery(source.id()).orElseThrow();
+            assertEquals(source, recovered);
+            assertEquals(DdlLogPhase.ROLLED_BACK, repository.ddlLog().find(
+                    cn.zhangyis.db.dd.domain.DdlId.of(marker.marker().ddlOperationId()))
+                    .orElseThrow().phase());
+            assertEquals(source, new cn.zhangyis.db.dd.sdi.SerializedDictionaryInfoService(
+                    storage.tableDdlStorageService()).read(
+                    source.storageBinding().orElseThrow()).orElseThrow());
+        } finally {
+            storage.close();
+        }
+    }
+
+    /** target SDI窗口收到durable取消时，live coordinator必须恢复source SDI并保留取消证据到ROLLED_BACK。 */
+    @Test
+    void cancelsInstantMetadataAlterBeforeForwardFence() {
+        StorageEngine storage = new StorageEngine(config());
+        storage.open();
+        Path tables = directory.resolve("instant-cancel-tables");
+        try (FileInternalCatalogStore catalog = FileInternalCatalogStore.openOrCreate(
+                directory.resolve("instant-cancel-mysql.ibd"));
+             DictionaryControlStore control = DictionaryControlStore.openOrCreate(
+                     directory.resolve("instant-cancel-mysql.dd.ctrl"), SpaceId.of(1), 1024)) {
+            PersistentDictionaryRepository repository = new PersistentDictionaryRepository(catalog);
+            DictionaryObjectCache cache = new DictionaryObjectCache(16);
+            MetadataLockManager locks = new MetadataLockManager(8, 128);
+            DictionaryDdlService base = new DictionaryDdlService(
+                    control, repository, cache, locks, storage.tableDdlStorageService(), tables);
+            base.createSchema(MdlOwnerId.of(83), ObjectName.of("app"),
+                    1, 2, Duration.ofSeconds(5));
+            TableDefinition source = base.createTable(
+                    MdlOwnerId.of(83), command(), Duration.ofSeconds(5));
+            OnlineDdlOperationRegistry registry = new OnlineDdlOperationRegistry(8);
+            OnlineDdlControlService onlineControl =
+                    new OnlineDdlControlService(repository.ddlLog(), registry);
+            DictionaryDdlFaultInjector cancelAtTargetSdi = new DictionaryDdlFaultInjector() {
+                @Override
+                public void afterDropPendingPublished(TableDefinition pending) {
+                }
+
+                @Override
+                public void afterInplaceAlterTargetSdi(DdlLogRecord prepared) {
+                    OnlineDdlCancelResult result = onlineControl.requestCancel(
+                            cn.zhangyis.db.dd.domain.DdlId.of(
+                                    prepared.marker().ddlOperationId()),
+                            OnlineDdlCancelRequest.admin(
+                                    DdlCancellationReason.USER_REQUEST, 83L),
+                            Duration.ofSeconds(1));
+                    assertEquals(OnlineDdlCancelOutcome.ACCEPTED_DURABLE, result.outcome());
+                }
+            };
+            DictionaryDdlService cancellable = new DictionaryDdlService(
+                    control, repository, cache, locks, storage.tableDdlStorageService(), tables,
+                    TablePurgeBarrier.NONE, cancelAtTargetSdi,
+                    DictionaryCleanSnapshotPublisher.noOp(), null, registry);
+
+            assertThrows(OnlineDdlCancellationException.class, () -> cancellable.alterTable(
+                    MdlOwnerId.of(84), metadataAlterCommand(), Duration.ofSeconds(5)));
+
+            TableDefinition recoveredSource =
+                    repository.findTableForRecovery(source.id()).orElseThrow();
+            assertEquals(source, recoveredSource);
+            DdlLogRecord terminal = repository.ddlLog().records().stream()
+                    .filter(record -> record.operation() == DdlLogOperation.ALTER_TABLE_INPLACE)
+                    .findFirst().orElseThrow();
+            assertEquals(DdlLogPhase.ROLLED_BACK, terminal.phase());
+            assertEquals(DdlControlState.CANCEL_REQUESTED, terminal.controlState());
+            assertEquals(DdlCancellationReason.USER_REQUEST,
+                    terminal.cancellation().orElseThrow().reasonCode());
+            assertEquals(OnlineDdlTerminalResult.ROLLED_BACK,
+                    registry.find(cn.zhangyis.db.dd.domain.DdlId.of(
+                            terminal.marker().ddlOperationId())).orElseThrow().terminalResult());
+        } finally {
+            storage.close();
+        }
+    }
+
+    /** FORWARD_ONLY已durable而DD仍是source时，恢复必须从exact target SDI发布目标comment并补terminal。 */
+    @Test
+    void forwardsInstantMetadataAlterFromTargetSdi() {
+        StorageEngine storage = new StorageEngine(config());
+        storage.open();
+        Path tables = directory.resolve("instant-forward-tables");
+        try (FileInternalCatalogStore catalog = FileInternalCatalogStore.openOrCreate(
+                directory.resolve("instant-forward-mysql.ibd"));
+             DictionaryControlStore control = DictionaryControlStore.openOrCreate(
+                     directory.resolve("instant-forward-mysql.dd.ctrl"), SpaceId.of(1), 1024)) {
+            PersistentDictionaryRepository repository = new PersistentDictionaryRepository(catalog);
+            DictionaryObjectCache cache = new DictionaryObjectCache(16);
+            MetadataLockManager locks = new MetadataLockManager(8, 128);
+            DictionaryDdlService ddl = new DictionaryDdlService(
+                    control, repository, cache, locks, storage.tableDdlStorageService(), tables);
+            ddl.createSchema(MdlOwnerId.of(79), ObjectName.of("app"),
+                    1, 2, Duration.ofSeconds(5));
+            TableDefinition source = ddl.createTable(
+                    MdlOwnerId.of(79), command(), Duration.ofSeconds(5));
+            DictionaryDdlService crashing = ddlWithFault(
+                    storage, control, repository, cache, locks, tables,
+                    new DictionaryDdlFaultInjector() {
+                        @Override
+                        public void afterDropPendingPublished(TableDefinition pending) {
+                        }
+
+                        @Override
+                        public void afterInplaceAlterForwardFenced(DdlLogRecord forwardFenced) {
+                            throw new SimulatedProcessCrashError();
+                        }
+                    });
+
+            assertThrows(SimulatedProcessCrashError.class, () -> crashing.alterTable(
+                    MdlOwnerId.of(80), metadataAlterCommand(), Duration.ofSeconds(5)));
+            DdlLogRecord marker = repository.ddlLog().unresolved().getFirst();
+            assertEquals(DdlControlState.FORWARD_ONLY, marker.controlState());
+            assertEquals(source, repository.findTableForRecovery(source.id()).orElseThrow());
+
+            DictionaryObjectCache recoveryCache = new DictionaryObjectCache(16);
+            new DictionaryDdlRecoveryService(control, repository, recoveryCache,
+                    storage.tableDdlStorageService(), tables).recover(Duration.ofSeconds(5));
+
+            TableDefinition recovered = repository.findTableForRecovery(source.id()).orElseThrow();
+            assertEquals("instant", recovered.options().comment());
+            assertEquals(marker.marker().dictionaryVersion(), recovered.version().value());
+            assertEquals(DdlLogPhase.COMMITTED, repository.ddlLog().find(
+                    cn.zhangyis.db.dd.domain.DdlId.of(marker.marker().ddlOperationId()))
+                    .orElseThrow().phase());
+            try (var pin = recoveryCache.pinTable(recovered.id(), Duration.ofSeconds(1),
+                    () -> Optional.of(recovered))) {
+                assertEquals(recovered, pin.value());
+            }
+        } finally {
+            storage.close();
+        }
+    }
+
+    /** target DD与DICTIONARY_COMMITTED完成后崩溃，恢复只补cache/COMMITTED，不得回写source。 */
+    @Test
+    void finishesInstantMetadataAlterAfterDictionaryCommit() {
+        StorageEngine storage = new StorageEngine(config());
+        storage.open();
+        Path tables = directory.resolve("instant-committed-tables");
+        try (FileInternalCatalogStore catalog = FileInternalCatalogStore.openOrCreate(
+                directory.resolve("instant-committed-mysql.ibd"));
+             DictionaryControlStore control = DictionaryControlStore.openOrCreate(
+                     directory.resolve("instant-committed-mysql.dd.ctrl"), SpaceId.of(1), 1024)) {
+            PersistentDictionaryRepository repository = new PersistentDictionaryRepository(catalog);
+            DictionaryObjectCache cache = new DictionaryObjectCache(16);
+            MetadataLockManager locks = new MetadataLockManager(8, 128);
+            DictionaryDdlService ddl = new DictionaryDdlService(
+                    control, repository, cache, locks, storage.tableDdlStorageService(), tables);
+            ddl.createSchema(MdlOwnerId.of(81), ObjectName.of("app"),
+                    1, 2, Duration.ofSeconds(5));
+            TableDefinition source = ddl.createTable(
+                    MdlOwnerId.of(81), command(), Duration.ofSeconds(5));
+            DictionaryDdlService crashing = ddlWithFault(
+                    storage, control, repository, cache, locks, tables,
+                    new DictionaryDdlFaultInjector() {
+                        @Override
+                        public void afterDropPendingPublished(TableDefinition pending) {
+                        }
+
+                        @Override
+                        public void afterInplaceAlterDictionaryCommitted(TableDefinition active) {
+                            throw new SimulatedProcessCrashError();
+                        }
+                    });
+
+            assertThrows(SimulatedProcessCrashError.class, () -> crashing.alterTable(
+                    MdlOwnerId.of(82), metadataAlterCommand(), Duration.ofSeconds(5)));
+            DdlLogRecord marker = repository.ddlLog().unresolved().getFirst();
+            TableDefinition committed = repository.findTableForRecovery(source.id()).orElseThrow();
+            assertEquals("instant", committed.options().comment());
+            assertEquals(DdlLogPhase.DICTIONARY_COMMITTED, marker.phase());
+
+            new DictionaryDdlRecoveryService(control, repository, cache,
+                    storage.tableDdlStorageService(), tables).recover(Duration.ofSeconds(5));
+
+            assertEquals("instant", repository.findTableForRecovery(source.id())
+                    .orElseThrow().options().comment());
+            assertEquals(DdlLogPhase.COMMITTED, repository.ddlLog().find(
+                    cn.zhangyis.db.dd.domain.DdlId.of(marker.marker().ddlOperationId()))
+                    .orElseThrow().phase());
+        } finally {
+            storage.close();
+        }
+    }
+
     /** DROP 只写 PREPARED、DD 仍 ACTIVE 时没有越过提交裁决点，恢复不得删除原表文件。 */
     @Test
     void rollsBackDropPreparedMarker() {
@@ -1286,7 +2425,12 @@ class DictionaryDdlServiceTest {
             PersistentDictionaryRepository repository = new PersistentDictionaryRepository(catalog);
             repository.ddlLog().prepare(new DdlLogRecord(
                     new cn.zhangyis.db.storage.api.ddl.DdlUndoMarker(1, 2, 41),
-                    DdlLogOperation.CREATE_TABLE, DdlLogPhase.PREPARED, SpaceId.of(1024), mismatched));
+                    0L, DdlLogOperation.CREATE_TABLE, DdlLogPhase.PREPARED,
+                    SpaceId.of(1024), mismatched, Optional.empty(), Optional.empty(),
+                    DdlExecutionProtocol.ATOMIC_BLOCKING_V1,
+                    Optional.empty(), Optional.empty(), Optional.of(new DdlSchemaDigest(
+                    DdlDigestAlgorithm.SHA_256, DdlSchemaCanonicalFormat.TABLE_SCHEMA_V1,
+                    new byte[32])), DdlControlState.OPEN, Optional.empty(), Optional.empty()));
 
             assertThrows(DictionaryRecoveryException.class,
                     () -> new DictionaryDdlRecoveryService(control, repository,
@@ -1295,6 +2439,52 @@ class DictionaryDdlServiceTest {
             assertTrue(Files.exists(mismatched), "mismatched marker must never authorize file deletion");
             assertEquals(DdlLogPhase.PREPARED,
                     repository.ddlLog().find(cn.zhangyis.db.dd.domain.DdlId.of(1)).orElseThrow().phase());
+        } finally {
+            storage.close();
+        }
+    }
+
+    /** recovery完成DD状态分类后必须先校验source digest；不匹配时不能回收descriptor或把marker伪装成回滚完成。 */
+    @Test
+    void preservesCreateIndexEvidenceWhenSourceSchemaDigestMismatches() {
+        StorageEngine storage = new StorageEngine(config());
+        storage.open();
+        Path tables = directory.resolve("digest-mismatch-tables");
+        try (FileInternalCatalogStore catalog = FileInternalCatalogStore.openOrCreate(
+                directory.resolve("digest-mismatch-mysql.ibd"));
+             DictionaryControlStore control = DictionaryControlStore.openOrCreate(
+                     directory.resolve("digest-mismatch-mysql.dd.ctrl"), SpaceId.of(1), 1024)) {
+            PersistentDictionaryRepository repository = new PersistentDictionaryRepository(catalog);
+            DictionaryObjectCache cache = new DictionaryObjectCache(16);
+            DictionaryDdlService ddl = new DictionaryDdlService(
+                    control, repository, cache, new MetadataLockManager(8, 128),
+                    storage.tableDdlStorageService(), tables);
+            ddl.createSchema(MdlOwnerId.of(801), ObjectName.of("app"), 1, 1,
+                    Duration.ofSeconds(5));
+            TableDefinition table = ddl.createTable(
+                    MdlOwnerId.of(802), updateCommand(), Duration.ofSeconds(5));
+            var binding = table.storageBinding().orElseThrow();
+            DdlSchemaDigest wrong = new DdlSchemaDigest(
+                    DdlDigestAlgorithm.SHA_256, DdlSchemaCanonicalFormat.TABLE_SCHEMA_V1,
+                    new byte[32]);
+            repository.ddlLog().prepare(new DdlLogRecord(
+                    new cn.zhangyis.db.storage.api.ddl.DdlUndoMarker(
+                            99, table.version().value() + 1, table.id().value()),
+                    999, DdlLogOperation.CREATE_INDEX, DdlLogPhase.PREPARED,
+                    binding.spaceId(), binding.path(), Optional.empty(), Optional.empty(),
+                    DdlExecutionProtocol.ATOMIC_BLOCKING_V1,
+                    Optional.of(wrong), Optional.empty(), Optional.of(wrong),
+                    DdlControlState.OPEN, Optional.empty(), Optional.empty()));
+
+            assertThrows(DictionaryRecoveryException.class,
+                    () -> new DictionaryDdlRecoveryService(
+                            control, repository, cache, storage.tableDdlStorageService(), tables)
+                            .recover(Duration.ofSeconds(5)));
+            assertEquals(DdlLogPhase.PREPARED,
+                    repository.ddlLog().find(cn.zhangyis.db.dd.domain.DdlId.of(99))
+                            .orElseThrow().phase());
+            assertTrue(storage.tableDdlStorageService()
+                    .readSecondaryIndexBuild(binding).isEmpty());
         } finally {
             storage.close();
         }
@@ -1491,6 +2681,419 @@ class DictionaryDdlServiceTest {
         }
     }
 
+    /**
+     * Shadow 已写 target SDI/READY、但 OPEN 尚未变为 FORWARD_ONLY 时模拟进程消失；新 storage 只打开
+     * committed source，DDL recovery 必须离线删除 exact shadow、保留 source 并删除 terminal journal。
+     */
+    @Test
+    void rollsBackGeneralShadowAlterFromReadyOpenAfterRestart() {
+        Path tables = directory.resolve("general-shadow-open-tables");
+        EngineConfig base = config();
+        StorageEngine live = new StorageEngine(base);
+        live.open();
+        try (FileInternalCatalogStore catalog = FileInternalCatalogStore.openOrCreate(
+                directory.resolve("general-shadow-open-mysql.ibd"));
+             DictionaryControlStore control = DictionaryControlStore.openOrCreate(
+                     directory.resolve("general-shadow-open-mysql.dd.ctrl"),
+                     SpaceId.of(1), 1024)) {
+            PersistentDictionaryRepository repository = new PersistentDictionaryRepository(catalog);
+            DictionaryObjectCache cache = new DictionaryObjectCache(16);
+            MetadataLockManager locks = new MetadataLockManager(8, 128);
+            DictionaryDdlService bootstrap = new DictionaryDdlService(
+                    control, repository, cache, locks, live.tableDdlStorageService(), tables);
+            bootstrap.createSchema(MdlOwnerId.of(710), ObjectName.of("app"),
+                    1, 1, Duration.ofSeconds(5));
+            TableDefinition source = bootstrap.createTable(
+                    MdlOwnerId.of(710), command(), Duration.ofSeconds(5));
+            DictionaryDdlService crashing = generalDdlWithFault(
+                    live, base, control, repository, cache, locks, tables,
+                    new DictionaryDdlFaultInjector() {
+                        @Override
+                        public void afterDropPendingPublished(TableDefinition pending) {
+                        }
+
+                        @Override
+                        public void afterGeneralAlterReady(DdlLogRecord prepared) {
+                            throw new SimulatedProcessCrashError();
+                        }
+                    });
+
+            assertThrows(SimulatedProcessCrashError.class, () -> crashing.alterTable(
+                    MdlOwnerId.of(711), structuralAlterCommand(), Duration.ofSeconds(5)));
+            DdlLogRecord marker = repository.ddlLog().unresolved().getFirst();
+            Path shadow = readGeneralManifest(base, marker)
+                    .shadowTarget().orElseThrow().path();
+            assertEquals(DdlControlState.OPEN, marker.controlState());
+            assertTrue(Files.exists(shadow));
+            live.close();
+
+            StorageEngine recovered = new StorageEngine(base.withRecoveryTablespaces(List.of(
+                    new EngineTablespaceConfig(
+                            source.storageBinding().orElseThrow().spaceId(),
+                            source.storageBinding().orElseThrow().path()))));
+            recovered.open();
+            try {
+                recoverGeneralAlter(recovered, base, control, repository,
+                        new DictionaryObjectCache(16), tables);
+            } finally {
+                recovered.close();
+            }
+
+            assertEquals(source, repository.findTableForRecovery(source.id()).orElseThrow());
+            assertFalse(Files.exists(shadow));
+            assertFalse(Files.exists(marker.auxiliaryPath().orElseThrow()));
+            assertEquals(DdlLogPhase.ROLLED_BACK, repository.ddlLog().find(
+                    cn.zhangyis.db.dd.domain.DdlId.of(marker.marker().ddlOperationId()))
+                    .orElseThrow().phase());
+        } finally {
+            live.close();
+        }
+    }
+
+    /**
+     * FORWARD_ONLY、RECONCILED 与 ENGINE_DONE 已持久而 DD 仍是 source 时，重启必须挂载 shadow SDI、
+     * 发布唯一 target aggregate、等待旧版本退休并删除旧空间。
+     */
+    @Test
+    void forwardsGeneralShadowAlterFromEngineDoneSourceAfterRestart() {
+        Path tables = directory.resolve("general-shadow-forward-tables");
+        EngineConfig base = config();
+        StorageEngine live = new StorageEngine(base);
+        live.open();
+        try (FileInternalCatalogStore catalog = FileInternalCatalogStore.openOrCreate(
+                directory.resolve("general-shadow-forward-mysql.ibd"));
+             DictionaryControlStore control = DictionaryControlStore.openOrCreate(
+                     directory.resolve("general-shadow-forward-mysql.dd.ctrl"),
+                     SpaceId.of(1), 1024)) {
+            PersistentDictionaryRepository repository = new PersistentDictionaryRepository(catalog);
+            DictionaryObjectCache cache = new DictionaryObjectCache(16);
+            MetadataLockManager locks = new MetadataLockManager(8, 128);
+            DictionaryDdlService bootstrap = new DictionaryDdlService(
+                    control, repository, cache, locks, live.tableDdlStorageService(), tables);
+            bootstrap.createSchema(MdlOwnerId.of(720), ObjectName.of("app"),
+                    1, 1, Duration.ofSeconds(5));
+            TableDefinition source = bootstrap.createTable(
+                    MdlOwnerId.of(720), command(), Duration.ofSeconds(5));
+            DictionaryDdlService crashing = generalDdlWithFault(
+                    live, base, control, repository, cache, locks, tables,
+                    new DictionaryDdlFaultInjector() {
+                        @Override
+                        public void afterDropPendingPublished(TableDefinition pending) {
+                        }
+
+                        @Override
+                        public void afterGeneralAlterEngineDone(DdlLogRecord engineDone) {
+                            throw new SimulatedProcessCrashError();
+                        }
+                    });
+
+            assertThrows(SimulatedProcessCrashError.class, () -> crashing.alterTable(
+                    MdlOwnerId.of(721), structuralAlterCommand(), Duration.ofSeconds(5)));
+            DdlLogRecord marker = repository.ddlLog().unresolved().getFirst();
+            Path oldPath = source.storageBinding().orElseThrow().path();
+            assertEquals(DdlLogPhase.ENGINE_DONE, marker.phase());
+            assertEquals(DdlControlState.FORWARD_ONLY, marker.controlState());
+            live.close();
+
+            StorageEngine recovered = new StorageEngine(base.withRecoveryTablespaces(List.of(
+                    new EngineTablespaceConfig(
+                            source.storageBinding().orElseThrow().spaceId(), oldPath))));
+            recovered.open();
+            try {
+                recoverGeneralAlter(recovered, base, control, repository,
+                        new DictionaryObjectCache(16), tables);
+            } finally {
+                recovered.close();
+            }
+
+            TableDefinition target = repository.findTableForRecovery(source.id()).orElseThrow();
+            assertEquals(2, target.columns().size());
+            assertEquals(marker.marker().dictionaryVersion(), target.version().value());
+            assertFalse(target.storageBinding().equals(source.storageBinding()));
+            assertFalse(Files.exists(oldPath));
+            assertTrue(Files.exists(target.storageBinding().orElseThrow().path()));
+            assertEquals(DdlLogPhase.COMMITTED, repository.ddlLog().find(
+                    cn.zhangyis.db.dd.domain.DdlId.of(marker.marker().ddlOperationId()))
+                    .orElseThrow().phase());
+        } finally {
+            live.close();
+        }
+    }
+
+    /**
+     * target DD 与 DICTIONARY_COMMITTED 已落盘后，重启 discovery 只打开 shadow；恢复必须依据持久 fence
+     * 离线删除未打开的旧 source，而不能反向恢复旧 aggregate。
+     */
+    @Test
+    void retiresGeneralShadowSourceFromTargetDictionaryAfterRestart() {
+        Path tables = directory.resolve("general-shadow-target-tables");
+        EngineConfig base = config();
+        StorageEngine live = new StorageEngine(base);
+        live.open();
+        try (FileInternalCatalogStore catalog = FileInternalCatalogStore.openOrCreate(
+                directory.resolve("general-shadow-target-mysql.ibd"));
+             DictionaryControlStore control = DictionaryControlStore.openOrCreate(
+                     directory.resolve("general-shadow-target-mysql.dd.ctrl"),
+                     SpaceId.of(1), 1024)) {
+            PersistentDictionaryRepository repository = new PersistentDictionaryRepository(catalog);
+            DictionaryObjectCache cache = new DictionaryObjectCache(16);
+            MetadataLockManager locks = new MetadataLockManager(8, 128);
+            DictionaryDdlService bootstrap = new DictionaryDdlService(
+                    control, repository, cache, locks, live.tableDdlStorageService(), tables);
+            bootstrap.createSchema(MdlOwnerId.of(730), ObjectName.of("app"),
+                    1, 1, Duration.ofSeconds(5));
+            TableDefinition source = bootstrap.createTable(
+                    MdlOwnerId.of(730), command(), Duration.ofSeconds(5));
+            DictionaryDdlService crashing = generalDdlWithFault(
+                    live, base, control, repository, cache, locks, tables,
+                    new DictionaryDdlFaultInjector() {
+                        @Override
+                        public void afterDropPendingPublished(TableDefinition pending) {
+                        }
+
+                        @Override
+                        public void afterGeneralAlterDictionaryCommitted(TableDefinition active) {
+                            throw new SimulatedProcessCrashError();
+                        }
+                    });
+
+            assertThrows(SimulatedProcessCrashError.class, () -> crashing.alterTable(
+                    MdlOwnerId.of(731), structuralAlterCommand(), Duration.ofSeconds(5)));
+            DdlLogRecord marker = repository.ddlLog().unresolved().getFirst();
+            TableDefinition target = repository.findTableForRecovery(source.id()).orElseThrow();
+            Path oldPath = source.storageBinding().orElseThrow().path();
+            assertEquals(DdlLogPhase.DICTIONARY_COMMITTED, marker.phase());
+            live.close();
+
+            StorageEngine recovered = new StorageEngine(base.withRecoveryTablespaces(List.of(
+                    new EngineTablespaceConfig(
+                            target.storageBinding().orElseThrow().spaceId(),
+                            target.storageBinding().orElseThrow().path()))));
+            recovered.open();
+            try {
+                recoverGeneralAlter(recovered, base, control, repository,
+                        new DictionaryObjectCache(16), tables);
+            } finally {
+                recovered.close();
+            }
+
+            assertEquals(target, repository.findTableForRecovery(source.id()).orElseThrow());
+            assertFalse(Files.exists(oldPath));
+            assertTrue(Files.exists(target.storageBinding().orElseThrow().path()));
+            assertEquals(DdlLogPhase.COMMITTED, repository.ddlLog().find(
+                    cn.zhangyis.db.dd.domain.DdlId.of(marker.marker().ddlOperationId()))
+                    .orElseThrow().phase());
+        } finally {
+            live.close();
+        }
+    }
+
+    /**
+     * 多 ADD descriptor 与 RECONCILED 已持久、DD 仍是 source 时，恢复应从同空间 target SDI 一次发布
+     * 两个新索引，并清除 descriptor chain 而保留新 root/segment。
+     */
+    @Test
+    void forwardsGeneralInplaceIndexesFromEngineDoneSourceAfterRestart() {
+        Path tables = directory.resolve("general-inplace-forward-tables");
+        EngineConfig base = config();
+        StorageEngine live = new StorageEngine(base);
+        live.open();
+        try (FileInternalCatalogStore catalog = FileInternalCatalogStore.openOrCreate(
+                directory.resolve("general-inplace-forward-mysql.ibd"));
+             DictionaryControlStore control = DictionaryControlStore.openOrCreate(
+                     directory.resolve("general-inplace-forward-mysql.dd.ctrl"),
+                     SpaceId.of(1), 1024)) {
+            PersistentDictionaryRepository repository = new PersistentDictionaryRepository(catalog);
+            DictionaryObjectCache cache = new DictionaryObjectCache(16);
+            MetadataLockManager locks = new MetadataLockManager(8, 128);
+            DictionaryDdlService bootstrap = new DictionaryDdlService(
+                    control, repository, cache, locks, live.tableDdlStorageService(), tables);
+            bootstrap.createSchema(MdlOwnerId.of(740), ObjectName.of("app"),
+                    1, 1, Duration.ofSeconds(5));
+            TableDefinition source = bootstrap.createTable(
+                    MdlOwnerId.of(740), command(), Duration.ofSeconds(5));
+            DictionaryDdlService crashing = generalDdlWithFault(
+                    live, base, control, repository, cache, locks, tables,
+                    new DictionaryDdlFaultInjector() {
+                        @Override
+                        public void afterDropPendingPublished(TableDefinition pending) {
+                        }
+
+                        @Override
+                        public void afterGeneralAlterEngineDone(DdlLogRecord engineDone) {
+                            throw new SimulatedProcessCrashError();
+                        }
+                    });
+
+            assertThrows(SimulatedProcessCrashError.class, () -> crashing.alterTable(
+                    MdlOwnerId.of(741), generalAddIndexesCommand(), Duration.ofSeconds(5)));
+            DdlLogRecord marker = repository.ddlLog().unresolved().getFirst();
+            live.close();
+
+            StorageEngine recovered = new StorageEngine(base.withRecoveryTablespaces(List.of(
+                    new EngineTablespaceConfig(
+                            source.storageBinding().orElseThrow().spaceId(),
+                            source.storageBinding().orElseThrow().path()))));
+            recovered.open();
+            try {
+                recoverGeneralAlter(recovered, base, control, repository,
+                        new DictionaryObjectCache(16), tables);
+            } finally {
+                recovered.close();
+            }
+
+            TableDefinition target = repository.findTableForRecovery(source.id()).orElseThrow();
+            assertEquals(List.of("PRIMARY", "idx_id_a", "idx_id_b"),
+                    target.indexes().stream().map(index -> index.name().displayName()).toList());
+            assertEquals(source.storageBinding().orElseThrow().spaceId(),
+                    target.storageBinding().orElseThrow().spaceId());
+            assertEquals(DdlLogPhase.COMMITTED, repository.ddlLog().find(
+                    cn.zhangyis.db.dd.domain.DdlId.of(marker.marker().ddlOperationId()))
+                    .orElseThrow().phase());
+            assertFalse(Files.exists(marker.auxiliaryPath().orElseThrow()));
+        } finally {
+            live.close();
+        }
+    }
+
+    /**
+     * mixed DROP+ADD 的 target DD 已提交时，恢复必须按持久 fence 退休旧索引并保留新增 binding；
+     * descriptor cleanup 不得误删已发布的 ADD root。
+     */
+    @Test
+    void retiresGeneralInplaceDropFromTargetDictionaryAfterRestart() {
+        Path tables = directory.resolve("general-inplace-target-tables");
+        EngineConfig base = config();
+        StorageEngine live = new StorageEngine(base);
+        live.open();
+        try (FileInternalCatalogStore catalog = FileInternalCatalogStore.openOrCreate(
+                directory.resolve("general-inplace-target-mysql.ibd"));
+             DictionaryControlStore control = DictionaryControlStore.openOrCreate(
+                     directory.resolve("general-inplace-target-mysql.dd.ctrl"),
+                     SpaceId.of(1), 1024)) {
+            PersistentDictionaryRepository repository = new PersistentDictionaryRepository(catalog);
+            DictionaryObjectCache cache = new DictionaryObjectCache(16);
+            MetadataLockManager locks = new MetadataLockManager(8, 128);
+            DictionaryDdlService bootstrap = new DictionaryDdlService(
+                    control, repository, cache, locks, live.tableDdlStorageService(), tables);
+            bootstrap.createSchema(MdlOwnerId.of(750), ObjectName.of("app"),
+                    1, 1, Duration.ofSeconds(5));
+            bootstrap.createTable(MdlOwnerId.of(750), updateCommand(), Duration.ofSeconds(5));
+            TableDefinition source = bootstrap.createSecondaryIndex(
+                    MdlOwnerId.of(750), secondaryIndexCommand(), Duration.ofSeconds(5));
+            DictionaryDdlService crashing = generalDdlWithFault(
+                    live, base, control, repository, cache, locks, tables,
+                    new DictionaryDdlFaultInjector() {
+                        @Override
+                        public void afterDropPendingPublished(TableDefinition pending) {
+                        }
+
+                        @Override
+                        public void afterGeneralAlterDictionaryCommitted(TableDefinition active) {
+                            throw new SimulatedProcessCrashError();
+                        }
+                    });
+
+            assertThrows(SimulatedProcessCrashError.class, () -> crashing.alterTable(
+                    MdlOwnerId.of(751), generalMixedIndexCommand(), Duration.ofSeconds(5)));
+            DdlLogRecord marker = repository.ddlLog().unresolved().getFirst();
+            TableDefinition target = repository.findTableForRecovery(source.id()).orElseThrow();
+            assertEquals(List.of("PRIMARY", "idx_id"),
+                    target.indexes().stream().map(index -> index.name().displayName()).toList());
+            live.close();
+
+            StorageEngine recovered = new StorageEngine(base.withRecoveryTablespaces(List.of(
+                    new EngineTablespaceConfig(
+                            target.storageBinding().orElseThrow().spaceId(),
+                            target.storageBinding().orElseThrow().path()))));
+            recovered.open();
+            try {
+                recoverGeneralAlter(recovered, base, control, repository,
+                        new DictionaryObjectCache(16), tables);
+            } finally {
+                recovered.close();
+            }
+
+            assertEquals(target, repository.findTableForRecovery(source.id()).orElseThrow());
+            assertEquals(DdlLogPhase.COMMITTED, repository.ddlLog().find(
+                    cn.zhangyis.db.dd.domain.DdlId.of(marker.marker().ddlOperationId()))
+                    .orElseThrow().phase());
+            assertFalse(Files.exists(marker.auxiliaryPath().orElseThrow()));
+        } finally {
+            live.close();
+        }
+    }
+
+    /**
+     * FORWARD_ONLY 先于 RECONCILED 是故意保留的 crash window；恢复不得把“方向已封闭”误当作“物理结果完整”，
+     * 必须 fail-closed 并原样保留 journal、descriptor 与 source DD 供诊断或后续修复。
+     */
+    @Test
+    void failsClosedWhenGeneralAlterForwardFenceLacksReconciledForce() {
+        Path tables = directory.resolve("general-forward-gap-tables");
+        EngineConfig base = config();
+        StorageEngine live = new StorageEngine(base);
+        live.open();
+        try (FileInternalCatalogStore catalog = FileInternalCatalogStore.openOrCreate(
+                directory.resolve("general-forward-gap-mysql.ibd"));
+             DictionaryControlStore control = DictionaryControlStore.openOrCreate(
+                     directory.resolve("general-forward-gap-mysql.dd.ctrl"),
+                     SpaceId.of(1), 1024)) {
+            PersistentDictionaryRepository repository = new PersistentDictionaryRepository(catalog);
+            DictionaryObjectCache cache = new DictionaryObjectCache(16);
+            MetadataLockManager locks = new MetadataLockManager(8, 128);
+            DictionaryDdlService bootstrap = new DictionaryDdlService(
+                    control, repository, cache, locks, live.tableDdlStorageService(), tables);
+            bootstrap.createSchema(MdlOwnerId.of(760), ObjectName.of("app"),
+                    1, 1, Duration.ofSeconds(5));
+            TableDefinition source = bootstrap.createTable(
+                    MdlOwnerId.of(760), command(), Duration.ofSeconds(5));
+            DictionaryDdlService crashing = generalDdlWithFault(
+                    live, base, control, repository, cache, locks, tables,
+                    new DictionaryDdlFaultInjector() {
+                        @Override
+                        public void afterDropPendingPublished(TableDefinition pending) {
+                        }
+
+                        @Override
+                        public void afterGeneralAlterForwardFenced(DdlLogRecord forwardFenced) {
+                            throw new SimulatedProcessCrashError();
+                        }
+                    });
+
+            assertThrows(SimulatedProcessCrashError.class, () -> crashing.alterTable(
+                    MdlOwnerId.of(761), generalAddIndexesCommand(), Duration.ofSeconds(5)));
+            DdlLogRecord marker = repository.ddlLog().unresolved().getFirst();
+            live.close();
+
+            StorageEngine recovered = new StorageEngine(base.withRecoveryTablespaces(List.of(
+                    new EngineTablespaceConfig(
+                            source.storageBinding().orElseThrow().spaceId(),
+                            source.storageBinding().orElseThrow().path()))));
+            recovered.open();
+            try {
+                assertThrows(DictionaryRecoveryException.class, () -> recoverGeneralAlter(
+                        recovered, base, control, repository,
+                        new DictionaryObjectCache(16), tables));
+                assertTrue(recovered.tableDdlStorageService()
+                        .readOnlineAlterDescriptorSet(
+                                source.storageBinding().orElseThrow()).isPresent());
+            } finally {
+                recovered.close();
+            }
+
+            DdlLogRecord retained = repository.ddlLog().find(
+                    cn.zhangyis.db.dd.domain.DdlId.of(marker.marker().ddlOperationId()))
+                    .orElseThrow();
+            assertEquals(DdlLogPhase.PREPARED, retained.phase());
+            assertEquals(DdlControlState.FORWARD_ONLY, retained.controlState());
+            assertTrue(Files.exists(marker.auxiliaryPath().orElseThrow()));
+            assertEquals(source, repository.findTableForRecovery(source.id()).orElseThrow());
+        } finally {
+            live.close();
+        }
+    }
+
     private static InternalCatalogStore durableThenThrow(InternalCatalogStore delegate) {
         return new InternalCatalogStore() {
             @Override
@@ -1519,6 +3122,58 @@ class DictionaryDdlServiceTest {
                 // delegate 由测试外层 try-with-resources 拥有，wrapper 不重复关闭。
             }
         };
+    }
+
+    /** 构造启用完整通用ALTER能力且共享真实storage gate/history的故障注入coordinator。 */
+    private static DictionaryDdlService generalDdlWithFault(
+            StorageEngine storage, EngineConfig config,
+            DictionaryControlStore control,
+            PersistentDictionaryRepository repository,
+            DictionaryObjectCache cache, MetadataLockManager locks,
+            Path tables, DictionaryDdlFaultInjector faultInjector) {
+        OnlineDdlOperationRegistry registry = new OnlineDdlOperationRegistry(32);
+        return new DictionaryDdlService(
+                control, repository, cache, locks, storage.tableDdlStorageService(), tables,
+                storage.tablePurgeBarrier(), faultInjector,
+                DictionaryCleanSnapshotPublisher.noOp(), null, registry, null,
+                new OnlineAlterRuntime(
+                        storage.onlineDdlTableGate(), config.onlineDdlConfig(),
+                        new OnlineAlterChangeLogFiles(
+                                config.onlineDdlDirectory(), config.onlineDdlConfig()),
+                        storage.typeCodecRegistry(), storage.readViewRetentionBarrier()),
+                new DefaultOnlineAlterRetirementBarrier(
+                        storage.indexRetirementHistoryBarrier(),
+                        storage.tablePurgeBarrier(), cache));
+    }
+
+    /** 在已完成storage恢复的测试实例内运行完整通用ALTER DDL recovery。 */
+    private static void recoverGeneralAlter(
+            StorageEngine storage, EngineConfig config,
+            DictionaryControlStore control,
+            PersistentDictionaryRepository repository,
+            DictionaryObjectCache cache, Path tables) {
+        new DictionaryDdlRecoveryService(
+                control, repository, cache, storage.tableDdlStorageService(), tables,
+                storage.tablePurgeBarrier(), null,
+                new OnlineDdlOperationRegistry(32), null,
+                new OnlineAlterRecoveryRuntime(new OnlineAlterChangeLogFiles(
+                        config.onlineDdlDirectory(), config.onlineDdlConfig())),
+                new DefaultOnlineAlterRetirementBarrier(
+                        storage.indexRetirementHistoryBarrier(),
+                        storage.tablePurgeBarrier(), cache))
+                .recover(Duration.ofSeconds(5));
+    }
+
+    /** 只读打开operation-owned journal并在返回manifest前关闭FileChannel。 */
+    private static OnlineAlterManifest readGeneralManifest(
+            EngineConfig config, DdlLogRecord marker) {
+        OnlineDdlCaptureId captureId = OnlineDdlCaptureId.of(
+                marker.marker().ddlOperationId());
+        try (var journal = new OnlineAlterChangeLogFiles(
+                config.onlineDdlDirectory(), config.onlineDdlConfig()).open(
+                captureId, marker.auxiliaryPath().orElseThrow())) {
+            return new OnlineAlterManifestCodec().decode(journal.header().manifest());
+        }
     }
 
     private static DictionaryDdlService ddlWithFault(
@@ -1573,6 +3228,39 @@ class DictionaryDdlServiceTest {
                                 Optional.empty()))));
     }
 
+    /** 两个ADD强制进入通用INPLACE_INDEX，不走单索引兼容委托。 */
+    private static AlterTableCommand generalAddIndexesCommand() {
+        return new AlterTableCommand(
+                QualifiedTableName.of("app", "orders"),
+                List.of(
+                        new AlterTableAction.AddIndex(new CreateIndexSpec(
+                                ObjectName.of("idx_id_a"), false, false,
+                                List.of(new CreateIndexKeyPartSpec(
+                                        ObjectName.of("id"), IndexOrder.ASC, 0)))),
+                        new AlterTableAction.AddIndex(new CreateIndexSpec(
+                                ObjectName.of("idx_id_b"), false, false,
+                                List.of(new CreateIndexKeyPartSpec(
+                                        ObjectName.of("id"), IndexOrder.DESC, 0))))));
+    }
+
+    /** 一个DROP与一个ADD共享manifest/generation并同时覆盖retirement资源验证。 */
+    private static AlterTableCommand generalMixedIndexCommand() {
+        return new AlterTableCommand(
+                QualifiedTableName.of("app", "orders"),
+                List.of(
+                        new AlterTableAction.DropIndex(ObjectName.of("idx_value")),
+                        new AlterTableAction.AddIndex(new CreateIndexSpec(
+                                ObjectName.of("idx_id"), false, false,
+                                List.of(new CreateIndexKeyPartSpec(
+                                        ObjectName.of("id"), IndexOrder.ASC, 0))))));
+    }
+
+    /** 构造不改变row layout、可由target SDI完整恢复的metadata-only命令。 */
+    private static AlterTableCommand metadataAlterCommand() {
+        return new AlterTableCommand(QualifiedTableName.of("app", "orders"),
+                List.of(new AlterTableAction.Comment("instant")));
+    }
+
     private static DropSecondaryIndexCommand dropIndexCommand() {
         return new DropSecondaryIndexCommand(
                 QualifiedTableName.of("app", "orders"), ObjectName.of("idx_value"));
@@ -1582,5 +3270,9 @@ class DictionaryDdlServiceTest {
         return new EngineConfig(directory, PageSize.ofBytes(16 * 1024), 256,
                 SpaceId.of(5), PageNo.of(64), 64, 100,
                 Duration.ofSeconds(10), 64L * 1024 * 1024);
+    }
+
+    /** 仅用于让测试越过生产 RuntimeException 补偿分支，模拟 JVM 在 durable 边界直接消失。 */
+    private static final class SimulatedProcessCrashError extends Error {
     }
 }

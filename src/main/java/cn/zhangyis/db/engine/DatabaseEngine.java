@@ -8,8 +8,12 @@ import cn.zhangyis.db.engine.adapter.DictionaryStorageMetadataMapper;
 import cn.zhangyis.db.engine.adapter.DefaultSqlStorageGateway;
 import cn.zhangyis.db.engine.adapter.DefaultSqlDdlGateway;
 import cn.zhangyis.db.dd.ddl.DictionaryDdlService;
+import cn.zhangyis.db.dd.ddl.OnlineDdlControlService;
+import cn.zhangyis.db.dd.ddl.OnlineDdlOperationRegistry;
 import cn.zhangyis.db.dd.mdl.MetadataLockManager;
 import cn.zhangyis.db.dd.recovery.DictionaryDdlRecoveryService;
+import cn.zhangyis.db.dd.ddl.OnlineIndexBuildRuntime;
+import cn.zhangyis.db.dd.recovery.OnlineIndexRecoveryRuntime;
 import cn.zhangyis.db.dd.recovery.DictionaryRecoveryIsolationPlanner;
 import cn.zhangyis.db.dd.recovery.RecoveryIsolationPlan;
 import cn.zhangyis.db.dd.recovery.DictionaryRecoveryManifestRepository;
@@ -24,6 +28,10 @@ import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.engine.EngineConfig;
 import cn.zhangyis.db.storage.engine.EngineTablespaceConfig;
 import cn.zhangyis.db.storage.engine.StorageEngine;
+import cn.zhangyis.db.storage.fil.online.OnlineIndexChangeLogFiles;
+import cn.zhangyis.db.storage.api.ddl.online.OnlineDdlAbortReason;
+import cn.zhangyis.db.storage.api.ddl.online.OnlineDdlTablePhase;
+import cn.zhangyis.db.storage.api.ddl.online.OnlineIndexBuildId;
 import cn.zhangyis.db.storage.engine.RecoveryExportWriteRejectedException;
 import cn.zhangyis.db.storage.fil.catalog.FileInternalCatalogStore;
 import cn.zhangyis.db.storage.fil.catalog.FileDictionaryRecoveryManifestStore;
@@ -143,6 +151,10 @@ public final class DatabaseEngine implements AutoCloseable {
      * 本对象持有的 {@code ddl} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
      */
     private DictionaryDdlService ddl;
+    /** live/recovery/control 共享的唯一 Online DDL 轻量 registry；不拥有业务资源。 */
+    private OnlineDdlOperationRegistry onlineDdlRegistry;
+    /** 只读诊断与 durable cancel CAS 的稳定 Java/admin facade。 */
+    private OnlineDdlControlService onlineDdlControl;
     /**
      * 本对象拥有的 {@code sqlMetadataMapper} 受控集合；元素生命周期与外层对象一致，仅由本类方法更新，对外暴露时必须返回副本或不可变视图。
      */
@@ -246,6 +258,7 @@ public final class DatabaseEngine implements AutoCloseable {
                 accessMode = determineAccessMode(baseConfig, unavailableTables);
                 cache = new DictionaryObjectCache(DICTIONARY_CACHE_CAPACITY);
                 metadataLocks = new MetadataLockManager();
+                onlineDdlRegistry = new OnlineDdlOperationRegistry(DICTIONARY_CACHE_CAPACITY);
                 dictionary = new DataDictionaryService(repository, cache, metadataLocks);
                 DictionaryRecoverySnapshotPublisher cleanSnapshotPublisher =
                         new DictionaryRecoverySnapshotPublisher(
@@ -265,8 +278,25 @@ public final class DatabaseEngine implements AutoCloseable {
                         isolationPlan.exclusionPolicy(), () -> {
                             new DictionaryDdlRecoveryService(controlStore, repository, cache,
                                     storage.tableDdlStorageServiceForRecoveryCompletion(), tablesDirectory,
-                                    storage.tablePurgeBarrierForRecoveryCompletion())
-                                    .recover(baseConfig.flushTimeout());
+                                    storage.tablePurgeBarrierForRecoveryCompletion(),
+                                    new OnlineIndexRecoveryRuntime(
+                                            baseConfig.onlineDdlConfig(),
+                                             new OnlineIndexChangeLogFiles(
+                                                     baseConfig.onlineDdlDirectory(),
+                                                     baseConfig.onlineDdlConfig()),
+                                             storage.typeCodecRegistryForRecoveryCompletion()),
+                                     onlineDdlRegistry,
+                                    new cn.zhangyis.db.dd.ddl.DefaultIndexRetirementBarrier(
+                                            storage.indexRetirementHistoryBarrierForRecoveryCompletion(),
+                                            cache),
+                                    new cn.zhangyis.db.dd.recovery.OnlineAlterRecoveryRuntime(
+                                            new cn.zhangyis.db.storage.fil.online.OnlineAlterChangeLogFiles(
+                                                    baseConfig.onlineDdlDirectory(),
+                                                    baseConfig.onlineDdlConfig())),
+                                    new cn.zhangyis.db.dd.ddl.DefaultOnlineAlterRetirementBarrier(
+                                            storage.indexRetirementHistoryBarrierForRecoveryCompletion(),
+                                            storage.tablePurgeBarrierForRecoveryCompletion(), cache))
+                                     .recover(baseConfig.flushTimeout());
                             cleanSnapshotPublisher.publish();
                         });
                 storage.configureIndexMetadataResolver(new DictionaryIndexMetadataResolver(repository));
@@ -278,7 +308,52 @@ public final class DatabaseEngine implements AutoCloseable {
                 ddl = new DictionaryDdlService(controlStore, repository, cache, metadataLocks,
                         storage.tableDdlStorageService(), tablesDirectory, storage.tablePurgeBarrier(),
                         cn.zhangyis.db.dd.ddl.DictionaryDdlFaultInjector.NO_OP,
-                        cleanSnapshotPublisher);
+                        cleanSnapshotPublisher,
+                        new OnlineIndexBuildRuntime(storage.onlineDdlTableGate(),
+                                 baseConfig.onlineDdlConfig(),
+                                 new OnlineIndexChangeLogFiles(
+                                         baseConfig.onlineDdlDirectory(), baseConfig.onlineDdlConfig()),
+                                 storage.typeCodecRegistry()), onlineDdlRegistry,
+                        new cn.zhangyis.db.dd.ddl.DefaultIndexRetirementBarrier(
+                                storage.indexRetirementHistoryBarrier(), cache),
+                        new cn.zhangyis.db.dd.ddl.OnlineAlterRuntime(
+                                storage.onlineDdlTableGate(), baseConfig.onlineDdlConfig(),
+                                new cn.zhangyis.db.storage.fil.online.OnlineAlterChangeLogFiles(
+                                        baseConfig.onlineDdlDirectory(),
+                                        baseConfig.onlineDdlConfig()),
+                                storage.typeCodecRegistry(),
+                                storage.readViewRetentionBarrier()),
+                        new cn.zhangyis.db.dd.ddl.DefaultOnlineAlterRetirementBarrier(
+                                storage.indexRetirementHistoryBarrier(),
+                                storage.tablePurgeBarrier(), cache));
+                onlineDdlControl = new OnlineDdlControlService(
+                        repository.ddlLog(), onlineDdlRegistry, identity -> {
+                    // durable cancel已释放 catalog writer fence；先精确唤醒 pending MDL，再唤醒 gate drain。
+                    if (identity.ownerId() > 0) {
+                        metadataLocks.cancelPending(
+                                cn.zhangyis.db.dd.domain.MdlOwnerId.of(identity.ownerId()));
+                    }
+                    OnlineDdlTablePhase phase = storage.onlineDdlTableGate()
+                            .phase(identity.tableId());
+                    if (phase != OnlineDdlTablePhase.ABSENT
+                            && phase != OnlineDdlTablePhase.ABORTING) {
+                        if (identity.operation()
+                                == cn.zhangyis.db.dd.ddl.DdlLogOperation.ALTER_TABLE_INPLACE
+                                || identity.operation()
+                                == cn.zhangyis.db.dd.ddl.DdlLogOperation.REBUILD_TABLE) {
+                            // 通用ALTER在gate中由capture id登记；若误用旧build入口，取消虽已durable，
+                            // 但正在等待base-copy/final drain的线程不会被唤醒。
+                            storage.onlineDdlTableGate().beginAbort(
+                                    cn.zhangyis.db.storage.api.ddl.online.OnlineDdlCaptureId.of(
+                                            identity.ddlId().value()),
+                                    OnlineDdlAbortReason.CANCELLED);
+                        } else {
+                            storage.onlineDdlTableGate().beginAbort(
+                                    OnlineIndexBuildId.of(identity.ddlId().value()),
+                                    OnlineDdlAbortReason.CANCELLED);
+                        }
+                    }
+                });
                 // 5. SQL/session 是最后发布的用户入口，避免半恢复实例接受语句。
                 sqlMetadataMapper = new DictionaryStorageMetadataMapper();
                 sqlParser = new DefaultSqlParser();
@@ -314,6 +389,17 @@ public final class DatabaseEngine implements AutoCloseable {
         requireOpen();
         rejectRecoveryExportFacade("DDL");
         return ddl;
+    }
+
+    /**
+     * 返回 Online DDL 诊断与管理控制面。该 facade 不暴露 gate、row-log 或 MDL 内部对象；
+     * 取消权限仍由 {@code OnlineDdlCancelRequest} 显式声明。
+     *
+     * @return 与 live coordinator 共享 registry/marker repository 的稳定 Java/admin facade
+     */
+    public OnlineDdlControlService onlineDdlControl() {
+        requireOpen();
+        return onlineDdlControl;
     }
 
     /** 返回已完成 discovery/recovery 的底层存储组合根。
@@ -535,6 +621,8 @@ public final class DatabaseEngine implements AutoCloseable {
             }
         }
         storage = null;
+        onlineDdlControl = null;
+        onlineDdlRegistry = null;
         xaCoordinator = null;
         // 2. 用户入口不拥有独立资源，但必须在下层 close 后清除引用。
         sqlMetadataMapper = null;

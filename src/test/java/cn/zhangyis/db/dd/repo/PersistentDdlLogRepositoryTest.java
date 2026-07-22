@@ -1,9 +1,14 @@
 package cn.zhangyis.db.dd.repo;
 
 import cn.zhangyis.db.dd.ddl.DictionaryDdlLogStateException;
+import cn.zhangyis.db.dd.ddl.DdlControlState;
+import cn.zhangyis.db.dd.ddl.DdlDigestAlgorithm;
+import cn.zhangyis.db.dd.ddl.DdlExecutionProtocol;
 import cn.zhangyis.db.dd.ddl.DdlLogOperation;
 import cn.zhangyis.db.dd.ddl.DdlLogPhase;
 import cn.zhangyis.db.dd.ddl.DdlLogRecord;
+import cn.zhangyis.db.dd.ddl.DdlSchemaCanonicalFormat;
+import cn.zhangyis.db.dd.ddl.DdlSchemaDigest;
 import cn.zhangyis.db.dd.domain.DdlId;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.api.catalog.CatalogBatch;
@@ -19,6 +24,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -41,14 +47,14 @@ class PersistentDdlLogRepositoryTest {
         Path dropPath = directory.resolve("tables/table_12_space_1025.ibd").toAbsolutePath().normalize();
         try (FileInternalCatalogStore store = FileInternalCatalogStore.openOrCreate(catalog)) {
             PersistentDdlLogRepository logs = new PersistentDdlLogRepository(store);
-            logs.prepare(new DdlLogRecord(
+            logs.prepare(productionRecord(
                     new DdlUndoMarker(7, 21, 11), DdlLogOperation.CREATE_TABLE, DdlLogPhase.PREPARED,
                     SpaceId.of(1024), createPath));
             logs.transition(DdlId.of(7), DdlLogPhase.PREPARED, DdlLogPhase.ENGINE_DONE);
             logs.transition(DdlId.of(7), DdlLogPhase.ENGINE_DONE, DdlLogPhase.DICTIONARY_COMMITTED);
             logs.transition(DdlId.of(7), DdlLogPhase.DICTIONARY_COMMITTED, DdlLogPhase.COMMITTED);
 
-            logs.prepare(new DdlLogRecord(
+            logs.prepare(productionRecord(
                     new DdlUndoMarker(9, 22, 12), DdlLogOperation.DROP_TABLE, DdlLogPhase.PREPARED,
                     SpaceId.of(1025), dropPath));
             logs.transition(DdlId.of(9), DdlLogPhase.PREPARED, DdlLogPhase.DICTIONARY_COMMITTED);
@@ -75,7 +81,7 @@ class PersistentDdlLogRepositoryTest {
         Path tablePath = directory.resolve("tables/table_11_space_1024.ibd");
         try (FileInternalCatalogStore store = FileInternalCatalogStore.openOrCreate(catalog)) {
             PersistentDdlLogRepository logs = new PersistentDdlLogRepository(store);
-            DdlLogRecord prepared = new DdlLogRecord(
+            DdlLogRecord prepared = productionRecord(
                     new DdlUndoMarker(17, 31, 11), 23,
                     DdlLogOperation.CREATE_INDEX, DdlLogPhase.PREPARED,
                     SpaceId.of(1024), tablePath);
@@ -101,7 +107,7 @@ class PersistentDdlLogRepositoryTest {
         Path tablePath = directory.resolve("tables/table_11_space_1024.ibd");
         try (FileInternalCatalogStore store = FileInternalCatalogStore.openOrCreate(catalog)) {
             PersistentDdlLogRepository logs = new PersistentDdlLogRepository(store);
-            logs.prepare(new DdlLogRecord(
+            logs.prepare(productionRecord(
                     new DdlUndoMarker(18, 32, 11), 23,
                     DdlLogOperation.DROP_INDEX, DdlLogPhase.PREPARED,
                     SpaceId.of(1024), tablePath));
@@ -119,13 +125,58 @@ class PersistentDdlLogRepositoryTest {
         }
     }
 
+    /**
+     * 同一ALTER_TABLE_INPLACE operation按auxiliary journal区分instant与通用协议：通用路径必须先形成
+     * ENGINE_DONE，旧instant marker仍禁止伪造物理完成阶段。
+     */
+    @Test
+    void usesProtocolShapeAwareInplaceAlterPhaseGraph() {
+        Path tablePath = directory.resolve("tables/table_41_space_3000.ibd");
+        Path journal = directory.resolve("online-ddl/online-alter-301.log");
+        try (FileInternalCatalogStore store = FileInternalCatalogStore.openOrCreate(
+                directory.resolve("inplace-phase-mysql.ibd"))) {
+            PersistentDdlLogRepository logs = new PersistentDdlLogRepository(store);
+            DdlLogRecord general = new DdlLogRecord(
+                    new DdlUndoMarker(301, 14, 41), 0,
+                    DdlLogOperation.ALTER_TABLE_INPLACE, DdlLogPhase.PREPARED,
+                    SpaceId.of(3000), tablePath, Optional.of(journal), Optional.empty(),
+                    DdlExecutionProtocol.ONLINE_ALTER_INPLACE_V1,
+                    Optional.of(digest(1)), Optional.empty(), Optional.of(digest(2)),
+                    DdlControlState.OPEN, Optional.empty(), Optional.empty());
+            logs.prepare(general);
+            logs.compareAndSetControl(DdlId.of(301), DdlLogPhase.PREPARED,
+                    DdlControlState.OPEN, DdlControlState.FORWARD_ONLY, Optional.empty());
+            logs.transition(DdlId.of(301), DdlLogPhase.PREPARED, DdlLogPhase.ENGINE_DONE);
+            logs.transition(DdlId.of(301), DdlLogPhase.ENGINE_DONE,
+                    DdlLogPhase.DICTIONARY_COMMITTED);
+            logs.transition(DdlId.of(301), DdlLogPhase.DICTIONARY_COMMITTED,
+                    DdlLogPhase.COMMITTED);
+
+            DdlLogRecord instant = new DdlLogRecord(
+                    new DdlUndoMarker(302, 15, 41), 0,
+                    DdlLogOperation.ALTER_TABLE_INPLACE, DdlLogPhase.PREPARED,
+                    SpaceId.of(3000), tablePath, Optional.empty(), Optional.empty(),
+                    DdlExecutionProtocol.ONLINE_ALTER_INPLACE_V1,
+                    Optional.of(digest(1)), Optional.empty(), Optional.of(digest(2)),
+                    DdlControlState.OPEN, Optional.empty(), Optional.empty());
+            logs.prepare(instant);
+            logs.compareAndSetControl(DdlId.of(302), DdlLogPhase.PREPARED,
+                    DdlControlState.OPEN, DdlControlState.FORWARD_ONLY, Optional.empty());
+            assertThrows(DictionaryDdlLogStateException.class,
+                    () -> logs.transition(DdlId.of(302), DdlLogPhase.PREPARED,
+                            DdlLogPhase.ENGINE_DONE));
+            logs.transition(DdlId.of(302), DdlLogPhase.PREPARED,
+                    DdlLogPhase.DICTIONARY_COMMITTED);
+        }
+    }
+
     /** 非法跳转、重复 prepare 与终态推进必须在 append 前拒绝，不能污染 durable phase history。 */
     @Test
     void rejectsInvalidTransitionsBeforePersistence() {
         try (FileInternalCatalogStore store =
                      FileInternalCatalogStore.openOrCreate(directory.resolve("invalid-mysql.ibd"))) {
             PersistentDdlLogRepository logs = new PersistentDdlLogRepository(store);
-            DdlLogRecord prepared = new DdlLogRecord(
+            DdlLogRecord prepared = productionRecord(
                     new DdlUndoMarker(3, 8, 31), DdlLogOperation.CREATE_TABLE, DdlLogPhase.PREPARED,
                     SpaceId.of(2048), directory.resolve("tables/table_31_space_2048.ibd"));
             logs.prepare(prepared);
@@ -145,10 +196,10 @@ class PersistentDdlLogRepositoryTest {
     @Test
     void codecRejectsKeyPayloadIdentityMismatch() {
         DdlLogCatalogCodec codec = new DdlLogCatalogCodec();
-        DdlLogRecord record = new DdlLogRecord(
+        DdlLogRecord record = productionRecord(
                 new DdlUndoMarker(5, 13, 41), DdlLogOperation.DROP_TABLE, DdlLogPhase.PREPARED,
                 SpaceId.of(3000), directory.resolve("tables/table_41_space_3000.ibd"));
-        CatalogRecord encoded = codec.encode(record);
+        CatalogRecord encoded = codec.encode(record).getFirst();
         DdlLogRecord decoded = codec.decode(new CatalogBatch(1, List.of(encoded))).orElseThrow();
         assertEquals(record, decoded);
 
@@ -157,7 +208,7 @@ class PersistentDdlLogRepositoryTest {
         assertThrows(cn.zhangyis.db.dd.exception.DictionaryCatalogCorruptionException.class,
                 () -> codec.decode(new CatalogBatch(1,
                         List.of(new CatalogRecord(encoded.key(), damagedPayload)))));
-        assertArrayEquals(encoded.key(), codec.encode(decoded).key());
+        assertArrayEquals(encoded.key(), codec.encode(decoded).getFirst().key());
     }
 
     /** 扩展前的 v1 table marker 没有 secondary identity，升级后必须继续可读且解码为 0。 */
@@ -193,9 +244,9 @@ class PersistentDdlLogRepositoryTest {
     @Test
     void codecRejectsUnknownCodesAndMalformedPayloadShape() {
         DdlLogCatalogCodec codec = new DdlLogCatalogCodec();
-        CatalogRecord encoded = codec.encode(new DdlLogRecord(
+        CatalogRecord encoded = codec.encode(productionRecord(
                 new DdlUndoMarker(6, 14, 42), DdlLogOperation.CREATE_TABLE, DdlLogPhase.PREPARED,
-                SpaceId.of(3001), directory.resolve("tables/table_42_space_3001.ibd")));
+                SpaceId.of(3001), directory.resolve("tables/table_42_space_3001.ibd"))).getFirst();
 
         byte[] unknownVersion = encoded.payload();
         unknownVersion[4] = 99;
@@ -217,11 +268,11 @@ class PersistentDdlLogRepositoryTest {
         assertCatalogCorruption(codec, encoded.key(), trailing);
 
         byte[] malformedUtf8 = encoded.payload();
-        malformedUtf8[45] = (byte) 0xFF;
+        malformedUtf8[47] = (byte) 0xFF;
         assertCatalogCorruption(codec, encoded.key(), malformedUtf8);
 
         byte[] invalidPlatformPath = encoded.payload();
-        invalidPlatformPath[45] = 0;
+        invalidPlatformPath[47] = 0;
         assertCatalogCorruption(codec, encoded.key(), invalidPlatformPath);
 
         byte[] malformedDdlKey = Arrays.copyOf(encoded.key(), encoded.key().length - 1);
@@ -236,7 +287,7 @@ class PersistentDdlLogRepositoryTest {
     @Test
     void codecRejectsPathBeyondV1LimitBeforeAppend() {
         DdlLogCatalogCodec codec = new DdlLogCatalogCodec();
-        DdlLogRecord tooLong = new DdlLogRecord(
+        DdlLogRecord tooLong = productionRecord(
                 new DdlUndoMarker(8, 15, 43), DdlLogOperation.CREATE_TABLE, DdlLogPhase.PREPARED,
                 SpaceId.of(3002), Path.of("x".repeat(901)));
 
@@ -252,7 +303,7 @@ class PersistentDdlLogRepositoryTest {
             store.append(List.of(new CatalogRecord("future".getBytes(StandardCharsets.UTF_8),
                     "payload".getBytes(StandardCharsets.UTF_8))));
             PersistentDdlLogRepository logs = new PersistentDdlLogRepository(store);
-            logs.prepare(new DdlLogRecord(
+            logs.prepare(productionRecord(
                     new DdlUndoMarker(4, 9, 51), DdlLogOperation.CREATE_TABLE, DdlLogPhase.PREPARED,
                     SpaceId.of(4096), directory.resolve("tables/table_51_space_4096.ibd")));
 
@@ -264,5 +315,36 @@ class PersistentDdlLogRepositoryTest {
     private static void assertCatalogCorruption(DdlLogCatalogCodec codec, byte[] key, byte[] payload) {
         assertThrows(cn.zhangyis.db.dd.exception.DictionaryCatalogCorruptionException.class,
                 () -> codec.decode(new CatalogBatch(1, List.of(new CatalogRecord(key, payload)))));
+    }
+
+    /** 构造满足v4 checkpoint策略的表级production测试marker。 */
+    private static DdlLogRecord productionRecord(
+            DdlUndoMarker marker, DdlLogOperation operation, DdlLogPhase phase,
+            SpaceId spaceId, Path path) {
+        return productionRecord(marker, 0L, operation, phase, spaceId, path);
+    }
+
+    /** 构造满足v4 checkpoint策略的production测试marker，摘要内容只用于验证仓储协议。 */
+    private static DdlLogRecord productionRecord(
+            DdlUndoMarker marker, long secondaryObjectId, DdlLogOperation operation,
+            DdlLogPhase phase, SpaceId spaceId, Path path) {
+        Optional<DdlSchemaDigest> source = operation == DdlLogOperation.CREATE_TABLE
+                ? Optional.empty() : Optional.of(digest(1));
+        Optional<DdlSchemaDigest> intermediate = operation == DdlLogOperation.DROP_TABLE
+                || operation == DdlLogOperation.DISCARD_TABLESPACE
+                || operation == DdlLogOperation.IMPORT_TABLESPACE
+                ? Optional.of(digest(2)) : Optional.empty();
+        return new DdlLogRecord(marker, secondaryObjectId, operation, phase, spaceId, path,
+                Optional.empty(), Optional.empty(), DdlExecutionProtocol.ATOMIC_BLOCKING_V1,
+                source, intermediate, Optional.of(digest(3)), DdlControlState.OPEN,
+                Optional.empty(), Optional.empty());
+    }
+
+    /** 生成长度正确且可稳定比较的SHA-256测试值。 */
+    private static DdlSchemaDigest digest(int seed) {
+        byte[] bytes = new byte[32];
+        Arrays.fill(bytes, (byte) seed);
+        return new DdlSchemaDigest(DdlDigestAlgorithm.SHA_256,
+                DdlSchemaCanonicalFormat.TABLE_SCHEMA_V1, bytes);
     }
 }

@@ -6,6 +6,7 @@ import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.recovery.RecoveryMode;
 import cn.zhangyis.db.storage.flush.doublewrite.DoublewriteMode;
+import cn.zhangyis.db.storage.trx.PurgeConfig;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -51,6 +52,7 @@ class EngineConfigTest {
         assertEquals(8, c.undoCachedSegmentsPerKind(), "INSERT/UPDATE 默认各保留八个 cached segment");
         assertEquals(Duration.ofSeconds(5), c.undoHistoryTransitionTimeout());
         assertEquals(DoublewriteMode.DETECT_AND_RECOVER, c.doublewriteMode());
+        assertEquals(PurgeConfig.defaults(), c.purgeConfig());
         assertEquals(dir.resolve("doublewrite-flush-list.dwb"), c.flushListDoublewriteFile());
         assertEquals(dir.resolve("doublewrite-lru.dwb"), c.lruDoublewriteFile());
     }
@@ -177,6 +179,19 @@ class EngineConfigTest {
         assertEquals(DoublewriteMode.DETECT_ONLY, detectOnly.doublewriteMode());
         assertEquals(DoublewriteMode.DETECT_AND_RECOVER, c.doublewriteMode());
         assertThrows(DatabaseValidationException.class, () -> c.withDoublewriteMode(null));
+    }
+
+    /** purge worker 边界通过不可变 wither 接入组合根，且空配置在构造线程池前被领域校验拒绝。 */
+    @Test
+    void purgeConfigDefaultsAndIsImmutableAndConfigurable() {
+        EngineConfig original = valid();
+        PurgeConfig custom = new PurgeConfig(2, 8, Duration.ofMillis(250));
+
+        EngineConfig configured = original.withPurgeConfig(custom);
+
+        assertEquals(custom, configured.purgeConfig());
+        assertEquals(PurgeConfig.defaults(), original.purgeConfig());
+        assertThrows(DatabaseValidationException.class, () -> original.withPurgeConfig(null));
     }
 
     /**

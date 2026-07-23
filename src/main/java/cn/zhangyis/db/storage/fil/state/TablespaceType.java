@@ -13,7 +13,7 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
  */
 public enum TablespaceType {
     /**
-     * 系统表空间稳定编码。当前没有独立的系统表空间 bootstrap/文件布局实现。
+     * 系统表空间稳定编码。SpaceId 0 的 {@code system.ibd} 保存全局 Change Buffer header/tree。
      */
     SYSTEM(0),
 

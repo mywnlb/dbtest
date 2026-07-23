@@ -1,11 +1,4 @@
 package cn.zhangyis.db.storage.fsp.extent;
-import cn.zhangyis.db.storage.fsp.FspRedoDeltas;
-import cn.zhangyis.db.storage.fsp.exception.FspMetadataException;
-import cn.zhangyis.db.storage.fsp.flst.FileAddress;
-import cn.zhangyis.db.storage.fsp.flst.Flst;
-import cn.zhangyis.db.storage.fsp.header.SpaceHeaderLayout;
-import cn.zhangyis.db.storage.redo.FspMetadataDeltaKind;
-
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.ExtentId;
@@ -17,27 +10,36 @@ import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.PageGuard;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
+import cn.zhangyis.db.storage.fsp.FspRedoDeltas;
+import cn.zhangyis.db.storage.fsp.exception.FspMetadataException;
+import cn.zhangyis.db.storage.fsp.flst.FileAddress;
+import cn.zhangyis.db.storage.fsp.flst.Flst;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
+import cn.zhangyis.db.storage.redo.FspMetadataDeltaKind;
 
 import java.util.Optional;
 import java.util.OptionalInt;
 
 /**
- * XDES（extent descriptor）仓储（设计 §6.3）。首版 XDES entries 内嵌 page 0；按 ExtentId.extentNo 定位 slot。
- * 物理空间账本：extent 状态 / 归属 segment / list-node 指针 / page 分配位图。读写经 page 0 latch（写 X）。
- * extent 0 是系统保留 extent，不能走普通 initFree/free-list 分配路径，也不能被普通 XDES mutator 改写。
- * extentNo 超 page 0 首批容量 → FspMetadataException（首版不支持独立 XDES 管理页）。
+ * XDES（extent descriptor）仓储（设计 §6.3）。首批 entries 保持内嵌 page0，超出兼容容量后由
+ * {@link ExtentManagementRegionLayout} 定位到独立 XDES primary/overflow 页。
+ * 物理空间账本包含 extent 状态、segment owner、FLST node 与 page bitmap；所有访问先取得 per-space page0 gate，
+ * 再访问实际 descriptor 页，使跨页 FLST writer 仍由同一物理临界区排斥。
  *
- * <p>简化点：1 位/页 bitmap（不分 used/clean 两位）；本切片 no-redo，写页只标脏、不产 redo（设计 §15 redo 规则推迟满足），
- * 未来 redo 切片接入 {@code UPDATE_XDES} 后才能 crash-safe。
+ * <p>教学简化：bitmap 仍为 1 位/页，不区分 InnoDB 的 free/clean 双位；写入通过既有 FSP metadata delta
+ * 进入 redo。entry stride 保持 68 字节，但只消费 {@code ceil(pagesPerExtent/8)} 个有效 bitmap 字节，避免
+ * 64KB 页最后一个兼容槽的无效 padding 进入 FIL trailer。</p>
  */
 public final class ExtentDescriptorRepository {
 
-    /** 受控页来源；XDES entries 内嵌 page 0，经 MTR.getPage 拿 page 0 的 PageGuard。 */
+    /** 受控页来源；所有 page0/独立 XDES 页都经 MTR 获取 guard。 */
     private final BufferPool pool;
 
     /** 实例级页大小；决定每 extent 有效页数（pagesPerExtent）与 page 0 首批 XDES 容量。 */
     private final PageSize pageSize;
+
+    /** page0 兼容槽、独立页和管理 extent 的唯一寻址规则。 */
+    private final ExtentManagementRegionLayout layout;
 
     /**
      * 创建 {@code ExtentDescriptorRepository}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
@@ -52,18 +54,77 @@ public final class ExtentDescriptorRepository {
         }
         this.pool = pool;
         this.pageSize = pageSize;
+        this.layout = new ExtentManagementRegionLayout(pageSize);
     }
 
-    private int entryOffset(ExtentId extentId) {
+    /** @return 本仓储使用的不可变管理区布局，供同一 FSP 组合根注入 FLST/initializer。 */
+    public ExtentManagementRegionLayout layout() {
+        return layout;
+    }
+
+    private ExtentDescriptorLocation location(ExtentId extentId) {
         requireExtent(extentId);
-        if (extentId.extentNo() >= ExtentDescriptorLayout.maxEntriesInPage0(pageSize)) {
-            throw new FspMetadataException("extent beyond first XDES region not supported: " + extentId.extentNo());
-        }
-        return ExtentDescriptorLayout.entryOffset(extentId.extentNo());
+        return layout.locate(extentId);
     }
 
     private PageId page0(ExtentId extentId) {
         return PageId.of(extentId.spaceId(), PageNo.of(0));
+    }
+
+    /**
+     * 先取得 page0 gate，再取得并验证实际 descriptor 页。page0 自身直接复用 gate guard，避免重复 fix。
+     */
+    private PageGuard descriptorGuard(MiniTransaction mtr, ExtentDescriptorLocation location,
+                                      PageLatchMode mode) {
+        PageLatchMode gateMode = mode == PageLatchMode.EXCLUSIVE
+                ? PageLatchMode.EXCLUSIVE : PageLatchMode.SHARED;
+        PageGuard gate = mtr.getPage(pool, page0(location.extentId()), gateMode);
+        if (location.descriptorPageId().pageNo().value() == 0L) {
+            return gate;
+        }
+        PageGuard descriptor = mtr.getPage(pool, location.descriptorPageId(), mode);
+        XdesPageCodec.readAndValidate(descriptor, location.descriptorPageId(),
+                expectedStandaloneHeader(location.descriptorPageId()));
+        return descriptor;
+    }
+
+    /**
+     * 根据独立 XDES 页号构造必须与磁盘一致的 header；只接受 page5、区首或区首+5 三类公式位置。
+     *
+     * @param pageId 待验证的独立 XDES 物理 identity；SpaceId 原样进入返回 header 的诊断上下文
+     * @return 与运行期管理区公式一致的角色、group base、首 extent 和 entry count
+     * @throws FspMetadataException 页号不属于 XDES 公式位置或该位置没有实际 descriptor 时抛出
+     */
+    XdesPageHeader expectedStandaloneHeader(PageId pageId) {
+        long pageNo = pageId.pageNo().value();
+        long region;
+        XdesPageRole role;
+        long first;
+        long count;
+        if (pageNo == 5L) {
+            region = 0L;
+            role = XdesPageRole.OVERFLOW;
+            first = layout.entriesPerDescriptorPage();
+            count = layout.overflowEntryCount(region);
+        } else if (pageNo > 0L && pageNo % pageSize.bytes() == 0L) {
+            region = pageNo / pageSize.bytes();
+            role = XdesPageRole.PRIMARY;
+            first = layout.firstStandaloneExtent(region);
+            count = layout.primaryEntryCount(region);
+        } else if (pageNo > 5L && (pageNo - 5L) % pageSize.bytes() == 0L) {
+            region = (pageNo - 5L) / pageSize.bytes();
+            role = XdesPageRole.OVERFLOW;
+            first = checkedAdd(layout.firstStandaloneExtent(region),
+                    layout.entriesPerDescriptorPage(), "XDES overflow first extent");
+            count = layout.overflowEntryCount(region);
+        } else {
+            throw new FspMetadataException("page is not a standalone XDES location: " + pageId);
+        }
+        if (count <= 0L || count > Integer.MAX_VALUE) {
+            throw new FspMetadataException("standalone XDES page has no valid entries: " + pageId);
+        }
+        long groupBase = layout.primaryXdesPageNo(region).value();
+        return new XdesPageHeader(role, groupBase, first, (int) count);
     }
 
     /**
@@ -84,9 +145,10 @@ public final class ExtentDescriptorRepository {
     public ExtentDescriptor read(MiniTransaction mtr, ExtentId extentId) {
         // 1、校验表空间生命周期、页号、区段身份与容量边界，在共享或持久副作用前拒绝非法状态。
         requireMtr(mtr);
-        int base = entryOffset(extentId);
+        ExtentDescriptorLocation location = location(extentId);
+        int base = location.entryOffset();
         // 2、继续完成范围、身份与候选校验；通过后，按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，保持处理顺序与资源边界。
-        PageGuard g = mtr.getPage(pool, page0(extentId), PageLatchMode.SHARED);
+        PageGuard g = descriptorGuard(mtr, location, PageLatchMode.SHARED);
         ExtentState state = decodeState(g.readInt(base + ExtentDescriptorLayout.STATE));
         // 3、在中间分支复核阶段性结果；满足条件后，执行空间元数据或物理文件变化，并维持领域不变量。
         long owner = g.readLong(base + ExtentDescriptorLayout.OWNER_SEGMENT);
@@ -102,8 +164,7 @@ public final class ExtentDescriptorRepository {
      * @return {@code listNodeAddr} 定位或分配的稳定值对象；成功时不为 {@code null}，其身份、范围和特殊值已由构造校验保证
      */
     public FileAddress listNodeAddr(ExtentId extentId) {
-        int base = entryOffset(extentId);
-        return FileAddress.of(PageNo.of(0), base + ExtentDescriptorLayout.PREV);
+        return location(extentId).listNodeAddress();
     }
 
     /** 反向：由链节点地址还原 ExtentId。节点必在 page0、偏移须按 ENTRY_SIZE 对齐，否则视为页上链指针损坏。
@@ -131,16 +192,10 @@ public final class ExtentDescriptorRepository {
         if (nodeAddr == null || nodeAddr.isNull()) {
             throw new DatabaseValidationException("node address must be concrete");
         }
-        if (nodeAddr.pageNo().value() != 0) {
-            throw new FspMetadataException("xdes list node must be on page 0: " + nodeAddr);
-        }
-        // 3、在中间分支复核阶段性结果；满足条件后，执行空间元数据或物理文件变化，并维持领域不变量。
-        int rel = nodeAddr.offset() - SpaceHeaderLayout.XDES_BASE - ExtentDescriptorLayout.PREV;
-        if (rel < 0 || rel % ExtentDescriptorLayout.ENTRY_SIZE != 0) {
-            throw new FspMetadataException("misaligned xdes list node offset: " + nodeAddr.offset());
-        }
-        // 4、发布稳定结果并逆序释放 lease、latch 与 fix，以稳定返回或领域异常完成收口。
-        return ExtentId.of(spaceId, rel / ExtentDescriptorLayout.ENTRY_SIZE);
+        // 3、在中间分支复核阶段性结果；纯布局同时校验页号角色、entry 对齐和该页声明的槽位范围。
+        ExtentId extentId = layout.extentIdOfNode(spaceId, nodeAddr);
+        // 4、发布稳定结果；实际访问该 descriptor 时 repository 仍会验证独立页 header。
+        return extentId;
     }
 
     /** extent 内首个未分配页下标（S）；满则 empty。仅扫前 pagesPerExtent 位。
@@ -160,12 +215,14 @@ public final class ExtentDescriptorRepository {
     public OptionalInt firstFreePageIndex(MiniTransaction mtr, ExtentId extentId) {
         // 1、校验表空间生命周期、页号、区段身份与容量边界，在共享或持久副作用前拒绝非法状态。
         requireMtr(mtr);
-        int base = entryOffset(extentId);
+        ExtentDescriptorLocation location = location(extentId);
+        int base = location.entryOffset();
         // 2、继续完成范围、身份与候选校验；通过后，按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，保持处理顺序与资源边界。
         int pe = pageSize.pagesPerExtent();
-        PageGuard g = mtr.getPage(pool, page0(extentId), PageLatchMode.SHARED);
+        PageGuard g = descriptorGuard(mtr, location, PageLatchMode.SHARED);
         // 3、在中间分支复核阶段性结果；满足条件后，执行空间元数据或物理文件变化，并维持领域不变量。
-        byte[] bm = g.readBytes(base + ExtentDescriptorLayout.BITMAP, ExtentDescriptorLayout.BITMAP_BYTES);
+        byte[] bm = g.readBytes(base + ExtentDescriptorLayout.BITMAP,
+                ExtentDescriptorLayout.activeBitmapBytes(pageSize));
         for (int i = 0; i < pe; i++) {
             if ((bm[i / 8] & (1 << (i % 8))) == 0) {
                 return OptionalInt.of(i);
@@ -192,12 +249,14 @@ public final class ExtentDescriptorRepository {
     public int allocatedPageCount(MiniTransaction mtr, ExtentId extentId) {
         // 1、校验表空间生命周期、页号、区段身份与容量边界，在共享或持久副作用前拒绝非法状态。
         requireMtr(mtr);
-        int base = entryOffset(extentId);
+        ExtentDescriptorLocation location = location(extentId);
+        int base = location.entryOffset();
         // 2、继续完成范围、身份与候选校验；通过后，按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，保持处理顺序与资源边界。
         int pe = pageSize.pagesPerExtent();
-        PageGuard g = mtr.getPage(pool, page0(extentId), PageLatchMode.SHARED);
+        PageGuard g = descriptorGuard(mtr, location, PageLatchMode.SHARED);
         // 3、在中间分支复核阶段性结果；满足条件后，执行空间元数据或物理文件变化，并维持领域不变量。
-        byte[] bm = g.readBytes(base + ExtentDescriptorLayout.BITMAP, ExtentDescriptorLayout.BITMAP_BYTES);
+        byte[] bm = g.readBytes(base + ExtentDescriptorLayout.BITMAP,
+                ExtentDescriptorLayout.activeBitmapBytes(pageSize));
         int count = 0;
         for (int i = 0; i < pe; i++) {
             if ((bm[i / 8] & (1 << (i % 8))) != 0) {
@@ -245,12 +304,11 @@ public final class ExtentDescriptorRepository {
     public void initFree(MiniTransaction mtr, ExtentId extentId) {
         // 1、校验表空间生命周期、页号、区段身份与容量边界，在共享或持久副作用前拒绝非法状态。
         requireMtr(mtr);
-        if (extentId != null && extentId.extentNo() == 0) {
-            throw new FspMetadataException("extent 0 is system-reserved; use reserveSystemExtent");
-        }
+        requireOrdinaryMutableExtent(extentId);
         // 2、继续完成范围、身份与候选校验；通过后，按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，保持处理顺序与资源边界。
-        int base = entryOffset(extentId);
-        PageGuard g = mtr.getPage(pool, page0(extentId), PageLatchMode.EXCLUSIVE);
+        ExtentDescriptorLocation location = location(extentId);
+        int base = location.entryOffset();
+        PageGuard g = descriptorGuard(mtr, location, PageLatchMode.EXCLUSIVE);
         writeStateImage(mtr, g, extentId, base, ExtentState.FREE, "initialize FREE extent state");
         // 3、在中间分支复核阶段性结果；满足条件后，执行空间元数据或物理文件变化，并维持领域不变量。
         writeOwnerImage(mtr, g, extentId, base, 0L, "initialize FREE extent owner");
@@ -259,9 +317,9 @@ public final class ExtentDescriptorRepository {
         writeAddressImage(mtr, g, extentId, base + ExtentDescriptorLayout.NEXT,
                 FileAddress.NULL, ExtentDescriptorLayout.NEXT, "initialize FREE extent next");
         // 4、发布稳定结果并逆序释放 lease、latch 与 fix，以稳定返回或领域异常完成收口。
-        FspRedoDeltas.writeBytes(mtr, g, page0(extentId), FspMetadataDeltaKind.XDES_BITMAP_BYTE,
+        FspRedoDeltas.writeBytes(mtr, g, location.descriptorPageId(), FspMetadataDeltaKind.XDES_BITMAP_BYTE,
                 extentId.extentNo(), 0, base + ExtentDescriptorLayout.BITMAP,
-                new byte[ExtentDescriptorLayout.BITMAP_BYTES], "initialize FREE extent bitmap");
+                new byte[ExtentDescriptorLayout.activeBitmapBytes(pageSize)], "initialize FREE extent bitmap");
     }
 
     /** 初始化/修复 extent0 系统保留状态：page0..3 固定管理页标记已分配，避免普通 allocator 误用。
@@ -279,15 +337,40 @@ public final class ExtentDescriptorRepository {
      * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public void reserveSystemExtent(MiniTransaction mtr, SpaceId spaceId) {
+        reserveSystemExtent(mtr, spaceId, 3);
+    }
+
+    /**
+     * 初始化/修复 extent0 系统保留状态，并把 {@code page0..lastFixedPage} 标成已分配。普通 GENERAL/UNDO
+     * 继续传 3；SpaceId 0 的 Change Buffer bootstrap 传 4，防止稳定 root 被普通 segment 复用。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 MTR、空间 identity 与固定页上界，越界请求在读取 page0 前失败。</li>
+     *     <li>以 page0 X latch 把 extent0 标成 owner=0 的 FSEG_FRAG 系统域并清理链指针。</li>
+     *     <li>重建 bitmap 后逐页设置固定分配位；所有字节由同一 MTR 收集 FSP redo。</li>
+     * </ol>
+     *
+     * @param mtr 承载 page0/XDES 修改的活动 MTR
+     * @param spaceId 待初始化表空间 identity
+     * @param lastFixedPage extent0 内最后一个固定页号，必须位于 3..pagesPerExtent-1
+     * @throws DatabaseValidationException 参数缺失或固定页超出 extent0 时抛出
+     */
+    public void reserveSystemExtent(MiniTransaction mtr, SpaceId spaceId, int lastFixedPage) {
         // 1、校验表空间生命周期、页号、区段身份与容量边界，在共享或持久副作用前拒绝非法状态。
         requireMtr(mtr);
         if (spaceId == null) {
             throw new DatabaseValidationException("space id must not be null");
         }
+        if (lastFixedPage < 3 || lastFixedPage >= pageSize.pagesPerExtent()) {
+            throw new DatabaseValidationException("last fixed system page is outside extent0: "
+                    + lastFixedPage);
+        }
         ExtentId extentId = ExtentId.of(spaceId, 0);
         // 2、继续完成范围、身份与候选校验；通过后，按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，保持处理顺序与资源边界。
-        int base = entryOffset(extentId);
-        PageGuard g = mtr.getPage(pool, page0(extentId), PageLatchMode.EXCLUSIVE);
+        ExtentDescriptorLocation location = location(extentId);
+        int base = location.entryOffset();
+        PageGuard g = descriptorGuard(mtr, location, PageLatchMode.EXCLUSIVE);
         writeStateImage(mtr, g, extentId, base, ExtentState.FSEG_FRAG, "reserve system extent state");
         // 3、在中间分支复核阶段性结果；满足条件后，执行空间元数据或物理文件变化，并维持领域不变量。
         writeOwnerImage(mtr, g, extentId, base, 0L, "reserve system extent owner");
@@ -295,17 +378,146 @@ public final class ExtentDescriptorRepository {
                 FileAddress.NULL, ExtentDescriptorLayout.PREV, "reserve system extent prev");
         writeAddressImage(mtr, g, extentId, base + ExtentDescriptorLayout.NEXT,
                 FileAddress.NULL, ExtentDescriptorLayout.NEXT, "reserve system extent next");
-        FspRedoDeltas.writeBytes(mtr, g, page0(extentId), FspMetadataDeltaKind.XDES_BITMAP_BYTE,
+        FspRedoDeltas.writeBytes(mtr, g, location.descriptorPageId(), FspMetadataDeltaKind.XDES_BITMAP_BYTE,
                 extentId.extentNo(), 0, base + ExtentDescriptorLayout.BITMAP,
-                new byte[ExtentDescriptorLayout.BITMAP_BYTES], "reserve system extent bitmap");
+                new byte[ExtentDescriptorLayout.activeBitmapBytes(pageSize)], "reserve system extent bitmap");
         // 4、发布稳定结果并逆序释放 lease、latch 与 fix，以稳定返回或领域异常完成收口。
-        for (int page = 0; page < 4; page++) {
+        for (int page = 0; page <= lastFixedPage; page++) {
             int byteOffset = base + ExtentDescriptorLayout.BITMAP + page / 8;
             byte b = g.readBytes(byteOffset, 1)[0];
-            FspRedoDeltas.writeBytes(mtr, g, page0(extentId), FspMetadataDeltaKind.XDES_BITMAP_BYTE,
+            FspRedoDeltas.writeBytes(mtr, g, location.descriptorPageId(), FspMetadataDeltaKind.XDES_BITMAP_BYTE,
                     extentId.extentNo(), page / 8, byteOffset,
                     new byte[] {(byte) (b | (1 << (page % 8)))}, "reserve system extent allocated bit");
         }
+    }
+
+    /**
+     * 把重复管理区的首个 extent 固定为 FSP 自有域，并只标记其中实际承载 XDES/IBUF_BITMAP 的页。
+     * 该 extent 永不进入普通 FREE 或 segment 链；未标记的剩余页也不开放给普通分配器。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>验证目标确为管理区首 extent，并检查固定页下标属于该 extent。</li>
+     *     <li>在 page0 gate 与实际 descriptor 页 X latch 下识别全零新槽或已完成的管理槽；任何旧 FREE/FSEG
+     *     所有权和链指针冲突都 fail-closed，避免升级覆盖用户页。</li>
+     *     <li>写入 owner=0、FSEG_FRAG、空链和清零 bitmap，再设置 primary、bitmap、可选 overflow 固定页位。</li>
+     * </ol>
+     *
+     * @param mtr 承载管理页格式化与 XDES after-image redo 的活动 MTR
+     * @param extentId 重复管理区首 extent identity
+     * @param fixedPageIndexes extent 内必须永久保留的页下标，通常为 0、1 和可选 5
+     * @throws FspMetadataException 目标不是管理 extent，或旧 descriptor 已被普通链/segment 使用时抛出
+     * @throws DatabaseValidationException 参数缺失或固定页下标越界时抛出
+     */
+    public void reserveManagementExtent(MiniTransaction mtr, ExtentId extentId, int... fixedPageIndexes) {
+        // 1. 管理 extent 和所有固定页必须先由纯布局证明合法，非法请求不能触碰 descriptor。
+        requireMtr(mtr);
+        requireExtent(extentId);
+        if (!layout.isManagementExtent(extentId.extentNo())) {
+            throw new FspMetadataException("extent is not a management-region owner: " + extentId.extentNo());
+        }
+        if (fixedPageIndexes == null || fixedPageIndexes.length == 0) {
+            throw new DatabaseValidationException("management extent fixed pages must not be empty");
+        }
+        for (int pageIndex : fixedPageIndexes) {
+            requireBitIndex(pageIndex);
+        }
+
+        // 2. 全零槽是尚未材料化的新格式；非零槽只接受已经脱离所有 FLST 的系统 owner 形状。
+        ExtentDescriptorLocation location = location(extentId);
+        int base = location.entryOffset();
+        PageGuard guard = descriptorGuard(mtr, location, PageLatchMode.EXCLUSIVE);
+        requireReservableManagementImage(guard, extentId, base);
+
+        // 3. 统一重写 canonical image，使重复执行和已完成 recovery 都收敛到相同固定页集合。
+        writeStateImage(mtr, guard, extentId, base, ExtentState.FSEG_FRAG,
+                "reserve management extent state");
+        writeOwnerImage(mtr, guard, extentId, base, 0L, "reserve management extent owner");
+        writeAddressImage(mtr, guard, extentId, base + ExtentDescriptorLayout.PREV,
+                FileAddress.NULL, ExtentDescriptorLayout.PREV, "reserve management extent prev");
+        writeAddressImage(mtr, guard, extentId, base + ExtentDescriptorLayout.NEXT,
+                FileAddress.NULL, ExtentDescriptorLayout.NEXT, "reserve management extent next");
+        FspRedoDeltas.writeBytes(mtr, guard, location.descriptorPageId(), FspMetadataDeltaKind.XDES_BITMAP_BYTE,
+                extentId.extentNo(), 0, base + ExtentDescriptorLayout.BITMAP,
+                new byte[ExtentDescriptorLayout.activeBitmapBytes(pageSize)],
+                "reserve management extent bitmap");
+        for (int pageIndex : fixedPageIndexes) {
+            writeAllocatedBit(mtr, guard, location, base, pageIndex, true,
+                    "reserve management metadata page");
+        }
+    }
+
+    /**
+     * 在写任何重复管理页前预检旧 descriptor 是否可安全转为系统保留。该入口服务 page0 仍承载 descriptor、
+     * 而 primary/bitmap 位于远端的 4KB/8KB 兼容布局，避免最后才发现旧 owner 冲突而留下不可回滚的半格式页。
+     *
+     * @param mtr 已持 page0 gate 的管理区初始化 MTR
+     * @param extentId 待保留的管理区首 extent
+     * @throws FspMetadataException descriptor 已进入普通 FREE/segment 链或被其它 owner 占用时抛出
+     */
+    public void requireManagementExtentReservable(MiniTransaction mtr, ExtentId extentId) {
+        requireMtr(mtr);
+        requireExtent(extentId);
+        if (!layout.isManagementExtent(extentId.extentNo())) {
+            throw new FspMetadataException("extent is not a management-region owner: " + extentId.extentNo());
+        }
+        ExtentDescriptorLocation location = location(extentId);
+        PageGuard guard = descriptorGuard(mtr, location, PageLatchMode.EXCLUSIVE);
+        requireReservableManagementImage(guard, extentId, location.entryOffset());
+    }
+
+    /** 接受全零新槽或已完成 canonical 管理槽，拒绝所有可能属于 legacy 业务分配的证据。 */
+    private static void requireReservableManagementImage(PageGuard guard, ExtentId extentId, int base) {
+        byte[] raw = guard.readBytes(base, ExtentDescriptorLayout.ENTRY_SIZE);
+        boolean blank = true;
+        for (byte value : raw) {
+            if (value != 0) {
+                blank = false;
+                break;
+            }
+        }
+        if (!blank) {
+            ExtentState state = decodeState(guard.readInt(base + ExtentDescriptorLayout.STATE));
+            long owner = guard.readLong(base + ExtentDescriptorLayout.OWNER_SEGMENT);
+            FileAddress prev = FileAddress.readFrom(guard, base + ExtentDescriptorLayout.PREV);
+            FileAddress next = FileAddress.readFrom(guard, base + ExtentDescriptorLayout.NEXT);
+            if (state != ExtentState.FSEG_FRAG || owner != 0L || !prev.isNull() || !next.isNull()) {
+                throw new FspMetadataException("management extent conflicts with legacy allocation; "
+                        + "offline rebuild is required: " + extentId);
+            }
+        }
+    }
+
+    /**
+     * 在已经保留的管理 extent 中追加一个固定页位。group0 的 overflow XDES page5 在旧 page0 兼容槽耗尽时
+     * 才出现，因此不能在 tablespace bootstrap 时无条件覆盖 page5。
+     *
+     * @param mtr 承载 bitmap delta 的活动 MTR
+     * @param pageId 新格式化管理页的物理 identity
+     * @throws FspMetadataException 所属管理 extent 未处于 owner=0/FSEG_FRAG canonical 状态时抛出
+     */
+    public void markManagementPageAllocated(MiniTransaction mtr, PageId pageId) {
+        requireMtr(mtr);
+        if (pageId == null) {
+            throw new DatabaseValidationException("management page id must not be null");
+        }
+        long extentNo = pageId.pageNo().value() / pageSize.pagesPerExtent();
+        int pageIndex = (int) (pageId.pageNo().value() % pageSize.pagesPerExtent());
+        if (!layout.isManagementExtent(extentNo)) {
+            throw new FspMetadataException("page does not belong to a management extent: " + pageId);
+        }
+        ExtentId extentId = ExtentId.of(pageId.spaceId(), extentNo);
+        ExtentDescriptorLocation location = location(extentId);
+        int base = location.entryOffset();
+        PageGuard guard = descriptorGuard(mtr, location, PageLatchMode.EXCLUSIVE);
+        ExtentState state = decodeState(guard.readInt(base + ExtentDescriptorLayout.STATE));
+        long owner = guard.readLong(base + ExtentDescriptorLayout.OWNER_SEGMENT);
+        if (state != ExtentState.FSEG_FRAG || owner != 0L) {
+            throw new FspMetadataException("management extent is not reserved before fixed-page update: "
+                    + extentId);
+        }
+        writeAllocatedBit(mtr, guard, location, base, pageIndex, true,
+                "reserve delayed management metadata page");
     }
 
     /**
@@ -322,8 +534,9 @@ public final class ExtentDescriptorRepository {
             throw new DatabaseValidationException("extent state must not be null");
         }
         requireOrdinaryMutableExtent(extentId);
-        int base = entryOffset(extentId);
-        PageGuard g = mtr.getPage(pool, page0(extentId), PageLatchMode.EXCLUSIVE);
+        ExtentDescriptorLocation location = location(extentId);
+        int base = location.entryOffset();
+        PageGuard g = descriptorGuard(mtr, location, PageLatchMode.EXCLUSIVE);
         writeStateImage(mtr, g, extentId, base, state, "write XDES state");
     }
 
@@ -356,8 +569,9 @@ public final class ExtentDescriptorRepository {
         if (raw == 0 && owner.isPresent()) {
             throw new DatabaseValidationException("segment id 0 is reserved as XDES owner sentinel");
         }
-        int base = entryOffset(extentId);
-        PageGuard g = mtr.getPage(pool, page0(extentId), PageLatchMode.EXCLUSIVE);
+        ExtentDescriptorLocation location = location(extentId);
+        int base = location.entryOffset();
+        PageGuard g = descriptorGuard(mtr, location, PageLatchMode.EXCLUSIVE);
         // 4、发布稳定结果并逆序释放 lease、latch 与 fix，以稳定返回或领域异常完成收口。
         writeOwnerImage(mtr, g, extentId, base, raw, "write XDES owner");
     }
@@ -394,9 +608,10 @@ public final class ExtentDescriptorRepository {
      */
     public boolean isPageAllocated(MiniTransaction mtr, ExtentId extentId, int pageIndexInExtent) {
         requireMtr(mtr);
-        int base = entryOffset(extentId);
+        ExtentDescriptorLocation location = location(extentId);
+        int base = location.entryOffset();
         requireBitIndex(pageIndexInExtent);
-        PageGuard g = mtr.getPage(pool, page0(extentId), PageLatchMode.SHARED);
+        PageGuard g = descriptorGuard(mtr, location, PageLatchMode.SHARED);
         byte b = g.readBytes(base + ExtentDescriptorLayout.BITMAP + pageIndexInExtent / 8, 1)[0];
         return (b & (1 << (pageIndexInExtent % 8))) != 0;
     }
@@ -421,19 +636,28 @@ public final class ExtentDescriptorRepository {
         // 1、校验表空间生命周期、页号、区段身份与容量边界，在共享或持久副作用前拒绝非法状态。
         requireMtr(mtr);
         requireOrdinaryMutableExtent(extentId);
-        int base = entryOffset(extentId);
+        ExtentDescriptorLocation location = location(extentId);
+        int base = location.entryOffset();
         // 2、继续完成范围、身份与候选校验；通过后，按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，保持处理顺序与资源边界。
         requireBitIndex(pageIndexInExtent);
-        PageGuard g = mtr.getPage(pool, page0(extentId), PageLatchMode.EXCLUSIVE);
-        int byteOffset = base + ExtentDescriptorLayout.BITMAP + pageIndexInExtent / 8;
+        PageGuard g = descriptorGuard(mtr, location, PageLatchMode.EXCLUSIVE);
         // 3、在中间分支复核阶段性结果；满足条件后，执行空间元数据或物理文件变化，并维持领域不变量。
-        int mask = 1 << (pageIndexInExtent % 8);
-        byte b = g.readBytes(byteOffset, 1)[0];
-        byte nb = (byte) (allocated ? (b | mask) : (b & ~mask));
-        // 4、发布稳定结果并逆序释放 lease、latch 与 fix，以稳定返回或领域异常完成收口。
-        FspRedoDeltas.writeBytes(mtr, g, page0(extentId), FspMetadataDeltaKind.XDES_BITMAP_BYTE,
-                extentId.extentNo(), pageIndexInExtent / 8, byteOffset, new byte[] {nb},
+        writeAllocatedBit(mtr, g, location, base, pageIndexInExtent, allocated,
                 "set XDES page allocation bit");
+        // 4、发布稳定结果并逆序释放 lease、latch 与 fix，以稳定返回或领域异常完成收口。
+    }
+
+    /** 在调用方已持实际 descriptor X latch 时执行单 bitmap byte 的原子 after-image 写入。 */
+    private static void writeAllocatedBit(MiniTransaction mtr, PageGuard guard,
+                                          ExtentDescriptorLocation location, int base,
+                                          int pageIndexInExtent, boolean allocated, String reason) {
+        int byteOffset = base + ExtentDescriptorLayout.BITMAP + pageIndexInExtent / 8;
+        int mask = 1 << (pageIndexInExtent % 8);
+        byte before = guard.readBytes(byteOffset, 1)[0];
+        byte after = (byte) (allocated ? before | mask : before & ~mask);
+        FspRedoDeltas.writeBytes(mtr, guard, location.descriptorPageId(),
+                FspMetadataDeltaKind.XDES_BITMAP_BYTE, location.extentId().extentNo(),
+                pageIndexInExtent / 8, byteOffset, new byte[] {after}, reason);
     }
 
     /**
@@ -451,28 +675,29 @@ public final class ExtentDescriptorRepository {
             throw new DatabaseValidationException("file address must not be null (use FileAddress.NULL)");
         }
         requireOrdinaryMutableExtent(extentId);
-        int base = entryOffset(extentId);
-        PageGuard g = mtr.getPage(pool, page0(extentId), PageLatchMode.EXCLUSIVE);
+        ExtentDescriptorLocation location = location(extentId);
+        int base = location.entryOffset();
+        PageGuard g = descriptorGuard(mtr, location, PageLatchMode.EXCLUSIVE);
         writeAddressImage(mtr, g, extentId, base + fieldOffset, addr, fieldOffset, "write XDES list address");
     }
 
     private void writeStateImage(MiniTransaction mtr, PageGuard guard, ExtentId extentId, int base,
                                  ExtentState state, String reason) {
-        FspRedoDeltas.writeInt(mtr, guard, page0(extentId), FspMetadataDeltaKind.XDES_FIELD,
+        FspRedoDeltas.writeInt(mtr, guard, location(extentId).descriptorPageId(), FspMetadataDeltaKind.XDES_FIELD,
                 extentId.extentNo(), ExtentDescriptorLayout.STATE,
                 base + ExtentDescriptorLayout.STATE, state.ordinal(), reason);
     }
 
     private void writeOwnerImage(MiniTransaction mtr, PageGuard guard, ExtentId extentId, int base,
                                  long owner, String reason) {
-        FspRedoDeltas.writeLong(mtr, guard, page0(extentId), FspMetadataDeltaKind.XDES_FIELD,
+        FspRedoDeltas.writeLong(mtr, guard, location(extentId).descriptorPageId(), FspMetadataDeltaKind.XDES_FIELD,
                 extentId.extentNo(), ExtentDescriptorLayout.OWNER_SEGMENT,
                 base + ExtentDescriptorLayout.OWNER_SEGMENT, owner, reason);
     }
 
     private void writeAddressImage(MiniTransaction mtr, PageGuard guard, ExtentId extentId, int offset,
                                    FileAddress address, int fieldOffset, String reason) {
-        FspRedoDeltas.writeAddress(mtr, guard, page0(extentId), FspMetadataDeltaKind.XDES_FIELD,
+        FspRedoDeltas.writeAddress(mtr, guard, location(extentId).descriptorPageId(), FspMetadataDeltaKind.XDES_FIELD,
                 extentId.extentNo(), fieldOffset, offset, address, reason);
     }
 
@@ -509,10 +734,20 @@ public final class ExtentDescriptorRepository {
         }
     }
 
-    private static void requireOrdinaryMutableExtent(ExtentId extentId) {
+    private void requireOrdinaryMutableExtent(ExtentId extentId) {
         requireExtent(extentId);
-        if (extentId.extentNo() == 0) {
-            throw new FspMetadataException("extent 0 is system-reserved; use reserveSystemExtent");
+        if (layout.isManagementExtent(extentId.extentNo())) {
+            throw new FspMetadataException("management extent is reserved and cannot use ordinary XDES mutator: "
+                    + extentId.extentNo());
+        }
+    }
+
+    /** 以项目领域异常报告持久地址算术溢出，禁止把裸 ArithmeticException 泄漏给 FSP 调用方。 */
+    private static long checkedAdd(long left, long right, String field) {
+        try {
+            return Math.addExact(left, right);
+        } catch (ArithmeticException error) {
+            throw new FspMetadataException(field + " overflows", error);
         }
     }
 }

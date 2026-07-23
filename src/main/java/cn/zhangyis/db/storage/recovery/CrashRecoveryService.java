@@ -143,6 +143,14 @@ public final class CrashRecoveryService {
                     tracker.complete(state, reader.recoveredToLsn());
                 }
 
+                // Change Buffer 是后续 rollback/purge 可能依赖的物理接管证据；必须先证明 header/tree 完整，
+                // 才允许事务 inverse 访问任一可能触发发布前 merge 的二级 leaf。
+                if (request.changeBufferRecovery() != null) {
+                    tracker.begin(RecoveryStageName.CHANGE_BUFFER_RECOVER);
+                    request.changeBufferRecovery().validateAfterRedo();
+                    tracker.complete(state, reader.recoveredToLsn());
+                }
+
                 if (request.undoTablespaceRecovery() != null) {
                     tracker.begin(RecoveryStageName.UNDO_TABLESPACE_RESUME);
                     request.undoTablespaceRecovery().resumeAfterRedo(reader.recoveredToLsn());
@@ -261,6 +269,12 @@ public final class CrashRecoveryService {
             request.transactionRecoveryContext().validateTransactionDeltas(batches);
         }
         tracker.complete(state, reader.recoveredToLsn());
+
+        if (request.changeBufferRecovery() != null) {
+            tracker.begin(RecoveryStageName.CHANGE_BUFFER_RECOVER);
+            request.changeBufferRecovery().validateAfterRedo();
+            tracker.complete(state, reader.recoveredToLsn());
+        }
 
         tracker.begin(RecoveryStageName.READ_ONLY_DIAGNOSTIC_OPEN);
         // 3、在中间分支复核阶段性结果；满足条件后，按恢复阶段应用物理页或事务状态变化，并维持领域不变量。

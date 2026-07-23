@@ -42,10 +42,10 @@ public final class CachingTablespaceRegistry implements TablespaceRegistry {
     private final TablespaceMetadataLoader metadataLoader;
 
     /**
-     * 运行期逻辑句柄 cache。并发映射安全发布不可变 handle，但不把多个 registry 方法、page0 写入或
-     * PageStore 操作组合成原子事务；跨模块顺序由外层 access lease 保护。
+     * 运行期逻辑句柄及普通准入资格 cache。并发映射把 handle 与 recovery-only 位作为同一个不可变值发布，
+     * 但不把多个 registry 方法、page0 写入或 PageStore 操作组合成原子事务；跨模块顺序由外层 access lease 保护。
      */
-    private final ConcurrentMap<SpaceId, TablespaceHandle> handles = new ConcurrentHashMap<>();
+    private final ConcurrentMap<SpaceId, CachedHandle> handles = new ConcurrentHashMap<>();
 
     /**
      * 创建使用指定加载端口的空 registry。
@@ -84,7 +84,7 @@ public final class CachingTablespaceRegistry implements TablespaceRegistry {
         TablespaceHandle handle = loadHandle(spaceId);
 
         // 3. 逻辑发布不隐式执行普通状态准入或物理 open。
-        handles.put(spaceId, handle);
+        handles.put(spaceId, CachedHandle.ordinary(handle));
         return handle;
     }
 
@@ -98,7 +98,8 @@ public final class CachingTablespaceRegistry implements TablespaceRegistry {
     @Override
     public Optional<TablespaceHandle> find(SpaceId spaceId) {
         validateSpaceId(spaceId);
-        return Optional.ofNullable(handles.get(spaceId));
+        CachedHandle cached = handles.get(spaceId);
+        return cached == null ? Optional.empty() : Optional.of(cached.handle());
     }
 
     /**
@@ -107,7 +108,8 @@ public final class CachingTablespaceRegistry implements TablespaceRegistry {
      * <p>数据流：</p>
      * <ol>
      *     <li>校验 SpaceId，保证 cache key 与异常上下文有效。</li>
-     *     <li>cache miss 时在同键的 {@code computeIfAbsent} 内调用 loader；成功值安全发布，失败不留半句柄。</li>
+     *     <li>cache miss 或 recovery-only 命中时在同键 {@code compute} 内调用严格 loader；成功值安全发布，
+     *     失败时不留半句柄且保留原恢复句柄供诊断。</li>
      *     <li>对命中/新加载快照统一执行 {@code NORMAL/ACTIVE} 白名单，按损坏、丢弃或暂不可用分类失败。</li>
      * </ol>
      *
@@ -123,8 +125,14 @@ public final class CachingTablespaceRegistry implements TablespaceRegistry {
         // 1. 无效 cache key 在触发加载之前失败。
         validateSpaceId(spaceId);
 
-        // 2. 同键 cache miss 的成功加载由 ConcurrentHashMap 发布；异常不会写入映射。
-        TablespaceHandle handle = handles.computeIfAbsent(spaceId, this::loadHandle);
+        // 2. recovery-only 命中也必须在同键 compute 内严格重载；重载异常时 ConcurrentHashMap 保留旧恢复句柄。
+        CachedHandle cached = handles.compute(spaceId, (id, existing) -> {
+            if (existing == null || existing.requiresOrdinaryAdmission()) {
+                return CachedHandle.ordinary(loadHandle(id));
+            }
+            return existing;
+        });
+        TablespaceHandle handle = cached.handle();
 
         // 3. 即使 cache 命中也重新复核状态，禁止返回已 mark 的非服务句柄。
         ensureOrdinaryAccessAllowed(handle.tablespace());
@@ -151,8 +159,10 @@ public final class CachingTablespaceRegistry implements TablespaceRegistry {
         // 1. 恢复映射同样必须使用稳定 SpaceId。
         validateSpaceId(spaceId);
 
-        // 2. 只确保句柄存在，不套用普通状态白名单。
-        return handles.computeIfAbsent(spaceId, this::loadHandle);
+        // 2. recovery cache miss 使用最小 loader，并把结果连同 recovery-only 资格在同一 map 值中原子发布。
+        CachedHandle cached = handles.computeIfAbsent(spaceId,
+                id -> CachedHandle.recovery(loadHandleForRecovery(id)));
+        return cached.handle();
     }
 
     /**
@@ -180,7 +190,7 @@ public final class CachingTablespaceRegistry implements TablespaceRegistry {
         TablespaceHandle handle = loadHandle(spaceId);
 
         // 3. 直接替换逻辑值；外层 lease 负责与状态发布串行化。
-        handles.put(spaceId, handle);
+        handles.put(spaceId, CachedHandle.ordinary(handle));
         return handle;
     }
 
@@ -209,7 +219,7 @@ public final class CachingTablespaceRegistry implements TablespaceRegistry {
         TablespaceHandle handle = new TablespaceHandle(metadata.toTablespace());
 
         // 3. 直接发布调用方给出的代次；持久化和并发覆盖裁决属于外层 lifecycle lease。
-        handles.put(metadata.spaceId(), handle);
+        handles.put(metadata.spaceId(), CachedHandle.ordinary(handle));
         return handle;
     }
 
@@ -240,14 +250,15 @@ public final class CachingTablespaceRegistry implements TablespaceRegistry {
         }
 
         // 2. 同键 compute 内读取/加载当前代次并执行状态机迁移，失败不会写入半成品。
-        TablespaceHandle corrupted = handles.compute(spaceId, (id, existing) -> {
-            Tablespace current = (existing != null ? existing : loadHandle(id)).tablespace();
-            return new TablespaceHandle(current.transitTo(TablespaceState.CORRUPTED));
+        CachedHandle corruptedEntry = handles.compute(spaceId, (id, existing) -> {
+            Tablespace current = (existing != null ? existing.handle() : loadHandle(id)).tablespace();
+            TablespaceHandle corrupted = new TablespaceHandle(current.transitTo(TablespaceState.CORRUPTED));
+            return new CachedHandle(corrupted, existing != null && existing.recoveryOnly());
         });
 
         // 3. 状态发布后再留诊断日志；日志不替代 durable lifecycle marker。
         log.warn("tablespace {} marked corrupted: {}", spaceId.value(), reason);
-        return corrupted;
+        return corruptedEntry.handle();
     }
 
     /**
@@ -271,14 +282,15 @@ public final class CachingTablespaceRegistry implements TablespaceRegistry {
         validateSpaceId(spaceId);
 
         // 2. 同键原子读改写；类型专属状态校验由外层 UNDO 编排负责。
-        TablespaceHandle inactive = handles.compute(spaceId, (id, existing) -> {
-            Tablespace current = (existing != null ? existing : loadHandle(id)).tablespace();
-            return new TablespaceHandle(current.transitTo(TablespaceState.INACTIVE));
+        CachedHandle inactiveEntry = handles.compute(spaceId, (id, existing) -> {
+            Tablespace current = (existing != null ? existing.handle() : loadHandle(id)).tablespace();
+            TablespaceHandle inactive = new TablespaceHandle(current.transitTo(TablespaceState.INACTIVE));
+            return new CachedHandle(inactive, existing != null && existing.recoveryOnly());
         });
 
         // 3. 只记录运行期发布事件，不能替代 page0 durable lifecycle。
         log.info("tablespace {} marked inactive", spaceId.value());
-        return inactive;
+        return inactiveEntry.handle();
     }
 
     /**
@@ -302,14 +314,15 @@ public final class CachingTablespaceRegistry implements TablespaceRegistry {
         validateSpaceId(spaceId);
 
         // 2. 同键原子派生终态；物理 drain 和持久 marker 必须已由外层协议协调。
-        TablespaceHandle discarded = handles.compute(spaceId, (id, existing) -> {
-            Tablespace current = (existing != null ? existing : loadHandle(id)).tablespace();
-            return new TablespaceHandle(current.transitTo(TablespaceState.DISCARDED));
+        CachedHandle discardedEntry = handles.compute(spaceId, (id, existing) -> {
+            Tablespace current = (existing != null ? existing.handle() : loadHandle(id)).tablespace();
+            TablespaceHandle discarded = new TablespaceHandle(current.transitTo(TablespaceState.DISCARDED));
+            return new CachedHandle(discarded, existing != null && existing.recoveryOnly());
         });
 
         // 3. 日志只记录运行期状态发布，不证明文件删除已经完成。
         log.info("tablespace {} marked discarded", spaceId.value());
-        return discarded;
+        return discardedEntry.handle();
     }
 
     /**
@@ -348,7 +361,7 @@ public final class CachingTablespaceRegistry implements TablespaceRegistry {
      */
     @Override
     public List<TablespaceHandle> listOpenTablespaces() {
-        return List.copyOf(handles.values());
+        return handles.values().stream().map(CachedHandle::handle).toList();
     }
 
     /**
@@ -394,6 +407,35 @@ public final class CachingTablespaceRegistry implements TablespaceRegistry {
     }
 
     /**
+     * 调用恢复专用 loader 并核对 identity。该结果只能包装为 recovery-only cache entry，不能直接返回给普通路径。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>调用 {@link TablespaceMetadataLoader#loadForRecovery(SpaceId)} 读取可支撑 redo 的最小可信 metadata。</li>
+     *     <li>核对 metadata identity，禁止把错误文件绑定到请求 key。</li>
+     *     <li>构造不可变 handle；是否发布及 recovery-only 标记由调用方在同键映射操作中完成。</li>
+     * </ol>
+     *
+     * @param spaceId 已通过非空校验的恢复目标标识
+     * @return 与请求 identity 一致但尚未取得普通管理目录准入资格的运行时句柄
+     * @throws TablespaceNotFoundException recovery loader 返回空时抛出
+     * @throws DatabaseValidationException loader 返回其它 SpaceId 或 metadata 结构非法时抛出
+     */
+    private TablespaceHandle loadHandleForRecovery(SpaceId spaceId) {
+        // 1. 恢复也不能用空 metadata 建立虚假文件身份。
+        TablespaceMetadata metadata = metadataLoader.loadForRecovery(spaceId)
+                .orElseThrow(() -> new TablespaceNotFoundException("tablespace not found: " + spaceId.value()));
+
+        // 2. 放宽的是派生管理页完整性，不是 page0 与配置 identity 的绑定。
+        if (!metadata.spaceId().equals(spaceId)) {
+            throw new DatabaseValidationException("loaded recovery tablespace metadata space id mismatch");
+        }
+
+        // 3. handle 不携带物理资源；CachedHandle 的 recoveryOnly 位负责阻止普通 cache hit 直接放行。
+        return new TablespaceHandle(metadata.toTablespace());
+    }
+
+    /**
      * 对运行期快照实施普通操作状态白名单。
      *
      * <p>{@code NORMAL/ACTIVE} 直接通过；{@code CORRUPTED} 与 {@code DISCARDED} 分别映射为损坏和
@@ -429,6 +471,37 @@ public final class CachingTablespaceRegistry implements TablespaceRegistry {
     private void validateSpaceId(SpaceId spaceId) {
         if (spaceId == null) {
             throw new DatabaseValidationException("tablespace space id must not be null");
+        }
+    }
+
+    /**
+     * registry 单键的原子缓存值。{@code recoveryOnly=true} 表示该 handle 只通过 page0 恢复身份校验，普通
+     * {@link #require(SpaceId)} 必须在同键 compute 中用严格 loader 替换后才能返回。
+     *
+     * @param handle 不持物理资源的不可变运行时句柄
+     * @param recoveryOnly 是否仍欠缺普通 XDES/bitmap 管理目录准入校验
+     */
+    private record CachedHandle(TablespaceHandle handle, boolean recoveryOnly) {
+
+        /**
+         * 只有 recovery-only 且 lifecycle 已允许普通访问的句柄才需要晋升。CORRUPTED/DISCARDED/INACTIVE 等状态
+         * 应直接由普通状态白名单拒绝，不能通过重载意外丢失 recovery 编排刚发布的运行期状态。
+         *
+         * @return 需要严格 loader 复核 XDES 管理目录后才能服务普通流量时返回 {@code true}
+         */
+        private boolean requiresOrdinaryAdmission() {
+            TablespaceState state = handle.tablespace().state();
+            return recoveryOnly && (state == TablespaceState.NORMAL || state == TablespaceState.ACTIVE);
+        }
+
+        /** @return 已完成普通准入的缓存值 */
+        private static CachedHandle ordinary(TablespaceHandle handle) {
+            return new CachedHandle(handle, false);
+        }
+
+        /** @return 仅允许恢复/诊断读取的缓存值 */
+        private static CachedHandle recovery(TablespaceHandle handle) {
+            return new CachedHandle(handle, true);
         }
     }
 }

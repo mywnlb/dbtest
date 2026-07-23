@@ -68,6 +68,9 @@ final class BufferPoolInstance implements FrameReleaser {
      */
     private volatile DirtyVictimFlusher victimFlusher;
 
+    /** 发布前页面拦截器；bootstrap set-once，volatile 只用于跨线程安全发布，不允许运行期替换。 */
+    private volatile PageLoadInterceptor pageLoadInterceptor;
+
     /** 13.1d 子锁集合；page hash、frame、free/LRU/flush list 均有独立短锁边界。 */
     private final BufferPoolInstanceLatchSet latches = new BufferPoolInstanceLatchSet();
     /** 本分片 page hash：PageId→帧（含 LOADING 占位）。由 pageHashLock 在外保护。 */
@@ -161,6 +164,17 @@ final class BufferPoolInstance implements FrameReleaser {
             throw new DatabaseValidationException("victim flusher already attached (set-once)");
         }
         this.victimFlusher = flusher;
+    }
+
+    /** 把 facade 的 set-once 发布前拦截器安装到本分片。 */
+    void attachPageLoadInterceptor(PageLoadInterceptor interceptor) {
+        if (interceptor == null) {
+            throw new DatabaseValidationException("page load interceptor must not be null");
+        }
+        if (pageLoadInterceptor != null) {
+            throw new DatabaseValidationException("page load interceptor already attached (set-once)");
+        }
+        pageLoadInterceptor = interceptor;
     }
 
     /** 取页（命中或读穿），固定并取 page latch，返回 guard。**不上报 read-ahead 钩子**——钩子由 facade.getPage 路由后调。
@@ -400,31 +414,144 @@ final class BufferPoolInstance implements FrameReleaser {
             future.failExceptionally(loadError);
             throw loadError;
         }
-        // 3、在中间分支复核阶段性结果；满足条件后，完成页载入、替换、dirty snapshot 或状态转换，并维持领域不变量。
-        latches.lockPageHash();
-        try {
-            latches.lockFrame(frame);
+        PendingPagePublication publication = null;
+        PageLoadInterceptor interceptor = pageLoadInterceptor;
+        if (interceptor != null) {
+            publication = new PendingPagePublication(this, frame);
             try {
-                if (!lifecycleClock.isCurrentAndOpen(pageId.spaceId(), loadVersion)) {
-                    BufferPoolStalePageException stale = new BufferPoolStalePageException(
-                            "page load became stale before publish: " + pageId);
-                    pageHash.remove(pageId);
-                    resetFrameToFree(frame);
-                    future.failExceptionally(stale);
-                    throw stale;
+                latches.assertMetadataUnlocked("page pre-publication interceptor");
+                interceptor.beforePublish(publication);
+            } catch (RuntimeException interceptionFailure) {
+                if (publication.writePending() || (publication.claimed() && !publication.closed())) {
+                    PagePublicationFatalException fatal = new PagePublicationFatalException(
+                            "page pre-publication interceptor failed after claiming/writing " + pageId,
+                            interceptionFailure);
+                    future.failExceptionally(fatal);
+                    // 已认领或写过的 frame 不能复位重用：其 guard/redo/global change-buffer 状态可能仍在外部 MTR。
+                    throw fatal;
                 }
-                stateMachine.transition(frame, BufferFrameState.CLEAN);
-                insertIntoLru(frame);
-                frame.loadFuture = null;
-            } finally {
-                latches.unlockFrame(frame);
+                latches.lockPageHash();
+                try {
+                    latches.lockFrame(frame);
+                    try {
+                        pageHash.remove(pageId);
+                        resetFrameToFree(frame);
+                    } finally {
+                        latches.unlockFrame(frame);
+                    }
+                } finally {
+                    latches.unlockPageHash();
+                }
+                future.failExceptionally(interceptionFailure);
+                throw interceptionFailure;
             }
-        } finally {
-            latches.unlockPageHash();
+            if (publication.claimed() && !publication.closed()) {
+                PagePublicationFatalException fatal = new PagePublicationFatalException(
+                        "page pre-publication interceptor returned with an open pending guard: " + pageId);
+                future.failExceptionally(fatal);
+                // guard 仍持有 page X latch，不能复位或发布 frame；引擎 fail-stop 后由 recovery 恢复一致状态。
+                throw fatal;
+            }
+        }
+        // 3、在中间分支复核阶段性结果；满足条件后，完成页载入、替换、dirty snapshot 或状态转换，并维持领域不变量。
+        try {
+            latches.lockPageHash();
+            try {
+                latches.lockFrame(frame);
+                try {
+                    if (!lifecycleClock.isCurrentAndOpen(pageId.spaceId(), loadVersion)) {
+                        BufferPoolStalePageException stale = new BufferPoolStalePageException(
+                                "page load became stale before publish: " + pageId);
+                        pageHash.remove(pageId);
+                        resetFrameToFree(frame);
+                        future.failExceptionally(stale);
+                        throw stale;
+                    }
+                    boolean pendingWrite = publication != null && publication.writePending();
+                    boolean pendingClosed = publication != null && publication.closed();
+                    stateMachine.transition(frame, pendingWrite && !pendingClosed
+                            ? BufferFrameState.DIRTY_PENDING : BufferFrameState.CLEAN);
+                    insertIntoLru(frame);
+                    frame.loadFuture = null;
+                    if (pendingWrite && pendingClosed) {
+                        // 自有 merge MTR 已在回调内提交并盖 pageLSN；此时才把页面加入 flush list。
+                        markDirty(frame);
+                    }
+                } finally {
+                    latches.unlockFrame(frame);
+                }
+            } finally {
+                latches.unlockPageHash();
+            }
+        } catch (BufferPoolStalePageException stale) {
+            // 生命周期失效分支已经移除映射、回收 frame 并完成 future，保留其可重试语义。
+            throw stale;
+        } catch (RuntimeException publicationFailure) {
+            PagePublicationFatalException fatal = new PagePublicationFatalException(
+                    "buffer pool failed while finalizing pre-publication state for " + pageId,
+                    publicationFailure);
+            future.failExceptionally(fatal);
+            // 元数据发布可能已部分执行，不能猜测回滚 pageHash/LRU/frame 状态。
+            throw fatal;
         }
         future.complete();
         // 4、返回受控 Guard/快照或释放 fix，以稳定返回或领域异常完成收口。
         return frame;
+    }
+
+    /**
+     * 为 PendingPagePublication 取得不增加 fixCount 的 X guard。LOADING 页理论上无人持 latch，仍使用有界 tryLock
+     * 防止实现错误造成无界等待；取得后在 frameMutex 下复核 page identity/state。
+     */
+    PageGuard claimPendingPage(PendingPagePublication publication, BufferFrame frame) {
+        boolean locked;
+        try {
+            locked = frame.pageLatch.writeLock().tryLock(loadTimeoutNanos, java.util.concurrent.TimeUnit.NANOSECONDS);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new BufferPoolLoadTimeoutException(
+                    "interrupted while claiming pending page " + frame.pageId, interrupted);
+        }
+        if (!locked) {
+            throw new BufferPoolLoadTimeoutException("timed out claiming pending page " + frame.pageId);
+        }
+        latches.lockFrame(frame);
+        try {
+            if (frame.state != BufferFrameState.LOADING || frame.loadFuture == null
+                    || frame.pageId == null || !frame.pageId.equals(publication.pageId())) {
+                frame.pageLatch.writeLock().unlock();
+                throw new BufferPoolStalePageException(
+                        "pending page changed before exclusive claim: " + publication.pageId());
+            }
+            return new PageGuard(publication, frame, PageLatchMode.EXCLUSIVE,
+                    frame.pageLatch.writeLock(), null);
+        } finally {
+            latches.unlockFrame(frame);
+        }
+    }
+
+    /** pending guard 关闭后的 dirty 发布；不递减 loader owner 的单个 fixCount。 */
+    void releasePendingPage(BufferFrame frame, boolean wrote) {
+        latches.lockFrame(frame);
+        try {
+            if (!wrote || frame.state == BufferFrameState.LOADING) {
+                return;
+            }
+            markDirty(frame);
+            dirtyStateChangeListener.run();
+        } finally {
+            latches.unlockFrame(frame);
+        }
+    }
+
+    /** page hash 短锁内查询本分片是否含 CLEAN/DIRTY/LOADING 等任意当前映射。 */
+    boolean isResident(PageId pageId) {
+        latches.lockPageHash();
+        try {
+            return pageHash.get(pageId) != null;
+        } finally {
+            latches.unlockPageHash();
+        }
     }
 
     /**

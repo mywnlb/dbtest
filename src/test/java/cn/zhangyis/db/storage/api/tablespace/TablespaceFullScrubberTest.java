@@ -15,6 +15,11 @@ import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.engine.DatabaseEngine;
 import cn.zhangyis.db.storage.engine.EngineConfig;
 import cn.zhangyis.db.storage.fsp.extent.ExtentDescriptorLayout;
+import cn.zhangyis.db.storage.fsp.extent.ExtentManagementRegionLayout;
+import cn.zhangyis.db.storage.fsp.extent.XdesPageCodec;
+import cn.zhangyis.db.storage.fsp.extent.XdesPageRole;
+import cn.zhangyis.db.storage.fsp.header.SpaceHeaderLayout;
+import cn.zhangyis.db.storage.page.FilePageHeader;
 import cn.zhangyis.db.storage.page.PageEnvelopeLayout;
 import cn.zhangyis.db.storage.page.PageImageChecksum;
 import cn.zhangyis.db.storage.page.PageType;
@@ -162,6 +167,56 @@ class TablespaceFullScrubberTest {
     }
 
     /**
+     * scanner 必须按运行期布局读取 group0 page5 overflow XDES，而不能继续以 page0 槽容量拒绝合法大文件；
+     * header 任一范围字段损坏时即使 checksum 重算也必须 fail-closed。
+     */
+    @Test
+    void scansStandaloneOverflowXdesAndRejectsCorruptHeader() throws IOException {
+        Candidate candidate = createCandidate();
+        ExtentManagementRegionLayout layout = new ExtentManagementRegionLayout(PAGE_SIZE);
+        long standaloneExtent = layout.entriesPerDescriptorPage();
+        int pageCount = Math.toIntExact((standaloneExtent + 1L) * PAGE_SIZE.pagesPerExtent());
+        extendSparse(candidate.path(), pageCount);
+
+        byte[] page0 = readPage(candidate.path(), 0);
+        ByteBuffer pageZeroImage = ByteBuffer.wrap(page0).order(ByteOrder.BIG_ENDIAN);
+        pageZeroImage.putLong(SpaceHeaderLayout.CURRENT_SIZE, pageCount);
+        pageZeroImage.putLong(SpaceHeaderLayout.FREE_LIMIT, pageCount);
+        int extentZeroBitmap = ExtentDescriptorLayout.entryOffset(0) + ExtentDescriptorLayout.BITMAP;
+        page0[extentZeroBitmap] = (byte) (page0[extentZeroBitmap] | (1 << 5));
+        PageImageChecksum.stamp(page0, PAGE_SIZE);
+        writePage(candidate.path(), 0, page0);
+
+        byte[] page5 = new byte[PAGE_SIZE.bytes()];
+        ByteBuffer xdes = ByteBuffer.wrap(page5).order(ByteOrder.BIG_ENDIAN);
+        xdes.putInt(PageEnvelopeLayout.SPACE_ID, candidate.spaceId().value());
+        xdes.putInt(PageEnvelopeLayout.PAGE_NO, 5);
+        xdes.putInt(PageEnvelopeLayout.PREV_PAGE_NO, (int) FilePageHeader.FIL_NULL);
+        xdes.putInt(PageEnvelopeLayout.NEXT_PAGE_NO, (int) FilePageHeader.FIL_NULL);
+        xdes.putLong(PageEnvelopeLayout.PAGE_LSN, 0L);
+        xdes.putInt(PageEnvelopeLayout.PAGE_TYPE, PageType.XDES.code());
+        xdes.putInt(XdesPageCodec.MAGIC_OFFSET, XdesPageCodec.MAGIC);
+        xdes.putInt(XdesPageCodec.FORMAT_OFFSET, XdesPageCodec.FORMAT_VERSION);
+        xdes.putInt(XdesPageCodec.ROLE_OFFSET, XdesPageRole.OVERFLOW.persistentCode());
+        xdes.putLong(XdesPageCodec.GROUP_BASE_OFFSET, 0L);
+        xdes.putLong(XdesPageCodec.FIRST_EXTENT_OFFSET, standaloneExtent);
+        xdes.putInt(XdesPageCodec.ENTRY_COUNT_OFFSET,
+                Math.toIntExact(layout.overflowEntryCount(0L)));
+        PageImageChecksum.stamp(page5, PAGE_SIZE);
+        writePage(candidate.path(), 5, page5);
+
+        TablespaceFullScrubResult result = new TablespaceFullScrubber().scrub(request(candidate));
+        assertEquals(pageCount, result.pageCount());
+
+        xdes.putLong(XdesPageCodec.FIRST_EXTENT_OFFSET, standaloneExtent + 1L);
+        PageImageChecksum.stamp(page5, PAGE_SIZE);
+        writePage(candidate.path(), 5, page5);
+        TablespaceScrubException failure = assertThrows(TablespaceScrubException.class,
+                () -> new TablespaceFullScrubber().scrub(request(candidate)));
+        assertTrue(failure.getMessage().contains("standalone XDES header mismatch"));
+    }
+
+    /**
      * 用公共组合根创建带 ACTIVE SDI 的真实 file-per-table，避免测试绕过 FSP/XDES/lifecycle 初始化。
      *
      * @return 已关闭引擎后仍可供离线 scanner 读取的稳定候选 identity/path
@@ -225,6 +280,15 @@ class TablespaceFullScrubberTest {
             while (write.hasRemaining()) {
                 channel.write(write, position + write.position());
             }
+            channel.force(true);
+        }
+    }
+
+    /** 只在文件尾写一个零字节形成页对齐稀疏范围，避免测试为未分配页逐页执行物理写。 */
+    private static void extendSparse(Path path, int pageCount) throws IOException {
+        long size = Math.multiplyExact((long) pageCount, PAGE_SIZE.bytes());
+        try (FileChannel channel = FileChannel.open(path, StandardOpenOption.WRITE)) {
+            channel.write(ByteBuffer.wrap(new byte[]{0}), size - 1L);
             channel.force(true);
         }
     }

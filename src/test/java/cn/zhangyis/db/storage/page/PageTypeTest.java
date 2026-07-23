@@ -25,6 +25,8 @@ class PageTypeTest {
         assertEquals(8, PageType.BLOB.code());
         assertEquals(9, PageType.UNDO_PAYLOAD.code());
         assertEquals(10, PageType.DDL_DESCRIPTOR.code());
+        assertEquals(11, PageType.IBUF_HEADER.code());
+        assertEquals(12, PageType.IBUF_INDEX.code());
     }
 
     /**

@@ -21,7 +21,8 @@ import java.util.List;
 /**
  * 二级 entry 发布前的事务锁与物理候选检查。所有非 NULL logical key 先取得 collation/prefix 归一化的
  * {@link SecondaryLogicalKeyLockKey} X 锁并持有到事务终态，使 non-unique locking range 与 DML 使用同一稳定资源；
- * logical unique 再扫描完整 prefix，非唯一或含 NULL 的 key 只检查同一完整物理 identity。
+ * logical unique 再扫描完整 prefix，UPDATE/revive 的非唯一或含 NULL key 检查同一完整物理 identity。聚簇层已经
+ * 证明主键全新的 INSERT 可通过 {@link #checkFreshInsert} 跳过非唯一 leaf 读取，为 Change Buffer 保留冷页条件。
  *
  * <p>该 logical-key 锁是教学实现对 InnoDB unique-prefix next-key/gap 锁的稳定等价抽象：它不依赖瞬时 page/heapNo，
  * 但仍进入同一个 LockManager/Wait-For Graph，并由事务终态统一释放。</p>
@@ -125,6 +126,47 @@ public final class SecondaryUniqueCheckService {
             }
             throw error;
         }
+    }
+
+    /**
+     * 检查聚簇唯一性已经证明主键全新的 INSERT 所对应的二级发布前态。逻辑唯一索引仍调用完整 prefix 检查；
+     * 非唯一索引的 physical key 由“logical key + 全部聚簇主键”组成，而聚簇层已经在同一事务下锁定并确认该
+     * 主键不存在，因此其发布前态必为 ABSENT，无需把二级目标 leaf 提前载入 Buffer Pool。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 exact-version metadata、完整行和事务请求；逻辑唯一索引委托完整检查，绝不推迟唯一冲突。</li>
+     *     <li>从非唯一 layout 投影 logical key，复用同一归一化 REC_X 事务锁，保持与 locking range 的并发边界。</li>
+     *     <li>依赖调用方已完成的聚簇主键唯一检查，把完整 physical identity 冻结为 ABSENT，不访问二级页。</li>
+     *     <li>返回无页副作用的发布前态；后续直写仍由 B+Tree 校验页内 identity，冷页则允许 Change Buffer 接管。</li>
+     * </ol>
+     *
+     * @param metadata 目标 exact-version 二级索引；非唯一分支的 physical key 必须包含完整聚簇主键后缀
+     * @param row 已通过聚簇主键唯一检查、即将写入的新完整行
+     * @param request 当前写事务 owner、隔离级别和有界锁等待配置
+     * @return 逻辑唯一索引的真实扫描结果；非唯一索引固定返回可发布且前态为 ABSENT
+     * @throws DatabaseValidationException 参数缺失、行/layout 错配或 key 归一化失败时抛出
+     * @throws cn.zhangyis.db.storage.trx.lock.LockWaitTimeoutException logical key 锁等待超时时抛出；此时未访问二级页
+     */
+    public SecondaryUniqueCheckResult checkFreshInsert(
+            SecondaryIndexMetadata metadata, LogicalRecord row,
+            cn.zhangyis.db.storage.btree.BTreeCurrentReadRequest request) {
+        // 1、唯一约束必须读取完整 prefix 候选，Change Buffer 不能改变冲突判定时点。
+        if (metadata == null || row == null || request == null) {
+            throw new DatabaseValidationException("secondary fresh-insert check metadata/row/request must not be null");
+        }
+        if (metadata.logicalUnique()) {
+            return check(metadata, row, request);
+        }
+
+        // 2、非唯一索引仍取得 logical-key X 锁，保持现有 range-lock 与 DML 串行语义。
+        LogicalRecord targetEntry = metadata.layout().toEntry(row, false);
+        SearchKey logicalKey = metadata.layout().logicalKey(targetEntry);
+        lockLogicalKey(metadata, logicalKey, request);
+
+        // 3、聚簇主键已被同事务确认并锁定为全新，故完整二级 identity 不可能有合法旧版本。
+        // 4、不打开目标 leaf；后续 coordinator 才能按 residency/bitmap 决定 buffer 或直写。
+        return SecondaryUniqueCheckResult.available(SecondaryPublishState.ABSENT);
     }
 
     /**

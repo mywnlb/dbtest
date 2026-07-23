@@ -148,6 +148,37 @@ class StorageEngineTest {
         assertEquals(EngineState.CLOSED, engine.state());
     }
 
+    /** fresh 组合根必须持久化 SpaceId 0 固定格式；缺 exact-version DD resolver 时只降级新 mutation，不移除结构。 */
+    @Test
+    void freshEngineBootstrapsSystemChangeBufferAndPublishesSnapshot() {
+        EngineConfig cfg = config();
+        StorageEngine engine = new StorageEngine(cfg);
+        engine.open();
+        try {
+            var snapshot = engine.changeBufferSnapshot();
+            assertTrue(Files.exists(cfg.systemTablespaceFile()));
+            assertTrue(snapshot.available());
+            assertEquals(cn.zhangyis.db.storage.changebuffer.ChangeBufferMode.ALL,
+                    snapshot.configuredMode());
+            assertEquals(cn.zhangyis.db.storage.changebuffer.ChangeBufferMode.NONE,
+                    snapshot.effectiveMode());
+            assertEquals(0L, snapshot.pendingRecords());
+            assertEquals(1L, snapshot.systemTreePages());
+            assertEquals(0L, snapshot.counters().bufferedOperations());
+        } finally {
+            engine.close();
+        }
+
+        StorageEngine reopened = new StorageEngine(cfg);
+        reopened.open();
+        try {
+            assertTrue(reopened.changeBufferSnapshot().available());
+            assertEquals(0L, reopened.changeBufferSnapshot().pendingRecords());
+        } finally {
+            reopened.close();
+        }
+    }
+
     /** 生产组合根的 capacity-aware MTR 可用 LOB_WRITE profile 完成真实多页写读，不依赖测试 no-op manager。 */
     @Test
     void engineLobFacadeUsesSharedDiskPoolCodecAndRedoBudget() {

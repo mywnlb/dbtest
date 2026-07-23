@@ -60,6 +60,8 @@ class DatabaseEngineTest {
         try (DatabaseEngine database = new DatabaseEngine(config())) {
             database.open();
             assertEquals(DatabaseEngineState.OPEN, database.state());
+            assertEquals(cn.zhangyis.db.storage.changebuffer.ChangeBufferMode.ALL,
+                    database.storage().changeBufferSnapshot().effectiveMode());
         }
     }
 

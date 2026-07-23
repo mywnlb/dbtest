@@ -29,7 +29,13 @@ public enum PageType {
     /** 超出单张 UNDO 页容量的完整 UndoRecord 编码 payload 页链（1.6）。 */
     UNDO_PAYLOAD(9),
     /** 通用Online ALTER的版本化物理descriptor chain页；只由DDL专属segment拥有。 */
-    DDL_DESCRIPTOR(10);
+    DDL_DESCRIPTOR(10),
+    /** system.ibd page 3：Change Buffer 持久 header；追加编码，既有页类型 code 不变。 */
+    IBUF_HEADER(11),
+    /** system.ibd 全局 Change Buffer B+Tree 页；与普通用户 INDEX 页按 envelope 类型隔离。 */
+    IBUF_INDEX(12),
+    /** page0 容量之后承载连续 extent descriptor 的独立管理页。 */
+    XDES(13);
 
     /**
      * 记录 {@code code} 的权威数值状态；仅由本类受控路径更新，取值范围和特殊值遵循所属格式或状态机，溢出必须拒绝。

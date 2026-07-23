@@ -1,5 +1,6 @@
 package cn.zhangyis.db.storage.engine;
 
+import cn.zhangyis.db.common.exception.DatabaseFatalException;
 import cn.zhangyis.db.common.exception.DatabaseRuntimeException;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.Lsn;
@@ -41,6 +42,24 @@ import cn.zhangyis.db.storage.btree.SplitCapableBTreeIndexService;
 import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.LruBufferPool;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
+import cn.zhangyis.db.storage.changebuffer.ChangeBufferBitmapRepository;
+import cn.zhangyis.db.storage.changebuffer.ChangeBufferBootstrap;
+import cn.zhangyis.db.storage.changebuffer.ChangeBufferConfig;
+import cn.zhangyis.db.storage.changebuffer.ChangeBufferCounters;
+import cn.zhangyis.db.storage.changebuffer.ChangeBufferDdlBarrier;
+import cn.zhangyis.db.storage.changebuffer.ChangeBufferHeaderRepository;
+import cn.zhangyis.db.storage.changebuffer.ChangeBufferHeaderSnapshot;
+import cn.zhangyis.db.storage.changebuffer.ChangeBufferMergeWorker;
+import cn.zhangyis.db.storage.changebuffer.ChangeBufferMetadataCatalog;
+import cn.zhangyis.db.storage.changebuffer.ChangeBufferMetadataResolver;
+import cn.zhangyis.db.storage.changebuffer.ChangeBufferPageGate;
+import cn.zhangyis.db.storage.changebuffer.ChangeBufferPageMergeInterceptor;
+import cn.zhangyis.db.storage.changebuffer.ChangeBufferPageMerger;
+import cn.zhangyis.db.storage.changebuffer.ChangeBufferRecoveryValidator;
+import cn.zhangyis.db.storage.changebuffer.ChangeBufferStore;
+import cn.zhangyis.db.storage.changebuffer.ChangeBufferStateException;
+import cn.zhangyis.db.storage.changebuffer.ChangeBufferSnapshot;
+import cn.zhangyis.db.storage.changebuffer.SecondaryIndexMutationCoordinator;
 import cn.zhangyis.db.storage.fil.access.TablespaceAccessController;
 import cn.zhangyis.db.storage.fil.io.FileChannelPageStore;
 import cn.zhangyis.db.storage.fil.io.PageStore;
@@ -94,6 +113,7 @@ import cn.zhangyis.db.storage.recovery.TransactionRecoveryContext;
 import cn.zhangyis.db.storage.recovery.TransactionRecoveryException;
 import cn.zhangyis.db.storage.redo.RedoApplyContext;
 import cn.zhangyis.db.storage.redo.RedoApplyDispatcher;
+import cn.zhangyis.db.storage.redo.RedoAppendBudget;
 import cn.zhangyis.db.storage.redo.RedoCapacityThrottle;
 import cn.zhangyis.db.storage.redo.RedoBudgetPurpose;
 import cn.zhangyis.db.storage.redo.RedoCapacityPolicy;
@@ -148,6 +168,7 @@ import cn.zhangyis.db.storage.undo.UndoRecord;
 import cn.zhangyis.db.storage.undo.UndoRecordIdentity;
 import cn.zhangyis.db.storage.undo.UndoRecordType;
 import cn.zhangyis.db.storage.undo.UndoSegmentDropPlan;
+import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -161,28 +182,31 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Consumer;
 
 /**
  * 存储引擎组合根（engine bootstrap E1/E2/E3a，设计 §3/§13）。把此前仅在测试中构造的存储组件接线成一个生产实例：
  * 共享单一 {@link TablespaceAccessController}，redo 用 durable {@link RedoLogManager}，使 **WAL 顺序在生产
  * flush/checkpoint 路径与 commit 之间成立**（redo durable 必先于 data page 写数据文件）。
  *
- * <p><b>生命周期</b>：{@link #open()}（fresh 建 redo/系统 undo 表空间；existing 打开配置表空间并运行
- * {@link CrashRecoveryService}：doublewrite repair、redo replay、安装 redo 边界、UNDO truncate 续作、
- * SPACE_FILE_RECONCILE、UNDO_ROLLBACK、RESUME_PURGE）→ {@link #checkpoint()}/{@link #close()} 经
+ * <p><b>生命周期</b>：{@link #open()}（fresh 建 redo、system.ibd Change Buffer 与系统 undo 表空间；existing
+ * 打开配置表空间并运行 {@link CrashRecoveryService}：doublewrite repair、redo replay、安装 redo 边界、
+ * CHANGE_BUFFER_RECOVER、UNDO truncate 续作、SPACE_FILE_RECONCILE、UNDO_ROLLBACK、RESUME_PURGE）→
+ * {@link #checkpoint()}/{@link #close()} 经
  * {@link FlushService#flushThrough} 按 WAL 顺序持久（先 redo.flush 再刷脏页再持久 checkpoint），close 末关闭
  * AutoCloseable 句柄。
  *
  * <p><b>当前限制</b>：启动后已有后台 redo flusher、单线程 page cleaner；配置 legacy 单聚簇索引或 DD resolver 时会启动
  * {@code PurgeCoordinator} + purge driver。事务 UNDO_ROLLBACK / RESUME_PURGE 已作为正式 recovery stage 接入；
- * DD 表级 resolver 模式支持多索引 rollback、secondary purge、affected-table barrier 与 prepared transaction
- * 外部决议恢复；DDL 收敛由上层
+ * DD 表级 resolver 模式支持多索引 rollback、secondary purge、Change Buffer exact-version merge、
+ * affected-table barrier 与 prepared transaction 外部决议恢复；DDL 收敛由上层
  * DatabaseEngine 在本存储恢复成功后执行。doublewrite 已常开为 {@link RecoverableDoublewriteStrategy}，但恢复页列表来自 doublewrite 文件有效 slot 并
  * 过滤到 recovery 已打开空间，仍没有全空间 checksum discovery。
  *
  * <p>访问器暴露已接线的事务/disk/btree/undo/mvcc/rollback/DML facade 服务；本类只负责组合根与生命周期，
  * 单聚簇物理 anchor 由 {@link ClusteredDmlService} 编排，表级多索引顺序由 {@link TableDmlService} 编排。
  */
+@Slf4j
 public final class StorageEngine {
 
     /**
@@ -195,6 +219,10 @@ public final class StorageEngine {
     private final Runnable recoveryCompletionHook;
     /** 写 MTR 的唯一实例级准入；构造即为 RECOVERY_INTERNAL，完成钩子后单向封存。 */
     private final StorageWriteAdmission writeAdmission = StorageWriteAdmission.recoveryInternal();
+    /**
+     * 后台存储 fatal 向公共组合根发布的可替换回调；只能在 NEW 期配置，worker 调用时不得持页、MTR 或生命周期锁。
+     */
+    private Consumer<DatabaseFatalException> backgroundFatalFailureHandler = ignored -> { };
     /** 恢复 PREPARED 的外部权威决议源；默认 unresolved，绝不由存储层猜测全局事务结果。 */
     private final PreparedTransactionDecisionProvider preparedDecisionProvider;
     /**
@@ -285,6 +313,34 @@ public final class StorageEngine {
      * 本对象持有的 {@code indexPageAccess} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
      */
     private IndexPageAccess indexPageAccess;
+    /** system.ibd 存在时的 page3 header 仓储；legacy existing 实例为空且 effective mode=NONE。 */
+    private ChangeBufferHeaderRepository changeBufferHeaders;
+    /** 用户空间 4-bit/page bitmap 仓储；只在 system.ibd 格式可用时接线。 */
+    private ChangeBufferBitmapRepository changeBufferBitmaps;
+    /** 全局 IBUF_INDEX B+Tree store。 */
+    private ChangeBufferStore changeBufferStore;
+    /** 前台 append、发布前 merge 与 DDL discard 共用的 per-target gate。 */
+    private ChangeBufferPageGate changeBufferPageGate;
+    /** exact-version 进程目录与持久 DD resolver 组合。 */
+    private ChangeBufferMetadataCatalog changeBufferMetadataCatalog;
+    /** DML/rollback/purge 统一 buffer-or-direct 决策点。 */
+    private SecondaryIndexMutationCoordinator secondaryIndexMutations;
+    /** DROP INDEX/TABLE 回收物理资源前的全局 mutation 屏障。 */
+    private ChangeBufferDdlBarrier changeBufferDdlBarrier;
+    /** LOADING frame 发布前唯一 merge 拦截器。 */
+    private ChangeBufferPageMergeInterceptor changeBufferLoadInterceptor;
+    /** redo 后 header/tree 一致性恢复参与者。 */
+    private ChangeBufferRecoveryValidator changeBufferRecoveryValidator;
+    /** 普通可写模式下的低优先级主动 merge worker。 */
+    private ChangeBufferMergeWorker changeBufferMergeWorker;
+    /** 本次 open 是否发现/创建了 system.ibd Change Buffer 格式；legacy existing 保持 false。 */
+    private boolean changeBufferAvailable;
+    /** append、merge、DDL 与 fallback 共用的进程级统计 owner；不参与任何持久裁决。 */
+    private final ChangeBufferCounters changeBufferCounters = new ChangeBufferCounters();
+    /** 结合 system.ibd 与持久 exact-version resolver 后的运行期策略；可能从 configured mode 降级为 NONE。 */
+    private ChangeBufferConfig effectiveChangeBufferConfig;
+    /** resolver 能否在重启后按 table/schema/index 三元组重建二级布局。 */
+    private boolean persistentChangeBufferMetadataAvailable;
     /** DD/DDL 上层唯一可调用的物理 CREATE/DROP TABLE facade。 */
     private TableDdlStorageService tableDdlStorageService;
     /**
@@ -482,10 +538,12 @@ public final class StorageEngine {
     }
 
     /**
-     * 打开引擎。fresh（baseDir 无 redo.log）建 redo 文件 + 系统 undo 表空间；existing 先打开系统 undo 和
-     * {@link EngineConfig#recoveryTablespaces()} 中列出的数据表空间，再由 {@link CrashRecoveryService} 执行
-     * checkpoint-aware redo replay、安装恢复边界、UNDO TRUNCATING 续作和 SPACE_FILE_RECONCILE。恢复/建库完成后先
-     * 启动后台 page cleaner，再发布 OPEN。
+     * 打开引擎。fresh（baseDir 无 redo.log）在 boot MTR 创建 redo、SpaceId 0 {@code system.ibd}、Change Buffer
+     * page3/page4 与系统 undo；existing 先打开 system/undo/配置数据空间，再由 {@link CrashRecoveryService} 执行
+     * doublewrite、checkpoint-aware redo、恢复边界、CHANGE_BUFFER_RECOVER、undo/事务/purge 与文件 reconcile。
+     * 正常恢复完成后安装发布前 merge 拦截器，并依次启动 redo flusher、page cleaner、purge、Change Buffer worker、
+     * read-ahead，最后才发布 OPEN；只读校验模式不安装写拦截器或后台写线程。
+     *
      * @throws EngineStateException 当前生命周期、版本或所有权与请求不一致时抛出；调用方应重新读取权威状态后回滚或重试
      */
     public void open() {
@@ -544,6 +602,8 @@ public final class StorageEngine {
                     : RedoLogFileRepository.open(config.redoFile());
             redoReclaim = null;
         }
+        // existing 实例绝不隐式创建 system.ibd；只有 fresh bootstrap 或真实文件存在时才接线持久格式。
+        this.changeBufferAvailable = fresh || Files.exists(config.systemTablespaceFile());
         this.redo = RedoLogManager.durable(redoRepo);
         this.checkpointStore = readOnlyValidate
                 ? RedoCheckpointStore.openReadOnly(config.redoControlFile())
@@ -648,9 +708,10 @@ public final class StorageEngine {
         this.btreeService = new SplitCapableBTreeIndexService(indexPageAccess, diskSpaceManager, typeRegistry);
         this.btreeRootSnapshots = new BTreeRootSnapshotService(indexPageAccess);
         this.purgeDmlRowGuards = new PurgeDmlRowGuardManager();
+        initializeChangeBufferComponents();
         this.tableDdlStorageService = new TableDdlStorageService(miniTransactionManager, diskSpaceManager,
                 indexPageAccess, pool, store, flushService, accessController, config.pageSize(),
-                btreeService, btreeRootSnapshots, lobStorage, writeAdmission);
+                btreeService, btreeRootSnapshots, lobStorage, writeAdmission, changeBufferDdlBarrier);
         this.lockObservationService = new DefaultLockObservationService();
         // 3、在中间分支复核阶段性结果；满足条件后，调用 binder、executor、字典或 storage 稳定接口完成领域动作，并维持领域不变量。
         this.lockManager = new LockManager(lockObservationService);
@@ -666,7 +727,7 @@ public final class StorageEngine {
         this.rollbackService = indexMetadataResolver instanceof UndoTargetMetadataResolver targetResolver
                 ? new RollbackService(btreeService, undoAccess, transactionManager,
                         miniTransactionManager, undoSegmentFinalizer, lobStorage, targetResolver,
-                        btreeRootSnapshots, purgeDmlRowGuards)
+                        btreeRootSnapshots, purgeDmlRowGuards, secondaryIndexMutations)
                 : indexMetadataResolver == null
                         ? new RollbackService(btreeService, undoAccess, transactionManager,
                                 miniTransactionManager, undoSegmentFinalizer)
@@ -680,13 +741,14 @@ public final class StorageEngine {
                 lobStorage, onlineDdlTableGate);
         this.tableDmlService = new TableDmlService(dmlService, transactionManager, miniTransactionManager,
                 btreeService, btreeCurrentReadService, lockManager,
-                btreeRootSnapshots, typeRegistry, purgeDmlRowGuards, redo);
+                btreeRootSnapshots, typeRegistry, purgeDmlRowGuards, redo, secondaryIndexMutations);
         this.purgeCoordinator = indexMetadataResolver instanceof UndoTargetMetadataResolver targetResolver
                 ? new PurgeCoordinator(miniTransactionManager, txnSystem, history, undoAccess,
                         undoSegmentFinalizer, btreeService, targetResolver, btreeRootSnapshots,
                         purgeDmlRowGuards, new SecondaryPurgeSafetyChecker(miniTransactionManager,
                                 btreeService, undoAccess, config.undoSpaceId(),
-                                config.maxVersionHops(), typeRegistry), lobStorage, config.purgeConfig())
+                                config.maxVersionHops(), typeRegistry), lobStorage, config.purgeConfig(),
+                        secondaryIndexMutations)
                 : indexMetadataResolver != null
                         ? new PurgeCoordinator(miniTransactionManager, txnSystem, history, undoAccess,
                                 undoSegmentFinalizer, btreeService, indexMetadataResolver)
@@ -701,15 +763,22 @@ public final class StorageEngine {
         this.crashRecoveryService = new CrashRecoveryService(recoveryGate, recoveryProgressJournal);
 
         if (fresh) {
-            // 建系统 undo 表空间（page0/inode 经 MTR 写入，redo 累积，close 时随 flushThrough durable）
+            // 先建 SpaceId 0 system.ibd 及全局树，再建系统 undo；同一 MTR 的物理页顺序单调且统一受 redo 保护。
             MiniTransaction boot = miniTransactionManager.begin(
                     miniTransactionManager.budgetFor(RedoBudgetPurpose.ENGINE_BOOT));
+            diskSpaceManager.createTablespace(boot, ChangeBufferHeaderSnapshot.SYSTEM_SPACE_ID,
+                    config.systemTablespaceFile(), config.systemTablespaceInitialPages(), TablespaceType.SYSTEM);
+            new ChangeBufferBootstrap(diskSpaceManager, indexPageAccess, changeBufferHeaders, config.pageSize())
+                    .initialize(boot, config.changeBufferConfig().mode());
             diskSpaceManager.createTablespace(boot, config.undoSpaceId(), config.undoFile(),
                     config.undoSpaceInitialPages(), TablespaceType.UNDO);
             // 0.3：同 boot MTR 格式化 page3 rseg header（空 slot 目录，redo 保护），供 claim/release 持久与恢复扫描。
             rsegHeaderRepo.format(boot, config.undoSpaceId(), rollbackSlots.rollbackSegmentId(),
                     config.slotCapacity(), config.undoCachedSegmentsPerKind());
             miniTransactionManager.commit(boot);
+            log.info("initialized system Change Buffer: file={} mode={}",
+                    config.systemTablespaceFile(), config.changeBufferConfig().mode());
+            attachChangeBufferLoadInterceptor();
             lastRecoveryReport = null;
         } else {
             recoverExisting();
@@ -735,6 +804,7 @@ public final class StorageEngine {
         startBackgroundRedoFlusher();
         startBackgroundPageCleaner();
         startBackgroundPurgeDriver();
+        startBackgroundChangeBufferMerge();
         // read-ahead 在 bootstrap/recover 之后启动并接钩子：建库/恢复的 page access 不触发预取；之后普通 getPage 顺序访问才驱动。
         startBackgroundReadAhead(lruPool);
         // warmup load：上次 close 的热页定位预取回池（缺失/损坏 dump no-op；未打开空间的页由 prefetch 跳过）。最佳努力，不阻断 open。
@@ -744,6 +814,115 @@ public final class StorageEngine {
         }
         // 4、关闭 scope 并返回不可变结果，以稳定返回或领域异常完成收口。
         this.state = EngineState.OPEN;
+    }
+
+    /**
+     * 构造 Change Buffer 的单一生产协作图。此阶段只绑定对象，不读取 page 3，也不安装 Buffer Pool 拦截器；
+     * fresh bootstrap 尚未创建系统页，existing recovery 也尚未完成 redo replay。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>根据 system.ibd 可用性与 resolver 能力计算 effective mode；缺持久 resolver 时禁止产生跨重启不可解析的新记录。</li>
+     *     <li>创建共享 header、bitmap、global store、metadata catalog 与 per-page gate，所有协作者绑定同一 Buffer Pool/MTR。</li>
+     *     <li>构造发布前 merger/interceptor、统一 secondary mutation coordinator 与 DDL barrier。</li>
+     *     <li>构造恢复校验器和后台 worker；实际 attach/start 延后到 bootstrap 或 recovery 安全边界。</li>
+     * </ol>
+     */
+    private void initializeChangeBufferComponents() {
+        // 1、legacy existing 没有 system.ibd 时完全不构造持久协作者；上层继续使用原来的二级树直写路径。
+        persistentChangeBufferMetadataAvailable = indexMetadataResolver instanceof ChangeBufferMetadataResolver;
+        effectiveChangeBufferConfig = changeBufferAvailable && persistentChangeBufferMetadataAvailable
+                ? config.changeBufferConfig()
+                : withChangeBufferModeDisabled(config.changeBufferConfig());
+        if (config.changeBufferConfig().mode()
+                != cn.zhangyis.db.storage.changebuffer.ChangeBufferMode.NONE
+                && effectiveChangeBufferConfig.mode()
+                == cn.zhangyis.db.storage.changebuffer.ChangeBufferMode.NONE) {
+            log.warn("Change Buffer mode downgraded to NONE: systemTablespaceAvailable={} "
+                            + "persistentMetadataResolverAvailable={}",
+                    changeBufferAvailable, persistentChangeBufferMetadataAvailable);
+        }
+        if (!changeBufferAvailable) {
+            return;
+        }
+
+        // 2、所有持久仓储共享本引擎的页大小、Buffer Pool、B+Tree 与 redo/MTR 域，不创建旁路页缓存。
+        ChangeBufferMetadataResolver persistentResolver = persistentChangeBufferMetadataAvailable
+                ? (ChangeBufferMetadataResolver) indexMetadataResolver : null;
+        this.changeBufferHeaders = new ChangeBufferHeaderRepository(pool, config.pageSize());
+        this.changeBufferBitmaps = new ChangeBufferBitmapRepository(pool, config.pageSize());
+        this.changeBufferStore = new ChangeBufferStore(changeBufferHeaders, btreeService, config.pageSize());
+        this.changeBufferPageGate = new ChangeBufferPageGate(1024);
+        this.changeBufferMetadataCatalog = persistentResolver == null
+                ? new ChangeBufferMetadataCatalog()
+                : new ChangeBufferMetadataCatalog(persistentResolver);
+
+        // 3、append、demand merge 与 DROP discard 共用 gate/store/catalog，避免同一 target 存在两套串行化所有权。
+        ChangeBufferPageMerger merger = new ChangeBufferPageMerger(
+                changeBufferMetadataCatalog, typeRegistry, config.pageSize());
+        this.changeBufferLoadInterceptor = new ChangeBufferPageMergeInterceptor(
+                changeBufferBitmaps, changeBufferStore, merger, miniTransactionManager,
+                changeBufferPageGate, effectiveChangeBufferConfig.pageGateTimeout(), config.pageSize(),
+                changeBufferCounters);
+        this.secondaryIndexMutations = new SecondaryIndexMutationCoordinator(
+                effectiveChangeBufferConfig, pool, miniTransactionManager, btreeService,
+                btreeRootSnapshots, indexPageAccess, changeBufferStore, changeBufferBitmaps,
+                changeBufferPageGate, changeBufferMetadataCatalog,
+                typeRegistry, config.pageSize(), changeBufferCounters);
+        this.changeBufferDdlBarrier = new ChangeBufferDdlBarrier(
+                changeBufferStore, changeBufferBitmaps, changeBufferPageGate,
+                miniTransactionManager, changeBufferMetadataCatalog, changeBufferCounters);
+
+        // 4、这里只创建生命周期对象；在持久格式被 redo 校验前启动或 attach 都会提前暴露未恢复页面。
+        this.changeBufferRecoveryValidator = new ChangeBufferRecoveryValidator(
+                changeBufferHeaders, changeBufferStore, changeBufferBitmaps,
+                miniTransactionManager, config.pageSize());
+        this.changeBufferMergeWorker = new ChangeBufferMergeWorker(
+                effectiveChangeBufferConfig, changeBufferStore, miniTransactionManager, pool,
+                this::failChangeBufferMergeWorker);
+    }
+
+    /**
+     * 把后台 Change Buffer fatal 原子投影到存储层准入，再通知公共组合根发布 FAILED。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>先永久关闭写 MTR 准入，使尚未进入物理临界区的新写在申请 redo/page 资源前失败。</li>
+     *     <li>把 recovery traffic gate 置为 FAILED 并保留同一个 fatal，阻止所有稳定 storage facade 继续服务。</li>
+     *     <li>最后在不持存储锁的 worker 线程通知外层组合根；回调失败由 worker 作为 suppressed 诊断保留。</li>
+     * </ol>
+     *
+     * @param failure 后台目标加载或发布前 merge 的致命失败；不得为 {@code null}
+     */
+    private void failChangeBufferMergeWorker(DatabaseFatalException failure) {
+        // 1、新写必须先于外层状态通知被截断，不能依赖 Session 下一次碰巧观察到 fatal。
+        writeAdmission.close();
+        // 2、所有 requireOpen 入口立即观察 FAILED，并可通过 recovery diagnostics 读取原始 cause。
+        recoveryGate.failClosed(failure);
+        // 3、外层 DatabaseEngine 独立发布生命周期 FAILED；此处不持页 latch、MTR 或 worker lifecycle lock。
+        backgroundFatalFailureHandler.accept(failure);
+    }
+
+    /**
+     * 保留用户配置的容量与 timeout，只把产生新 mutation 的模式降级为 NONE。
+     *
+     * @param configured 已由 EngineConfig 完整校验的配置
+     * @return 资源边界不变、模式为 NONE 的运行期配置
+     */
+    private static ChangeBufferConfig withChangeBufferModeDisabled(ChangeBufferConfig configured) {
+        return new ChangeBufferConfig(cn.zhangyis.db.storage.changebuffer.ChangeBufferMode.NONE,
+                configured.maxSizePercent(), configured.mergeInterval(), configured.mergeBatchPages(),
+                configured.pageGateTimeout(), configured.stopTimeout());
+    }
+
+    /**
+     * 在 system.ibd 已格式化或 redo 后校验完成时 set-once 安装发布前拦截器。安装本身不触页；成功后任何
+     * 用户 leaf 从 LOADING 变为可见前都必须先消费对应 mutation。
+     */
+    private void attachChangeBufferLoadInterceptor() {
+        if (changeBufferAvailable) {
+            ((LruBufferPool) pool).attachPageLoadInterceptor(changeBufferLoadInterceptor);
+        }
     }
 
     /**
@@ -794,6 +973,10 @@ public final class StorageEngine {
             throw new DatabaseValidationException("system undo tablespace cannot be force-skipped: "
                     + config.undoSpaceId().value());
         }
+        if (skipped.contains(ChangeBufferHeaderSnapshot.SYSTEM_SPACE_ID)) {
+            throw new DatabaseValidationException("system tablespace cannot be force-skipped: "
+                    + ChangeBufferHeaderSnapshot.SYSTEM_SPACE_ID.value());
+        }
         // 4、发布恢复结果并释放恢复专用资源，以稳定返回或领域异常完成收口。
         if (clusteredIndex != null && skipped.contains(clusteredIndex.rootPageId().spaceId())) {
             throw new DatabaseValidationException("configured clustered index space cannot be force-skipped: "
@@ -822,6 +1005,10 @@ public final class StorageEngine {
      */
     private void recoverExisting() {
         // 1、只打开恢复准入范围内的物理空间，避免 redo/doublewrite 访问未发现文件。
+        if (changeBufferAvailable) {
+            diskSpaceManager.openTablespaceForRecovery(ChangeBufferHeaderSnapshot.SYSTEM_SPACE_ID,
+                    config.systemTablespaceFile());
+        }
         diskSpaceManager.openTablespaceForRecovery(config.undoSpaceId(), config.undoFile());
         for (EngineTablespaceConfig tablespace : config.recoveryTablespaces()) {
             if (recoveryExclusionPolicy.shouldSkip(tablespace.spaceId())) {
@@ -883,9 +1070,57 @@ public final class StorageEngine {
                     .withSpaceFileReconcile(recoverySpaces)
                     .withTransactionRecovery(transactionRecovery, undoRecovery);
         }).withSpaceExclusionPolicy(recoveryExclusionPolicy);
+        if (changeBufferAvailable) {
+            request = request.withChangeBufferRecovery(this::recoverChangeBufferAfterRedo);
+        }
 
         // 4、恢复总控负责阶段顺序、redo flush/page force 与 traffic gate；失败不会发布半恢复引擎。
         lastRecoveryReport = crashRecoveryService.recover(request);
+    }
+
+    /**
+     * 在 redo 连续边界安装后验证 Change Buffer，并按恢复模式决定是否发布写合并能力。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>完整校验 page3 固定身份、全局树根/segment、sequence 单调性、pending 精确计数、
+     *     单目标 64 条可合并上限与逐目标 bitmap；
+     *     任一持久证据冲突都保持 recovery gate 关闭。</li>
+     *     <li>READ_ONLY_VALIDATE 只保留诊断快照，不安装任何会写 target/bitmap 的拦截器。</li>
+     *     <li>FORCE 模式拒绝带 pending 证据的实例，避免健康页读取绕过合并后导出陈旧索引结果。</li>
+     *     <li>NORMAL 模式证明 pending 可由持久 DD exact-version 解析后，set-once 安装发布前拦截器。</li>
+     * </ol>
+     *
+     * @throws ChangeBufferStateException pending 记录无法在当前恢复模式安全合并时抛出，调用方必须停止恢复
+     */
+    private void recoverChangeBufferAfterRedo() {
+        // 1、validator 只在成功提交只读 MTR 后发布 validatedPendingOperations。
+        changeBufferRecoveryValidator.validateAfterRedo();
+        long pending = changeBufferRecoveryValidator.validatedPendingOperations();
+        log.info("validated Change Buffer after redo: pending={} recoveryMode={}",
+                pending, config.recoveryMode());
+
+        // 2、只读诊断不能改变 Buffer Pool 发布协议，更不能消费全局树或修改用户 bitmap。
+        if (config.recoveryMode() == RecoveryMode.READ_ONLY_VALIDATE) {
+            return;
+        }
+
+        // 3、FORCE 不启动普通 merge 生命周期；只要仍有待合并记录，就无法证明导出读取看到了完整二级状态。
+        if (config.recoveryMode() == RecoveryMode.FORCE_SKIP_CORRUPT_TABLESPACE) {
+            if (pending > 0) {
+                throw new ChangeBufferStateException(
+                        "force recovery cannot export with pending change buffer records: " + pending);
+            }
+            return;
+        }
+
+        // 4、跨重启 mutation 必须由持久 DD 精确解析 schemaVersion；空树允许低层 legacy 组合根继续以 NONE 打开。
+        if (pending > 0 && !persistentChangeBufferMetadataAvailable) {
+            throw new ChangeBufferStateException(
+                    "pending change buffer records require an exact-version persistent metadata resolver: "
+                            + pending);
+        }
+        attachChangeBufferLoadInterceptor();
     }
 
     /**
@@ -1597,6 +1832,9 @@ public final class StorageEngine {
      */
     private List<SpaceId> recoverySpaceIds() {
         LinkedHashSet<SpaceId> spaces = new LinkedHashSet<>();
+        if (changeBufferAvailable) {
+            spaces.add(ChangeBufferHeaderSnapshot.SYSTEM_SPACE_ID);
+        }
         spaces.add(config.undoSpaceId());
         for (EngineTablespaceConfig tablespace : config.recoveryTablespaces()) {
             spaces.add(tablespace.spaceId());
@@ -1665,6 +1903,17 @@ public final class StorageEngine {
     }
 
     /**
+     * 启动低优先级 Change Buffer 主动合并。demand-load correctness 不依赖该 worker；后台关闭时仍由发布前
+     * interceptor 保证首次可见前合并。worker 必须晚于 redo flusher/page cleaner，避免其产生的 merge redo 无持久推进者。
+     */
+    private void startBackgroundChangeBufferMerge() {
+        if (!config.backgroundFlushEnabled() || changeBufferMergeWorker == null) {
+            return;
+        }
+        changeBufferMergeWorker.start();
+    }
+
+    /**
      * 0.10a/0.10c：启动后台 read-ahead 服务并接 Buffer Pool 钩子。仅在后台启用时启动；linear 阈值取 InnoDB 默认 56，
      * random 阈值取 {@link #RANDOM_READ_AHEAD_THRESHOLD}=0（禁用，对齐 MySQL OFF），故一般负载（含既有测试）不触发
      * 预取、行为不变。必须晚于 bootstrap/recover，使其只跟踪普通 getPage 访问。
@@ -1710,6 +1959,7 @@ public final class StorageEngine {
             return;
         }
         if (state == EngineState.READ_ONLY) {
+            stopBackgroundChangeBufferMerge();
             stopBackgroundPurgeDriver();
             closeOpenedHandles();
             return;
@@ -1719,6 +1969,7 @@ public final class StorageEngine {
         }
         // 2、继续完成范围、身份与候选校验；通过后，按 session、transaction、MDL 与 metadata scope 顺序取得受控资源，保持处理顺序与资源边界。
         stopBackgroundReadAhead();
+        stopBackgroundChangeBufferMerge();
         stopBackgroundPurgeDriver();
         stopBackgroundPageCleaner();
         stopBackgroundRedoFlusher();
@@ -1786,6 +2037,7 @@ public final class StorageEngine {
         // 1、校验语法/命令、会话状态与元数据身份，在共享或持久副作用前拒绝非法状态。
         stopAfterFailedOpen(this::stopBackgroundReadAhead, original);
         // 2、继续完成范围、身份与候选校验；通过后，按 session、transaction、MDL 与 metadata scope 顺序取得受控资源，保持处理顺序与资源边界。
+        stopAfterFailedOpen(this::stopBackgroundChangeBufferMerge, original);
         stopAfterFailedOpen(this::stopBackgroundPurgeDriver, original);
         stopAfterFailedOpen(this::stopBackgroundPageCleaner, original);
         // 3、在中间分支复核阶段性结果；满足条件后，调用 binder、executor、字典或 storage 稳定接口完成领域动作，并维持领域不变量。
@@ -1826,6 +2078,18 @@ public final class StorageEngine {
         if (!stopped) {
             throw new DatabaseRuntimeException("page cleaner did not stop within "
                     + config.backgroundFlushStopTimeout());
+        }
+    }
+
+    /**
+     * 在停止 page cleaner、final flush 与关闭 Buffer Pool 前有界停止 Change Buffer worker。即使 worker 从未启动，
+     * close 也会把 NEW 转为 STOPPED，使失败 open 和 FORCE/READ_ONLY 生命周期没有遗留线程所有权。
+     *
+     * @throws ChangeBufferStateException worker 在自身 stop timeout 内不能终止时抛出，调用方不得继续关闭页依赖
+     */
+    private void stopBackgroundChangeBufferMerge() {
+        if (changeBufferMergeWorker != null) {
+            changeBufferMergeWorker.close();
         }
     }
 
@@ -2212,6 +2476,25 @@ public final class StorageEngine {
     }
 
     /**
+     * 配置后台存储致命失败的公共组合根通知，只能在 open 前设置。回调只负责发布外层生命周期状态，不能在
+     * worker 线程递归关闭 StorageEngine；存储写闸门与 recovery gate 会在调用它之前先行关闭。
+     *
+     * @param handler 后台 fatal 通知端口；不得为 {@code null}，生命周期须覆盖当前 StorageEngine
+     * @throws EngineStateException 引擎不再处于 NEW 时抛出，调用方不得在 worker 启动后替换失败所有权
+     * @throws DatabaseValidationException handler 为空时抛出
+     */
+    public void configureBackgroundFatalFailureHandler(Consumer<DatabaseFatalException> handler) {
+        if (state != EngineState.NEW) {
+            throw new EngineStateException(
+                    "background fatal failure handler must be configured before open(): " + state);
+        }
+        if (handler == null) {
+            throw new DatabaseValidationException("background fatal failure handler must not be null");
+        }
+        this.backgroundFatalFailureHandler = handler;
+    }
+
+    /**
      * 定位并读取数据库引擎组合根领域对象；先校验标识与准入状态，返回值只暴露稳定视图或受控句柄。
      *
      * @return {@code mvccReader} 创建的模块协作者；成功时不为 {@code null}，其依赖和生命周期由当前组合根拥有
@@ -2364,6 +2647,55 @@ public final class StorageEngine {
             return new PageCleanerMetricsSnapshot(PageCleanerState.NEW, 0, 0, 0, false, "", 0, 0);
         }
         return pageCleanerSupervisor.metricsSnapshot();
+    }
+
+    /**
+     * 采集 Change Buffer 持久边界与运行期计数。该查询只复制 header/segment/原子统计，不加载任何用户
+     * 二级 leaf，也不会触发 merge；READ_ONLY_VALIDATE 可安全调用，关闭或失败 open 后拒绝访问已释放页句柄。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验引擎处于 OPEN 或 READ_ONLY；legacy 无 system.ibd 直接返回 effective NONE 空快照。</li>
+     *     <li>独立只读 MTR 读取 page3 configured mode 与 pending，返回前释放 header latch/fix。</li>
+     *     <li>另一只读 MTR 检查 leaf/non-leaf segment 已用页并加稳定 root，避免 page3→page2 逆序锁页。</li>
+     *     <li>合并弱一致事件计数、bitmap 观察数和 worker 状态，发布不含内部 Guard 的不可变快照。</li>
+     * </ol>
+     *
+     * @return 当前 Change Buffer 控制面快照；成功时不为 {@code null}
+     * @throws EngineStateException 引擎未完成启动或已经关闭时抛出
+     * @throws ChangeBufferStateException 持久 segment 页数溢出或格式不一致时抛出
+     */
+    public ChangeBufferSnapshot changeBufferSnapshot() {
+        // 1、诊断只允许句柄仍存活的两个稳定状态；legacy 不能读取不存在的 SpaceId 0。
+        if (state != EngineState.OPEN && state != EngineState.READ_ONLY) {
+            throw new EngineStateException("change buffer snapshot requires OPEN/READ_ONLY state: " + state);
+        }
+        if (!changeBufferAvailable) {
+            return new ChangeBufferSnapshot(false, config.changeBufferConfig().mode(),
+                    cn.zhangyis.db.storage.changebuffer.ChangeBufferMode.NONE, 0L,
+                    changeBufferCounters.snapshot(), 0L, 0L,
+                    cn.zhangyis.db.storage.changebuffer.ChangeBufferWorkerState.NEW);
+        }
+
+        // 2、header 与 segment inode 分开读取，避免先持 page3 再访问较低 page2 违反 MTR 物理页全序。
+        ChangeBufferHeaderSnapshot header = miniTransactionManager.executeDetached(
+                RedoAppendBudget.readOnly(), changeBufferHeaders::read);
+
+        // 3、两个 segment 的 usedPageCount 是 FSP 权威分配证据；固定 page4 root 不属于任一 segment，单独加一。
+        long systemTreePages = miniTransactionManager.executeDetached(RedoAppendBudget.readOnly(), read -> {
+            long leafPages = diskSpaceManager.inspectDropSegmentPlan(read, header.leafSegment()).usedPageCount();
+            long nonLeafPages = diskSpaceManager.inspectDropSegmentPlan(read, header.nonLeafSegment()).usedPageCount();
+            try {
+                return Math.addExact(1L, Math.addExact(leafPages, nonLeafPages));
+            } catch (ArithmeticException overflow) {
+                throw new ChangeBufferStateException("change buffer system tree page count overflow", overflow);
+            }
+        });
+
+        // 4、LongAdder/ConcurrentHashMap 读只提供诊断弱一致性，不能反向参与 header 或恢复决策。
+        return new ChangeBufferSnapshot(true, header.configuredMode(), effectiveChangeBufferConfig.mode(),
+                header.pendingOperations(), changeBufferCounters.snapshot(), systemTreePages,
+                changeBufferBitmaps.observedBitmapPageCount(), changeBufferMergeWorker.state());
     }
 
     /**

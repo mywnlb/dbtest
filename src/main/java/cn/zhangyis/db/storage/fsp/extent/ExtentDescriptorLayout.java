@@ -1,13 +1,11 @@
 package cn.zhangyis.db.storage.fsp.extent;
-import cn.zhangyis.db.storage.fsp.flst.FileAddress;
-import cn.zhangyis.db.storage.fsp.header.SpaceHeaderLayout;
-
 
 import cn.zhangyis.db.domain.PageSize;
+import cn.zhangyis.db.storage.fsp.header.SpaceHeaderLayout;
 
 /**
- * XDES entry 布局：内嵌 page 0、从 SpaceHeaderLayout.XDES_BASE 起、每条 ENTRY_SIZE 字节（条内偏移如下）。
- * bitmap 固定 32 字节（256 位，1 位/页，1=已分配），仅前 pagesPerExtent 位有效。
+ * XDES entry 页内布局：page0 与独立 primary/overflow 页都从 SpaceHeaderLayout.XDES_BASE 起，
+ * 每条 ENTRY_SIZE 字节。bitmap 固定保留 32 字节 stride，仅前 pagesPerExtent 位有效。
  */
 public final class ExtentDescriptorLayout {
 
@@ -43,6 +41,9 @@ public final class ExtentDescriptorLayout {
      */
     public static final int ENTRY_SIZE = BITMAP + BITMAP_BYTES; // 68
 
+    /** page0 与独立 XDES 页统一保留到 256 字节后再放 descriptor，确保旧 page0 地址永久稳定。 */
+    public static final int ENTRIES_BASE = SpaceHeaderLayout.XDES_BASE;
+
     /**
      * 计算 page 0 在 Space Header 与固定 XDES entry 布局之后能够容纳的完整 extent descriptor 数量。
      *
@@ -60,6 +61,45 @@ public final class ExtentDescriptorLayout {
      * @return {@code entryOffset} 计算出的非负长度、位置或数量；结果必须落在所属页、集合或持久格式容量内，溢出通过领域异常报告
      */
     public static int entryOffset(long extentNo) {
-        return Math.toIntExact(SpaceHeaderLayout.XDES_BASE + extentNo * ENTRY_SIZE);
+        try {
+            return entryOffsetInPage(Math.toIntExact(extentNo));
+        } catch (ArithmeticException error) {
+            throw new cn.zhangyis.db.common.exception.DatabaseValidationException(
+                    "XDES extent number cannot be represented as a page slot: " + extentNo, error);
+        }
+    }
+
+    /**
+     * 根据 descriptor 页内槽位计算 entry 起始偏移；与全局 extentNo 解耦，供独立 XDES 页复用。
+     *
+     * @param slotInPage 当前 descriptor 页内的零基槽位；必须非负且由管理区布局验证未超过容量
+     * @return 从物理页首计算的 entry 字节偏移
+     * @throws cn.zhangyis.db.common.exception.DatabaseValidationException 槽位为负或乘加溢出时抛出
+     */
+    public static int entryOffsetInPage(int slotInPage) {
+        if (slotInPage < 0) {
+            throw new cn.zhangyis.db.common.exception.DatabaseValidationException(
+                    "XDES slot in page must not be negative: " + slotInPage);
+        }
+        try {
+            return Math.addExact(ENTRIES_BASE, Math.multiplyExact(slotInPage, ENTRY_SIZE));
+        } catch (ArithmeticException error) {
+            throw new cn.zhangyis.db.common.exception.DatabaseValidationException(
+                    "XDES entry offset overflows for slot " + slotInPage, error);
+        }
+    }
+
+    /**
+     * 返回当前页大小下 bitmap 真正表达的字节数。小页 extent 仍保留 32 字节 stride，但未使用 padding 不得触碰 FIL trailer。
+     *
+     * @param pageSize 实例固定页大小；不得为空
+     * @return {@code ceil(pagesPerExtent/8)}，范围为 8..32
+     */
+    public static int activeBitmapBytes(PageSize pageSize) {
+        if (pageSize == null) {
+            throw new cn.zhangyis.db.common.exception.DatabaseValidationException(
+                    "XDES bitmap page size must not be null");
+        }
+        return (pageSize.pagesPerExtent() + Byte.SIZE - 1) / Byte.SIZE;
     }
 }

@@ -47,13 +47,16 @@ final class MtrOperationRedoBudgetEstimator {
             throw new DatabaseValidationException("production write requires a concrete redo budget purpose");
         }
         int pageImageEquivalents = switch (purpose) {
-            case ENGINE_BOOT -> 9;
+            // system.ibd page0..4、两个 segment inode、undo page0..3 与重复元数据 delta 共处一次 boot MTR。
+            case ENGINE_BOOT -> 32;
             case ROLLBACK_MARKER -> 6;
             case TRANSACTION_STATE -> 1;
             case UNDO_TRUNCATE_LIFECYCLE -> 4;
             case UNDO_TRUNCATE_REBUILD -> 25;
             case DDL_TABLE_DROP -> 4;
             case DDL_SDI_WRITE -> 3;
+            case CHANGE_BUFFER_APPEND -> 32;
+            case CHANGE_BUFFER_MERGE -> 128;
             case CLUSTERED_INSERT, CLUSTERED_UPDATE, CLUSTERED_DELETE, SECONDARY_INDEX, PURGE_INDEX,
                     PURGE_RECORD_PROGRESS,
                     ROLLBACK_INVERSE, UNDO_COMMIT, UNDO_FINALIZATION, LOB_WRITE, LOB_FREE,

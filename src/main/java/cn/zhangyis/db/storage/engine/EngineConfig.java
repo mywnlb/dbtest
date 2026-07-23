@@ -4,6 +4,7 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.SpaceId;
+import cn.zhangyis.db.storage.changebuffer.ChangeBufferConfig;
 import cn.zhangyis.db.storage.api.undotruncate.UndoTruncationConfig;
 import cn.zhangyis.db.storage.flush.doublewrite.DoublewriteMode;
 import cn.zhangyis.db.storage.recovery.RecoveryMode;
@@ -51,6 +52,7 @@ import java.util.Set;
  * @param onlineDdlConfig Online ADD INDEX 的单日志容量、扫描批次与 terminal abort 预留；不得为 {@code null}
  * @param purgeConfig purge worker 数量、单批最大在途日志数与批次等待上限；不得为 {@code null}
  * @param undoTruncationConfig purge cycle 驱动自动 undo 截断的阈值与冷却策略；不得为 {@code null}
+ * @param changeBufferConfig Change Buffer 模式、Buffer Pool 容量占比、后台批次与有界等待；不得为 {@code null}
  */
 public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapacityFrames,
                            SpaceId undoSpaceId, PageNo undoSpaceInitialPages, int slotCapacity,
@@ -63,7 +65,8 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                            Set<SpaceId> forceSkippedSpaces, int maxExternalUndoPayloadPages,
                            int undoCachedSegmentsPerKind, Duration undoHistoryTransitionTimeout,
                            DoublewriteMode doublewriteMode, OnlineDdlConfig onlineDdlConfig,
-                           PurgeConfig purgeConfig, UndoTruncationConfig undoTruncationConfig) {
+                           PurgeConfig purgeConfig, UndoTruncationConfig undoTruncationConfig,
+                           ChangeBufferConfig changeBufferConfig) {
 
     /** 默认启动后台 page cleaner，使 engine open 后具备持续 checkpoint tick 能力。 */
     private static final boolean DEFAULT_BACKGROUND_FLUSH_ENABLED = true;
@@ -87,6 +90,8 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
     private static final PurgeConfig DEFAULT_PURGE_CONFIG = PurgeConfig.defaults();
     /** 默认启用 purge 驱动截断；兼容构造器统一取得一个 extent 门槛与三十秒冷却。 */
     private static final UndoTruncationConfig DEFAULT_UNDO_TRUNCATION_CONFIG = UndoTruncationConfig.defaults();
+    /** 新实例默认启用完整 Change Buffer；existing legacy 是否有效由 system.ibd 持久格式决定。 */
+    private static final ChangeBufferConfig DEFAULT_CHANGE_BUFFER_CONFIG = ChangeBufferConfig.defaults();
 
     public EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapacityFrames,
                         SpaceId undoSpaceId, PageNo undoSpaceInitialPages, int slotCapacity,
@@ -279,13 +284,38 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 onlineDdlConfig, purgeConfig, DEFAULT_UNDO_TRUNCATION_CONFIG);
     }
 
+    /**
+     * 兼容新增 Change Buffer 配置前的完整 canonical 签名。旧调用点取得新实例默认策略；existing legacy 实例
+     * 若没有 {@code system.ibd}，组合根仍会把 effective mode 收窄为 NONE，绝不隐式升级。
+     */
+    public EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapacityFrames,
+                        SpaceId undoSpaceId, PageNo undoSpaceInitialPages, int slotCapacity,
+                        int maxVersionHops, Duration flushTimeout, long redoCapacityBytes,
+                        List<EngineTablespaceConfig> recoveryTablespaces,
+                        boolean backgroundFlushEnabled, int pageCleanerQueueCapacity,
+                        Duration backgroundFlushInterval, int backgroundFlushMaxPages,
+                        Duration backgroundFlushStopTimeout, RedoRotationConfig redoRotation,
+                        int bufferPoolInstanceCount, RecoveryMode recoveryMode,
+                        Set<SpaceId> forceSkippedSpaces, int maxExternalUndoPayloadPages,
+                        int undoCachedSegmentsPerKind, Duration undoHistoryTransitionTimeout,
+                        DoublewriteMode doublewriteMode, OnlineDdlConfig onlineDdlConfig,
+                        PurgeConfig purgeConfig, UndoTruncationConfig undoTruncationConfig) {
+        this(baseDir, pageSize, bufferPoolCapacityFrames, undoSpaceId, undoSpaceInitialPages,
+                slotCapacity, maxVersionHops, flushTimeout, redoCapacityBytes, recoveryTablespaces,
+                backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
+                backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation,
+                bufferPoolInstanceCount, recoveryMode, forceSkippedSpaces, maxExternalUndoPayloadPages,
+                undoCachedSegmentsPerKind, undoHistoryTransitionTimeout, doublewriteMode,
+                onlineDdlConfig, purgeConfig, undoTruncationConfig, DEFAULT_CHANGE_BUFFER_CONFIG);
+    }
+
     public EngineConfig {
         if (baseDir == null || pageSize == null || undoSpaceId == null
                 || undoSpaceInitialPages == null || flushTimeout == null || recoveryTablespaces == null
                 || backgroundFlushInterval == null || backgroundFlushStopTimeout == null
                 || recoveryMode == null || forceSkippedSpaces == null || undoHistoryTransitionTimeout == null
                 || doublewriteMode == null || onlineDdlConfig == null || purgeConfig == null
-                || undoTruncationConfig == null) {
+                || undoTruncationConfig == null || changeBufferConfig == null) {
             throw new DatabaseValidationException("engine config object fields must not be null");
         }
         if (bufferPoolCapacityFrames <= 0) {
@@ -293,6 +323,9 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
         }
         if (undoSpaceInitialPages.value() <= 0) {
             throw new DatabaseValidationException("undoSpaceInitialPages must be positive: " + undoSpaceInitialPages.value());
+        }
+        if (undoSpaceId.value() == 0) {
+            throw new DatabaseValidationException("SpaceId 0 is reserved for system.ibd Change Buffer metadata");
         }
         if (slotCapacity <= 0) {
             throw new DatabaseValidationException("slotCapacity must be positive: " + slotCapacity);
@@ -389,7 +422,7 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, rotation, bufferPoolInstanceCount, recoveryMode,
                 forceSkippedSpaces, maxExternalUndoPayloadPages, undoCachedSegmentsPerKind,
                 undoHistoryTransitionTimeout, doublewriteMode, onlineDdlConfig, purgeConfig,
-                undoTruncationConfig);
+                undoTruncationConfig, changeBufferConfig);
     }
 
     /**
@@ -406,7 +439,7 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, instanceCount, recoveryMode,
                 forceSkippedSpaces, maxExternalUndoPayloadPages, undoCachedSegmentsPerKind,
                 undoHistoryTransitionTimeout, doublewriteMode, onlineDdlConfig, purgeConfig,
-                undoTruncationConfig);
+                undoTruncationConfig, changeBufferConfig);
     }
 
     /**
@@ -423,7 +456,7 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, bufferPoolInstanceCount, mode,
                 forceSkippedSpaces, maxExternalUndoPayloadPages, undoCachedSegmentsPerKind,
                 undoHistoryTransitionTimeout, doublewriteMode, onlineDdlConfig, purgeConfig,
-                undoTruncationConfig);
+                undoTruncationConfig, changeBufferConfig);
     }
 
     /**
@@ -439,7 +472,7 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, bufferPoolInstanceCount,
                 recoveryMode, forceSkippedSpaces, maxExternalUndoPayloadPages, undoCachedSegmentsPerKind,
                 undoHistoryTransitionTimeout, doublewriteMode, onlineDdlConfig, purgeConfig,
-                undoTruncationConfig);
+                undoTruncationConfig, changeBufferConfig);
     }
 
     /**
@@ -457,7 +490,7 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, bufferPoolInstanceCount,
                 recoveryMode, skippedSpaces, maxExternalUndoPayloadPages, undoCachedSegmentsPerKind,
                 undoHistoryTransitionTimeout, doublewriteMode, onlineDdlConfig, purgeConfig,
-                undoTruncationConfig);
+                undoTruncationConfig, changeBufferConfig);
     }
 
     /**
@@ -479,7 +512,7 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, bufferPoolInstanceCount,
                 RecoveryMode.FORCE_SKIP_CORRUPT_TABLESPACE, skippedSpaces, maxExternalUndoPayloadPages,
                 undoCachedSegmentsPerKind, undoHistoryTransitionTimeout, doublewriteMode, onlineDdlConfig,
-                purgeConfig, undoTruncationConfig);
+                purgeConfig, undoTruncationConfig, changeBufferConfig);
     }
 
     /** 派生单条 external undo payload 页数上限；降低该值前必须确认 active/history undo 不含更长页链。
@@ -494,7 +527,7 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, bufferPoolInstanceCount,
                 recoveryMode, forceSkippedSpaces, maxPages, undoCachedSegmentsPerKind,
                 undoHistoryTransitionTimeout, doublewriteMode, onlineDdlConfig, purgeConfig,
-                undoTruncationConfig);
+                undoTruncationConfig, changeBufferConfig);
     }
 
     /**
@@ -511,7 +544,7 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, bufferPoolInstanceCount,
                 recoveryMode, forceSkippedSpaces, maxExternalUndoPayloadPages, capacity,
                 undoHistoryTransitionTimeout, doublewriteMode, onlineDdlConfig, purgeConfig,
-                undoTruncationConfig);
+                undoTruncationConfig, changeBufferConfig);
     }
 
     /** 派生独立的 history transition 等待上限；只影响内存串行化，不改变磁盘格式。
@@ -525,7 +558,7 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, bufferPoolInstanceCount,
                 recoveryMode, forceSkippedSpaces, maxExternalUndoPayloadPages, undoCachedSegmentsPerKind, timeout,
-                doublewriteMode, onlineDdlConfig, purgeConfig, undoTruncationConfig);
+                doublewriteMode, onlineDdlConfig, purgeConfig, undoTruncationConfig, changeBufferConfig);
     }
 
     /** 派生 doublewrite 保护模式；不会改变其它恢复与 flush 配置。
@@ -544,7 +577,7 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, bufferPoolInstanceCount,
                 recoveryMode, forceSkippedSpaces, maxExternalUndoPayloadPages, undoCachedSegmentsPerKind,
                 undoHistoryTransitionTimeout, mode, onlineDdlConfig, purgeConfig,
-                undoTruncationConfig);
+                undoTruncationConfig, changeBufferConfig);
     }
 
     /**
@@ -565,7 +598,7 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, bufferPoolInstanceCount,
                 recoveryMode, forceSkippedSpaces, maxExternalUndoPayloadPages, undoCachedSegmentsPerKind,
                 undoHistoryTransitionTimeout, doublewriteMode, config, purgeConfig,
-                undoTruncationConfig);
+                undoTruncationConfig, changeBufferConfig);
     }
 
     /**
@@ -586,7 +619,7 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, bufferPoolInstanceCount,
                 recoveryMode, forceSkippedSpaces, maxExternalUndoPayloadPages, undoCachedSegmentsPerKind,
                 undoHistoryTransitionTimeout, doublewriteMode, onlineDdlConfig, config,
-                undoTruncationConfig);
+                undoTruncationConfig, changeBufferConfig);
     }
 
     /**
@@ -606,7 +639,29 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
                 backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
                 backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, bufferPoolInstanceCount,
                 recoveryMode, forceSkippedSpaces, maxExternalUndoPayloadPages, undoCachedSegmentsPerKind,
-                undoHistoryTransitionTimeout, doublewriteMode, onlineDdlConfig, purgeConfig, config);
+                undoHistoryTransitionTimeout, doublewriteMode, onlineDdlConfig, purgeConfig, config,
+                changeBufferConfig);
+    }
+
+    /**
+     * 派生仅替换 Change Buffer 策略的配置副本。该操作不升级 existing legacy 文件；没有 system.ibd 的实例仍会
+     * 在 open 时把 effective mode 收窄为 NONE。
+     *
+     * @param config 模式、空间占比、merge 批次与全部等待上限；不得为 {@code null}
+     * @return 保留其它 engine 字段的新配置
+     * @throws DatabaseValidationException config 为空时抛出
+     */
+    public EngineConfig withChangeBufferConfig(ChangeBufferConfig config) {
+        if (config == null) {
+            throw new DatabaseValidationException("change buffer config must not be null");
+        }
+        return new EngineConfig(baseDir, pageSize, bufferPoolCapacityFrames, undoSpaceId, undoSpaceInitialPages,
+                slotCapacity, maxVersionHops, flushTimeout, redoCapacityBytes, recoveryTablespaces,
+                backgroundFlushEnabled, pageCleanerQueueCapacity, backgroundFlushInterval,
+                backgroundFlushMaxPages, backgroundFlushStopTimeout, redoRotation, bufferPoolInstanceCount,
+                recoveryMode, forceSkippedSpaces, maxExternalUndoPayloadPages, undoCachedSegmentsPerKind,
+                undoHistoryTransitionTimeout, doublewriteMode, onlineDdlConfig, purgeConfig,
+                undoTruncationConfig, config);
     }
 
     private static int defaultMaxExternalUndoPages(int capacityFrames, int instanceCount) {
@@ -642,6 +697,24 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
     /** 系统 undo 表空间数据文件路径。 */
     public Path undoFile() {
         return baseDir.resolve("undo_" + undoSpaceId.value() + ".ibu");
+    }
+
+    /**
+     * 全局 Change Buffer 所属系统表空间文件。路径由实例目录固定派生，不能与 DD 的 {@code mysql.ibd} 混用。
+     *
+     * @return {@code baseDir/system.ibd}
+     */
+    public Path systemTablespaceFile() {
+        return baseDir.resolve("system.ibd");
+    }
+
+    /**
+     * 新系统表空间初始容量。extent 0 保存固定页，至少再提供一个普通 extent 给全局树 split segment。
+     *
+     * @return 两个 extent 的页数，适配全部受支持 page size
+     */
+    public PageNo systemTablespaceInitialPages() {
+        return PageNo.of(Math.multiplyExact(2L, pageSize.pagesPerExtent()));
     }
 
     /** doublewrite buffer 文件路径（崩溃后修复 torn data page 的整页副本）。 */
@@ -697,6 +770,10 @@ public record EngineConfig(Path baseDir, PageSize pageSize, int bufferPoolCapaci
             if (tablespace.spaceId().equals(undoSpaceId)) {
                 throw new DatabaseValidationException("system undo tablespace is managed by engine config: "
                         + undoSpaceId.value());
+            }
+            if (tablespace.spaceId().value() == 0) {
+                throw new DatabaseValidationException(
+                        "SpaceId 0 system tablespace is managed by engine config");
             }
             if (!seen.add(tablespace.spaceId())) {
                 throw new DatabaseValidationException("duplicate engine recovery tablespace space id: "

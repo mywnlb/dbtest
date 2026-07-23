@@ -300,6 +300,7 @@ public final class DatabaseEngine implements AutoCloseable {
                             cleanSnapshotPublisher.publish();
                         });
                 storage.configureIndexMetadataResolver(new DictionaryIndexMetadataResolver(repository));
+                storage.configureBackgroundFatalFailureHandler(this::failClosed);
                 storage.open();
                 xaRegistry.completeRecoveryDecisions();
                 xaCoordinator = new PersistentXaCoordinator(xaRegistry);
@@ -656,7 +657,7 @@ public final class DatabaseEngine implements AutoCloseable {
         try {
             if (state == DatabaseEngineState.OPEN) {
                 state = DatabaseEngineState.FAILED;
-                log.error("database engine entered FAILED after a fail-stop statement error", failure);
+                log.error("database engine entered FAILED after a fail-stop engine error", failure);
             }
         } finally {
             lifecycleLock.unlock();

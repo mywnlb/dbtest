@@ -7,6 +7,7 @@ import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.fil.io.PageStore;
 import cn.zhangyis.db.storage.fsp.exception.FspMetadataException;
 import cn.zhangyis.db.storage.fsp.exception.SpaceReservationExceededException;
+import cn.zhangyis.db.storage.fsp.extent.ExtentManagementRegionLayout;
 import cn.zhangyis.db.storage.fsp.flst.Flst;
 import cn.zhangyis.db.storage.fsp.header.SpaceHeaderRepository;
 import cn.zhangyis.db.storage.fsp.header.SpaceHeaderSnapshot;
@@ -46,6 +47,9 @@ public final class SpaceReservationService {
     /** FLST 原语；用于读取全局 FSP_FREE 链长度，估算可承诺的完整 extent。 */
     private final Flst flst;
 
+    /** 识别重复管理区首 extent，防止 reservation 把固定 XDES/bitmap 容量承诺给业务页。 */
+    private final ExtentManagementRegionLayout managementLayout;
+
     /** 容量承诺账本锁。不得在持有该锁时进入 Buffer Pool、page latch、事务锁等待或上层 SQL/session 回调。 */
     private final ReentrantLock lock = new ReentrantLock();
 
@@ -73,6 +77,7 @@ public final class SpaceReservationService {
         this.pageSize = pageSize;
         this.headerRepo = headerRepo;
         this.flst = flst;
+        this.managementLayout = new ExtentManagementRegionLayout(pageSize);
     }
 
     /**
@@ -246,7 +251,7 @@ public final class SpaceReservationService {
                 continue;
             }
             probeFreeLimit = nextFreeLimit;
-            if (extentNo != 0L) {
+            if (!managementLayout.isManagementExtent(extentNo)) {
                 available++;
             }
         }

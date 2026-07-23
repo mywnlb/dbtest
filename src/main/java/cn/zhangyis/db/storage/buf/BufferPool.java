@@ -170,6 +170,21 @@ public interface BufferPool extends AutoCloseable {
      */
     List<PageId> residentPageIds();
 
+    /**
+     * 判断单页是否已在 page hash 中驻留，LOADING 占位也视为驻留。Change Buffer eligibility 使用该事实保证
+     * 只缓冲尚未开始载入的目标 leaf；默认实现基于只读快照，生产 LRU pool 提供 O(1) 分片查询。
+     *
+     * @param pageId 待判断的稳定物理页；不得为 {@code null}
+     * @return 已驻留或正在载入时为 {@code true}
+     */
+    default boolean isResident(PageId pageId) {
+        if (pageId == null) {
+            throw new cn.zhangyis.db.common.exception.DatabaseValidationException(
+                    "resident page id must not be null");
+        }
+        return residentPageIds().contains(pageId);
+    }
+
     /** 关闭 Buffer Pool 视图；不隐式 flush dirty page，写盘必须由 FlushCoordinator/FlushService 先完成。 */
     @Override
     void close();

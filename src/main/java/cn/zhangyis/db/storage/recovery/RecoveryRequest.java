@@ -32,6 +32,7 @@ import java.util.Set;
  * @param transactionRecoveryContext 可选正式事务恢复上下文；在 redo replay 前装载 sidecar，期间接收 transaction delta。
  * @param transactionUndoRecovery 可选事务 undo 恢复参与者；消费 immutable snapshot 并负责正式 UNDO_ROLLBACK/RESUME_PURGE。
  * @param skipPolicy 对象级恢复排除策略；NORMAL/READ_ONLY 可携带 committed DD 隔离集合，但管理员集合仅 FORCE 可用。
+ * @param changeBufferRecovery 可选 redo 后 Change Buffer 持久结构校验参与者；只读诊断同样执行只读校验
  */
 public record RecoveryRequest(RecoveryMode mode,
                               RedoCheckpointStore checkpointStore,
@@ -45,7 +46,8 @@ public record RecoveryRequest(RecoveryMode mode,
                               RedoLogManager recoveredRedoManager,
                               TransactionRecoveryContext transactionRecoveryContext,
                               TransactionUndoRecoveryParticipant transactionUndoRecovery,
-                              RecoverySpaceExclusionPolicy skipPolicy) {
+                              RecoverySpaceExclusionPolicy skipPolicy,
+                              ChangeBufferRecoveryParticipant changeBufferRecovery) {
 
     public RecoveryRequest {
         if (mode == null || checkpointStore == null || redoRepository == null
@@ -89,6 +91,25 @@ public record RecoveryRequest(RecoveryMode mode,
         spacesToReconcile = spacesToReconcile == null ? List.of() : List.copyOf(spacesToReconcile);
     }
 
+    /** 兼容 Change Buffer 恢复阶段引入前的 RecoverySpaceExclusionPolicy 构造调用。 */
+    public RecoveryRequest(RecoveryMode mode,
+                           RedoCheckpointStore checkpointStore,
+                           RedoLogFileRepository redoRepository,
+                           RedoApplyDispatcher dispatcher,
+                           RedoApplyContext applyContext,
+                           DoublewriteRecoveryScanner doublewriteScanner,
+                           List<PageId> pagesToRepair,
+                           UndoTablespaceRecoveryParticipant undoTablespaceRecovery,
+                           List<SpaceId> spacesToReconcile,
+                           RedoLogManager recoveredRedoManager,
+                           TransactionRecoveryContext transactionRecoveryContext,
+                           TransactionUndoRecoveryParticipant transactionUndoRecovery,
+                           RecoverySpaceExclusionPolicy skipPolicy) {
+        this(mode, checkpointStore, redoRepository, dispatcher, applyContext, doublewriteScanner,
+                pagesToRepair, undoTablespaceRecovery, spacesToReconcile, recoveredRedoManager,
+                transactionRecoveryContext, transactionUndoRecovery, skipPolicy, null);
+    }
+
     /** 兼容仍按旧单集合模型构造请求的低层测试；该集合被解释为管理员本次声明。 */
     public RecoveryRequest(RecoveryMode mode,
                            RedoCheckpointStore checkpointStore,
@@ -107,7 +128,7 @@ public record RecoveryRequest(RecoveryMode mode,
                 pagesToRepair, undoTablespaceRecovery, spacesToReconcile, recoveredRedoManager,
                 transactionRecoveryContext, transactionUndoRecovery,
                 skipPolicy == null ? RecoverySpaceExclusionPolicy.none()
-                        : RecoverySpaceExclusionPolicy.of(skipPolicy.skippedSpaces(), Set.of()));
+                        : RecoverySpaceExclusionPolicy.of(skipPolicy.skippedSpaces(), Set.of()), null);
     }
 
     /**
@@ -181,7 +202,8 @@ public record RecoveryRequest(RecoveryMode mode,
         }
         return new RecoveryRequest(mode, checkpointStore, redoRepository, dispatcher, applyContext,
                 doublewriteScanner, pagesToRepair, undoTablespaceRecovery, spacesToReconcile,
-                recoveredRedoManager, transactionRecoveryContext, transactionUndoRecovery, policy);
+                recoveredRedoManager, transactionRecoveryContext, transactionUndoRecovery, policy,
+                changeBufferRecovery);
     }
 
     /**
@@ -198,7 +220,8 @@ public record RecoveryRequest(RecoveryMode mode,
         }
         return new RecoveryRequest(mode, checkpointStore, redoRepository, dispatcher, applyContext,
                 scanner, pages, undoTablespaceRecovery, spacesToReconcile,
-                recoveredRedoManager, transactionRecoveryContext, transactionUndoRecovery, skipPolicy);
+                recoveredRedoManager, transactionRecoveryContext, transactionUndoRecovery, skipPolicy,
+                changeBufferRecovery);
     }
 
     /**
@@ -214,7 +237,8 @@ public record RecoveryRequest(RecoveryMode mode,
         }
         return new RecoveryRequest(mode, checkpointStore, redoRepository, dispatcher, applyContext,
                 doublewriteScanner, pagesToRepair, participant, spacesToReconcile,
-                recoveredRedoManager, transactionRecoveryContext, transactionUndoRecovery, skipPolicy);
+                recoveredRedoManager, transactionRecoveryContext, transactionUndoRecovery, skipPolicy,
+                changeBufferRecovery);
     }
 
     /**
@@ -231,7 +255,8 @@ public record RecoveryRequest(RecoveryMode mode,
         }
         return new RecoveryRequest(mode, checkpointStore, redoRepository, dispatcher, applyContext,
                 doublewriteScanner, pagesToRepair, undoTablespaceRecovery, spaces,
-                recoveredRedoManager, transactionRecoveryContext, transactionUndoRecovery, skipPolicy);
+                recoveredRedoManager, transactionRecoveryContext, transactionUndoRecovery, skipPolicy,
+                changeBufferRecovery);
     }
 
     /**
@@ -248,7 +273,8 @@ public record RecoveryRequest(RecoveryMode mode,
         }
         return new RecoveryRequest(mode, checkpointStore, redoRepository, dispatcher, applyContext,
                 doublewriteScanner, pagesToRepair, undoTablespaceRecovery, spacesToReconcile,
-                redoManager, transactionRecoveryContext, transactionUndoRecovery, skipPolicy);
+                redoManager, transactionRecoveryContext, transactionUndoRecovery, skipPolicy,
+                changeBufferRecovery);
     }
 
     /**
@@ -268,7 +294,7 @@ public record RecoveryRequest(RecoveryMode mode,
         return new RecoveryRequest(mode, checkpointStore, redoRepository,
                 RedoApplyDispatcher.pageDispatcher(context.deltaSink()), applyContext,
                 doublewriteScanner, pagesToRepair, undoTablespaceRecovery, spacesToReconcile,
-                recoveredRedoManager, context, participant, skipPolicy);
+                recoveredRedoManager, context, participant, skipPolicy, changeBufferRecovery);
     }
 
     /**
@@ -288,6 +314,23 @@ public record RecoveryRequest(RecoveryMode mode,
         }
         return new RecoveryRequest(mode, checkpointStore, redoRepository, dispatcher, applyContext,
                 doublewriteScanner, pagesToRepair, undoTablespaceRecovery, spacesToReconcile,
-                recoveredRedoManager, context, transactionUndoRecovery, skipPolicy);
+                recoveredRedoManager, context, transactionUndoRecovery, skipPolicy,
+                changeBufferRecovery);
+    }
+
+    /**
+     * 接入 redo replay 后、undo rollback 前的 Change Buffer 只读校验阶段。
+     *
+     * @param participant 与当前 system.ibd/Buffer Pool/MTR 组合根一致的恢复参与者
+     * @return 保留其它恢复输入并携带参与者的新请求
+     */
+    public RecoveryRequest withChangeBufferRecovery(ChangeBufferRecoveryParticipant participant) {
+        if (participant == null) {
+            throw new DatabaseValidationException("change buffer recovery participant must not be null");
+        }
+        return new RecoveryRequest(mode, checkpointStore, redoRepository, dispatcher, applyContext,
+                doublewriteScanner, pagesToRepair, undoTablespaceRecovery, spacesToReconcile,
+                recoveredRedoManager, transactionRecoveryContext, transactionUndoRecovery, skipPolicy,
+                participant);
     }
 }

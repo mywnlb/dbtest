@@ -42,6 +42,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -61,6 +62,60 @@ class CrashRecoveryServiceTest {
 
     @TempDir
     Path dir;
+
+    /** redo replay 后必须先执行 Change Buffer 校验，成功后才允许 NORMAL 打开普通流量。 */
+    @Test
+    void changeBufferRecoveryRunsAfterRedoBeforeNormalTrafficOpens() {
+        try (PageStore store = new FileChannelPageStore();
+             RedoLogFileRepository redo = RedoLogFileRepository.open(dir.resolve("change-buffer-redo.log"));
+             RedoCheckpointStore checkpoint = RedoCheckpointStore.open(
+                     dir.resolve("change-buffer-control"))) {
+            RecoveryTrafficGate gate = new RecoveryTrafficGate();
+            AtomicInteger calls = new AtomicInteger();
+            RecoveryRequest request = RecoveryRequest.normal(checkpoint, redo,
+                            RedoApplyDispatcher.pageDispatcher(), new RedoApplyContext(store, PS))
+                    .withChangeBufferRecovery(() -> {
+                        assertEquals(RecoveryState.RECOVERING, gate.state());
+                        calls.incrementAndGet();
+                    });
+
+            RecoveryReport report = new CrashRecoveryService(gate).recover(request);
+
+            assertEquals(1, calls.get());
+            assertEquals(List.of(RecoveryStageName.TRAFFIC_CLOSED,
+                            RecoveryStageName.DOUBLEWRITE_REPAIR,
+                            RecoveryStageName.REDO_REPLAY,
+                            RecoveryStageName.CHANGE_BUFFER_RECOVER,
+                            RecoveryStageName.OPEN_TRAFFIC),
+                    report.completedStages());
+        }
+    }
+
+    /** READ_ONLY_VALIDATE 同样校验持久结构，但参与者返回后只能发布只读诊断状态。 */
+    @Test
+    void changeBufferRecoveryRunsReadOnlyWithoutOpeningWritableTraffic() {
+        try (PageStore store = new FileChannelPageStore();
+             RedoLogFileRepository redo = RedoLogFileRepository.open(dir.resolve("change-buffer-ro-redo.log"));
+             RedoCheckpointStore checkpoint = RedoCheckpointStore.open(
+                     dir.resolve("change-buffer-ro-control"))) {
+            RecoveryTrafficGate gate = new RecoveryTrafficGate();
+            AtomicInteger calls = new AtomicInteger();
+            RecoveryRequest request = RecoveryRequest.readOnlyValidate(checkpoint, redo,
+                            RedoApplyDispatcher.pageDispatcher(), new RedoApplyContext(store, PS))
+                    .withChangeBufferRecovery(calls::incrementAndGet);
+
+            RecoveryReport report = new CrashRecoveryService(gate).recover(request);
+
+            assertEquals(1, calls.get());
+            assertEquals(RecoveryState.READ_ONLY, gate.state());
+            assertEquals(List.of(RecoveryStageName.TRAFFIC_CLOSED,
+                            RecoveryStageName.DOUBLEWRITE_REPAIR,
+                            RecoveryStageName.REDO_REPLAY,
+                            RecoveryStageName.CHANGE_BUFFER_RECOVER,
+                            RecoveryStageName.READ_ONLY_DIAGNOSTIC_OPEN),
+                    report.completedStages());
+        }
+    }
 
     /** redo-control 声明的 data format 必须与实际 repository 一致，恢复不得跨格式猜测。 */
     @Test

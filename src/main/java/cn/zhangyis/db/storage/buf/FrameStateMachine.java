@@ -13,7 +13,7 @@ import java.util.Map;
  * <p><b>合法转换表</b>（self-transition 恒合法，便于幂等 markDirty/clean 复调）：
  * <ul>
  *   <li>FREE → LOADING（认领待读）/ CLEAN（直接装入，如 newPage 清零或干净帧复用）。</li>
- *   <li>LOADING → CLEAN（读盘成功发布）/ FREE（读盘失败回收占位）。</li>
+ *   <li>LOADING → CLEAN（无写读盘成功发布）/ DIRTY_PENDING（发布前 MTR 已写但 guard 尚未关闭）/ FREE（读盘失败回收占位）。</li>
  *   <li>CLEAN → DIRTY_PENDING（MTR 写入）/ DIRTY（直接发布）/ EVICTING（淘汰）/ STALE（生命周期失效）/ LOADING（复用）。</li>
  *   <li>DIRTY_PENDING → DIRTY（MTR 发布）/ CLEAN（未发布写入回滚）。</li>
  *   <li>DIRTY → FLUSHING（开始刷盘）/ CLEAN（legacy 直写回清脏）。</li>
@@ -31,7 +31,8 @@ final class FrameStateMachine {
 
     static {
         ALLOWED.put(BufferFrameState.FREE, EnumSet.of(BufferFrameState.LOADING, BufferFrameState.CLEAN));
-        ALLOWED.put(BufferFrameState.LOADING, EnumSet.of(BufferFrameState.CLEAN, BufferFrameState.FREE));
+        ALLOWED.put(BufferFrameState.LOADING,
+                EnumSet.of(BufferFrameState.CLEAN, BufferFrameState.DIRTY_PENDING, BufferFrameState.FREE));
         ALLOWED.put(BufferFrameState.CLEAN,
                 EnumSet.of(BufferFrameState.DIRTY_PENDING, BufferFrameState.DIRTY,
                         BufferFrameState.FREE, BufferFrameState.LOADING, BufferFrameState.EVICTING,

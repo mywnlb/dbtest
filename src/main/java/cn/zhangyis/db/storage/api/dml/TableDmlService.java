@@ -13,6 +13,7 @@ import cn.zhangyis.db.storage.btree.BTreeRootSnapshotService;
 import cn.zhangyis.db.storage.btree.SecondaryIndexMetadata;
 import cn.zhangyis.db.storage.btree.SplitCapableBTreeIndexService;
 import cn.zhangyis.db.storage.btree.TableIndexMetadata;
+import cn.zhangyis.db.storage.changebuffer.SecondaryIndexMutationCoordinator;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionManager;
 import cn.zhangyis.db.storage.mtr.MiniTransactionState;
@@ -64,6 +65,8 @@ public final class TableDmlService {
     private final TypeCodecRegistry registry;
     /** redo end LSN 诊断；聚簇内核结果仍是本条逻辑 DML 的公开 anchor。 */
     private final cn.zhangyis.db.storage.redo.RedoLogManager redo;
+    /** 可选 Change Buffer 决策点；legacy/低层测试为空时保持原来的真实 B+Tree 直写语义。 */
+    private final SecondaryIndexMutationCoordinator secondaryMutations;
     /** 仅包内测试可替换的 secondary MTR 稳定边界故障接缝；生产始终为 no-op。 */
     private TableDmlProgressFaultInjector faultInjector = TableDmlProgressFaultInjector.NO_OP;
 
@@ -88,6 +91,32 @@ public final class TableDmlService {
                            LockManager lockManager, BTreeRootSnapshotService rootSnapshots,
                            TypeCodecRegistry registry, PurgeDmlRowGuardManager rowGuards,
                            cn.zhangyis.db.storage.redo.RedoLogManager redo) {
+        this(clustered, transactionManager, mtrManager, btree, currentRead, lockManager,
+                rootSnapshots, registry, rowGuards, redo, null);
+    }
+
+    /**
+     * 创建接入 Change Buffer 的生产表级 DML 服务。原构造器继续服务不含 system.ibd 的 legacy 测试组合根。
+     *
+     * @param clustered 聚簇 DML 与逻辑 undo anchor
+     * @param transactionManager 事务 write id/终态目录
+     * @param mtrManager 二级短 MTR 工厂
+     * @param btree 二级 B+Tree 原语
+     * @param currentRead 聚簇 current-read 服务
+     * @param lockManager logical unique/record 锁目录
+     * @param rootSnapshots root level 快照协作者
+     * @param registry 索引 comparator/codec 注册表
+     * @param rowGuards DML/purge 物理行协调器
+     * @param redo 公开结果的 redo 边界来源
+     * @param secondaryMutations 可选统一 buffer-or-direct 决策点；为空保持 legacy 直写
+     */
+    public TableDmlService(ClusteredDmlService clustered, TransactionManager transactionManager,
+                           MiniTransactionManager mtrManager, SplitCapableBTreeIndexService btree,
+                           cn.zhangyis.db.storage.btree.BTreeCurrentReadService currentRead,
+                           LockManager lockManager, BTreeRootSnapshotService rootSnapshots,
+                           TypeCodecRegistry registry, PurgeDmlRowGuardManager rowGuards,
+                           cn.zhangyis.db.storage.redo.RedoLogManager redo,
+                           SecondaryIndexMutationCoordinator secondaryMutations) {
         if (clustered == null || transactionManager == null || mtrManager == null || btree == null
                 || currentRead == null || lockManager == null || rootSnapshots == null || registry == null
                 || rowGuards == null || redo == null) {
@@ -103,6 +132,7 @@ public final class TableDmlService {
         this.registry = registry;
         this.rowGuards = rowGuards;
         this.redo = redo;
+        this.secondaryMutations = secondaryMutations;
     }
 
     /**
@@ -131,6 +161,7 @@ public final class TableDmlService {
         // 1. write id 与主键都来自当前 ACTIVE 事务和完整表行；禁止用未经类型物化的用户字面量作为锁 identity。
         requireActive(command == null ? null : command.transaction());
         TableIndexMetadata metadata = command.metadata();
+        registerChangeBufferMetadata(metadata);
         Transaction txn = command.transaction();
         TransactionId txnId = transactionManager.assignWriteId(txn);
         SearchKey clusterKey = keyFromRow(command.record(), metadata.clusteredIndex());
@@ -143,7 +174,8 @@ public final class TableDmlService {
         List<SecondaryPlan> plans = new ArrayList<>();
         List<SecondaryUndoMutation> mutations = new ArrayList<>();
         for (SecondaryIndexMetadata secondary : metadata.secondaryIndexes()) {
-            SecondaryUniqueCheckResult checked = uniqueCheck.check(secondary, command.record(), request);
+            SecondaryUniqueCheckResult checked = uniqueCheck.checkFreshInsert(
+                    secondary, command.record(), request);
             if (checked.duplicate() || checked.publishState() != SecondaryPublishState.ABSENT) {
                 throw new DmlDuplicateKeyException("duplicate secondary key for index "
                         + secondary.index().indexId());
@@ -163,7 +195,7 @@ public final class TableDmlService {
 
             // 4. 每个 secondary 使用独立短 MTR；异常不会跨树遗留 page latch，active undo 保留已完成动作的反向证据。
             for (SecondaryPlan plan : plans) {
-                publishSecondary(plan, false);
+                publishSecondary(metadata.tableId(), metadata.schemaVersion(), plan, false);
             }
             return new DmlWriteResult(result.changed(), result.affectedRows(), redo.currentLsn(), txnId);
         }
@@ -242,6 +274,7 @@ public final class TableDmlService {
                                           Optional<cn.zhangyis.db.storage.api.SegmentRef> lobSegment,
                                           Duration lockWaitTimeout) {
         // 1. 聚簇 FOR_UPDATE 在 row guard 之前完成可能阻塞的事务锁等待，并物化旧行作为后续 exact-version 投影来源。
+        registerChangeBufferMetadata(metadata);
         TransactionId txnId = transactionManager.assignWriteId(txn);
         BTreeCurrentReadRequest request = request(txnId, txn, lockWaitTimeout);
         Optional<BTreeLookupResult> locked = currentRead.lockPoint(metadata.clusteredIndex(), clusterKey,
@@ -293,8 +326,9 @@ public final class TableDmlService {
 
             // 4. new-before-old 顺序保证回表不会因先删旧 entry 而出现瞬时断链；undo 前态使异常后 inverse 可判定。
             for (SecondaryPlan plan : changed) {
-                publishSecondary(plan, true);
-                markSecondary(plan.secondary(), plan.oldPhysicalKey(), true);
+                publishSecondary(metadata.tableId(), metadata.schemaVersion(), plan, true);
+                markSecondary(metadata.tableId(), metadata.schemaVersion(),
+                        plan.secondary(), plan.oldEntry(), true);
             }
             return new DmlWriteResult(result.changed(), result.affectedRows(), redo.currentLsn(), txnId);
         }
@@ -322,6 +356,7 @@ public final class TableDmlService {
         // 1. 聚簇 FOR_UPDATE 在 row guard 之前取得事务行锁；不存在分支不会生成二级计划或物理副作用。
         requireActive(command == null ? null : command.transaction());
         TableIndexMetadata metadata = command.metadata();
+        registerChangeBufferMetadata(metadata);
         Transaction txn = command.transaction();
         TransactionId txnId = transactionManager.assignWriteId(txn);
         BTreeCurrentReadRequest request = request(txnId, txn, command.lockWaitTimeout());
@@ -356,7 +391,8 @@ public final class TableDmlService {
 
             // 4. 二级仅翻转 delete 位，不做结构删除；purge horizon 未满足前必须保留旧版本导航入口。
             for (SecondaryPlan plan : plans) {
-                markSecondary(plan.secondary(), secondaryPhysicalKey(plan), true);
+                markSecondary(metadata.tableId(), metadata.schemaVersion(),
+                        plan.secondary(), plan.entry(), true);
             }
             return new DmlWriteResult(result.changed(), result.affectedRows(), redo.currentLsn(), txnId);
         }
@@ -429,7 +465,22 @@ public final class TableDmlService {
      * @throws DmlDuplicateKeyException INSERT 计划错误地要求 revive 时抛出。
      * @throws DatabaseRuntimeException root 刷新、redo admission、B+Tree 结构写或 MTR 提交失败时抛出。
      */
-    private void publishSecondary(SecondaryPlan plan, boolean allowRevive) {
+    private void publishSecondary(long tableId, long schemaVersion,
+                                  SecondaryPlan plan, boolean allowRevive) {
+        if (plan.state() == SecondaryPublishState.DELETE_MARKED && !allowRevive) {
+            throw new DmlDuplicateKeyException("INSERT cannot revive a marked secondary entry");
+        }
+        if (secondaryMutations != null) {
+            long indexId = plan.secondary().index().indexId();
+            faultInjector.onBoundary(TableDmlProgressPhase.BEFORE_MTR,
+                    TableDmlSecondaryOperation.INSERT_OR_REVIVE, indexId);
+            secondaryMutations.insertOrRevive(tableId, schemaVersion, plan.secondary(), plan.entry(),
+                    plan.state() == SecondaryPublishState.DELETE_MARKED,
+                    RedoBudgetPurpose.SECONDARY_INDEX);
+            faultInjector.onBoundary(TableDmlProgressPhase.AFTER_COMMIT,
+                    TableDmlSecondaryOperation.INSERT_OR_REVIVE, indexId);
+            return;
+        }
         // 1. 读 MTR 只物化 root level，提交释放 S latch 后才创建写 MTR。
         BTreeIndex index = refresh(plan.secondary().index());
         faultInjector.onBoundary(TableDmlProgressPhase.BEFORE_MTR,
@@ -479,7 +530,19 @@ public final class TableDmlService {
      * @param deleted  {@code true} 发布 delete mark；{@code false} revive 同一物理 entry。
      * @throws DatabaseRuntimeException root 刷新、redo admission、entry 定位、页改写或 MTR 提交失败时抛出。
      */
-    private void markSecondary(SecondaryIndexMetadata metadata, SearchKey key, boolean deleted) {
+    private void markSecondary(long tableId, long schemaVersion, SecondaryIndexMetadata metadata,
+                               LogicalRecord entry, boolean deleted) {
+        SearchKey key = metadata.layout().physicalKey(entry);
+        if (secondaryMutations != null) {
+            long indexId = metadata.index().indexId();
+            faultInjector.onBoundary(TableDmlProgressPhase.BEFORE_MTR,
+                    TableDmlSecondaryOperation.DELETE_MARK, indexId);
+            secondaryMutations.setDeleteMark(tableId, schemaVersion, metadata, entry, deleted,
+                    RedoBudgetPurpose.SECONDARY_INDEX);
+            faultInjector.onBoundary(TableDmlProgressPhase.AFTER_COMMIT,
+                    TableDmlSecondaryOperation.DELETE_MARK, indexId);
+            return;
+        }
         // 1. 刷新读与写 MTR 分离，避免持 root S latch 再申请写路径 latch。
         BTreeIndex index = refresh(metadata.index());
         faultInjector.onBoundary(TableDmlProgressPhase.BEFORE_MTR,
@@ -532,6 +595,13 @@ public final class TableDmlService {
                 mtrManager.rollbackUncommitted(read);
             }
             throw error;
+        }
+    }
+
+    /** 前台已持有 exact-version 聚合；在可能产生 buffered mutation 前注册不可变 merge metadata。 */
+    private void registerChangeBufferMetadata(TableIndexMetadata metadata) {
+        if (secondaryMutations != null) {
+            secondaryMutations.register(metadata);
         }
     }
 

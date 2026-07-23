@@ -1,5 +1,6 @@
 package cn.zhangyis.db.storage.buf;
 
+import cn.zhangyis.db.common.exception.DatabaseFatalException;
 import cn.zhangyis.db.domain.PageId;
 
 import java.util.concurrent.CompletableFuture;
@@ -9,7 +10,8 @@ import java.util.concurrent.TimeoutException;
 
 /**
  * 单页载入的"完成信号"（设计 §7.1/§7.3）。IO owner 在 pageHashLock+frameMutex 内为某帧建立本对象并注册 LOADING 占位，出锁读盘；
- * 成功发布 CLEAN 后 {@link #complete()}、失败回收占位后 {@link #failExceptionally(Throwable)}，唤醒所有等待者。
+ * 成功发布 CLEAN 后 {@link #complete()}、失败时 {@link #failExceptionally(Throwable)}，唤醒所有等待者。普通失败已先
+ * 回收占位并允许重试；claim/写入后的致命失败保留 LOADING 证据并向所有等待者传播同一 fail-stop 异常。
  *
  * <p><b>有界等待</b>（AGENTS 并发约束 / 评审点 4）：命中 LOADING 页的等待者用 {@link #await(long, PageId)} 等候，
  * 必有界：成功或失败均正常返回（失败由调用方回环重试），超时或中断则抛 {@link BufferPoolLoadTimeoutException}，
@@ -28,7 +30,7 @@ final class PageLoadFuture {
         done.complete(null);
     }
 
-    /** IO owner 读盘失败、已在 Buffer Pool 内部短锁下回收 LOADING 占位后调用，以异常唤醒全部等待者（等待者随后重试）。
+    /** IO owner 普通读盘失败或不可回收的发布致命失败后调用，以异常唤醒全部等待者。
      *
      * @param cause 需要分类或包装的原始失败；不得为 {@code null}，包装时必须保留 cause 与 suppressed 异常图
      */
@@ -37,18 +39,25 @@ final class PageLoadFuture {
     }
 
     /**
-     * 有界等待载入结束。成功或失败（载入异常）均正常返回——等待者据此回环重查 residentMap；
-     * 超时抛 {@link BufferPoolLoadTimeoutException}；被中断时恢复中断位后抛同类异常。绝不无限期阻塞。
+     * 有界等待载入结束。成功或已回收占位的普通失败正常返回，等待者据此回环重查 residentMap；不可回收的
+     * {@link DatabaseFatalException} 原样传播。超时抛 {@link BufferPoolLoadTimeoutException}；被中断时恢复中断位后
+     * 抛同类异常。绝不无限期阻塞。
      *
      * @param timeoutNanos 最长等待纳秒数（来自池的 load 超时配置）。
      * @param pageId       仅用于异常上下文。
+     * @throws DatabaseFatalException loader 在页面认领/写入或元数据发布后失败时抛出，调用方必须停止普通服务
      * @throws BufferPoolLoadTimeoutException 操作在约定时限内无法完成时抛出；调用方可回滚或稍后重试
      */
     void await(long timeoutNanos, PageId pageId) {
         try {
             done.get(timeoutNanos, TimeUnit.NANOSECONDS);
         } catch (ExecutionException loadFailed) {
-            // 载入失败：吞掉异常正常返回，等待者回环重查——届时占位已被 owner 回收，等待者重试为新 owner。
+            Throwable cause = loadFailed.getCause();
+            if (cause instanceof DatabaseFatalException fatal) {
+                // claim/写入或发布元数据之后的失败不能回收 LOADING frame；等待者必须共同 fail-stop，不能忙循环重试。
+                throw fatal;
+            }
+            // 普通读盘/拦截前失败已回收占位：正常返回并让等待者回环成为新的 IO owner。
         } catch (TimeoutException timedOut) {
             throw new BufferPoolLoadTimeoutException("timed out waiting page load: " + pageId, timedOut);
         } catch (InterruptedException interrupted) {

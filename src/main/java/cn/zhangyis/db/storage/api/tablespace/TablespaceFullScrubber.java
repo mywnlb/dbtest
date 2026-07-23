@@ -1,6 +1,8 @@
 package cn.zhangyis.db.storage.api.tablespace;
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
+import cn.zhangyis.db.domain.ExtentId;
+import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.api.ddl.SerializedDictionaryInfo;
@@ -8,7 +10,13 @@ import cn.zhangyis.db.storage.fil.state.TablespaceState;
 import cn.zhangyis.db.storage.fil.state.TablespaceType;
 import cn.zhangyis.db.storage.fil.state.TablespaceTypeFlags;
 import cn.zhangyis.db.storage.fsp.extent.ExtentDescriptorLayout;
+import cn.zhangyis.db.storage.fsp.extent.ExtentDescriptorLocation;
+import cn.zhangyis.db.storage.fsp.extent.ExtentManagementRegionLayout;
 import cn.zhangyis.db.storage.fsp.extent.ExtentState;
+import cn.zhangyis.db.storage.fsp.extent.XdesPageCodec;
+import cn.zhangyis.db.storage.fsp.extent.XdesPageHeader;
+import cn.zhangyis.db.storage.fsp.extent.XdesPageRole;
+import cn.zhangyis.db.storage.fsp.flst.FileAddress;
 import cn.zhangyis.db.storage.fsp.header.SpaceHeaderLayout;
 import cn.zhangyis.db.storage.fsp.header.SpaceHeaderPhysical;
 import cn.zhangyis.db.storage.fsp.header.SpaceHeaderRawCodec;
@@ -32,6 +40,8 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Objects;
 import java.util.zip.CRC32C;
 
@@ -119,14 +129,9 @@ public final class TablespaceFullScrubber {
                 physical = SpaceHeaderRawCodec.readPhysical(ByteBuffer.wrap(page0).order(ByteOrder.BIG_ENDIAN));
                 validatePageZero(request, physical, pageCount, page0);
 
-                long extentCapacity = ExtentDescriptorLayout.maxEntriesInPage0(request.expectedPageSize())
-                        * request.expectedPageSize().pagesPerExtent();
-                if (pageCount > extentCapacity) {
-                    throw new TablespaceScrubException(
-                            "tablespace exceeds page0 XDES coverage: pages=" + pageCount
-                                    + " capacity=" + extentCapacity);
-                }
-                validateXdes(page0, request.expectedPageSize(), pageCount, path);
+                DescriptorCatalog descriptors = loadDescriptorCatalog(channel, page, page0,
+                        request, physical, pageCount, deadline);
+                validateXdes(descriptors, pageCount, path);
 
                 sdi = null;
                 for (int pageNo = 0; pageNo < pageCount; pageNo++) {
@@ -140,7 +145,7 @@ public final class TablespaceFullScrubber {
                     }
                     byte[] bytes = page.array();
                     fileDigest.update(bytes);
-                    boolean allocated = isAllocated(page0, request.expectedPageSize(), pageNo);
+                    boolean allocated = descriptors.isAllocated(pageNo);
                     if (isAllZero(bytes)) {
                         /*
                          * page 1 在旧版教学格式中只是尚未初始化的 change-buffer bitmap 占位页：extent0 会把它标为
@@ -164,6 +169,20 @@ public final class TablespaceFullScrubber {
                             .getInt(PageEnvelopeLayout.PAGE_TYPE)) != PageType.IBUF_BITMAP) {
                         throw new TablespaceScrubException(
                                 "tablespace page1 is not IBUF_BITMAP: " + request.path());
+                    }
+                    if (isRepeatedBitmapPage(request.expectedPageSize(), pageNo)
+                            && PageType.fromCode(ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN)
+                            .getInt(PageEnvelopeLayout.PAGE_TYPE)) != PageType.IBUF_BITMAP) {
+                        throw new TablespaceScrubException(
+                                "tablespace repeated bitmap page has wrong type: " + request.path()
+                                        + " page=" + pageNo);
+                    }
+                    if (descriptors.isStandaloneDescriptorPage(pageNo)
+                            && PageType.fromCode(ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN)
+                            .getInt(PageEnvelopeLayout.PAGE_TYPE)) != PageType.XDES) {
+                        throw new TablespaceScrubException(
+                                "tablespace standalone XDES page has wrong type: " + request.path()
+                                        + " page=" + pageNo);
                     }
                     if (pageNo == 2
                             && PageType.fromCode(ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN)
@@ -203,32 +222,162 @@ public final class TablespaceFullScrubber {
     }
 
     /**
-     * 校验当前文件覆盖范围内的 XDES 状态、owner 和 FLST 节点地址，再允许 allocation bitmap
-     * 参与页面裁决。该检查只解释 page0 原始字节，不挂载 Buffer Pool，也不修复损坏账本。
+     * 建立当前 freeLimit 覆盖范围的只读 descriptor 页目录，供后续 XDES 状态、owner、FLST 与 bitmap
+     * 校验使用。该步骤按统一 layout 解释 page0 与独立 XDES 镜像，不挂载 Buffer Pool，也不修复损坏账本。
      *
      * <p>数据流：</p>
      * <ol>
-     *     <li>按文件页数计算必须存在的 extent entry 数，逐项拒绝未知持久 state ordinal。</li>
-     *     <li>校验 owner sentinel：无主状态必须为零，普通 FSEG/FSEG_FRAG 必须携带正 segment id；
-     *     extent0 的系统 FSEG_FRAG 是明确例外。</li>
-     *     <li>校验 prev/next 要么是全零 NULL，要么指向同状态/同 owner entry 并由其反向字段精确指回。</li>
-     *     <li>FREE extent 不得声明 allocated bit，FULL_FRAG 必须覆盖完整 extent，EOF 后不得有幽灵分配位。</li>
+     *     <li>验证 freeLimit 按 extent 对齐，并把它换算成至少包含 extent0 的已材料化范围。</li>
+     *     <li>以已验证 page0 作为目录根，逐 extent 使用运行期 layout 找到实际承载 descriptor 的页面。</li>
+     *     <li>补读每个已进入 freeLimit 管理区的固定 primary 与可选 overflow，即使 primary 因兼容槽仍有空 header。</li>
+     *     <li>返回不可变目录；页面语义校验随后只消费该目录，不再重新执行另一套寻址公式。</li>
      * </ol>
      *
+     * @param channel 当前 NOFOLLOW 只读 channel
+     * @param page 可复用的整页读 buffer
      * @param page0 已通过严格 checksum、信封和 Space Header identity 校验的页镜像
-     * @param pageSize 当前实例页大小，决定每个 extent 的页数
+     * @param request 候选 identity、页大小和路径
+     * @param physical page0 物理字段快照，freeLimit 决定已材料化 XDES 范围
      * @param pageCount 文件完整页数，决定必须校验的 XDES entry 范围
-     * @param path 当前候选规范路径，仅用于损坏诊断
-     * @throws TablespaceScrubException XDES 任一状态、owner、链地址或 bitmap 语义不一致时抛出
+     * @param deadline 全扫描共享 monotonic deadline
+     * @return 已验证 descriptor 页目录，供逐页 allocation 裁决和跨页 FLST 反查复用
+     * @throws TablespaceScrubException freeLimit 错位、必需管理页缺失或独立 XDES envelope/header 损坏时抛出
      */
-    private static void validateXdes(byte[] page0, PageSize pageSize, int pageCount, Path path) {
-        // 1. ordinal 是持久格式的一部分；未知值不能退化成仅信任 bitmap 的候选。
+    private static DescriptorCatalog loadDescriptorCatalog(
+            FileChannel channel,
+            ByteBuffer page,
+            byte[] page0,
+            TablespaceFullScrubRequest request,
+            SpaceHeaderPhysical physical,
+            int pageCount,
+            long deadline) throws IOException {
+        // 1. freeLimit 是 descriptor 是否已经发布的边界；物理 currentSize 的零填充尾部不能被误判为损坏 XDES。
+        PageSize pageSize = request.expectedPageSize();
         int pagesPerExtent = pageSize.pagesPerExtent();
-        int extentCount = Math.ceilDiv(pageCount, pagesPerExtent);
-        ExtentState[] states = ExtentState.values();
-        ByteBuffer image = ByteBuffer.wrap(page0).order(ByteOrder.BIG_ENDIAN);
+        long freeLimit = physical.freeLimitPageNo().value();
+        if (freeLimit % pagesPerExtent != 0L) {
+            throw new TablespaceScrubException(
+                    "tablespace freeLimit is not extent aligned: " + request.path() + " freeLimit=" + freeLimit);
+        }
+        int extentCount = Math.toIntExact(Math.max(1L, freeLimit / pagesPerExtent));
+        // 2. page0 已由调用方严格验证；逐 extent 定位会按需发现 group0 page5 和真正承载 entry 的独立页。
+        ExtentManagementRegionLayout layout = new ExtentManagementRegionLayout(pageSize);
+        Map<Long, byte[]> images = new HashMap<>();
+        images.put(0L, page0);
+
         for (int extentNo = 0; extentNo < extentCount; extentNo++) {
-            int base = ExtentDescriptorLayout.entryOffset(extentNo);
+            ExtentDescriptorLocation location = layout.locate(ExtentId.of(request.expectedSpaceId(), extentNo));
+            loadStandaloneDescriptorPage(channel, page, images, location.descriptorPageId().pageNo().value(),
+                    request, pageCount, deadline, layout);
+        }
+        // 3. 区首 fixed primary 即使 entryCount=0 也是已材料化格式证据，不能因没有 descriptor 引用而漏检。
+        long lastRegion = layout.regionIndexOfExtent(extentCount - 1L);
+        for (long region = 1L; region <= lastRegion; region++) {
+            loadStandaloneDescriptorPage(channel, page, images, layout.primaryXdesPageNo(region).value(),
+                    request, pageCount, deadline, layout);
+            if (layout.requiresOverflowPage(region)) {
+                loadStandaloneDescriptorPage(channel, page, images, layout.overflowXdesPageNo(region).value(),
+                        request, pageCount, deadline, layout);
+            }
+        }
+        // 4. 冻结镜像目录，后续跨页 reciprocal 校验与逐页 allocation 判断共享同一份扫描证据。
+        return new DescriptorCatalog(request.expectedSpaceId(), pageSize, layout, extentCount, images);
+    }
+
+    /**
+     * 读取并严格验证一张被已材料化管理区要求存在的独立 XDES 页；page0 由调用方单独提供。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>对 page0 和目录内已验证页幂等返回；其它页先证明落在当前文件完整页范围内。</li>
+     *     <li>在共享 deadline 下做定点整页读取，全零页视为已发布管理证据丢失并 fail-closed。</li>
+     *     <li>校验 checksum、FIL identity/type，再按统一 layout 交叉验证角色、group base 与 descriptor 范围。</li>
+     *     <li>仅在全部验证成功后发布不可变页镜像；失败不改变目录，也不修复候选文件。</li>
+     * </ol>
+     *
+     * @param channel 当前 NOFOLLOW 只读 channel
+     * @param page 可复用整页 buffer
+     * @param images 已验证 descriptor 页目录；本方法仅在成功后追加当前页
+     * @param pageNo 由管理区 layout 计算的独立 XDES 物理页号
+     * @param request 候选路径、SpaceId 与固定页大小
+     * @param pageCount 候选文件完整物理页数
+     * @param deadline 全 scrub 共享 monotonic deadline
+     * @param layout 与运行期 repository 相同的纯寻址规则
+     * @throws TablespaceScrubException 页面越界、全零、checksum、identity、type 或 XDES header 不匹配时抛出
+     */
+    private static void loadStandaloneDescriptorPage(
+            FileChannel channel,
+            ByteBuffer page,
+            Map<Long, byte[]> images,
+            long pageNo,
+            TablespaceFullScrubRequest request,
+            int pageCount,
+            long deadline,
+            ExtentManagementRegionLayout layout) throws IOException {
+        // 1. 幂等加载避免同一页被多个 extent 重复 IO；文件范围在乘法计算 position 前验证。
+        if (pageNo == 0L || images.containsKey(pageNo)) {
+            return;
+        }
+        if (pageNo < 0L || pageNo >= pageCount || pageNo > Integer.MAX_VALUE) {
+            throw new TablespaceScrubException(
+                    "materialized XDES page is outside tablespace file: " + request.path() + " page=" + pageNo);
+        }
+        // 2. 已材料化独立页不接受文件扩展留下的全零镜像。
+        readPage(channel, page, pageNo * request.expectedPageSize().bytes(),
+                request.expectedPageSize().bytes(), deadline, request.path(), (int) pageNo);
+        byte[] bytes = page.array().clone();
+        if (isAllZero(bytes)) {
+            throw new TablespaceScrubException(
+                    "materialized standalone XDES page is all-zero: " + request.path() + " page=" + pageNo);
+        }
+        // 3. 先验证通用物理信封，再消费 XDES 专用 body，防止把业务页字节误解释成 descriptor 范围。
+        validatePageEnvelope(bytes, request.expectedPageSize(), request.expectedSpaceId(),
+                (int) pageNo, PageType.XDES);
+        XdesPageHeader expected = expectedXdesHeader(layout, pageNo);
+        ByteBuffer image = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN);
+        if (image.getInt(XdesPageCodec.MAGIC_OFFSET) != XdesPageCodec.MAGIC
+                || image.getInt(XdesPageCodec.FORMAT_OFFSET) != XdesPageCodec.FORMAT_VERSION
+                || image.getInt(XdesPageCodec.ROLE_OFFSET) != expected.role().persistentCode()
+                || image.getLong(XdesPageCodec.GROUP_BASE_OFFSET) != expected.groupBasePageNo()
+                || image.getLong(XdesPageCodec.FIRST_EXTENT_OFFSET) != expected.firstExtentNo()
+                || image.getInt(XdesPageCodec.ENTRY_COUNT_OFFSET) != expected.entryCount()) {
+            throw new TablespaceScrubException(
+                    "standalone XDES header mismatch: " + request.path() + " page=" + pageNo);
+        }
+        // 4. 校验完成后才发布扫描镜像，异常路径保留调用方既有目录不变。
+        images.put(pageNo, bytes);
+    }
+
+    /** 按与运行期 layout 相同的公式构造 raw scrub 期望 header。 */
+    private static XdesPageHeader expectedXdesHeader(ExtentManagementRegionLayout layout, long pageNo) {
+        long pageBytes = layout.pageSize().bytes();
+        if (pageNo == 5L) {
+            return new XdesPageHeader(XdesPageRole.OVERFLOW, 0L,
+                    layout.entriesPerDescriptorPage(), Math.toIntExact(layout.overflowEntryCount(0L)));
+        }
+        if (pageNo > 0L && pageNo % pageBytes == 0L) {
+            long region = pageNo / pageBytes;
+            return new XdesPageHeader(XdesPageRole.PRIMARY, pageNo,
+                    layout.firstStandaloneExtent(region), Math.toIntExact(layout.primaryEntryCount(region)));
+        }
+        if (pageNo > 5L && (pageNo - 5L) % pageBytes == 0L) {
+            long region = (pageNo - 5L) / pageBytes;
+            return new XdesPageHeader(XdesPageRole.OVERFLOW, region * pageBytes,
+                    Math.addExact(layout.firstStandaloneExtent(region), layout.entriesPerDescriptorPage()),
+                    Math.toIntExact(layout.overflowEntryCount(region)));
+        }
+        throw new TablespaceScrubException("invalid standalone XDES formula page: " + pageNo);
+    }
+
+    private static void validateXdes(DescriptorCatalog catalog, int pageCount, Path path) {
+        // 1. ordinal 是持久格式的一部分；未知值不能退化成仅信任 bitmap 的候选。
+        int pagesPerExtent = catalog.pageSize.pagesPerExtent();
+        int extentCount = catalog.extentCount;
+        ExtentState[] states = ExtentState.values();
+        for (int extentNo = 0; extentNo < extentCount; extentNo++) {
+            ExtentDescriptorLocation location = catalog.location(extentNo);
+            ByteBuffer image = catalog.image(extentNo);
+            int base = location.entryOffset();
             int ordinal = image.getInt(base + ExtentDescriptorLayout.STATE);
             if (ordinal < 0 || ordinal >= states.length) {
                 throw new TablespaceScrubException(
@@ -236,35 +385,41 @@ public final class TablespaceFullScrubber {
                                 + " ordinal=" + ordinal);
             }
             ExtentState state = states[ordinal];
-            if (extentNo == 0 && state != ExtentState.FSEG_FRAG) {
+            boolean managementExtent = catalog.layout.isManagementExtent(extentNo);
+            if (managementExtent && state != ExtentState.FSEG_FRAG) {
                 throw new TablespaceScrubException(
-                        "invalid system XDES state: path=" + path + " state=" + state);
+                        "invalid management XDES state: path=" + path + " extent=" + extentNo
+                                + " state=" + state);
             }
 
-            // 2. owner=0 是无主哨兵；extent0 由系统保留路径以 FSEG_FRAG/owner0 初始化。
+            // 2. owner=0 是无主哨兵；每个重复管理 extent 都是 FSEG_FRAG/owner0 的系统域。
             long owner = image.getLong(base + ExtentDescriptorLayout.OWNER_SEGMENT);
-            boolean systemExtent = extentNo == 0;
             boolean segmentOwned = state == ExtentState.FSEG || state == ExtentState.FSEG_FRAG;
             if (owner < 0 || (!segmentOwned && owner != 0)
-                    || (segmentOwned && !systemExtent && owner == 0)) {
+                    || (segmentOwned && !managementExtent && owner == 0)
+                    || (managementExtent && owner != 0)) {
                 throw new TablespaceScrubException(
                         "invalid XDES owner semantics: path=" + path + " extent=" + extentNo
                                 + " state=" + state + " owner=" + owner);
             }
 
-            // 3. 当前 v1 的 extent FLST node 全部内嵌 page0，地址必须落到受检 entry 的 PREV 字段。
+            // 3. 地址可跨 page0/primary/overflow，但必须由同一 layout 反解并由邻居精确反指当前 node。
             int previousExtent = validateXdesAddress(
-                    image, base + ExtentDescriptorLayout.PREV, extentCount, path, extentNo, "prev");
+                    catalog, image, base + ExtentDescriptorLayout.PREV, path, extentNo, "prev");
             int nextExtent = validateXdesAddress(
-                    image, base + ExtentDescriptorLayout.NEXT, extentCount, path, extentNo, "next");
-            int currentNodeOffset = base + ExtentDescriptorLayout.PREV;
+                    catalog, image, base + ExtentDescriptorLayout.NEXT, path, extentNo, "next");
+            FileAddress currentNode = location.listNodeAddress();
+            if (managementExtent && (previousExtent >= 0 || nextExtent >= 0)) {
+                throw new TablespaceScrubException(
+                        "management extent must not belong to an FLST: path=" + path + " extent=" + extentNo);
+            }
             validateXdesReciprocalAddress(
-                    image, previousExtent, ExtentDescriptorLayout.NEXT,
-                    currentNodeOffset, state, owner, states,
+                    catalog, previousExtent, ExtentDescriptorLayout.NEXT,
+                    currentNode, state, owner, states,
                     path, extentNo, "previous.next");
             validateXdesReciprocalAddress(
-                    image, nextExtent, ExtentDescriptorLayout.PREV,
-                    currentNodeOffset, state, owner, states,
+                    catalog, nextExtent, ExtentDescriptorLayout.PREV,
+                    currentNode, state, owner, states,
                     path, extentNo, "next.prev");
 
             // 4. FREE 不允许任何已分配页；FULL_FRAG 必须完整，且文件 EOF 之后不得出现幽灵分配位。
@@ -276,7 +431,7 @@ public final class TablespaceFullScrubber {
             }
             for (int pageInExtent = 0; pageInExtent < pagesPerExtent; pageInExtent++) {
                 int bitmapOffset = base + ExtentDescriptorLayout.BITMAP + pageInExtent / 8;
-                boolean allocated = (page0[bitmapOffset] & (1 << (pageInExtent % 8))) != 0;
+                boolean allocated = (image.get(bitmapOffset) & (1 << (pageInExtent % 8))) != 0;
                 if (pageInExtent >= pagesInFile && allocated) {
                     throw new TablespaceScrubException(
                             "XDES bitmap allocates page beyond file size: path=" + path
@@ -297,21 +452,21 @@ public final class TablespaceFullScrubber {
     }
 
     /**
-     * 校验一个原始 XDES prev/next 地址满足当前 page0 内嵌 FLST node 布局。
+     * 校验一个原始 XDES prev/next 地址满足统一跨页 FLST node 布局。
      *
-     * @param image page0 大端视图
+     * @param catalog 已验证 descriptor 页目录
+     * @param image 当前 descriptor 页大端视图
      * @param offset FileAddress 的 12 字节起点
-     * @param extentCount 当前文件覆盖、允许被链指针引用的 entry 数
      * @param path 候选诊断路径
      * @param ownerExtent 持有该指针的 extent 号
      * @param field 指针字段名，仅用于诊断
      * @return NULL 地址返回 -1；非空地址返回被引用的 extent 号
-     * @throws TablespaceScrubException 非 NULL 地址越页、未对齐、自引用或引用文件范围外 entry 时抛出
+     * @throws TablespaceScrubException 非 NULL 地址不属于 page0/primary/overflow、未对齐、自引用或越过 materialized 范围时抛出
      */
     private static int validateXdesAddress(
+            DescriptorCatalog catalog,
             ByteBuffer image,
             int offset,
-            int extentCount,
             Path path,
             int ownerExtent,
             String field) {
@@ -320,11 +475,16 @@ public final class TablespaceFullScrubber {
         if (pageNo == 0 && nodeOffset == 0) {
             return -1;
         }
-        int firstNodeOffset = ExtentDescriptorLayout.entryOffset(0) + ExtentDescriptorLayout.PREV;
-        int relative = nodeOffset - firstNodeOffset;
-        int referencedExtent = relative < 0 ? -1 : relative / ExtentDescriptorLayout.ENTRY_SIZE;
-        if (pageNo != 0 || relative < 0 || relative % ExtentDescriptorLayout.ENTRY_SIZE != 0
-                || referencedExtent >= extentCount || referencedExtent == ownerExtent) {
+        int referencedExtent;
+        try {
+            referencedExtent = Math.toIntExact(catalog.layout.extentIdOfNode(catalog.spaceId,
+                    FileAddress.of(PageNo.of(pageNo), nodeOffset)).extentNo());
+        } catch (RuntimeException invalid) {
+            throw new TablespaceScrubException(
+                    "invalid XDES " + field + " address: path=" + path + " extent=" + ownerExtent
+                            + " page=" + pageNo + " offset=" + nodeOffset, invalid);
+        }
+        if (referencedExtent >= catalog.extentCount || referencedExtent == ownerExtent) {
             throw new TablespaceScrubException(
                     "invalid XDES " + field + " address: path=" + path + " extent=" + ownerExtent
                             + " page=" + pageNo + " offset=" + nodeOffset);
@@ -335,10 +495,10 @@ public final class TablespaceFullScrubber {
     /**
      * 校验 XDES 双向链节点的反向地址精确指回当前 entry，拒绝只有单边看似对齐的损坏指针。
      *
-     * @param image page0 大端视图
+     * @param catalog 已验证 descriptor 页目录
      * @param referencedExtent 前向字段引用的 extent；-1 表示 NULL，无需反向检查
      * @param reciprocalField 被引用 entry 中应当反指当前节点的 PREV 或 NEXT 字段偏移
-     * @param expectedNodeOffset 当前 entry 的 PREV 节点地址
+     * @param expectedNode 当前 entry 的跨页 PREV 节点地址
      * @param expectedState 当前 entry 的 XDES 状态；同一物理链中的邻居必须一致
      * @param expectedOwner 当前 entry 的 segment owner；同一 segment 链中的邻居必须一致
      * @param states 持久 ordinal 到领域状态的固定映射
@@ -348,10 +508,10 @@ public final class TablespaceFullScrubber {
      * @throws TablespaceScrubException 反向指针不是 page0 当前节点地址时抛出
      */
     private static void validateXdesReciprocalAddress(
-            ByteBuffer image,
+            DescriptorCatalog catalog,
             int referencedExtent,
             int reciprocalField,
-            int expectedNodeOffset,
+            FileAddress expectedNode,
             ExtentState expectedState,
             long expectedOwner,
             ExtentState[] states,
@@ -361,13 +521,16 @@ public final class TablespaceFullScrubber {
         if (referencedExtent < 0) {
             return;
         }
-        int reciprocal = ExtentDescriptorLayout.entryOffset(referencedExtent) + reciprocalField;
-        long reciprocalPage = image.getLong(reciprocal);
-        int reciprocalOffset = image.getInt(reciprocal + Long.BYTES);
-        int targetBase = ExtentDescriptorLayout.entryOffset(referencedExtent);
-        int targetOrdinal = image.getInt(targetBase + ExtentDescriptorLayout.STATE);
-        long targetOwner = image.getLong(targetBase + ExtentDescriptorLayout.OWNER_SEGMENT);
-        if (reciprocalPage != 0 || reciprocalOffset != expectedNodeOffset) {
+        ExtentDescriptorLocation targetLocation = catalog.location(referencedExtent);
+        ByteBuffer targetImage = catalog.image(referencedExtent);
+        int targetBase = targetLocation.entryOffset();
+        int reciprocal = targetBase + reciprocalField;
+        long reciprocalPage = targetImage.getLong(reciprocal);
+        int reciprocalOffset = targetImage.getInt(reciprocal + Long.BYTES);
+        int targetOrdinal = targetImage.getInt(targetBase + ExtentDescriptorLayout.STATE);
+        long targetOwner = targetImage.getLong(targetBase + ExtentDescriptorLayout.OWNER_SEGMENT);
+        if (reciprocalPage != expectedNode.pageNo().value()
+                || reciprocalOffset != expectedNode.offset()) {
             throw new TablespaceScrubException(
                     "invalid XDES reciprocal " + relation + " address: path=" + path
                             + " extent=" + ownerExtent + " referencedExtent=" + referencedExtent);
@@ -461,15 +624,72 @@ public final class TablespaceFullScrubber {
         return new SerializedDictionaryInfo(tableId, version, payload);
     }
 
-    /** 从 page0 内嵌 XDES bitmap 判断物理页是否已经分配。 */
-    private static boolean isAllocated(byte[] page0, PageSize pageSize, int pageNo) {
-        int pagesPerExtent = pageSize.pagesPerExtent();
-        long extentNo = pageNo / pagesPerExtent;
-        int pageInExtent = pageNo % pagesPerExtent;
-        int offset = ExtentDescriptorLayout.entryOffset(extentNo)
-                + ExtentDescriptorLayout.BITMAP + pageInExtent / 8;
-        int mask = 1 << (pageInExtent % 8);
-        return (page0[offset] & mask) != 0;
+    /** 判断页号是否是 {@code 1 + k*pageSize.bytes()} 的重复 IBUF_BITMAP 固定位置。 */
+    private static boolean isRepeatedBitmapPage(PageSize pageSize, int pageNo) {
+        return pageNo >= 1 && (pageNo - 1L) % pageSize.bytes() == 0L;
+    }
+
+    /**
+     * scrub 期间只读持有的 XDES 页目录。它只缓存少量管理页镜像，不缓存业务页；所有 extent/node 反查
+     * 都复用运行期 {@link ExtentManagementRegionLayout}，避免离线工具复制另一套地址公式。
+     */
+    private static final class DescriptorCatalog {
+
+        /** 候选表空间 identity，用于把持久 FileAddress 还原为 ExtentId。 */
+        private final SpaceId spaceId;
+        /** bitmap 位宽与 extent 换算使用的实例页大小。 */
+        private final PageSize pageSize;
+        /** page0/primary/overflow 唯一布局公式。 */
+        private final ExtentManagementRegionLayout layout;
+        /** freeLimit 已材料化的 extent 数；文件尾的零填充 extent 不要求 descriptor 页。 */
+        private final int extentCount;
+        /** pageNo 到已通过 checksum/envelope/header 校验的原始页镜像。 */
+        private final Map<Long, byte[]> images;
+
+        private DescriptorCatalog(SpaceId spaceId, PageSize pageSize,
+                                  ExtentManagementRegionLayout layout, int extentCount,
+                                  Map<Long, byte[]> images) {
+            this.spaceId = spaceId;
+            this.pageSize = pageSize;
+            this.layout = layout;
+            this.extentCount = extentCount;
+            this.images = Map.copyOf(images);
+        }
+
+        /** 返回 extent 的稳定物理槽位；范围在调用点由 materialized extentCount 保证。 */
+        private ExtentDescriptorLocation location(long extentNo) {
+            return layout.locate(ExtentId.of(spaceId, extentNo));
+        }
+
+        /** 返回 extent 所在 descriptor 页的大端只读包装；缺页表示 catalog 构建逻辑或持久格式损坏。 */
+        private ByteBuffer image(long extentNo) {
+            ExtentDescriptorLocation location = location(extentNo);
+            byte[] bytes = images.get(location.descriptorPageId().pageNo().value());
+            if (bytes == null) {
+                throw new TablespaceScrubException(
+                        "validated XDES image is missing for extent " + extentNo);
+            }
+            return ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN);
+        }
+
+        /** 依据已材料化 descriptor bitmap 裁决页；freeLimit 之外的物理零填充一律视为未分配。 */
+        private boolean isAllocated(int pageNo) {
+            int pagesPerExtent = pageSize.pagesPerExtent();
+            long extentNo = pageNo / (long) pagesPerExtent;
+            if (extentNo >= extentCount) {
+                return false;
+            }
+            ExtentDescriptorLocation location = location(extentNo);
+            ByteBuffer image = image(extentNo);
+            int pageInExtent = pageNo % pagesPerExtent;
+            int offset = location.entryOffset() + ExtentDescriptorLayout.BITMAP + pageInExtent / 8;
+            return (image.get(offset) & (1 << (pageInExtent % 8))) != 0;
+        }
+
+        /** page0 不是独立 XDES；其它已加载 key 包含空 primary 和真正承载 entries 的管理页。 */
+        private boolean isStandaloneDescriptorPage(int pageNo) {
+            return pageNo != 0 && images.containsKey((long) pageNo);
+        }
     }
 
     /** 判断整页是否仍为文件扩展留下的零填充未分配页。 */

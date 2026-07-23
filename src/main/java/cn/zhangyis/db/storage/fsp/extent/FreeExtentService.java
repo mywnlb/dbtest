@@ -1,10 +1,4 @@
 package cn.zhangyis.db.storage.fsp.extent;
-import cn.zhangyis.db.storage.fsp.exception.FspMetadataException;
-import cn.zhangyis.db.storage.fsp.flst.FileAddress;
-import cn.zhangyis.db.storage.fsp.flst.Flst;
-import cn.zhangyis.db.storage.fsp.header.SpaceHeaderRepository;
-import cn.zhangyis.db.storage.fsp.header.SpaceHeaderSnapshot;
-
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.ExtentId;
@@ -14,6 +8,11 @@ import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
+import cn.zhangyis.db.storage.fsp.exception.FspMetadataException;
+import cn.zhangyis.db.storage.fsp.flst.FileAddress;
+import cn.zhangyis.db.storage.fsp.flst.Flst;
+import cn.zhangyis.db.storage.fsp.header.SpaceHeaderRepository;
+import cn.zhangyis.db.storage.fsp.header.SpaceHeaderSnapshot;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 
 import java.util.Optional;
@@ -22,10 +21,11 @@ import java.util.OptionalInt;
 /**
  * 表空间全局空间生命周期（设计 §7、§8）：freeLimit 填充把原始文件页材料化为 FREE extent 入 FSP_FREE，
  * acquire/return FREE extent，从 FSP_FREE_FRAG 分配 fragment 页并维护 FREE↔FREE_FRAG↔FULL_FRAG 迁移。
- * 仅碰 page0；每个写 op 开头预闩 page0 X，使后续读取（getFirst/firstFreePageIndex）降级、避免同页 S→X。
+ * 每个写 op 开头预闩 page0 X；超过 page0 XDES 容量后，由重复管理区 initializer 按 primary、bitmap、overflow
+ * 顺序格式化固定页，再允许普通 extent 进入自由链。
  *
- * <p>简化点：只材料化整 extent（不处理 currentSize 非对齐尾页）；跳过系统 extent0；本片 no-redo，写页只标脏、
- * 不产 redo、不声明 crash-safe（设计 §15 推迟满足）。无空间以 {@link Optional#empty()} 表达，由 2c 决定 autoextend。
+ * <p>简化点：只材料化整 extent（不处理 currentSize 非对齐尾页）；跳过所有管理 extent。FSP 字段通过
+ * metadata delta、固定页通过 PAGE_INIT/物理 header redo 恢复。无空间以 {@link Optional#empty()} 表达，由 facade 决定 autoextend。
  */
 public final class FreeExtentService {
 
@@ -43,6 +43,9 @@ public final class FreeExtentService {
 
     /** FLST 链表原语。 */
     private final Flst flst;
+
+    /** freeLimit 跨区前格式化 XDES/IBUF_BITMAP 并保留管理 extent。 */
+    private final ExtentManagementRegionInitializer managementRegions;
 
     /**
      * 创建 {@code FreeExtentService}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
@@ -64,6 +67,7 @@ public final class FreeExtentService {
         this.headerRepo = headerRepo;
         this.xdes = xdes;
         this.flst = flst;
+        this.managementRegions = new ExtentManagementRegionInitializer(pool, pageSize, xdes);
     }
 
     private void latchPage0(MiniTransaction mtr, SpaceId spaceId) {
@@ -72,7 +76,8 @@ public final class FreeExtentService {
 
     /**
      * 材料化下一个非系统、整体在 currentSize 之内的 extent 到 FSP_FREE，并推进 freeLimit；越界返回 empty。
-     * 数据流：读 header(freeLimit/currentSize/pageSize) → 跳过 extent0 → initFree + addLast(FSP_FREE) → 推进 freeLimit。
+     * 数据流：读 header(freeLimit/currentSize/pageSize) → 格式化/跳过管理 extent → initFree + addLast(FSP_FREE)
+     * → 推进 freeLimit。管理 extent 可连续跳过，因此一次调用仍返回首个真正可分配 extent。
      *
      * <p>数据流：</p>
      * <ol>
@@ -93,20 +98,25 @@ public final class FreeExtentService {
         // 2、继续完成范围、身份与候选校验；通过后，按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，保持处理顺序与资源边界。
         long pe = pageSize.pagesPerExtent();
         SpaceHeaderSnapshot h = headerRepo.read(mtr, spaceId);
-        // 3、在中间分支复核阶段性结果；满足条件后，执行空间元数据或物理文件变化，并维持领域不变量。
+        // 3、逐 extent 检查完整物理边界；管理区先完成固定页格式化与 XDES 保留，不能短暂进入 FSP_FREE。
         long currentSize = h.currentSizeInPages().value();
         long freeLimit = h.freeLimitPageNo().value();
-        // 4、发布稳定结果并逆序释放 lease、latch 与 fix，以稳定返回或领域异常完成收口。
+        if (freeLimit % pe != 0L) {
+            throw new FspMetadataException("freeLimit is not extent aligned: " + freeLimit);
+        }
         while (true) {
             long extentNo = freeLimit / pe;
-            if ((extentNo + 1) * pe > currentSize) {
+            long nextFreeLimit = checkedAdd(freeLimit, pe, "next freeLimit");
+            if (nextFreeLimit > currentSize) {
                 return Optional.empty();
             }
-            freeLimit += pe;
+            boolean managementExtent = managementRegions.prepareForMaterialization(mtr, spaceId, extentNo);
+            freeLimit = nextFreeLimit;
             headerRepo.setFreeLimitPageNo(mtr, spaceId, PageNo.of(freeLimit));
-            if (extentNo == 0) {
-                continue; // 系统 extent0 不入 free-list
+            if (managementExtent) {
+                continue;
             }
+            // 4、普通 extent 只有在 descriptor 页已具备合法 header 后才能初始化并发布到全局 FREE 链。
             ExtentId ext = ExtentId.of(spaceId, extentNo);
             xdes.initFree(mtr, ext);
             flst.addLast(mtr, spaceId, headerRepo.freeExtentListBaseAddr(spaceId), xdes.listNodeAddr(ext));
@@ -126,8 +136,8 @@ public final class FreeExtentService {
 
     /**
      * 按方向 hint 取一个 FREE extent。NO_DIRECTION 完全复用旧链头语义；UP/DOWN 先在已材料化的 FSP_FREE 链中寻找
-     * hint 所属 extent 附近的最近候选。UP 如果右侧尚未材料化，会按 freeLimit 继续填充直到找到不小于 hint 的 extent
-     * 或物理空间耗尽；DOWN 不会通过向右填充制造更小候选，找不到即回退链头。
+     * hint 所属 extent 附近的最近候选。UP 如果右侧尚未材料化，每次分配至多推进一个普通 extent（期间允许跳过
+     * 一个或多个管理 extent），以固定单次 MTR 的管理页/FLST redo 上界；仍未命中则回退链头。
      *
      * <p>数据流：</p>
      * <ol>
@@ -194,14 +204,13 @@ public final class FreeExtentService {
         if (candidate.isPresent()) {
             return removeFreeExtent(mtr, spaceId, freeBase, candidate.get());
         }
-        while (direction == ExtentAllocationDirection.UP) {
+        if (direction == ExtentAllocationDirection.UP) {
             Optional<ExtentId> filled = fillFreeListStep(mtr, spaceId);
-            if (filled.isEmpty()) {
-                break;
-            }
-            candidate = nearestCandidate(mtr, spaceId, freeBase, direction, hintExtentNo);
-            if (candidate.isPresent()) {
-                return removeFreeExtent(mtr, spaceId, freeBase, candidate.get());
+            if (filled.isPresent()) {
+                candidate = nearestCandidate(mtr, spaceId, freeBase, direction, hintExtentNo);
+                if (candidate.isPresent()) {
+                    return removeFreeExtent(mtr, spaceId, freeBase, candidate.get());
+                }
             }
         }
         // 4、唤醒后再次验证结果并释放内部短锁，以稳定返回或领域异常完成收口。
@@ -348,6 +357,15 @@ public final class FreeExtentService {
         }
         if (spaceId == null) {
             throw new DatabaseValidationException("space id must not be null");
+        }
+    }
+
+    /** 把页号边界加法的 JVM 溢出转换为可诊断的数据库校验异常。 */
+    private static long checkedAdd(long left, long right, String field) {
+        try {
+            return Math.addExact(left, right);
+        } catch (ArithmeticException error) {
+            throw new DatabaseValidationException(field + " overflows", error);
         }
     }
 }

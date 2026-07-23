@@ -94,8 +94,9 @@ tableId/spaceId、规范路径和 page0 identity 必须一致。
 每个文件使用单个复用 page buffer 顺序扫描：
 
 1. 校验 page-size 对齐、page0 FSP_HDR envelope、space flags、space version 和 GENERAL lifecycle。
-2. 在消费 allocation bitmap 前，逐 extent 校验 XDES state ordinal、owner sentinel、page0 内嵌
-   FLST prev/next 节点地址，以及 FREE/FULL_FRAG 与 bitmap 的一致性。
+2. 在消费 allocation bitmap 前，按 `ExtentManagementRegionLayout` 读取 freeLimit 已材料化范围的
+   page0/primary/overflow XDES，校验独立页 header、state ordinal、owner sentinel、跨页 FLST
+   prev/next 反向地址，以及 FREE/FULL_FRAG 与 bitmap 的一致性；freeLimit 外物理零填充不伪造 descriptor。
 3. 对每个已初始化页验证 header/trailer checksum、trailer low32 LSN、spaceId、pageNo 和 page type。
 4. 完全零页只有在 FSP/XDES 证明未分配时才接受；唯一兼容例外是旧版教学文件中 extent0 已保留但
    尚未初始化的 page1 change-buffer bitmap 占位页。当前创建路径写入 page1 IBUF_BITMAP 与 page2 INODE

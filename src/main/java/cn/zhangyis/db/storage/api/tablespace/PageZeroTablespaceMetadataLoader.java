@@ -47,6 +47,8 @@ import java.util.Optional;
  * <p>checksum/trailer 语义：新写盘页必须通过 {@link PageImageChecksum} 校验；为兼容早期切片写出的 page0，
  * header checksum 与 trailer checksum 同为 0 的页在通过 FSP_HDR 信封校验后按 legacy unstamped 接受。这个兼容点只保护
  * 历史文件打开，不表示 checksum=0 的任意损坏页可被检测出来；后续文件经 FlushCoordinator 刷出后会进入严格校验路径。
+ * 普通 {@link #load(SpaceId)} 还会按 freeLimit 校验已材料化 XDES/bitmap 管理目录；恢复
+ * {@link #loadForRecovery(SpaceId)} 刻意只建立 page0 根，让 PAGE_INIT redo 有机会修复派生页。
  */
 public final class PageZeroTablespaceMetadataLoader implements TablespaceMetadataLoader {
 
@@ -62,6 +64,9 @@ public final class PageZeroTablespaceMetadataLoader implements TablespaceMetadat
 
     /** 与 MTR/flush/truncate 共享；raw loader 读取 page0 的整个窗口持共享 lease。 */
     private final TablespaceAccessController accessController;
+
+    /** 普通打开阶段只读核对 freeLimit 已发布的独立 XDES、重复 bitmap 与管理 extent 归属。 */
+    private final MaterializedXdesAdmissionValidator xdesAdmissionValidator;
 
     /**
      * 创建 page-0 metadata loader。
@@ -88,6 +93,7 @@ public final class PageZeroTablespaceMetadataLoader implements TablespaceMetadat
         this.pageStore = pageStore;
         this.pageSize = pageSize;
         this.accessController = accessController;
+        this.xdesAdmissionValidator = new MaterializedXdesAdmissionValidator(pageStore, pageSize);
     }
 
     /**
@@ -100,11 +106,36 @@ public final class PageZeroTablespaceMetadataLoader implements TablespaceMetadat
      */
     @Override
     public Optional<TablespaceMetadata> load(SpaceId spaceId) {
+        return load(spaceId, true);
+    }
+
+    /**
+     * 恢复打开只校验 page0 这个 redo 根，不要求可能由 PAGE_INIT redo 重建的独立 XDES/bitmap 已经稳定。
+     * 返回 metadata 会被 registry 标记为 recovery-only；普通流量首次 require 时仍须重新执行 {@link #load(SpaceId)}。
+     *
+     * @param spaceId 恢复配置声明且应与 page0 一致的表空间标识
+     * @return page0 最小恢复身份可信时返回 metadata；物理句柄未打开时返回空
+     * @throws DatabaseValidationException 输入或 page0 自描述字段非法时抛出
+     * @throws TablespaceCorruptedException page0 信封、checksum 或 identity 无法作为恢复根时抛出
+     */
+    @Override
+    public Optional<TablespaceMetadata> loadForRecovery(SpaceId spaceId) {
+        return load(spaceId, false);
+    }
+
+    /**
+     * 在共享 tablespace lease 中选择普通或恢复加载强度，确保 raw page0/管理页读取不会跨越物理 truncate。
+     *
+     * @param spaceId 待读取的稳定表空间标识；不得为空
+     * @param ordinaryAdmission {@code true} 时校验全部已材料化管理区；{@code false} 时仅建立恢复所需 page0 根
+     * @return 已打开且通过相应强度校验时返回 metadata，否则返回空
+     */
+    private Optional<TablespaceMetadata> load(SpaceId spaceId, boolean ordinaryAdmission) {
         if (spaceId == null) {
             throw new DatabaseValidationException("space id must not be null");
         }
         try (TablespaceAccessLease ignored = accessController.acquireShared(spaceId)) {
-            return loadUnderLease(spaceId);
+            return loadUnderLease(spaceId, ordinaryAdmission);
         }
     }
 
@@ -119,10 +150,12 @@ public final class PageZeroTablespaceMetadataLoader implements TablespaceMetadat
      * </ol>
      *
      * @param spaceId 目标表空间的稳定标识；不得为 {@code null}，且必须已注册并满足当前生命周期准入条件
+     * @param ordinaryAdmission {@code true} 时在发布前验证 freeLimit 覆盖的 XDES 管理目录；恢复加载传
+     *                            {@code false}，把派生页修复留给 redo，但结果不得直接服务普通流量
      * @return {@code loadUnderLease} 按身份或键定位到的对象；未找到、不可见或尚未持久化时为空 {@code Optional}，从不返回 Java {@code null}
      * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
-    private Optional<TablespaceMetadata> loadUnderLease(SpaceId spaceId) {
+    private Optional<TablespaceMetadata> loadUnderLease(SpaceId spaceId, boolean ordinaryAdmission) {
         // 1、校验表空间生命周期、页号、区段身份与容量边界，在共享或持久副作用前拒绝非法状态。
         Path path;
         try {
@@ -137,8 +170,15 @@ public final class PageZeroTablespaceMetadataLoader implements TablespaceMetadat
         validateChecksumOrLegacyUnstamped(spaceId, page);
         SpaceHeaderPhysical physical = SpaceHeaderRawCodec.readPhysical(page);
         if (!physical.spaceId().equals(spaceId)) {
-            throw new DatabaseValidationException("page0 space id mismatch: expected " + spaceId.value()
+            throw new TablespaceCorruptedException("page0 space id mismatch: expected " + spaceId.value()
                     + " got " + physical.spaceId().value());
+        }
+        if (!physical.pageSize().equals(pageSize)) {
+            throw new TablespaceCorruptedException("page0 page size mismatch for space " + spaceId.value()
+                    + ": configured=" + pageSize.bytes() + " declared=" + physical.pageSize().bytes());
+        }
+        if (ordinaryAdmission) {
+            xdesAdmissionValidator.validate(spaceId, page, physical);
         }
         TablespaceType type = TablespaceTypeFlags.decode(physical.spaceFlags());
         // 3、在中间分支复核阶段性结果；满足条件后，执行空间元数据或物理文件变化，并维持领域不变量。

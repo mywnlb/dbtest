@@ -201,7 +201,27 @@ file-per-table，属性探测与 channel 打开都使用 NOFOLLOW；在消费 bi
 同状态/同 owner 双向 list 地址和 EOF 分配边界。不挂载 registry、不修改页面，也不扩张为
 系统/undo/全 data-dir 自动校验。
 
-超过首 256MB 后，每隔固定范围会出现新的 extent descriptor 管理区域。本设计由 `ExtentDescriptorRepository` 屏蔽“XDES entries 在 page 0 内嵌还是在独立管理页中”的差异。
+超过 page0 兼容容量后，每隔固定范围会出现新的 extent descriptor 管理区域。本设计由
+`ExtentManagementRegionLayout` 统一寻址、`ExtentDescriptorRepository` 屏蔽“XDES entry 在 page0
+内嵌还是在独立管理页中”的差异。MiniMySQL 不把“首 256MB”写死，因为不同 page size 下 68-byte
+教学 entry 的 page0 容量不同。
+
+当前持久布局固定为：`C=floor((pageSize-256)/68)`，`G=pageSize.bytes/pagesPerExtent`。`extentNo<C`
+永久保留旧 page0 地址；region0 超出的 entry 放 page5。region `r>0` 的 primary XDES 位于
+`r*pageSize.bytes`，重复 `IBUF_BITMAP` 位于 `+1`，容量不足时 overflow XDES 位于 `+5`。region 首
+extent 由 FSP 以 `FSEG_FRAG/owner0` 保留且不进入普通 FLST。4KB/8KB 下部分早期 region 的 primary
+可以声明 0 个 entry，这是为兼容旧 page0 槽而保留的固定管理页，不允许业务分配器复用。
+
+每条 descriptor 仍占 68 字节以保持 page0 地址稳定，但 bitmap 只读取/写入
+`ceil(pagesPerExtent/8)` 个有效字节；其余是 padding。该约束尤其避免 64KB 页最后一个兼容槽越过
+FIL trailer。未来固定位置若已存在 legacy owner、链指针或非零业务页，在线路径 fail-closed 并要求
+离线重建，不猜测搬迁。
+
+普通打开不能只验证 page0：它还必须按 page0 的 `freeLimit` 枚举已经发布的管理区，严格核对必需的
+primary/overflow XDES、重复 `IBUF_BITMAP`、区首 `FSEG_FRAG/owner0` descriptor、固定页 bitmap，并确认
+page0 三个全局 extent-list base 的 first/last 没有指向管理 extent。恢复打开只建立 page0 最小可信根，
+允许 `PAGE_INIT` redo 补齐尚未写回的管理页；这种句柄只能标记为 recovery-only，首次普通访问必须重新完成
+上述完整校验，不能由 registry cache hit 绕过。
 
 物理定位公式：
 
@@ -777,6 +797,9 @@ InnoDB 风格删除分两阶段：
 
 - 必须按层级加锁，释放由 MTR memo LIFO 负责。
 - 同层多个 page 按 `PageId` 排序加锁，避免死锁。
+- FSP/FLST 先取得所属表空间 page0 gate：reader 用 S、writer 用 X；随后才访问独立 XDES 页。持 gate
+  遍历持久链时若 next/prev 指向已持最高页号以下的 XDES 页，可使用带书面证明的窄 MTR 越序 scope；
+  scope 不释放 gate，不能用于掩盖调用方“先持数据页再反向进入 FSP”的锁序错误。
 - 读路径使用 S latch；元数据修改使用 X latch；只更新 space-level 状态时可用 SX latch。
 - 长事务锁不进入 MTR memo；MTR 只管理物理短临界区。
 - page allocation 允许在持有 page latch 时触发表空间扩展，但扩展路径不能反向等待业务 page latch。

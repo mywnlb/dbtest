@@ -7,6 +7,7 @@ import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.buf.BufferPool;
 import cn.zhangyis.db.storage.buf.PageGuard;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
+import cn.zhangyis.db.storage.buf.PendingPagePublication;
 import cn.zhangyis.db.storage.fil.access.TablespaceAccessController;
 import cn.zhangyis.db.storage.page.PageEnvelope;
 import cn.zhangyis.db.storage.page.PageType;
@@ -132,6 +133,60 @@ public final class MiniTransaction {
             throw new DatabaseValidationException("newPage pageType must not be null");
         }
         return fix(pool, pageId, mode, false, pageType);
+    }
+
+    /**
+     * 为已经由 tablespace 扩容覆盖、但仍是全零的固定管理页登记 PAGE_INIT。FSP 重复 XDES/IBUF_BITMAP
+     * 不能调用 {@link #newPage}，因为幂等重试命中 resident frame 时会清零已完成的管理页；它们在持 X latch
+     * 证明全零后使用本入口，使 crash recovery 仍可在文件尾丢失时按需扩容并先建页骨架。
+     *
+     * @param pageId 当前 MTR 已持有 X guard 的全零固定管理页
+     * @param pageType 恢复初始化时写入的稳定页类型
+     * @throws MtrStateException 当前 MTR 未以 X 模式持有目标页时抛出，调用方不得伪造无物理写的 PAGE_INIT
+     */
+    public void recordBlankPageInitialization(PageId pageId, PageType pageType) {
+        ensureActive();
+        if (pageId == null || pageType == null) {
+            throw new DatabaseValidationException("blank page initialization identity/type must not be null");
+        }
+        if (!memo.holds(pageId, PageLatchMode.EXCLUSIVE)) {
+            throw new MtrStateException("blank page initialization requires an X guard: " + pageId);
+        }
+        collector.recordInit(pageId, pageType);
+    }
+
+    /**
+     * 把 Buffer Pool 尚未发布的 LOADING 页认领为本 MTR 的 X-latched 写页。该 guard 不增加 loader fixCount，
+     * 但与普通 X guard 一样接入 redo collector、touched-page pageLSN 盖戳和 memo 逆序释放。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 MTR 与 publication，并取得目标 tablespace 共享 operation lease。</li>
+     *     <li>执行默认 PageId 锁序检查；确有局部无环证明的 merge 可由调用方显式开启越序 scope。</li>
+     *     <li>以有界等待认领 publication 的唯一 X guard，挂载当前 redo collector 并登记 memo。</li>
+     *     <li>返回受控 guard；commit 盖 pageLSN 后关闭，rollback/失败不得把部分写页面发布为 clean。</li>
+     * </ol>
+     *
+     * @param publication Buffer Pool 当前 IO owner 提供的单次发布前能力；不得为 {@code null}
+     * @return 由本 MTR memo 持有的 X guard，调用方不得自行关闭
+     * @throws DatabaseValidationException 参数为空或 publication 已被认领时抛出
+     */
+    public PageGuard adoptPendingPage(PendingPagePublication publication) {
+        // 1、lease 必须先于 page latch，并在 memo 中晚释放。
+        ensureActive();
+        if (publication == null) {
+            throw new DatabaseValidationException("pending page publication must not be null");
+        }
+        PageId pageId = publication.pageId();
+        acquireTablespaceLease(pageId.spaceId());
+        // 2、与普通 getPage 共享锁序守卫；Change Buffer interceptor 必须显式记录越序证明。
+        enforcePageLatchOrder(pageId);
+        // 3、认领不增加 fix 的 X guard并接入同一 redo/pageLSN 生命周期。
+        PageGuard guard = publication.claimExclusive();
+        guard.attachWriteListener(collector);
+        memo.pushPageGuard(guard, pageId, PageLatchMode.EXCLUSIVE);
+        // 4、guard 生命周期归 memo，返回只供当前短物理操作读写。
+        return guard;
     }
 
     /**

@@ -17,6 +17,10 @@ public enum RedoBudgetPurpose {
     CLUSTERED_DELETE,
     /** 二级索引单树 publish/revive/delete-mark/purge 物理 MTR。 */
     SECONDARY_INDEX,
+    /** Change Buffer 全局树 append、header 与用户 bitmap 的原子发布。 */
+    CHANGE_BUFFER_APPEND,
+    /** 发布前或后台把一批 mutation 应用到目标 leaf 并从全局树消费。 */
+    CHANGE_BUFFER_MERGE,
     /** purge 对聚簇索引执行物理删除。 */
     PURGE_INDEX,
     /** purge 原子消费一条 undo record 的旧 LOB ownership 并推进持久 logical head。 */

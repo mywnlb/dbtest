@@ -6,6 +6,9 @@ import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.fil.io.FileChannelPageStore;
 import cn.zhangyis.db.storage.fil.io.PageStore;
+import cn.zhangyis.db.storage.fsp.extent.ExtentDescriptorLayout;
+import cn.zhangyis.db.storage.fsp.extent.ExtentState;
+import cn.zhangyis.db.storage.fsp.extent.XdesPageCodec;
 import cn.zhangyis.db.storage.page.PageEnvelopeLayout;
 import cn.zhangyis.db.storage.page.PageType;
 import org.junit.jupiter.api.Test;
@@ -78,6 +81,42 @@ class PageRedoApplyExtendOnDemandTest {
             RedoApplyContext ctx = new RedoApplyContext(store, PS);
             assertThrows(RedoLogCorruptedException.class,
                     () -> RedoApplyDispatcher.pageDispatcher().applyAll(batches, ctx));
+        }
+    }
+
+    /**
+     * 重复管理页的 PAGE_INIT 必须与后续 XDES header/metadata delta 在同批恢复：文件尾丢失时先扩容，
+     * 然后只做物理 after-image patch，不能重跑 freeLimit allocator。
+     */
+    @Test
+    void standaloneXdesInitAndMetadataDeltaRecoverBeyondEof() {
+        Path redoPath = dir.resolve("xdes-redo.log");
+        PageId page5 = PageId.of(SPACE, PageNo.of(5));
+        byte[] magic = ByteBuffer.allocate(Integer.BYTES).putInt(XdesPageCodec.MAGIC).array();
+        byte[] state = ByteBuffer.allocate(Integer.BYTES).putInt(ExtentState.FREE_FRAG.ordinal()).array();
+        try (RedoLogFileRepository repo = RedoLogFileRepository.open(redoPath)) {
+            RedoLogManager redo = RedoLogManager.durable(repo);
+            redo.append(List.of(
+                    new PageInitRecord(page5, PageType.XDES),
+                    new PageBytesRecord(page5, XdesPageCodec.MAGIC_OFFSET, magic),
+                    new FspMetadataDeltaRecord(page5, FspMetadataDeltaKind.XDES_FIELD,
+                            237L, ExtentDescriptorLayout.STATE,
+                            ExtentDescriptorLayout.ENTRIES_BASE + ExtentDescriptorLayout.STATE, state)));
+            redo.flush();
+        }
+        try (PageStore store = new FileChannelPageStore();
+             RedoLogFileRepository repo = RedoLogFileRepository.open(redoPath)) {
+            store.create(SPACE, dir.resolve("xdes.ibd"), PS, PageNo.of(4));
+            RedoApplyDispatcher.pageDispatcher().applyAll(repo.readBatches(), new RedoApplyContext(store, PS));
+
+            assertTrue(store.currentSizeInPages(SPACE).value() >= 6L);
+            byte[] image = new byte[PS.bytes()];
+            store.readPage(page5, ByteBuffer.wrap(image));
+            ByteBuffer page = ByteBuffer.wrap(image);
+            assertEquals(PageType.XDES.code(), page.getInt(PageEnvelopeLayout.PAGE_TYPE));
+            assertEquals(XdesPageCodec.MAGIC, page.getInt(XdesPageCodec.MAGIC_OFFSET));
+            assertEquals(ExtentState.FREE_FRAG.ordinal(),
+                    page.getInt(ExtentDescriptorLayout.ENTRIES_BASE + ExtentDescriptorLayout.STATE));
         }
     }
 }

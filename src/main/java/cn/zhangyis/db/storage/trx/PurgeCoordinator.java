@@ -12,6 +12,9 @@ import cn.zhangyis.db.storage.btree.SecondaryEntryRemovalStatus;
 import cn.zhangyis.db.storage.btree.SecondaryIndexMetadata;
 import cn.zhangyis.db.storage.btree.SplitCapableBTreeIndexService;
 import cn.zhangyis.db.storage.btree.IndexMetadataResolver;
+import cn.zhangyis.db.storage.changebuffer.SecondaryIndexDeleteMode;
+import cn.zhangyis.db.storage.changebuffer.SecondaryIndexMutationCoordinator;
+import cn.zhangyis.db.storage.changebuffer.SecondaryIndexMutationResult;
 import cn.zhangyis.db.storage.buf.PageLatchMode;
 import cn.zhangyis.db.storage.api.lob.LobFreeBatchPlan;
 import cn.zhangyis.db.storage.api.lob.LobFreeTarget;
@@ -23,6 +26,7 @@ import cn.zhangyis.db.storage.redo.RedoBudgetWorkload;
 import cn.zhangyis.db.storage.btree.BTreeRedoBudgetEstimator;
 import cn.zhangyis.db.storage.mtr.MiniTransactionState;
 import cn.zhangyis.db.storage.record.format.LogicalRecord;
+import cn.zhangyis.db.storage.record.format.RecordType;
 import cn.zhangyis.db.storage.record.page.SearchKey;
 import cn.zhangyis.db.storage.undo.UndoLogSegment;
 import cn.zhangyis.db.storage.undo.UndoLogKind;
@@ -87,6 +91,8 @@ public final class PurgeCoordinator implements PurgeTarget {
     private final SecondaryPurgeSafetyChecker secondarySafety;
     /** 消费 LV purge-old ownership 的页链服务；legacy/无 LOB binding 模式允许为空，但遇 ownership 必须 fail-closed。 */
     private final LobStorage lobStorage;
+    /** 可选 Change Buffer 决策点；purge progress 只在真实 DELETE 或全局 DELETE mutation 提交后推进。 */
+    private final SecondaryIndexMutationCoordinator secondaryMutations;
     /** 兼容构造使用的单 worker 有界窗口；不创建平台线程。 */
     private static final PurgeConfig DIRECT_CONFIG = new PurgeConfig(1, 16, Duration.ofSeconds(5));
     /** worker 只处理 logical chain；history finalization 仍由持有 batch gate 的 dispatcher 执行。 */
@@ -119,7 +125,8 @@ public final class PurgeCoordinator implements PurgeTarget {
                             SplitCapableBTreeIndexService btree,
                             BTreeIndex clusteredIndex) {
         this(mgr, system, history, undoAccess, finalizer, btree,
-                targetResolver(legacyResolver(clusteredIndex)), null, null, null, null);
+                targetResolver(legacyResolver(clusteredIndex)), null, null, null, null,
+                DIRECT_CONFIG, false, null);
     }
 
     /**
@@ -139,7 +146,8 @@ public final class PurgeCoordinator implements PurgeTarget {
                             SplitCapableBTreeIndexService btree,
                             IndexMetadataResolver indexResolver) {
         this(mgr, system, history, undoAccess, finalizer, btree,
-                targetResolver(indexResolver), null, null, null, null);
+                targetResolver(indexResolver), null, null, null, null,
+                DIRECT_CONFIG, false, null);
     }
 
     /**
@@ -165,7 +173,7 @@ public final class PurgeCoordinator implements PurgeTarget {
                             PurgeDmlRowGuardManager rowGuards,
                             SecondaryPurgeSafetyChecker secondarySafety) {
         this(mgr, system, history, undoAccess, finalizer, btree, targetResolver, rootSnapshots,
-                rowGuards, secondarySafety, null);
+                rowGuards, secondarySafety, null, DIRECT_CONFIG, false, null);
     }
 
     /**
@@ -203,7 +211,7 @@ public final class PurgeCoordinator implements PurgeTarget {
                             SecondaryPurgeSafetyChecker secondarySafety,
                             LobStorage lobStorage) {
         this(mgr, system, history, undoAccess, finalizer, btree, targetResolver, rootSnapshots,
-                rowGuards, secondarySafety, lobStorage, DIRECT_CONFIG, false);
+                rowGuards, secondarySafety, lobStorage, DIRECT_CONFIG, false, null);
     }
 
     /**
@@ -233,7 +241,38 @@ public final class PurgeCoordinator implements PurgeTarget {
                             LobStorage lobStorage,
                             PurgeConfig purgeConfig) {
         this(mgr, system, history, undoAccess, finalizer, btree, targetResolver, rootSnapshots,
-                rowGuards, secondarySafety, lobStorage, purgeConfig, true);
+                rowGuards, secondarySafety, lobStorage, purgeConfig, true, null);
+    }
+
+    /**
+     * 完整生产构造器：安全证明后的二级物理 DELETE 可由 Change Buffer durable 接管，worker/进度边界不变。
+     *
+     * @param mgr undo/index/progress MTR 工厂
+     * @param system purge boundary 权威来源
+     * @param history committed history FIFO
+     * @param undoAccess undo logical chain 入口
+     * @param finalizer undo owner 终结器
+     * @param btree 聚簇/二级物理原语
+     * @param targetResolver exact-version 表级 resolver
+     * @param rootSnapshots root level 快照服务
+     * @param rowGuards DML/rollback/purge 共用行 guard
+     * @param secondarySafety 二级旧 identity 版本链证明器
+     * @param lobStorage purge-old LOB 释放服务
+     * @param purgeConfig worker 与有界等待配置
+     * @param secondaryMutations 可选统一 buffer-or-direct 决策点
+     */
+    public PurgeCoordinator(MiniTransactionManager mgr, TransactionSystem system, HistoryList history,
+                            UndoLogSegmentAccess undoAccess, UndoSegmentFinalizer finalizer,
+                            SplitCapableBTreeIndexService btree,
+                            UndoTargetMetadataResolver targetResolver,
+                            BTreeRootSnapshotService rootSnapshots,
+                            PurgeDmlRowGuardManager rowGuards,
+                            SecondaryPurgeSafetyChecker secondarySafety,
+                            LobStorage lobStorage,
+                            PurgeConfig purgeConfig,
+                            SecondaryIndexMutationCoordinator secondaryMutations) {
+        this(mgr, system, history, undoAccess, finalizer, btree, targetResolver, rootSnapshots,
+                rowGuards, secondarySafety, lobStorage, purgeConfig, true, secondaryMutations);
     }
 
     private PurgeCoordinator(MiniTransactionManager mgr, TransactionSystem system, HistoryList history,
@@ -245,7 +284,8 @@ public final class PurgeCoordinator implements PurgeTarget {
                              SecondaryPurgeSafetyChecker secondarySafety,
                              LobStorage lobStorage,
                              PurgeConfig purgeConfig,
-                             boolean parallel) {
+                             boolean parallel,
+                             SecondaryIndexMutationCoordinator secondaryMutations) {
         // 1、校验必需协作者、身份与配置边界，在字段赋值或资源打开前拒绝非法组合。
         if (mgr == null || system == null || history == null || undoAccess == null || finalizer == null
                 || btree == null || targetResolver == null || purgeConfig == null) {
@@ -270,6 +310,7 @@ public final class PurgeCoordinator implements PurgeTarget {
         this.secondarySafety = secondarySafety;
         // 4、完成初始状态发布；失败以领域异常终止构造，成功对象满足类级生命周期不变量。
         this.lobStorage = lobStorage;
+        this.secondaryMutations = secondaryMutations;
         this.maxInFlightLogs = purgeConfig.maxInFlightLogs();
         this.workerPool = parallel ? PurgeWorkerPool.parallel(purgeConfig) : PurgeWorkerPool.direct(purgeConfig);
     }
@@ -420,11 +461,15 @@ public final class PurgeCoordinator implements PurgeTarget {
                         entry, removedClustered, removedSecondary, skippedUnavailable);
             }
             try (PurgeDmlRowGuard ignored = guard.orElseThrow()) {
+                if (secondaryMutations != null) {
+                    secondaryMutations.register(task.target().tableIndexes());
+                }
                 for (SecondaryTask secondaryTask : task.secondaryTasks()) {
                     SecondaryPurgeDecision decision = secondarySafety.evaluate(task.record(), task.rollPointer(),
                             task.target().tableIndexes(), secondaryTask.metadata());
                     if (decision == SecondaryPurgeDecision.REMOVE) {
-                        removedSecondary += purgeSecondary(secondaryTask);
+                        removedSecondary += purgeSecondary(task.record().tableId(),
+                                task.target().tableIndexes().schemaVersion(), secondaryTask);
                     }
                 }
                 if (task.deleteClustered()) {
@@ -728,7 +773,27 @@ public final class PurgeCoordinator implements PurgeTarget {
      * @throws RuntimeException root 刷新、redo admission、B+Tree 删除/merge/root-shrink、状态冲突或 MTR 提交失败时抛出。
      * @throws UndoLogFormatException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
-    private int purgeSecondary(SecondaryTask task) {
+    private int purgeSecondary(long tableId, long schemaVersion, SecondaryTask task) {
+        if (secondaryMutations != null) {
+            LogicalRecord entry = new LogicalRecord(schemaVersion,
+                    task.physicalKey().values(), false, RecordType.CONVENTIONAL, null);
+            SecondaryIndexMutationResult mutation = secondaryMutations.delete(
+                    tableId, schemaVersion, task.metadata(), entry,
+                    SecondaryIndexDeleteMode.DELETE_MARKED, RedoBudgetPurpose.PURGE_INDEX);
+            if (mutation.buffered()) {
+                faultInjector.get().onBoundary(PurgeProgressPhase.AFTER_SECONDARY_COMMIT,
+                        task.metadata().index().indexId());
+                return 0;
+            }
+            BTreeSecondaryRemovalResult result = mutation.removalResult().orElseThrow();
+            if (result.status() == SecondaryEntryRemovalStatus.STATE_CONFLICT) {
+                throw new UndoLogFormatException("purge secondary entry is still live: index="
+                        + task.metadata().index().indexId() + " key=" + task.physicalKey());
+            }
+            faultInjector.get().onBoundary(PurgeProgressPhase.AFTER_SECONDARY_COMMIT,
+                    task.metadata().index().indexId());
+            return result.status() == SecondaryEntryRemovalStatus.REMOVED ? 1 : 0;
+        }
         // 1. 结构预算只消费当前 root header level，不能依赖 DD binding 的过期提示。
         BTreeIndex index = refresh(task.metadata().index());
         MiniTransaction ix = mgr.begin(mgr.budgetFor(RedoBudgetPurpose.PURGE_INDEX,

@@ -63,7 +63,7 @@ import cn.zhangyis.db.storage.record.schema.ColumnType;
 import cn.zhangyis.db.storage.record.schema.StorageKind;
 import cn.zhangyis.db.storage.record.type.ColumnValue;
 import cn.zhangyis.db.storage.btree.TableIndexMetadata;
-import cn.zhangyis.db.storage.redo.RedoBudgetWorkload;
+import cn.zhangyis.db.storage.changebuffer.ChangeBufferDdlBarrier;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;
@@ -154,6 +154,8 @@ public final class TableDdlStorageService {
      * 统一写准入闸门；raw 文件动作没有 MTR 可替它检查，因此必须在获得表空间独占 lease 前显式校验。
      */
     private final StorageWriteAdmission writeAdmission;
+    /** 可选 Change Buffer DDL 屏障；legacy 无 system.ibd 组合根为空。 */
+    private final ChangeBufferDdlBarrier changeBufferBarrier;
 
     /**
      * 创建 {@code TableDdlStorageService}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
@@ -178,7 +180,7 @@ public final class TableDdlStorageService {
                                   BTreeRootSnapshotService rootSnapshots,
                                   LobStorage lobStorage) {
         this(mtrManager, disk, indexPages, pool, store, flush, accessController, pageSize,
-                btree, rootSnapshots, lobStorage, StorageWriteAdmission.normal());
+                btree, rootSnapshots, lobStorage, StorageWriteAdmission.normal(), null);
     }
 
     /**
@@ -205,6 +207,35 @@ public final class TableDdlStorageService {
                                   BTreeRootSnapshotService rootSnapshots,
                                   LobStorage lobStorage,
                                   StorageWriteAdmission writeAdmission) {
+        this(mtrManager, disk, indexPages, pool, store, flush, accessController, pageSize,
+                btree, rootSnapshots, lobStorage, writeAdmission, null);
+    }
+
+    /**
+     * 创建接入 Change Buffer 生命周期屏障的生产物理 DDL 门面；原构造器继续支持 legacy 无 system.ibd 实例。
+     *
+     * @param mtrManager 短物理事务协作者
+     * @param disk 空间管理门面
+     * @param indexPages 索引页访问入口
+     * @param pool 共享 Buffer Pool
+     * @param store 物理 PageStore
+     * @param flush WAL-safe flush 服务
+     * @param accessController 表空间 operation lease 控制器
+     * @param pageSize 实例页大小
+     * @param btree DDL B+Tree 协作者
+     * @param rootSnapshots root level 快照服务
+     * @param lobStorage LOB 迁移/释放服务
+     * @param writeAdmission 引擎写准入闸门
+     * @param changeBufferBarrier 可选 DROP 前全局 mutation 屏障
+     */
+    public TableDdlStorageService(MiniTransactionManager mtrManager, DiskSpaceManager disk,
+                                  IndexPageAccess indexPages, BufferPool pool, PageStore store,
+                                  FlushService flush, TablespaceAccessController accessController,
+                                  PageSize pageSize, SplitCapableBTreeIndexService btree,
+                                  BTreeRootSnapshotService rootSnapshots,
+                                  LobStorage lobStorage,
+                                  StorageWriteAdmission writeAdmission,
+                                  ChangeBufferDdlBarrier changeBufferBarrier) {
         if (mtrManager == null || disk == null || indexPages == null || pool == null || store == null
                 || flush == null || accessController == null || pageSize == null
                 || btree == null || rootSnapshots == null || lobStorage == null || writeAdmission == null) {
@@ -225,6 +256,7 @@ public final class TableDdlStorageService {
         this.rootSnapshots = rootSnapshots;
         this.lobStorage = lobStorage;
         this.writeAdmission = writeAdmission;
+        this.changeBufferBarrier = changeBufferBarrier;
     }
 
     /**
@@ -1502,6 +1534,12 @@ public final class TableDdlStorageService {
         if (!durable.equals(expected)) {
             throw new SerializedDictionaryInfoException(
                     "secondary index drop descriptor changed before finish");
+        }
+
+        // 新 DD 已阻断目标索引写；必须先移除全局 mutation identity，随后 inode 才允许被复用。
+        if (changeBufferBarrier != null) {
+            changeBufferBarrier.discardIndex(
+                    table.tableId(), expected.indexBinding().indexId(), timeout);
         }
 
         // 2. admission 等待前结束 plan MTR，避免持 page2 latch 等 redo capacity。
@@ -3632,6 +3670,9 @@ public final class TableDdlStorageService {
             throw new DatabaseValidationException("discard binding/quarantine/positive timeout required");
         }
         requireOpenedPath(binding, "DISCARD TABLESPACE");
+        if (changeBufferBarrier != null) {
+            changeBufferBarrier.discardSpace(binding.spaceId(), timeout);
+        }
         try (TablespaceAccessLease ignored = accessController.acquireExclusive(binding.spaceId())) {
             TablespaceDrainResult drained = flush.drainTablespace(binding.spaceId(), timeout);
             if (drained.timedOut()) {
@@ -3680,6 +3721,9 @@ public final class TableDdlStorageService {
         // 1. raw 路径没有 MTR 兜底，必须先检查统一写闸门和不可被目录穿越替换的路径身份。
         validateOfflineArguments(binding, quarantine, timeout, "recovery discard");
         writeAdmission.assertWriteAllowed();
+        if (changeBufferBarrier != null) {
+            changeBufferBarrier.discardUnavailableSpace(binding.spaceId(), timeout);
+        }
         Path source = checkedOfflinePath(binding.path(), "recovery discard source");
         Path target = checkedOfflinePath(quarantine, "recovery discard target");
         if (source.equals(target)) {
@@ -3737,6 +3781,9 @@ public final class TableDdlStorageService {
             TableStorageBinding binding, Path source, Duration timeout) {
         validateOfflineArguments(binding, source, timeout, "recovery drop");
         writeAdmission.assertWriteAllowed();
+        if (changeBufferBarrier != null) {
+            changeBufferBarrier.discardUnavailableSpace(binding.spaceId(), timeout);
+        }
         Path checkedSource = checkedOfflinePath(source, "recovery drop source");
         try (TablespaceAccessLease ignored = accessController.acquireExclusive(binding.spaceId())) {
             assertOffline(binding.spaceId(), "recovery drop");
@@ -3988,10 +4035,13 @@ public final class TableDdlStorageService {
      *
      * <p>数据流：</p>
      * <ol>
-     *     <li>校验表空间生命周期、页号、区段身份与容量边界，非法或损坏元数据在分配/IO 前拒绝。</li>
-     *     <li>按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，避免锁序反转。</li>
-     *     <li>执行空间元数据或物理文件变化，并把需要的 allocation intent、redo、dirty 或 force 副作用交给既有下游。</li>
-     *     <li>发布稳定结果并逆序释放 lease、latch 与 fix；失败保留可由恢复流程识别的权威状态。</li>
+     *     <li>校验 binding、候选文件 page0 身份与期望版本；失败时不消费旧 Change Buffer 证据也不复制文件。</li>
+     *     <li>在取得用户表空间独占 lease 前，从 system.ibd 丢弃旧 SpaceId incarnation 的全部 pending mutation，
+     *         避免持有用户 lease 后反向访问系统空间。</li>
+     *     <li>取得独占 lifecycle lease，原子安装文件、以 recovery 模式挂载并失效同 SpaceId 的旧 frame。</li>
+     *     <li>按重复页公式逐页重建不可信 Change Buffer bitmap；每页独立提交，page0 仍保持 DISCARDED。</li>
+     *     <li>用 redo 恢复 page0 NORMAL，等待覆盖 bitmap reset 与 restore 的 WAL durable 边界后 force 数据文件。</li>
+     *     <li>刷新 registry 元数据并发布成功日志；任一失败保持 DD/文件可由既有 IMPORT recovery 重试。</li>
      * </ol>
      *
      * @param binding 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
@@ -4003,26 +4053,38 @@ public final class TableDdlStorageService {
      */
     public void importTablespace(TableStorageBinding binding, Path source, TablespaceFileIdentity expected,
                                  Duration timeout) {
-        // 1、校验表空间生命周期、页号、区段身份与容量边界，在共享或持久副作用前拒绝非法状态。
+        // 1、先证明外部文件属于当前 binding；校验失败不得破坏旧 incarnation 的恢复证据。
         if (binding == null || source == null || expected == null || timeout == null
                 || timeout.isZero() || timeout.isNegative()) {
             throw new DatabaseValidationException("import binding/source/identity/positive timeout required");
         }
-        // 2、继续完成范围、身份与候选校验；通过后，按 tablespace lease、space header、XDES、INODE 与数据页顺序取得受控资源，保持处理顺序与资源边界。
         if (!expected.spaceId().equals(binding.spaceId())) {
             throw new DatabaseValidationException("import identity does not match binding space");
         }
         TablespaceFileIdentity actual = fileInspection.inspect(source, binding.spaceId(), expected.pageSize());
-        // 3、在中间分支复核阶段性结果；满足条件后，执行空间元数据或物理文件变化，并维持领域不变量。
         if (!actual.equals(expected)) {
             throw new TableDdlStorageException("import tablespace file identity mismatch: " + source);
         }
         Path temporary = binding.path().resolveSibling(binding.path().getFileName() + ".import.tmp");
-        // 4、发布稳定结果并逆序释放 lease、latch 与 fix，以稳定返回或领域异常完成收口。
+
+        // 2、全局树属于 system.ibd，必须在用户空间独占 lease 外清除，保持跨空间 lease/latch 单向顺序。
+        if (changeBufferBarrier != null) {
+            changeBufferBarrier.discardUnavailableSpace(binding.spaceId(), timeout);
+        }
+
+        // 3、独占 lease 阻止旧 SpaceId 在安装与 reset 窗口重新进入普通 MTR。
         try (TablespaceAccessLease ignored = accessController.acquireExclusive(binding.spaceId())) {
             fileTransfer.importFile(source, binding.path(), temporary);
             disk.openTablespaceForRecovery(binding.spaceId(), binding.path());
             pool.invalidateTablespace(binding.spaceId(), timeout);
+
+            // 4、导入文件的 bitmap 属于其它运行历史；在 page0 NORMAL 前全部归零，不能据此承诺空闲空间。
+            if (changeBufferBarrier != null) {
+                changeBufferBarrier.resetImportedSpaceBitmaps(
+                        binding.spaceId(), store.currentSizeInPages(binding.spaceId()), timeout);
+            }
+
+            // 5、restore redo 在 reset redo 之后追加；flushThrough 该 LSN 同时建立两者 WAL durable 边界。
             MiniTransaction restore = mtrManager.begin(mtrManager.budgetFor(RedoBudgetPurpose.DDL_TABLE_DROP));
             Lsn restoreLsn;
             try {
@@ -4034,6 +4096,8 @@ public final class TableDdlStorageService {
             }
             flush.flushThrough(restoreLsn, timeout);
             store.force(binding.spaceId());
+
+            // 6、只有 reset、NORMAL marker 与数据文件 force 全部成功后才刷新普通访问 registry。
             disk.refreshTablespaceMetadata(binding.spaceId());
             log.info("imported physical tablespace: table={} space={} source={}", binding.tableId(),
                     binding.spaceId().value(), source);
@@ -4090,6 +4154,9 @@ public final class TableDdlStorageService {
             throw new DatabaseValidationException("drop fault injector must not be null");
         }
         requireOpenedPath(binding, "DDL DROP");
+        if (changeBufferBarrier != null) {
+            changeBufferBarrier.discardSpace(binding.spaceId(), timeout);
+        }
         try (TablespaceAccessLease ignored = accessController.acquireExclusive(binding.spaceId())) {
             TablespaceDrainResult drained = flush.drainTablespace(binding.spaceId(), timeout);
             if (drained.timedOut()) {

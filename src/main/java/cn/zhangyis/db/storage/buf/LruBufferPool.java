@@ -62,6 +62,12 @@ public final class LruBufferPool implements BufferPool {
      */
     private final AtomicReference<ReadAheadHook> readAheadHook = new AtomicReference<>();
 
+    /**
+     * 可选发布前页面拦截器（set-once）。实例仅保存引用并在完成磁盘 IO 后、发布 page hash future 前调用；
+     * 回调期间 facade/instance 的 metadata 锁均未持有。
+     */
+    private final AtomicReference<PageLoadInterceptor> pageLoadInterceptor = new AtomicReference<>();
+
     /** 单实例池，默认 midpoint LRU（Phase A）。等价 {@code instanceCount=1}。
      * @param pageStore 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
      * @param pageSize 调用方提供的长度或容量值对象；不得为 {@code null}，且必须已通过其构造范围校验
@@ -169,8 +175,35 @@ public final class LruBufferPool implements BufferPool {
         }
     }
 
+    /**
+     * 注入发布前页面拦截器并传播到全部分片。该能力影响页可见性，必须在开放用户流量前 set-once 安装。
+     *
+     * @param interceptor 只通过 PendingPagePublication 修改页面的拦截器；不得为 {@code null}
+     * @throws DatabaseValidationException 重复安装或参数为空时抛出
+     */
+    public void attachPageLoadInterceptor(PageLoadInterceptor interceptor) {
+        if (interceptor == null) {
+            throw new DatabaseValidationException("page load interceptor must not be null");
+        }
+        if (!pageLoadInterceptor.compareAndSet(null, interceptor)) {
+            throw new DatabaseValidationException("page load interceptor already attached (set-once)");
+        }
+        for (BufferPoolInstance instance : instances) {
+            instance.attachPageLoadInterceptor(interceptor);
+        }
+    }
+
     private BufferPoolInstance instanceFor(PageId pageId) {
         return instances[router.route(pageId)];
+    }
+
+    /** O(1) 路由到所属分片查询 page hash；LOADING 占位同样阻止 Change Buffer 新增 mutation。 */
+    @Override
+    public boolean isResident(PageId pageId) {
+        if (pageId == null) {
+            throw new DatabaseValidationException("resident page id must not be null");
+        }
+        return instanceFor(pageId).isResident(pageId);
     }
 
     /**

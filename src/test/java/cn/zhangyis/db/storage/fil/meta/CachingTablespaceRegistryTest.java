@@ -137,6 +137,27 @@ class CachingTablespaceRegistryTest {
     }
 
     /**
+     * recovery cache miss 只能发布“待普通准入复核”的句柄。第一次普通 require 必须重新调用严格 loader；严格
+     * 校验失败时保留恢复句柄供诊断，修复证据后再次 require 能完成晋升，不能因 cache hit 永久绕过普通校验。
+     */
+    @Test
+    void recoveryLoadedHandleRequiresStrictReloadBeforeOrdinaryAccess() {
+        RecoveryAwareLoader loader = new RecoveryAwareLoader(metadata(TablespaceState.NORMAL));
+        CachingTablespaceRegistry registry = new CachingTablespaceRegistry(loader);
+
+        assertEquals(TablespaceState.NORMAL,
+                registry.requireForRecovery(SpaceId.of(10)).tablespace().state());
+        assertEquals(1, loader.recoveryLoadCount());
+        assertThrows(TablespaceCorruptedException.class, () -> registry.require(SpaceId.of(10)));
+        assertEquals(TablespaceState.NORMAL,
+                registry.requireForRecovery(SpaceId.of(10)).tablespace().state());
+
+        loader.allowOrdinaryLoad();
+        assertEquals(TablespaceState.NORMAL, registry.require(SpaceId.of(10)).tablespace().state());
+        assertEquals(2, loader.ordinaryLoadCount());
+    }
+
+    /**
      * 验证 {@code shouldRefreshRuntimeHandleFromLoader} 对应的表空间物理文件行为；断言方法名所声明的结果、权威状态变化、异常边界及资源所有权均符合契约。
      */
     @Test
@@ -257,6 +278,45 @@ class CachingTablespaceRegistryTest {
 
         private void metadata(TablespaceMetadata metadata) {
             this.metadata = metadata;
+        }
+    }
+
+    /** 为 recovery/ordinary 双入口提供独立计数和可恢复的严格校验失败。 */
+    private static final class RecoveryAwareLoader implements TablespaceMetadataLoader {
+        private final TablespaceMetadata metadata;
+        private final AtomicInteger ordinaryLoads = new AtomicInteger();
+        private final AtomicInteger recoveryLoads = new AtomicInteger();
+        private boolean ordinaryAllowed;
+
+        private RecoveryAwareLoader(TablespaceMetadata metadata) {
+            this.metadata = metadata;
+        }
+
+        @Override
+        public Optional<TablespaceMetadata> load(SpaceId spaceId) {
+            ordinaryLoads.incrementAndGet();
+            if (!ordinaryAllowed) {
+                throw new TablespaceCorruptedException("management catalog is not ready");
+            }
+            return Optional.of(metadata);
+        }
+
+        @Override
+        public Optional<TablespaceMetadata> loadForRecovery(SpaceId spaceId) {
+            recoveryLoads.incrementAndGet();
+            return Optional.of(metadata);
+        }
+
+        private void allowOrdinaryLoad() {
+            ordinaryAllowed = true;
+        }
+
+        private int ordinaryLoadCount() {
+            return ordinaryLoads.get();
+        }
+
+        private int recoveryLoadCount() {
+            return recoveryLoads.get();
         }
     }
 }

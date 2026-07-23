@@ -3,6 +3,7 @@ package cn.zhangyis.db.storage.btree;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.storage.api.SegmentRef;
+import cn.zhangyis.db.storage.page.PageType;
 import cn.zhangyis.db.storage.record.schema.IndexKeyDef;
 import cn.zhangyis.db.storage.record.schema.TableSchema;
 
@@ -19,10 +20,11 @@ import cn.zhangyis.db.storage.record.schema.TableSchema;
  *                       都必须为 true；DD logical unique 由 {@link SecondaryIndexMetadata} 独立表达。
  * @param leafSegment    leaf 页分配所属 segment；leaf-only 调用可为空，split-capable 写路径必须提供。
  * @param nonLeafSegment non-leaf 页分配所属 segment；B3 root 稳定不分配新 non-leaf，仍随元数据携带供后续高度增长。
+ * @param pageType 索引页 envelope 类型；用户/DD 索引为 INDEX，全局 Change Buffer 树为 IBUF_INDEX。
  */
 public record BTreeIndex(long indexId, PageId rootPageId, int rootLevel,
                          IndexKeyDef keyDef, TableSchema schema, boolean physicalUnique,
-                         SegmentRef leafSegment, SegmentRef nonLeafSegment) {
+                         SegmentRef leafSegment, SegmentRef nonLeafSegment, PageType pageType) {
 
     /**
      * B1/B2 兼容构造器：只描述一个 leaf-only 索引，不携带 segment 信息。
@@ -38,7 +40,27 @@ public record BTreeIndex(long indexId, PageId rootPageId, int rootLevel,
      */
     public BTreeIndex(long indexId, PageId rootPageId, int rootLevel,
                       IndexKeyDef keyDef, TableSchema schema, boolean physicalUnique) {
-        this(indexId, rootPageId, rootLevel, keyDef, schema, physicalUnique, null, null);
+        this(indexId, rootPageId, rootLevel, keyDef, schema, physicalUnique,
+                null, null, PageType.INDEX);
+    }
+
+    /**
+     * 兼容新增内部索引页类型前的完整 descriptor 构造器；全部既有用户索引保持 {@link PageType#INDEX}。
+     *
+     * @param indexId 索引稳定 id
+     * @param rootPageId 稳定 root 页
+     * @param rootLevel 当前 root level
+     * @param keyDef 完整物理 key
+     * @param schema leaf record schema
+     * @param physicalUnique 是否拒绝完整 key 重复
+     * @param leafSegment leaf 分配 segment，可为空
+     * @param nonLeafSegment non-leaf 分配 segment，可为空
+     */
+    public BTreeIndex(long indexId, PageId rootPageId, int rootLevel,
+                      IndexKeyDef keyDef, TableSchema schema, boolean physicalUnique,
+                      SegmentRef leafSegment, SegmentRef nonLeafSegment) {
+        this(indexId, rootPageId, rootLevel, keyDef, schema, physicalUnique,
+                leafSegment, nonLeafSegment, PageType.INDEX);
     }
 
     /**
@@ -58,8 +80,8 @@ public record BTreeIndex(long indexId, PageId rootPageId, int rootLevel,
         if (indexId < 0) {
             throw new DatabaseValidationException("btree index id must be non-negative: " + indexId);
         }
-        if (rootPageId == null || keyDef == null || schema == null) {
-            throw new DatabaseValidationException("btree index root/keyDef/schema must not be null");
+        if (rootPageId == null || keyDef == null || schema == null || pageType == null) {
+            throw new DatabaseValidationException("btree index root/keyDef/schema/pageType must not be null");
         }
         if (rootLevel < 0) {
             throw new DatabaseValidationException("btree root level must be non-negative: " + rootLevel);
@@ -67,6 +89,9 @@ public record BTreeIndex(long indexId, PageId rootPageId, int rootLevel,
         if (keyDef.indexId() != indexId) {
             throw new DatabaseValidationException("btree index id must match keyDef index id: "
                     + indexId + " vs " + keyDef.indexId());
+        }
+        if (pageType != PageType.INDEX && pageType != PageType.IBUF_INDEX) {
+            throw new DatabaseValidationException("btree page type must be INDEX or IBUF_INDEX: " + pageType);
         }
     }
 
@@ -80,7 +105,7 @@ public record BTreeIndex(long indexId, PageId rootPageId, int rootLevel,
      */
     public BTreeIndex withRootLevel(int newRootLevel) {
         return new BTreeIndex(indexId, rootPageId, newRootLevel, keyDef, schema, physicalUnique,
-                leafSegment, nonLeafSegment);
+                leafSegment, nonLeafSegment, pageType);
     }
 
     /**

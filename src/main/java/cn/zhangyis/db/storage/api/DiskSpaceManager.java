@@ -278,6 +278,12 @@ public final class DiskSpaceManager {
         if (type == null) {
             throw new DatabaseValidationException("tablespace type must not be null");
         }
+        if (type == TablespaceType.SYSTEM && spaceId.value() != 0) {
+            throw new DatabaseValidationException("SYSTEM tablespace must use SpaceId 0");
+        }
+        if (type != TablespaceType.SYSTEM && spaceId.value() == 0) {
+            throw new DatabaseValidationException("SpaceId 0 is reserved for SYSTEM tablespace");
+        }
 
         // 2. 先建立零填充物理容量；该 FILE 动作不属于 MTR undo，后续失败由上层 DDL/recovery 负责清理。
         pageStore.create(spaceId, path, pageSize, initialSizePages);
@@ -308,7 +314,7 @@ public final class DiskSpaceManager {
         }
 
         // 4. extent0 含固定 FSP 管理页，必须先在 XDES 标为系统保留，普通 segment 分配器才可安全进入该空间。
-        xdes.reserveSystemExtent(mtr, spaceId);
+        xdes.reserveSystemExtent(mtr, spaceId, type == TablespaceType.SYSTEM ? 4 : 3);
 
         // 5. page0 尚未 durable，直接用已校验参数发布运行时快照；调用方须在 MTR commit/flush 后再发布上层可见性。
         registry.replace(tablespaceMetadata(spaceId, path, type, initialState, initialSizePages));
@@ -338,9 +344,9 @@ public final class DiskSpaceManager {
      * <ol>
      *     <li>先校验空间标识与路径，禁止用空 identity 打开无法登记的文件。</li>
      *     <li>PageStore 校验文件存在、长度按页对齐并登记物理句柄；此阶段不解析 page0 业务语义。</li>
-     *     <li>registry loader 读取并校验 page0 envelope/checksum/FSP/lifecycle，再原样发布 NORMAL、CORRUPTED 等真实状态；
-     *     本方法不把状态伪装成可用，后续普通空间管理仍须经 {@code registry.require} 白名单准入。加载失败时立即关闭
-     *     刚打开的物理句柄，防止半开文件泄漏。</li>
+     *     <li>registry ordinary loader 校验 page0 envelope/checksum/FSP/lifecycle，并按 freeLimit 定点校验已发布的
+     *     XDES/bitmap 管理目录后再发布真实状态；本方法不把状态伪装成可用，后续普通空间管理仍须经
+     *     {@code registry.require} 白名单准入。加载失败时立即关闭刚打开的物理句柄，防止半开文件泄漏。</li>
      * </ol>
      *
      * @param spaceId 文件 page0 应声明的稳定空间标识；不能为 {@code null}
@@ -374,8 +380,10 @@ public final class DiskSpaceManager {
      * <ol>
      *     <li>校验恢复配置提供的 space identity 与路径，避免把未知文件挂到空 key。</li>
      *     <li>PageStore 打开物理文件并建立按页 IO 句柄。</li>
-     *     <li>{@link TablespaceRegistry#requireForRecovery(SpaceId)} 仍校验 page0 格式与 identity，但跳过普通状态白名单，
-     *     允许 CORRUPTED/TRUNCATING 等状态交给后续 redo、truncate 或 DDL recovery；失败时关闭物理句柄。</li>
+     *     <li>{@link TablespaceRegistry#requireForRecovery(SpaceId)} 仍校验 page0 格式与 identity，但把句柄标为
+     *     recovery-only，不要求可由 PAGE_INIT redo 修复的独立 XDES/bitmap 已经稳定；允许 CORRUPTED/TRUNCATING
+     *     等状态交给后续 redo、truncate 或 DDL recovery。NORMAL/ACTIVE 在首次普通 require 时必须严格重载，
+     *     recovery 加载失败则关闭物理句柄。</li>
      * </ol>
      *
      * @param spaceId 恢复配置与 page0 应共同声明的空间标识；不能为 {@code null}

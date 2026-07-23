@@ -15,12 +15,15 @@ import cn.zhangyis.db.storage.btree.BTreeIndex;
 import cn.zhangyis.db.storage.trx.UndoTargetMetadata;
 import cn.zhangyis.db.storage.trx.UndoTargetMetadataResolver;
 import cn.zhangyis.db.storage.trx.UndoTargetDisposition;
+import cn.zhangyis.db.storage.changebuffer.ChangeBufferMetadataResolver;
+import cn.zhangyis.db.storage.btree.SecondaryIndexMetadata;
 
 import java.util.Set;
 import java.util.TreeSet;
 
 /** committed DD table/index 定义与物理 binding 的 rollback/purge adapter。无全局默认索引或名称猜测。 */
-public final class DictionaryIndexMetadataResolver implements IndexMetadataResolver, UndoTargetMetadataResolver {
+public final class DictionaryIndexMetadataResolver implements IndexMetadataResolver,
+        UndoTargetMetadataResolver, ChangeBufferMetadataResolver {
 
     /**
      * 本对象持有的 {@code repository} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
@@ -63,6 +66,37 @@ public final class DictionaryIndexMetadataResolver implements IndexMetadataResol
     @Override
     public UndoTargetMetadata resolveTarget(long tableId, long indexId) {
         return mapTarget(tableId, indexId);
+    }
+
+    /**
+     * Change Buffer merge 按持久 table/schema/index 三元组解析 exact-version 二级 descriptor；与 undo resolver 不同，
+     * 这里的 indexId 必须指向 secondary，且 schema version 必须逐值相等，禁止用当前同名索引代替旧 incarnation。
+     *
+     * @param tableId mutation 持久化的正 DD 表 id
+     * @param schemaVersion entry 编码时的正 storage schema version
+     * @param indexId mutation 持久化的正二级索引 id
+     * @return 与三元组精确匹配且仍可物理访问的二级 metadata
+     * @throws DictionaryObjectNotFoundException 表/索引已删除、隔离或版本不匹配时抛出，恢复/merge 必须 fail-closed
+     */
+    @Override
+    public SecondaryIndexMetadata resolve(long tableId, long schemaVersion, long indexId) {
+        TableDefinition table = repository.findTableForRecovery(TableId.of(tableId)).orElseThrow(() ->
+                new DictionaryObjectNotFoundException("change buffer table metadata not found: " + tableId));
+        if (table.state() != TableState.ACTIVE) {
+            throw new DictionaryObjectNotFoundException(
+                    "change buffer references non-active table: " + tableId + " state=" + table.state());
+        }
+        MappedTableStorage mapped = mapper.map(table);
+        if (mapped.tableIndexes().schemaVersion() != schemaVersion) {
+            throw new DictionaryObjectNotFoundException("change buffer schema version mismatch: table="
+                    + tableId + " expected=" + schemaVersion + " actual="
+                    + mapped.tableIndexes().schemaVersion());
+        }
+        return mapped.tableIndexes().secondaryIndexes().stream()
+                .filter(secondary -> secondary.index().indexId() == indexId)
+                .findFirst().orElseThrow(() -> new DictionaryObjectNotFoundException(
+                        "change buffer secondary metadata not found: table=" + tableId
+                                + " index=" + indexId));
     }
 
     private UndoTargetMetadata mapTarget(long tableId, long indexId) {

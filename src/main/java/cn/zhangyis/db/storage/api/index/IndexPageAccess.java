@@ -103,8 +103,32 @@ public final class IndexPageAccess {
      * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public RecordPage createIndexPage(MiniTransaction mtr, PageId pageId, long indexId, int level) {
+        return createIndexPage(mtr, pageId, indexId, level, PageType.INDEX);
+    }
+
+    /**
+     * 建并格式化普通 INDEX 或系统 IBUF_INDEX 页。页类型由 descriptor 固定，不能借此写任意 envelope code。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 MTR、页 identity、index id、level 与允许页类型，任何错误早于 newPage。</li>
+     *     <li>取得表空间 lease 并经 Buffer Pool 创建 X-latched 零页，PAGE_INIT 使用目标类型。</li>
+     *     <li>写入同类型 FIL envelope 并格式化 RecordPage header；redo/dirty 均归当前 MTR。</li>
+     *     <li>返回仍由 MTR memo 持有的 RecordPage 视图，调用方不得自行释放。</li>
+     * </ol>
+     *
+     * @param mtr 活动短物理事务
+     * @param pageId 已物理分配或系统保留的新页
+     * @param indexId 与 descriptor/keyDef 一致的非负 id
+     * @param level 新页 B+Tree level，必须非负
+     * @param pageType 只能是 INDEX 或 IBUF_INDEX
+     * @return 绑定当前 MTR X guard 的已格式化 record page
+     * @throws DatabaseValidationException 输入或页类型非法时抛出
+     */
+    public RecordPage createIndexPage(MiniTransaction mtr, PageId pageId, long indexId, int level,
+                                      PageType pageType) {
         // 1、校验表空间生命周期、页号、区段身份与容量边界，在共享或持久副作用前拒绝非法状态。
-        if (mtr == null || pageId == null) {
+        if (mtr == null || pageId == null || pageType == null) {
             throw new DatabaseValidationException("createIndexPage mtr/pageId must not be null");
         }
         if (indexId < 0) {
@@ -114,11 +138,14 @@ public final class IndexPageAccess {
         if (level < 0) {
             throw new DatabaseValidationException("level must be non-negative: " + level);
         }
+        if (pageType != PageType.INDEX && pageType != PageType.IBUF_INDEX) {
+            throw new DatabaseValidationException("index page type must be INDEX or IBUF_INDEX: " + pageType);
+        }
         requireOrdinaryAccess(mtr, pageId.spaceId());
-        PageGuard g = mtr.newPage(pool, pageId, PageLatchMode.EXCLUSIVE, PageType.INDEX);
+        PageGuard g = mtr.newPage(pool, pageId, PageLatchMode.EXCLUSIVE, pageType);
         // 3、在中间分支复核阶段性结果；满足条件后，执行空间元数据或物理文件变化，并维持领域不变量。
         PageEnvelope.writeHeader(g, new FilePageHeader(pageId.spaceId(), pageId.pageNo().value(),
-                FilePageHeader.FIL_NULL, FilePageHeader.FIL_NULL, 0L, PageType.INDEX));
+                FilePageHeader.FIL_NULL, FilePageHeader.FIL_NULL, 0L, pageType));
         RecordPage rp = new RecordPage(g, pageSize);
         rp.format(indexId, level);
         // 4、发布稳定结果并逆序释放 lease、latch 与 fix，以稳定返回或领域异常完成收口。

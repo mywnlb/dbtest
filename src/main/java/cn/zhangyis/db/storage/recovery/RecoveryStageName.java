@@ -12,6 +12,8 @@ public enum RecoveryStageName {
     REDO_REPLAY,
     /** redo 完成后把恢复边界安装到本进程将继续使用的 RedoLogManager，使新 MTR 从 recoveredToLsn 续写、历史日志视为 durable。 */
     REDO_BOUNDARY_INSTALL,
+    /** redo 后验证 system.ibd Change Buffer header/global tree；目标页保持惰性，失败不得进入 undo 或开放流量。 */
+    CHANGE_BUFFER_RECOVER,
     /** redo 完成后续作 durable TRUNCATING undo 表空间，完成前保持流量关闭。 */
     UNDO_TABLESPACE_RESUME,
     /**

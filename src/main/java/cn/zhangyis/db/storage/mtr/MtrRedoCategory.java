@@ -7,7 +7,7 @@ package cn.zhangyis.db.storage.mtr;
  */
 public enum MtrRedoCategory {
 
-    /** 新页初始化，由 {@link MiniTransaction#newPage} 固定产生，不受普通分类 scope 影响。 */
+    /** 新页初始化，由 {@link MiniTransaction#newPage} 或已验证全零的固定管理页初始化产生，不受普通分类 scope 影响。 */
     PAGE_INIT,
 
     /** 未声明语义来源的普通页字节写；这是兼容既有调用方的默认分类。 */

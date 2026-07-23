@@ -11,6 +11,7 @@ import cn.zhangyis.db.storage.fil.access.TablespaceAccessController;
 import cn.zhangyis.db.storage.engine.StorageWriteAdmission;
 
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Function;
 
 /**
  * mini-transaction 管理器（设计 §13.2）：把 MTR 绑定到当前线程，禁止静默嵌套。
@@ -171,6 +172,58 @@ public final class MiniTransactionManager {
      */
     public RedoAppendBudget budgetFor(RedoBudgetPurpose purpose, RedoBudgetWorkload workload) {
         return operationBudgetEstimator.estimate(purpose, workload);
+    }
+
+    /**
+     * 在当前线程可能已绑定父 MTR 的情况下执行一个显式独立提交的物理子操作。该能力只供页面发布前 merge：
+     * 父 MTR 保持其既有 latch/lease，但暂时从 ThreadLocal 隐藏；子 MTR 使用自己的 redo range、memo 与提交边界，
+     * 完成后无条件恢复父绑定。普通业务代码仍应使用 begin/commit，不能借此制造任意嵌套事务。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>保存当前父绑定并临时移除，使 begin 的显式预算准入发生在子 MTR 获取资源之前。</li>
+     *     <li>创建子 MTR 并执行回调；回调只能操作与父持有资源具有书面无环证明的发布前页面/global ibuf 页。</li>
+     *     <li>正常返回时提交独立 redo；回调在 ACTIVE 阶段失败则释放子 memo，提交期失败保持 fail-stop 状态。</li>
+     *     <li>finally 清除任何子绑定并恢复原父 MTR，确保外层调用随后继续完成原 getPage/fix 生命周期。</li>
+     * </ol>
+     *
+     * @param budget 覆盖整个子操作最坏分支的显式 redo 上界；不得为 {@code null}
+     * @param work 在新子 MTR 内执行并返回稳定结果的回调；不得为 {@code null}
+     * @param <T> 回调返回值类型
+     * @return 子 MTR 成功提交后返回的回调结果
+     * @throws DatabaseValidationException 参数为空时抛出
+     */
+    public <T> T executeDetached(RedoAppendBudget budget, Function<MiniTransaction, T> work) {
+        // 1、父绑定只暂存于当前栈帧，不向其它线程发布。
+        if (budget == null || work == null) {
+            throw new DatabaseValidationException("detached mini transaction budget/work must not be null");
+        }
+        MiniTransaction parent = current.get();
+        current.remove();
+        MiniTransaction child = null;
+        try {
+            // 2、子 MTR 走完整 write-admission 和 redo capacity reservation。
+            child = begin(budget);
+            T result = work.apply(child);
+            // 3、只有独立 redo/pageLSN/dirty 发布完整完成才向发布前拦截器返回。
+            commit(child);
+            return result;
+        } catch (RuntimeException failure) {
+            if (child != null && child.state() == MiniTransactionState.ACTIVE && current.get() == child) {
+                try {
+                    rollbackUncommitted(child);
+                } catch (RuntimeException releaseFailure) {
+                    failure.addSuppressed(releaseFailure);
+                }
+            }
+            throw failure;
+        } finally {
+            // 4、commit/rollback 均应已解绑；防御性清理后恢复外层 MTR identity。
+            current.remove();
+            if (parent != null) {
+                current.set(parent);
+            }
+        }
     }
 
     private MiniTransaction beginInternal(RedoAppendBudget budget) {

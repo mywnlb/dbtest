@@ -40,6 +40,65 @@ import static org.junit.jupiter.api.Assertions.*;
 class DatabaseEngineSessionIntegrationTest {
     @TempDir Path directory;
 
+    /**
+     * 公开 SQL 写链在非唯一 secondary leaf 冷页上应提交 Change Buffer mutation；随后 secondary point query
+     * 只能在发布前 merge 完成后返回该行。
+     */
+    @Test
+    void sqlInsertBuffersColdNonUniqueSecondaryAndLookupMergesIt() throws Exception {
+        EngineConfig config = new EngineConfig(directory, PageSize.ofBytes(16 * 1024), 16,
+                SpaceId.of(5), PageNo.of(64), 64, 100, Duration.ofSeconds(10),
+                64L * 1024 * 1024, List.of(), false, 4, Duration.ofMillis(100),
+                0, Duration.ofSeconds(3));
+        try (DatabaseEngine first = new DatabaseEngine(config)) {
+            first.open();
+            createChangeBufferTable(first);
+            createChangeBufferEvictorTable(first);
+            try (var session = first.openSession(options(true))) {
+                int i = 0;
+                do {
+                    String tag = "k%03d".formatted(i) + "x".repeat(340);
+                    session.execute("INSERT INTO cb_docs (id, tag) VALUES (" + i + ", '" + tag + "')");
+                    i++;
+                } while (secondaryRootLevel(first) == 0 && i < 100);
+                assertTrue(secondaryRootLevel(first) > 0, "fixture must split the secondary root");
+                for (int row = 0; row < 24; row++) {
+                    session.execute("INSERT INTO cb_evict (id, body) VALUES (" + row + ", '"
+                            + ("e".repeat(2000)) + "')");
+                }
+            }
+        }
+        // close 的 warmup dump 会恢复刚写过的 leaf；删除 sidecar 只影响性能提示，不改变数据库持久证据。
+        Files.deleteIfExists(config.bufferPoolDumpFile());
+
+        String candidate = "z" + "y".repeat(340);
+        try (DatabaseEngine reopened = new DatabaseEngine(config)) {
+            reopened.open();
+            assertEquals(cn.zhangyis.db.storage.changebuffer.ChangeBufferMode.ALL,
+                    reopened.storage().changeBufferSnapshot().effectiveMode());
+            try (var session = reopened.openSession(options(true))) {
+                for (int row = 0; row < 24; row++) {
+                    assertEquals(1, assertInstanceOf(QueryResult.class,
+                            session.execute("SELECT body FROM cb_evict WHERE id=" + row)).rows().size());
+                }
+                session.execute("INSERT INTO cb_docs (id, tag) VALUES (10000, '" + candidate + "')");
+                var buffered = reopened.storage().changeBufferSnapshot();
+                assertEquals(1L, buffered.pendingRecords(), () -> "unexpected Change Buffer snapshot: " + buffered);
+                assertEquals(1L, buffered.counters().bufferedOperations());
+
+                QueryResult found = assertInstanceOf(QueryResult.class,
+                        session.execute("SELECT id FROM cb_docs WHERE tag='" + candidate + "'"));
+                assertEquals(1, found.rows().size());
+                assertEquals(BigInteger.valueOf(10_000),
+                        assertInstanceOf(SqlValue.IntegerValue.class,
+                                found.rows().getFirst().values().getFirst()).value());
+                var merged = reopened.storage().changeBufferSnapshot();
+                assertEquals(0L, merged.pendingRecords());
+                assertEquals(1L, merged.counters().mergedOperations());
+            }
+        }
+    }
+
     /** engine close 先回滚活动 Session 并释放 metadata/row/LOB ownership，重开后未提交行不可见。 */
     @Test
     void closeRollsBackActiveLobSessionBeforeStorageShutdown() {
@@ -1043,6 +1102,65 @@ class DatabaseEngineSessionIntegrationTest {
                         List.of(new CreateIndexKeyPartSpec(
                                 ObjectName.of("id"), IndexOrder.ASC, 0))))),
                 Duration.ofSeconds(5));
+    }
+
+    /** 创建带宽字段非唯一升序二级索引的表，使少量行即可稳定触发 leaf split。 */
+    private static void createChangeBufferTable(DatabaseEngine database) {
+        database.ddl().createSchema(MdlOwnerId.of(902), ObjectName.of("app"), 1, 1,
+                Duration.ofSeconds(2));
+        database.ddl().createTable(MdlOwnerId.of(902), new CreateTableCommand(
+                QualifiedTableName.of("app", "cb_docs"), PageNo.of(256),
+                List.of(new CreateColumnSpec(ObjectName.of("id"),
+                                ColumnTypeDefinition.bigint(false, false)),
+                        new CreateColumnSpec(ObjectName.of("tag"), new ColumnTypeDefinition(
+                                DictionaryTypeId.VARCHAR, false, false, 600, 0, 1, 2, List.of()))),
+                List.of(new CreateIndexSpec(ObjectName.of("PRIMARY"), true, true,
+                                List.of(new CreateIndexKeyPartSpec(
+                                        ObjectName.of("id"), IndexOrder.ASC, 0))),
+                        new CreateIndexSpec(ObjectName.of("idx_tag"), false, false,
+                                List.of(new CreateIndexKeyPartSpec(
+                                        ObjectName.of("tag"), IndexOrder.ASC, 0))))),
+                Duration.ofSeconds(5));
+    }
+
+    /** 创建超过测试 Buffer Pool 容量的外部 LOB 页集，用公开 SELECT 驱逐 recovery 可能触碰过的目标 leaf。 */
+    private static void createChangeBufferEvictorTable(DatabaseEngine database) {
+        database.ddl().createTable(MdlOwnerId.of(904), new CreateTableCommand(
+                QualifiedTableName.of("app", "cb_evict"), PageNo.of(128),
+                List.of(new CreateColumnSpec(ObjectName.of("id"),
+                                ColumnTypeDefinition.bigint(false, false)),
+                        new CreateColumnSpec(ObjectName.of("body"), new ColumnTypeDefinition(
+                                DictionaryTypeId.TEXT, false, false, 65_535, 0, 1, 1, List.of()))),
+                List.of(new CreateIndexSpec(ObjectName.of("PRIMARY"), true, true,
+                        List.of(new CreateIndexKeyPartSpec(
+                                ObjectName.of("id"), IndexOrder.ASC, 0))))),
+                Duration.ofSeconds(5));
+    }
+
+    /** 从稳定 root 页头读取 idx_tag 当前层级；DD binding 中的 level 只是可刷新快照。 */
+    private static int secondaryRootLevel(DatabaseEngine database) {
+        try (var lease = database.dictionary().openTable(MdlOwnerId.of(903),
+                QualifiedTableName.of("app", "cb_docs"),
+                cn.zhangyis.db.dd.service.TableAccessIntent.READ, Duration.ofSeconds(2))) {
+            var table = lease.table();
+            long indexId = table.indexes().stream()
+                    .filter(index -> index.name().equals(ObjectName.of("idx_tag")))
+                    .findFirst().orElseThrow().id().value();
+            var binding = table.storageBinding().orElseThrow().indexes().stream()
+                    .filter(index -> index.indexId() == indexId).findFirst().orElseThrow();
+            var manager = database.storage().miniTransactionManager();
+            var read = manager.beginReadOnly();
+            try {
+                int level = database.storage().indexPageAccess().openIndexPage(
+                        read, binding.rootPageId(),
+                        cn.zhangyis.db.storage.buf.PageLatchMode.SHARED).header().level();
+                manager.commit(read);
+                return level;
+            } catch (RuntimeException failure) {
+                manager.rollbackUncommitted(read);
+                throw failure;
+            }
+        }
     }
 
     private SessionOptions options(boolean autocommit) {

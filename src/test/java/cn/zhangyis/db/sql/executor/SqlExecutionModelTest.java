@@ -3,6 +3,7 @@ package cn.zhangyis.db.sql.executor;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.dd.domain.ColumnTypeDefinition;
 import cn.zhangyis.db.dd.domain.DictionaryTypeId;
+import cn.zhangyis.db.sql.type.SqlValue;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;

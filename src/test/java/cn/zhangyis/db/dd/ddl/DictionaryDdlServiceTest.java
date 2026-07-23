@@ -31,7 +31,7 @@ import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.engine.EngineConfig;
 import cn.zhangyis.db.storage.engine.StorageEngine;
 import cn.zhangyis.db.storage.engine.EngineTablespaceConfig;
-import cn.zhangyis.db.storage.engine.RecoveryExportWriteRejectedException;
+import cn.zhangyis.db.common.exception.RecoveryExportWriteRejectedException;
 import cn.zhangyis.db.dd.exception.TableRecoveryUnavailableException;
 import cn.zhangyis.db.dd.recovery.backup.RecoveryBackupArtifact;
 import cn.zhangyis.db.storage.api.TablePurgeBarrier;

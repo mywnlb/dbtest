@@ -32,7 +32,7 @@ import cn.zhangyis.db.storage.fil.online.OnlineIndexChangeLogFiles;
 import cn.zhangyis.db.storage.api.ddl.online.OnlineDdlAbortReason;
 import cn.zhangyis.db.storage.api.ddl.online.OnlineDdlTablePhase;
 import cn.zhangyis.db.storage.api.ddl.online.OnlineIndexBuildId;
-import cn.zhangyis.db.storage.engine.RecoveryExportWriteRejectedException;
+import cn.zhangyis.db.common.exception.RecoveryExportWriteRejectedException;
 import cn.zhangyis.db.storage.fil.catalog.FileInternalCatalogStore;
 import cn.zhangyis.db.storage.fil.catalog.FileDictionaryRecoveryManifestStore;
 import cn.zhangyis.db.engine.recovery.DatabaseInstanceFileLock;
@@ -49,6 +49,10 @@ import cn.zhangyis.db.session.SqlSession;
 import cn.zhangyis.db.sql.binder.DefaultSqlBinder;
 import cn.zhangyis.db.sql.binder.SqlTypeCoercion;
 import cn.zhangyis.db.sql.executor.DefaultSqlExecutor;
+import cn.zhangyis.db.sql.optimizer.DefaultSqlStatementCompiler;
+import cn.zhangyis.db.sql.optimizer.HeuristicQueryOptimizer;
+import cn.zhangyis.db.sql.optimizer.SqlStatementCompiler;
+import cn.zhangyis.db.sql.optimizer.logical.BoundToLogicalConverter;
 import cn.zhangyis.db.sql.parser.DefaultSqlParser;
 
 import java.io.IOException;
@@ -167,6 +171,10 @@ public final class DatabaseEngine implements AutoCloseable {
      * 本对象持有的 {@code sqlBinder} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
      */
     private DefaultSqlBinder sqlBinder;
+    /**
+     * 实例级无状态 SQL 编译 pipeline；由组合根选择具体 optimizer，所有 Session 只依赖稳定编译接口。
+     */
+    private SqlStatementCompiler sqlCompiler;
     /**
      * 本对象持有的 {@code sessions} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
      */
@@ -359,6 +367,8 @@ public final class DatabaseEngine implements AutoCloseable {
                 sqlMetadataMapper = new DictionaryStorageMetadataMapper();
                 sqlParser = new DefaultSqlParser();
                 sqlBinder = new DefaultSqlBinder(new SqlTypeCoercion());
+                sqlCompiler = new DefaultSqlStatementCompiler(
+                        sqlBinder, new BoundToLogicalConverter(), new HeuristicQueryOptimizer());
                 sessions = new SessionRegistry();
                 state = DatabaseEngineState.OPEN;
                 log.info("database engine opened: tablespaces={} dictionaryVersion={}", tablespaces.size(),
@@ -442,7 +452,8 @@ public final class DatabaseEngine implements AutoCloseable {
             DefaultSqlStorageGateway gateway = new DefaultSqlStorageGateway(storage, sqlMetadataMapper,
                     options.rowLockTimeout(),
                     accessMode == DatabaseAccessMode.RECOVERY_EXPORT_READ_ONLY);
-            DefaultSqlSession session = new DefaultSqlSession(id, options, dictionary, sqlParser, sqlBinder,
+            DefaultSqlSession session = new DefaultSqlSession(
+                    id, options, dictionary, sqlParser, sqlBinder, sqlCompiler,
                     new DefaultSqlExecutor(gateway), gateway, new DefaultSqlDdlGateway(ddl),
                     xaCoordinator,
                     sessionExecutionGate,
@@ -629,6 +640,7 @@ public final class DatabaseEngine implements AutoCloseable {
         sqlMetadataMapper = null;
         sqlParser = null;
         sqlBinder = null;
+        sqlCompiler = null;
         sessions = null;
         failure = closeOne(xaRegistry, failure);
         xaRegistry = null;

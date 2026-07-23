@@ -1,11 +1,11 @@
 package cn.zhangyis.db.session;
 
 import cn.zhangyis.db.dd.domain.MdlOwnerId;
-import cn.zhangyis.db.sql.binder.bound.BoundClusteredInsert;
-import cn.zhangyis.db.sql.binder.bound.BoundPointSelect;
-import cn.zhangyis.db.sql.binder.bound.BoundSecondaryRangeSelect;
-import cn.zhangyis.db.sql.binder.bound.BoundUpdate;
-import cn.zhangyis.db.sql.binder.bound.BoundDelete;
+import cn.zhangyis.db.sql.optimizer.physical.PhysicalInsert;
+import cn.zhangyis.db.sql.optimizer.physical.PhysicalPointSelect;
+import cn.zhangyis.db.sql.optimizer.physical.PhysicalSecondaryRangeSelect;
+import cn.zhangyis.db.sql.optimizer.physical.PhysicalPointUpdate;
+import cn.zhangyis.db.sql.optimizer.physical.PhysicalPointDelete;
 import cn.zhangyis.db.sql.binder.bound.SelectLockMode;
 import cn.zhangyis.db.sql.executor.SqlRow;
 import cn.zhangyis.db.sql.executor.storage.*;
@@ -132,44 +132,44 @@ class SessionTransactionPolicyTest {
                 SqlStatementDeadline deadline) {
             events.add("release-savepoint");
         }
-        @Override public SqlWriteOutcome insert(SqlTransactionHandle transaction, BoundClusteredInsert statement,
+        @Override public SqlWriteOutcome insert(SqlTransactionHandle transaction, PhysicalInsert statement,
                                                 SqlStatementDeadline deadline) {
             events.add("insert"); return new SqlWriteOutcome(1, false);
         }
         @Override public Optional<SqlRow> selectPoint(SqlTransactionHandle transaction,
-                                                     BoundPointSelect statement,
+                                                     PhysicalPointSelect statement,
                                                      SqlStatementDeadline deadline) {
             events.add("select"); return Optional.empty();
         }
         @Override public List<SqlRow> selectRange(SqlTransactionHandle transaction,
-                                                 BoundSecondaryRangeSelect statement,
+                                                 PhysicalSecondaryRangeSelect statement,
                                                  SqlStatementDeadline deadline) {
             lastRangeLockMode = statement.lockMode();
             events.add("range"); return List.of();
         }
         @Override public List<SqlRow> selectRange(SqlTransactionHandle transaction,
-                                                 cn.zhangyis.db.sql.binder.bound.BoundRangeSelect statement,
+                                                 cn.zhangyis.db.sql.optimizer.physical.PhysicalRangeSelect statement,
                                                  SqlStatementDeadline deadline) {
             lastRangeLockMode = statement.lockMode();
             events.add("comparison-range"); return List.of();
         }
-        @Override public SqlWriteOutcome update(SqlTransactionHandle transaction, BoundUpdate statement,
+        @Override public SqlWriteOutcome update(SqlTransactionHandle transaction, PhysicalPointUpdate statement,
                                                 SqlStatementDeadline deadline) {
             events.add("update"); return new SqlWriteOutcome(1, false);
         }
-        @Override public SqlWriteOutcome delete(SqlTransactionHandle transaction, BoundDelete statement,
+        @Override public SqlWriteOutcome delete(SqlTransactionHandle transaction, PhysicalPointDelete statement,
                                                 SqlStatementDeadline deadline) {
             events.add("delete"); return new SqlWriteOutcome(1, false);
         }
         @Override public SqlWriteOutcome updateRange(
                 SqlTransactionHandle transaction,
-                cn.zhangyis.db.sql.binder.bound.BoundRangeUpdate statement,
+                cn.zhangyis.db.sql.optimizer.physical.PhysicalRangeUpdate statement,
                 SqlStatementDeadline deadline) {
             events.add("range-update"); return new SqlWriteOutcome(0, false);
         }
         @Override public SqlWriteOutcome deleteRange(
                 SqlTransactionHandle transaction,
-                cn.zhangyis.db.sql.binder.bound.BoundRangeDelete statement,
+                cn.zhangyis.db.sql.optimizer.physical.PhysicalRangeDelete statement,
                 SqlStatementDeadline deadline) {
             events.add("range-delete"); return new SqlWriteOutcome(0, false);
         }

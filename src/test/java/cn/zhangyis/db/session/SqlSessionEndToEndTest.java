@@ -5,7 +5,7 @@ import cn.zhangyis.db.dd.domain.*;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.engine.DatabaseEngine;
 import cn.zhangyis.db.sql.executor.QueryResult;
-import cn.zhangyis.db.sql.executor.SqlValue;
+import cn.zhangyis.db.sql.type.SqlValue;
 import cn.zhangyis.db.sql.executor.UpdateResult;
 import cn.zhangyis.db.sql.executor.storage.SqlIsolationLevel;
 import cn.zhangyis.db.sql.executor.storage.exception.SqlStorageException;
@@ -18,6 +18,7 @@ import java.nio.file.Path;
 import java.time.*;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -117,6 +118,100 @@ class SqlSessionEndToEndTest {
         }
     }
 
+    /**
+     * 从 Session 入口贯穿 Parser、Binder、Optimizer 和真实 residual evaluator，验证
+     * OR/NOT/括号/null-test 的三值语义以及 point SELECT、range DML 的安全边界。
+     */
+    @Test
+    void executesBooleanExpressionsAndNullTestsEndToEnd() {
+        try (DatabaseEngine database = new DatabaseEngine(
+                SqlSessionTestSupport.config(directory))) {
+            database.open();
+            SqlSessionTestSupport.createSchema(database);
+            createBooleanExpressionTable(database);
+            try (SqlSession session = database.openSession(
+                    SqlSessionTestSupport.options(
+                            true, SqlIsolationLevel.REPEATABLE_READ,
+                            Duration.ofSeconds(3)))) {
+                session.execute("""
+                        INSERT INTO boolean_docs (id,status,note)
+                        VALUES (1,'open',NULL)
+                        """);
+                session.execute("""
+                        INSERT INTO boolean_docs (id,status,note)
+                        VALUES (2,'closed','payload')
+                        """);
+                session.execute("""
+                        INSERT INTO boolean_docs (id,status,note)
+                        VALUES (3,'open','other')
+                        """);
+
+                QueryResult pointWithResidual = assertInstanceOf(
+                        QueryResult.class, session.execute("""
+                                SELECT id FROM boolean_docs
+                                WHERE id=1 AND
+                                      (note IS NULL OR NOT status='open')
+                                """));
+                assertEquals(1, pointWithResidual.rows().size());
+
+                QueryResult rootOr = assertInstanceOf(
+                        QueryResult.class, session.execute("""
+                                SELECT id FROM boolean_docs
+                                WHERE id=3 OR note IS NULL
+                                """));
+                assertEquals(Set.of(BigInteger.ONE,
+                                BigInteger.valueOf(3)),
+                        rootOr.rows().stream()
+                                .map(row -> assertInstanceOf(
+                                        SqlValue.IntegerValue.class,
+                                        row.values().getFirst()).value())
+                                .collect(java.util.stream.Collectors.toSet()));
+
+                QueryResult notNull = assertInstanceOf(
+                        QueryResult.class, session.execute("""
+                                SELECT id FROM boolean_docs
+                                WHERE NOT (note IS NULL)
+                                """));
+                assertEquals(Set.of(BigInteger.TWO,
+                                BigInteger.valueOf(3)),
+                        notNull.rows().stream()
+                                .map(row -> assertInstanceOf(
+                                        SqlValue.IntegerValue.class,
+                                        row.values().getFirst()).value())
+                                .collect(java.util.stream.Collectors.toSet()));
+
+                QueryResult lockingResidual = assertInstanceOf(
+                        QueryResult.class, session.execute("""
+                                SELECT id FROM boolean_docs
+                                WHERE note IS NULL OR status='closed'
+                                FOR SHARE
+                                """));
+                assertEquals(Set.of(BigInteger.ONE, BigInteger.TWO),
+                        lockingResidual.rows().stream()
+                                .map(row -> assertInstanceOf(
+                                        SqlValue.IntegerValue.class,
+                                        row.values().getFirst()).value())
+                                .collect(java.util.stream.Collectors.toSet()));
+
+                assertEquals(0, assertInstanceOf(
+                        UpdateResult.class, session.execute("""
+                                UPDATE boolean_docs SET status='ignored'
+                                WHERE id=1 AND note IS NOT NULL
+                                """)).affectedRows());
+                assertEquals(1, assertInstanceOf(
+                        UpdateResult.class, session.execute("""
+                                DELETE FROM boolean_docs
+                                WHERE id=2 AND
+                                      (note IS NULL OR status='closed')
+                                """)).affectedRows());
+                assertTrue(assertInstanceOf(
+                        QueryResult.class, session.execute("""
+                                SELECT id FROM boolean_docs WHERE id=2
+                                """)).rows().isEmpty());
+            }
+        }
+    }
+
     private static QueryResult query(SqlSession session, String table, long id) {
         return assertInstanceOf(QueryResult.class,
                 session.execute("SELECT * FROM " + table + " WHERE id=" + id));
@@ -178,6 +273,45 @@ class SqlSessionEndToEndTest {
                                 List.of(new CreateIndexKeyPartSpec(
                                         ObjectName.of("category"), IndexOrder.ASC, 0))))),
                 Duration.ofSeconds(5));
+    }
+
+    /**
+     * 创建 nullable external TEXT 表，确保 null-test 不依赖 LOB hydration 或字符串比较。
+     *
+     * @param database 已打开且已创建 app schema 的数据库实例
+     */
+    private static void createBooleanExpressionTable(
+            DatabaseEngine database) {
+        database.ddl().createTable(
+                MdlOwnerId.of(10_030),
+                new CreateTableCommand(
+                        QualifiedTableName.of(
+                                "app", "boolean_docs"),
+                        PageNo.of(448),
+                        List.of(
+                                new CreateColumnSpec(
+                                        ObjectName.of("id"),
+                                        ColumnTypeDefinition.bigint(
+                                                false, false)),
+                                new CreateColumnSpec(
+                                        ObjectName.of("status"),
+                                        new ColumnTypeDefinition(
+                                                DictionaryTypeId.VARCHAR,
+                                                false, false, 32, 0,
+                                                1, 2, List.of())),
+                                new CreateColumnSpec(
+                                        ObjectName.of("note"),
+                                        new ColumnTypeDefinition(
+                                                DictionaryTypeId.TEXT,
+                                                false, true, 65_535, 0,
+                                                1, 1, List.of()))),
+                        List.of(new CreateIndexSpec(
+                                ObjectName.of("PRIMARY"),
+                                true, true,
+                                List.of(new CreateIndexKeyPartSpec(
+                                        ObjectName.of("id"),
+                                        IndexOrder.ASC, 0))))),
+                        Duration.ofSeconds(5));
     }
 
     private static CreateColumnSpec column(String name, ColumnTypeDefinition type) {

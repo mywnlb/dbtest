@@ -1,5 +1,6 @@
 package cn.zhangyis.db.storage.engine;
 
+import cn.zhangyis.db.common.exception.RecoveryExportWriteRejectedException;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 
 import java.util.concurrent.atomic.AtomicReference;

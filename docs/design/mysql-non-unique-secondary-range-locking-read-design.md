@@ -1,5 +1,11 @@
 # Non-Unique Secondary Range / Locking Read Design
 
+> 2026-07-23 状态说明：本文保留 non-unique range/locking-read 的存储、锁与 MVCC 设计；原
+> `BoundSecondaryRangeSelect` 物理形状已迁移为 optimizer 输出的 `PhysicalSecondaryRangeSelect`，
+> Binder 现在只保留 typed residual/read intent。规划分层见
+> [Calcite-Lite ADR](../adr/2026-07-23-calcite-lite-sql-planning.md)，当前接线以
+> [current-implementation-map.md](current-implementation-map.md) 为准。
+
 ## 1. 目标与依据
 
 本设计收束 SQL 读主线中“完整 non-unique secondary logical key 等值，映射为物理 B+Tree prefix range”的

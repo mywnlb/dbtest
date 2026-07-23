@@ -2,6 +2,12 @@
 
 版本：2026-07-16
 
+> 2026-07-23 状态说明：本文保留最初 primary-point/Session 切片的决策与恢复语义；其中
+> “Binder 直接输出物理 Bound” 已由
+> [Calcite-Lite ADR](../adr/2026-07-23-calcite-lite-sql-planning.md) 取代。当前生产链为 semantic
+> Bound -> LogicalPlan -> PhysicalPlan，准确接线见
+> [current-implementation-map.md](current-implementation-map.md)；adapter 的事务、MVCC、LOB 与回滚边界未变。
+
 ## 1. 背景
 
 `storage-backlog.md` 2.8 要求把已经存在的 Data Dictionary、Transaction/MVCC、单聚簇索引 DML、

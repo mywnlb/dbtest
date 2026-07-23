@@ -8,24 +8,24 @@ import cn.zhangyis.db.dd.domain.ColumnTypeDefinition;
 import cn.zhangyis.db.dd.domain.DictionaryTypeId;
 import cn.zhangyis.db.dd.domain.IndexDefinition;
 import cn.zhangyis.db.dd.domain.TableDefinition;
-import cn.zhangyis.db.sql.binder.bound.BoundClusteredInsert;
-import cn.zhangyis.db.sql.binder.bound.BoundPointSelect;
-import cn.zhangyis.db.sql.binder.bound.BoundUpdate;
-import cn.zhangyis.db.sql.binder.bound.BoundDelete;
-import cn.zhangyis.db.sql.binder.bound.BoundSecondaryRangeSelect;
-import cn.zhangyis.db.sql.binder.bound.BoundRangeSelect;
-import cn.zhangyis.db.sql.binder.bound.BoundRangeUpdate;
-import cn.zhangyis.db.sql.binder.bound.BoundRangeDelete;
-import cn.zhangyis.db.sql.binder.bound.BoundIndexRange;
-import cn.zhangyis.db.sql.binder.bound.BoundRangeEndpoint;
-import cn.zhangyis.db.sql.binder.bound.BoundRowPredicate;
-import cn.zhangyis.db.sql.binder.bound.BoundRowPredicateOperator;
 import cn.zhangyis.db.sql.binder.bound.SelectLockMode;
-import cn.zhangyis.db.sql.binder.bound.PointAccessKind;
+import cn.zhangyis.db.sql.expression.BoundColumnReference;
+import cn.zhangyis.db.sql.expression.BoundComparison;
+import cn.zhangyis.db.sql.expression.BoundConjunction;
+import cn.zhangyis.db.sql.expression.BoundDisjunction;
+import cn.zhangyis.db.sql.expression.BoundExpression;
+import cn.zhangyis.db.sql.expression.BoundLiteral;
+import cn.zhangyis.db.sql.expression.BoundNegation;
+import cn.zhangyis.db.sql.expression.BoundNullTest;
+import cn.zhangyis.db.sql.expression.BoundNullTestOperator;
+import cn.zhangyis.db.sql.expression.BoundTruthLiteral;
 import cn.zhangyis.db.sql.executor.SqlRow;
-import cn.zhangyis.db.sql.executor.SqlValue;
+import cn.zhangyis.db.sql.optimizer.logical.PredicateSet;
+import cn.zhangyis.db.sql.type.SqlBoolean;
+import cn.zhangyis.db.sql.type.SqlValue;
 import cn.zhangyis.db.sql.executor.storage.*;
 import cn.zhangyis.db.sql.executor.storage.exception.*;
+import cn.zhangyis.db.sql.optimizer.physical.*;
 import cn.zhangyis.db.storage.api.dml.*;
 import cn.zhangyis.db.storage.btree.BTreeIndex;
 import cn.zhangyis.db.storage.btree.BTreeCurrentReadMode;
@@ -36,7 +36,7 @@ import cn.zhangyis.db.storage.btree.SearchKeyComparator;
 import cn.zhangyis.db.storage.btree.SecondaryIndexMetadata;
 import cn.zhangyis.db.storage.engine.EngineState;
 import cn.zhangyis.db.storage.engine.StorageEngine;
-import cn.zhangyis.db.storage.engine.RecoveryExportWriteRejectedException;
+import cn.zhangyis.db.common.exception.RecoveryExportWriteRejectedException;
 import cn.zhangyis.db.storage.mtr.MiniTransaction;
 import cn.zhangyis.db.storage.mtr.MiniTransactionState;
 import cn.zhangyis.db.storage.record.format.LogicalRecord;
@@ -406,7 +406,7 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
      * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     @Override
-    public SqlWriteOutcome insert(SqlTransactionHandle transaction, BoundClusteredInsert statement,
+    public SqlWriteOutcome insert(SqlTransactionHandle transaction, PhysicalInsert statement,
                                   SqlStatementDeadline deadline) {
         rejectRecoveryExportWrite("INSERT");
         if (statement == null || deadline == null) {
@@ -452,11 +452,11 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
      * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     @Override
-    public SqlWriteOutcome update(SqlTransactionHandle transaction, BoundUpdate statement,
+    public SqlWriteOutcome update(SqlTransactionHandle transaction, PhysicalPointUpdate statement,
                                   SqlStatementDeadline deadline) {
         rejectRecoveryExportWrite("UPDATE");
         if (statement == null || deadline == null) {
-            throw new DatabaseValidationException("bound UPDATE/deadline must not be null");
+            throw new DatabaseValidationException("physical point UPDATE/deadline must not be null");
         }
         return withActive(transaction, deadline, handle -> {
             MappedTableStorage mapped = mapper.map(statement.table());
@@ -499,11 +499,11 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
      * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     @Override
-    public SqlWriteOutcome delete(SqlTransactionHandle transaction, BoundDelete statement,
+    public SqlWriteOutcome delete(SqlTransactionHandle transaction, PhysicalPointDelete statement,
                                   SqlStatementDeadline deadline) {
         rejectRecoveryExportWrite("DELETE");
         if (statement == null || deadline == null) {
-            throw new DatabaseValidationException("bound DELETE/deadline must not be null");
+            throw new DatabaseValidationException("physical point DELETE/deadline must not be null");
         }
         return withActive(transaction, deadline, handle -> {
             MappedTableStorage mapped = mapper.map(statement.table());
@@ -532,12 +532,13 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
     }
 
     /**
-     * 聚簇主键点查：RR 复用事务 ReadView，RC 每语句 finally 注销；整行 LOB hydrate 完成后才投影。
+     * 聚簇/唯一二级点查：access key 只缩小候选，完整 residual 决定 SQL WHERE 真值；
+     * RR 复用事务 ReadView，RC 每语句 finally 注销，整行 LOB hydrate 完成后才投影。
      * <ol>
      *     <li>在 deadline 内进入 handle，并把 exact DD binding 映射为 index/key。</li>
-     *     <li>创建隔离级别对应的 ReadView；RC view 立即登记到 purge low-water 集合。</li>
-     *     <li>执行 MVCC 点查，并在同一个 view 存活期间用短 MTR hydrate 所有 external LOB。</li>
-     *     <li>完整行 hydration 后才按 projection ordinal 转换公开 SqlValue，避免返回 partial row/reference。</li>
+     *     <li>按隔离级别选择读取语义：RU current read 不创建 view，RR/RC 创建或复用 ReadView。</li>
+     *     <li>执行 MVCC/current-read 点查，并用完整聚簇行求值 residual；只有 TRUE 可以进入结果。</li>
+     *     <li>在同一个 view 存活期间用短 MTR hydrate external LOB，完成后才按 projection ordinal 转换公开 SqlValue。</li>
      *     <li>finally 注销 RC view；读取失败为主异常，close 失败作为 suppressed，fatal 严重度不得降级。</li>
      * </ol>
      *
@@ -548,10 +549,10 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
      * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     @Override
-    public Optional<SqlRow> selectPoint(SqlTransactionHandle transaction, BoundPointSelect statement,
+    public Optional<SqlRow> selectPoint(SqlTransactionHandle transaction, PhysicalPointSelect statement,
                                         SqlStatementDeadline deadline) {
         if (statement == null || deadline == null) {
-            throw new DatabaseValidationException("bound SELECT/deadline must not be null");
+            throw new DatabaseValidationException("physical point SELECT/deadline must not be null");
         }
         return withActive(transaction, deadline, handle -> {
             // 1. handle wait 已由 withActive 截断，下面所有 LOB 阶段继续消费同一绝对 deadline。
@@ -562,6 +563,7 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
             if (statement.keyValues().stream().anyMatch(SqlValue.NullValue.class::isInstance)) {
                 return Optional.empty();
             }
+            // 2. RU 读取瞬间的当前未标删版本，不登记 ReadView；后续阶段继续使用同一 deadline。
             if (handle.transaction.isolationLevel() == IsolationLevel.READ_UNCOMMITTED) {
                 List<LogicalRecord> records;
                 if (statement.accessKind() == PointAccessKind.CLUSTERED_PRIMARY) {
@@ -570,14 +572,20 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
                 } else {
                     records = scanReadUncommittedBatches(mapped, statement.accessIndexId(),
                             equalityRange(statement.keyValues()),
-                            equalityPredicates(statement.table(), statement.accessIndexId(),
-                                    statement.keyValues()),
+                            statement.predicates(),
                             deadline);
                     if (records.size() > 1) {
                         throw new SqlStorageException(
                                 "multiple current rows for logical unique secondary key");
                     }
                 }
+                // 3. RU 聚簇点查也必须执行完整 residual；access key 不能替代 SQL WHERE 真值。
+                records = records.stream()
+                        .filter(record -> matchesPredicates(
+                                record, statement.predicates(),
+                                clusteredIndex))
+                        .toList();
+                // 4. 所有候选通过 residual 后才 hydrate/project，失败不会泄漏 partial row。
                 List<SqlRow> projected = projectRows(records, statement.projectionOrdinals(),
                         statement.table(), clusteredIndex, deadline);
                 return projected.stream().findFirst();
@@ -588,14 +596,19 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
             ReadView view = views.openReadView(handle.transaction);
             RuntimeException failure = null;
             try {
-                // 3. view 覆盖版本选择与外置引用解引用，避免 RC 提前注销后 purge 回收旧 LOB ownership。
+                // 3. view 覆盖版本选择与 residual 求值，避免 access key 被误当成最终 SQL truth。
                 Optional<LogicalRecord> record = statement.accessKind() == PointAccessKind.CLUSTERED_PRIMARY
                         ? engine.mvccReader().read(view, clusteredIndex, key)
                         : engine.secondaryMvccReader().readUnique(view, mapped.tableIndexes(),
                                 mapped.tableIndexes().requireSecondary(statement.accessIndexId()), key);
                 if (record.isEmpty()) return Optional.empty();
+                if (!matchesPredicates(
+                        record.orElseThrow(), statement.predicates(),
+                        clusteredIndex)) {
+                    return Optional.empty();
+                }
 
-                // RC view 必须覆盖 external chain hydration；否则 purge low water 可能在引用解引用前越过该版本。
+                // 4. RC view 必须覆盖 external chain hydration；否则 purge low water 可能在引用解引用前越过该版本。
                 List<ColumnValue> hydrated = hydrateExternalValues(
                         record.orElseThrow().columnValues(), clusteredIndex, deadline);
                 // 4. hydration 全部成功后才构造公开结果，storage LobReference 永不越过 gateway。
@@ -643,10 +656,11 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
      * @throws SqlStorageException metadata 映射、MVCC/current-read、容量或 LOB 阶段失败时抛出并保留 cause。
      */
     @Override
-    public List<SqlRow> selectRange(SqlTransactionHandle transaction, BoundSecondaryRangeSelect statement,
+    public List<SqlRow> selectRange(SqlTransactionHandle transaction, PhysicalSecondaryRangeSelect statement,
                                     SqlStatementDeadline deadline) {
         if (statement == null || deadline == null) {
-            throw new DatabaseValidationException("bound range SELECT/deadline must not be null");
+            throw new DatabaseValidationException(
+                    "physical secondary range SELECT/deadline must not be null");
         }
         return withActive(transaction, deadline, handle -> {
             // 1. mapper 只消费 Binder 固定的 exact table version；logical key 不包含 storage clustered suffix。
@@ -668,7 +682,11 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
                                     ? BTreeCurrentReadMode.FOR_SHARE : BTreeCurrentReadMode.FOR_UPDATE,
                             deadline.cap(operationTimeout, "secondary locking range"));
                     // 3/4. 全部行依次 hydrate/project；异常直接抛出，不返回已构造前缀。
-                    return projectRows(records, statement.projectionOrdinals(), statement.table(),
+                    List<LogicalRecord> matched = records.stream()
+                            .filter(row -> matchesPredicates(
+                                    row, statement.predicates(), clusteredIndex))
+                            .toList();
+                    return projectRows(matched, statement.projectionOrdinals(), statement.table(),
                             clusteredIndex, deadline);
                 } catch (RuntimeException readFailure) {
                     throw adapt("secondary locking range/LOB read failed", readFailure);
@@ -679,8 +697,7 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
                 List<LogicalRecord> records = scanReadUncommittedBatches(
                         mapped, statement.accessIndexId(),
                         equalityRange(statement.logicalKeyValues()),
-                        equalityPredicates(statement.table(), statement.accessIndexId(),
-                                statement.logicalKeyValues()),
+                        statement.predicates(),
                         deadline);
                 return projectRows(records, statement.projectionOrdinals(), statement.table(),
                         clusteredIndex, deadline);
@@ -694,6 +711,8 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
             try {
                 List<LogicalRecord> records = engine.secondaryMvccReader().readRange(
                         view, mapped.tableIndexes(), secondary, logicalKey);
+                records = records.stream().filter(row -> matchesPredicates(
+                        row, statement.predicates(), clusteredIndex)).toList();
                 // 3/4. projection 只有在每条 external value hydrate 完整后才创建，Storage reference 不越过 port。
                 return projectRows(records, statement.projectionOrdinals(), statement.table(),
                         clusteredIndex, deadline);
@@ -731,20 +750,21 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
      * </ol>
      *
      * @param transaction 本 gateway 创建且仍 ACTIVE 的不透明事务句柄
-     * @param statement Binder 固定的 exact-version typed range plan
+     * @param statement Optimizer 产生的 exact-version typed physical range plan
      * @param deadline 覆盖分页、锁等待、undo 与 LOB hydration 的绝对期限
      * @return 完整不可变结果；empty/无匹配时为空，不返回 partial prefix
      * @throws DatabaseValidationException 参数缺失时抛出
      * @throws SqlStorageException 扫描、回表、容量、锁或 LOB 阶段失败时抛出
      */
     @Override
-    public List<SqlRow> selectRange(SqlTransactionHandle transaction, BoundRangeSelect statement,
+    public List<SqlRow> selectRange(SqlTransactionHandle transaction, PhysicalRangeSelect statement,
                                     SqlStatementDeadline deadline) {
         if (statement == null || deadline == null) {
-            throw new DatabaseValidationException("bound comparison range SELECT/deadline must not be null");
+            throw new DatabaseValidationException(
+                    "physical comparison range SELECT/deadline must not be null");
         }
         return withActive(transaction, deadline, handle -> {
-            // 1、empty 是 Binder 的纯证明，不需要创建 view、分配 transaction id 或取得行锁。
+            // 1、empty 是 Optimizer 的纯证明，不需要创建 view、分配 transaction id 或取得行锁。
             if (statement.empty()) {
                 return List.of();
             }
@@ -766,11 +786,12 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
      * 范围 UPDATE 先完成 FOR UPDATE scan 与 identity 物化，再在一个 statement guard 内逐点应用 patch。
      */
     @Override
-    public SqlWriteOutcome updateRange(SqlTransactionHandle transaction, BoundRangeUpdate statement,
+    public SqlWriteOutcome updateRange(SqlTransactionHandle transaction, PhysicalRangeUpdate statement,
                                        SqlStatementDeadline deadline) {
         rejectRecoveryExportWrite("range UPDATE");
         if (statement == null || deadline == null) {
-            throw new DatabaseValidationException("bound range UPDATE/deadline must not be null");
+            throw new DatabaseValidationException(
+                    "physical range UPDATE/deadline must not be null");
         }
         return withActive(transaction, deadline, handle -> {
             // 1、无匹配证明早于事务 id、锁和 undo；不会把 no-op 误记为写事务。
@@ -815,11 +836,12 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
      * 范围 DELETE 与 UPDATE 共享先物化 identity 的 Halloween/partial 防线，随后在同一 guard 内逐点标删。
      */
     @Override
-    public SqlWriteOutcome deleteRange(SqlTransactionHandle transaction, BoundRangeDelete statement,
+    public SqlWriteOutcome deleteRange(SqlTransactionHandle transaction, PhysicalRangeDelete statement,
                                        SqlStatementDeadline deadline) {
         rejectRecoveryExportWrite("range DELETE");
         if (statement == null || deadline == null) {
-            throw new DatabaseValidationException("bound range DELETE/deadline must not be null");
+            throw new DatabaseValidationException(
+                    "physical range DELETE/deadline must not be null");
         }
         return withActive(transaction, deadline, handle -> {
             // 1、empty 不触发事务写身份。
@@ -857,7 +879,7 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
      */
     private List<SqlRow> readConsistentRange(
             EngineSqlTransactionHandle handle, MappedTableStorage mapped,
-            BoundRangeSelect statement, SqlStatementDeadline deadline) {
+            PhysicalRangeSelect statement, SqlStatementDeadline deadline) {
         if (handle.transaction.isolationLevel() == IsolationLevel.READ_UNCOMMITTED) {
             List<LogicalRecord> records = scanReadUncommittedBatches(
                     mapped, statement.accessIndexId(), statement.indexRange(),
@@ -900,7 +922,7 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
      */
     private List<LogicalRecord> scanMvccBatches(
             ReadView view, MappedTableStorage mapped, long accessIndexId,
-            BoundIndexRange range, List<BoundRowPredicate> predicates,
+            IndexRange range, PredicateSet predicates,
             SqlStatementDeadline deadline) {
         BTreeIndex access = mapped.index(accessIndexId);
         BTreeIndex clustered = mapped.clusteredIndex();
@@ -969,7 +991,7 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
      */
     private List<LogicalRecord> scanReadUncommittedBatches(
             MappedTableStorage mapped, long accessIndexId,
-            BoundIndexRange range, List<BoundRowPredicate> predicates,
+            IndexRange range, PredicateSet predicates,
             SqlStatementDeadline deadline) {
         BTreeIndex access = mapped.index(accessIndexId);
         BTreeIndex clustered = mapped.clusteredIndex();
@@ -1034,7 +1056,7 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
      */
     private LockedSelection readLockingRange(
             EngineSqlTransactionHandle handle, MappedTableStorage mapped, long accessIndexId,
-            BoundIndexRange range, List<BoundRowPredicate> predicates, SelectLockMode lockMode,
+            IndexRange range, PredicateSet predicates, SelectLockMode lockMode,
             SqlStatementDeadline deadline) {
         BTreeIndex access = mapped.index(accessIndexId);
         BTreeIndex clustered = mapped.clusteredIndex();
@@ -1112,88 +1134,167 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
         return rows.stream().map(row -> keyFromRow(row.columnValues(), clustered)).toList();
     }
 
-    private BTreeScanRange toBTreeRange(BoundIndexRange range, BTreeIndex access,
+    private BTreeScanRange toBTreeRange(IndexRange range, BTreeIndex access,
                                         SearchKey continuation, int limit) {
         Optional<SearchKey> lower = continuation == null
                 ? range.lower().map(endpoint -> endpointKey(endpoint, access))
                 : Optional.of(continuation);
         boolean lowerInclusive = continuation == null
-                ? range.lower().map(BoundRangeEndpoint::inclusive).orElse(true) : false;
+                ? range.lower().map(RangeEndpoint::inclusive).orElse(true) : false;
         Optional<SearchKey> upper = range.upper().map(endpoint -> endpointKey(endpoint, access));
-        boolean upperInclusive = range.upper().map(BoundRangeEndpoint::inclusive).orElse(true);
+        boolean upperInclusive = range.upper().map(RangeEndpoint::inclusive).orElse(true);
         return BTreeScanRange.of(lower, lowerInclusive, upper, upperInclusive, limit);
     }
 
-    private SearchKey endpointKey(BoundRangeEndpoint endpoint, BTreeIndex access) {
+    private SearchKey endpointKey(RangeEndpoint endpoint, BTreeIndex access) {
         return new SearchKey(toKeyValues(endpoint.keyValues(), access));
     }
 
     /** 把完整 logical equality key 表达为双侧闭合前缀范围。 */
-    private static BoundIndexRange equalityRange(List<SqlValue> values) {
-        BoundRangeEndpoint endpoint = new BoundRangeEndpoint(values, true);
-        return new BoundIndexRange(Optional.of(endpoint), Optional.of(endpoint));
+    private static IndexRange equalityRange(List<SqlValue> values) {
+        RangeEndpoint endpoint = new RangeEndpoint(values, true);
+        return new IndexRange(Optional.of(endpoint), Optional.of(endpoint));
     }
 
     /**
-     * 从 exact DD index key parts 构造当前行复核谓词。secondary physical suffix 不在 values 中，
-     * 因而只重算 logical parts；这正是排除 marked old entry 和并发换 key 假命中的权威判断。
+     * 使用 Record codec 的 exact type/collation 比较语义求值完整 residual。
      */
-    private static List<BoundRowPredicate> equalityPredicates(
-            TableDefinition table, long indexId, List<SqlValue> values) {
-        IndexDefinition index = table.indexes().stream()
-                .filter(candidate -> candidate.id().value() == indexId)
-                .findFirst()
-                .orElseThrow(() -> new DatabaseValidationException(
-                        "equality predicate index is missing from exact table version"));
-        if (values.size() != index.keyParts().size()) {
-            throw new DatabaseValidationException(
-                    "equality predicate value count differs from logical index parts");
-        }
-        ArrayList<BoundRowPredicate> predicates = new ArrayList<>(values.size());
-        for (int i = 0; i < values.size(); i++) {
-            long columnId = index.keyParts().get(i).columnId();
-            int ordinal = table.columns().stream()
-                    .filter(column -> column.columnId() == columnId)
-                    .mapToInt(column -> column.ordinal())
-                    .findFirst()
-                    .orElseThrow(() -> new DatabaseValidationException(
-                            "index key part references missing DD column"));
-            predicates.add(new BoundRowPredicate(
-                    ordinal, BoundRowPredicateOperator.EQUAL, values.get(i)));
-        }
-        return List.copyOf(predicates);
+    private boolean matchesPredicates(
+            LogicalRecord row, PredicateSet predicates,
+            BTreeIndex clustered) {
+        return evaluatePredicate(
+                predicates.condition(), row, clustered).matchesWhere();
     }
 
     /**
-     * 逐 residual 使用 Record codec 的一列 ASC 比较定义；NULL comparison 返回 UNKNOWN，conjunction 因而不匹配。
+     * 递归求值 M3 封闭表达式集合；comparison 遇到 SQL NULL 返回 UNKNOWN。
+     *
+     * @param expression 物理计划完整 residual 的当前节点
+     * @param row 已完成 MVCC/current-read 选择的聚簇行
+     * @param clustered exact table version 对应的聚簇 schema/comparator
+     * @return 保留 FALSE/UNKNOWN 区别的 SQL 三值结果
+     * @throws SqlStorageException 物理计划未经过规则规范化或出现非 boolean 根时抛出
      */
-    private boolean matchesPredicates(LogicalRecord row, List<BoundRowPredicate> predicates,
-                                      BTreeIndex clustered) {
-        for (BoundRowPredicate predicate : predicates) {
-            ColumnValue left = row.columnValues().get(predicate.columnOrdinal());
-            if (left instanceof ColumnValue.NullValue
-                    || predicate.value() instanceof SqlValue.NullValue) {
-                return false;
+    private SqlBoolean evaluatePredicate(
+            BoundExpression expression, LogicalRecord row,
+            BTreeIndex clustered) {
+        return switch (expression) {
+            case BoundTruthLiteral truth -> truth.value();
+            case BoundConjunction conjunction -> {
+                SqlBoolean result = SqlBoolean.TRUE;
+                for (BoundExpression operand : conjunction.operands()) {
+                    result = result.and(
+                            evaluatePredicate(operand, row, clustered));
+                    if (result == SqlBoolean.FALSE) {
+                        break;
+                    }
+                }
+                yield result;
             }
-            ColumnValue right = toColumnValue(predicate.value(),
-                    clustered.schema().column(predicate.columnOrdinal()).type());
-            IndexKeyDef oneColumn = new IndexKeyDef(clustered.indexId(), List.of(
-                    new KeyPartDef(new ColumnId(predicate.columnOrdinal()), KeyOrder.ASC, 0)));
-            int comparison = predicateComparator.compare(
-                    new SearchKey(List.of(left)), new SearchKey(List.of(right)),
-                    oneColumn, clustered.schema());
-            boolean matched = switch (predicate.operator()) {
-                case EQUAL -> comparison == 0;
-                case LESS_THAN -> comparison < 0;
-                case LESS_THAN_OR_EQUAL -> comparison <= 0;
-                case GREATER_THAN -> comparison > 0;
-                case GREATER_THAN_OR_EQUAL -> comparison >= 0;
-            };
-            if (!matched) {
-                return false;
+            case BoundDisjunction disjunction -> {
+                SqlBoolean result = SqlBoolean.FALSE;
+                for (BoundExpression operand : disjunction.operands()) {
+                    result = result.or(
+                            evaluatePredicate(
+                                    operand, row, clustered));
+                    if (result == SqlBoolean.TRUE) {
+                        break;
+                    }
+                }
+                yield result;
             }
+            case BoundNegation negation ->
+                    evaluatePredicate(
+                            negation.operand(), row, clustered).not();
+            case BoundNullTest nullTest ->
+                    evaluateNullTest(nullTest, row);
+            case BoundComparison comparison ->
+                    evaluateComparison(comparison, row, clustered);
+            case BoundColumnReference ignored -> throw new SqlStorageException(
+                    "physical residual contains scalar column root");
+            case BoundLiteral ignored -> throw new SqlStorageException(
+                    "physical residual contains non-boolean expression: "
+                            + expression.getClass().getSimpleName());
+        };
+    }
+
+    /**
+     * 在已选出的完整聚簇行上求值 IS NULL / IS NOT NULL。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>从 canonical 列引用按 exact ordinal 读取 record 值，或读取规则保留的 typed literal。</li>
+     *     <li>只检查显式 NullValue 标记，不触发 LOB hydration、collation 比较或索引访问。</li>
+     *     <li>按操作符返回确定 TRUE/FALSE；null-test 不产生 UNKNOWN。</li>
+     * </ol>
+     *
+     * @param nullTest 物理 residual 中已验证的 scalar null-test
+     * @param row MVCC/current-read 选出的完整聚簇记录
+     * @return 非 UNKNOWN 的 SQL boolean
+     * @throws SqlStorageException operand 不是当前 M3 可执行的列引用或 literal 时抛出
+     */
+    private static SqlBoolean evaluateNullTest(
+            BoundNullTest nullTest, LogicalRecord row) {
+        // 1、物理校验已核对列 identity；此处只读取同一 exact row 的 ordinal。
+        boolean isNull;
+        if (nullTest.operand()
+                instanceof BoundColumnReference column) {
+            isNull = row.columnValues()
+                    .get(column.columnOrdinal())
+                    instanceof ColumnValue.NullValue;
+        } else if (nullTest.operand()
+                instanceof BoundLiteral literal) {
+            isNull = literal.value()
+                    instanceof SqlValue.NullValue;
+        } else {
+            throw new SqlStorageException(
+                    "physical null-test requires a column or literal operand");
         }
-        return true;
+        // 2、NullValue 是 record/sql 层共享的空值证据，不需要读取外置 payload。
+        // 3、IS NOT NULL 是二值反转，不等价于会保留 UNKNOWN 的 boolean NOT。
+        boolean matches =
+                nullTest.operator() == BoundNullTestOperator.IS_NULL
+                        ? isNull : !isNull;
+        return matches ? SqlBoolean.TRUE : SqlBoolean.FALSE;
+    }
+
+    /**
+     * 按单列 Record comparator 求值 canonical column-literal comparison。
+     */
+    private SqlBoolean evaluateComparison(
+            BoundComparison predicate, LogicalRecord row,
+            BTreeIndex clustered) {
+        if (!(predicate.left() instanceof BoundColumnReference column)
+                || !(predicate.right() instanceof BoundLiteral literal)) {
+            throw new SqlStorageException(
+                    "physical comparison is not canonical column-literal");
+        }
+        ColumnValue left =
+                row.columnValues().get(column.columnOrdinal());
+        if (left instanceof ColumnValue.NullValue
+                || literal.value() instanceof SqlValue.NullValue) {
+            return SqlBoolean.UNKNOWN;
+        }
+        ColumnValue right = toColumnValue(
+                literal.value(), clustered.schema()
+                        .column(column.columnOrdinal()).type());
+        IndexKeyDef oneColumn =
+                new IndexKeyDef(clustered.indexId(), List.of(
+                        new KeyPartDef(
+                                new ColumnId(column.columnOrdinal()),
+                                KeyOrder.ASC, 0)));
+        int order = predicateComparator.compare(
+                new SearchKey(List.of(left)),
+                new SearchKey(List.of(right)),
+                oneColumn, clustered.schema());
+        boolean matched = switch (predicate.operator()) {
+            case EQUAL -> order == 0;
+            case LESS_THAN -> order < 0;
+            case LESS_THAN_OR_EQUAL -> order <= 0;
+            case GREATER_THAN -> order > 0;
+            case GREATER_THAN_OR_EQUAL -> order >= 0;
+        };
+        return matched ? SqlBoolean.TRUE : SqlBoolean.FALSE;
     }
 
     private boolean containsIdentity(List<SearchKey> identities, SearchKey candidate,

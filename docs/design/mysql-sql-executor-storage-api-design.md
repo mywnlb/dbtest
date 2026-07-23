@@ -56,14 +56,14 @@
 
 执行链路：
 
-1. `Session` 收到 AST 或 parser 输出。
-2. `NameResolver` 通过 Data Dictionary 解析 schema/table/column/index。
-3. `MetadataLockManager` 获取 statement 所需 MDL。
-4. `SimplePlanner` 构造 `QueryPlan` 或 `DmlPlan`。
-5. `SqlExecutor` 创建 `ExecutionContext`，绑定 `TransactionContext`。
-6. `PlanNode` 树按 pull 模型执行，调用 `StorageEngine`。
+1. `Session` 接收 Parser 输出并创建 statement deadline / metadata scope。
+2. Binder 通过 Data Dictionary 解析 schema/table/column 并取得 MDL/DD pin。
+3. SQL compiler 把 semantic Bound 转为 LogicalPlan，经规则和访问路径选择形成 PhysicalPlan。
+4. Session 只在完整 PhysicalPlan 成功后 publish statement metadata。
+5. `SqlExecutor` 封闭分派 PhysicalPlan，并只通过窄 `SqlDataAccessPort` 访问数据。
+6. 当前适配器物化 point/range 结果；目标 PlanNode/StorageCursor 按 pull 模型执行。
 7. Storage Engine 通过 B+Tree、Record、Transaction、Buffer Pool、Redo、Disk Manager 完成读写。
-8. Executor 清理 cursor、dictionary pin、MDL 和 statement 资源。
+8. Session/事务策略清理 dictionary pin、MDL、statement 与 transaction 资源。
 
 依赖方向：
 
@@ -82,7 +82,7 @@
 | 包 | 职责 | 依赖 | 主要模式 |
 | --- | --- | --- | --- |
 | `sql.exec.api` | `SqlExecutor`、`ExecutionResult`、`ResultSetCursor` | plan, runtime | Facade |
-| `sql.exec.input` | 接收 `BoundStatement`、`PhysicalPlan` 和 statement resource guard | parser/binder, optimizer | Adapter |
+| `sql.exec.input` | 关系语句只接收 `PhysicalPlan` 和 statement resource guard；DDL Bound command 绕过关系 Executor | optimizer, session | Adapter |
 | `sql.exec.plan` | `QueryPlan`、`DmlPlan`、访问路径描述 | dd domain | Composite, Strategy |
 | `sql.exec.node` | PlanNode 执行树，scan/filter/project/limit/sort/dml | storage api, expr | Iterator, Template Method |
 | `sql.exec.expr` | predicate、projection、update assignment 求值 | row model | Interpreter, Strategy |
@@ -214,6 +214,12 @@ Planner 不做：
 - 类型比较使用 Record/Data Dictionary 提供的 `ColumnType` 和 collation。
 - 三值逻辑由 `SqlBoolean` 表达。
 - WHERE 谓词在 Executor 层判断，Storage 只接收 index range。
+
+当前 M3 的阶段性简化：`PhysicalPlan` 携带完整 `PredicateSet`，engine adapter 在
+MVCC/current-read 选出完整聚簇行后递归求值 comparison、AND、OR、NOT 和 null-test。
+comparison 使用 Record exact type/collation comparator，null-test 只读取显式 NullValue，
+只有 SQL TRUE 进入结果或 DML identity 集。该 evaluator 不下沉到 B+Tree/Record，未来建立
+pull-based Executor 后再上移；在此之前 access range 只能缩小候选，不能替代最终 residual。
 
 ## 8. SELECT 设计
 

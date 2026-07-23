@@ -5,7 +5,7 @@ import cn.zhangyis.db.dd.domain.*;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.engine.DatabaseEngine;
 import cn.zhangyis.db.sql.executor.QueryResult;
-import cn.zhangyis.db.sql.executor.SqlValue;
+import cn.zhangyis.db.sql.type.SqlValue;
 import cn.zhangyis.db.sql.executor.storage.SqlIsolationLevel;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;

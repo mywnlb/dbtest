@@ -8,11 +8,14 @@ import cn.zhangyis.db.sql.executor.storage.*;
 import cn.zhangyis.db.sql.executor.storage.exception.SqlStorageException;
 import cn.zhangyis.db.sql.executor.storage.exception.SqlStatementRollbackException;
 import cn.zhangyis.db.sql.executor.storage.exception.SqlTransactionOutcomeException;
+import cn.zhangyis.db.sql.optimizer.SqlStatementCompiler;
+import cn.zhangyis.db.sql.optimizer.exception.SqlOptimizationException;
 import cn.zhangyis.db.sql.parser.DefaultSqlParser;
 import cn.zhangyis.db.common.exception.DatabaseFatalException;
 import cn.zhangyis.db.session.exception.SessionBusyException;
 import cn.zhangyis.db.session.exception.SessionStateException;
 import cn.zhangyis.db.session.exception.TransactionOutcomeUnknownException;
+import cn.zhangyis.db.session.xa.SessionXaCoordinator;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -52,6 +55,40 @@ class DefaultSqlSessionTest {
             assertEquals(SessionTransactionMode.IMPLICIT, session.snapshot().transactionMode());
             session.execute("SET autocommit=1");
             assertFalse(session.snapshot().transactionActive());
+            session.close();
+        }
+    }
+
+    /**
+     * 生产构造入口必须使用组合根注入的 Compiler；优化失败时 Executor 不得运行，未发布 metadata 与
+     * autocommit transaction 都要沿既有失败路径释放。
+     */
+    @Test
+    void usesInjectedCompilerAndAbortsBeforeExecutor() {
+        try (SessionTestDictionary dictionary = new SessionTestDictionary(directory)) {
+            SessionTransactionPolicyTest.RecordingGateway gateway =
+                    new SessionTransactionPolicyTest.RecordingGateway();
+            DefaultSqlBinder binder = new DefaultSqlBinder(new SqlTypeCoercion());
+            AtomicBoolean executorCalled = new AtomicBoolean();
+            SqlStatementCompiler compiler = (statement, context) -> {
+                binder.bind(statement, context);
+                throw new SqlOptimizationException("injected optimizer rejection");
+            };
+            SqlExecutor executor = (transaction, plan, status, deadline) -> {
+                executorCalled.set(true);
+                throw new AssertionError("Executor must not run after compiler failure");
+            };
+            DefaultSqlSession session = new DefaultSqlSession(
+                    SessionId.of(1), options(Duration.ofSeconds(1)), dictionary.service,
+                    new DefaultSqlParser(), binder, compiler, executor, gateway,
+                    SqlDdlGateway.UNSUPPORTED, SessionXaCoordinator.UNSUPPORTED,
+                    SessionExecutionAdmission.unrestricted(), false, () -> { });
+
+            assertThrows(SqlOptimizationException.class,
+                    () -> session.execute("SELECT * FROM orders WHERE id=1"));
+            assertFalse(executorCalled.get());
+            assertEquals(List.of("begin:RO", "rollback"), gateway.events);
+            assertEquals(SessionState.OPEN, session.snapshot().state());
             session.close();
         }
     }
@@ -264,7 +301,7 @@ class DefaultSqlSessionTest {
 
     private static final class RollbackOnlyGateway extends SessionTransactionPolicyTest.RecordingGateway {
         @Override public SqlWriteOutcome insert(SqlTransactionHandle transaction,
-                                                cn.zhangyis.db.sql.binder.bound.BoundClusteredInsert statement,
+                                                cn.zhangyis.db.sql.optimizer.physical.PhysicalInsert statement,
                                                 SqlStatementDeadline deadline) {
             throw new SqlStatementRollbackException("statement rollback failed", true,
                     new cn.zhangyis.db.common.exception.DatabaseRuntimeException("injected"));
@@ -280,7 +317,7 @@ class DefaultSqlSessionTest {
 
     private static final class FatalInsertGateway extends SessionTransactionPolicyTest.RecordingGateway {
         @Override public SqlWriteOutcome insert(SqlTransactionHandle transaction,
-                                                cn.zhangyis.db.sql.binder.bound.BoundClusteredInsert statement,
+                                                cn.zhangyis.db.sql.optimizer.physical.PhysicalInsert statement,
                                                 SqlStatementDeadline deadline) {
             throw new SqlStorageException("adapter wrapper",
                     new DatabaseFatalException("injected fail-stop boundary"));

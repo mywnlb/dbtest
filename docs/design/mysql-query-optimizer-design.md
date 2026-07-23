@@ -78,8 +78,8 @@
 | 包 | 职责 | 依赖 | 主要模式 |
 | --- | --- | --- | --- |
 | `sql.opt.api` | `QueryOptimizer`、`OptimizerResult`、`ExplainService` | logical, physical | Facade |
-| `sql.opt.logical` | `LogicalPlan`、`RelNode`、`QueryBlock` | exec bind | Composite |
-| `sql.opt.rewrite` | 常量折叠、谓词规范化、等价类、投影裁剪 | logical | Rule Engine |
+| `sql.optimizer.logical` | `LogicalPlan`、`RelNode`、`QueryBlock` | binder | Composite |
+| `sql.optimizer.rewrite` | 常量折叠、谓词规范化、等价类、投影裁剪 | logical | Rule Engine |
 | `sql.opt.range` | SARGable 条件识别、range interval 构造 | dd index | Strategy |
 | `sql.opt.access` | access path 枚举、covering index、ICP 候选 | range, cost | Factory, Strategy |
 | `sql.opt.join` | join graph、join order、join algorithm 选择 | cost, access | Dynamic Programming, Greedy |
@@ -108,7 +108,7 @@
 
 | 对象 | 职责 |
 | --- | --- |
-| `PredicateSet` | 规范化谓词集合，拆分 conjunct、disjunct、join predicate |
+| `PredicateSet` | condition 为唯一权威；conjunct、disjunct、引用列只能作为派生视图 |
 | `EquivalenceClass` | `a=b`、`b=c` 这类等价关系 |
 | `RangeInterval` | 单个索引上的 key range，含 open/closed bound |
 | `AccessPath` | table/index 访问方式、range、是否覆盖、是否 ICP |
@@ -174,6 +174,16 @@
 - outer join reorder。
 - window/aggregate rewrite。
 
+当前 M3 已生产接线的规则子集为：统一 bottom-up sealed expression 遍历、保持顺序的
+AND/OR 展平、literal-column comparison 规范化，以及 AND/OR/NOT/null-test 的安全
+SQL 三值折叠。`RuleProgram` 按稳定规则名和声明顺序运行，以 16 个完整 pass 为上限，
+伪变化、结构循环或不收敛均在物理计划发布前失败；不做 De Morgan、CNF、排序或去重。
+
+规则固定点随后进入 `PredicateAnalyzer`；分析器只从最外层正向 AND 的 canonical
+column-literal comparison 派生 equality/range/empty 证明，OR、NOT 和 null-test 作为
+完整 residual barrier 而不是 optimization error。`HeuristicAccessPathSelector` 独占
+访问路径选择；统计、memo、cost、trait、EXPLAIN 仍是目标能力。
+
 ### 7.2 Range Optimizer
 
 访问路径流程见 [query-optimizer-access-path-flow.mmd](diagrams/query-optimizer-access-path-flow.mmd)。
@@ -185,6 +195,11 @@ Range 提取规则：
 - `LIKE 'abc%'` 可转换为前缀范围，普通 `%abc` 不可转换。
 - OR 条件第一阶段只支持同一索引上的 range union；跨索引 index merge 作为扩展点。
 - 非 SARGable 条件保留给 Executor filter 或 ICP。
+
+当前 M3 尚未接入上述 NULL endpoint 和 OR range union：null-test、OR、NOT 均保留为
+residual；只有同级正向 AND comparison 可缩小候选。完整唯一键 equality 被证明时，
+一致性 SELECT 可 point 定位后继续求值额外 residual；locking read 和带额外条件的
+UPDATE/DELETE 仍走携带完整 residual 的 range/full-scan 路径。
 
 ### 7.3 Access Path 枚举
 
@@ -332,7 +347,7 @@ Trace 是 session scoped，不持久化到 DD；`INFORMATION_SCHEMA.OPTIMIZER_TR
 
 ### 10.1 与 SQL Executor
 
-- Executor 调用 `QueryOptimizer.optimize()`。
+- Session 持有的 SQL compiler 调用 `QueryOptimizer.optimize()`；Executor 不参与编译或重新选路。
 - Optimizer 返回 `PhysicalPlan`，Executor 映射为 PlanNode tree。
 - EXPLAIN ANALYZE 由 Executor 收集实际执行指标。
 - Optimizer 不打开 StorageCursor。

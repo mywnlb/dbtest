@@ -322,7 +322,7 @@ flowchart TD
 | Existing-page semantic open | `IndexPageAccess` 物理校验 -> LeafOnly root header / SplitCapable unified helper indexId 核对 -> 按实际 page level 选择 leaf 或 derived node-pointer schema -> `RecordPageKeyOrderValidator` | Implemented (0.21d)；12 个 SplitCapable existing-page 打开点与 LeafOnly 单一 root 入口均在业务读取/修改前 fail-closed；3 个 fresh create/format 空页直开点保持不重复扫描；校验期只读且仍持当前 S/X latch |
 | Locate leaf without target IO | `SecondaryIndexMutationCoordinator` -> `SplitCapableBTreeIndexService.locateLeafWithoutLoading`（`:1272`）以 S-crab 只打开 root/internal，最后一个内部 pointer 返回 `BTreeLeafTarget(pageId,rootLeaf=false)`；root 自身是 leaf 时返回 root identity 并要求 direct | Implemented for Change Buffer eligibility；不打开、prefetch 或 fix 目标 leaf；内部页 descriptor 仍按 `BTreeIndex.pageType` 校验，结构损坏不降级为猜测页号 |
 | Point lookup | `BTreeIndexService.lookup` -> SplitCapable `findLeafSharedCrab`（N 层 `chooseChild` **S-crab** 下降：持父 S→latch 子 S→放父 S，祖先早释放，0.13c）-> `search.findEqual` -> `RecordCursor` -> `materialize` | Implemented；SplitCapable 任意高度（0.11）；读路径 S-crab（0.13c）；LeafOnly 仍 level 0 |
-| Point current-read (2.7a) | `BTreeCurrentReadService.lockPoint` -> 建立单次 monotonic deadline -> 短 MTR 定位 record/gap -> commit 释放 page latch/fix -> `LockManager.acquire(remaining)` -> 短 MTR 重定位校验；RC miss 不锁 gap，RR miss 按模式锁 gap | Implemented；point/unique 的全部 relocation 共用原请求剩余预算，不按重试刷新 timeout；SQL INSERT 消费 unique-check/insert-intention；SQL point UPDATE/DELETE 经 `TableDmlService` 消费 FOR_UPDATE record lock；普通 point SELECT 走 MVCC，`FOR SHARE/UPDATE` 由通用 exact `BoundRangeSelect` 消费同一 current-read 锁链 |
+| Point current-read (2.7a) | `BTreeCurrentReadService.lockPoint` -> 建立单次 monotonic deadline -> 短 MTR 定位 record/gap -> commit 释放 page latch/fix -> `LockManager.acquire(remaining)` -> 短 MTR 重定位校验；RC miss 不锁 gap，RR miss 按模式锁 gap | Implemented；point/unique 的全部 relocation 共用原请求剩余预算，不按重试刷新 timeout；SQL INSERT 消费 unique-check/insert-intention；SQL point UPDATE/DELETE 经 `TableDmlService` 消费 FOR_UPDATE record lock；普通 point SELECT 走 MVCC，`FOR SHARE/UPDATE` 由通用 exact `PhysicalRangeSelect` 消费同一 current-read 锁链 |
 | Unique insert current-read check (2.7a) | `BTreeCurrentReadService.checkUniqueForInsert` -> 物理 duplicate 命中取 `REC_S` 并重定位确认；miss 取 `INSERT_INTENTION` 到目标 gap 并重定位确认 -> `BTreeUniqueCheckResult` | Implemented；2.1 起 `ClusteredDmlService.insert` 调用；仍是物理唯一检查（delete-marked 同 key 算 duplicate），不做 MVCC 逻辑唯一 |
 | Secondary logical key DML check | `TableDmlService.insert/update/delete` -> `SecondaryUniqueCheckService.lockLogicalKey/check` 以 collation/prefix 规范化 logical key -> `SecondaryLogicalKeyLockKey` X（事务终态释放）-> `scanSecondaryPrefixIncludingDeleted(limit=1025)`；等待后只看当前前缀，不读 ReadView/undo：任意 live 冲突、其它主键 marked 跳过、同 identity marked 供 UPDATE revive；UPDATE 初查 marked 后在 row guard 内 `recheckExactPublishState` 抵御 purge 竞态。fresh non-unique INSERT 仍由 `checkFreshInsert` 跳过必然 absent 的 leaf read | Implemented；DELETE commit 后 logical unique key 可在 purge 前复用，rollback/live 与 PREPARED 二阶段等待语义已有回归；无 live 时超过 1024 候选抛容量异常而非截断发布；完整 physical key 仍由 B+Tree `physicalUnique` 保护 |
 | Non-unique secondary logical-prefix read | consistent：`SecondaryMvccReader.readRange` -> including-deleted prefix candidate 短 MTR -> 聚簇 MVCC/undo -> 可见完整行重算 key/按 clustered identity 去重；locking：`SecondaryCurrentReadService.readRange` -> logical-prefix S/X -> candidate 重扫 -> 聚簇 `lockPoint` S/X -> 当前完整行重算 key | Implemented；SQL 完整单列、无 prefix、non-unique secondary equality 返回多行；ReadView 覆盖 LOB hydration，locking 等待不持 page latch，锁到事务终态；4096+1 candidate fail-closed，不静默截断 |
@@ -545,7 +545,7 @@ flowchart TD
 | ReadView 创建 (T1.4) | RR/RC -> `ReadViewManager.openReadView(txn)`：RR 缓存、RC 语句级新建 -> `TransactionSystem.openReadViewSnapshot` 原子捕获 active/counter 并登记 live view；RU -> gateway/MVCC 直接读取当前非 delete-marked 聚簇版本，不创建 ReadView；SERIALIZABLE 普通 SELECT 由 Session policy 按事务模式提升 FOR SHARE | Implemented；RC view 在 point/range finally 注销，RR 在事务终态释放；RU secondary 只作候选且回聚簇复核 current logical key/residual；autocommit 单语句 SERIALIZABLE 保持语句级一致性读 |
 | Version-safe secondary/LOB purge | `PurgeCoordinator.runBatch` -> `HistoryList.snapshotPrefix` 冻结有界 eligible 物理前缀 -> `PurgeWorkerPool` 以 affected-table completion DAG 派发整 log task -> 每个 worker 从持久 logical head 逐记录执行 secondary/clustered/LOB + `PURGE_RECORD_PROGRESS` -> dispatcher 只 finalization 连续 READY 物理 head | Implemented；生产默认 4 worker/16 logs/5s，同表 FIFO、异表并行，多表 log 同时占有全部 table lane；row guard busy 只阻塞同表后继；worker 不摘 history，后方已 EMPTY 日志仍由 dispatcher 在前驱收口后严格摘链；legacy 构造保持 direct 串行 |
 | Recovery-unavailable undo/purge | `DictionaryIndexMetadataResolver` 把隔离 DD state 映射为 `UndoTargetDisposition.RECOVERY_UNAVAILABLE` -> live `RollbackService/PurgeCoordinator` 抛 `UndoTargetUnavailableException`；startup recovery 在完整解码 current 与验证 predecessor 后只推进链首并累计 skip report | Implemented；不可用目标的 B+Tree/record/page 不被访问；skip 只允许 recovery participant，普通在线路径不吞掉一致性错误；system undo space 本身永不排除 |
-| Consistent read (point + general range) | SQL SELECT -> RR/RC ReadView -> point 走 `MvccReader`/`SecondaryMvccReader`；comparison range 走 optional-bound 256-row including-deleted scan -> secondary/clustered identity -> 聚簇 `MvccReader`/undo -> exact Record comparator residual -> 同一 view 内 LOB hydration/投影 -> RC finally close | Implemented；Binder 支持 `=,<,<=,>,>=,BETWEEN` conjunction，选择 clustered/unique point、最长 composite continuous prefix 或 clustered full scan；ASC/DESC、short logical prefix + physical suffix、stable-id tie-break 已接；4096 rows/16384 physical candidates 超限不返回 partial |
+| Consistent read (point + general range) | SQL SELECT -> RR/RC ReadView -> point 走 `MvccReader`/`SecondaryMvccReader`；comparison range 走 optional-bound 256-row including-deleted scan -> secondary/clustered identity -> 聚簇 `MvccReader`/undo -> exact Record comparator residual -> 同一 view 内 LOB hydration/投影 -> RC finally close | Implemented；Binder 只绑定 `=,<,<=,>,>=,BETWEEN` typed conjunction，`HeuristicQueryOptimizer` 选择 clustered/unique point、最长 composite continuous prefix 或 clustered full scan；ASC/DESC、short logical prefix + physical suffix、stable-id tie-break 已接；4096 rows/16384 physical candidates 超限不返回 partial |
 | General locking current read | SQL point/comparison/composite/full-scan 显式 `FOR SHARE/FOR UPDATE`，或 SERIALIZABLE 显式/implicit transaction 普通 SELECT 自动 FOR SHARE -> RW transaction/write id -> `BTreeCurrentReadService.lockRange` -> secondary candidate 再锁 clustered point -> current row residual -> LOB/project | Implemented；锁等待共享 absolute deadline且不持 page latch；range DML 先物化 identity 防 Halloween/partial mutation。RR/SERIALIZABLE next-key/terminal gap、RC/RU record-only 规则已接；RC residual-miss 提前释放仍未接 |
 | Table purge barrier / DROP | commit/recovery publish `HistoryEntry.affectedTableIds` -> `HistoryList.awaitTableUnreferenced` 在同一显式锁下维护 per-table 引用计数/Condition -> `HistoryTablePurgeBarrier.awaitUnreferenced` (`HistoryTablePurgeBarrier.java:36`) -> DD `DictionaryDdlService.dropTable` (`DictionaryDdlService.java:303`) 在 table MDL X 下、写 PREPARED/发布 DROP_PENDING 前等待；logged/legacy pending recovery (`DictionaryDdlRecoveryService.java:314`) 在物理删除前再次等待 | Implemented；timeout 保持 ACTIVE 或 DROP_PENDING+文件及当前 marker phase；purge finalization 原子摘 history 后唤醒；无独立持久计数，page3/first-page history 始终是重启真相 |
 | Row-lock diagnostics (2.8a) | `LockManager.acquire/release/releaseAll` -> `RowLockEventSink` 事件端口（端口与事件载荷 `RowLockObservation`/`RowLockBlocker`/`ThreadEventId` 定义在 `storage.trx.lock`，server.lockobs 向下实现，无反向依赖）；`StorageEngine.lockDiagnosticSnapshot` -> `lockManager.snapshot()` -> `DefaultLockObservationService.captureSnapshot` -> `data_locks` / `data_lock_waits` rows | Implemented; row-lock only；不授锁、不 release、不 rollback；session/statement id 为 0，DD 未接所以 schema/table 为空、index 名为 `index#<indexId>` |
@@ -805,7 +805,7 @@ flowchart TD
 | `storage.api.ddl.online` + `storage.fil.online` | `OnlineDdlTableGate`, index/alter capture target、candidate/log records, `FileOnlineIndexChangeLog`, `FileOnlineAlterChangeLog`, controlled path factories | Implemented online ADD/DROP + general ALTER v1; production-wired | per-table gate以显式锁保护ACTIVATING/CAPTURING/SEALING/RETIREMENT_OPEN/ABORTING；通用journal拥有immutable manifest header、CRC/sequence/force watermark、READY/RECONCILED和有界可rewind candidate stream。所有文件只按exact id/path打开清理，不替代redo/undo/binlog |
 | `engine` | `DatabaseEngine`, `DatabaseAccessMode`, unavailable diagnostics、execution/write gates、DD metadata resolver/mapper、SQL gateways | Implemented public composition root | FORCE completion hook 在 worker/warmup 前执行 recovery-object DDL；NORMAL/DEGRADED/RECOVERY_EXPORT_READ_ONLY/VALIDATION_READ_ONLY 由启动证据发布；Session gateway 与 storage write admission 双层守门 |
 
-## SQL Point / Comparison Range + CREATE/DROP INDEX Session Slice
+## SQL Calcite-Lite Planning + Executor / Session Slice
 
 ### Current Flow
 
@@ -814,24 +814,35 @@ flowchart TD
   Engine["DatabaseEngine.openSession"] --> Registry["SessionRegistry"]
   Engine --> Session["DefaultSqlSession"]
   Engine --> Gate["EngineSessionExecutionGate"]
+  Engine -->|"compose shared pipeline"| Compiler["SqlStatementCompiler / DefaultSqlStatementCompiler"]
   Session -->|"enter / failClosed"| Gate
   Session --> Deadline["SqlStatementDeadline"]
-  Session --> Parser["DefaultSqlParser"]
+  Session --> Parser["SqlParser / DefaultSqlParser"]
   Session --> Policy["SessionTransactionPolicy"]
+  Session --> Compiler
   Policy --> Savepoints["opaque SQL savepoint handles"]
   Policy --> XaCoord["PersistentXaCoordinator"]
   XaCoord --> XaRegistry["FileXaRegistry mysql.xa"]
-  XaCoord --> Port
-  Session --> Binder["DefaultSqlBinder"]
-  Session --> Executor["DefaultSqlExecutor"]
+  XaCoord --> Gateway
+  Compiler --> Binder["SqlBinder / DefaultSqlBinder"]
+  Compiler --> Converter["BoundToLogicalConverter"]
+  Compiler --> Optimizer["HeuristicQueryOptimizer"]
+  Optimizer --> Rules["RuleProgram fixed point"]
+  Optimizer --> Selector["HeuristicAccessPathSelector"]
+  Selector --> Analyzer["PredicateAnalyzer"]
+  Session -->|"DDL only"| Binder
+  Session --> Executor["SqlExecutor / DefaultSqlExecutor"]
   Session --> DdlPort["SqlDdlGateway"]
   DdlPort --> DdlAdapter["engine.adapter.DefaultSqlDdlGateway"]
   DdlAdapter --> Ddl["DictionaryDdlService"]
   Policy --> Metadata["TransactionMetadataScope"]
   Deadline --> Metadata
+  Session -->|"publish after physical plan"| Metadata
   Metadata --> DD["DataDictionaryService.openTable READ/WRITE"]
-  Executor --> Port["SqlStorageGateway"]
-  Port --> Adapter["engine.adapter.DefaultSqlStorageGateway"]
+  Executor --> DataPort["SqlDataAccessPort"]
+  Policy --> Gateway["SqlStorageGateway transaction/XA facade"]
+  DataPort --> Adapter["engine.adapter.DefaultSqlStorageGateway"]
+  Gateway --> Adapter
   Deadline --> Adapter
   Adapter --> Mapper["DictionaryStorageMetadataMapper"]
   Adapter --> DML["TableDmlService INSERT + clustered terminal"]
@@ -841,15 +852,31 @@ flowchart TD
   Close -->|"write quiescence"| Gate
 ```
 
+### Current Flow Source Anchors
+
+| Diagram edges | Production source evidence |
+| --- | --- |
+| Engine -> Registry / Session / Gate / Compiler | `DatabaseEngine.java:217,368-372,446-462` |
+| Session -> Gate / Deadline / Parser / Policy | `DefaultSqlSession.java:297-315,402-405` |
+| Session -> Compiler -> Binder / Converter / Optimizer -> Executor | `DefaultSqlSession.java:411-414`; `DefaultSqlStatementCompiler.java:72-76` |
+| Optimizer -> RuleProgram / Access selector -> Predicate analyzer | `HeuristicQueryOptimizer.java:59-61`; `RuleProgram.java:73-116`; `HeuristicAccessPathSelector.java:126-173`; `PredicateAnalyzer.java:42-97` |
+| Session -> DDL port -> adapter -> DD coordinator | `DefaultSqlSession.java:458-464,502-508,546-553,592-598`; `DefaultSqlDdlGateway.java:51-57,68-74,85-94,105-112` |
+| Policy -> Savepoint / XA / Gateway / Metadata | `SessionTransactionPolicy.java:243-307,321-389,554-607` |
+| XA coordinator -> durable registry / storage facade | `PersistentXaCoordinator.java:90-97,166-190` |
+| Metadata -> DD and publish transfer | `StatementBindingScope.java:63-94`; `TransactionMetadataScope.java:100-120` |
+| Executor -> Data Port -> adapter | `DefaultSqlExecutor.java:74-110`; `DefaultSqlStorageGateway.java:58,409-897` |
+| Adapter -> mapper / DML / MVCC / LOB / residual | `DefaultSqlStorageGateway.java:409-512,552-619,760-897,1162-1298,1539-1581` |
+| Engine close -> Session convergence / execution gate | `DatabaseEngine.java:532-567` |
+
 ### Current Data Chains
 
 | Flow | Current production chain | Current state |
 | --- | --- | --- |
-| Session admission | `DatabaseEngine.openSession` under lifecycle lock -> `SessionRegistry.register` -> `DefaultSqlSession`；每次 `execute` 先 `EngineSessionExecutionGate.enter` 取 read permit、再取 Session operation lock，并读取本次 open 的 `DatabaseAccessMode` | Implemented；NORMAL/DEGRADED 保持原语义；RECOVERY_EXPORT_READ_ONLY 只允许无锁 SELECT，拒绝 locking read、DML、DDL、transaction/savepoint 与 XA；gateway/storage write admission 二次守门；close 锁序仍固定 gate→Session |
-| Parse / bind | `DefaultSqlSession.execute` -> one deadline -> parser（DML/comparison/SELECT、transaction/savepoint/XA、index/table/tablespace DDL）-> SERIALIZABLE policy 必要时在 bind 前把普通 SELECT 提升 FOR SHARE -> Binder 产生 typed point/range/ALTER plans；DDL 在 bind 成功后进入 implicit-commit boundary | Implemented v1；逻辑名称/类型错误早于 implicit commit，物理对象在独立 DDL owner 的 MDL X 下重验；SQL 层不 import storage internal |
-| INSERT / point + range writes | `DefaultSqlExecutor.execute` -> `DefaultSqlStorageGateway.insert/update/delete/updateRange/deleteRange` -> exact DD mapping；range 先通过 locking scan 物化全部 clustered identity，再在单个 `DmlStatementGuard` 中逐点调用 `TableDmlService` | Implemented；28 类型、external LOB、logical unique/NULL、多索引 statement rollback 均走生产链；range 修改 access key 不会 Halloween，容量超限早于首笔 mutation；仍禁止修改主键 |
-| Point SELECT | `DefaultSqlBinder.bindSelect` (`DefaultSqlBinder.java:78`) 完整主键优先，否则选择完整无 prefix 的最小 id logical-unique secondary -> `DefaultSqlExecutor.execute` (`DefaultSqlExecutor.java:35`) -> `DefaultSqlStorageGateway.selectPoint` (`DefaultSqlStorageGateway.java:136`) 创建 ReadView -> primary `MvccReader` 或 `SecondaryMvccReader.readUnique` (`SecondaryMvccReader.java:82`) 回表复核 -> view 内 LOB hydration/投影 -> RC finally close | Implemented；RR/RC、未提交版本、A→B/A→B→A、marked candidate 与唯一可见性损坏均覆盖；NULL equality 返回空；不泄露 storage reference |
-| Comparison/composite/full-scan SELECT | parser `PredicateNode` (`=,<,<=,>,>=,BETWEEN`) -> Binder typed residual/constraint intersection -> point、legacy single non-unique equality 或 `BoundRangeSelect`（最长 continuous composite prefix/stable id/full scan）-> gateway 256-row physical batches -> MVCC/current-read 回表 -> Record comparator residual -> LOB/project | Implemented；point locking、open/closed/unbounded、ASC/DESC、short logical prefix 覆盖 clustered suffix、empty contradiction 与 full scan 已接；4096 rows/16384 candidates fail-closed，不支持 OR/IN/LIKE/prefix-index SQL range/LIMIT |
+| Session admission | `DatabaseEngine.openSession` under lifecycle lock -> `SessionRegistry.register` -> `DefaultSqlSession`；每次 `execute` 先 `EngineSessionExecutionGate.enter` 取 read permit、再取 Session operation lock，并读取本次 open 的 `DatabaseAccessMode` | Implemented；NORMAL/DEGRADED 保持原语义；RECOVERY_EXPORT_READ_ONLY 允许 consistent SELECT 与只加共享锁的 `FOR SHARE`，拒绝 `FOR UPDATE`、DML、DDL 与 XA；本地 transaction/savepoint control 仍可编排只读事务，gateway/storage write admission 是二次防线；close 锁序固定 gate→Session |
+| Parse / compile / publish | `DatabaseEngine` 组合共享 compiler (`DatabaseEngine.java:368-371`)；`DefaultSqlSession.execute` 创建 one deadline/解析 (`DefaultSqlSession.java:297,307`) -> `compiler.compile` (`:411`) -> semantic Binder / logical converter (`DefaultSqlStatementCompiler.java:72-76`) -> optimizer；`HeuristicQueryOptimizer` 先 `RuleProgram.rewrite` 再 `HeuristicAccessPathSelector.select` (`HeuristicQueryOptimizer.java:59-61`) -> `PhysicalPlan` -> Session `StatementBindingScope.publish()` (`DefaultSqlSession.java:413`) -> Executor (`:414`)；DDL 继续直接 `bindDdl` 后进入 implicit-commit boundary | Implemented M3；生产 Session 注入 `SqlStatementCompiler`，Binder 不选择索引且不 publish/close scope；规则/分析/选路都不创建事务、锁、ReadView 或 storage cursor；只有完整 physical plan 成功后才 publish；DDL/session control 保持旁路 |
+| INSERT / point + range writes | `DefaultSqlExecutor` sealed 分派 (`DefaultSqlExecutor.java:74-110`) -> `SqlDataAccessPort` -> `DefaultSqlStorageGateway` physical entry (`DefaultSqlStorageGateway.java:399,445,492,761,811`) -> exact DD mapping；range 先通过 locking scan 物化全部 clustered identity (`:776,826`)，再在单个 `DmlStatementGuard` 中逐点调用 `TableDmlService` (`:790,833`) | Implemented；28 类型、external LOB、logical unique/NULL、多索引 statement rollback 均走生产链；range 修改 access key 不会 Halloween，容量超限早于首笔 mutation；仍禁止修改主键 |
+| Point SELECT | semantic `BoundSelect.condition` -> `BoundToLogicalConverter` 的 `project(filter(scan))` -> `RuleProgram` fixed point -> `PredicateAnalyzer` equality/empty 快照 -> `HeuristicAccessPathSelector` primary 优先或最小 stable-id logical-unique secondary (`HeuristicAccessPathSelector.java:126-173`) -> 带完整 residual 的 `PhysicalPointSelect` -> Executor/Data Port -> gateway (`DefaultSqlStorageGateway.java:552`) -> MVCC/current row -> residual (`:584-588,604-609`) -> LOB/project -> RC finally close | Implemented M3；point key 只能由最外层正向 AND 的相同 typed equality 证明；一致性 SELECT 允许完整唯一键加额外 opaque residual，locking read 仍走 range；RR/RC/RU 聚簇与 secondary 都在完整行上执行最终 SQL truth，不泄露 storage reference |
+| Boolean/comparison/composite/full-scan SELECT | parser `BooleanExpressionNode` 按 `NOT > AND > OR` 解析括号、comparison、BETWEEN、null-test (`DefaultSqlParser.java:598-750`) -> Binder sealed `BoundExpression` (`DefaultSqlBinder.java:568-761`) -> logical `PredicateSet(condition)` -> bottom-up `RuleProgram` AND/OR 展平、comparison 规范化、三值折叠 -> `PredicateAnalyzer` 最外层正向 AND 安全交集 -> selector point/range/full-scan -> Executor -> gateway 256-row batches -> MVCC/current-read 回表 -> recursive residual evaluator (`DefaultSqlStorageGateway.java:1162-1298`) -> LOB/project | Implemented M3；`condition` 是唯一权威且 conjunct/引用列只派生；OR/NOT/null-test 是 residual barrier 而非 optimizer error，root barrier 走聚簇 full scan；range 只缩小候选、TRUE 才命中；尚无 IN/LIKE、OR range union、NULL endpoint、prefix-index SQL range 或 LIMIT |
 | Isolation + named savepoint | Session options `READ_UNCOMMITTED/READ_COMMITTED/REPEATABLE_READ/SERIALIZABLE` -> policy/gateway mapping；`SAVEPOINT/ROLLBACK TO [SAVEPOINT]/RELEASE SAVEPOINT` -> canonical session map -> opaque handle -> undo+lock boundaries | Implemented；RU 当前版本读且按 RC gap rule，RR transaction ReadView，RC statement ReadView，SERIALIZABLE 显式/implicit transaction SELECT 自动 FOR SHARE；普通事务锁保留到终态，保存点释放仅限明确白名单 retention |
 | SQL XA | parser `XA START|BEGIN/END/PREPARE/COMMIT/ROLLBACK/RECOVER` -> `SessionTransactionPolicy` branch state -> `PersistentXaCoordinator` -> fsync append-only `FileXaRegistry` -> gateway storage PREPARED facade；phase two 可由其它 Session 按 XID 发起 | Implemented v1；PREPARING→PREPARED→DECIDED→COMPLETED 顺序、只读 prepare、one-phase、startup decision provider 与离线 `XaRecoveryMaintenance` 已接；JOIN/RESUME/SUSPEND 仅同 Session 兼容，FOR MIGRATE/跨 Session active migration 拒绝，无 compaction/heuristic/权限系统 |
 | Controlled tablespace DDL | `ALTER TABLE t DISCARD|IMPORT TABLESPACE` -> dedicated AST/bound plan -> `prepareDdl` -> `SqlDdlGateway.alterTablespace` -> DD operation-specific lifecycle/recovery | Implemented；必须单 action；普通 ACTIVE/DISCARDED 使用既有 transfer 状态机，recovery states 由同一 Java DDL facade 路由到 raw/trusted 状态机；RECOVERY_EXPORT_READ_ONLY 拒绝所有 DDL |
@@ -864,12 +891,14 @@ flowchart TD
 
 | Package area | Representative classes | Current state | Notes |
 | --- | --- | --- | --- |
-| `sql.parser` | lexer/token/source position/AST/`DefaultSqlParser` | Implemented v1 | DML/SELECT comparison range、FOR SHARE/UPDATE、transaction/savepoint、完整 v1 XA grammar、CREATE/DROP INDEX、DISCARD/IMPORT 与通用 ALTER actions；CREATE/单动作 ALTER ADD 的 online 行为不需要新 grammar；无 `ALGORITHM/LOCK` 子句、OR/IN/LIKE、主键/type/foreign/generated ALTER |
+| `sql.parser` | `SqlParser`, lexer/token/source position/sealed boolean AST/`DefaultSqlParser` | Implemented M3 | 手写 recursive descent 已接括号、`NOT > AND > OR`、comparison、BETWEEN、IS NULL/IS NOT NULL；statement 只保存单一 condition；XA、DDL、locking grammar 保持；通用 Pratt scalar expression、IN/LIKE、`ALGORITHM/LOCK` 仍未接 |
 | `common.json` | `StrictJsonValidator` | Implemented and production-wired | binder 与 record LOB codec 共享 RFC 8259 严格文本校验；零对象树、保留原始文本/数字精度；拒绝宽松扩展并限制嵌套深度；不实现 MySQL binary JSON |
-| `sql.binder` | `DefaultSqlBinder`, point/write/range plans, `BoundAlterTable/Tablespace`, create/drop index plans, coercion/scopes | Implemented v1 | DD 28 类型、strict JSON、range intersection/access path、ALTER ordered action/default coercion；DDL 只输出逻辑 coordinator command，不提前选择或持有物理 binding |
-| `sql.executor` + `.storage` | public values/results, `DefaultSqlExecutor`, deadline, storage/DDL gateways, opaque transaction/savepoint/XA DTO | Implemented v1 | SQL/session 对 storage 零 import；DML/query 经 executor，DDL 由 Session 在 implicit-commit 后走独立 port，XA 经 opaque participant methods；共享绝对 deadline |
+| `sql.type` / `sql.expression` | `SqlValue`, `SqlBoolean`, sealed `BoundExpression`、column/literal/comparison/AND/OR/NOT/null-test/truth | Implemented M3; production-wired | 列引用携带 stable id+ordinal+exact DD type+source position；三值 AND/OR/NOT 与 non-nullable null-test 已接，WHERE 只有 TRUE 命中；仍无 function/arithmetic/通用 scalar tree |
+| `sql.binder` | `SqlBinder`, `DefaultSqlBinder`, semantic `BoundInsert/Select/Update/Delete`, expression/coercion/scopes, DDL bound commands | Implemented M3 | 递归绑定单一 boolean condition；同一正向 AND 域保留重复 equality 拒绝，OR 分支可重复列；null-test 不走 LOB comparator；不包含 index id/range，不 publish metadata |
+| `sql.optimizer.logical/physical/rewrite` | `PredicateSet`, `RuleProgram`/四条默认规则、bottom-up expression rewriter、`PredicateAnalyzer`, `HeuristicAccessPathSelector`, physical variants | Implemented M3; production-wired | 有界固定点后只从正向 AND comparison 派生约束；OR/NOT/null-test 保留完整 residual；point key 证明不穿越 OR/NOT，SELECT 可 point+residual，DML point 仍 exact-only；无 OR union/NULL endpoint/memo/cost/statistics/trait/EXPLAIN/trace |
+| `sql.executor` + `.storage` | `SqlExecutor`, public results, `DefaultSqlExecutor`, `SqlDataAccessPort`, transaction/XA `SqlStorageGateway`, deadline、DDL gateway 与 opaque DTO | Implemented M3 | Executor 只消费 `PhysicalPlan` 且只依赖窄 data port；当前 query 仍由 adapter 完整物化，M3 boolean residual evaluator 暂在 adapter；DDL 与 XA/事务 facade 分离，共享绝对 deadline |
 | `session` | `DefaultSqlSession`, execution admission, `SessionTransactionPolicy`, registry/state/options, `session.xa` port/DTO | Implemented in-process v1 + recovery export gate | autocommit、四隔离级别、XA/savepoint/DDL 与 fatal fail-close 已接；导出只读按语句类型拒绝所有会建立事务锁或持久状态的命令；无 network/prepared/plan cache/权限系统，XA 无 active branch migration |
-| `engine.adapter` | `DefaultSqlStorageGateway`, `DefaultSqlDdlGateway`, opaque transaction/savepoint handles | Implemented v1 | DML/query/savepoint/XA participant mapping 与 DDL coordinator port 分离；range/LOB/deadline/fatal 语义不变 |
+| `engine.adapter` | `DefaultSqlStorageGateway`, `DefaultSqlDdlGateway`, opaque transaction/savepoint handles | Implemented M3 data bridge + v1 DDL | 在完整聚簇行上递归求值 comparison/AND/OR/NOT/null-test；null-test 只看 NullValue、不 hydration LOB；range DML 原子性、ReadView/LOB/deadline/fatal 语义不变 |
 | `engine.xa` | `FileXaRegistry`, `PersistentXaCoordinator`, `XaRecoveryMaintenance`, registry entry/state | Implemented persistent v1 | append-only sequence+CRC32C+force；append/force I/O 失败把 registry 标为 fail-stop，禁止在未知尾部后继续读写，reopen 仍只截断不完整末帧；per-XID owner wait 与 storage phase 共用绝对预算；提供 startup PREPARED decision、Session coordinator 与 instance-lock offline decision；不打开 storage 的 maintenance 不执行普通事务 |
 
 ## Reserved / Unwired Production Types
@@ -957,7 +986,7 @@ flowchart TD
 
 | Gap | Current consequence | Preferred resolution |
 | --- | --- | --- |
-| 公共 DD+storage+SQL Session+XA 组合根已接 | `DatabaseEngine`先打开catalog/manifest/XA registry，规划对象级force isolation并从DD发现recovery spaces；storage以registry决议恢复PREPARED，随后完成logged DDL（含index/general journal、descriptor、retirement与shadow recovery）、SDI reconcile/orphan cleanup，再构造XA coordinator、Online DDL control与Session | SQL v1已含comparison range、四隔离级别、persistent XA、受控transfer、online ADD/DROP INDEX、通用INPLACE/SHADOW ALTER与recovery export read only；仍缺主键/类型/foreign/generated ALTER、network/prepared/optimizer/权限系统 |
+| 公共 DD+storage+SQL Session+XA 组合根已接 | `DatabaseEngine`先打开catalog/manifest/XA registry，规划对象级force isolation并从DD发现recovery spaces；storage以registry决议恢复PREPARED，随后完成logged DDL（含index/general journal、descriptor、retirement与shadow recovery）、SDI reconcile/orphan cleanup，再构造XA coordinator、Online DDL control与Session | SQL 已含 Calcite-Lite M3 boolean expression/logical/rule/analysis/physical 编译链、safe residual、comparison range、四隔离级别与既有 XA/DDL；仍缺 IN/LIKE/函数算术、OR union/NULL endpoint、memo/cost/statistics/EXPLAIN、真正 cursor/operator pipeline、network/prepared/plan cache/权限系统及更多 ALTER |
 | 后台 redo flush + recent tracker/closedLsn + DurabilityPolicy 已接；Session commit 已消费 | `SessionTransactionPolicy` 把 durability mode 经 gateway 传入 `ClusteredDmlService.commit`，在 `UndoLogManager.onCommit` 后按 FLUSH/WRITE/BACKGROUND 等待；`MiniTransaction.commit`/`TransactionManager.commit` 本身仍不携带上层 durability 语义 | 后续协议层只映射 Session option，不绕过该 gateway/DML 终态链 |
 | public recovery 已从 DD 发现并隔离表空间，低层入口仍接受显式列表 | `DatabaseEngine` 用字典 binding 生成 recovery spaces，并用 DD/管理员 union exclusion policy 过滤隔离空间；`StorageEngine` 保留显式列表作为稳定低层 API。2.9 离线 scanner 仍只校验 clean manifest 的 ACTIVE file-per-table | 保持该分层；共享/系统/undo 空间对象级隔离与全实例离线 scrub 仍由 engine/DD 编排，不能让 fil 反向读 DD |
 | Recovery/closing gate 已覆盖 Session admission 与 DML | `DatabaseEngine` 仅在 recovery + DDL recovery 后发布 OPEN；`openSession` 要求 OPEN，CLOSING 先拒绝新流量；普通 storage accessor 和 DML facade 仍要求 recovery gate OPEN（含拒绝 READ_ONLY diagnostic） | 补 worker resume 结果、恢复锁/等待快照和更丰富 Session diagnostics |
@@ -1053,7 +1082,7 @@ flowchart TD
 | 四隔离级别的 point/general range 读已接 | RR/RC ReadView 覆盖分页、undo、residual/LOB；RU 无 ReadView、回聚簇取 current non-marked version；SERIALIZABLE 按 Session transaction mode 自动 locking read | 长期 cursor 与 `SET TRANSACTION ISOLATION LEVEL` 留后续 |
 | LockManager 已接 SQL DML/current-read/SERIALIZABLE 与保存点 retention boundary | point/range DML/SELECT 锁进入事务 owner 集合；普通 record/gap/next-key/logical lock rollback-to 后仍保留，只有白名单锁按 acquisition boundary 释放；等待前无 page latch/fix | RC residual-miss 提前释放、插入实体锁更细分类与更完整 Performance Schema 语义 |
 | rollback 消费 multi-index/LOB ownership、命名 savepoint 与 PREPARED owner | live/statement/savepoint/recovery/prepared 共用 progress；secondary→clustered→LOB+marker 顺序；Session 名称只持 opaque boundary | 多 worker/multi-rseg 与未来跨 Session branch migration 不在 storage rollback 内解决 |
-| SQL gateway 已接表级 DML、point/general range、四隔离级别和 named savepoint | DD exact-version metadata、typed residual、ReadView/current read、lock/LOB 生命周期均生产接线；range DML 防 partial/Halloween | optimizer/prepared statement/network 未接 |
+| SQL compiler/gateway 已接 semantic→logical→heuristic physical、表级 DML、point/general range、四隔离级别和 named savepoint | DD exact-version metadata、typed residual、PhysicalPlan、ReadView/current read、lock/LOB 生命周期均生产接线；range DML 防 partial/Halloween | memo/cost/statistics/trait/EXPLAIN、prepared statement/plan cache、真正 pull cursor 与 network 未接 |
 | persistent server XA + storage PREPARED 已接 | `FileXaRegistry` 持久 XID/state/decision，`PersistentXaCoordinator` 编排 gateway phase one/two，startup registry 是 decision provider；无决议 PREPARED fail-closed，离线 maintenance 可决议 | 无在线 compaction、heuristic、权限/协议 packet、active branch 跨 Session migration |
 | 正式 trx recovery table v1 已接，尚无逐事务持久系统页 | sidecar 保存 counter baseline，redo 保存 terminal evidence，page3 保存仍占用 undo 的事务；三者交叉校验后恢复 counter/recovered-active/history | 若未来需要 XA/长 prepared，再设计持久 transaction system page/完整事务明细，不在 v1 扩张 |
 
@@ -1082,6 +1111,61 @@ flowchart TD
 | 单 writer 假设 | `UndoLogSegment` 假设同一事务/同 kind 单 EXCLUSIVE append 会话 | 实现并发 multi-writer 锁序 / rseg slot 选择 |
 | 单 undo 表空间假设 | `RollPointer` 只编 pageNo+offset；T1.3c 固定单一默认 rseg，rseg/slot 存 `UndoContext` + 内存目录不进指针 | 扩展多 rseg/多 undo 表空间编码 |
 | recovery 已接 catalog-loss、XA registry decision、DD discovery、ACTIVE/PREPARED transaction、table/index/transfer/rebuild、online ADD/DROP与通用INPLACE/SHADOW ALTER、SDI reconcile | public engine阻止误建空catalog；digest/control/manifest/journal/descriptor/retirement与committed DD共同决定tree/SDI/space方向，非法generation、path、schema image或phase/control组合均fail-closed；在用户流量开放前同步收敛 | 全实例离线scrub、恢复/worker/lock可观察性 |
+
+## 2026-07-23 Calcite-Lite SQL Boolean Expression M3 10-Pass Review Log
+
+本轮在 M1/M2 未提交工作区上增量实现，以 57 行 M3 slice、三份相关厚设计、生产源码、
+测试、`rg`、Git diff 与固定工具链逐项复核；未使用 GitNexus，也未持久化 implementation plan。
+
+| Pass | Dimension | Result | Evidence / correction |
+| --- | --- | --- | --- |
+| 1 | Parser / AST / precedence | PASS | statement AST 已从 predicate list 单一迁移为 `BooleanExpressionNode condition`；源码核对 `NOT > AND > OR`、括号、comparison、BETWEEN 专用 AND、IS NULL/IS NOT NULL 与稳定错误位置；Session 的 SERIALIZABLE clause 重建同步迁移，无旧 AST accessor 生产引用 |
+| 2 | Binder / type / identity | PASS | Binder 递归生成 AND/OR/NOT/null-test typed tree，列继续携带 stable id、ordinal、exact DD type 与 source position；同一正向 AND 域重复 equality 仍拒绝，OR 分支独立；null-test 不调用 LOB comparator，nullable external TEXT 真实 Session 测试通过 |
+| 3 | Rule fixed point / three-valued logic | PASS | 新 `BoundExpressionTreeRewriter` exhaustive sealed switch 统一 bottom-up 遍历；四条默认规则按 AND flatten→OR flatten→comparison canonicalize→truth fold 运行，16-pass/cycle/fake-change 防线保留；AND/OR/NOT 三值表、null-test 二值性和嵌套子树 canonicalization 均有测试 |
+| 4 | Analyzer / safe pushdown | PASS | `PredicateAnalyzer` 只消费 `PredicateSet.conjuncts()` 的最外层正向 canonical comparison；OR/NOT/null-test 标为 opaque residual，不再作为未知 shape 失败；root OR/NOT/null-test 无约束时确定回退聚簇无界扫描，不实施 OR union 或 NULL endpoint |
+| 5 | Access path / point proof | PASS | 一致性 SELECT 在完整主键或 logical-unique key 被正向 equality 覆盖时允许 point+额外 residual；locking read 继续 range；point validator 只从最外层 AND comparison 证明 key，专项测试拒绝仅由 OR 分支提供的 key，防止 under-scan |
+| 6 | Physical residual / evaluator | PASS | 物理校验递归覆盖 truth/comparison/AND/OR/NOT/null-test，comparison 仍要求 column-literal，null-test 只接受 column/literal；adapter 在完整聚簇行上 AND/OR 短路、NOT 保留 UNKNOWN、null-test 只检查 NullValue，未下沉 B+Tree/Record |
+| 7 | SELECT / DML / isolation | PASS | Session 真实链覆盖 point+opaque residual、root OR full scan、NOT、nullable external TEXT、FOR SHARE 与 range UPDATE/DELETE；adapter 另覆盖 RU point OR/null-test，既有 RC/RR、ReadView、LOB hydration、锁等待、range identity 物化/Halloween 与 statement guard 回归全部通过 |
+| 8 | Dependency / resources / Reserved | PASS | 新 parser/binder/expression/optimizer 类型不依赖 engine/session/storage internal；既有 Binder→`storage.api.ddl` 稳定端口未改变；无新增锁、等待、共享可变状态、持久格式或恢复阶段。逐类型 `rg` 证明全部新增生产类型有生产调用方，Reserved/Unwired 无新增行 |
+| 9 | Docs / current map checklist | PASS | 57 行 slice、Parser/Binder、Optimizer、Executor 厚设计和本 SQL flow/package/gap 小节已按最终源码同步；重新执行本文件 10 项清单，实线均有 source anchor，OR union/NULL endpoint/pull executor/cost/statistics 保持明确 gap，未改目标架构图 |
+| 10 | Static / forced full regression | PASS | M3 生产范围无 executable Java monitor、裸 `IllegalArgumentException/RuntimeException`、未决占位标记、`System.out` 或越层 import；`git diff --check` 无 whitespace error（仅 CRLF 提示）。固定 JDK 25.0.2 + Gradle 9.5.1 `test --rerun-tasks --no-daemon`：331 suites / **1933 tests**，0 failure/error/skip，相对 M2 增加 9 tests |
+
+## 2026-07-23 Calcite-Lite SQL Expression + Rule M2 10-Pass Review Log
+
+本轮在 M1 未提交工作区上继续实现，先以 Git 状态区分并保留既有改动，再按相关厚设计、
+M2 57 行 slice、生产源码、测试、`rg` 和固定工具链执行十个独立事实面复核；未使用 GitNexus。
+
+| Pass | Dimension | Result | Evidence / correction |
+| --- | --- | --- | --- |
+| 1 | 权威来源 / 工作区 / blast radius | PASS | 先读 current map 与 parser/binder、optimizer、executor 三份厚设计；高扇出扫描确认旧 `BoundRowPredicate` 覆盖 13 个生产/4 个测试文件，旧 `executor.SqlValue` 覆盖 20 个生产/9 个测试文件，迁移前先跑 SQL+adapter+Session 基线并保持 M1 其它改动 |
+| 2 | Value / Expression 语义 | PASS | `SqlValue` 下移 `sql.type` 且旧 FQN 在 `src/main`/`src/test` 零引用；sealed expression 只含 column/literal/comparison/AND/truth，列携带 stable id+ordinal+exact type+position，comparison exact-type，`SqlBoolean` 真值表与 WHERE-only-TRUE 有单测 |
+| 3 | Predicate 单一权威 | PASS | `BoundSelect/Update/Delete` 只保存完整 condition；`PredicateSet` 私有构造且 conjunct/引用 ordinal 均递归派生，equals/hash 只基于 condition；旧 `BoundRowPredicate*` 源文件删除，生产/测试零引用，不存在双轨状态 |
+| 4 | Rule 固定点 / 封闭性 | PASS（加固） | 默认稳定顺序为 AND 展平→literal-column 反转→三值折叠；最多16 pass，拒绝重复规则名、伪 changed、循环和不收敛；复核把关系树 rewriter 改为 sealed exhaustive switch，并补 comparison 方向反转测试 |
+| 5 | Analyzer / Access path 安全 | PASS | `PredicateAnalyzer` 只消费 canonical condition 并派生 equality/range/empty；string/binary 等未知 collation 顺序不用于矛盾或收紧证明；Selector 独占 M1-compatible primary→unique→non-unique→longest-prefix→clustered 选择、stable-id tie-break 与 DESC 交换 |
+| 6 | Physical plan / residual | PASS（加固） | point、secondary-prefix、general range SELECT 都携带完整 residual；复核新增 canonical residual 校验和“每个 point key 必须由相同 typed equality 证明”，替代 optimizer 不能提交 under-scan；LOB/JSON、NULL key、endpoint width 与 exact table version 继续 fail-closed |
+| 7 | Executor / adapter / 事务语义 | PASS（修正） | Executor 仍只封闭分派 PhysicalPlan/Data Port；adapter 在 MVCC/current-read 完整聚簇行上用 Record comparator 递归求值三值 residual，只有 TRUE 命中；复核补 RU 聚簇 point residual 过滤及真实 adapter 回归，ReadView、LOB、deadline、range DML identity 物化/Halloween 与 statement guard 未改 |
+| 8 | Metadata / 依赖 / 并发 / Reserved | PASS | Compiler/规则/分析/选路不 publish/close metadata，不创建事务、锁、ReadView 或 cursor；Session 仍在完整 PhysicalPlan 后 publish。optimizer/expression/type 无 engine/session/storage 上行 import，storage 无 SQL/session/engine 反向 import；无新增锁/等待或共享可变状态；新增生产类型均有生产调用方，Reserved/Unwired 无新增行 |
+| 9 | TDD / 文档 / current map | PASS | 先加入缺失 expression/rule 类型的编译红灯，再实现并迁移高扇出调用方；定向 36 tests 通过。M2 slice、三份厚设计和本 SQL flow/package/gap 小节已同步；按本文件 10 项清单逐项复核实线、planned 标记、依赖、PageStore 不变、Reserved、Gap、占位词、状态、跨模块语义和文档分层 |
+| 10 | 静态规则 / 强制全量 | PASS | 新生产范围无 executable Java monitor、裸 `IllegalArgumentException/RuntimeException`、TODO/TBD/FIXME、`System.out` 或越层 import；`git diff --check` 无 whitespace error（仅 CRLF 提示）。固定 JDK 25.0.2 + Gradle 9.5.1 `test --rerun-tasks --no-daemon`：331 suites / **1924 tests**，0 failure/error/skip，相对 329/1916 基线增加 2 suites/8 tests |
+
+## 2026-07-23 Calcite-Lite SQL Planning M1 10-Pass Review Log
+
+本轮按用户要求以十个独立事实面复核最终源码；实现计划只保留在 agent todo，持久资产仅为 53 行 slice、
+37 行 ADR 与受影响的厚设计/current map 小节。调用链直接由设计、源码、`rg`、Git diff 和测试报告核对，
+未使用 GitNexus。
+
+| Pass | Dimension | Result | Evidence / correction |
+| --- | --- | --- | --- |
+| 1 | 目标架构与生产接线 | PASS | `DatabaseEngine` 组合共享 `SqlStatementCompiler` 并注入 Session；真实链为 Parser → semantic Binder → logical converter → heuristic optimizer → PhysicalPlan → Executor → Data Port → adapter，DDL/session control 保持旁路；高扇出改动覆盖 Session、Executor、gateway、adapter 与测试调用方 |
+| 2 | Binder / IR 职责与封闭性 | PASS | Binder 只保留 exact table、ordinal、typed value/predicate、assignment/read intent，不含 index/range；旧 `BoundPoint/Range/Secondary` 物理类型及校验器已删除，`BoundRelationalStatement`、`RelNode`、`PhysicalPlan` 均 sealed，converter/optimizer/executor switch 穷尽且无 default |
+| 3 | 优化规则语义等价 | PASS | 逐段对照旧 Binder 的 predicate 交集与 access selector：完整 primary → 最小 stable-id unique secondary → 单列 non-unique equality → 最长连续 composite prefix/stable-id → clustered scan；DESC 边界交换、unknown collation 宽化、locking point、完整 residual 与 empty 证明保持 |
+| 4 | 计划不变量与失败前置 | PASS（修正） | semantic/logical/physical 构造器冻结集合并交叉校验 exact table/index/ordinal/key width；SQL NULL 只能形成 empty、不能进入 point key/endpoint。复核补上 `PhysicalPointSelect` 自身对 LOB/JSON key 的拒绝及替代 optimizer 回归，避免只依赖默认 heuristic 前置判断 |
+| 5 | Metadata scope 所有权 | PASS | Binder/Compiler 都不 publish/close；Session 仅在完整 PhysicalPlan 返回后 `scope.publish()`，再进入 Executor。Compiler optimizer-failure 测试证明 staged MDL 随调用方 close；注入失败 compiler 的 Session 测试证明 Executor 未调用、autocommit 空事务回滚且 Session 恢复 OPEN |
+| 6 | Executor / Data Port / 存储语义 | PASS | Executor 只消费 PhysicalPlan 并依赖 `SqlDataAccessPort`；`SqlStorageGateway` 只额外组合 transaction/XA facade。adapter diff 除物理类型迁移、诊断和注释外未改 ReadView、LOB、deadline、fatal 或 DML 算法；range UPDATE/DELETE 仍先物化全部 identity，再在一个 `DmlStatementGuard` 内原子修改 |
+| 7 | 依赖、异常与并发边界 | PASS（修正） | storage 无 SQL/session/engine/DD 反向 import，optimizer 无 engine/session/storage import，Session 无 storage internal import；跨 Session/storage 的 recovery-export 异常移至 `common.exception`。Compiler/Converter/Optimizer 无共享可变状态；变更范围无 Java monitor、wait/notify 或无界新增等待 |
+| 8 | 定向与跨模块回归 | PASS | Binder/Compiler/Optimizer/Executor/Session 定向通过；随后 gateway、transaction policy、Session end-to-end、MVCC concurrency、crash recovery 与 DatabaseEngine integration 扩展回归通过，覆盖锁定读、range DML、LOB、事务终态和重启链 |
+| 9 | 文档与 current-map 10 项清单 | PASS（修正） | ADR、slice 与 parser/binder、optimizer、executor 三份权威厚设计已同步；SQL 图每组实线有 production source anchor，memo/cost/cursor/EXPLAIN 只列 gap。全部新生产类型均有生产调用方，因此 Reserved/Unwired 无新增项；复核按源码把 recovery-export 准入更正为 consistent/FOR SHARE 可用、FOR UPDATE/写入拒绝 |
+| 10 | 静态规则与强制全量 | PASS | 旧物理 Bound 在 `src/main`/`src/test` 零引用；变更生产范围无裸 `IllegalArgumentException/RuntimeException`、monitor、TODO/TBD/FIXME、`System.out` 或越层 import；`git diff --check` 无 whitespace error（仅 CRLF 提示）。固定 JDK 25.0.2 + Gradle 9.5.1 `test --rerun-tasks --no-daemon`：329 suites / **1916 tests**，0 failure/error/skip |
 
 ## 2026-07-22 Online DDL Evolution E+F Five-Pass Implementation Review Log
 

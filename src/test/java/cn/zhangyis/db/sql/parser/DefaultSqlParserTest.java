@@ -11,6 +11,13 @@ import cn.zhangyis.db.sql.parser.ast.CreateIndexStatementNode;
 import cn.zhangyis.db.sql.parser.ast.DropIndexStatementNode;
 import cn.zhangyis.db.sql.parser.ast.IndexKeyOrderNode;
 import cn.zhangyis.db.sql.parser.ast.BetweenPredicateNode;
+import cn.zhangyis.db.sql.parser.ast.BooleanExpressionNode;
+import cn.zhangyis.db.sql.parser.ast.ConjunctionExpressionNode;
+import cn.zhangyis.db.sql.parser.ast.DisjunctionExpressionNode;
+import cn.zhangyis.db.sql.parser.ast.NegationExpressionNode;
+import cn.zhangyis.db.sql.parser.ast.NullTestOperator;
+import cn.zhangyis.db.sql.parser.ast.NullTestPredicateNode;
+import cn.zhangyis.db.sql.parser.ast.PredicateNode;
 import cn.zhangyis.db.sql.parser.ast.SavepointStatementNode;
 import cn.zhangyis.db.sql.parser.ast.ComparisonOperator;
 import cn.zhangyis.db.sql.parser.ast.ComparisonPredicateNode;
@@ -40,7 +47,7 @@ class DefaultSqlParserTest {
         SelectStatementNode select = assertInstanceOf(SelectStatementNode.class,
                 parser.parse("select name,id from def.app.t where id=1 AND name='x'"));
         assertFalse(select.star());
-        assertEquals(2, select.predicates().size());
+        assertEquals(2, conjuncts(select.condition()).size());
     }
 
     /**
@@ -117,11 +124,11 @@ class DefaultSqlParserTest {
         assertEquals("orders", update.table().parts().getLast().value());
         assertEquals(2, update.assignments().size());
         assertEquals("name", update.assignments().getFirst().column().value());
-        assertEquals(2, update.predicates().size());
+        assertEquals(2, conjuncts(update.condition()).size());
 
         DeleteStatementNode delete = assertInstanceOf(DeleteStatementNode.class,
                 parser.parse("DELETE FROM orders WHERE id=1;"));
-        assertEquals(1, delete.predicates().size());
+        assertInstanceOf(PredicateNode.class, delete.condition());
     }
 
     /** 两种 DDL 语法必须归一为同一个 AST，默认 ASC 与显式 DESC 均保持。 */
@@ -228,11 +235,11 @@ class DefaultSqlParserTest {
                         """));
 
         ComparisonPredicateNode lower = assertInstanceOf(
-                ComparisonPredicateNode.class, select.predicates().get(1));
+                ComparisonPredicateNode.class, conjuncts(select.condition()).get(1));
         ComparisonPredicateNode upper = assertInstanceOf(
-                ComparisonPredicateNode.class, select.predicates().get(2));
+                ComparisonPredicateNode.class, conjuncts(select.condition()).get(2));
         BetweenPredicateNode between = assertInstanceOf(
-                BetweenPredicateNode.class, select.predicates().get(3));
+                BetweenPredicateNode.class, conjuncts(select.condition()).get(3));
         assertEquals(ComparisonOperator.GREATER_THAN_OR_EQUAL, lower.operator());
         assertEquals(ComparisonOperator.LESS_THAN, upper.operator());
         assertEquals("score", between.column().value());
@@ -241,13 +248,46 @@ class DefaultSqlParserTest {
         UpdateStatementNode update = assertInstanceOf(UpdateStatementNode.class,
                 parser.parse("UPDATE orders SET status='old' WHERE id>10 AND id<=20"));
         assertEquals(ComparisonOperator.GREATER_THAN,
-                assertInstanceOf(ComparisonPredicateNode.class, update.predicates().getFirst()).operator());
+                assertInstanceOf(ComparisonPredicateNode.class,
+                        conjuncts(update.condition()).getFirst()).operator());
         assertEquals(ComparisonOperator.LESS_THAN_OR_EQUAL,
-                assertInstanceOf(ComparisonPredicateNode.class, update.predicates().getLast()).operator());
+                assertInstanceOf(ComparisonPredicateNode.class,
+                        conjuncts(update.condition()).getLast()).operator());
 
         DeleteStatementNode delete = assertInstanceOf(DeleteStatementNode.class,
                 parser.parse("DELETE FROM orders WHERE created_at BETWEEN '2020-01-01' AND '2020-12-31'"));
-        assertInstanceOf(BetweenPredicateNode.class, delete.predicates().getFirst());
+        assertInstanceOf(BetweenPredicateNode.class, delete.condition());
+    }
+
+    /**
+     * 布尔表达式必须按 NOT、AND、OR 的优先级形成语法树；括号只改变树形，
+     * 不作为无执行语义的独立节点泄漏给 Binder。
+     */
+    @Test
+    void parsesBooleanPrecedenceParenthesesAndNullTests() {
+        SelectStatementNode select = assertInstanceOf(SelectStatementNode.class,
+                parser.parse("""
+                        SELECT id FROM orders
+                        WHERE id=1 OR NOT (status IS NULL AND tenant>=2)
+                        """));
+
+        DisjunctionExpressionNode disjunction = assertInstanceOf(
+                DisjunctionExpressionNode.class, select.condition());
+        assertInstanceOf(PredicateNode.class, disjunction.operands().getFirst());
+        NegationExpressionNode negation = assertInstanceOf(
+                NegationExpressionNode.class, disjunction.operands().getLast());
+        ConjunctionExpressionNode conjunction = assertInstanceOf(
+                ConjunctionExpressionNode.class, negation.operand());
+        NullTestPredicateNode nullTest = assertInstanceOf(
+                NullTestPredicateNode.class, conjunction.operands().getFirst());
+        assertEquals(NullTestOperator.IS_NULL, nullTest.operator());
+        assertEquals("status", nullTest.column().value());
+
+        DeleteStatementNode delete = assertInstanceOf(DeleteStatementNode.class,
+                parser.parse("DELETE FROM orders WHERE note IS NOT NULL"));
+        assertEquals(NullTestOperator.IS_NOT_NULL,
+                assertInstanceOf(NullTestPredicateNode.class,
+                        delete.condition()).operator());
     }
 
     /**
@@ -257,7 +297,7 @@ class DefaultSqlParserTest {
     void rejectsUnsupportedShapesAndBrokenFraming() {
         String[] invalid = {
                 "", "INSERT INTO t VALUES (1)", "INSERT INTO t(id) VALUES (1),(2)",
-                "SELECT * FROM t", "SELECT * FROM t WHERE id <> 1", "SELECT * FROM t WHERE id=1 OR x=2",
+                "SELECT * FROM t", "SELECT * FROM t WHERE id <> 1",
                 "SELECT * FROM t WHERE id=1; SELECT 1", "INSERT INTO t(id) VALUES (X'ABC')",
                 "INSERT INTO t(id) VALUES (B'012')", "SELECT * FROM `t WHERE id=1", "BEGIN garbage",
                 "SELECT * FROM t WHERE id=1 FOR", "SELECT * FROM t WHERE id=1 FOR DELETE",
@@ -267,7 +307,10 @@ class DefaultSqlParserTest {
                 "DROP INDEX IF EXISTS idx ON t", "DROP INDEX idx t",
                 "ALTER TABLE t DROP PRIMARY KEY", "ALTER TABLE t CONVERT TO CHARACTER SET 45",
                 "SELECT * FROM t WHERE id <", "SELECT * FROM t WHERE id BETWEEN 1",
-                "SELECT * FROM t WHERE id BETWEEN 1 OR 2", "SELECT * FROM t WHERE id ! 1"
+                "SELECT * FROM t WHERE id BETWEEN 1 OR 2", "SELECT * FROM t WHERE id ! 1",
+                "SELECT * FROM t WHERE (id=1", "SELECT * FROM t WHERE id=1)",
+                "SELECT * FROM t WHERE id IS", "SELECT * FROM t WHERE id IS TRUE",
+                "SELECT * FROM t WHERE id NOT BETWEEN 1 AND 2"
                 , "SAVEPOINT", "ROLLBACK TO", "ROLLBACK TO SAVEPOINT",
                 "RELEASE beforebatch", "RELEASE SAVEPOINT"
         };
@@ -289,6 +332,23 @@ class DefaultSqlParserTest {
         SelectStatementNode node = assertInstanceOf(SelectStatementNode.class,
                 parser.parse("SeLeCt * FrOm Mixed WHERE ID=1"));
         assertEquals("Mixed", node.table().parts().getFirst().value());
-        assertEquals("ID", node.predicates().getFirst().column().value());
+        assertEquals("ID",
+                assertInstanceOf(PredicateNode.class,
+                        node.condition()).column().value());
+    }
+
+    /**
+     * 把 Parser 产生的最外层 conjunction 展开为测试观察列表；单谓词视为单元素，
+     * OR/NOT 不允许被误当成 AND 展开。
+     *
+     * @param condition statement AST 中唯一权威的 WHERE 条件
+     * @return 保持用户书写顺序的最外层 AND operand
+     */
+    private static List<BooleanExpressionNode> conjuncts(
+            BooleanExpressionNode condition) {
+        if (condition instanceof ConjunctionExpressionNode conjunction) {
+            return conjunction.operands();
+        }
+        return List.of(condition);
     }
 }

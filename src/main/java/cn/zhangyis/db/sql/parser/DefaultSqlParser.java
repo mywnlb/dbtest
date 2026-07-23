@@ -10,7 +10,7 @@ import java.util.Locale;
 import java.util.Optional;
 
 /** v1 递归下降 parser；实例只持最大输入配置，单次 parse 的 token/cursor 均为局部状态。 */
-public final class DefaultSqlParser {
+public final class DefaultSqlParser implements SqlParser {
     /**
      * 类级校验或资源上界；所有实例以该值拒绝超限输入，调整时必须复核容量、等待与格式约束。
      */
@@ -43,6 +43,7 @@ public final class DefaultSqlParser {
      * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      * @throws SqlSyntaxException SQL 或协议输入不符合受支持语法时抛出；调用方应修正输入，不能据此提交事务副作用
      */
+    @Override
     public StatementNode parse(String sql) {
         if (sql == null) throw new DatabaseValidationException("SQL text must not be null");
         if (sql.length() > maxSqlLength) {
@@ -570,7 +571,8 @@ public final class DefaultSqlParser {
             assignments.add(assignment());
             while (match(TokenType.COMMA)) { take(); assignments.add(assignment()); }
             // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
-            requireKeyword("WHERE"); return new UpdateStatementNode(table, assignments, predicates());
+            requireKeyword("WHERE");
+            return new UpdateStatementNode(table, assignments, condition());
         }
 
         private AssignmentNode assignment() { return new AssignmentNode(identifier(), equalsLiteral()); }
@@ -583,12 +585,83 @@ public final class DefaultSqlParser {
          */
         private DeleteStatementNode delete() {
             requireKeyword("DELETE"); requireKeyword("FROM"); QualifiedNameNode table = qualifiedName();
-            requireKeyword("WHERE"); return new DeleteStatementNode(table, predicates());
+            requireKeyword("WHERE");
+            return new DeleteStatementNode(table, condition());
         }
 
-        private List<PredicateNode> predicates() {
-            List<PredicateNode> result = new ArrayList<>(); result.add(predicate());
-            while (keyword("AND")) { take(); result.add(predicate()); } return List.copyOf(result);
+        /**
+         * 从 WHERE 起点按 {@code NOT > AND > OR} 解析完整 boolean 语法树。
+         *
+         * @return 保持用户优先级、operand 顺序和源位置的不可变条件
+         * @throws SqlSyntaxException 条件缺失、括号不闭合或原子谓词非法时抛出
+         */
+        private BooleanExpressionNode condition() {
+            return disjunction();
+        }
+
+        /**
+         * 解析最低优先级 OR；每个 operand 已先完整消费其 AND 子树。
+         *
+         * <p>数据流：</p>
+         * <ol>
+         *     <li>读取第一个 conjunction，确保 OR 左侧是完整 boolean 表达式。</li>
+         *     <li>按用户顺序消费零个或多个 OR 和右侧 conjunction。</li>
+         *     <li>单元素保持原节点，多元素冻结为 n-ary disjunction，避免无意义包装。</li>
+         * </ol>
+         *
+         * @return OR 优先级层的不可变表达式
+         */
+        private BooleanExpressionNode disjunction() {
+            // 1、右侧 AND 必须先归组，防止把 a OR b AND c 错解为 (a OR b) AND c。
+            ArrayList<BooleanExpressionNode> operands = new ArrayList<>();
+            operands.add(conjunction());
+            // 2、OR token 只在本层消费，括号内会递归进入新的 disjunction。
+            while (keyword("OR")) {
+                take();
+                operands.add(conjunction());
+            }
+            // 3、保留最小 AST 形状；多 operand 的顺序后续不得重排。
+            return operands.size() == 1
+                    ? operands.getFirst()
+                    : new DisjunctionExpressionNode(operands);
+        }
+
+        /**
+         * 解析中间优先级 AND；BETWEEN 的内部 AND 由原子谓词先行消费。
+         *
+         * @return 保持用户顺序的单表达式或 n-ary conjunction
+         */
+        private BooleanExpressionNode conjunction() {
+            ArrayList<BooleanExpressionNode> operands = new ArrayList<>();
+            operands.add(negation());
+            while (keyword("AND")) {
+                take();
+                operands.add(negation());
+            }
+            return operands.size() == 1
+                    ? operands.getFirst()
+                    : new ConjunctionExpressionNode(operands);
+        }
+
+        /**
+         * 解析最高 boolean 前缀优先级 NOT、括号或原子谓词。
+         *
+         * @return 保留连续 NOT 和括号改变后树形的 boolean 表达式
+         * @throws SqlSyntaxException 右括号缺失或括号内条件非法时抛出
+         */
+        private BooleanExpressionNode negation() {
+            if (keyword("NOT")) {
+                Token not = take();
+                return new NegationExpressionNode(
+                        negation(), not.position());
+            }
+            if (match(TokenType.LPAREN)) {
+                take();
+                BooleanExpressionNode nested = disjunction();
+                require(TokenType.RPAREN, "')'");
+                return nested;
+            }
+            return predicate();
         }
 
         private SelectStatementNode select() {
@@ -600,9 +673,7 @@ public final class DefaultSqlParser {
             requireKeyword("FROM");
             QualifiedNameNode table = qualifiedName();
             requireKeyword("WHERE");
-            List<PredicateNode> predicates = new ArrayList<>();
-            predicates.add(predicate());
-            while (keyword("AND")) { take(); predicates.add(predicate()); }
+            BooleanExpressionNode condition = condition();
             SelectLockingClause lockingClause = SelectLockingClause.NONE;
             if (keyword("FOR")) {
                 take();
@@ -616,18 +687,20 @@ public final class DefaultSqlParser {
                     throw syntax("expected SHARE or UPDATE after FOR", current());
                 }
             }
-            return new SelectStatementNode(star, projections, table, predicates, lockingClause);
+            return new SelectStatementNode(
+                    star, projections, table, condition, lockingClause);
         }
 
         /**
-         * 解析一个列对 literal 的 comparison 或 BETWEEN。
+         * 解析一个列对 literal 的 comparison、BETWEEN 或 NULL 检查。
          *
          * <p>数据流：</p>
          * <ol>
          *     <li>读取左侧列标识符；列解析失败时不消费任何字面量。</li>
          *     <li>优先识别 BETWEEN，并在节点内部消费其语法专用 AND。</li>
-         *     <li>否则消费一个已支持的二元比较符；未支持操作符在 AST 发布前失败。</li>
-         *     <li>读取右侧 literal 并构造保留开闭边界的不可变谓词。</li>
+         *     <li>识别 IS [NOT] NULL；NOT 只属于 null-test，不与前缀 boolean NOT 混用。</li>
+         *     <li>否则消费一个已支持的二元比较符并读取右侧 literal。</li>
+         *     <li>构造保留开闭边界、NULL 操作符与源位置的不可变谓词。</li>
          * </ol>
          *
          * @return 尚未绑定 DD 类型和索引路径的不可变谓词
@@ -643,10 +716,24 @@ public final class DefaultSqlParser {
                 requireKeyword("AND");
                 return new BetweenPredicateNode(column, lower, literal());
             }
-            // 3、操作符 token 决定范围方向和开闭性，等值保留既有 AST 类型。
+            // 3、IS NULL 的结果永远是二值 boolean；Parser 不根据列 nullable 提前折叠。
+            if (keyword("IS")) {
+                take();
+                boolean negated = false;
+                if (keyword("NOT")) {
+                    take();
+                    negated = true;
+                }
+                requireKeyword("NULL");
+                return new NullTestPredicateNode(
+                        column, negated
+                        ? NullTestOperator.IS_NOT_NULL
+                        : NullTestOperator.IS_NULL);
+            }
+            // 4、操作符 token 决定范围方向和开闭性，等值保留既有 AST 类型。
             Token operator = current();
             take();
-            // 4、literal 缺失会抛稳定位置异常，不发布半构造谓词。
+            // literal 缺失会抛稳定位置异常，不发布半构造谓词。
             return switch (operator.type()) {
                 case EQUALS -> new EqualityPredicateNode(column, literal());
                 case LESS_THAN -> new ComparisonPredicateNode(

@@ -2,17 +2,34 @@ package cn.zhangyis.db.sql.binder.bound;
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.dd.domain.TableDefinition;
-import cn.zhangyis.db.sql.executor.SqlValue;
-import java.util.List;
+import cn.zhangyis.db.sql.expression.BoundExpression;
+import cn.zhangyis.db.sql.expression.BoundExpressionValidation;
 
-/** 主键点 DELETE；定位值按聚簇 index part 顺序冻结。
+/**
+ * 单表 DELETE 的纯语义绑定结果；Optimizer 决定主键点删除或原子范围删除。
  *
- * @param table 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
- * @param primaryKeyValues 参与 {@code 构造} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+ * @param table statement metadata lease 固定的 exact table version
+ * @param condition 完成名称解析和类型转换的完整 WHERE condition
  */
-public record BoundDelete(TableDefinition table, List<SqlValue> primaryKeyValues) implements BoundStatement {
+public record BoundDelete(TableDefinition table, BoundExpression condition)
+        implements BoundRelationalStatement {
+
+    /**
+     * 校验并冻结 DELETE predicate。
+     *
+     * <ol>
+     *     <li>拒绝缺失 exact table version 或 condition。</li>
+     *     <li>递归核对 condition 的 stable column identity、ordinal 与完整 DD type。</li>
+     * </ol>
+     *
+     * @throws DatabaseValidationException table、predicate 容器缺失或 ordinal 越界时抛出
+     */
     public BoundDelete {
-        BoundPrimaryKeyValidation.validate(table, primaryKeyValues, "DELETE");
-        primaryKeyValues = List.copyOf(primaryKeyValues);
+        // 1、DELETE 不允许以缺失 predicate 的方式隐式扩张为全表删除。
+        if (table == null || condition == null) {
+            throw new DatabaseValidationException("invalid semantic bound DELETE fields");
+        }
+        // 2、物理选路之前先闭合 exact metadata version 不变量。
+        BoundExpressionValidation.validateCondition(condition, table);
     }
 }

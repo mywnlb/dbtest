@@ -5,7 +5,7 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.dd.domain.ColumnTypeDefinition;
 import cn.zhangyis.db.dd.domain.DictionaryTypeId;
 import cn.zhangyis.db.sql.binder.exception.SqlTypeCoercionException;
-import cn.zhangyis.db.sql.executor.SqlValue;
+import cn.zhangyis.db.sql.type.SqlValue;
 import cn.zhangyis.db.sql.parser.ast.*;
 
 import java.math.BigDecimal;

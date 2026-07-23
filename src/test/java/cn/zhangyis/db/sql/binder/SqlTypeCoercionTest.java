@@ -3,7 +3,7 @@ package cn.zhangyis.db.sql.binder;
 import cn.zhangyis.db.common.exception.DatabaseRuntimeException;
 import cn.zhangyis.db.dd.domain.ColumnTypeDefinition;
 import cn.zhangyis.db.dd.domain.DictionaryTypeId;
-import cn.zhangyis.db.sql.executor.SqlValue;
+import cn.zhangyis.db.sql.type.SqlValue;
 import cn.zhangyis.db.sql.binder.exception.SqlTypeCoercionException;
 import cn.zhangyis.db.sql.parser.SourcePosition;
 import cn.zhangyis.db.sql.parser.ast.*;

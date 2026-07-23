@@ -13,7 +13,7 @@ import cn.zhangyis.db.session.SessionState;
 import cn.zhangyis.db.sql.executor.QueryResult;
 import cn.zhangyis.db.sql.executor.UpdateResult;
 import cn.zhangyis.db.sql.executor.CommandResult;
-import cn.zhangyis.db.sql.executor.SqlValue;
+import cn.zhangyis.db.sql.type.SqlValue;
 import cn.zhangyis.db.sql.executor.storage.SqlDurabilityMode;
 import cn.zhangyis.db.sql.executor.storage.SqlIsolationLevel;
 import cn.zhangyis.db.storage.engine.EngineConfig;
@@ -136,10 +136,10 @@ class DatabaseEngineSessionIntegrationTest {
                 QueryResult result = assertInstanceOf(QueryResult.class,
                         session.execute("SELECT body, id FROM docs WHERE email='READER@example.test'"));
                 assertEquals(1, result.rows().size());
-                assertEquals(body, ((cn.zhangyis.db.sql.executor.SqlValue.StringValue)
+                assertEquals(body, ((cn.zhangyis.db.sql.type.SqlValue.StringValue)
                         result.rows().getFirst().values().get(0)).value());
                 assertEquals(java.math.BigInteger.valueOf(7),
-                        ((cn.zhangyis.db.sql.executor.SqlValue.IntegerValue)
+                        ((cn.zhangyis.db.sql.type.SqlValue.IntegerValue)
                                 result.rows().getFirst().values().get(1)).value());
             }
         }

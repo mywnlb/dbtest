@@ -10,19 +10,24 @@ import cn.zhangyis.db.dd.domain.ColumnTypeDefinition;
 import cn.zhangyis.db.dd.domain.DictionaryTypeId;
 import cn.zhangyis.db.dd.service.DataDictionaryService;
 import cn.zhangyis.db.sql.binder.*;
-import cn.zhangyis.db.sql.binder.bound.BoundStatement;
 import cn.zhangyis.db.sql.executor.*;
+import cn.zhangyis.db.sql.type.SqlValue;
 import cn.zhangyis.db.sql.executor.storage.SqlStorageGateway;
 import cn.zhangyis.db.sql.executor.storage.SqlStatementDeadline;
 import cn.zhangyis.db.sql.executor.storage.exception.SqlStatementRollbackException;
 import cn.zhangyis.db.sql.executor.storage.exception.SqlTransactionOutcomeException;
-import cn.zhangyis.db.sql.parser.DefaultSqlParser;
+import cn.zhangyis.db.sql.parser.SqlParser;
 import cn.zhangyis.db.sql.parser.ast.*;
+import cn.zhangyis.db.sql.optimizer.DefaultSqlStatementCompiler;
+import cn.zhangyis.db.sql.optimizer.HeuristicQueryOptimizer;
+import cn.zhangyis.db.sql.optimizer.SqlStatementCompiler;
+import cn.zhangyis.db.sql.optimizer.logical.BoundToLogicalConverter;
+import cn.zhangyis.db.sql.optimizer.physical.PhysicalPlan;
 import cn.zhangyis.db.session.exception.SessionBusyException;
 import cn.zhangyis.db.session.exception.SessionStateException;
 import cn.zhangyis.db.session.exception.TransactionOutcomeUnknownException;
 import cn.zhangyis.db.session.xa.SessionXaCoordinator;
-import cn.zhangyis.db.storage.engine.RecoveryExportWriteRejectedException;
+import cn.zhangyis.db.common.exception.RecoveryExportWriteRejectedException;
 
 import java.time.Duration;
 import java.math.BigInteger;
@@ -49,15 +54,19 @@ public final class DefaultSqlSession implements SqlSession {
     /**
      * 本对象持有的 {@code parser} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
      */
-    private final DefaultSqlParser parser;
+    private final SqlParser parser;
     /**
      * 本对象持有的 {@code binder} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
      */
     private final DefaultSqlBinder binder;
     /**
+     * 数据访问语句的完整编译 pipeline；成功返回后 Session 才能发布 statement metadata scope。
+     */
+    private final SqlStatementCompiler compiler;
+    /**
      * 本对象持有的 {@code executor} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
      */
-    private final DefaultSqlExecutor executor;
+    private final SqlExecutor executor;
     /**
      * 本对象持有的 {@code transactions} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
      */
@@ -89,14 +98,14 @@ public final class DefaultSqlSession implements SqlSession {
      * @param id 参与 {@code 构造} 的稳定领域标识 {@code SessionId}；不得为 {@code null}，并须由对应值对象构造校验产生
      * @param options 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
      * @param dictionary 由组合根提供的 {@code DataDictionaryService} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
-     * @param parser 由组合根提供的 {@code DefaultSqlParser} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param parser 由组合根提供的 {@code SqlParser} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
      * @param binder 由组合根提供的 {@code DefaultSqlBinder} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
-     * @param executor 由组合根提供的 {@code DefaultSqlExecutor} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param executor 由组合根提供的 {@code SqlExecutor} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
      * @param gateway 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
      * @param onClose 在契约指定成功、失败或释放边界调用的回调；不得为 {@code null}，且不得破坏当前资源所有权和异常传播规则
      */
     public DefaultSqlSession(SessionId id, SessionOptions options, DataDictionaryService dictionary,
-                             DefaultSqlParser parser, DefaultSqlBinder binder, DefaultSqlExecutor executor,
+                             SqlParser parser, DefaultSqlBinder binder, SqlExecutor executor,
                              SqlStorageGateway gateway, Runnable onClose) {
         this(id, options, dictionary, parser, binder, executor, gateway,
                 cn.zhangyis.db.sql.executor.storage.SqlDdlGateway.UNSUPPORTED,
@@ -109,15 +118,15 @@ public final class DefaultSqlSession implements SqlSession {
      * @param id 参与 {@code 构造} 的稳定领域标识 {@code SessionId}；不得为 {@code null}，并须由对应值对象构造校验产生
      * @param options 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
      * @param dictionary 由组合根提供的 {@code DataDictionaryService} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
-     * @param parser 由组合根提供的 {@code DefaultSqlParser} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param parser 由组合根提供的 {@code SqlParser} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
      * @param binder 由组合根提供的 {@code DefaultSqlBinder} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
-     * @param executor 由组合根提供的 {@code DefaultSqlExecutor} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param executor 由组合根提供的 {@code SqlExecutor} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
      * @param gateway 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
      * @param executionAdmission SQL 解析、绑定或执行链路提供的语句、值或会话上下文；不得为 {@code null}，必须属于当前语句及会话的同一次执行
      * @param onClose 在契约指定成功、失败或释放边界调用的回调；不得为 {@code null}，且不得破坏当前资源所有权和异常传播规则
      */
     public DefaultSqlSession(SessionId id, SessionOptions options, DataDictionaryService dictionary,
-                             DefaultSqlParser parser, DefaultSqlBinder binder, DefaultSqlExecutor executor,
+                             SqlParser parser, DefaultSqlBinder binder, SqlExecutor executor,
                              SqlStorageGateway gateway, SessionExecutionAdmission executionAdmission,
                              Runnable onClose) {
         this(id, options, dictionary, parser, binder, executor, gateway,
@@ -131,9 +140,9 @@ public final class DefaultSqlSession implements SqlSession {
      * @param id 参与 {@code 构造} 的稳定领域标识 {@code SessionId}；不得为 {@code null}，并须由对应值对象构造校验产生
      * @param options 调用方提供的不可变领域输入；必须先通过其构造校验且不得为 {@code null}
      * @param dictionary 由组合根提供的 {@code DataDictionaryService} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
-     * @param parser 由组合根提供的 {@code DefaultSqlParser} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param parser 由组合根提供的 {@code SqlParser} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
      * @param binder 由组合根提供的 {@code DefaultSqlBinder} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
-     * @param executor 由组合根提供的 {@code DefaultSqlExecutor} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
+     * @param executor 由组合根提供的 {@code SqlExecutor} 协作者；不得为 {@code null}，其生命周期必须覆盖本次 {@code 构造} 调用
      * @param gateway 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
      * @param ddlGateway 由组合根注入的下游协作者；不得为 {@code null}，生命周期至少覆盖本对象
      * @param executionAdmission SQL 解析、绑定或执行链路提供的语句、值或会话上下文；不得为 {@code null}，必须属于当前语句及会话的同一次执行
@@ -141,7 +150,7 @@ public final class DefaultSqlSession implements SqlSession {
      * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
      */
     public DefaultSqlSession(SessionId id, SessionOptions options, DataDictionaryService dictionary,
-                             DefaultSqlParser parser, DefaultSqlBinder binder, DefaultSqlExecutor executor,
+                             SqlParser parser, DefaultSqlBinder binder, SqlExecutor executor,
                              SqlStorageGateway gateway,
                              cn.zhangyis.db.sql.executor.storage.SqlDdlGateway ddlGateway,
                              SessionExecutionAdmission executionAdmission,
@@ -166,7 +175,7 @@ public final class DefaultSqlSession implements SqlSession {
      * @param onClose Session registry 注销回调
      */
     public DefaultSqlSession(SessionId id, SessionOptions options, DataDictionaryService dictionary,
-                             DefaultSqlParser parser, DefaultSqlBinder binder, DefaultSqlExecutor executor,
+                             SqlParser parser, DefaultSqlBinder binder, SqlExecutor executor,
                              SqlStorageGateway gateway,
                              cn.zhangyis.db.sql.executor.storage.SqlDdlGateway ddlGateway,
                              SessionXaCoordinator xaCoordinator,
@@ -193,27 +202,73 @@ public final class DefaultSqlSession implements SqlSession {
      * @param onClose Session registry 注销回调
      */
     public DefaultSqlSession(SessionId id, SessionOptions options, DataDictionaryService dictionary,
-                             DefaultSqlParser parser, DefaultSqlBinder binder, DefaultSqlExecutor executor,
+                             SqlParser parser, DefaultSqlBinder binder, SqlExecutor executor,
                              SqlStorageGateway gateway,
                              cn.zhangyis.db.sql.executor.storage.SqlDdlGateway ddlGateway,
                              SessionXaCoordinator xaCoordinator,
                              SessionExecutionAdmission executionAdmission,
                              boolean recoveryExportReadOnly,
                              Runnable onClose) {
+        this(id, options, dictionary, parser, binder,
+                new DefaultSqlStatementCompiler(
+                        binder, new BoundToLogicalConverter(), new HeuristicQueryOptimizer()),
+                executor, gateway, ddlGateway, xaCoordinator, executionAdmission,
+                recoveryExportReadOnly, onClose);
+    }
+
+    /**
+     * DatabaseEngine 的完整组合根入口。Compiler 显式注入，使生产 Session 不依赖启发式、memo 或 cost
+     * optimizer 的具体选择；Parser、Binder、Compiler 与 Executor 仍共享同一实例生命周期。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验全部协作者，防止发布缺少任一 SQL 阶段的 Session。</li>
+     *     <li>保存无状态 SQL pipeline 与 DDL Binder；不在构造期间打开 metadata 或事务资源。</li>
+     *     <li>创建 Session transaction policy，并把 opaque storage gateway 限定在该策略内。</li>
+     * </ol>
+     *
+     * @param id Session 稳定身份；必须由 {@link SessionRegistry} 分配
+     * @param options Session SQL、隔离级别与 timeout 配置
+     * @param dictionary transaction metadata owner 使用的 DD facade
+     * @param parser SQL 文本到 AST 的稳定接口
+     * @param binder 关系语句 semantic binder，同时提供独立 DDL normalization
+     * @param compiler AST 到 PhysicalPlan 的完整编译接口；不得自行发布 metadata scope
+     * @param executor 只消费 PhysicalPlan 的执行接口
+     * @param gateway 当前 Session 的 transaction/XA/data facade
+     * @param ddlGateway 独立 DDL coordinator port
+     * @param xaCoordinator 实例共享 XA coordinator
+     * @param executionAdmission DatabaseEngine statement gate
+     * @param recoveryExportReadOnly 是否启用 FORCE 导出语句白名单
+     * @param onClose Session registry 注销回调
+     * @throws DatabaseValidationException 任一协作者缺失时抛出；不会发布半初始化 Session
+     */
+    public DefaultSqlSession(
+            SessionId id, SessionOptions options, DataDictionaryService dictionary,
+            SqlParser parser, DefaultSqlBinder binder, SqlStatementCompiler compiler,
+            SqlExecutor executor, SqlStorageGateway gateway,
+            cn.zhangyis.db.sql.executor.storage.SqlDdlGateway ddlGateway,
+            SessionXaCoordinator xaCoordinator,
+            SessionExecutionAdmission executionAdmission,
+            boolean recoveryExportReadOnly,
+            Runnable onClose) {
+        // 1、协作者完整性在任何 Session/transaction 状态发布前校验。
         if (id == null || options == null || dictionary == null || parser == null || binder == null
-                || executor == null || gateway == null || ddlGateway == null
+                || compiler == null || executor == null || gateway == null || ddlGateway == null
                 || xaCoordinator == null || executionAdmission == null || onClose == null) {
             throw new DatabaseValidationException("session collaborators must not be null");
         }
+        // 2、SQL pipeline 全部是无执行资源的长期协作者，statement 资源只在 execute 内创建。
         this.id = id;
         this.options = options;
         this.parser = parser;
         this.binder = binder;
+        this.compiler = compiler;
         this.executor = executor;
         this.ddlGateway = ddlGateway;
         this.onClose = onClose;
         this.executionAdmission = executionAdmission;
         this.recoveryExportReadOnly = recoveryExportReadOnly;
+        // 3、transaction policy 是唯一持有 opaque handle 与 transaction metadata scope 的 Session 子对象。
         this.transactions = new SessionTransactionPolicy(options, gateway, dictionary,
                 MdlOwnerId.forSession(id.value()), xaCoordinator);
     }
@@ -256,7 +311,7 @@ public final class DefaultSqlSession implements SqlSession {
                     && select.lockingClause() == SelectLockingClause.NONE
                     && transactions.requiresSerializableLockingRead()) {
                 statement = new SelectStatementNode(select.star(), select.projections(), select.table(),
-                        select.predicates(), SelectLockingClause.FOR_SHARE);
+                        select.condition(), SelectLockingClause.FOR_SHARE);
             }
             if (transactions.rollbackOnly() && !isRollback(statement)) {
                 throw new SessionStateException("rollback-only transaction accepts only ROLLBACK/close");
@@ -332,26 +387,32 @@ public final class DefaultSqlSession implements SqlSession {
      * 执行一条已识别为数据访问的语句。
      * <ol>
      *     <li>按读写意图准备/复用事务，并记录它是否为本语句专属 autocommit transaction。</li>
-     *     <li>以 deadline 限制 MDL 获取，完成 exact-version DD binding 后把 bound plan 交给 executor/storage。</li>
+     *     <li>以 deadline 限制 MDL 获取，依次完成 semantic bind、logical conversion 和 physical optimization；
+     *         只有完整计划成功后才 publish statement scope 并交给 Executor。</li>
      *     <li>成功的 autocommit 语句先完成 storage commit，再让 binding scope 释放 transaction metadata。</li>
      *     <li>失败时显式事务只标记 rollback-only；autocommit 尝试 full rollback，二次失败作为 suppressed 保留。</li>
      * </ol>
      *
-     * @param syntax SQL 解析、绑定或执行链路提供的语句、值或会话上下文；不得为 {@code null}，必须属于当前语句及会话的同一次执行
-     * @param readOnly 资源的访问模式；写模式允许受控修改，读模式禁止产生 dirty、redo 或元数据发布副作用
-     * @param deadline SQL 解析、绑定或执行链路提供的语句、值或会话上下文；不得为 {@code null}，必须属于当前语句及会话的同一次执行
-     * @return {@code executeData} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
+     * @param syntax Parser 产生的 INSERT、SELECT、UPDATE 或 DELETE AST；必须属于本次 execute
+     * @param readOnly 事务访问模式；只读模式禁止 dirty/redo，但仍允许发布本事务持有的 READ metadata lease
+     * @param deadline 从 Session.execute 入口创建的唯一绝对期限；编译、MDL、锁和终态等待共享其预算
+     * @return 完整查询行集或写入 affected-row 结果，并带有语句终态后的事务状态
+     * @throws DatabaseRuntimeException 编译、执行或 autocommit 终结失败时抛出；原始 cause/suppressed
+     *         图保留，autocommit 会先尝试回滚
      */
     private SqlExecutionResult executeData(StatementNode syntax, boolean readOnly, SqlStatementDeadline deadline) {
         // 1. prepareData 只建立事务上下文；实际写 id 仍由 storage 首写延迟分配。
         transactions.prepareData(readOnly);
         boolean autocommitStatement = transactions.mode() == SessionTransactionMode.AUTOCOMMIT_STATEMENT;
-        // 2. metadata timeout 不得越过 statement 剩余预算，scope 只负责本次 binding 发布边界。
+        // 2. metadata timeout 不得越过语句预算；compiler 全部成功后才把 staged lease 与计划一起发布。
         try (StatementBindingScope scope = transactions.beginBinding(
                 deadline.cap(options.metadataLockTimeout(), "metadata binding"))) {
             Optional<ObjectName> schema = options.currentSchema().map(ObjectName::of);
-            BoundStatement bound = binder.bind(syntax, new SqlBindingContext(schema, options.zoneId(), scope));
-            SqlExecutionResult result = executor.execute(transactions.handle(), bound, transactions.status(), deadline);
+            PhysicalPlan plan = compiler.compile(
+                    syntax, new SqlBindingContext(schema, options.zoneId(), scope));
+            scope.publish();
+            SqlExecutionResult result = executor.execute(
+                    transactions.handle(), plan, transactions.status(), deadline);
             // 3. storage 终态成功后 completeAutocommit 才清 transaction-duration MDL/pin。
             if (autocommitStatement) {
                 transactions.completeAutocommit(deadline.remaining("autocommit finalization"));

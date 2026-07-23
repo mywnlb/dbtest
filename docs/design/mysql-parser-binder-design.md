@@ -53,7 +53,9 @@
 
 转换链路：
 
-`SqlText -> TokenStream -> StatementAst -> BoundStatement -> LogicalPlan / DdlRequest / Executor`
+`SqlText -> TokenStream -> StatementAst -> BoundStatement -> LogicalPlan -> PhysicalPlan -> Executor`
+
+DDL command 从 `BoundStatement` 旁路进入 `DdlRequest` / DDL coordinator，不进入关系优化与执行链。
 
 核心原则：
 
@@ -70,6 +72,8 @@
 | `sql.parser.lexer` | 字符流到 token，注释、字符串、标识符、位置 span | session config | Strategy |
 | `sql.parser.core` | token 到不可变 AST | ast | Parser, Factory |
 | `sql.parser.ast` | AST node、statement node、expression node | 无 | Composite, Visitor |
+| `sql.expression` | sealed bound expression、exact type/nullability/source position | dd domain, parser position | Composite |
+| `sql.type` | SQL typed value 与三值 boolean | common | Value Object |
 | `sql.binder.api` | Parser/Binder 门面、绑定请求和输出 | parser, binder | Facade |
 | `sql.binder.scope` | scope stack、table alias、column namespace | dd domain | Repository |
 | `sql.binder.name` | schema/table/column/name resolution | dd, mdl | Chain of Responsibility |
@@ -104,7 +108,7 @@
 | `DdlRequest` | DDL coordinator 输入 |
 | `TableBinding` | table id、alias、dictionary version、storage binding |
 | `ColumnBinding` | column id、table binding、type、nullable、ordinal |
-| `BoundExpression` | 语义表达式、类型、collation、source span |
+| `BoundExpression` | sealed 语义表达式；列引用携带 stable column id、ordinal、exact DD type 和 source position |
 | `ParameterMetadata` | 参数 ordinal、期望类型、nullable、执行期约束 |
 | `StatementResourceGuard` | 管理 MDL ticket、DD pin、statement cleanup |
 
@@ -134,6 +138,12 @@ Parser 输出：
 - `PrepareAst` / `ExecuteAst`
 
 AST 不允许包含语义绑定结果。相同 SQL 文本在不同 schema、不同 DD version、不同权限上下文下可以复用 AST，但不能复用绑定对象。
+
+当前 M3 生产 Parser 对单表 SELECT/UPDATE/DELETE 的 WHERE 使用 sealed
+`BooleanExpressionNode`，按 `NOT > AND > OR` 构造不可变树，并支持括号、
+comparison、BETWEEN、`IS NULL` 与 `IS NOT NULL`。statement 只保存一个
+`condition`，不再同时维护 predicate list；IN、LIKE、函数、算术和通用 Pratt
+scalar expression 仍未接线。
 
 ### 6.2 BoundStatement
 
@@ -248,10 +258,13 @@ TypeResolver 处理：
 - Optimizer 读取 `BoundQuery`、`TableBinding`、`ColumnBinding`、`BoundExpression`。
 - Optimizer 负责逻辑改写、access path、join order 和 cost。
 - Binder 不创建物理执行计划。
+- 当前 M3 关系 Binder 递归输出 AND/OR/NOT/null-test 的单一 typed boolean condition；
+  `PredicateSet` 的 conjunct/引用列均由该 condition 派生，`RuleProgram` 规范化之后才允许
+  `PredicateAnalyzer` 从最外层正向 AND comparison 提取安全 range 约束。
 
 ### 8.3 与 Executor
 
-- Executor 接收 `BoundStatement` 或 Optimizer 输出计划。
+- 关系语句的 Executor 只接收 Optimizer 输出的 `PhysicalPlan`；DDL coordinator 可直接接收独立的 Bound command。
 - Executor 不做名称解析和类型推导。
 - Executor 通过 `StatementResourceGuard` 确保 statement 结束释放 MDL/DD pin。
 
@@ -482,7 +495,7 @@ TypeResolver 处理：
 | 2 | 目标与非目标 | 已明确 Parser/Binder 不做 optimizer、executor、storage 和账号权限实现 |
 | 3 | MySQL 8.0 贴合 | 已覆盖 sql_mode、prepared statement、MDL、Data Dictionary、类型转换和 collation |
 | 4 | 高内聚 | Lexer、Parser、AST、NameResolver、TypeResolver、ParameterBinder、PrivilegeHook 职责独立 |
-| 5 | 低耦合 | Parser 不依赖 DD，Binder 不依赖 storage，Optimizer/Executor 接收绑定结果 |
+| 5 | 低耦合 | Parser 不依赖 DD，Binder 不依赖 storage，Optimizer 接收语义绑定结果，Executor 只接收物理计划 |
 | 6 | 面向对象 | 已定义 Token、AST、BoundStatement、BindingContext、TableBinding、ColumnBinding 等对象 |
 | 7 | 设计模式 | 已列出 Facade、Composite、Visitor、Builder、Strategy、Snapshot、Guard 等模式 |
 | 8 | 核心领域模型 | 已覆盖语法对象、绑定对象、参数元数据和资源 guard |

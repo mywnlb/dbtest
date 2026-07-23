@@ -1,6 +1,6 @@
 # MiniMySQL InnoDB 风格 Undo Log 与 Purge 模块设计
 
-版本：2026-06-06  
+版本：2026-07-23
 实现语言：Java  
 参考基线：MySQL 8.0.46 InnoDB 官方手册与源码文档  
 关联设计：[innodb-transaction-mvcc-design.md](innodb-transaction-mvcc-design.md)，[innodb-secondary-index-mvcc-purge-design.md](innodb-secondary-index-mvcc-purge-design.md)，[innodb-crash-recovery-design.md](innodb-crash-recovery-design.md)，[innodb-redo-log-design.md](innodb-redo-log-design.md)，[innodb-buffer-pool-design.md](innodb-buffer-pool-design.md)，[innodb-btree-design.md](innodb-btree-design.md)，[innodb-record-design.md](innodb-record-design.md)，[innodb-disk-manager-design.md](innodb-disk-manager-design.md)
@@ -141,7 +141,7 @@
 | 枚举 | 取值 |
 | --- | --- |
 | `UndoLogKind` | `INSERT`, `UPDATE`, `TEMPORARY` |
-| `UndoRecordType` | `INSERT_ROW`, `UPDATE_ROW`, `DELETE_MARK`, `UPDATE_EXTERN_REF`, `DDL_MARKER` |
+| `UndoRecordType` | `INSERT_ROW`, `UPDATE_ROW`, `DELETE_MARK`, `REUSE_DELETE_MARKED`, `UPDATE_EXTERN_REF`, `DDL_MARKER` |
 | `UndoLogState` | `ACTIVE`, `PREPARED`, `COMMITTED_IN_HISTORY`, `ROLLING_BACK`, `ROLLED_BACK`, `PURGE_READY`, `PURGED`, `REUSABLE` |
 | `UndoSegmentState` | `FREE`, `ACTIVE`, `CACHED`, `TO_PURGE`, `PURGING`, `REUSABLE`, `TRUNCATING` |
 | `UndoTablespaceState` | `ACTIVE`, `INACTIVE`, `TRUNCATE_CANDIDATE`, `TRUNCATING`, `RESTORING`, `DROPPED` |
@@ -204,7 +204,7 @@
 `UndoSegment` 表示一条 undo log 的页链：
 
 - insert undo segment 保存未提交插入的撤销信息。
-- update undo segment 保存更新前镜像、delete-mark 前镜像和版本链指针。
+- update undo segment 保存更新前镜像、delete-mark 前镜像、delete-marked key reuse 前镜像和版本链指针。
 - temporary undo segment 仅服务临时对象，不进入普通 history list。
 
 约束：
@@ -242,6 +242,11 @@
 - undo record 不直接访问 Buffer Pool；读取由 repository 完成，应用由 rollback/purge executor 完成。
 - update undo 必须包含恢复旧隐藏列所需的信息。
 - delete-mark undo 必须能区分“撤销删除标记”和“purge 物理删除后只保留诊断”的边界。
+- `REUSE_DELETE_MARKED` 使用稳定 type code 4、归属 UPDATE log 且 `RollPointer.insert=false`；旧读者遇到未知 code
+  fail-closed，不提升 undo page format。它保存旧全行/隐藏列，旧版本 delete flag 由类型隐含为 true。
+- reuse secondary tail 使用 `PUBLISH_ENTRY`：`ABSENT` rollback 物理删除，`DELETE_MARKED` rollback 重新标记；
+  purge 只消费该 tail 的 rollback 证据，不据此删除当前 entry。
+- reuse 新 LOB 只持 rollback-new ownership；旧 marked 行的 purge-old ownership 仍归先前 DELETE_MARK，禁止双重释放。
 
 ### 5.6 HistoryList
 
@@ -255,7 +260,7 @@
 
 约束：
 
-- insert undo 不进入 history list。
+- insert undo 不进入 history list；逻辑 INSERT 若复用 marked 聚簇记录，使用 update-class reuse undo 并进入 history。
 - prepared transaction 的 undo 不进入可 purge 区间。
 - 链顺序是 append 的物理顺序，不按 TransactionNo 排序；purge 遇到不满足边界的 head 必须停止。
 - 内存 `HistoryList` 只是持久链投影，append/unlink 必须先提交 page3 与节点链接，再发布内存队列。

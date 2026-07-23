@@ -12,6 +12,10 @@ import cn.zhangyis.db.storage.api.ddl.StorageIndexKeyPart;
 import cn.zhangyis.db.storage.api.ddl.StorageIndexOrder;
 import cn.zhangyis.db.storage.api.ddl.StorageTableDefinition;
 import cn.zhangyis.db.storage.api.ddl.TableStorageBinding;
+import cn.zhangyis.db.storage.api.trx.CommitPreparedTransactionCommand;
+import cn.zhangyis.db.storage.api.trx.PrepareTransactionCommand;
+import cn.zhangyis.db.storage.api.trx.ResolvedRollbackPreparedTransactionCommand;
+import cn.zhangyis.db.storage.btree.BTreeCurrentReadRequest;
 import cn.zhangyis.db.storage.btree.BTreeLookupResult;
 import cn.zhangyis.db.storage.btree.IndexMetadataResolver;
 import cn.zhangyis.db.storage.btree.SecondaryIndexMetadata;
@@ -38,6 +42,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -200,19 +205,19 @@ class TableDmlServiceTest {
     }
 
     /**
-     * 其它主键遗留的 delete-marked unique entry 仍占用 logical key。前台 INSERT 必须保守报告重复，等待 purge
-     * 物理摘除后再重试，不能因为普通 lookup 过滤 marked entry 而提前复用键值。
+     * 已提交 DELETE 遗留的其它主键 marked entry 不再占用 logical unique key；新 INSERT 必须创建自己的物理
+     * identity，而不是等待 purge 或复活旧主键 entry。
      *
      * <p>数据流：</p>
      * <ol>
      *     <li>提交主键 1 的 INSERT 与 DELETE，使聚簇行和 email entry 保持 delete-marked 物理状态。</li>
-     *     <li>主键 2 尝试写入相同 email；unique-prefix current-read 必须看到主键 1 的 marked 候选并拒绝。</li>
-     *     <li>回滚未产生页写的第二事务，确认旧 entry 仍 marked、主键 2 没有留下聚簇或二级残留。</li>
+     *     <li>主键 2 插入相同 email；logical-key X 已证明删除事务终结，prefix scan 跳过其它主键 marked history。</li>
+     *     <li>提交第二事务，确认旧 identity 仍 marked、新 identity live，两个物理候选可共存但仅一个当前有效。</li>
      * </ol>
      */
     @Test
-    @DisplayName("delete-marked unique entry owned by another primary key remains duplicate")
-    void deleteMarkedUniqueEntryFromAnotherPrimaryKeyRemainsDuplicate() {
+    @DisplayName("committed delete-marked unique entry can be reused before purge")
+    void committedDeleteMarkedUniqueEntryCanBeReusedBeforePurge() {
         StorageEngine engine = new StorageEngine(config());
         engine.open();
         try {
@@ -229,17 +234,319 @@ class TableDmlServiceTest {
             commit(engine, delete);
             assertMarked(engine, table.email(), deletedRow);
 
-            // 2. 包含 delete-marked 的 prefix scan 必须把其它主键候选判为重复，不能进入聚簇首 MTR。
-            LogicalRecord conflictingRow = row(2, "retained@example.test", 8);
-            Transaction conflicting = transaction(engine);
-            assertThrows(DmlDuplicateKeyException.class, () -> engine.tableDmlService().insert(
-                    new TableInsertCommand(conflicting, table.metadata(), conflictingRow, Optional.empty(), TIMEOUT)));
+            // 2. 其它主键 marked 候选只是历史导航入口；新主键必须得到独立 ABSENT 物理前态。
+            LogicalRecord replacement = row(2, "retained@example.test", 8);
+            Transaction replacementInsert = transaction(engine);
+            engine.tableDmlService().insert(new TableInsertCommand(
+                    replacementInsert, table.metadata(), replacement, Optional.empty(), TIMEOUT));
+            commit(engine, replacementInsert);
 
-            // 3. 重复检查只持有事务锁且没有页写；显式终态释放锁后，树中只能保留原 marked identity。
-            engine.tableDmlService().rollback(new ResolvedDmlRollbackCommand(conflicting));
+            // 3. purge 前允许同一 logical prefix 有多个 marked/live physical suffix，但绝不允许两个 live identity。
             assertMarked(engine, table.email(), deletedRow);
+            assertLive(engine, table.email(), replacement);
+            assertTrue(clusteredIncludingDeleted(engine, table, 1).orElseThrow().record().deleted());
+            assertEquals(replacement.columnValues(),
+                    clustered(engine, table, 2).orElseThrow().record().columnValues());
+        } finally {
+            engine.close();
+        }
+    }
+
+    /**
+     * 删除事务尚未终结时，新的同键 INSERT 必须等待 logical-key X；删除提交后等待者重扫当前 prefix，跳过 marked
+     * history 并成功发布，不能在锁授予前读取中间状态。
+     *
+     * @throws Exception executor future 或有界等待报告异常时抛出，由测试框架保留原始 cause
+     */
+    @Test
+    @DisplayName("unique insert waits for delete commit before reusing marked key")
+    void uniqueInsertWaitsForDeleteCommitBeforeReusingMarkedKey() throws Exception {
+        StorageEngine engine = new StorageEngine(config());
+        engine.open();
+        try {
+            TableSetup table = createTable(engine, "table-unique-delete-commit-wait.ibd");
+            LogicalRecord deletedRow = row(1, "commit-wait@example.test", 7);
+            Transaction initial = transaction(engine);
+            engine.tableDmlService().insert(new TableInsertCommand(
+                    initial, table.metadata(), deletedRow, Optional.empty(), TIMEOUT));
+            commit(engine, initial);
+
+            Transaction deleting = transaction(engine);
+            engine.tableDmlService().delete(new TableDeleteCommand(
+                    deleting, table.metadata(), primaryKey(1), TIMEOUT));
+            LogicalRecord replacement = row(2, "commit-wait@example.test", 8);
+            Transaction waitingTxn = transaction(engine);
+
+            try (var executor = Executors.newSingleThreadExecutor()) {
+                var waiting = executor.submit(() -> engine.tableDmlService().insert(new TableInsertCommand(
+                        waitingTxn, table.metadata(), replacement, Optional.empty(), TIMEOUT)));
+                assertThrows(TimeoutException.class, () -> waiting.get(100, TimeUnit.MILLISECONDS),
+                        "waiter must not inspect the uncommitted delete-marked entry");
+
+                commit(engine, deleting);
+                assertEquals(1, waiting.get(2, TimeUnit.SECONDS).affectedRows());
+            }
+            commit(engine, waitingTxn);
+
+            assertMarked(engine, table.email(), deletedRow);
+            assertLive(engine, table.email(), replacement);
+        } finally {
+            engine.close();
+        }
+    }
+
+    /**
+     * 删除事务回滚时必须先通过 undo revive 原 entry，再释放 logical-key X；等待 INSERT 醒来后重扫看到 live 候选并
+     * 报 duplicate，不能依据等待前观察到的 marked 位错误复用键值。
+     *
+     * @throws Exception executor future 或有界等待报告异常时抛出，由测试框架保留原始 cause
+     */
+    @Test
+    @DisplayName("unique insert sees live conflict after delete rollback")
+    void uniqueInsertSeesLiveConflictAfterDeleteRollback() throws Exception {
+        MutableTableResolver resolver = new MutableTableResolver();
+        StorageEngine engine = new StorageEngine(config());
+        engine.configureIndexMetadataResolver(resolver);
+        engine.open();
+        try {
+            TableSetup table = createTable(engine, "table-unique-delete-rollback-wait.ibd");
+            resolver.install(new UndoTargetMetadata(table.metadata(), Optional.empty()));
+            LogicalRecord retained = row(1, "rollback-wait@example.test", 7);
+            Transaction initial = transaction(engine);
+            engine.tableDmlService().insert(new TableInsertCommand(
+                    initial, table.metadata(), retained, Optional.empty(), TIMEOUT));
+            commit(engine, initial);
+
+            Transaction deleting = transaction(engine);
+            engine.tableDmlService().delete(new TableDeleteCommand(
+                    deleting, table.metadata(), primaryKey(1), TIMEOUT));
+            LogicalRecord rejected = row(2, "rollback-wait@example.test", 8);
+            Transaction waitingTxn = transaction(engine);
+
+            try (var executor = Executors.newSingleThreadExecutor()) {
+                var waiting = executor.submit(() -> engine.tableDmlService().insert(new TableInsertCommand(
+                        waitingTxn, table.metadata(), rejected, Optional.empty(), TIMEOUT)));
+                assertThrows(TimeoutException.class, () -> waiting.get(100, TimeUnit.MILLISECONDS),
+                        "waiter must remain behind the deleting transaction logical-key lock");
+
+                engine.tableDmlService().rollback(new ResolvedDmlRollbackCommand(deleting));
+                ExecutionException duplicate = assertThrows(ExecutionException.class,
+                        () -> waiting.get(2, TimeUnit.SECONDS));
+                assertTrue(duplicate.getCause() instanceof DmlDuplicateKeyException);
+            }
+            engine.tableDmlService().rollback(new ResolvedDmlRollbackCommand(waitingTxn));
+
+            assertLive(engine, table.email(), retained);
             assertTrue(clustered(engine, table, 2).isEmpty());
-            assertAbsent(engine, table.email(), conflictingRow);
+            assertAbsent(engine, table.email(), rejected);
+        } finally {
+            engine.close();
+        }
+    }
+
+    /**
+     * PREPARED 删除事务必须继续持有 logical-key X；只有 phase-two commit 的终态 redo durable 并释放锁后，等待
+     * INSERT 才能重扫 marked 当前状态并成功，phase one 不能提前暴露可复用键值。
+     *
+     * @throws Exception executor future 或有界等待报告异常时抛出，由测试框架保留原始 cause
+     */
+    @Test
+    @DisplayName("prepared delete commit releases unique key only after phase two")
+    void preparedDeleteCommitReleasesUniqueKeyOnlyAfterPhaseTwo() throws Exception {
+        StorageEngine engine = new StorageEngine(config());
+        engine.open();
+        try {
+            TableSetup table = createTable(engine, "table-unique-prepared-commit.ibd");
+            LogicalRecord deletedRow = row(1, "prepared-commit@example.test", 7);
+            Transaction initial = transaction(engine);
+            engine.tableDmlService().insert(new TableInsertCommand(
+                    initial, table.metadata(), deletedRow, Optional.empty(), TIMEOUT));
+            commit(engine, initial);
+
+            Transaction preparedDelete = transaction(engine);
+            engine.tableDmlService().delete(new TableDeleteCommand(
+                    preparedDelete, table.metadata(), primaryKey(1), TIMEOUT));
+            engine.preparedTransactionService().prepare(
+                    new PrepareTransactionCommand(preparedDelete, TIMEOUT));
+            LogicalRecord replacement = row(2, "prepared-commit@example.test", 8);
+            Transaction waitingTxn = transaction(engine);
+
+            try (var executor = Executors.newSingleThreadExecutor()) {
+                var waiting = executor.submit(() -> engine.tableDmlService().insert(new TableInsertCommand(
+                        waitingTxn, table.metadata(), replacement, Optional.empty(), TIMEOUT)));
+                assertThrows(TimeoutException.class, () -> waiting.get(100, TimeUnit.MILLISECONDS),
+                        "phase-one PREPARED must retain the logical unique-key lock");
+
+                engine.preparedTransactionService().commitPrepared(
+                        new CommitPreparedTransactionCommand(preparedDelete, TIMEOUT));
+                assertEquals(1, waiting.get(2, TimeUnit.SECONDS).affectedRows());
+            }
+            commit(engine, waitingTxn);
+            assertMarked(engine, table.email(), deletedRow);
+            assertLive(engine, table.email(), replacement);
+        } finally {
+            engine.close();
+        }
+    }
+
+    /**
+     * PREPARED 删除回滚必须先恢复聚簇与全部 secondary entry，再持久化 phase-two rollback 并释放 logical-key X；
+     * 等待 INSERT 醒来后只能看到恢复后的 live 冲突。
+     *
+     * @throws Exception executor future 或有界等待报告异常时抛出，由测试框架保留原始 cause
+     */
+    @Test
+    @DisplayName("prepared delete rollback restores live unique conflict before unlock")
+    void preparedDeleteRollbackRestoresLiveUniqueConflictBeforeUnlock() throws Exception {
+        MutableTableResolver resolver = new MutableTableResolver();
+        StorageEngine engine = new StorageEngine(config());
+        engine.configureIndexMetadataResolver(resolver);
+        engine.open();
+        try {
+            TableSetup table = createTable(engine, "table-unique-prepared-rollback.ibd");
+            resolver.install(new UndoTargetMetadata(table.metadata(), Optional.empty()));
+            LogicalRecord retained = row(1, "prepared-rollback@example.test", 7);
+            Transaction initial = transaction(engine);
+            engine.tableDmlService().insert(new TableInsertCommand(
+                    initial, table.metadata(), retained, Optional.empty(), TIMEOUT));
+            commit(engine, initial);
+
+            Transaction preparedDelete = transaction(engine);
+            engine.tableDmlService().delete(new TableDeleteCommand(
+                    preparedDelete, table.metadata(), primaryKey(1), TIMEOUT));
+            engine.preparedTransactionService().prepare(
+                    new PrepareTransactionCommand(preparedDelete, TIMEOUT));
+            LogicalRecord rejected = row(2, "prepared-rollback@example.test", 8);
+            Transaction waitingTxn = transaction(engine);
+
+            try (var executor = Executors.newSingleThreadExecutor()) {
+                var waiting = executor.submit(() -> engine.tableDmlService().insert(new TableInsertCommand(
+                        waitingTxn, table.metadata(), rejected, Optional.empty(), TIMEOUT)));
+                assertThrows(TimeoutException.class, () -> waiting.get(100, TimeUnit.MILLISECONDS),
+                        "phase-one PREPARED must retain the logical unique-key lock");
+
+                engine.preparedTransactionService().rollbackPrepared(
+                        new ResolvedRollbackPreparedTransactionCommand(preparedDelete, TIMEOUT));
+                ExecutionException duplicate = assertThrows(ExecutionException.class,
+                        () -> waiting.get(2, TimeUnit.SECONDS));
+                assertTrue(duplicate.getCause() instanceof DmlDuplicateKeyException);
+            }
+            engine.tableDmlService().rollback(new ResolvedDmlRollbackCommand(waitingTxn));
+            assertLive(engine, table.email(), retained);
+            assertTrue(clustered(engine, table, 2).isEmpty());
+        } finally {
+            engine.close();
+        }
+    }
+
+    /** 同一事务删除旧主键后可重入 logical-key X，并用新主键发布同一 unique key。 */
+    @Test
+    @DisplayName("same transaction reuses unique key with a new primary key")
+    void sameTransactionReusesUniqueKeyWithNewPrimaryKey() {
+        StorageEngine engine = new StorageEngine(config());
+        engine.open();
+        try {
+            TableSetup table = createTable(engine, "table-unique-same-transaction-reuse.ibd");
+            LogicalRecord oldRow = row(1, "same-transaction@example.test", 7);
+            Transaction initial = transaction(engine);
+            engine.tableDmlService().insert(new TableInsertCommand(
+                    initial, table.metadata(), oldRow, Optional.empty(), TIMEOUT));
+            commit(engine, initial);
+
+            Transaction replacing = transaction(engine);
+            engine.tableDmlService().delete(new TableDeleteCommand(
+                    replacing, table.metadata(), primaryKey(1), TIMEOUT));
+            LogicalRecord newRow = row(2, "same-transaction@example.test", 8);
+            engine.tableDmlService().insert(new TableInsertCommand(
+                    replacing, table.metadata(), newRow, Optional.empty(), TIMEOUT));
+            commit(engine, replacing);
+
+            assertMarked(engine, table.email(), oldRow);
+            assertLive(engine, table.email(), newRow);
+        } finally {
+            engine.close();
+        }
+    }
+
+    /**
+     * logical prefix 中可以积累多个已提交 marked history；检查必须越过前两个候选发现后续 live 冲突，并允许全 marked
+     * prefix 创建新的物理 suffix，防止旧的 limit=2 产生双 live unique key。
+     */
+    @Test
+    @DisplayName("unique check scans beyond multiple marked histories")
+    void uniqueCheckScansBeyondMultipleMarkedHistories() {
+        StorageEngine engine = new StorageEngine(config());
+        engine.open();
+        try {
+            TableSetup table = createTable(engine, "table-unique-many-marked.ibd");
+            String email = "many-marked@example.test";
+            for (int id = 1; id <= 3; id++) {
+                LogicalRecord historical = row(id, email, id);
+                Transaction insert = transaction(engine);
+                engine.tableDmlService().insert(new TableInsertCommand(
+                        insert, table.metadata(), historical, Optional.empty(), TIMEOUT));
+                commit(engine, insert);
+                Transaction delete = transaction(engine);
+                engine.tableDmlService().delete(new TableDeleteCommand(
+                        delete, table.metadata(), primaryKey(id), TIMEOUT));
+                commit(engine, delete);
+                assertMarked(engine, table.email(), historical);
+            }
+
+            LogicalRecord live = row(4, email, 4);
+            Transaction accepted = transaction(engine);
+            engine.tableDmlService().insert(new TableInsertCommand(
+                    accepted, table.metadata(), live, Optional.empty(), TIMEOUT));
+            commit(engine, accepted);
+
+            Transaction rejected = transaction(engine);
+            assertThrows(DmlDuplicateKeyException.class, () -> engine.tableDmlService().insert(
+                    new TableInsertCommand(rejected, table.metadata(), row(5, email, 5), Optional.empty(), TIMEOUT)));
+            engine.tableDmlService().rollback(new ResolvedDmlRollbackCommand(rejected));
+            assertLive(engine, table.email(), live);
+        } finally {
+            engine.close();
+        }
+    }
+
+    /**
+     * 候选扫描达到测试上限加一且尚未发现 live entry 时，服务必须抛容量异常；已读取的 marked 前缀不能被误当作
+     * 完整唯一性证明，异常后事务没有聚簇或二级页写。
+     */
+    @Test
+    @DisplayName("unique check fails closed when marked candidate capacity is exceeded")
+    void uniqueCheckFailsClosedWhenMarkedCandidateCapacityIsExceeded() {
+        StorageEngine engine = new StorageEngine(config());
+        engine.open();
+        try {
+            TableSetup table = createTable(engine, "table-unique-capacity.ibd");
+            String email = "capacity@example.test";
+            for (int id = 1; id <= 3; id++) {
+                LogicalRecord historical = row(id, email, id);
+                Transaction insert = transaction(engine);
+                engine.tableDmlService().insert(new TableInsertCommand(
+                        insert, table.metadata(), historical, Optional.empty(), TIMEOUT));
+                commit(engine, insert);
+                Transaction delete = transaction(engine);
+                engine.tableDmlService().delete(new TableDeleteCommand(
+                        delete, table.metadata(), primaryKey(id), TIMEOUT));
+                commit(engine, delete);
+            }
+
+            SecondaryUniqueCheckService bounded = new SecondaryUniqueCheckService(
+                    engine.miniTransactionManager(), engine.btreeService(), engine.lockManager(),
+                    engine.typeCodecRegistry(), 2);
+            Transaction probe = transaction(engine);
+            var owner = engine.transactionManager().assignWriteId(probe);
+            LogicalRecord target = row(4, email, 4);
+
+            assertThrows(SecondaryUniqueCheckCapacityException.class, () -> bounded.check(
+                    table.email(), target,
+                    new BTreeCurrentReadRequest(owner, probe.isolationLevel(), TIMEOUT, 8)));
+            engine.tableDmlService().rollback(new ResolvedDmlRollbackCommand(probe));
+
+            assertTrue(clusteredIncludingDeleted(engine, table, 4).isEmpty());
+            assertAbsent(engine, table.email(), target);
         } finally {
             engine.close();
         }
@@ -287,6 +594,96 @@ class TableDmlServiceTest {
             assertLive(engine, table.email(), rowA);
             assertMarked(engine, table.email(), rowB);
             assertEquals(rowA.columnValues(), clustered(engine, table, 1).orElseThrow().record().columnValues());
+        } finally {
+            engine.close();
+        }
+    }
+
+    /**
+     * 初次 unique 检查识别到同一物理 identity marked 后，purge 可以在 UPDATE 尚未取得 row guard 时删除该 entry。
+     * UPDATE 取得 guard 后必须把前态从 DELETE_MARKED 复核为 ABSENT；rollback 随后应删除新插入的 A，而不是尝试
+     * 对已被 purge 的历史 identity 恢复 delete mark。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>提交 A→B，留下 marked A、live B 和可 purge 的 UPDATE history。</li>
+     *     <li>在 B→A 完成初次 unique scan 后暂停；前台线程尚未取得 row guard，也没有写聚簇/secondary 页。</li>
+     *     <li>真实 PurgeCoordinator 删除 marked A 并推进 history，再恢复 UPDATE，让 row guard 内 exact recheck 选择 ABSENT。</li>
+     *     <li>回滚 B→A，确认新插入 A 被物理删除、B 恢复 live，证明 undo before-state 使用了复核结果。</li>
+     * </ol>
+     *
+     * @throws Exception executor、latch 或 purge 有界等待失败时抛出，由测试框架保留原始 cause
+     */
+    @Test
+    @DisplayName("update rechecks marked publish state after concurrent purge")
+    void updateRechecksMarkedPublishStateAfterConcurrentPurge() throws Exception {
+        MutableTableResolver resolver = new MutableTableResolver();
+        StorageEngine engine = new StorageEngine(foregroundOnlyConfig());
+        engine.configureIndexMetadataResolver(resolver);
+        engine.open();
+        try {
+            // 1、只改变 unique email，确保 history 中恰有一个可物理删除的 secondary old-key task。
+            TableSetup table = createTable(engine, "table-unique-purge-window.ibd");
+            resolver.install(new UndoTargetMetadata(table.metadata(), Optional.empty()));
+            LogicalRecord rowA = row(1, "purge-window-a@example.test", 7);
+            LogicalRecord rowB = row(1, "purge-window-b@example.test", 7);
+            Transaction insert = transaction(engine);
+            engine.tableDmlService().insert(new TableInsertCommand(
+                    insert, table.metadata(), rowA, Optional.empty(), TIMEOUT));
+            commit(engine, insert);
+            Transaction toB = transaction(engine);
+            engine.tableDmlService().update(new TableUpdateCommand(
+                    toB, table.metadata(), primaryKey(1), rowB, TIMEOUT));
+            commit(engine, toB);
+            assertMarked(engine, table.email(), rowA);
+
+            // 2、测试 hook 只阻塞无 page/row-guard 资源的稳定边界；事务 record/logical locks 仍按生产语义持有。
+            CountDownLatch uniqueChecked = new CountDownLatch(1);
+            CountDownLatch allowRowGuard = new CountDownLatch(1);
+            engine.tableDmlService().installFaultInjectorForTest((phase, operation, indexId) -> {
+                if (phase == TableDmlProgressPhase.AFTER_UNIQUE_CHECK_BEFORE_ROW_GUARD
+                        && operation == TableDmlSecondaryOperation.INSERT_OR_REVIVE
+                        && indexId == EMAIL_ID) {
+                    uniqueChecked.countDown();
+                    try {
+                        if (!allowRowGuard.await(2, TimeUnit.SECONDS)) {
+                            throw new AssertionError("timed out waiting to resume row-guard acquisition");
+                        }
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new AssertionError("unique-check test hook was interrupted", interrupted);
+                    }
+                }
+            });
+
+            Transaction backToA = transaction(engine);
+            try (var executor = Executors.newSingleThreadExecutor()) {
+                var updating = executor.submit(() -> engine.tableDmlService().update(new TableUpdateCommand(
+                        backToA, table.metadata(), primaryKey(1), rowA, TIMEOUT)));
+                try {
+                    assertTrue(uniqueChecked.await(2, TimeUnit.SECONDS),
+                            "B→A update must pause after seeing the marked A identity");
+
+                    // 3、purge 不进入事务逻辑锁目录；UPDATE 尚未取得 row guard，因此旧 A 可以在该窗口被删除。
+                    var summary = engine.purgeCoordinator().runBatch(1);
+                    assertEquals(1, summary.purgedLogs());
+                    assertEquals(1, summary.removedSecondaryEntries());
+                    assertAbsent(engine, table.email(), rowA);
+                } finally {
+                    allowRowGuard.countDown();
+                }
+                assertEquals(1, updating.get(2, TimeUnit.SECONDS).affectedRows());
+            } finally {
+                allowRowGuard.countDown();
+                engine.tableDmlService().installFaultInjectorForTest(TableDmlProgressFaultInjector.NO_OP);
+            }
+
+            // 4、复核后写入 undo 的 before-state 必须是 ABSENT；rollback 删除新 A 并恢复 B。
+            engine.tableDmlService().rollback(new ResolvedDmlRollbackCommand(backToA));
+            assertAbsent(engine, table.email(), rowA);
+            assertLive(engine, table.email(), rowB);
+            assertEquals(rowB.columnValues(),
+                    clustered(engine, table, 1).orElseThrow().record().columnValues());
         } finally {
             engine.close();
         }
@@ -860,5 +1257,16 @@ class TableDmlServiceTest {
     private EngineConfig config() {
         return new EngineConfig(directory, PAGE_SIZE, 256, SpaceId.of(5), PageNo.of(64),
                 64, 100, Duration.ofSeconds(30), 128L * 1024 * 1024);
+    }
+
+    /**
+     * 构造关闭后台 worker 的确定性配置，使测试可以显式控制 committed history 的唯一一次 purge 时点。
+     *
+     * @return 与 {@link #config()} 相同存储容量、但不启动 page-cleaner/purge driver 的引擎配置
+     */
+    private EngineConfig foregroundOnlyConfig() {
+        return new EngineConfig(directory, PAGE_SIZE, 256, SpaceId.of(5), PageNo.of(64),
+                64, 100, Duration.ofSeconds(30), 128L * 1024 * 1024, List.of(),
+                false, 128, Duration.ofMillis(10), 64, Duration.ofSeconds(30));
     }
 }

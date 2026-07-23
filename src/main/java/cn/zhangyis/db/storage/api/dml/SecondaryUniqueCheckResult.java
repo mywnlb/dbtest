@@ -6,7 +6,7 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
  * 二级 publish 前检查结果。duplicate=true 时调用方必须报告唯一/物理 identity 冲突，不能消费 publishState；
  * available 时 publishState 决定 insert 或 revive。
  *
- * @param duplicate    是否存在禁止发布的 live/其它主键候选。
+ * @param duplicate    是否存在禁止发布的 live logical candidate，或 exact physical 检查中出现状态错配。
  * @param publishState 无冲突时目标完整物理 identity 的既有状态；不能为 null。
  */
 public record SecondaryUniqueCheckResult(boolean duplicate, SecondaryPublishState publishState) {

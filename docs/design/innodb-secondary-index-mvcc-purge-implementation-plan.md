@@ -78,7 +78,8 @@ secondary consistent read 必须回表；purge 以聚簇版本链证明物理删
 ## Task 4: Unique Prefix Lock 与 Row Guard
 
 - [x] RED：两个事务不同主键并发写同 unique key，只有一个越过检查；NULL 不冲突。
-- [x] RED：其它主键 delete-marked entry 保守重复；同主键 marked entry 可复活。
+- [x] 历史 v1 RED：其它主键 delete-marked entry 保守重复；2026-07-23 current-read 切片已替换为“等待事务终态后重扫，
+  其它主键 marked 历史可复用、同主键 marked 可复活”，本文件不再作为当前实现依据。
 - [x] RED：DML guard 有界等待，purge zero-wait busy；用户输入 collation 等价时使用物化行主键 guard。
 - [x] 实现 including-deleted unique-prefix current-read；logical unique identity 在统一 `LockManager` 中持事务级 X 锁，
   1024 个公平 stripe 仅承担 DML/purge 同行物化 guard，不冒充 next-key/gap 锁。

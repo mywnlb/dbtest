@@ -1,6 +1,6 @@
 # MiniMySQL MySQL 8.0 风格 SQL Executor 与 Storage Engine API 设计
 
-版本：2026-06-05  
+版本：2026-07-23
 实现语言：Java  
 参考基线：MySQL 8.0.46 SQL Statements、InnoDB consistent read、locking read、transaction isolation、metadata locking  
 关联设计：[mysql-parser-binder-design.md](mysql-parser-binder-design.md)、[mysql-prepared-statement-plan-cache-design.md](mysql-prepared-statement-plan-cache-design.md)、[mysql-query-optimizer-design.md](mysql-query-optimizer-design.md)、[mysql-advanced-executor-operators-design.md](mysql-advanced-executor-operators-design.md)、[mysql-data-dictionary-ddl-design.md](mysql-data-dictionary-ddl-design.md)、[innodb-storage-engine-overview.md](innodb-storage-engine-overview.md)、[innodb-btree-design.md](innodb-btree-design.md)、[innodb-record-design.md](innodb-record-design.md)、[innodb-transaction-mvcc-design.md](innodb-transaction-mvcc-design.md)、[innodb-secondary-index-mvcc-purge-design.md](innodb-secondary-index-mvcc-purge-design.md)、[innodb-redo-log-design.md](innodb-redo-log-design.md)、[innodb-buffer-pool-design.md](innodb-buffer-pool-design.md)、[innodb-disk-manager-design.md](innodb-disk-manager-design.md)、[mysql-session-connection-protocol-design.md](mysql-session-connection-protocol-design.md)、[mysql-lock-observability-deadlock-design.md](mysql-lock-observability-deadlock-design.md)
@@ -267,7 +267,7 @@ DML 流程图见 [sql-dml-flow.mmd](diagrams/sql-dml-flow.mmd)。
 3. 构造 `LogicalRow`：默认值、NULL、类型、生成 `DB_ROW_ID` 扩展点。
 4. 检查唯一索引和主键冲突。
 5. 获取 insert intention lock 和必要 gap lock。
-6. Storage Engine 插入聚簇索引记录和二级索引记录。
+6. 主键 live 时报告 duplicate；delete-marked 时由 Storage Engine 走 update-class reuse，否则普通插入聚簇与二级记录。
 7. Record 写隐藏列，Transaction 写 undo，MTR 收集 redo。
 8. Autocommit 下提交事务并释放 row locks。
 
@@ -278,10 +278,12 @@ DML 流程图见 [sql-dml-flow.mmd](diagrams/sql-dml-flow.mmd)。
 1. 使用 current read 扫描候选行。
 2. 对扫描到的 index record 获取 X 或 next-key X lock。
 3. Executor 使用最新 current row 求值 WHERE。
-4. 构造 `UpdatePatch`。
-5. 如果更新聚簇主键，转换为 delete-mark + insert 的受控流程。
-6. 如果更新二级索引 key，Storage Engine delete-mark 旧 secondary entry 并插入新 entry。
-7. 写 undo、隐藏列、redo。
+4. READ COMMITTED 下 WHERE/residual 不匹配时，Storage 用该候选 scoped handle 精确释放 access 与 clustered record lock；
+   不能释放匹配行、logical-prefix 或 RR/SERIALIZABLE range lock。
+5. 构造 `UpdatePatch`。
+6. 如果更新聚簇主键，转换为 delete-mark + insert 的受控流程。
+7. 如果更新二级索引 key，Storage Engine delete-mark 旧 secondary entry 并插入新 entry。
+8. 写 undo、隐藏列、redo。
 
 ### 9.3 DELETE
 
@@ -290,8 +292,9 @@ DML 流程图见 [sql-dml-flow.mmd](diagrams/sql-dml-flow.mmd)。
 1. current read 扫描候选行。
 2. 获取 record X 或 next-key X lock。
 3. WHERE 命中后调用 `deleteRow()`。
-4. Record 层 delete-mark 聚簇记录和二级索引项。
-5. Purge 后续异步物理删除。
+4. RC WHERE 未命中时按候选精确解锁；命中行继续持锁到事务终态。
+5. Record 层 delete-mark 聚簇记录和二级索引项。
+6. Purge 后续异步物理删除。
 
 ### 9.4 语句级回滚
 

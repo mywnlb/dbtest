@@ -1,6 +1,6 @@
 # MiniMySQL InnoDB 风格 B+Tree 模块设计
 
-版本：2026-06-05  
+版本：2026-07-23
 实现语言：Java  
 参考基线：MySQL 8.0.46 InnoDB 官方手册与源码文档  
 关联设计：[innodb-storage-engine-overview.md](innodb-storage-engine-overview.md)、[innodb-disk-manager-design.md](innodb-disk-manager-design.md)、[innodb-buffer-pool-design.md](innodb-buffer-pool-design.md)、[innodb-record-design.md](innodb-record-design.md)、[innodb-redo-log-design.md](innodb-redo-log-design.md)、[innodb-transaction-mvcc-design.md](innodb-transaction-mvcc-design.md)、[innodb-undo-log-purge-design.md](innodb-undo-log-purge-design.md)、[innodb-secondary-index-mvcc-purge-design.md](innodb-secondary-index-mvcc-purge-design.md)
@@ -297,6 +297,10 @@ Non-leaf page：
 5. `SELECT FOR UPDATE`、`UPDATE`、`DELETE` 在范围内按隔离级别获取 record/gap/next-key lock。
 6. 扫描可向 Buffer Pool 提交 read-ahead hint。
 
+READ COMMITTED 的 residual-miss 优化使用 additive scoped-candidate API：existing `lockPoint/lockRange` 继续返回
+事务期锁语义；新入口把已重定位的记录快照与该次精确 `LockHandle` 绑定。只有上层用当前完整聚簇行证明最终
+residual 为 false 后才能释放该句柄；未分类、异常、RR/SERIALIZABLE 和 gap/next-key 均 fail-closed 保留。
+
 ### 7.3 Search Restart
 
 以下情况必须 restart：
@@ -324,6 +328,12 @@ Merge 流程见 [btree-merge-flow.mmd](diagrams/btree-merge-flow.mmd)。
 5. leaf 空间足够时调用 Record insert。
 6. 空间不足时构造 `PageSplitPlan`。
 7. MTR commit 后释放 page latch 和 buffer fix。
+
+聚簇主键命中 delete-marked 记录时不能直接当 duplicate，也不能物理 purge 后插入。state-aware current-read 以
+`ABSENT/LIVE/DELETE_MARKED` 分类：live 使用 record S，marked 使用 record X，absent 使用 insert intention；等待后
+状态变化必须按同一 deadline 重试。row guard 内 marked 仍稳定时，B+Tree 以旧隐藏列作 CAS，使用 update-class undo
+roll pointer 替换同 key 聚簇记录并清除 delete mark；marked 已被 purge 则退化为普通 insert。替换前必须一次性验证
+deleted flag、相同主键、编码长度/页容量，失败不得留下半写记录。
 
 ### 8.2 Split
 

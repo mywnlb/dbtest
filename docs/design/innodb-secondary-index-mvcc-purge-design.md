@@ -1,6 +1,6 @@
 # MiniMySQL 二级索引、回表 MVCC 与 Purge 生产闭环设计
 
-版本：2026-07-16
+版本：2026-07-23
 关联设计：`innodb-btree-design.md`、`innodb-transaction-mvcc-design.md`、
 `innodb-undo-log-purge-design.md`、`mysql-data-dictionary-ddl-design.md`、
 `mysql-sql-executor-storage-api-design.md`
@@ -70,21 +70,22 @@ rollback 收敛。
 
 ### 5.1 INSERT
 
-1. 分配 write id，检查聚簇主键和所有非 NULL logical unique secondary key。
+1. 分配 write id，检查聚簇主键；对所有非 NULL logical unique secondary key 取得事务级 X 锁并在等待后重扫当前前缀。
 2. 用待写聚簇行主键取得行 guard；进入前不持 page/undo latch 或 MTR。
 3. 冻结 INSERT undo secondary mutation 列表。
 4. 首个 MTR 写 undo、LOB、聚簇行并提交。
-5. 按 index id 逐个 MTR 插入 secondary entry；必须从 ABSENT 进入 live。
+5. 按 index id 逐个 MTR 插入 secondary entry；唯一二级在其它主键只留下 marked 历史时从 ABSENT 进入 live。
 6. 全部完成后返回，事务锁与 unique range lock 保留到事务终态。
 
 ### 5.2 UPDATE
 
 1. current-read 获取聚簇 X lock，等待后重定位并物化当前完整行。
-2. 从物化行提取主键取得行 guard，不能使用用户搜索字面量作 guard identity。
-3. 用 index comparator/prefix 语义比较 old/new logical key；等价 key 不产生 mutation。
-4. 对变化的 unique key 加包含 delete-marked 候选的 prefix next-key/gap X 锁。
-5. 新 entry 必须是 ABSENT 或同主键 DELETE_MARKED；状态写入 undo mutation。
-6. 首个 MTR 写 UPDATE undo并替换聚簇行。
+2. 用 index comparator/prefix 语义比较 old/new logical key；等价 key 不产生 mutation。
+3. 对变化的非 NULL unique key 取得 logical-prefix X 锁，等待后扫描包含 delete-marked 的全部当前候选。
+4. 从物化行提取主键取得行 guard，不能使用用户搜索字面量作 guard identity；进入前不持页 latch/MTR。
+5. 初查为同主键 DELETE_MARKED 时，在 row guard 内 exact 重读其状态，抵御初查后 purge 物理删除竞态；把最终
+   `ABSENT` 或 `DELETE_MARKED` 写入 undo mutation。
+6. 首个 MTR 写 UPDATE undo 并替换聚簇行。
 7. 每个变化索引先插入/复活新 entry，再 delete-mark 旧 entry。
 
 ### 5.3 DELETE
@@ -96,10 +97,18 @@ rollback 收敛。
 
 ## 6. 唯一二级检查
 
-NULL 参与 logical unique key 时允许多行，不做 logical duplicate 检查。非 NULL key 使用 logical-prefix range，定位时
-必须包含 delete-marked entry，并强制申请候选 next-key X 与 terminal gap X，语义不随 RC/RR 改变。零候选时 gap X
-串行化并发插入；命中其它主键的 live 或 delete-marked entry 均报告重复并等待后台 purge；同主键 delete-marked
-entry 可复活。最多读取两个候选即可发现非法多主键状态。
+NULL 参与 logical unique key 时允许多行，不做 logical duplicate 检查。非 NULL key 先取得 collation/prefix 归一化的
+logical-key X 锁并持有到事务终态；删除或改出旧 key 的事务也持有同一锁，因此等待结束后重扫 B+Tree 当前前缀即可
+观察提交或回滚结果。PREPARED 事务继续持锁，直到二阶段 commit/rollback 才唤醒等待者。
+
+唯一约束属于 current-read 判断，不使用调用事务的旧 ReadView，也不沿候选 undo 返回历史版本。扫描必须包含
+delete-marked entry：任意主键的 live 候选都报告重复；其它主键只留下的 marked 历史不再冲突；目标完整物理
+identity 的 marked entry 只供 UPDATE 复活，INSERT 新主键按 ABSENT 发布新 suffix。DELETE 提交后 key 可在 purge 前复用，
+DELETE 回滚后恢复的 live entry 仍冲突。
+
+单次扫描读取安全容量 1024 加一个 overflow 候选。发现 live 可立即报告重复；否则超过容量即抛领域容量异常并
+fail-closed，禁止用截断前缀发布。UPDATE 初查同主键 marked 后、取得 row guard 前，purge 可能物理删除该 entry；因此
+必须在 row guard 内 exact 重读，把 ABSENT/DELETE_MARKED 的稳定前态写入 undo。该重读不再次进入 LockManager。
 
 ## 7. Undo secondary tail
 
@@ -108,6 +117,8 @@ entry 可复活。最多读取两个候选即可发现非法多主键状态。
 - `INSERT_ENTRY`：INSERT 创建的 entry。
 - `CHANGE_KEY`：UPDATE 的 old mark + new publish；保存 new entry 修改前为 `ABSENT` 或 `DELETE_MARKED`。
 - `DELETE_MARK_ENTRY`：DELETE 标记的 entry。
+- `PUBLISH_ENTRY`：聚簇 marked-key reuse 为新行发布 entry；保存 `ABSENT/DELETE_MARKED`，rollback 删除或重新标记，
+  purge 不把它解释成旧 entry 清理任务。
 
 固定 identity、cluster key、旧 image 和现有 INSERT LOB tail 不变。secondary tail 使用独立 magic/version/count；
 INSERT 同时有两个尾部时顺序为 LOB -> secondary。旧 record EOF 解码为空 mutation。未知 magic/version、重复索引、
@@ -173,6 +184,8 @@ timeout；全部继承项目异常并保留 cause。
 ## 14. 验收
 
 - SQL INSERT 同步维护全部二级索引，唯一二级等值 SELECT 经过真实回表 MVCC。
+- 唯一二级 key 等待 delete 事务终态后重扫：commit 可在 purge 前复用，rollback 恢复 live 冲突，PREPARED 等到二阶段。
+- 多个 marked 历史不会遮住后方 live 冲突；1024+1 超限 fail-closed；UPDATE 与并发 purge 后 rollback 可正确收敛。
 - statement/full/recovery rollback 在任意 secondary MTR 中断点可重试收敛。
 - A->B->A 与较新版本仍需旧 entry 时 purge 不误删，后续对应 undo 最终回收。
 - DROP 不越过 persistent history；重启可重建 barrier并续作 pending drop。

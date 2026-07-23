@@ -1,8 +1,8 @@
 package cn.zhangyis.db.storage.api.dml;
 
 /**
- * 聚簇唯一键重复异常。当前 facade 做的是物理 current-read 唯一检查：包括 delete-marked 当前版本在内，
- * 只要同 key 物理记录仍存在就拒绝再次插入；MVCC 感知的逻辑唯一语义留 SQL/DD 阶段扩展。
+ * DML 唯一键重复异常。聚簇主键当前仍执行物理 current-read：同 key 的 delete-marked 记录在 purge 前仍算重复；
+ * 唯一二级索引则在事务级 logical-key X 锁后重扫当前前缀，仅 live 候选冲突，其它主键的 marked 历史不阻塞复用。
  */
 public class DmlDuplicateKeyException extends DmlOperationException {
 

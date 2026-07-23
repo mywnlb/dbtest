@@ -208,10 +208,10 @@ public final class TableDmlService {
      * <ol>
      *     <li>校验 ACTIVE 事务、分配 write id，并通过聚簇 FOR_UPDATE current-read 取得事务行锁和旧完整行；
      *         目标不存在时不创建 undo、不修改页，直接返回零影响。</li>
-     *     <li>从旧行重建实际聚簇键并核对命令定位；逐个二级 layout 比较 logical key，只为变键索引执行
-     *         unique 检查并冻结 old/new entry、发布前态与 CHANGE_KEY undo mutation。</li>
-     *     <li>在所有事务锁等待结束后取得 row guard，由聚簇首 MTR 写 UPDATE undo 和新聚簇版本；
-     *         聚簇层同时拒绝 v1 不支持的主键变化。</li>
+     *     <li>从旧行重建实际聚簇键并核对命令定位；逐个二级 layout 比较 logical key，只为变键索引取得
+     *         old/new logical-key 锁、执行 current unique 检查并冻结初始发布前态。</li>
+     *     <li>在所有事务锁等待结束后取得 row guard；初始前态为 DELETE_MARKED 时先复核精确物理 identity，
+     *         再用稳定前态构造 CHANGE_KEY undo，由聚簇首 MTR 写 UPDATE undo 和新聚簇版本。</li>
      *     <li>按 index id 对每棵变键二级树先 insert/revive 新 entry、再 delete-mark 旧 entry；最后返回影响行数和 redo LSN，
      *         中途失败由 undo 中的 new-before-state 决定 remove 还是 re-mark。</li>
      * </ol>
@@ -249,31 +249,35 @@ public final class TableDmlService {
     }
 
     /**
-     * 校验输入与当前状态后修改存储引擎稳定 API领域数据；成功发布完整结果，异常路径保留既有持久化与并发不变量。
+     * 在已验证 ACTIVE 的事务中执行表级 UPDATE，并让完整行替换与 typed patch 共用同一锁、undo 和二级索引编排。
      *
      * <p>数据流：</p>
      * <ol>
-     *     <li>读取并校验调用参数与当前领域状态，确保失败发生在本方法创建共享或持久副作用之前。</li>
-     *     <li>按类级并发协议取得本阶段所需协作者与 Guard，竞争后重新校验资源身份和生命周期。</li>
-     *     <li>执行核心状态转换或数据变换，并只通过本包稳定协作者发布可观察副作用。</li>
-     *     <li>汇总稳定结果并沿现有 finally/Guard 释放资源；异常不得伪造成功或清除未完成状态。</li>
+     *     <li>分配 write id，以 FOR_UPDATE current-read 锁定聚簇记录并物化旧行；未命中时不创建 undo 或页写。</li>
+     *     <li>由旧行生成新完整行，核对 schema/主键；对每个真实变键二级索引先锁旧 logical key，再检查新 key 的
+     *         including-deleted 当前前缀，所有事务锁等待均发生在 row guard 和页 MTR 之前。</li>
+     *     <li>取得物化主键对应的 row guard；若初查目标 identity 为 marked，则 exact 重读以吸收并发 purge，随后冻结
+     *         ABSENT/DELETE_MARKED 前态并交给聚簇首 MTR 写 UPDATE undo 与新聚簇版本。</li>
+     *     <li>按 index id 先发布或复活新 entry、再标记旧 entry；成功返回稳定 write id/LSN，失败保留 active undo，
+     *         由 statement/full rollback 按冻结前态收敛，try-with-resources 必定释放 row guard。</li>
      * </ol>
      *
-     * @param txn 调用方当前事务及其一致性视图或保存点状态；不得为 {@code null}，事务必须由当前会话拥有且处于本操作允许的生命周期阶段
-     * @param metadata 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
-     * @param clusterKey 参与 {@code updateInternal} 的稳定领域标识 {@code SearchKey}；不得为 {@code null}，并须由对应值对象构造校验产生
-     * @param rowFactory 参与记录编解码或索引比较的字段值；不得为 {@code null}，其类型、字节边界和 SQL NULL 语义必须与当前 schema 一致
-     * @param lobSegment 可选的 {@code lobSegment}；参数本身不得为 {@code null}，空 {@code Optional} 明确表示调用方未提供该领域值
-     * @param lockWaitTimeout 本次等待或操作的最大时长；不得为 {@code null} 且必须为正，超时不得留下未释放资源
-     * @return {@code updateInternal} 的不可变领域结果或状态快照；包含已完成动作、剩余工作及失败边界，成功时不为 {@code null}
-     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
-     * @throws DmlDuplicateKeyException 目标身份或唯一键已被占用时抛出；调用方应回滚本次变更或改用其他合法身份
+     * @param txn 调用方已由公开入口验证为 ACTIVE 的事务；write id、record/logical locks 与 undo 都归该事务所有
+     * @param metadata DD 提供的 exact-version 表索引快照；聚簇与全部二级 layout 必须对应同一 schema version
+     * @param clusterKey 定位目标旧行的完整聚簇 key；必须与 current-read 物化行重建出的 key 完全一致
+     * @param rowFactory 以锁定旧行为输入生成无隐藏列的新完整行；不得返回 null、错 schema 或错列数记录
+     * @param lobSegment 表级 external LOB segment binding；空值表示该表不使用外置链，不得传 null
+     * @param lockWaitTimeout current-read、logical-key 锁与 row guard 共用的正有界等待时长
+     * @return 未命中时为零影响结果；成功时为一行更新以及当前事务 write id 和最终 redo LSN
+     * @throws DatabaseValidationException metadata、物化主键、新行形状或等待参数违反契约时抛出；首个 DML 页写前保持无新增页副作用
+     * @throws DmlDuplicateKeyException 新 logical unique key 存在 live 候选，或 row guard 内复核发现目标 identity 意外 live 时抛出
+     * @throws DatabaseRuntimeException 锁等待、row guard、undo、MTR、LOB、B+Tree 或 redo 发布失败时抛出；调用方必须回滚 statement/transaction
      */
     private DmlWriteResult updateInternal(Transaction txn, TableIndexMetadata metadata, SearchKey clusterKey,
                                           java.util.function.Function<LogicalRecord, LogicalRecord> rowFactory,
                                           Optional<cn.zhangyis.db.storage.api.SegmentRef> lobSegment,
                                           Duration lockWaitTimeout) {
-        // 1. 聚簇 FOR_UPDATE 在 row guard 之前完成可能阻塞的事务锁等待，并物化旧行作为后续 exact-version 投影来源。
+        // 1、聚簇 FOR_UPDATE 在 row guard 之前完成可能阻塞的事务锁等待，并物化旧行作为后续 exact-version 投影来源。
         registerChangeBufferMetadata(metadata);
         TransactionId txnId = transactionManager.assignWriteId(txn);
         BTreeCurrentReadRequest request = request(txnId, txn, lockWaitTimeout);
@@ -283,7 +287,7 @@ public final class TableDmlService {
             return new DmlWriteResult(false, 0, redo.currentLsn(), txnId);
         }
 
-        // 2. 命令主键必须与锁定行一致；只记录 comparator 判断发生 logical key 变化的二级 mutation。
+        // 2、命令主键必须与锁定行一致；变键索引先取得全部事务锁并冻结 row guard 前的初始候选状态。
         LogicalRecord oldRow = locked.orElseThrow().record();
         SearchKey actualClusterKey = keyFromRow(oldRow, metadata.clusteredIndex());
         if (!actualClusterKey.equals(clusterKey)) {
@@ -297,7 +301,6 @@ public final class TableDmlService {
         }
 
         List<SecondaryPlan> changed = new ArrayList<>();
-        List<SecondaryUndoMutation> mutations = new ArrayList<>();
         for (SecondaryIndexMetadata secondary : metadata.secondaryIndexes()) {
             LogicalRecord oldEntry = secondary.layout().toEntry(oldRow, false);
             LogicalRecord newEntry = secondary.layout().toEntry(newRecord, false);
@@ -311,21 +314,44 @@ public final class TableDmlService {
                 throw new DmlDuplicateKeyException("duplicate secondary key for index "
                         + secondary.index().indexId());
             }
-            SecondaryEntryBeforeState before = checked.publishState() == SecondaryPublishState.DELETE_MARKED
-                    ? SecondaryEntryBeforeState.DELETE_MARKED : SecondaryEntryBeforeState.ABSENT;
             changed.add(new SecondaryPlan(secondary, newEntry, oldEntry, checked.publishState()));
-            mutations.add(SecondaryUndoMutation.changeKey(secondary.index().indexId(), before));
+        }
+        // 测试接缝位于全部事务锁/初次扫描完成、row guard 尚未取得的稳定窗口，用于复现并发 purge。
+        for (SecondaryPlan plan : changed) {
+            faultInjector.onBoundary(TableDmlProgressPhase.AFTER_UNIQUE_CHECK_BEFORE_ROW_GUARD,
+                    TableDmlSecondaryOperation.INSERT_OR_REVIVE, plan.secondary().index().indexId());
         }
 
-        // 3. 所有 unique/record lock 等待已经结束；row guard 只覆盖聚簇和二级的若干短物理 MTR。
+        // 3、所有事务锁等待已经结束；row guard 内只复核可能被 purge 删除的 exact marked identity，再冻结 undo 前态。
         try (PurgeDmlRowGuard ignored = rowGuards.acquireForDml(metadata.tableId(), actualClusterKey,
                 lockWaitTimeout)) {
+            List<SecondaryPlan> stablePlans = new ArrayList<>(changed.size());
+            List<SecondaryUndoMutation> mutations = new ArrayList<>(changed.size());
+            for (SecondaryPlan plan : changed) {
+                SecondaryPublishState stableState = plan.state();
+                if (stableState == SecondaryPublishState.DELETE_MARKED) {
+                    SecondaryUniqueCheckResult rechecked = uniqueCheck.recheckExactPublishState(
+                            plan.secondary(), newRecord);
+                    if (rechecked.duplicate()) {
+                        throw new DmlDuplicateKeyException("secondary publish identity became live for index "
+                                + plan.secondary().index().indexId());
+                    }
+                    stableState = rechecked.publishState();
+                }
+                SecondaryPlan stablePlan = new SecondaryPlan(
+                        plan.secondary(), plan.entry(), plan.oldEntry(), stableState);
+                stablePlans.add(stablePlan);
+                SecondaryEntryBeforeState before = stableState == SecondaryPublishState.DELETE_MARKED
+                        ? SecondaryEntryBeforeState.DELETE_MARKED : SecondaryEntryBeforeState.ABSENT;
+                mutations.add(SecondaryUndoMutation.changeKey(
+                        plan.secondary().index().indexId(), before));
+            }
             ClusteredUpdateCommand clusterCommand = new ClusteredUpdateCommand(txn, metadata.clusteredIndex(),
                     clusterKey, newRecord, metadata.tableId(), lobSegment, lockWaitTimeout);
             DmlWriteResult result = clustered.update(clusterCommand, mutations);
 
-            // 4. new-before-old 顺序保证回表不会因先删旧 entry 而出现瞬时断链；undo 前态使异常后 inverse 可判定。
-            for (SecondaryPlan plan : changed) {
+            // 4、new-before-old 顺序保证回表不会因先删旧 entry 而出现瞬时断链；undo 前态使异常后 inverse 可判定。
+            for (SecondaryPlan plan : stablePlans) {
                 publishSecondary(metadata.tableId(), metadata.schemaVersion(), plan, true);
                 markSecondary(metadata.tableId(), metadata.schemaVersion(),
                         plan.secondary(), plan.oldEntry(), true);

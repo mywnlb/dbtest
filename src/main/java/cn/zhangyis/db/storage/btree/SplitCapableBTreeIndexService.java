@@ -1572,7 +1572,7 @@ public final class SplitCapableBTreeIndexService implements BTreeIndexService {
      * @param mtr        当前短只读 MTR；结束后再进入事务锁等待或聚簇回表。
      * @param metadata   exact-version 二级 descriptor 与 layout。
      * @param logicalKey 声明 logical key parts 的完整值。
-     * @param limit      最大候选数；唯一检查通常取 2 以发现非法多主键状态。
+     * @param limit      本次允许物化的最大候选数；调用方应传“安全容量 + 1”显式发现截断，不能把有界前缀当成完整性证明。
      * @return 按完整物理 key 排序的物化候选，包含 delete-marked entry。
      * @throws DatabaseValidationException 参数缺失、limit 为负、descriptor/layout 或 logical part 数错配时抛出。
      * @throws DatabaseRuntimeException 页导航、sibling hand-over-hand、记录物化或 comparator 失败时抛出。

@@ -866,7 +866,37 @@ quarantine 目录不参与普通 orphan cleanup。跨设备 rename 和目录 fsy
 | 14 | 删除/修改链路 | 已覆盖 delete-mark、purge、undo、原地更新、delete-mark + insert |
 | 15 | 占位符与图渲染 | 常见占位标记命中为 0，三个 Mermaid 图均可渲染 |
 
-## 22. 参考链接
+## 22. 表空间页 0 自增 high-water 格式（2026-07-24）
+
+### 22.1 物理布局
+
+现有 lifecycle header 最后一个字节位于 offset 237，XDES 从 offset 256 开始。中间 18 字节固定为：
+
+| Offset | Length | Field | 语义 |
+| --- | ---: | --- | --- |
+| 238 | 4 | `AUTO_INCREMENT_FORMAT` | 0=旧表/无扩展，1=本格式 |
+| 242 | 8 | `AUTO_INCREMENT_HIGH_WATER` | 已消耗最大值；按 unsigned long 原始位持久化，但发号另受 DD 整数位宽及 signed/unsigned 列域约束 |
+| 250 | 4 | `AUTO_INCREMENT_FLAGS` | bit0=该表启用自增，其余位必须为 0 |
+| 254 | 2 | reserved | 必须为 0 |
+
+旧文件全零按 format 0 读取；新建表无论是否自增都写 format 1，自增表置 active bit。format/flag 与 DD
+列 generation 不一致、保留位非零或未知 flag 时拒绝打开。XDES offset 不移动，避免改变已有 extent 格式。
+
+### 22.2 更新与 WAL
+
+分配器按 `SpaceId` 取得有界显式锁，然后在页 0 X latch 下读取并校验 format/high-water，以单个 MTR
+写 high-water 和 page LSN。提交后先释放页 latch/fix，再等待 redo durable LSN 覆盖 commit LSN；
+只有成功后才把生成值交给普通表 DML。崩溃后 redo replay 幂等恢复最大已消耗值，事务 rollback 不回退，
+因此唯一性不依赖事务提交。
+
+### 22.3 生命周期协作
+
+create 初始化、backup/restore、DISCARD/IMPORT、full-page scrub、doublewrite 修复和 recovery page-0
+校验都必须把 238..255 作为受保护格式字节。scrub 不清零合法 high-water；IMPORT 同时校验 DD generation
+与 active flag；旧非自增表可在受控 upgrade 中写 format 1 inactive，旧表不能仅凭 SQL 元数据临时启用自增。
+shadow ALTER 在最终 table X/freeze 内复制 source high-water 到 target，再允许 rename/cutover。
+
+## 23. 参考链接
 
 - 本地参考 - InnoDB 存储结构与增删改查数据链路: `C:\coding\java\self\miniproject\miniproject\mysql\InnoDB存储结构与数据链路.html`
 - MySQL 8.0 Reference Manual - File Space Management: https://dev.mysql.com/doc/refman/8.0/en/innodb-file-space.html

@@ -49,6 +49,7 @@ import cn.zhangyis.db.session.SqlSession;
 import cn.zhangyis.db.sql.binder.DefaultSqlBinder;
 import cn.zhangyis.db.sql.binder.SqlTypeCoercion;
 import cn.zhangyis.db.sql.executor.DefaultSqlExecutor;
+import cn.zhangyis.db.sql.executor.node.SortExecutionConfig;
 import cn.zhangyis.db.sql.optimizer.DefaultSqlStatementCompiler;
 import cn.zhangyis.db.sql.optimizer.HeuristicQueryOptimizer;
 import cn.zhangyis.db.sql.optimizer.SqlStatementCompiler;
@@ -104,6 +105,8 @@ public final class DatabaseEngine implements AutoCloseable {
      * 构造时冻结的 {@code baseConfig} 配置快照；已完成范围和组合校验，运行期策略读取它但不得就地修改。
      */
     private final EngineConfig baseConfig;
+    /** 当前数据库实例独占的 SQL filesort 临时根与语句级资源边界。 */
+    private final SortExecutionConfig sqlSortConfig;
     /** 上层协调器持久 XA 决议端口；默认 unresolved，使未知 PREPARED 启动 fail-closed。 */
     private final PreparedTransactionDecisionProvider preparedDecisionProvider;
     /** 用户语句并发 read / shutdown write gate；不串行不同 Session。 */
@@ -213,6 +216,8 @@ public final class DatabaseEngine implements AutoCloseable {
             throw new DatabaseValidationException("undo space id conflicts with dictionary space id");
         }
         this.baseConfig = config;
+        this.sqlSortConfig =
+                SortExecutionConfig.forInstance(config.baseDir());
         this.preparedDecisionProvider = preparedDecisionProvider;
         this.sessionExecutionGate = new EngineSessionExecutionGate(this::state, this::failClosed);
     }
@@ -245,6 +250,7 @@ public final class DatabaseEngine implements AutoCloseable {
                 ensureBaseDirectory();
                 instanceFileLock = DatabaseInstanceFileLock.acquire(
                         baseConfig.baseDir(), baseConfig.flushTimeout());
+                sqlSortConfig.cleanupStaleStatements();
                 xaRegistry = FileXaRegistry.openOrCreate(baseConfig.baseDir());
                 // 2. 只有 catalog admission 成功后才允许打开/修复 manifest，并把它注入 control/repository。
                 Path catalogPath = baseConfig.baseDir().resolve("mysql.ibd");
@@ -310,6 +316,7 @@ public final class DatabaseEngine implements AutoCloseable {
                 storage.configureIndexMetadataResolver(new DictionaryIndexMetadataResolver(repository));
                 storage.configureBackgroundFatalFailureHandler(this::failClosed);
                 storage.open();
+                validateAutoIncrementMetadata();
                 xaRegistry.completeRecoveryDecisions();
                 xaCoordinator = new PersistentXaCoordinator(xaRegistry);
 
@@ -383,6 +390,26 @@ public final class DatabaseEngine implements AutoCloseable {
         }
     }
 
+    /**
+     * 在 crash/DDL recovery 完成、SQL 准入发布前校验全部 ACTIVE 表的 DD/page0 自增状态。
+     *
+     * <p>隔离或无 binding 的对象不在 discovery 打开集合中，因此不会越过 recovery exclusion
+     * 访问其文件。任一不一致都使本次 open 失败，不能用扫描最大主键猜测并覆盖持久 high-water。</p>
+     */
+    private void validateAutoIncrementMetadata() {
+        repository.snapshot().tables().values().stream()
+                .filter(table ->
+                        table.state()
+                                == cn.zhangyis.db.dd.domain.TableState.ACTIVE)
+                .filter(table -> table.storageBinding().isPresent())
+                .forEach(table -> storage.autoIncrementService()
+                        .validateMetadata(
+                                table.storageBinding().orElseThrow().spaceId(),
+                                table.columns().stream().anyMatch(column ->
+                                        column.generation()
+                                                == cn.zhangyis.db.dd.domain.ColumnGeneration.AUTO_INCREMENT)));
+    }
+
     /** 返回强制 MDL+pin 租约语义的 DD 读取 facade。
      *
      * @return {@code dictionary} 创建的模块协作者；成功时不为 {@code null}，其依赖和生命周期由当前组合根拥有
@@ -454,7 +481,9 @@ public final class DatabaseEngine implements AutoCloseable {
                     accessMode == DatabaseAccessMode.RECOVERY_EXPORT_READ_ONLY);
             DefaultSqlSession session = new DefaultSqlSession(
                     id, options, dictionary, sqlParser, sqlBinder, sqlCompiler,
-                    new DefaultSqlExecutor(gateway), gateway, new DefaultSqlDdlGateway(ddl),
+                    new DefaultSqlExecutor(
+                            gateway, sqlSortConfig),
+                    gateway, new DefaultSqlDdlGateway(ddl),
                     xaCoordinator,
                     sessionExecutionGate,
                     accessMode == DatabaseAccessMode.RECOVERY_EXPORT_READ_ONLY,

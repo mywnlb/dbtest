@@ -1,6 +1,7 @@
 package cn.zhangyis.db.dd.ddl;
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
+import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.dd.cache.DictionaryObjectCache;
 import cn.zhangyis.db.dd.domain.ColumnDefinition;
 import cn.zhangyis.db.dd.domain.ColumnTypeDefinition;
@@ -16,6 +17,7 @@ import cn.zhangyis.db.dd.domain.ObjectName;
 import cn.zhangyis.db.dd.domain.QualifiedTableName;
 import cn.zhangyis.db.dd.domain.SchemaDefinition;
 import cn.zhangyis.db.dd.domain.SchemaId;
+import cn.zhangyis.db.dd.domain.SchemaState;
 import cn.zhangyis.db.dd.domain.TableDefinition;
 import cn.zhangyis.db.dd.domain.TableId;
 import cn.zhangyis.db.dd.domain.TableState;
@@ -507,15 +509,16 @@ public final class DictionaryDdlService {
                     0, 1, command.indexes().size(), 1, 1, 1));
             DictionaryVersion version = DictionaryVersion.of(ids.dictionaryVersion());
             TableId tableId = TableId.of(ids.firstTableId());
-            List<ColumnDefinition> columns = columns(command);
+            TableOptions options = new TableOptions(
+                    command.options().comment(),
+                    schema.defaultCharsetId(), schema.defaultCollationId());
+            List<ColumnDefinition> columns = columns(command, options);
             List<IndexDefinition> indexes = indexes(command, ids.firstIndexId(), columns);
             Path path = tablePath(tableId, ids.firstSpaceId());
             ensureTablesDirectory();
             StorageTableDefinition storageRequest = storageDefinition(tableId, ids.firstSpaceId(), path,
                     version, command, columns, indexes);
             DdlId ddlId = DdlId.of(ids.firstDdlId());
-            TableOptions options = new TableOptions(
-                    "", schema.defaultCharsetId(), schema.defaultCollationId());
             TableDefinition plannedTarget = new TableDefinition(
                     tableId, schema.id(), command.name().table(), version, TableState.ACTIVE,
                     columns, indexes, Optional.empty(), options);
@@ -1872,6 +1875,339 @@ public final class DictionaryDdlService {
             log.info("dropped table: name={} tableId={} ddlId={} version={}", name.canonicalKey(),
                     active.id().value(), ids.firstDdlId(), droppedVersion.value());
             cleanSnapshotPublisher.publish();
+        }
+    }
+
+    /**
+     * 以一个 v5 marker 与两个原子字典批次删除多张表。所有目标先共同进入 DROP_PENDING，普通 lookup
+     * 看不到任何部分 ACTIVE 集合；崩溃恢复只接受 manifest 声明的全 ACTIVE、全 pending 或全 dropped。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>按 canonical key 去重并按 schema/table MDL key 排序取得锁，避免多语句反向等待。</li>
+     *     <li>在全部锁内解析目标；无 IF 时任一缺失在 control/catalog/文件副作用前令整句失败。</li>
+     *     <li>等待全部 history barrier，冻结 source/pending/target digest 后写一个 PREPARED batch marker。</li>
+     *     <li>用一个 DD transaction 发布所有 DROP_PENDING，推进 marker，再等待旧 pin 并逐空间幂等删除。</li>
+     *     <li>等待全部旧 pin 后逐空间执行 change-buffer barrier、WAL-safe drain 和幂等物理删除。</li>
+     *     <li>物理阶段 durable 后用一个 DD transaction 发布所有 DROPPED，最后写 terminal marker 和 clean snapshot。</li>
+     * </ol>
+     *
+     * @param owner 独立 DDL statement owner
+     * @param names 已规范化且互不重复的目标
+     * @param ifExists 缺失目标是否跳过并返回 warning 输入
+     * @param timeout MDL、history、pin、物理删除共用的正等待上界
+     * @return 按用户输入顺序返回的缺失目标；未指定 IF 时成功结果必为空
+     * @throws DatabaseValidationException 目标列表为空、重复、含空值或 timeout/owner 非法时抛出
+     * @throws DictionaryDdlException 目标状态、binding、barrier、物理删除或原子字典发布失败时抛出；
+     *                                durable marker 已存在时调用方不得自行回滚文件
+     */
+    public List<QualifiedTableName> dropTables(
+            MdlOwnerId owner, List<QualifiedTableName> names,
+            boolean ifExists, Duration timeout) {
+        // 1、纯输入校验与去重早于任何 MDL 或持久副作用。
+        validateOwnerTimeout(owner, timeout);
+        cleanSnapshotPublisher.assertAvailable();
+        if (names == null || names.isEmpty()
+                || names.stream().anyMatch(java.util.Objects::isNull)) {
+            throw new DatabaseValidationException(
+                    "DROP TABLE batch requires non-empty targets");
+        }
+        java.util.HashSet<String> unique = new java.util.HashSet<>();
+        for (QualifiedTableName name : names) {
+            if (!unique.add(name.canonicalKey())) {
+                throw new DatabaseValidationException(
+                        "DROP TABLE repeats target: " + name.canonicalKey());
+            }
+        }
+        ArrayList<MdlTicket> tickets = new ArrayList<>();
+        try {
+            names.stream().map(name -> name.schema().canonicalName())
+                    .distinct().sorted()
+                    .forEach(schema -> tickets.add(locks.acquire(
+                            new MdlRequest(owner, MdlKey.schema(schema),
+                                    MdlMode.INTENTION_EXCLUSIVE,
+                                    MdlDuration.TRANSACTION), timeout)));
+            names.stream().map(QualifiedTableName::canonicalKey)
+                    .sorted().forEach(table -> tickets.add(locks.acquire(
+                            new MdlRequest(owner, MdlKey.table(table),
+                                    MdlMode.EXCLUSIVE,
+                                    MdlDuration.TRANSACTION), timeout)));
+
+            // 2、完整解析集合后才允许预留版本；IF 只吞对象缺失，不吞隔离/状态/binding 错误。
+            ArrayList<QualifiedTableName> missing = new ArrayList<>();
+            ArrayList<TableDefinition> active = new ArrayList<>();
+            for (QualifiedTableName name : names) {
+                Optional<SchemaDefinition> schema =
+                        repository.findSchema(name.schema());
+                Optional<TableDefinition> table = schema.flatMap(value ->
+                        repository.findTableForRecovery(
+                                value.id(), name.table()));
+                if (table.isEmpty()
+                        || table.orElseThrow().state() == TableState.DROPPED) {
+                    missing.add(name);
+                    continue;
+                }
+                TableDefinition target = table.orElseThrow();
+                if (target.state() != TableState.ACTIVE) {
+                    throw new DictionaryDdlException(
+                            "DROP TABLE batch target is not ACTIVE: "
+                                    + name.canonicalKey() + " state="
+                                    + target.state());
+                }
+                if (target.storageBinding().isEmpty()) {
+                    throw new DictionaryDdlException(
+                            "DROP TABLE batch target has no physical binding: "
+                                    + name.canonicalKey());
+                }
+                active.add(target);
+            }
+            if (!ifExists && !missing.isEmpty()) {
+                throw new DictionaryObjectNotFoundException(
+                        "table does not exist: "
+                                + missing.getFirst().canonicalKey());
+            }
+            if (active.isEmpty()) {
+                return List.copyOf(missing);
+            }
+
+            // 3、全部 history 安全后冻结不可变 manifest；marker 先于任何 pending catalog 副作用。
+            for (TableDefinition table : active) {
+                purgeBarrier.awaitUnreferenced(
+                        table.id().value(), timeout);
+            }
+            DictionaryIdAllocation ids = control.reserve(
+                    new DictionaryIdRequest(0, 0, 0, 0, 1, 2));
+            DictionaryVersion pendingVersion =
+                    DictionaryVersion.of(ids.dictionaryVersion());
+            DictionaryVersion droppedVersion =
+                    DictionaryVersion.of(ids.dictionaryVersion() + 1);
+            List<TableDefinition> pending = active.stream()
+                    .map(table -> lifecycle(
+                            table, pendingVersion,
+                            TableState.DROP_PENDING))
+                    .toList();
+            List<TableDefinition> dropped = pending.stream()
+                    .map(table -> lifecycle(
+                            table, droppedVersion,
+                            TableState.DROPPED))
+                    .toList();
+            DdlBatchManifest manifest = batchManifest(
+                    Optional.empty(), active, pending, dropped);
+            DdlBatchTableEntry first = manifest.tables().getFirst();
+            DdlId ddlId = DdlId.of(ids.firstDdlId());
+            DdlLogRecord prepared = new DdlLogRecord(
+                    new DdlUndoMarker(
+                            ddlId.value(), pendingVersion.value(),
+                            first.tableId().value()),
+                    0L, DdlLogOperation.DROP_TABLE_BATCH,
+                    DdlLogPhase.PREPARED, first.spaceId(),
+                    tablesDirectory.resolve(first.relativePath()),
+                    Optional.empty(), Optional.empty(),
+                    DdlExecutionProtocol.BATCH_DROP_V1,
+                    Optional.empty(), Optional.empty(), Optional.empty(),
+                    DdlControlState.OPEN, Optional.empty(),
+                    Optional.empty(), Optional.of(manifest));
+            repository.ddlLog().prepare(prepared);
+            faultInjector.afterBatchDropPrepared(prepared);
+
+            // 4、同一 catalog transaction 隐藏全体目标；marker phase 是恢复端前滚方向的持久证据。
+            active.forEach(table ->
+                    cache.invalidateTable(table.id(), pendingVersion));
+            commitTableUpdates(pendingVersion, pending);
+            repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.PREPARED,
+                    DdlLogPhase.DICTIONARY_COMMITTED);
+            faultInjector.afterBatchDropPending(pending);
+
+            // 5、慢物理删除不持有 DD writer lock；任一失败保留全体 pending 和同一 manifest。
+            for (TableDefinition table : active) {
+                if (!cache.awaitUnpinned(table.id(), timeout)) {
+                    throw new DictionaryDdlException(
+                            "timed out waiting dictionary pins before batch DROP: "
+                                    + table.id().value());
+                }
+            }
+            for (TableDefinition table : active) {
+                physical.dropTable(
+                        table.storageBinding().orElseThrow(), timeout);
+            }
+            DdlLogRecord engineDone = repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.DICTIONARY_COMMITTED,
+                    DdlLogPhase.ENGINE_DONE);
+            faultInjector.afterBatchDropEngineDone(engineDone);
+
+            // 6、所有文件完成后一个 catalog batch 发布全部 tombstone，再终结唯一 marker。
+            commitTableUpdates(droppedVersion, dropped);
+            faultInjector.afterBatchDropDictionaryCommitted(dropped);
+            repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.ENGINE_DONE,
+                    DdlLogPhase.COMMITTED);
+            cleanSnapshotPublisher.publish();
+            log.info("dropped table batch: tableCount={} ddlId={} version={}",
+                    active.size(), ddlId.value(),
+                    droppedVersion.value());
+            return List.copyOf(missing);
+        } finally {
+            closeTickets(tickets);
+        }
+    }
+
+    /**
+     * 原子删除 schema 及其全部表。PREPARED marker 冻结 schema/表集合；最终 schema tombstone 与
+     * 所有 table tombstone 在同一 catalog batch 发布，启动恢复不会观察或制造半级联终态。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>取得 schema X 冻结成员集合，并把 IF EXISTS 仅应用于 schema 缺失。</li>
+     *     <li>校验每张成员表均 ACTIVE 且有 binding，等待持久 history 不再引用。</li>
+     *     <li>预留 pending/target 两个版本，冻结 schema/table digest 与受控路径后写 op13 PREPARED。</li>
+     *     <li>用一个 DD transaction 发布全部非空 DROP_PENDING 集合，并把 marker 推进到 DICTIONARY_COMMITTED。</li>
+     *     <li>等待全部 metadata pin，逐表执行 change-buffer barrier 与物理删除，再写 ENGINE_DONE。</li>
+     *     <li>在一个 DD transaction 同时发布 schema 和全部 table tombstone，随后终结 marker 与 clean snapshot。</li>
+     * </ol>
+     *
+     * @param owner 独立 DDL statement owner
+     * @param name 规范化 schema 名
+     * @param ifExists 缺失 schema 是否返回 false
+     * @param timeout 全部等待与物理删除的正上界
+     * @return schema 存在并进入删除状态时为 true；IF EXISTS 且缺失时为 false
+     * @throws DatabaseValidationException schema、owner 或 timeout 非法时抛出
+     * @throws DictionaryDdlException 成员状态/binding、barrier、物理删除或原子字典发布失败时抛出；
+     *                                marker durable 后必须交由恢复继续同一方向
+     */
+    public boolean dropSchema(
+            MdlOwnerId owner, ObjectName name,
+            boolean ifExists, Duration timeout) {
+        validateOwnerTimeout(owner, timeout);
+        cleanSnapshotPublisher.assertAvailable();
+        if (name == null) {
+            throw new DatabaseValidationException(
+                    "DROP SCHEMA name must not be null");
+        }
+        // 1、schema X 与所有正常表访问的 schema IX 冲突，取得后其成员集合稳定。
+        try (MdlTicket ignored = locks.acquire(new MdlRequest(
+                owner, MdlKey.schema(name.canonicalName()),
+                MdlMode.EXCLUSIVE, MdlDuration.TRANSACTION), timeout)) {
+            Optional<SchemaDefinition> existing =
+                    repository.findSchema(name);
+            if (existing.isEmpty()) {
+                if (ifExists) {
+                    return false;
+                }
+                throw new DictionaryObjectNotFoundException(
+                        "schema does not exist: " + name.displayName());
+            }
+            SchemaDefinition schema = existing.orElseThrow();
+            List<TableDefinition> tables = repository.snapshot().tables()
+                    .values().stream()
+                    .filter(table -> table.schemaId().equals(schema.id()))
+                    .filter(table -> table.state() != TableState.DROPPED)
+                    .sorted(java.util.Comparator.comparingLong(
+                            table -> table.id().value()))
+                    .toList();
+            // 2、隔离、pending 或缺 binding 都不能被 IF EXISTS 掩盖。
+            for (TableDefinition table : tables) {
+                if (table.state() != TableState.ACTIVE
+                        || table.storageBinding().isEmpty()) {
+                    throw new DictionaryDdlException(
+                            "DROP SCHEMA contains non-ACTIVE or unbound table: "
+                                    + table.id().value() + " state="
+                                    + table.state());
+                }
+                purgeBarrier.awaitUnreferenced(
+                        table.id().value(), timeout);
+            }
+
+            // 3、即使空 schema 也保留 pending/target 两个固定版本，使 v5 恢复状态机不出现特殊版本语法。
+            int versions = 2;
+            DictionaryIdAllocation ids = control.reserve(
+                    new DictionaryIdRequest(
+                            0, 0, 0, 0, 1, versions));
+            DictionaryVersion pendingVersion =
+                    DictionaryVersion.of(ids.dictionaryVersion());
+            SchemaDefinition tombstone = new SchemaDefinition(
+                    schema.id(), schema.name(),
+                    schema.defaultCharsetId(),
+                    schema.defaultCollationId(),
+                    DictionaryVersion.of(ids.dictionaryVersion() + 1),
+                    SchemaState.DROPPED);
+            List<TableDefinition> pending = tables.stream()
+                    .map(table -> lifecycle(
+                            table, pendingVersion,
+                            TableState.DROP_PENDING))
+                    .toList();
+            DictionaryVersion finalVersion = tombstone.version();
+            List<TableDefinition> dropped = pending.stream()
+                    .map(table -> lifecycle(
+                            table, finalVersion,
+                            TableState.DROPPED))
+                    .toList();
+            DdlBatchManifest manifest = batchManifest(
+                    Optional.of(new DdlBatchSchemaEntry(
+                            schema.id(), schema.name().canonicalName(),
+                            schemaDigests.digest(schema),
+                            schemaDigests.digest(tombstone))),
+                    tables, pending, dropped);
+            SpaceId primarySpace = manifest.tables().isEmpty()
+                    ? SpaceId.of(0)
+                    : manifest.tables().getFirst().spaceId();
+            Path primaryPath = manifest.tables().isEmpty()
+                    ? tablesDirectory
+                    : tablesDirectory.resolve(
+                            manifest.tables().getFirst().relativePath());
+            DdlId ddlId = DdlId.of(ids.firstDdlId());
+            DdlLogRecord prepared = new DdlLogRecord(
+                    new DdlUndoMarker(
+                            ddlId.value(), pendingVersion.value(),
+                            schema.id().value()),
+                    0L, DdlLogOperation.DROP_SCHEMA_CASCADE,
+                    DdlLogPhase.PREPARED, primarySpace, primaryPath,
+                    Optional.empty(), Optional.empty(),
+                    DdlExecutionProtocol.BATCH_DROP_V1,
+                    Optional.empty(), Optional.empty(), Optional.empty(),
+                    DdlControlState.OPEN, Optional.empty(),
+                    Optional.empty(), Optional.of(manifest));
+            repository.ddlLog().prepare(prepared);
+            faultInjector.afterBatchDropPrepared(prepared);
+
+            // 4、非空集合共同进入 pending；schema 在最终事务前保持 ACTIVE，但 schema X 阻止新访问。
+            tables.forEach(table ->
+                    cache.invalidateTable(table.id(), pendingVersion));
+            if (!pending.isEmpty()) {
+                commitTableUpdates(pendingVersion, pending);
+            }
+            repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.PREPARED,
+                    DdlLogPhase.DICTIONARY_COMMITTED);
+            faultInjector.afterBatchDropPending(pending);
+
+            // 5、物理删除失败时全体 pending 与 marker manifest 足以让启动恢复完成集合。
+            for (TableDefinition table : tables) {
+                if (!cache.awaitUnpinned(table.id(), timeout)) {
+                    throw new DictionaryDdlException(
+                            "timed out waiting dictionary pins before DROP SCHEMA: "
+                                    + table.id().value());
+                }
+                physical.dropTable(
+                        table.storageBinding().orElseThrow(), timeout);
+            }
+            DdlLogRecord engineDone = repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.DICTIONARY_COMMITTED,
+                    DdlLogPhase.ENGINE_DONE);
+            faultInjector.afterBatchDropEngineDone(engineDone);
+
+            // 6、schema 与全部表在一个最终 catalog transaction 中成为 tombstone，随后 marker 才 terminal。
+            commitSchemaAndTables(
+                    finalVersion, tombstone, dropped);
+            faultInjector.afterBatchDropDictionaryCommitted(dropped);
+            repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.ENGINE_DONE,
+                    DdlLogPhase.COMMITTED);
+            cleanSnapshotPublisher.publish();
+            log.info("dropped schema: name={} tables={} ddlId={} version={}",
+                    name.canonicalName(), tables.size(),
+                    ddlId.value(), finalVersion.value());
+            return true;
         }
     }
 
@@ -3422,7 +3758,8 @@ public final class DictionaryDdlService {
     private static StorageTableDefinition onlineInplaceStorageDefinition(
             StorageTableDefinition source, List<StorageIndexDefinition> indexes) {
         return new StorageTableDefinition(source.tableId(), source.spaceId(), source.path(),
-                source.schemaVersion(), source.initialSizeInPages(), source.columns(), indexes);
+                source.schemaVersion(), source.initialSizeInPages(), source.columns(), indexes,
+                source.autoIncrement());
     }
 
     /** source definition后追加全部ADD定义，供capture codec解析source row到staged secondary layout。 */
@@ -3791,7 +4128,9 @@ public final class DictionaryDdlService {
                         converted.add(new StagedColumn(new ColumnDefinition(
                                 column.definition().columnId(), column.definition().name(),
                                 after, column.definition().ordinal(),
-                                column.definition().defaultDefinition()),
+                                column.definition().defaultDefinition(),
+                                column.definition().comment(),
+                                column.definition().generation()),
                                 column.sourceOrdinal(), column.storageDefault()));
                     }
                     columns = converted;
@@ -3944,7 +4283,8 @@ public final class DictionaryDdlService {
             ColumnDefinition definition = column.definition();
             result.add(new StagedColumn(new ColumnDefinition(
                     definition.columnId(), definition.name(), definition.type(),
-                    ordinal, definition.defaultDefinition()),
+                    ordinal, definition.defaultDefinition(),
+                    definition.comment(), definition.generation()),
                     column.sourceOrdinal(), column.storageDefault()));
         }
         return result;
@@ -4036,6 +4376,130 @@ public final class DictionaryDdlService {
         }
     }
 
+    /**
+     * 在一个 catalog batch 中推进多张表，保证普通 lookup 不观察到同一 SQL 语句的部分状态。
+     *
+     * @param version 所有 table 共享的预留字典版本
+     * @param tables 非空、identity 唯一的生命周期新版本
+     */
+    private void commitTableUpdates(
+            DictionaryVersion version,
+            List<TableDefinition> tables) {
+        if (version == null || tables == null || tables.isEmpty()) {
+            throw new DatabaseValidationException(
+                    "batch table update requires version/tables");
+        }
+        try (DictionaryTransaction transaction =
+                     repository.begin(version)) {
+            tables.forEach(transaction::updateTable);
+            transaction.commit();
+        }
+    }
+
+    /**
+     * 同批发布 schema tombstone 与可选 table pending 集合。
+     */
+    private void commitSchemaAndTables(
+            DictionaryVersion version, SchemaDefinition schema,
+            List<TableDefinition> tables) {
+        try (DictionaryTransaction transaction =
+                     repository.begin(version)) {
+            transaction.updateSchema(schema);
+            tables.forEach(transaction::updateTable);
+            transaction.commit();
+        }
+    }
+
+    /**
+     * 按获取逆序释放动态 MDL ticket；ticket close 当前无 checked failure，幂等语义由锁管理器保证。
+     */
+    private static void closeTickets(List<MdlTicket> tickets) {
+        for (int index = tickets.size() - 1; index >= 0; index--) {
+            tickets.get(index).close();
+        }
+    }
+
+    /**
+     * 从同一冻结表集合生成 v5 批量 DROP manifest。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 source/pending/target 三个列表位置和 identity 一一对应，拒绝部分集合。</li>
+     *     <li>从权威 snapshot 取得每张表的 exact ACTIVE schema，并重算三个生命周期 checkpoint。</li>
+     *     <li>把绝对 binding 收敛为 tables 目录下单层相对文件名，再由 manifest 按 table id 排序去重。</li>
+     * </ol>
+     *
+     * @param schema DROP SCHEMA 的可选 schema 前后状态证据；普通多表 DROP 为空
+     * @param source DDL 锁内冻结的 ACTIVE 表集合
+     * @param pending 与 source 同序、共享 pending version 的 DROP_PENDING 集合
+     * @param target 与 source 同序、共享 target version 的 DROPPED 集合
+     * @return 可跨所有 marker phase 原样持久化的确定性 manifest
+     * @throws DictionaryDdlException 集合漂移、schema 缺失或 binding 路径逃逸受控目录时抛出
+     */
+    private DdlBatchManifest batchManifest(
+            Optional<DdlBatchSchemaEntry> schema,
+            List<TableDefinition> source,
+            List<TableDefinition> pending,
+            List<TableDefinition> target) {
+        // 1. 三个聚合列表来自同一冻结集合，任何 identity 漂移都意味着协调器内部错误。
+        if (source.size() != pending.size()
+                || source.size() != target.size()) {
+            throw new DictionaryDdlException(
+                    "DDL batch manifest lifecycle collection sizes differ");
+        }
+        ArrayList<DdlBatchTableEntry> entries =
+                new ArrayList<>(source.size());
+        for (int index = 0; index < source.size(); index++) {
+            TableDefinition before = source.get(index);
+            TableDefinition intermediate = pending.get(index);
+            TableDefinition after = target.get(index);
+            if (!before.id().equals(intermediate.id())
+                    || !before.id().equals(after.id())
+                    || intermediate.state() != TableState.DROP_PENDING
+                    || after.state() != TableState.DROPPED) {
+                throw new DictionaryDdlException(
+                        "DDL batch manifest lifecycle identities differ: "
+                                + before.id().value());
+            }
+
+            // 2. table digest 包含 schema identity、row format 与完整 aggregate，恢复端可以拒绝身份重用。
+            SchemaDefinition owner = repository.snapshot().schemas()
+                    .get(before.schemaId());
+            if (owner == null || owner.state() != SchemaState.ACTIVE) {
+                throw new DictionaryDdlException(
+                        "DDL batch table owner schema is not ACTIVE: "
+                                + before.id().value());
+            }
+            TableStorageBinding binding = before.storageBinding()
+                    .orElseThrow(() -> new DictionaryDdlException(
+                            "DDL batch source table has no binding: "
+                                    + before.id().value()));
+
+            // 3. manifest 不持久化任意绝对路径；恢复时再由实例 tables 根解析并验证 exact 文件名。
+            Path normalized = binding.path().toAbsolutePath().normalize();
+            if (!tablesDirectory.equals(normalized.getParent())
+                    || normalized.getFileName() == null) {
+                throw new DictionaryDdlException(
+                        "DDL batch table path escapes controlled tables directory: "
+                                + normalized);
+            }
+            entries.add(new DdlBatchTableEntry(
+                    before.id(), binding.spaceId(),
+                    normalized.getFileName().toString(),
+                    binding.rowFormatVersion(),
+                    schemaDigests.digest(
+                            owner, before,
+                            binding.rowFormatVersion()),
+                    schemaDigests.digest(
+                            owner, intermediate,
+                            binding.rowFormatVersion()),
+                    schemaDigests.digest(
+                            owner, after,
+                            binding.rowFormatVersion())));
+        }
+        return new DdlBatchManifest(schema, entries);
+    }
+
     private static TableDefinition lifecycle(TableDefinition before, DictionaryVersion version, TableState state) {
         return new TableDefinition(before.id(), before.schemaId(), before.name(), version, state,
                 before.columns(), before.indexes(), before.storageBinding(), before.options());
@@ -4090,11 +4554,24 @@ public final class DictionaryDdlService {
         }
     }
 
-    private static List<ColumnDefinition> columns(CreateTableCommand command) {
+    /**
+     * 将未分配 identity 的 CREATE 列转换为 table-local 稳定列。字符列的 0/0 是 Binder 刻意保留的
+     * schema-default 继承哨兵，只能在已解析目标 schema 且持有 schema IX/table X 后消解。
+     *
+     * @param command 已完成名称/default 基础校验的建表命令
+     * @param options 目标 schema 默认字符属性形成的初始表选项
+     * @return 按 SQL 声明顺序分配 columnId/ordinal、default 已持久化语义化的不可变列集合
+     */
+    private static List<ColumnDefinition> columns(
+            CreateTableCommand command, TableOptions options) {
         List<ColumnDefinition> columns = new ArrayList<>(command.columns().size());
         for (int ordinal = 0; ordinal < command.columns().size(); ordinal++) {
             CreateColumnSpec spec = command.columns().get(ordinal);
-            columns.add(new ColumnDefinition(ordinal + 1L, spec.name(), spec.type(), ordinal));
+            ColumnTypeDefinition type = inheritCharacterDefaults(
+                    spec.type(), options);
+            columns.add(new ColumnDefinition(
+                    ordinal + 1L, spec.name(), type, ordinal,
+                    spec.defaultDefinition(), spec.comment(), spec.generation()));
         }
         return List.copyOf(columns);
     }
@@ -4138,7 +4615,8 @@ public final class DictionaryDdlService {
                                 ? StorageIndexOrder.ASC : StorageIndexOrder.DESC,
                         part.prefixBytes())).toList())).toList();
         return new StorageTableDefinition(tableId.value(), cn.zhangyis.db.domain.SpaceId.of(spaceId), path,
-                version.value(), command.initialSizeInPages(), storageColumns, storageIndexes);
+                version.value(), command.initialSizeInPages(), storageColumns, storageIndexes,
+                hasAutoIncrement(columns));
     }
 
     /** 为 shadow target 组装全新 space/version 的完整 storage schema。 */
@@ -4154,7 +4632,7 @@ public final class DictionaryDdlService {
         return new StorageTableDefinition(
                 tableId.value(), cn.zhangyis.db.domain.SpaceId.of(spaceId), path,
                 version.value(), cn.zhangyis.db.domain.PageNo.of(64),
-                storageColumns, storageIndexes);
+                storageColumns, storageIndexes, hasAutoIncrement(columns));
     }
 
     /** 将 committed table/binding 映射为 shadow scan 使用的 exact source row format。 */
@@ -4170,7 +4648,8 @@ public final class DictionaryDdlService {
                 table.id().value(), binding.spaceId(), binding.path(),
                 binding.rowFormatVersion(), cn.zhangyis.db.domain.PageNo.of(1),
                 columns, table.indexes().stream()
-                .map(DictionaryDdlService::storageIndex).toList());
+                .map(DictionaryDdlService::storageIndex).toList(),
+                hasAutoIncrement(table.columns()));
     }
 
     private static StorageColumnType storageType(ColumnTypeDefinition type) {
@@ -4203,7 +4682,14 @@ public final class DictionaryDdlService {
         indexes.add(storageIndex(newIndex));
         return new StorageTableDefinition(
                 table.id().value(), binding.spaceId(), binding.path(), binding.rowFormatVersion(),
-                cn.zhangyis.db.domain.PageNo.of(1), columns, indexes);
+                cn.zhangyis.db.domain.PageNo.of(1), columns, indexes,
+                hasAutoIncrement(table.columns()));
+    }
+
+    private static boolean hasAutoIncrement(List<ColumnDefinition> columns) {
+        return columns.stream().anyMatch(column ->
+                column.generation()
+                        == cn.zhangyis.db.dd.domain.ColumnGeneration.AUTO_INCREMENT);
     }
 
     private Path tablePath(TableId tableId, int spaceId) {

@@ -15,7 +15,9 @@ import cn.zhangyis.db.dd.domain.TableDefinition;
 import cn.zhangyis.db.dd.domain.TableId;
 import cn.zhangyis.db.dd.domain.TableState;
 import cn.zhangyis.db.sql.binder.bound.BoundDelete;
+import cn.zhangyis.db.sql.binder.bound.BoundLimit;
 import cn.zhangyis.db.sql.binder.bound.BoundSelect;
+import cn.zhangyis.db.sql.binder.bound.BoundSortKey;
 import cn.zhangyis.db.sql.binder.bound.BoundUpdate;
 import cn.zhangyis.db.sql.binder.bound.SelectLockMode;
 import cn.zhangyis.db.sql.expression.BoundComparisonOperator;
@@ -24,20 +26,13 @@ import cn.zhangyis.db.sql.expression.BoundExpression;
 import cn.zhangyis.db.sql.expression.BoundNullTestOperator;
 import cn.zhangyis.db.sql.optimizer.logical.BoundToLogicalConverter;
 import cn.zhangyis.db.sql.optimizer.logical.PredicateSet;
-import cn.zhangyis.db.sql.optimizer.physical.PhysicalPointDelete;
-import cn.zhangyis.db.sql.optimizer.physical.PhysicalPointSelect;
-import cn.zhangyis.db.sql.optimizer.physical.PhysicalPointUpdate;
-import cn.zhangyis.db.sql.optimizer.physical.PhysicalRangeDelete;
-import cn.zhangyis.db.sql.optimizer.physical.PhysicalRangeSelect;
-import cn.zhangyis.db.sql.optimizer.physical.PhysicalRangeUpdate;
-import cn.zhangyis.db.sql.optimizer.physical.PhysicalSecondaryRangeSelect;
-import cn.zhangyis.db.sql.optimizer.physical.PointAccessKind;
-import cn.zhangyis.db.sql.optimizer.physical.RangeEndpoint;
+import cn.zhangyis.db.sql.optimizer.physical.*;
 import cn.zhangyis.db.sql.type.SqlValue;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;
 import java.util.List;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
@@ -65,17 +60,24 @@ class HeuristicQueryOptimizerTest {
         BoundSelect primary = new BoundSelect(table, List.of(2, 0), and(
                 predicate(table, 1, 2), predicate(table, 0, 7)),
                 SelectLockMode.CONSISTENT);
-        PhysicalPointSelect primaryPlan = assertInstanceOf(PhysicalPointSelect.class,
+        PhysicalQuery primaryQuery = assertInstanceOf(PhysicalQuery.class,
                 optimizer.optimize(converter.convert(primary)));
+        PhysicalPointAccess primaryPlan = assertInstanceOf(
+                PhysicalPointAccess.class, primaryQuery.root().input().input());
         assertEquals(PointAccessKind.CLUSTERED_PRIMARY, primaryPlan.accessKind());
         assertEquals(3, primaryPlan.accessIndexId());
         assertEquals(List.of(integer(7), integer(2)), primaryPlan.keyValues());
+        assertEquals(List.of(2, 0), primaryQuery.root().projectionOrdinals());
+        assertEquals(PredicateSet.of(primary.condition()),
+                primaryQuery.root().input().predicates());
 
         BoundSelect unique = new BoundSelect(table, List.of(0),
                 equal(table, 2, new SqlValue.StringValue("memo")),
                 SelectLockMode.CONSISTENT);
-        PhysicalPointSelect uniquePlan = assertInstanceOf(PhysicalPointSelect.class,
+        PhysicalQuery uniqueQuery = assertInstanceOf(PhysicalQuery.class,
                 optimizer.optimize(converter.convert(unique)));
+        PhysicalPointAccess uniquePlan = assertInstanceOf(
+                PhysicalPointAccess.class, uniqueQuery.root().input().input());
         assertEquals(PointAccessKind.UNIQUE_SECONDARY, uniquePlan.accessKind());
         assertEquals(4, uniquePlan.accessIndexId());
     }
@@ -90,8 +92,10 @@ class HeuristicQueryOptimizerTest {
                         BoundComparisonOperator.GREATER_THAN_OR_EQUAL,
                         integer(2))),
                 SelectLockMode.CONSISTENT);
-        PhysicalRangeSelect rangePlan = assertInstanceOf(PhysicalRangeSelect.class,
+        PhysicalQuery rangeQuery = assertInstanceOf(PhysicalQuery.class,
                 optimizer.optimize(converter.convert(range)));
+        PhysicalRangeAccess rangePlan = assertInstanceOf(
+                PhysicalRangeAccess.class, rangeQuery.root().input().input());
         assertEquals(6, rangePlan.accessIndexId());
         assertTrue(rangePlan.indexRange().upper().isPresent(),
                 "第二 key part 为 DESC，SQL lower bound 必须翻转为物理 upper bound");
@@ -100,11 +104,69 @@ class HeuristicQueryOptimizerTest {
                 comparison(table, 1, BoundComparisonOperator.GREATER_THAN,
                         integer(2)),
                 SelectLockMode.CONSISTENT);
-        PhysicalRangeSelect scanPlan = assertInstanceOf(PhysicalRangeSelect.class,
+        PhysicalQuery scanQuery = assertInstanceOf(PhysicalQuery.class,
                 optimizer.optimize(converter.convert(scan)));
+        PhysicalRangeAccess scanPlan = assertInstanceOf(
+                PhysicalRangeAccess.class, scanQuery.root().input().input());
         assertEquals(3, scanPlan.accessIndexId());
         assertTrue(scanPlan.indexRange().lower().isEmpty());
         assertTrue(scanPlan.indexRange().upper().isEmpty());
+    }
+
+    /**
+     * 排序策略必须在访问路径确定后判定：等值前缀后的同向 key 使用索引；
+     * 小 LIMIT 使用 Top-N，大 LIMIT 或无限制使用分堆归并。
+     */
+    @Test
+    void choosesIndexTopNAndPartitionedSortStrategies() {
+        TableDefinition table = table();
+        BoundSelect indexOrdered = new BoundSelect(
+                table, List.of(0),
+                and(equal(table, 3, new SqlValue.StringValue("open")),
+                        comparison(table, 1,
+                                BoundComparisonOperator.GREATER_THAN_OR_EQUAL,
+                                integer(2))),
+                List.of(new BoundSortKey(
+                        1, table.columns().get(1).columnId(),
+                        IndexOrder.DESC)),
+                Optional.empty(), SelectLockMode.CONSISTENT);
+        PhysicalQuery indexPlan = assertInstanceOf(
+                PhysicalQuery.class,
+                optimizer.optimize(converter.convert(indexOrdered)));
+        assertEquals(6, indexPlan.root().input().input().accessIndexId());
+        assertEquals(PhysicalSortStrategy.INDEX, indexPlan.sortStrategy());
+
+        BoundExpression scanPredicate = comparison(
+                table, 1, BoundComparisonOperator.GREATER_THAN, integer(2));
+        BoundSortKey byNote = new BoundSortKey(
+                2, table.columns().get(2).columnId(), IndexOrder.ASC);
+        PhysicalQuery topN = assertInstanceOf(
+                PhysicalQuery.class, optimizer.optimize(converter.convert(
+                        new BoundSelect(table, List.of(0), scanPredicate,
+                                List.of(byNote),
+                                Optional.of(new BoundLimit(3, 10)),
+                                SelectLockMode.CONSISTENT))));
+        assertEquals(PhysicalSortStrategy.TOP_N_HEAP, topN.sortStrategy());
+        assertEquals(3L, topN.limit().orElseThrow().offset());
+
+        PhysicalQuery large = assertInstanceOf(
+                PhysicalQuery.class, optimizer.optimize(converter.convert(
+                        new BoundSelect(table, List.of(0), scanPredicate,
+                                List.of(byNote),
+                                Optional.of(new BoundLimit(0, 5000)),
+                                SelectLockMode.CONSISTENT))));
+        assertEquals(
+                PhysicalSortStrategy.PARTITIONED_HEAP_MERGE,
+                large.sortStrategy());
+
+        PhysicalQuery unlimited = assertInstanceOf(
+                PhysicalQuery.class, optimizer.optimize(converter.convert(
+                        new BoundSelect(table, List.of(0), scanPredicate,
+                                List.of(byNote), Optional.empty(),
+                                SelectLockMode.CONSISTENT))));
+        assertEquals(
+                PhysicalSortStrategy.PARTITIONED_HEAP_MERGE,
+                unlimited.sortStrategy());
     }
 
     /** 普通二级等值保留多行 prefix-range；SQL NULL conjunction 生成 empty range 而不访问 point 路径。 */
@@ -115,25 +177,31 @@ class HeuristicQueryOptimizerTest {
                 table, List.of(0), and(
                 predicate(table, 0, 7), predicate(table, 1, 2)),
                 SelectLockMode.FOR_UPDATE);
-        PhysicalRangeSelect lockingPlan = assertInstanceOf(PhysicalRangeSelect.class,
+        PhysicalQuery lockingQuery = assertInstanceOf(PhysicalQuery.class,
                 optimizer.optimize(converter.convert(lockingPrimary)));
+        PhysicalRangeAccess lockingPlan = assertInstanceOf(
+                PhysicalRangeAccess.class, lockingQuery.root().input().input());
         assertEquals(SelectLockMode.FOR_UPDATE, lockingPlan.lockMode(),
                 "locking point 必须保留 current-read intent，不能错误降为一致性 point plan");
 
         BoundSelect secondary = new BoundSelect(table, List.of(0),
                 equal(table, 3, new SqlValue.StringValue("open")),
                 SelectLockMode.FOR_SHARE);
-        PhysicalSecondaryRangeSelect secondaryPlan =
-                assertInstanceOf(PhysicalSecondaryRangeSelect.class,
-                        optimizer.optimize(converter.convert(secondary)));
+        PhysicalQuery secondaryQuery = assertInstanceOf(PhysicalQuery.class,
+                optimizer.optimize(converter.convert(secondary)));
+        PhysicalSecondaryPrefixAccess secondaryPlan =
+                assertInstanceOf(PhysicalSecondaryPrefixAccess.class,
+                        secondaryQuery.root().input().input());
         assertEquals(5, secondaryPlan.accessIndexId());
         assertEquals(SelectLockMode.FOR_SHARE, secondaryPlan.lockMode());
 
         BoundSelect nullPredicate = new BoundSelect(table, List.of(0),
                 equal(table, 0, SqlValue.NullValue.INSTANCE),
                 SelectLockMode.CONSISTENT);
-        PhysicalRangeSelect empty = assertInstanceOf(PhysicalRangeSelect.class,
+        PhysicalQuery emptyQuery = assertInstanceOf(PhysicalQuery.class,
                 optimizer.optimize(converter.convert(nullPredicate)));
+        PhysicalRangeAccess empty = assertInstanceOf(
+                PhysicalRangeAccess.class, emptyQuery.root().input().input());
         assertTrue(empty.empty());
         assertEquals(3, empty.accessIndexId());
         assertTrue(empty.indexRange().lower().isEmpty());
@@ -191,9 +259,10 @@ class HeuristicQueryOptimizerTest {
                 opaqueResidual),
                 SelectLockMode.CONSISTENT);
 
-        PhysicalPointSelect pointPlan = assertInstanceOf(
-                PhysicalPointSelect.class,
-                optimizer.optimize(converter.convert(point)));
+        PhysicalQuery pointQuery = assertInstanceOf(
+                PhysicalQuery.class, optimizer.optimize(converter.convert(point)));
+        PhysicalPointAccess pointPlan = assertInstanceOf(
+                PhysicalPointAccess.class, pointQuery.root().input().input());
         assertEquals(3, pointPlan.accessIndexId());
         assertEquals(List.of(integer(7), integer(2)),
                 pointPlan.keyValues());
@@ -203,9 +272,10 @@ class HeuristicQueryOptimizerTest {
                 and(predicate(table, 0, 7), predicate(table, 1, 2)),
                 equal(table, 3, new SqlValue.StringValue("open")))),
                 SelectLockMode.CONSISTENT);
-        PhysicalRangeSelect scan = assertInstanceOf(
-                PhysicalRangeSelect.class,
-                optimizer.optimize(converter.convert(rootOr)));
+        PhysicalQuery scanQuery = assertInstanceOf(
+                PhysicalQuery.class, optimizer.optimize(converter.convert(rootOr)));
+        PhysicalRangeAccess scan = assertInstanceOf(
+                PhysicalRangeAccess.class, scanQuery.root().input().input());
         assertEquals(3, scan.accessIndexId());
         assertTrue(scan.indexRange().lower().isEmpty());
         assertTrue(scan.indexRange().upper().isEmpty());
@@ -244,9 +314,11 @@ class HeuristicQueryOptimizerTest {
         TableDefinition table = lobIndexTable();
         List<SqlValue> key = List.of(
                 new SqlValue.BytesValue(new byte[]{1}));
-        assertThrows(DatabaseValidationException.class, () -> new PhysicalPointSelect(
-                table, List.of(0), 8, PointAccessKind.UNIQUE_SECONDARY,
-                key, indexEqualityPredicates(table, 8, key)));
+        assertThrows(DatabaseValidationException.class, () -> query(
+                table, List.of(0),
+                new PhysicalPointAccess(
+                        table, 8, PointAccessKind.UNIQUE_SECONDARY, key),
+                indexEqualityPredicates(table, 8, key)));
     }
 
     /** 替代 optimizer 不能提交未由完整 residual 证明的 point key，否则会 under-scan 漏行。 */
@@ -257,9 +329,10 @@ class HeuristicQueryOptimizerTest {
                 new SqlValue.StringValue("memo"));
 
         assertThrows(DatabaseValidationException.class,
-                () -> new PhysicalPointSelect(
-                        table, List.of(0), 4,
-                        PointAccessKind.UNIQUE_SECONDARY, key,
+                () -> query(
+                        table, List.of(0),
+                        new PhysicalPointAccess(
+                                table, 4, PointAccessKind.UNIQUE_SECONDARY, key),
                         predicates(equal(
                                 table, 3,
                                 new SqlValue.StringValue("open")))));
@@ -272,14 +345,34 @@ class HeuristicQueryOptimizerTest {
         List<SqlValue> key = List.of(integer(7), integer(2));
 
         assertThrows(DatabaseValidationException.class,
-                () -> new PhysicalPointSelect(
-                        table, List.of(0), 3,
-                        PointAccessKind.CLUSTERED_PRIMARY, key,
+                () -> query(
+                        table, List.of(0),
+                        new PhysicalPointAccess(
+                                table, 3, PointAccessKind.CLUSTERED_PRIMARY, key),
                         PredicateSet.of(or(
                                 and(predicate(table, 0, 7),
                                         predicate(table, 1, 2)),
                                 equal(table, 3,
                                         new SqlValue.StringValue("open"))))));
+    }
+
+    /**
+     * 为替代优化器边界测试组装固定的 project-filter-access 物理树。
+     *
+     * @param table 物理树引用的 exact DD table version
+     * @param projections 用户可观察的列序号
+     * @param access 待校验的候选访问叶
+     * @param predicates 必须在完整行上保持的最终谓词
+     * @return 构造完成且已经过跨算子不变量校验的查询根
+     */
+    private static PhysicalQuery query(
+            TableDefinition table,
+            List<Integer> projections,
+            PhysicalAccess access,
+            PredicateSet predicates) {
+        assertEquals(table, access.table());
+        return new PhysicalQuery(new PhysicalProject(
+                new PhysicalFilter(access, predicates), projections));
     }
 
     private static BoundExpression predicate(

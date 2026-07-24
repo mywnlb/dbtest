@@ -16,6 +16,7 @@ import cn.zhangyis.db.dd.domain.TableId;
 import cn.zhangyis.db.dd.domain.TableState;
 import cn.zhangyis.db.dd.domain.TableOptions;
 import cn.zhangyis.db.dd.domain.ColumnDefaultDefinition;
+import cn.zhangyis.db.dd.domain.ColumnGeneration;
 import cn.zhangyis.db.domain.PageId;
 import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.SegmentId;
@@ -47,13 +48,15 @@ public final class DictionarySdiCodec {
      */
     private static final int MAGIC = 0x44445331;
     /** v2 为 binding 增加独立物理行格式版本；decoder 继续接受 v1。 */
-    private static final int FORMAT_VERSION = 3;
+    private static final int FORMAT_VERSION = 4;
     /**
      * 当前稳定格式版本；编解码与恢复路径共同依赖该值，升级时必须保留旧版本判定。
      */
     private static final int LEGACY_FORMAT_VERSION = 1;
     /** v2 只有 rowFormatVersion，没有 table/default 扩展。 */
     private static final int ROW_FORMAT_VERSION = 2;
+    /** v3 首次写入 table options 与 column default。 */
+    private static final int TABLE_OPTIONS_FORMAT_VERSION = 3;
     /** 单个名称、路径或 ENUM/SET symbol 的 UTF-8 上界。 */
     private static final int MAX_STRING_BYTES = 8 * 1024;
     /** 防止损坏 count 导致无界分配。 */
@@ -143,6 +146,7 @@ public final class DictionarySdiCodec {
             }
             int format = in.readInt();
             if (format != LEGACY_FORMAT_VERSION && format != ROW_FORMAT_VERSION
+                    && format != TABLE_OPTIONS_FORMAT_VERSION
                     && format != FORMAT_VERSION) {
                 throw new DictionarySdiCorruptionException("unsupported dictionary SDI payload format: " + format);
             }
@@ -156,7 +160,7 @@ public final class DictionarySdiCodec {
             if (state != TableState.ACTIVE) {
                 throw new DictionarySdiCorruptionException("SDI v1 table state must be ACTIVE: " + state);
             }
-            TableOptions options = format == FORMAT_VERSION
+            TableOptions options = format >= TABLE_OPTIONS_FORMAT_VERSION
                     ? new TableOptions(readString(in), in.readInt(), in.readInt())
                     : TableOptions.legacyDefaults();
             TableStorageBinding binding = readBinding(in, tableId, version, format);
@@ -308,6 +312,8 @@ public final class DictionarySdiCodec {
         if (column.defaultDefinition().constantLiteral().isPresent()) {
             writeString(out, column.defaultDefinition().constantLiteral().orElseThrow());
         }
+        writeString(out, column.comment());
+        out.writeInt(column.generation().stableCode());
     }
 
     /**
@@ -347,10 +353,16 @@ public final class DictionarySdiCodec {
         // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
         ColumnTypeDefinition type = new ColumnTypeDefinition(
                 typeId, unsigned, nullable, length, scale, charset, collation, symbols);
-        ColumnDefaultDefinition defaultDefinition = format == FORMAT_VERSION
+        ColumnDefaultDefinition defaultDefinition =
+                format >= TABLE_OPTIONS_FORMAT_VERSION
                 ? readColumnDefault(in) : nullable
                 ? ColumnDefaultDefinition.implicitNull() : ColumnDefaultDefinition.required();
-        return new ColumnDefinition(columnId, name, type, ordinal, defaultDefinition);
+        String comment = format >= FORMAT_VERSION ? readString(in) : "";
+        ColumnGeneration generation = format >= FORMAT_VERSION
+                ? ColumnGeneration.fromStableCode(in.readInt())
+                : ColumnGeneration.NONE;
+        return new ColumnDefinition(
+                columnId, name, type, ordinal, defaultDefinition, comment, generation);
     }
 
     private static int columnDefaultCode(ColumnDefaultDefinition.Kind kind) {

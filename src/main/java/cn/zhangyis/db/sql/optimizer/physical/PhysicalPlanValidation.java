@@ -77,6 +77,26 @@ final class PhysicalPlanValidation {
     }
 
     /**
+     * 校验独立 range access 叶的 index identity 与 endpoint；最终 residual 已上移到
+     * {@link PhysicalFilter}，本方法不得重新引入第二份 predicate 状态。
+     *
+     * @param table exact DD table version
+     * @param accessIndexId optimizer 选择的稳定 index id
+     * @param range 可无界或连续 prefix endpoint
+     * @throws DatabaseValidationException table/index/range 不完整或 endpoint 越界时抛出
+     */
+    static void validateRangeAccess(
+            TableDefinition table, long accessIndexId, IndexRange range) {
+        if (range == null) {
+            throw new DatabaseValidationException(
+                    "physical range access must not be null");
+        }
+        IndexDefinition index = requireIndex(table, accessIndexId);
+        range.lower().ifPresent(endpoint -> validateEndpoint(endpoint, index));
+        range.upper().ifPresent(endpoint -> validateEndpoint(endpoint, index));
+    }
+
+    /**
      * 校验物理计划 residual 已经过规则规范化，且仍绑定同一个 exact table version。
      *
      * <ol>

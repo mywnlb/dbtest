@@ -4,12 +4,19 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.dd.ddl.DictionaryDdlService;
 import cn.zhangyis.db.dd.domain.MdlOwnerId;
 import cn.zhangyis.db.sql.binder.bound.BoundCreateIndex;
+import cn.zhangyis.db.sql.binder.bound.BoundCreateTable;
 import cn.zhangyis.db.sql.binder.bound.BoundDropIndex;
 import cn.zhangyis.db.sql.binder.bound.BoundAlterTablespace;
 import cn.zhangyis.db.sql.binder.bound.BoundAlterTable;
+import cn.zhangyis.db.sql.binder.bound.BoundCreateSchema;
+import cn.zhangyis.db.sql.binder.bound.BoundDropSchema;
+import cn.zhangyis.db.sql.binder.bound.BoundDropTables;
+import cn.zhangyis.db.sql.executor.SqlWarning;
 import cn.zhangyis.db.sql.executor.storage.SqlDdlGateway;
+import cn.zhangyis.db.dd.exception.DictionaryObjectExistsException;
 
 import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -38,6 +45,102 @@ public final class DefaultSqlDdlGateway implements SqlDdlGateway {
             throw new DatabaseValidationException("SQL DDL gateway coordinator must not be null");
         }
         this.ddl = ddl;
+    }
+
+    /**
+     * 将 SQL CREATE TABLE 命令交给现有原子 DD coordinator。独立 owner 的生命周期完全位于本次
+     * coordinator 调用内，不复用刚被 implicit commit 终结的用户事务 owner。
+     *
+     * @param statement Binder 已完成纯输入校验且不持资源的建表命令
+     * @param timeout statement 剩余正有界时间；超时不得由 adapter 自行删除物理文件或 marker
+     * @throws DatabaseValidationException 参数缺失或 timeout 非正时抛出，且不进入 DD
+     */
+    @Override
+    public void createTable(BoundCreateTable statement, Duration timeout) {
+        if (statement == null || timeout == null
+                || timeout.isZero() || timeout.isNegative()) {
+            throw new DatabaseValidationException(
+                    "SQL CREATE TABLE requires statement/positive timeout");
+        }
+        ddl.createTable(
+                MdlOwnerId.forDdlStatement(
+                        statementSequence.incrementAndGet()),
+                statement.command(), timeout);
+    }
+
+    /**
+     * 在 coordinator 的 table X 重验后，仅把“表已存在”转换为 1050 warning。
+     */
+    @Override
+    public List<SqlWarning> createTableWithWarnings(
+            BoundCreateTable statement, Duration timeout) {
+        try {
+            createTable(statement, timeout);
+            return List.of();
+        } catch (DictionaryObjectExistsException exists) {
+            if (!statement.ifNotExists()) {
+                throw exists;
+            }
+            return List.of(new SqlWarning(
+                    1050, "42S01",
+                    "Table already exists: "
+                            + statement.command().name().canonicalKey()));
+        }
+    }
+
+    /**
+     * 创建默认 charset/collation 为当前教学实例 1/1 的 schema；重复对象只在 IF 分支降为 warning。
+     */
+    @Override
+    public List<SqlWarning> createSchema(
+            BoundCreateSchema statement, Duration timeout) {
+        require(statement, timeout, "CREATE SCHEMA");
+        try {
+            ddl.createSchema(
+                    nextOwner(), statement.name(), 1, 1, timeout);
+            return List.of();
+        } catch (DictionaryObjectExistsException exists) {
+            if (!statement.ifNotExists()) {
+                throw exists;
+            }
+            return List.of(new SqlWarning(
+                    1007, "HY000",
+                    "Schema already exists: "
+                            + statement.name().canonicalName()));
+        }
+    }
+
+    /**
+     * 把完整目标列表一次交给 DD batch coordinator，并将缺失目标映射为 1051 warning。
+     */
+    @Override
+    public List<SqlWarning> dropTables(
+            BoundDropTables statement, Duration timeout) {
+        require(statement, timeout, "DROP TABLE");
+        return ddl.dropTables(
+                        nextOwner(), statement.tables(),
+                        statement.ifExists(), timeout)
+                .stream()
+                .map(name -> new SqlWarning(
+                        1051, "42S02",
+                        "Unknown table: " + name.canonicalKey()))
+                .toList();
+    }
+
+    /**
+     * 执行 schema tombstone 与级联表删除；IF EXISTS 缺失时返回 1008 warning。
+     */
+    @Override
+    public List<SqlWarning> dropSchema(
+            BoundDropSchema statement, Duration timeout) {
+        require(statement, timeout, "DROP SCHEMA");
+        boolean dropped = ddl.dropSchema(
+                nextOwner(), statement.name(),
+                statement.ifExists(), timeout);
+        return dropped ? List.of() : List.of(new SqlWarning(
+                1008, "HY000",
+                "Schema does not exist: "
+                        + statement.name().canonicalName()));
     }
 
     /**
@@ -110,5 +213,20 @@ public final class DefaultSqlDdlGateway implements SqlDdlGateway {
         ddl.alterTable(
                 MdlOwnerId.forDdlStatement(statementSequence.incrementAndGet()),
                 statement.command(), timeout);
+    }
+
+    private MdlOwnerId nextOwner() {
+        return MdlOwnerId.forDdlStatement(
+                statementSequence.incrementAndGet());
+    }
+
+    private static void require(
+            Object statement, Duration timeout, String operation) {
+        if (statement == null || timeout == null
+                || timeout.isZero() || timeout.isNegative()) {
+            throw new DatabaseValidationException(
+                    "SQL " + operation
+                            + " requires statement/positive timeout");
+        }
     }
 }

@@ -3,6 +3,9 @@ package cn.zhangyis.db.dd.repo;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.dd.ddl.DdlCancellation;
 import cn.zhangyis.db.dd.ddl.DdlCancellationReason;
+import cn.zhangyis.db.dd.ddl.DdlBatchManifest;
+import cn.zhangyis.db.dd.ddl.DdlBatchSchemaEntry;
+import cn.zhangyis.db.dd.ddl.DdlBatchTableEntry;
 import cn.zhangyis.db.dd.ddl.DdlControlState;
 import cn.zhangyis.db.dd.ddl.DdlDigestAlgorithm;
 import cn.zhangyis.db.dd.ddl.DdlExecutionProtocol;
@@ -15,6 +18,8 @@ import cn.zhangyis.db.dd.ddl.DdlRetirementFence;
 import cn.zhangyis.db.dd.ddl.DdlSchemaCanonicalFormat;
 import cn.zhangyis.db.dd.ddl.DdlSchemaDigest;
 import cn.zhangyis.db.dd.exception.DictionaryCatalogCorruptionException;
+import cn.zhangyis.db.dd.domain.SchemaId;
+import cn.zhangyis.db.dd.domain.TableId;
 import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.api.catalog.CatalogBatch;
@@ -41,8 +46,9 @@ import java.util.List;
 import java.util.Optional;
 
 /**
- * DDL marker 与 InternalCatalogStore 无语义record之间的版本化codec。v4首次启用key中的chunk ordinal：
- * 一个逻辑marker的全部chunks位于同一catalog batch，frame CRC与batch SHA共同保护原子性。
+ * DDL marker 与 InternalCatalogStore 无语义 record 之间的版本化 codec。v4 首次启用 key 中的
+ * chunk ordinal，v5 在同一逻辑 payload 尾部增加批量 DROP manifest。一个逻辑 marker 的全部
+ * chunks 位于同一 catalog batch，frame CRC 与 batch SHA 共同保护原子性。
  */
 final class DdlLogCatalogCodec {
 
@@ -52,25 +58,24 @@ final class DdlLogCatalogCodec {
     private static final int KEY_V2_BYTES = KEY_V1_BYTES + Long.BYTES;
     /** payload magic "DDL1"；format byte紧随其后。 */
     private static final int MAGIC = 0x44444C31;
-    /** 当前写格式：digest checkpoint、protocol、control与monotonic扩展。 */
-    private static final int FORMAT_VERSION = 4;
+    /** 当前写格式：v4 checkpoint/control 字段后追加 v5 可选 batch manifest。 */
+    private static final int FORMAT_VERSION = 5;
     /** 最老可读table marker格式。 */
     private static final int LEGACY_FORMAT_VERSION = 1;
     /** catalog物理层单record payload上限；必须与FileInternalCatalogStore一致。 */
     private static final int MAX_CHUNK_BYTES = 1024;
-    /** 防止损坏chunk count造成无界聚合分配；当前完整fence/双path可容纳。 */
-    private static final int MAX_LOGICAL_PAYLOAD_BYTES = 16 * 1024;
+    /** 防止损坏chunk count造成无界聚合分配；批量 DROP 最多容纳 4096 张表的恢复清单。 */
+    private static final int MAX_LOGICAL_PAYLOAD_BYTES = 4 * 1024 * 1024;
     /** 由逻辑上限与单块上限共同确定的最大chunk数。 */
     private static final int MAX_CHUNKS = MAX_LOGICAL_PAYLOAD_BYTES / MAX_CHUNK_BYTES;
     /** 主路径和辅助路径各自沿用v3的UTF-8上限。 */
     private static final int MAX_PATH_BYTES = 900;
-
     /**
      * 把一个完整marker编码为同一catalog batch中的连续chunks。
      *
      * <p>数据流：</p>
      * <ol>
-     *     <li>严格编码两条路径并按v4 grammar生成有界逻辑payload。</li>
+     *     <li>严格编码路径、checkpoint 与可选 batch manifest，并按 v5 grammar 生成有界逻辑 payload。</li>
      *     <li>在任何catalog副作用前校验总长度和所有optional/fixed-width领域字段。</li>
      *     <li>按1024-byte上限连续切块，每个key重复immutable/phase并写从0开始的ordinal。</li>
      *     <li>返回不可变record列表；repository必须把整组交给一次store.append。</li>
@@ -78,7 +83,7 @@ final class DdlLogCatalogCodec {
      *
      * @param record 已由领域构造器验证、路径已规范化的完整marker
      * @return 非空、chunk ordinal连续的catalog records
-     * @throws DatabaseValidationException 路径UTF-8、总长度或字段超出v4上限时抛出
+     * @throws DatabaseValidationException 路径 UTF-8、总长度或字段超出当前格式上限时抛出
      */
     List<CatalogRecord> encode(DdlLogRecord record) {
         if (record == null) {
@@ -86,7 +91,7 @@ final class DdlLogCatalogCodec {
         }
         if (record.executionProtocol() == DdlExecutionProtocol.LEGACY_PHASE_ONLY) {
             throw new DatabaseValidationException(
-                    "DDL legacy protocol is decode-only and cannot be encoded as v4");
+                    "DDL legacy protocol is decode-only and cannot be encoded by current format");
         }
         // 1、路径必须使用REPORT，不能把未配对surrogate替换成相同的U+FFFD后持久化。
         byte[] path = strictUtf8(record.path().toString(), "path");
@@ -100,7 +105,7 @@ final class DdlLogCatalogCodec {
         byte[] payload = encodeLogical(record, path, auxiliary);
         if (payload.length <= 0 || payload.length > MAX_LOGICAL_PAYLOAD_BYTES) {
             throw new DatabaseValidationException(
-                    "DDL log v4 logical payload exceeds bound: " + payload.length);
+                    "DDL log logical payload exceeds bound: " + payload.length);
         }
 
         // 3、chunk key重复identity并携带ordinal；batch顺序就是重组顺序。
@@ -142,7 +147,7 @@ final class DdlLogCatalogCodec {
             return Optional.empty();
         }
         if (batch.records().size() > MAX_CHUNKS) {
-            throw new DictionaryCatalogCorruptionException("DDL log v4 chunk count exceeds bound");
+            throw new DictionaryCatalogCorruptionException("DDL log chunk count exceeds bound");
         }
         KeyFields firstKey = parseKey(firstKeyBytes);
         if (firstKey.chunkOrdinal() != 0) {
@@ -160,7 +165,7 @@ final class DdlLogCatalogCodec {
             logical.writeBytes(chunk.payload());
             if (logical.size() > MAX_LOGICAL_PAYLOAD_BYTES) {
                 throw new DictionaryCatalogCorruptionException(
-                        "DDL log logical payload exceeds v4 bound");
+                        "DDL log logical payload exceeds current bound");
             }
         }
 
@@ -170,7 +175,7 @@ final class DdlLogCatalogCodec {
             throw new DictionaryCatalogCorruptionException("truncated DDL log payload header");
         }
         int format = Byte.toUnsignedInt(payload[Integer.BYTES]);
-        if (format != FORMAT_VERSION && batch.records().size() != 1) {
+        if (format < 4 && batch.records().size() != 1) {
             throw new DictionaryCatalogCorruptionException("legacy DDL log cannot use chunks");
         }
 
@@ -185,7 +190,7 @@ final class DdlLogCatalogCodec {
         }
     }
 
-    /** 写出v4逻辑payload；DataOutputStream固定big-endian。 */
+    /** 写出当前 v5 逻辑 payload；DataOutputStream 固定 big-endian。 */
     private static byte[] encodeLogical(DdlLogRecord record, byte[] path, byte[] auxiliary) {
         try {
             ByteArrayOutputStream bytes = new ByteArrayOutputStream();
@@ -210,10 +215,11 @@ final class DdlLogCatalogCodec {
                 writeDigest(out, record.targetSchemaDigest());
                 writeCancellation(out, record.cancellation());
                 writeRetirementFence(out, record.retirementFence());
+                writeBatchManifest(out, record.batchManifest());
             }
             return bytes.toByteArray();
         } catch (IOException error) {
-            throw new DatabaseValidationException("failed to encode DDL log v4 payload", error);
+            throw new DatabaseValidationException("failed to encode DDL log payload", error);
         }
     }
 
@@ -257,6 +263,8 @@ final class DdlLogCatalogCodec {
                     ? readCancellation(in) : Optional.empty();
             Optional<DdlRetirementFence> retirementFence = format >= 4
                     ? readRetirementFence(in) : Optional.empty();
+            Optional<DdlBatchManifest> batchManifest = format >= 5
+                    ? readBatchManifest(in) : Optional.empty();
 
             if (in.available() != 0) {
                 throw new DictionaryCatalogCorruptionException("DDL log payload has trailing bytes");
@@ -270,7 +278,7 @@ final class DdlLogCatalogCodec {
                     secondaryObjectId, DdlLogOperation.fromStableCode(operationCode),
                     DdlLogPhase.fromStableCode(phaseCode), SpaceId.of(spaceId), path,
                     auxiliary, identity, protocol, source, intermediate, target,
-                    control, cancellation, retirementFence);
+                    control, cancellation, retirementFence, batchManifest);
         }
     }
 
@@ -500,6 +508,106 @@ final class DdlLogCatalogCodec {
         }
         return Optional.of(new DdlRetirementFence(tableId, sourceVersion, transactionNo,
                 metadataVersion, generation, ownerDdlId, resources));
+    }
+
+    /**
+     * 写入可选 v5 批量 DROP manifest。所有路径均为受控单层相对文件名，表项已由领域对象按 table id 排序。
+     */
+    private static void writeBatchManifest(
+            DataOutputStream out,
+            Optional<DdlBatchManifest> manifest) throws IOException {
+        out.writeByte(manifest.isPresent() ? 1 : 0);
+        if (manifest.isEmpty()) {
+            return;
+        }
+        DdlBatchManifest value = manifest.orElseThrow();
+        out.writeByte(value.schema().isPresent() ? 1 : 0);
+        if (value.schema().isPresent()) {
+            DdlBatchSchemaEntry schema = value.schema().orElseThrow();
+            byte[] name = strictUtf8(schema.canonicalName(),
+                    "batch schema name");
+            requirePathBound(name, "batch schema name");
+            out.writeLong(schema.schemaId().value());
+            writeShortBytes(out, name);
+            writeDigest(out, Optional.of(schema.sourceSchemaDigest()));
+            writeDigest(out, Optional.of(schema.targetSchemaDigest()));
+        }
+        out.writeInt(value.tables().size());
+        for (DdlBatchTableEntry table : value.tables()) {
+            byte[] relativePath = strictUtf8(
+                    table.relativePath(), "batch table path");
+            requirePathBound(relativePath, "batch table path");
+            out.writeLong(table.tableId().value());
+            out.writeInt(table.spaceId().value());
+            writeShortBytes(out, relativePath);
+            out.writeLong(table.rowFormatVersion());
+            writeDigest(out, Optional.of(table.sourceSchemaDigest()));
+            writeDigest(out, Optional.of(table.pendingSchemaDigest()));
+            writeDigest(out, Optional.of(table.targetSchemaDigest()));
+        }
+    }
+
+    /**
+     * 读取 v5 批量 DROP manifest；在分配集合前限制数量，领域构造器继续校验排序后的唯一 identity。
+     */
+    private static Optional<DdlBatchManifest> readBatchManifest(
+            DataInputStream in) throws IOException {
+        if (!readFlag(in, "batch manifest")) {
+            return Optional.empty();
+        }
+        Optional<DdlBatchSchemaEntry> schema = Optional.empty();
+        if (readFlag(in, "batch schema")) {
+            long schemaId = in.readLong();
+            String name = strictUtf8(
+                    readShortBytes(in, "batch schema name"),
+                    "batch schema name");
+            DdlSchemaDigest source = requiredDigest(
+                    in, "batch schema source");
+            DdlSchemaDigest target = requiredDigest(
+                    in, "batch schema target");
+            schema = Optional.of(new DdlBatchSchemaEntry(
+                    SchemaId.of(schemaId), name, source, target));
+        }
+        int count = in.readInt();
+        if (count < 0 || count > DdlBatchManifest.MAX_TABLES) {
+            throw new DictionaryCatalogCorruptionException(
+                    "invalid DDL batch table count: " + count);
+        }
+        List<DdlBatchTableEntry> tables = new ArrayList<>(count);
+        long previousTableId = 0L;
+        for (int index = 0; index < count; index++) {
+            long tableId = in.readLong();
+            int spaceId = in.readInt();
+            String relativePath = strictUtf8(
+                    readShortBytes(in, "batch table path"),
+                    "batch table path");
+            long rowFormatVersion = in.readLong();
+            DdlSchemaDigest source = requiredDigest(
+                    in, "batch table source");
+            DdlSchemaDigest pending = requiredDigest(
+                    in, "batch table pending");
+            DdlSchemaDigest target = requiredDigest(
+                    in, "batch table target");
+            if (tableId <= previousTableId) {
+                throw new DictionaryCatalogCorruptionException(
+                        "DDL batch table ids are not strictly ordered");
+            }
+            previousTableId = tableId;
+            tables.add(new DdlBatchTableEntry(
+                    TableId.of(tableId), SpaceId.of(spaceId),
+                    relativePath, rowFormatVersion,
+                    source, pending, target));
+        }
+        return Optional.of(new DdlBatchManifest(schema, tables));
+    }
+
+    /** 读取 manifest 中必须存在的 digest；absent 是格式损坏而不是默认值。 */
+    private static DdlSchemaDigest requiredDigest(
+            DataInputStream in, String checkpoint) throws IOException {
+        return readDigest(in, checkpoint).orElseThrow(() ->
+                new DictionaryCatalogCorruptionException(
+                        "DDL batch manifest lacks required digest: "
+                                + checkpoint));
     }
 
     /** 读取只允许0/1的optional flag。 */

@@ -111,7 +111,9 @@ public final class PersistentDictionaryRepository {
      * @return {@code findSchema} 按身份或键定位到的对象；未找到、不可见或尚未持久化时为空 {@code Optional}，从不返回 Java {@code null}
      */
     public Optional<SchemaDefinition> findSchema(SchemaId id) {
-        return Optional.ofNullable(snapshot.schemas().get(id));
+        return Optional.ofNullable(snapshot.schemas().get(id))
+                .filter(schema -> schema.state()
+                        == cn.zhangyis.db.dd.domain.SchemaState.ACTIVE);
     }
 
     /**
@@ -125,7 +127,10 @@ public final class PersistentDictionaryRepository {
         if (name == null) {
             throw new DatabaseValidationException("schema name must not be null");
         }
-        return snapshot.schemas().values().stream().filter(schema -> schema.name().equals(name)).findFirst();
+        return snapshot.schemas().values().stream()
+                .filter(schema -> schema.state()
+                        == cn.zhangyis.db.dd.domain.SchemaState.ACTIVE)
+                .filter(schema -> schema.name().equals(name)).findFirst();
     }
 
     /**
@@ -276,10 +281,30 @@ public final class PersistentDictionaryRepository {
             if (schema == null || !schema.version().equals(version)) {
                 throw new DictionaryVersionConflictException("schema mutation version mismatch");
             }
+            SchemaDefinition existingById = schemaView.get(schema.id());
             boolean duplicateName = schemaView.values().stream().anyMatch(existing ->
-                    existing.name().equals(schema.name()) && !existing.id().equals(schema.id()));
-            if (duplicateName || before.schemas().containsKey(schema.id())) {
+                    existing.state() == cn.zhangyis.db.dd.domain.SchemaState.ACTIVE
+                            && schema.state() == cn.zhangyis.db.dd.domain.SchemaState.ACTIVE
+                            && existing.name().equals(schema.name())
+                            && !existing.id().equals(schema.id()));
+            boolean validLifecycle = existingById != null
+                    && existingById.state()
+                    == cn.zhangyis.db.dd.domain.SchemaState.ACTIVE
+                    && schema.state()
+                    == cn.zhangyis.db.dd.domain.SchemaState.DROPPED
+                    && existingById.id().equals(schema.id())
+                    && existingById.name().equals(schema.name())
+                    && existingById.defaultCharsetId()
+                    == schema.defaultCharsetId()
+                    && existingById.defaultCollationId()
+                    == schema.defaultCollationId();
+            if (duplicateName || existingById != null && !validLifecycle) {
                 throw new DictionaryObjectExistsException("schema already exists: " + schema.name());
+            }
+            if (existingById == null && schema.state()
+                    != cn.zhangyis.db.dd.domain.SchemaState.ACTIVE) {
+                throw new DictionaryVersionConflictException(
+                        "new schema must enter ACTIVE state");
             }
             schemaView.put(schema.id(), schema);
         }

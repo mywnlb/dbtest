@@ -2,6 +2,9 @@ package cn.zhangyis.db.dd.repo;
 
 import cn.zhangyis.db.dd.ddl.DdlCancellation;
 import cn.zhangyis.db.dd.ddl.DdlCancellationReason;
+import cn.zhangyis.db.dd.ddl.DdlBatchManifest;
+import cn.zhangyis.db.dd.ddl.DdlBatchSchemaEntry;
+import cn.zhangyis.db.dd.ddl.DdlBatchTableEntry;
 import cn.zhangyis.db.dd.ddl.DdlControlCasResult;
 import cn.zhangyis.db.dd.ddl.DdlControlState;
 import cn.zhangyis.db.dd.ddl.DdlDigestAlgorithm;
@@ -15,6 +18,8 @@ import cn.zhangyis.db.dd.ddl.DdlRetirementFence;
 import cn.zhangyis.db.dd.ddl.DdlSchemaCanonicalFormat;
 import cn.zhangyis.db.dd.ddl.DdlSchemaDigest;
 import cn.zhangyis.db.dd.domain.DdlId;
+import cn.zhangyis.db.dd.domain.SchemaId;
+import cn.zhangyis.db.dd.domain.TableId;
 import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.storage.api.catalog.CatalogBatch;
@@ -43,11 +48,81 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/** DDL marker v4 codec、legacy兼容与durable control CAS的协议测试。 */
+/** DDL marker v4/v5 codec、legacy 兼容、batch manifest 与 durable control CAS 的协议测试。 */
 class DdlLogV4Test {
 
     @TempDir
     Path directory;
+
+    /**
+     * v5 必须把排序后的多表 checkpoint 与 schema 证据放入同一分块 batch，
+     * phase 推进和重启解码均不得丢失或重排 manifest。
+     */
+    @Test
+    void roundTripsChunkedV5BatchDropManifest() {
+        ArrayList<DdlBatchTableEntry> tables =
+                new ArrayList<>();
+        for (long tableId = 60; tableId >= 41; tableId--) {
+            int spaceId = 3000 + Math.toIntExact(tableId - 40);
+            tables.add(new DdlBatchTableEntry(
+                    TableId.of(tableId), SpaceId.of(spaceId),
+                    "table_" + tableId + "_space_" + spaceId
+                            + ".ibd",
+                    2, digest(1), digest(2), digest(3)));
+        }
+        DdlBatchManifest manifest = new DdlBatchManifest(
+                Optional.of(new DdlBatchSchemaEntry(
+                        SchemaId.of(9), "app",
+                        schemaDigest(11), schemaDigest(12))),
+                tables);
+        DdlLogRecord prepared = new DdlLogRecord(
+                new DdlUndoMarker(701, 30, 9), 0,
+                DdlLogOperation.DROP_SCHEMA_CASCADE,
+                DdlLogPhase.PREPARED, SpaceId.of(3001),
+                directory.resolve("table_41_space_3001.ibd"),
+                Optional.empty(), Optional.empty(),
+                DdlExecutionProtocol.BATCH_DROP_V1,
+                Optional.empty(), Optional.empty(), Optional.empty(),
+                DdlControlState.OPEN, Optional.empty(), Optional.empty(),
+                Optional.of(manifest));
+
+        DdlLogCatalogCodec codec = new DdlLogCatalogCodec();
+        List<CatalogRecord> encoded = codec.encode(prepared);
+        DdlLogRecord decoded = codec.decode(
+                new CatalogBatch(1, encoded)).orElseThrow();
+
+        assertTrue(encoded.size() > 1);
+        assertEquals(41L, decoded.batchManifest().orElseThrow()
+                .tables().getFirst().tableId().value());
+        assertEquals(60L, decoded.batchManifest().orElseThrow()
+                .tables().getLast().tableId().value());
+        assertEquals(prepared, decoded);
+        assertEquals(prepared.batchManifest(),
+                decoded.withPhase(
+                        DdlLogPhase.DICTIONARY_COMMITTED)
+                        .batchManifest());
+    }
+
+    /** encoder 与 decoder 必须共享 4096 表上限，禁止写出当前版本自身无法重开的 marker。 */
+    @Test
+    void rejectsV5BatchManifestAboveDecodeBound() {
+        ArrayList<DdlBatchTableEntry> tables =
+                new ArrayList<>(DdlBatchManifest.MAX_TABLES + 1);
+        for (int identity = 1;
+             identity <= DdlBatchManifest.MAX_TABLES + 1;
+             identity++) {
+            tables.add(new DdlBatchTableEntry(
+                    TableId.of(identity), SpaceId.of(identity),
+                    "table_" + identity + "_space_"
+                            + identity + ".ibd",
+                    1, digest(1), digest(2), digest(3)));
+        }
+
+        assertThrows(
+                cn.zhangyis.db.common.exception.DatabaseValidationException.class,
+                () -> new DdlBatchManifest(
+                        Optional.empty(), tables));
+    }
 
     /** 两条长路径和完整v4字段必须通过同一catalog batch分块，重启后逐字段恢复。 */
     @Test
@@ -385,6 +460,16 @@ class DdlLogV4Test {
         }
         return new DdlSchemaDigest(DdlDigestAlgorithm.SHA_256,
                 DdlSchemaCanonicalFormat.TABLE_SCHEMA_V1, bytes);
+    }
+
+    private static DdlSchemaDigest schemaDigest(int seed) {
+        byte[] bytes = new byte[32];
+        for (int index = 0; index < bytes.length; index++) {
+            bytes[index] = (byte) (seed + index);
+        }
+        return new DdlSchemaDigest(
+                DdlDigestAlgorithm.SHA_256,
+                DdlSchemaCanonicalFormat.SCHEMA_V1, bytes);
     }
 
     private static byte[] keyV2(DdlLogOperation operation, long ddlId, long version,

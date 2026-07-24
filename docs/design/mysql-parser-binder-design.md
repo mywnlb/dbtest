@@ -261,6 +261,12 @@ TypeResolver 处理：
 - 当前 M3 关系 Binder 递归输出 AND/OR/NOT/null-test 的单一 typed boolean condition；
   `PredicateSet` 的 conjunct/引用列均由该 condition 派生，`RuleProgram` 规范化之后才允许
   `PredicateAnalyzer` 从最外层正向 AND comparison 提取安全 range 约束。
+- 当前 JOIN v1 Parser 接受恰好两个输入的 `[INNER] JOIN ... ON qualifier.column =
+  qualifier.column`，projection、WHERE 和 ORDER BY 支持一段/两段列引用。Binder 先规范化
+  两个表名并按 canonical key 取得 lease，随后以 alias/table qualifier 作用域解析列：
+  未限定列必须唯一命中，ON 两列必须 exact type 相等。`BoundColumnReference` 携带
+  relation ordinal、stable column id、local ordinal 与 exact DD type；`BoundJoinSelect`
+  只保存语义和扁平 statement schema，不选择 join algorithm 或 inner index。
 
 ### 8.3 与 Executor
 
@@ -507,7 +513,62 @@ TypeResolver 处理：
 | 14 | 异常与恢复 | 已定义 parse/bind/schema stale/privilege/MDL timeout 的清理策略 |
 | 15 | 测试与顺序 | 已给出测试设计、实现顺序，并确认没有未完成标记或空白项 |
 
-## 18. 参考链接
+## 18. CREATE / INSERT / ORDER BY / 基础 DDL 完整语法契约（2026-07-24）
+
+### 18.1 CREATE TABLE 兼容边界
+
+本阶段语法层必须完整接受教学项目选定的 MySQL 8.0 DDL 子集：
+
+- 整数类型允许显示宽度，例如 `BIGINT(20)`、`BIGINT(15)`、`TINYINT(1)`、`TINYINT(4)`；显示宽度只属于
+  输入兼容信息，Binder 统一归一化为物理 `length=0`，`TINYINT(1)` 不转换为布尔类型。
+- 列约束允许 `NULL`、`NOT NULL`、`DEFAULT <literal>`、`AUTO_INCREMENT`、`COMMENT '<text>'`；
+  `AUTO_INCREMENT` 与显式 `DEFAULT` 互斥。
+- 表约束允许 `PRIMARY KEY`、`UNIQUE [KEY|INDEX] [name]`、普通 `KEY|INDEX`，并允许
+  `USING BTREE` 位于索引列列表之前或之后。当前只接受 `BTREE`，其它算法必须在 parse/bind 阶段显式拒绝。
+- `CREATE TABLE (...) COMMENT='<text>'` 写入表选项。列注释按 UTF-8 字节最多 1024，表注释最多 2048；
+  长度校验由领域对象再次执行，不能只信任 Parser。
+- 暂不支持 `ZEROFILL`、表达式默认值、生成列、外键、分区、FULLTEXT/SPATIAL 和表级字符集覆盖。
+
+AST 必须分别保存列注释、生成方式、表注释和索引算法，不能把这些信息拼回 SQL 文本。Binder 负责验证：
+整张表至多一个自增列；其类型必须是有符号或无符号整数、`NOT NULL`，并且是聚簇主键第一列。
+
+### 18.2 默认值规范化
+
+Parser 保留字面量种类，Binder 使用列类型执行严格强制转换并生成唯一 canonical literal。为兼容常见
+MySQL 导出语句，数值列的引号数值（例如 `DEFAULT '1'`、`DEFAULT '-1'`）允许转换为数值 canonical literal；
+不能完整消费、越界或精度不符时拒绝。字符串 canonical literal 使用单引号且通过双写单引号转义；
+`DECIMAL` 使用非科学计数法，时间与时间戳使用稳定格式。Catalog 解码后通过同一 literal parser 重新物化，
+保证重启前后默认值语义一致。
+
+### 18.3 多行 INSERT
+
+支持：
+
+```sql
+INSERT INTO t (c1, c2) VALUES (v11, v12), (v21, v22);
+INSERT INTO t VALUES (v11, v12), (v21, v22);
+```
+
+AST 使用“可选列名列表 + 非空行列表”，每行保留独立字面量列表。Binder 先解析目标列映射，再对每一行补齐
+未提供列：自增列绑定为 `AutoIncrement`，常量默认值绑定为 canonical 常量，隐式可空列绑定为 `NULL`，
+无默认的必填列报错。显式 `NULL` 或数值 `0` 在自增列上同样绑定为 `AutoIncrement`；正整数保留并推进
+high-water，负数拒绝。本阶段不支持单元格 `DEFAULT`、`INSERT ... SELECT` 与 `ON DUPLICATE KEY UPDATE`。
+
+### 18.4 ORDER BY / LIMIT
+
+`SELECT` 尾部支持多个源表列的 `ORDER BY column [ASC|DESC]`，以及 `LIMIT count`、
+`LIMIT count OFFSET offset`、`LIMIT offset,count`。所有数值必须是可装入非负 `long` 的整数字面量。
+AST 保留排序项顺序和方向；Binder 将每项绑定为稳定列标识，不接受表达式、输出别名、序号和
+`NULLS FIRST/LAST`。空值语义固定为 ASC 时在前、DESC 时在后。
+
+### 18.5 基础 DDL v2
+
+Parser/Binder 还支持 `CREATE SCHEMA|DATABASE [IF NOT EXISTS]`、`CREATE TABLE [IF NOT EXISTS]`、
+`DROP TABLE [IF EXISTS] t1[,t2...]` 与 `DROP SCHEMA|DATABASE [IF EXISTS] name`。名称在 Binder 中按
+当前 identifier 规范归一化；同一 `DROP TABLE` 列表中的重复目标必须拒绝。`IF` 只改变“对象已存在/
+不存在”的结果为 warning，不吞掉权限、恢复隔离、元数据损坏或锁超时错误。
+
+## 19. 参考链接
 
 - MySQL 8.0 Reference Manual - Prepared Statements: https://dev.mysql.com/doc/refman/8.0/en/sql-prepared-statements.html
 - MySQL 8.0 Reference Manual - Character Sets and Collations: https://dev.mysql.com/doc/refman/8.0/en/charset.html

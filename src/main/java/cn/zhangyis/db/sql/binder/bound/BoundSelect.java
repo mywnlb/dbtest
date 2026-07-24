@@ -7,6 +7,7 @@ import cn.zhangyis.db.sql.expression.BoundExpressionValidation;
 
 import java.util.HashSet;
 import java.util.List;
+import java.util.Optional;
 
 /**
  * 单表 SELECT 的纯语义绑定结果，不包含 access index、range 或 point/range 分类。
@@ -14,10 +15,13 @@ import java.util.List;
  * @param table statement metadata lease 固定的 exact table version
  * @param projectionOrdinals 用户投影的 table column ordinal，顺序即公开结果顺序
  * @param condition 完成列解析和类型转换的 boolean condition；Optimizer 不得删除最终 residual
+ * @param orderBy 完成名称解析的稳定排序键；允许引用未投影列
+ * @param limit 规范化后的 offset/count；空表示不限制
  * @param lockMode 一致性读或当前版本锁定读语义；规则改写不得改变该属性
  */
 public record BoundSelect(TableDefinition table, List<Integer> projectionOrdinals,
-                          BoundExpression condition, SelectLockMode lockMode)
+                          BoundExpression condition, List<BoundSortKey> orderBy,
+                          Optional<BoundLimit> limit, SelectLockMode lockMode)
         implements BoundRelationalStatement {
 
     /**
@@ -35,7 +39,7 @@ public record BoundSelect(TableDefinition table, List<Integer> projectionOrdinal
     public BoundSelect {
         // 1、任何不完整 semantic IR 都必须早于 logical plan 构造失败。
         if (table == null || projectionOrdinals == null || projectionOrdinals.isEmpty()
-                || condition == null || lockMode == null) {
+                || condition == null || orderBy == null || limit == null || lockMode == null) {
             throw new DatabaseValidationException("invalid semantic bound SELECT fields");
         }
         // 2、projection 顺序进入公开结果，但重复/越界位置没有合法 SQL 含义。
@@ -49,7 +53,25 @@ public record BoundSelect(TableDefinition table, List<Integer> projectionOrdinal
         }
         // 3、stable column identity 与 exact table version 必须在 Binder 边界闭合。
         BoundExpressionValidation.validateCondition(condition, table);
-        // 4、调用方不能在规则或 Executor 运行期间修改 projection。
+        for (BoundSortKey key : orderBy) {
+            if (key == null || key.columnOrdinal() >= table.columns().size()
+                    || table.columns().get(key.columnOrdinal()).columnId() != key.columnId()) {
+                throw new DatabaseValidationException(
+                        "bound ORDER BY key does not belong to exact table version");
+            }
+        }
+        // 4、调用方不能在规则或 Executor 运行期间修改 projection/order。
         projectionOrdinals = List.copyOf(projectionOrdinals);
+        orderBy = List.copyOf(orderBy);
+    }
+
+    /**
+     * 保留排序能力引入前的构造形状。
+     */
+    public BoundSelect(
+            TableDefinition table, List<Integer> projectionOrdinals,
+            BoundExpression condition, SelectLockMode lockMode) {
+        this(table, projectionOrdinals, condition,
+                List.of(), Optional.empty(), lockMode);
     }
 }

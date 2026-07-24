@@ -174,7 +174,7 @@
 - outer join reorder。
 - window/aggregate rewrite。
 
-当前 M3 已生产接线的规则子集为：统一 bottom-up sealed expression 遍历、保持顺序的
+当前 M4 继续生产使用的规则子集为：统一 bottom-up sealed expression 遍历、保持顺序的
 AND/OR 展平、literal-column comparison 规范化，以及 AND/OR/NOT/null-test 的安全
 SQL 三值折叠。`RuleProgram` 按稳定规则名和声明顺序运行，以 16 个完整 pass 为上限，
 伪变化、结构循环或不收敛均在物理计划发布前失败；不做 De Morgan、CNF、排序或去重。
@@ -183,6 +183,19 @@ SQL 三值折叠。`RuleProgram` 按稳定规则名和声明顺序运行，以 1
 column-literal comparison 派生 equality/range/empty 证明，OR、NOT 和 null-test 作为
 完整 residual barrier 而不是 optimization error。`HeuristicAccessPathSelector` 独占
 访问路径选择；统计、memo、cost、trait、EXPLAIN 仍是目标能力。
+
+M4 的 SELECT 物理结果不再是携带 projection/residual 的扁平 variant，而固定为
+`PhysicalQuery -> PhysicalProject -> PhysicalFilter -> PhysicalAccess`。访问叶目前封闭为
+point、ordinary secondary-prefix 和 general range；它只描述候选访问，不持有 residual、
+projection、事务、ReadView 或 cursor。Executor 通过独立 `PlanNodeFactory` 映射运行期树，
+因此 Optimizer 仍保持纯函数式、可复用和无执行状态。
+
+2026-07-24 二表 INNER JOIN v1 在此基础上新增 `LogicalJoin` 与 `PhysicalJoinQuery`：
+SQL 左表固定为 outer 聚簇全扫，右侧 ON 列存在单列完整 clustered/unique/ordinary
+secondary 时分别选择 point/prefix Index Nested Loop probe，否则选择每个 outer row
+重开的聚簇全扫 Nested Loop probe。ON 与 WHERE 保持两个独立 `PredicateSet`，排序和投影
+使用左表列后拼接右表列的 statement schema。该切片不声称实现下文的统计 join reorder、
+dynamic programming、Hash Join、outer join 或 locking join。
 
 ### 7.2 Range Optimizer
 
@@ -239,6 +252,10 @@ Join algorithm：
 | Index Nested Loop Join | 内表有 ref/eq_ref/range 路径 | 支持 |
 | Hash Join | 等值 join 且 build side 可内存容纳 | Optimizer 输出算法选择，由 [mysql-advanced-executor-operators-design.md](mysql-advanced-executor-operators-design.md) 执行 |
 | Batched Key Access | 内表索引 lookup 可批量 | 扩展点 |
+
+当前生产子集只实现恰好二表、列列 exact-type 等值 INNER JOIN，固定 SQL 左驱动；
+“默认支持/支持”在当前代码中分别对应 `PhysicalJoinProbeKind.FULL_SCAN` 与
+`POINT/SECONDARY_PREFIX`。下文 join order 搜索和 Hash Join 仍是目标设计。
 
 ### 7.5 ORDER BY、LIMIT 与 filesort
 
@@ -582,7 +599,46 @@ Trace 是 session scoped，不持久化到 DD；`INFORMATION_SCHEMA.OPTIMIZER_TR
 | 14 | 异常与恢复 | 已给出统计缺失、优化超时、unsupported、cost overflow 的处理策略 |
 | 15 | 测试与顺序 | 已给出测试设计、后续实现顺序，并确认没有未完成标记或空白项 |
 
-## 20. 参考链接
+## 20. ORDER BY / LIMIT 物理属性设计（2026-07-24）
+
+### 20.1 排序属性
+
+排序属性在概念上区分 required ordering 与 provided ordering，每个元素由绑定列标识和方向组成。
+当前 Java 切片没有额外引入 `RequiredOrdering` / `ProvidedOrdering` 类型：required 直接保存为不可变
+`List<PhysicalSortKey>`，provided 由 `PhysicalSortStrategy.INDEX` 这一已证明结论表达。访问路径枚举器不能
+仅用“选择了索引”推断有序，而必须证明索引 key part 与要求的连续前缀一致：
+
+- 被等值谓词固定的前导 key part 可以跳过；
+- 从第一个未固定 key part 开始，列和方向必须逐项完全一致；
+- range 所在 key part 之后的列不再提供全局有序性；
+- 本阶段 B+Tree cursor 只支持正向扫描，因此不通过整体反向扫描满足相反方向；
+- secondary access 只有在回表不会重排候选时保留其 provided ordering。
+
+### 20.2 候选计划
+
+有序访问满足要求时删除显式 Sort，并把 Limit 放在 Project 之上，使 Filter 之后的合格行数控制提前停止。
+无排序要求时，Limit 同样直接包装既有 pull tree。不能由索引满足时：
+
+- 有限 limit 且 `offset+count` 不溢出、估算的 retained rows/key bytes 不超过 statement memory quota，
+  选择 Top-N 最大堆；
+- 其它情况选择 external filesort；
+- cost 必须同时计算扫描、比较、序列化、run 写读和多轮 fan-in，不得把 spill 当作零成本后备路径。
+
+Top-N 与完整 filesort 在语义上产生同一 provided ordering，因此上层 Limit/Project 不区分实现。
+`LIMIT 0` 由 `LimitNode.openNode` 在不打开既有 child tree 的情况下直接进入空窗口，避免打开访问路径。
+
+当前成本模型仍是教学型确定性 heuristic：索引顺序证明成功即选择 `INDEX`，可表示且不超过
+`TOP_N_MAX_RETAINED_ROWS` 的 `offset+count` 选择 `TOP_N_HEAP`，其余选择
+`PARTITIONED_HEAP_MERGE`。扫描、序列化、临时 IO 和多轮归并的数值 cost 尚未接入，因此不能把该
+策略选择表述为完整 cost-based filesort。
+
+### 20.3 正确性与回退
+
+统计缺失时采用保守行数/键宽估算，宁可选择 external sort，不能因低估而突破配额。运行期实际键宽超过
+Top-N 预算时，算子必须在尚未输出任何行前安全降级为 spill；一旦向上游输出则禁止改变顺序策略。
+所有大小和 `offset+count` 计算使用溢出检测并转换为项目领域异常。
+
+## 21. 参考链接
 
 - MySQL 8.0 Reference Manual - Optimization: https://dev.mysql.com/doc/refman/8.0/en/optimization.html
 - MySQL 8.0 Reference Manual - EXPLAIN Statement: https://dev.mysql.com/doc/refman/8.0/en/explain.html

@@ -9,20 +9,11 @@ import cn.zhangyis.db.dd.domain.DictionaryTypeId;
 import cn.zhangyis.db.dd.domain.IndexDefinition;
 import cn.zhangyis.db.dd.domain.TableDefinition;
 import cn.zhangyis.db.sql.binder.bound.SelectLockMode;
-import cn.zhangyis.db.sql.expression.BoundColumnReference;
-import cn.zhangyis.db.sql.expression.BoundComparison;
-import cn.zhangyis.db.sql.expression.BoundConjunction;
-import cn.zhangyis.db.sql.expression.BoundDisjunction;
-import cn.zhangyis.db.sql.expression.BoundExpression;
-import cn.zhangyis.db.sql.expression.BoundLiteral;
-import cn.zhangyis.db.sql.expression.BoundNegation;
-import cn.zhangyis.db.sql.expression.BoundNullTest;
-import cn.zhangyis.db.sql.expression.BoundNullTestOperator;
-import cn.zhangyis.db.sql.expression.BoundTruthLiteral;
-import cn.zhangyis.db.sql.executor.SqlRow;
+import cn.zhangyis.db.sql.executor.expression.ExpressionEvaluator;
+import cn.zhangyis.db.sql.executor.row.SqlRowView;
 import cn.zhangyis.db.sql.optimizer.logical.PredicateSet;
-import cn.zhangyis.db.sql.type.SqlBoolean;
 import cn.zhangyis.db.sql.type.SqlValue;
+import cn.zhangyis.db.sql.type.InsertValueSource;
 import cn.zhangyis.db.sql.executor.storage.*;
 import cn.zhangyis.db.sql.executor.storage.exception.*;
 import cn.zhangyis.db.sql.optimizer.physical.*;
@@ -48,6 +39,9 @@ import cn.zhangyis.db.storage.record.schema.IndexKeyDef;
 import cn.zhangyis.db.storage.record.schema.KeyOrder;
 import cn.zhangyis.db.storage.record.schema.KeyPartDef;
 import cn.zhangyis.db.storage.record.type.ColumnValue;
+import cn.zhangyis.db.storage.record.type.BinaryCollation;
+import cn.zhangyis.db.storage.record.type.CollationStrategy;
+import cn.zhangyis.db.storage.record.type.LobCodec;
 import cn.zhangyis.db.storage.record.type.TypeCodecRegistry;
 import cn.zhangyis.db.storage.recovery.RecoveryState;
 import cn.zhangyis.db.storage.redo.DurabilityPolicy;
@@ -90,9 +84,15 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
     private final Duration operationTimeout;
     /** FORCE 导出模式的 gateway 级二次防线；即使绕过 Session AST 也不能写 storage。 */
     private final boolean recoveryExportReadOnly;
-    /** residual comparison 复用 Record 的 NULL/type/collation 排序，不在 SQL adapter 复制比较规则。 */
+    /** residual comparison 共享的 Record type/collation registry。 */
+    private final TypeCodecRegistry predicateTypeCodecs =
+            new TypeCodecRegistry();
+    /** 普通 inline 类型复用 Record 的 NULL/type/collation 排序，不在 SQL adapter 复制比较规则。 */
     private final SearchKeyComparator predicateComparator =
-            new SearchKeyComparator(new TypeCodecRegistry());
+            new SearchKeyComparator(predicateTypeCodecs);
+    /** SELECT Filter 与 range DML 共用的 canonical 三值解释实现；本对象无共享可变状态。 */
+    private final ExpressionEvaluator expressionEvaluator =
+            new ExpressionEvaluator();
 
     /**
      * 创建 {@code DefaultSqlStorageGateway}；先校验并保存构造参数，成功后对象处于可用初始状态，失败时不发布半初始化实例。
@@ -394,9 +394,10 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
      * partial rollback，若 rollback 本身失败则保留原始异常并显式报告 rollback-only。
      * <ol>
      *     <li>以 statement deadline 限制 opaque handle 准入，并从 exact-version DD definition 映射物理 index/LOB binding。</li>
-     *     <li>把 SQL 值转换成 record 值并派生聚簇 key；转换失败早于 undo、LOB、row 或锁副作用。</li>
-     *     <li>创建 statement guard 后调用 DML facade，row-lock timeout 取配置与 deadline 剩余值的较小者。</li>
-     *     <li>成功关闭 guard 并发布 handle wrote；失败由 guard 做 partial rollback，异常保留 rollback-only/fatal 语义。</li>
+     *     <li>先用自增占位值验证全部行的 record shape，常量错误发生在 high-water 消耗之前。</li>
+     *     <li>按输入顺序持久分配自增值并物化全部 record；页 0 durable 等待不持 statement guard。</li>
+     *     <li>创建一个 statement guard 后顺序调用 DML facade；任一行失败由同一 guard 回滚全部已写行。</li>
+     *     <li>成功关闭 guard并发布总 affected rows/第一生成键；失败保留 rollback-only/fatal 语义。</li>
      * </ol>
      *
      * @param transaction 调用方持有的 {@code SqlTransactionHandle} 资源句柄；不得为 {@code null} 且必须处于有效期，方法返回前所有权仍归调用方
@@ -416,20 +417,40 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
             // 1. mapper 只消费 binder 固定的 DD version，不重新按表名读取可能已变化的 metadata。
             MappedTableStorage mapped = mapper.map(statement.table());
             BTreeIndex index = mapped.clusteredIndex();
-            // 2. record/schema 校验仍在实际业务 MTR 前完成，key 顺序由 index definition 权威决定。
-            List<ColumnValue> values = toColumnValues(statement.values(), index);
-            LogicalRecord record = new LogicalRecord(index.schema().schemaVersion(), values, false,
-                    RecordType.CONVENTIONAL);
-            // 3. guard 快照双 undo head；DML 成功前不发布 statement terminal。
+            // 2. 所有常量/行宽先转换；自增占位值只用于无副作用 record codec 校验。
+            validateInsertBatch(statement, index);
+            // 3. 页0 high-water 在普通 DML guard 前持久化；rollback 有意不回收已发值。
+            ResolvedInsertBatch resolved = resolveInsertBatch(
+                    statement, mapped, deadline);
+            List<LogicalRecord> records = resolved.rows().stream().map(row ->
+                    new LogicalRecord(
+                            index.schema().schemaVersion(),
+                            toColumnValues(row, index), false,
+                            RecordType.CONVENTIONAL)).toList();
+            // 4. 一个 guard 覆盖整批物理写入；中途失败由 partial rollback 恢复 statement 起点。
             DmlStatementGuard guard = engine.dmlService().beginStatement(handle.transaction, index);
             try {
-                DmlWriteResult result = engine.tableDmlService().insert(new TableInsertCommand(handle.transaction,
-                        mapped.tableIndexes(), record, mapped.lobSegment(),
-                        deadline.cap(operationTimeout, "clustered INSERT row-lock wait")));
-                // 4. guard.close 成功才允许 handle 记为已写；失败路径由 catch 汇总 partial rollback 结果。
+                long affectedRows = 0;
+                boolean changed = false;
+                for (LogicalRecord record : records) {
+                    DmlWriteResult result = engine.tableDmlService().insert(
+                            new TableInsertCommand(
+                                    handle.transaction,
+                                    mapped.tableIndexes(), record,
+                                    mapped.lobSegment(),
+                                    deadline.cap(
+                                            operationTimeout,
+                                            "clustered INSERT row-lock wait")));
+                    affectedRows = Math.addExact(
+                            affectedRows, result.affectedRows());
+                    changed |= result.changed();
+                }
+                // 5. guard.close 成功才允许 handle 记为已写；失败路径由 catch 汇总 partial rollback 结果。
                 guard.close();
-                handle.wrote |= result.changed();
-                return new SqlWriteOutcome(result.affectedRows(), handle.transaction.rollbackOnly());
+                handle.wrote |= changed;
+                return new SqlWriteOutcome(
+                        affectedRows, handle.transaction.rollbackOnly(),
+                        resolved.firstGeneratedKey());
             } catch (RuntimeException writeFailure) {
                 try {
                     guard.rollback();
@@ -441,6 +462,148 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
                 throw adapt("clustered INSERT failed after confirmed statement rollback", writeFailure);
             }
         });
+    }
+
+    /**
+     * 在自增分配前验证整批行可映射到 Record schema。生成单元格使用合法正占位值，验证结果不发布。
+     */
+    private void validateInsertBatch(
+            PhysicalInsert statement, BTreeIndex index) {
+        for (List<InsertValueSource> sources : statement.batch().rows()) {
+            List<SqlValue> values = sources.stream().map(source ->
+                    source instanceof InsertValueSource.Constant constant
+                            ? constant.value()
+                            : new SqlValue.IntegerValue(BigInteger.ONE))
+                    .toList();
+            toColumnValues(values, index);
+        }
+    }
+
+    /**
+     * 把 value sources 解析为普通 typed rows。显式自增正值与生成请求在一次 storage 调用中按行顺序推进
+     * high-water；无自增表禁止出现生成来源。
+     */
+    private ResolvedInsertBatch resolveInsertBatch(
+            PhysicalInsert statement, MappedTableStorage mapped,
+            SqlStatementDeadline deadline) {
+        int autoOrdinal = -1;
+        for (var column : statement.table().columns()) {
+            if (column.generation()
+                    == cn.zhangyis.db.dd.domain.ColumnGeneration.AUTO_INCREMENT) {
+                autoOrdinal = column.ordinal();
+                break;
+            }
+        }
+        boolean containsGenerated = statement.batch().rows().stream()
+                .flatMap(List::stream)
+                .anyMatch(InsertValueSource.AutoIncrement.class::isInstance);
+        if (autoOrdinal < 0) {
+            if (containsGenerated) {
+                throw new DatabaseValidationException(
+                        "INSERT generation source requires AUTO_INCREMENT metadata");
+            }
+            return new ResolvedInsertBatch(
+                    statement.batch().rows().stream()
+                            .map(DefaultSqlStorageGateway::constantRow)
+                            .toList(),
+                    Optional.empty());
+        }
+
+        List<Optional<BigInteger>> requests = new ArrayList<>(
+                statement.batch().rows().size());
+        for (List<InsertValueSource> row : statement.batch().rows()) {
+            InsertValueSource source = row.get(autoOrdinal);
+            if (source instanceof InsertValueSource.AutoIncrement) {
+                requests.add(Optional.empty());
+            } else {
+                SqlValue value =
+                        ((InsertValueSource.Constant) source).value();
+                if (!(value instanceof SqlValue.IntegerValue integer)) {
+                    throw new DatabaseValidationException(
+                            "AUTO_INCREMENT source must be an integer");
+                }
+                requests.add(Optional.of(integer.value()));
+            }
+        }
+        ColumnTypeDefinition autoType =
+                statement.table().columns().get(autoOrdinal).type();
+        var allocation = engine.autoIncrementService().allocate(
+                 mapped.binding().spaceId(), requests,
+                 autoIncrementMaximum(autoType),
+                 deadline.remaining("AUTO_INCREMENT durable allocation"));
+        List<List<SqlValue>> rows = new ArrayList<>(
+                statement.batch().rows().size());
+        for (int rowIndex = 0;
+             rowIndex < statement.batch().rows().size(); rowIndex++) {
+            List<SqlValue> values =
+                    new ArrayList<>(constantRowWithGeneratedPlaceholder(
+                            statement.batch().rows().get(rowIndex)));
+            values.set(autoOrdinal, new SqlValue.IntegerValue(
+                    allocation.values().get(rowIndex)));
+            rows.add(List.copyOf(values));
+        }
+        return new ResolvedInsertBatch(
+                 rows, allocation.firstGeneratedKey());
+    }
+
+    /**
+     * 将 DD 整数类型转换为当前 AUTO_INCREMENT 列可生成的最大正值。
+     *
+     * <p>该边界必须在页 0 high-water 更新前参与分配，不能等到 Record 编码时再拒绝，否则一次失败
+     * INSERT 会永久把发号器推进到列域之外。列类型已由 CREATE/binder 保证为整数，本方法仍 fail-closed
+     * 拒绝非整数元数据，防止损坏 DD 绕过该不变量。</p>
+     *
+     * @param type AUTO_INCREMENT 列的 exact DD 类型；必须是 TINYINT、SMALLINT、INT 或 BIGINT
+     * @return 按整数位宽和 signed/unsigned 属性计算的最大正值；结果可由页 0 无符号 64 位字段表达
+     * @throws DatabaseValidationException 元数据不是 AUTO_INCREMENT 可用的整数类型时抛出；调用方不得发号
+     */
+    private static BigInteger autoIncrementMaximum(
+            ColumnTypeDefinition type) {
+        int bits = switch (type.typeId()) {
+            case TINYINT -> Byte.SIZE;
+            case SMALLINT -> Short.SIZE;
+            case INT -> Integer.SIZE;
+            case BIGINT -> Long.SIZE;
+            default -> throw new DatabaseValidationException(
+                    "AUTO_INCREMENT metadata requires an integer column");
+        };
+        int exponent = type.unsigned() ? bits : bits - 1;
+        return TWO.pow(exponent).subtract(BigInteger.ONE);
+    }
+
+    private static List<SqlValue> constantRow(
+            List<InsertValueSource> sources) {
+        if (sources.stream().anyMatch(
+                InsertValueSource.AutoIncrement.class::isInstance)) {
+            throw new DatabaseValidationException(
+                    "unresolved AUTO_INCREMENT source in constant row");
+        }
+        return sources.stream()
+                .map(source -> ((InsertValueSource.Constant) source).value())
+                .toList();
+    }
+
+    private static List<SqlValue> constantRowWithGeneratedPlaceholder(
+            List<InsertValueSource> sources) {
+        return sources.stream().map(source ->
+                source instanceof InsertValueSource.Constant constant
+                        ? constant.value()
+                        : new SqlValue.IntegerValue(BigInteger.ONE))
+                .toList();
+    }
+
+    /** 已解析批次只属于当前 statement，不跨线程或缓存发布。 */
+    private record ResolvedInsertBatch(
+            List<List<SqlValue>> rows,
+            Optional<BigInteger> firstGeneratedKey) {
+        private ResolvedInsertBatch {
+            if (rows == null || rows.isEmpty()
+                    || firstGeneratedKey == null) {
+                throw new DatabaseValidationException(
+                        "resolved INSERT batch is invalid");
+            }
+            rows = rows.stream().map(List::copyOf).toList();
+        }
     }
 
     /** 主键点 UPDATE：在 storage 的 FOR_UPDATE 锁定版本上应用 typed patch，避免 gateway 先读后写竞态。
@@ -532,254 +695,1078 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
     }
 
     /**
-     * 聚簇/唯一二级点查：access key 只缩小候选，完整 residual 决定 SQL WHERE 真值；
-     * RR 复用事务 ReadView，RC 每语句 finally 注销，整行 LOB hydrate 完成后才投影。
-     * <ol>
-     *     <li>在 deadline 内进入 handle，并把 exact DD binding 映射为 index/key。</li>
-     *     <li>按隔离级别选择读取语义：RU current read 不创建 view，RR/RC 创建或复用 ReadView。</li>
-     *     <li>执行 MVCC/current-read 点查，并用完整聚簇行求值 residual；只有 TRUE 可以进入结果。</li>
-     *     <li>在同一个 view 存活期间用短 MTR hydrate external LOB，完成后才按 projection ordinal 转换公开 SqlValue。</li>
-     *     <li>finally 注销 RC view；读取失败为主异常，close 失败作为 suppressed，fatal 严重度不得降级。</li>
-     * </ol>
-     *
-     * @param transaction 调用方持有的 {@code SqlTransactionHandle} 资源句柄；不得为 {@code null} 且必须处于有效期，方法返回前所有权仍归调用方
-     * @param statement 调用方请求的目标状态、阶段或模式；不得为 {@code null}，且必须是当前状态机允许的后继值
-     * @param deadline SQL 解析、绑定或执行链路提供的语句、值或会话上下文；不得为 {@code null}，必须属于当前语句及会话的同一次执行
-     * @return {@code selectPoint} 按身份或键定位到的对象；未找到、不可见或尚未持久化时为空 {@code Optional}，从不返回 Java {@code null}
-     * @throws DatabaseValidationException 输入、配置或持久格式不满足本方法约束时抛出；调用方应修正输入，恢复流程中则应停止消费该证据
-     */
-    @Override
-    public Optional<SqlRow> selectPoint(SqlTransactionHandle transaction, PhysicalPointSelect statement,
-                                        SqlStatementDeadline deadline) {
-        if (statement == null || deadline == null) {
-            throw new DatabaseValidationException("physical point SELECT/deadline must not be null");
-        }
-        return withActive(transaction, deadline, handle -> {
-            // 1. handle wait 已由 withActive 截断，下面所有 LOB 阶段继续消费同一绝对 deadline。
-            MappedTableStorage mapped = mapper.map(statement.table());
-            BTreeIndex clusteredIndex = mapped.clusteredIndex();
-            BTreeIndex accessIndex = mapped.index(statement.accessIndexId());
-            SearchKey key = new SearchKey(toKeyValues(statement.keyValues(), accessIndex));
-            if (statement.keyValues().stream().anyMatch(SqlValue.NullValue.class::isInstance)) {
-                return Optional.empty();
-            }
-            // 2. RU 读取瞬间的当前未标删版本，不登记 ReadView；后续阶段继续使用同一 deadline。
-            if (handle.transaction.isolationLevel() == IsolationLevel.READ_UNCOMMITTED) {
-                List<LogicalRecord> records;
-                if (statement.accessKind() == PointAccessKind.CLUSTERED_PRIMARY) {
-                    records = engine.mvccReader().readUncommitted(clusteredIndex, key)
-                            .map(List::of).orElseGet(List::of);
-                } else {
-                    records = scanReadUncommittedBatches(mapped, statement.accessIndexId(),
-                            equalityRange(statement.keyValues()),
-                            statement.predicates(),
-                            deadline);
-                    if (records.size() > 1) {
-                        throw new SqlStorageException(
-                                "multiple current rows for logical unique secondary key");
-                    }
-                }
-                // 3. RU 聚簇点查也必须执行完整 residual；access key 不能替代 SQL WHERE 真值。
-                records = records.stream()
-                        .filter(record -> matchesPredicates(
-                                record, statement.predicates(),
-                                clusteredIndex))
-                        .toList();
-                // 4. 所有候选通过 residual 后才 hydrate/project，失败不会泄漏 partial row。
-                List<SqlRow> projected = projectRows(records, statement.projectionOrdinals(),
-                        statement.table(), clusteredIndex, deadline);
-                return projected.stream().findFirst();
-            }
-            ReadViewManager views = engine.transactionManager().readViewManager();
-            deadline.remaining("point-select ReadView creation");
-            // 2. TransactionSystem 在此登记 live view，purge 在 closeReadView 前不能越过它。
-            ReadView view = views.openReadView(handle.transaction);
-            RuntimeException failure = null;
-            try {
-                // 3. view 覆盖版本选择与 residual 求值，避免 access key 被误当成最终 SQL truth。
-                Optional<LogicalRecord> record = statement.accessKind() == PointAccessKind.CLUSTERED_PRIMARY
-                        ? engine.mvccReader().read(view, clusteredIndex, key)
-                        : engine.secondaryMvccReader().readUnique(view, mapped.tableIndexes(),
-                                mapped.tableIndexes().requireSecondary(statement.accessIndexId()), key);
-                if (record.isEmpty()) return Optional.empty();
-                if (!matchesPredicates(
-                        record.orElseThrow(), statement.predicates(),
-                        clusteredIndex)) {
-                    return Optional.empty();
-                }
-
-                // 4. RC view 必须覆盖 external chain hydration；否则 purge low water 可能在引用解引用前越过该版本。
-                List<ColumnValue> hydrated = hydrateExternalValues(
-                        record.orElseThrow().columnValues(), clusteredIndex, deadline);
-                // 4. hydration 全部成功后才构造公开结果，storage LobReference 永不越过 gateway。
-                List<SqlValue> projected = new ArrayList<>(statement.projectionOrdinals().size());
-                for (int ordinal : statement.projectionOrdinals()) {
-                    projected.add(toSqlValue(hydrated.get(ordinal), statement.table().columns().get(ordinal).type()));
-                }
-                return Optional.of(new SqlRow(projected));
-            } catch (RuntimeException readFailure) {
-                failure = adapt("point-select MVCC/LOB read failed", readFailure);
-                throw failure;
-            } finally {
-                // 5. RR 由事务终态 release；RC 必须在全部读取工作结束后恰好注销，且不能覆盖主失败。
-                if (handle.transaction.isolationLevel() == IsolationLevel.READ_COMMITTED) {
-                    try {
-                        views.closeReadView(view);
-                    } catch (RuntimeException closeFailure) {
-                        RuntimeException adapted = adapt("close READ COMMITTED ReadView failed", closeFailure);
-                        if (failure == null) throw adapted;
-                        failure.addSuppressed(adapted);
-                    }
-                }
-            }
-        });
-    }
-
-    /**
-     * 执行 non-unique secondary logical-prefix range read。
+     * 打开兼容单 cursor，并通过内部 statement scope 持有 transaction operation lease。
      *
      * <p>数据流：</p>
      * <ol>
-     *     <li>在 statement deadline 内进入 opaque handle，并从 exact DD version 映射 secondary layout/key。</li>
-     *     <li>consistent 模式创建 RC/RR ReadView，扫描 marked candidates 后回聚簇 MVCC；locking 模式改走
-     *         logical-prefix S/X 与聚簇 current-read，不创建历史快照。</li>
-     *     <li>对每条完整聚簇结果 hydrate external LOB，再按 Binder ordinal 构造公开 SqlRow。</li>
-     *     <li>任何 candidate/LOB 失败都不发布 partial list；locking locks 保持到事务终态。</li>
-     *     <li>RC 在全部行 hydration/投影后 finally 注销 ReadView；关闭失败保留主异常与 fatal 严重度。</li>
+     *     <li>校验 access/deadline，并创建一个正式 statement cursor scope。</li>
+     *     <li>在 scope 内按 exact DD version 映射并打开唯一 child cursor。</li>
+     *     <li>用包装器把旧 API 的 cursor close 转换为 child close 后 scope close。</li>
+     *     <li>任一构造失败关闭 scope，确保 RC ReadView 与 operation lease 不泄漏。</li>
      * </ol>
      *
-     * @param transaction 本 gateway 创建的 ACTIVE opaque handle。
-     * @param statement   exact-version non-unique secondary range plan。
-     * @param deadline    覆盖 handle、predicate/row lock 与 LOB hydration 的绝对语句期限。
-     * @return 完整、不可变的多行公开结果；SQL NULL equality 返回空列表。
-     * @throws DatabaseValidationException statement/deadline 缺失时抛出。
-     * @throws SqlStorageException metadata 映射、MVCC/current-read、容量或 LOB 阶段失败时抛出并保留 cause。
+     * @param transaction 本 adapter 创建且仍 ACTIVE 的不透明事务能力
+     * @param access Optimizer 产生且不包含 residual/projection 的访问叶
+     * @param deadline parse/bind/optimize/execute 共用的绝对期限
+     * @return 已打开且必须关闭的 pull cursor
+     * @throws DatabaseValidationException access/deadline 缺失时抛出
+     * @throws SqlTransactionStateException handle 忙、跨 adapter 或已终态时抛出
+     * @throws SqlStorageException metadata/ReadView/cursor 初始化失败时抛出
      */
     @Override
-    public List<SqlRow> selectRange(SqlTransactionHandle transaction, PhysicalSecondaryRangeSelect statement,
-                                    SqlStatementDeadline deadline) {
-        if (statement == null || deadline == null) {
+    public SqlStorageCursor openCursor(
+            SqlTransactionHandle transaction, PhysicalAccess access,
+            SqlStatementDeadline deadline) {
+        // 单 cursor 兼容入口也复用正式 scope；返回包装器在 cursor close 后关闭 scope。
+        if (access == null || deadline == null) {
             throw new DatabaseValidationException(
-                    "physical secondary range SELECT/deadline must not be null");
+                    "physical access/deadline must not be null");
         }
-        return withActive(transaction, deadline, handle -> {
-            // 1. mapper 只消费 Binder 固定的 exact table version；logical key 不包含 storage clustered suffix。
-            MappedTableStorage mapped = mapper.map(statement.table());
-            BTreeIndex clusteredIndex = mapped.clusteredIndex();
-            BTreeIndex accessIndex = mapped.index(statement.accessIndexId());
-            var secondary = mapped.tableIndexes().requireSecondary(statement.accessIndexId());
-            SearchKey logicalKey = new SearchKey(toKeyValues(statement.logicalKeyValues(), accessIndex));
-            if (statement.logicalKeyValues().stream().anyMatch(SqlValue.NullValue.class::isInstance)) {
-                return List.of();
+        SqlCursorScope scope =
+                openCursorScope(transaction, deadline);
+        try {
+            return new ScopedSqlStorageCursor(
+                    scope.openCursor(access), scope);
+        } catch (RuntimeException openFailure) {
+            try {
+                scope.close();
+            } catch (RuntimeException closeFailure) {
+                openFailure.addSuppressed(closeFailure);
             }
+            throw openFailure;
+        }
+    }
 
-            if (statement.lockMode() != SelectLockMode.CONSISTENT) {
+    /**
+     * 打开一个可拥有多个 child cursor 的查询语句 scope。
+     *
+     * <ol>
+     *     <li>校验 deadline 与 engine gate，并有界取得 transaction operation lock。</li>
+     *     <li>锁内确认 handle ACTIVE 且没有其它 cursor scope；成功发布 cursorActive。</li>
+     *     <li>返回单 owner scope；后续 cursor 映射、ReadView 延迟创建与关闭均不再次获取 handle lock。</li>
+     *     <li>构造失败在本栈帧释放 lock；成功后只有 scope close 释放，阻止 statement 中途 commit/rollback。</li>
+     * </ol>
+     *
+     * @param transaction 本 adapter 创建的 ACTIVE transaction handle
+     * @param deadline parse/bind/optimize/execute 共用的绝对期限
+     * @return 可同时持有 outer/inner cursor 的语句资源作用域
+     */
+    @Override
+    public SqlCursorScope openCursorScope(
+            SqlTransactionHandle transaction,
+            SqlStatementDeadline deadline) {
+        // 1、scope 是事务并发边界，输入错误必须早于 lock/read-view 副作用。
+        if (deadline == null) {
+            throw new DatabaseValidationException(
+                    "SQL cursor scope deadline must not be null");
+        }
+        requireEngineOpen();
+        EngineSqlTransactionHandle handle =
+                requireOwned(transaction);
+        acquireCursorLease(handle, deadline);
+        boolean transferred = false;
+        try {
+            // 2、ReentrantLock 同线程可重入，因此 cursorActive 是不可省略的语义防线。
+            if (handle.state
+                    != EngineSqlTransactionHandle.State.ACTIVE) {
+                throw new SqlTransactionStateException(
+                        "SQL transaction handle is terminal: "
+                                + handle.state);
+            }
+            if (handle.cursorActive) {
+                throw new SqlTransactionStateException(
+                        "SQL transaction handle already owns an active cursor scope");
+            }
+            handle.cursorActive = true;
+            // 3、ReadView 延迟到首个非 empty consistent cursor，LIMIT 0 不创建历史快照。
+            EngineSqlCursorScope scope =
+                    new EngineSqlCursorScope(
+                            handle, deadline);
+            transferred = true;
+            return scope;
+        } catch (RuntimeException openFailure) {
+            throw adapt(
+                    "open SQL cursor scope failed",
+                    openFailure);
+        } finally {
+            // 4、只有完整发布的 scope 接管 operation lease。
+            if (!transferred) {
+                handle.operationLock.unlock();
+            }
+        }
+    }
+
+    /**
+     * 使用语句剩余时间取得 cursor-scope 独占 lease；该 lease 跨全部 child advance，
+     * 只能由 scope close 释放。
+     */
+    private void acquireCursorLease(
+            EngineSqlTransactionHandle handle,
+            SqlStatementDeadline deadline) {
+        boolean acquired;
+        try {
+            Duration wait = deadline.cap(
+                    operationTimeout, "SQL cursor transaction handle wait");
+            acquired = handle.operationLock.tryLock(
+                    wait.toNanos(), TimeUnit.NANOSECONDS);
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            throw new SqlTransactionStateException(
+                    "interrupted while waiting for SQL cursor transaction handle",
+                    error);
+        }
+        if (!acquired) {
+            throw new SqlTransactionStateException(
+                    "SQL transaction handle is busy");
+        }
+    }
+
+    /**
+     * 生产 cursor scope：共享一个 operation lease、deadline 与一致性 ReadView。
+     * 该对象只由执行 statement 的线程使用，不以全局锁串行化其它事务。
+     */
+    private final class EngineSqlCursorScope
+            implements SqlCursorScope {
+        /** scope 生命周期内独占的 opaque transaction handle。 */
+        private final EngineSqlTransactionHandle handle;
+        /** 所有 child cursor 共享的绝对 statement deadline。 */
+        private final SqlStatementDeadline deadline;
+        /** 已创建 cursor 的稳定顺序；close 按反序幂等收口。 */
+        private final ArrayList<AbstractEngineSqlStorageCursor> cursors =
+                new ArrayList<>();
+        /** 首个 consistent cursor 延迟创建的 statement ReadView。 */
+        private ReadView view;
+        /** RC view 的注销 owner；RU/尚未创建时为空。 */
+        private ReadViewManager views;
+        /** close 的单 owner 权威状态。 */
+        private boolean closed;
+
+        private EngineSqlCursorScope(
+                EngineSqlTransactionHandle handle,
+                SqlStatementDeadline deadline) {
+            this.handle = handle;
+            this.deadline = deadline;
+        }
+
+        /**
+         * 创建 scope-owned cursor；多个 cursor 复用同一 ReadView，但各自保留独立扫描状态。
+         */
+        @Override
+        public SqlStorageCursor openCursor(
+                PhysicalAccess access) {
+            if (closed) {
+                throw new SqlStorageException(
+                        "SQL cursor scope is closed");
+            }
+            if (access == null) {
+                throw new DatabaseValidationException(
+                        "physical access must not be null");
+            }
+            try {
+                MappedTableStorage mapped =
+                        mapper.map(access.table());
+                AbstractEngineSqlStorageCursor cursor =
+                        switch (access) {
+                            case PhysicalPointAccess point ->
+                                    new PointSqlStorageCursor(
+                                            this, mapped, point,
+                                            deadline);
+                            case PhysicalSecondaryPrefixAccess secondary ->
+                                    new SecondaryPrefixSqlStorageCursor(
+                                            this, mapped, secondary,
+                                            deadline);
+                            case PhysicalRangeAccess range ->
+                                    new RangeSqlStorageCursor(
+                                            this, mapped, range,
+                                            deadline);
+                        };
+                cursor.initializeReadView();
+                cursors.add(cursor);
+                return cursor;
+            } catch (RuntimeException openFailure) {
+                throw adapt(
+                        "open SQL storage cursor in statement scope failed",
+                        openFailure);
+            }
+        }
+
+        /**
+         * 为 consistent cursor 返回 scope 唯一 ReadView；empty/RU/locking 返回 null。
+         */
+        private ReadView readView(
+                boolean consistent, boolean empty) {
+            if (empty || !consistent
+                    || handle.transaction.isolationLevel()
+                    == IsolationLevel.READ_UNCOMMITTED) {
+                return null;
+            }
+            if (view == null) {
+                deadline.remaining(
+                        "SQL cursor scope ReadView creation");
+                views = engine.transactionManager()
+                        .readViewManager();
+                view = views.openReadView(
+                        handle.transaction);
+            }
+            return view;
+        }
+
+        /**
+         * 反序关闭全部 cursor，再注销 RC view 并最终释放 operation lease。
+         */
+        @Override
+        public void close() {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            RuntimeException failure = null;
+            for (int index = cursors.size() - 1;
+                 index >= 0; index--) {
                 try {
-                    // 2. locking read 只读当前版本；同一 absolute deadline 的剩余量成为 storage 内部共享等待预算。
-                    List<LogicalRecord> records = engine.secondaryCurrentReadService().readRange(
-                            handle.transaction, mapped.tableIndexes(), secondary, logicalKey,
-                            statement.lockMode() == SelectLockMode.FOR_SHARE
-                                    ? BTreeCurrentReadMode.FOR_SHARE : BTreeCurrentReadMode.FOR_UPDATE,
-                            deadline.cap(operationTimeout, "secondary locking range"));
-                    // 3/4. 全部行依次 hydrate/project；异常直接抛出，不返回已构造前缀。
-                    List<LogicalRecord> matched = records.stream()
-                            .filter(row -> matchesPredicates(
-                                    row, statement.predicates(), clusteredIndex))
-                            .toList();
-                    return projectRows(matched, statement.projectionOrdinals(), statement.table(),
-                            clusteredIndex, deadline);
-                } catch (RuntimeException readFailure) {
-                    throw adapt("secondary locking range/LOB read failed", readFailure);
-                }
-            }
-
-            if (handle.transaction.isolationLevel() == IsolationLevel.READ_UNCOMMITTED) {
-                List<LogicalRecord> records = scanReadUncommittedBatches(
-                        mapped, statement.accessIndexId(),
-                        equalityRange(statement.logicalKeyValues()),
-                        statement.predicates(),
-                        deadline);
-                return projectRows(records, statement.projectionOrdinals(), statement.table(),
-                        clusteredIndex, deadline);
-            }
-
-            ReadViewManager views = engine.transactionManager().readViewManager();
-            deadline.remaining("secondary range ReadView creation");
-            // 2. consistent range 的一个 view 覆盖 secondary scan、逐候选 clustered/undo 与全部 LOB hydration。
-            ReadView view = views.openReadView(handle.transaction);
-            RuntimeException failure = null;
-            try {
-                List<LogicalRecord> records = engine.secondaryMvccReader().readRange(
-                        view, mapped.tableIndexes(), secondary, logicalKey);
-                records = records.stream().filter(row -> matchesPredicates(
-                        row, statement.predicates(), clusteredIndex)).toList();
-                // 3/4. projection 只有在每条 external value hydrate 完整后才创建，Storage reference 不越过 port。
-                return projectRows(records, statement.projectionOrdinals(), statement.table(),
-                        clusteredIndex, deadline);
-            } catch (RuntimeException readFailure) {
-                failure = adapt("secondary range MVCC/LOB read failed", readFailure);
-                throw failure;
-            } finally {
-                // 5. RR view 由事务终态释放；RC 必须在最后一行投影完成后注销，且关闭失败不能覆盖主失败。
-                if (handle.transaction.isolationLevel() == IsolationLevel.READ_COMMITTED) {
-                    try {
-                        views.closeReadView(view);
-                    } catch (RuntimeException closeFailure) {
-                        RuntimeException adapted = adapt("close READ COMMITTED range ReadView failed", closeFailure);
-                        if (failure == null) {
-                            throw adapted;
-                        }
-                        failure.addSuppressed(adapted);
+                    cursors.get(index).close();
+                } catch (RuntimeException closeFailure) {
+                    if (failure == null) {
+                        failure = closeFailure;
+                    } else {
+                        failure.addSuppressed(
+                                closeFailure);
                     }
                 }
             }
-        });
+            cursors.clear();
+            if (views != null
+                    && handle.transaction.isolationLevel()
+                    == IsolationLevel.READ_COMMITTED) {
+                try {
+                    views.closeReadView(view);
+                } catch (RuntimeException closeFailure) {
+                    RuntimeException adapted = adapt(
+                            "close SQL cursor scope READ COMMITTED ReadView failed",
+                            closeFailure);
+                    if (failure == null) {
+                        failure = adapted;
+                    } else {
+                        failure.addSuppressed(
+                                adapted);
+                    }
+                }
+            }
+            try {
+                handle.cursorActive = false;
+                handle.operationLock.unlock();
+            } catch (RuntimeException unlockFailure) {
+                RuntimeException adapted = adapt(
+                        "release SQL cursor scope transaction lease failed",
+                        unlockFailure);
+                if (failure == null) {
+                    failure = adapted;
+                } else {
+                    failure.addSuppressed(
+                            adapted);
+                }
+            }
+            if (failure != null) {
+                throw failure;
+            }
+        }
     }
 
     /**
-     * 执行 comparison/composite/full-scan SELECT，并在 adapter 内收敛分页、MVCC/current-read、
-     * residual、LOB hydration 与容量边界。
-     *
-     * <p>数据流：</p>
-     * <ol>
-     *     <li>校验计划并映射 exact DD version；empty plan 在创建 ReadView/事务锁前返回。</li>
-     *     <li>以 256 条 physical candidate 为批次扫描；consistent read 复用一个 ReadView，
-     *         locking read 每批短定位、释放页资源、等待锁并重定位。</li>
-     *     <li>二级候选回聚簇取得可见/当前完整行，按聚簇 identity 去重，再用 Record 比较规则执行全部 residual。</li>
-     *     <li>完整结果通过 4096 row 与 16384 physical candidate 双上限后，才 hydrate LOB 并发布公开行。</li>
-     * </ol>
-     *
-     * @param transaction 本 gateway 创建且仍 ACTIVE 的不透明事务句柄
-     * @param statement Optimizer 产生的 exact-version typed physical range plan
-     * @param deadline 覆盖分页、锁等待、undo 与 LOB hydration 的绝对期限
-     * @return 完整不可变结果；empty/无匹配时为空，不返回 partial prefix
-     * @throws DatabaseValidationException 参数缺失时抛出
-     * @throws SqlStorageException 扫描、回表、容量、锁或 LOB 阶段失败时抛出
+     * 旧单 cursor API 的所有权适配器；close 必须先使 row view 失效，再关闭整个 scope。
      */
-    @Override
-    public List<SqlRow> selectRange(SqlTransactionHandle transaction, PhysicalRangeSelect statement,
-                                    SqlStatementDeadline deadline) {
-        if (statement == null || deadline == null) {
-            throw new DatabaseValidationException(
-                    "physical comparison range SELECT/deadline must not be null");
+    private static final class ScopedSqlStorageCursor
+            implements SqlStorageCursor {
+        private final SqlStorageCursor cursor;
+        private final SqlCursorScope scope;
+        private boolean closed;
+
+        private ScopedSqlStorageCursor(
+                SqlStorageCursor cursor,
+                SqlCursorScope scope) {
+            this.cursor = cursor;
+            this.scope = scope;
         }
-        return withActive(transaction, deadline, handle -> {
-            // 1、empty 是 Optimizer 的纯证明，不需要创建 view、分配 transaction id 或取得行锁。
-            if (statement.empty()) {
-                return List.of();
+
+        @Override
+        public boolean advance() {
+            return cursor.advance();
+        }
+
+        @Override
+        public SqlRowView current() {
+            return cursor.current();
+        }
+
+        @Override
+        public void close() {
+            if (closed) {
+                return;
             }
-            MappedTableStorage mapped = mapper.map(statement.table());
-            if (statement.lockMode() == SelectLockMode.CONSISTENT) {
-                // 2、同一个 view 覆盖全部分页、undo 与 residual；RC 只在所有 LOB 投影完成后关闭。
-                return readConsistentRange(handle, mapped, statement, deadline);
+            closed = true;
+            RuntimeException failure = null;
+            try {
+                cursor.close();
+            } catch (RuntimeException closeFailure) {
+                failure = closeFailure;
             }
-            List<LogicalRecord> records = readLockingRange(handle, mapped, statement.accessIndexId(),
-                    statement.indexRange(), statement.predicates(),
-                    statement.lockMode(), deadline).rows();
-            // 4、scan helper 已完整通过双容量上限；投影阶段任一失败仍不会返回已构造前缀。
-            return projectRows(records, statement.projectionOrdinals(), statement.table(),
-                    mapped.clusteredIndex(), deadline);
-        });
+            try {
+                scope.close();
+            } catch (RuntimeException closeFailure) {
+                if (failure == null) {
+                    failure = closeFailure;
+                } else {
+                    failure.addSuppressed(
+                            closeFailure);
+                }
+            }
+            if (failure != null) {
+                throw failure;
+            }
+        }
+    }
+
+    /**
+     * adapter cursor 公共状态机。current row 只保存已脱离 page latch 的 LogicalRecord；
+     * generation 使旧 SqlRowView 在下一次 advance/close 后稳定失败。
+     */
+    private abstract class AbstractEngineSqlStorageCursor
+            implements SqlStorageCursor {
+        /** operation lease/ReadView 的 statement owner。 */
+        private final EngineSqlCursorScope scope;
+        /** statement scope 统一持有 operation lease，本 cursor 只借用事务身份。 */
+        private final EngineSqlTransactionHandle handle;
+        /** exact DD version 派生的全部 table/index mapping。 */
+        protected final MappedTableStorage mapped;
+        /** projection/hydration/scan 共用的绝对语句期限。 */
+        protected final SqlStatementDeadline deadline;
+        /** 完整逻辑行、LOB 与 exact comparator 共同使用的聚簇 descriptor。 */
+        protected final BTreeIndex clustered;
+        /** 是否为非 locking consistent read；决定初始化阶段是否创建 view。 */
+        private final boolean consistent;
+        /** optimizer empty 证明；该 cursor 不得创建 view 或访问存储。 */
+        private final boolean empty;
+        /** consistent read 的 view；初始化前以及 RU/locking/empty cursor 为 null。 */
+        protected ReadView view;
+        /** 当前 row-view generation；advance/close 单调增加。 */
+        private long generation;
+        /** 最近一次成功 advance 的完整逻辑行。 */
+        private LogicalRecord current;
+        /** close 的唯一权威状态；由 statement 线程单 owner 更新。 */
+        private boolean closed;
+
+        /**
+         * 创建 cursor 并按读意图决定是否打开 ReadView。
+         *
+         * @param handle 已持有 operation lock 的 ACTIVE handle
+         * @param mapped exact table mapping
+         * @param deadline statement absolute deadline
+         * @param consistent 是否为非 locking consistent read
+         * @param empty 是否为 optimizer empty 证明；empty 不创建 view
+         */
+        protected AbstractEngineSqlStorageCursor(
+                EngineSqlCursorScope scope,
+                MappedTableStorage mapped,
+                SqlStatementDeadline deadline,
+                boolean consistent,
+                boolean empty) {
+            this.scope = scope;
+            this.handle = scope.handle;
+            this.mapped = mapped;
+            this.deadline = deadline;
+            this.clustered = mapped.clusteredIndex();
+            this.consistent = consistent;
+            this.empty = empty;
+        }
+
+        /**
+         * 在子类全部字段完成校验后创建 ReadView，避免子类构造失败遗留已登记的 RC view。
+         */
+        private void initializeReadView() {
+            view = scope.readView(
+                    consistent, empty);
+        }
+
+        /**
+         * 拉取下一条完整逻辑行，并在任何扫描失败前使旧 row view 失效。
+         *
+         * <ol>
+         *     <li>校验 cursor 未关闭，推进 generation 并清除旧 current。</li>
+         *     <li>委托具体 access cursor 完成短 MTR/MVCC/current-read 定位。</li>
+         *     <li>EOF 返回 false；非空记录成为本 generation 的唯一 current。</li>
+         * </ol>
+         *
+         * @return 有新当前行时为 {@code true}，EOF 时为 {@code false}
+         * @throws SqlStorageException cursor 已关闭或底层读取失败时抛出
+         */
+        @Override
+        public final boolean advance() {
+            // 1、旧视图先失效；即使下游扫描失败也不能继续读取上一行。
+            requireOpen();
+            generation++;
+            current = null;
+            // 2、具体 cursor 返回前不得保留 page latch/fix。
+            LogicalRecord next;
+            try {
+                next = nextRecord();
+            } catch (RuntimeException readFailure) {
+                throw adapt(
+                        "advance SQL storage cursor failed",
+                        readFailure);
+            }
+            // 3、Java null 只在 adapter 内部表达 EOF，不进入 SQL NULL 值域。
+            if (next == null) {
+                return false;
+            }
+            current = next;
+            return true;
+        }
+
+        /**
+         * 返回当前 generation 的 cursor-owned 视图。
+         *
+         * @return 下一次 advance/close 前有效的完整逻辑行视图
+         * @throws SqlStorageException 尚未成功 advance 或 cursor 已关闭时抛出
+         */
+        @Override
+        public final SqlRowView current() {
+            requireOpen();
+            if (current == null) {
+                throw new SqlStorageException(
+                        "SQL cursor has no current row");
+            }
+            return new EngineSqlRowView(
+                    this, generation, current);
+        }
+
+        /**
+         * 幂等关闭 cursor 局部资源；RC view 与 operation lease 由外层 statement scope 统一释放。
+         *
+         * <ol>
+         *     <li>先发布 closed/generation，使任何旧 row view 立即失效。</li>
+         *     <li>释放本 access cursor 的批次/列表等局部资源。</li>
+         *     <li>局部失败向 scope/Executor 传播；不得自行关闭共享 ReadView 或解锁 transaction handle。</li>
+         * </ol>
+         */
+        @Override
+        public final void close() {
+            if (closed) {
+                return;
+            }
+            // 1、先发布 closed/generation，清理失败后旧 row view 也绝不能恢复可用。
+            closed = true;
+            generation++;
+            current = null;
+            RuntimeException failure = null;
+            try {
+                closeCursor();
+            } catch (RuntimeException closeFailure) {
+                failure = adapt(
+                        "close SQL storage cursor resources failed",
+                        closeFailure);
+            }
+            if (failure != null) {
+                throw failure;
+            }
+        }
+
+        /** 返回下一条完整逻辑行；EOF 用包内 Java null 表示。 */
+        protected abstract LogicalRecord nextRecord();
+
+        /** 子类可释放批次缓冲等非事务资源；默认无资源。 */
+        protected void closeCursor() {
+        }
+
+        /** 验证 cursor 仍打开。 */
+        private void requireOpen() {
+            if (closed) {
+                throw new SqlStorageException(
+                        "SQL storage cursor is closed");
+            }
+        }
+
+        /**
+         * 验证 row view 仍对应当前 generation/record。
+         */
+        private void requireCurrent(
+                long expectedGeneration,
+                LogicalRecord expectedRecord) {
+            requireOpen();
+            if (generation != expectedGeneration
+                    || current != expectedRecord) {
+                throw new SqlStorageException(
+                        "SQL row view is no longer current");
+            }
+        }
+    }
+
+    /**
+     * cursor-owned 行视图；每列 external value 仅在真正投影读取时 hydrate 一次。
+     */
+    private final class EngineSqlRowView implements SqlRowView {
+        /** 所属 cursor，用于 generation 校验和 deadline。 */
+        private final AbstractEngineSqlStorageCursor cursor;
+        /** 创建视图时的 generation。 */
+        private final long generation;
+        /** 已脱离 page latch/fix 的完整逻辑行。 */
+        private final LogicalRecord record;
+        /** 每列惰性 SQL value cache；Java null 仅表示尚未读取。 */
+        private final SqlValue[] values;
+        /** 每列已 hydrate 的 storage value；Java null 仅表示尚未解析 external 引用。 */
+        private final ColumnValue[] hydratedValues;
+
+        private EngineSqlRowView(
+                AbstractEngineSqlStorageCursor cursor,
+                long generation,
+                LogicalRecord record) {
+            this.cursor = cursor;
+            this.generation = generation;
+            this.record = record;
+            this.values = new SqlValue[
+                    record.columnValues().size()];
+            this.hydratedValues = new ColumnValue[
+                    record.columnValues().size()];
+        }
+
+        @Override
+        public int width() {
+            requireCurrent();
+            return record.columnValues().size();
+        }
+
+        @Override
+        public SqlValue valueAt(int ordinal) {
+            requireOrdinal(ordinal);
+            try {
+                SqlValue cached = values[ordinal];
+                if (cached != null) {
+                    return cached;
+                }
+                ColumnValue value = storageValueAt(ordinal);
+                SqlValue converted = toSqlValue(
+                        value, cursor.mapped.table()
+                                .columns().get(ordinal).type());
+                values[ordinal] = converted;
+                return converted;
+            } catch (RuntimeException valueFailure) {
+                throw adapt(
+                        "read SQL cursor row value failed for column "
+                                + ordinal,
+                        valueFailure);
+            }
+        }
+
+        @Override
+        public boolean isNullAt(int ordinal) {
+            requireOrdinal(ordinal);
+            return record.columnValues().get(ordinal)
+                    instanceof ColumnValue.NullValue;
+        }
+
+        @Override
+        public int compareLiteral(
+                int ordinal, SqlValue literal) {
+            requireOrdinal(ordinal);
+            try {
+                if (literal == null
+                        || literal instanceof SqlValue.NullValue) {
+                    throw new SqlStorageException(
+                            "row comparison requires non-null SQL literal");
+                }
+                ColumnValue left = storageValueAt(ordinal);
+                if (left instanceof ColumnValue.NullValue) {
+                    throw new SqlStorageException(
+                            "row comparison cannot compare SQL NULL");
+                }
+                ColumnValue right = toColumnValue(
+                        literal, cursor.clustered.schema()
+                                .column(ordinal).type());
+                return compareExpressionValues(
+                        left, right, cursor.clustered, ordinal);
+            } catch (RuntimeException comparisonFailure) {
+                throw adapt(
+                        "compare SQL cursor row value failed for column "
+                                + ordinal,
+                        comparisonFailure);
+            }
+        }
+
+        /**
+         * 返回可交给 type codec/comparator 的列值；只有该列真正取值或比较时才 hydrate LOB。
+         */
+        private ColumnValue storageValueAt(int ordinal) {
+            ColumnValue cached = hydratedValues[ordinal];
+            if (cached != null) {
+                return cached;
+            }
+            ColumnValue value =
+                    record.columnValues().get(ordinal);
+            if (value instanceof ColumnValue.ExternalValue external) {
+                value = hydrateExternalValue(
+                        external, cursor.clustered,
+                        cursor.deadline, ordinal);
+            }
+            hydratedValues[ordinal] = value;
+            return value;
+        }
+
+        /** 验证视图有效且 ordinal 属于 exact row schema。 */
+        private void requireOrdinal(int ordinal) {
+            requireCurrent();
+            if (ordinal < 0
+                    || ordinal >= record.columnValues().size()) {
+                throw new SqlStorageException(
+                        "SQL row-view ordinal is outside schema");
+            }
+        }
+
+        private void requireCurrent() {
+            cursor.requireCurrent(generation, record);
+        }
+    }
+
+    /**
+     * 比较已完成 LOB hydration 的表达式值。普通类型继续使用索引/Record 的保序 codec；
+     * LOB 因完整 payload 可能超过页内 256B 上限，必须在无 page latch 的 Executor 阶段直接按
+     * exact charset/collation 比较逻辑字节。JSON v1 按项目既有“严格 UTF-8 文本”简化为二进制字节序，
+     * 不声称实现 MySQL binary JSON 类型优先级。
+     *
+     * @param left 当前完整逻辑行的非 NULL、非 external 列值
+     * @param right Binder 已转换到 exact column type 的非 NULL literal
+     * @param clustered 当前表的 exact clustered schema
+     * @param ordinal 待比较列在 exact table version 中的位置
+     * @return 左值小于、等于或大于右值时的负数、零或正数
+     * @throws SqlStorageException LOB hydration 后类型、字符或长度证据非法时抛出
+     */
+    private int compareExpressionValues(
+            ColumnValue left, ColumnValue right,
+            BTreeIndex clustered, int ordinal) {
+        ColumnType type =
+                clustered.schema().column(ordinal).type();
+        return switch (type.typeId()) {
+            case TINYTEXT, TEXT, MEDIUMTEXT, LONGTEXT ->
+                    compareLobPayload(
+                            left, right, type, true);
+            case TINYBLOB, BLOB, MEDIUMBLOB, LONGBLOB, JSON ->
+                    compareLobPayload(
+                            left, right, type, false);
+            default -> {
+                IndexKeyDef oneColumn = new IndexKeyDef(
+                        clustered.indexId(),
+                        List.of(new KeyPartDef(
+                                new ColumnId(ordinal),
+                                KeyOrder.ASC, 0)));
+                yield predicateComparator.compare(
+                        new SearchKey(List.of(left)),
+                        new SearchKey(List.of(right)),
+                        oneColumn, clustered.schema());
+            }
+        };
+    }
+
+    /**
+     * 对两个已物化 LOB 逻辑值执行完整 payload 比较，不再施加记录页的 inline 编码上限。
+     *
+     * @param left 已 hydrate 的非 NULL LOB 列值
+     * @param right Binder 已转换的同类型非 NULL literal
+     * @param type exact Record column type
+     * @param useColumnCollation TEXT family 为 true，BLOB/JSON v1 二进制文本为 false
+     * @return 按 exact collation 或二进制字节序得到的比较结果
+     */
+    private int compareLobPayload(
+            ColumnValue left, ColumnValue right,
+            ColumnType type, boolean useColumnCollation) {
+        LobCodec codec = (LobCodec)
+                predicateTypeCodecs.codecFor(type);
+        byte[] leftBytes =
+                codec.logicalBytesForStorage(left, type);
+        byte[] rightBytes =
+                codec.logicalBytesForStorage(right, type);
+        CollationStrategy collation = useColumnCollation
+                ? predicateTypeCodecs.collationFor(
+                        type.charset(), type.collation())
+                : BinaryCollation.INSTANCE;
+        return collation.compare(
+                leftBytes, 0, leftBytes.length,
+                rightBytes, 0, rightBytes.length);
+    }
+
+    /**
+     * point cursor 在第一次 advance 执行一次聚簇/唯一二级 MVCC 定位。
+     */
+    private final class PointSqlStorageCursor
+            extends AbstractEngineSqlStorageCursor {
+        private final PhysicalPointAccess access;
+        private boolean consumed;
+
+        private PointSqlStorageCursor(
+                EngineSqlCursorScope scope,
+                MappedTableStorage mapped,
+                PhysicalPointAccess access,
+                SqlStatementDeadline deadline) {
+            super(scope, mapped, deadline, true, false);
+            this.access = access;
+        }
+
+        /**
+         * 执行一次 point 定位。
+         *
+         * <ol>
+         *     <li>消费单次定位额度，后续调用直接 EOF。</li>
+         *     <li>按 access index exact codec 构造 search key。</li>
+         *     <li>RU 读取 current non-marked 聚簇版本，unique secondary 必须回表并保持唯一。</li>
+         *     <li>RR/RC 使用 cursor 已登记 ReadView 读取聚簇或唯一二级可见版本。</li>
+         * </ol>
+         *
+         * @return 完整聚簇逻辑行；未找到、不可见或已消费时为 Java {@code null}
+         * @throws SqlStorageException metadata、key codec、MVCC/undo 或唯一性证据失败时抛出
+         */
+        @Override
+        protected LogicalRecord nextRecord() {
+            // 1、point access 只执行一次；后续 advance 稳定返回 EOF。
+            if (consumed) {
+                return null;
+            }
+            consumed = true;
+            // 2、按 access index 的 exact codec 构造 typed search key。
+            BTreeIndex index =
+                    mapped.index(access.accessIndexId());
+            SearchKey key = new SearchKey(
+                    toKeyValues(access.keyValues(), index));
+            if (view == null) {
+                // 3、RU 不创建 ReadView；unique secondary 仍回聚簇并拒绝多 live identity。
+                if (access.accessKind()
+                        == PointAccessKind.CLUSTERED_PRIMARY) {
+                    return engine.mvccReader()
+                            .readUncommitted(clustered, key)
+                            .orElse(null);
+                }
+                List<LogicalRecord> rows =
+                        scanReadUncommittedRaw(
+                                mapped, access.accessIndexId(),
+                                equalityRange(access.keyValues()),
+                                deadline);
+                if (rows.size() > 1) {
+                    throw new SqlStorageException(
+                            "multiple current rows for logical unique secondary key");
+                }
+                return rows.isEmpty() ? null : rows.getFirst();
+            }
+            // 4、RR/RC 共用已登记 view，point 结果只携带完整聚簇逻辑值。
+            Optional<LogicalRecord> record =
+                    access.accessKind()
+                            == PointAccessKind.CLUSTERED_PRIMARY
+                            ? engine.mvccReader().read(
+                                    view, clustered, key)
+                            : engine.secondaryMvccReader()
+                                    .readUnique(
+                                            view,
+                                            mapped.tableIndexes(),
+                                            mapped.tableIndexes()
+                                                    .requireSecondary(
+                                                            access.accessIndexId()),
+                                            key);
+            return record.orElse(null);
+        }
+    }
+
+    /**
+     * logical secondary prefix 服务当前返回稳定完整行集合；cursor 逐行暴露且让 RC view
+     * 一直存活到最后一行投影完成。后续可把底层 reader 继续细化为分页 cursor。
+     */
+    private final class SecondaryPrefixSqlStorageCursor
+            extends AbstractEngineSqlStorageCursor {
+        private final EngineSqlTransactionHandle handle;
+        private final PhysicalSecondaryPrefixAccess access;
+        private List<LogicalRecord> rows;
+        private int index;
+
+        private SecondaryPrefixSqlStorageCursor(
+                EngineSqlCursorScope scope,
+                MappedTableStorage mapped,
+                PhysicalSecondaryPrefixAccess access,
+                SqlStatementDeadline deadline) {
+            super(scope, mapped, deadline,
+                    access.lockMode()
+                            == SelectLockMode.CONSISTENT,
+                    false);
+            this.handle = scope.handle;
+            this.access = access;
+        }
+
+        /**
+         * 首次拉取时加载底层稳定列表，随后逐行发布。
+         *
+         * <ol>
+         *     <li>只在第一次调用选择 reader 并加载完整行列表。</li>
+         *     <li>按稳定顺序返回当前元素，列表耗尽后返回 EOF。</li>
+         * </ol>
+         *
+         * @return 下一条完整聚簇逻辑行，EOF 时为 Java {@code null}
+         * @throws SqlStorageException 底层 secondary reader 或回表失败时抛出
+         */
+        @Override
+        protected LogicalRecord nextRecord() {
+            // 1、底层 reader 首次调用形成稳定列表，后续 advance 不重复访问存储。
+            if (rows == null) {
+                rows = loadRows();
+            }
+            // 2、adapter 边界逐行发布；EOF 不泄露列表或 record 引用。
+            return index < rows.size()
+                    ? rows.get(index++) : null;
+        }
+
+        /**
+         * 按 read intent 选择 locking、RU current 或 RR/RC MVCC secondary reader。
+         *
+         * @return 已回聚簇、脱离 page latch/fix 的稳定完整行列表
+         * @throws SqlStorageException metadata、锁等待、MVCC 或容量失败时抛出
+         */
+        private List<LogicalRecord> loadRows() {
+            BTreeIndex index =
+                    mapped.index(access.accessIndexId());
+            SearchKey logicalKey = new SearchKey(
+                    toKeyValues(
+                            access.logicalKeyValues(), index));
+            SecondaryIndexMetadata secondary =
+                    mapped.tableIndexes().requireSecondary(
+                            access.accessIndexId());
+            if (access.lockMode()
+                    != SelectLockMode.CONSISTENT) {
+                return engine.secondaryCurrentReadService()
+                        .readRange(
+                                handle.transaction,
+                                mapped.tableIndexes(),
+                                secondary, logicalKey,
+                                access.lockMode()
+                                        == SelectLockMode.FOR_SHARE
+                                        ? BTreeCurrentReadMode.FOR_SHARE
+                                        : BTreeCurrentReadMode.FOR_UPDATE,
+                                deadline.cap(
+                                        operationTimeout,
+                                        "secondary-prefix locking cursor"));
+            }
+            if (view == null) {
+                return scanReadUncommittedRaw(
+                        mapped, access.accessIndexId(),
+                        equalityRange(
+                                access.logicalKeyValues()),
+                        deadline);
+            }
+            return engine.secondaryMvccReader().readRange(
+                    view, mapped.tableIndexes(),
+                    secondary, logicalKey);
+        }
+    }
+
+    /**
+     * 通用 range cursor：每次只持有一个 256-candidate 批次，逐候选回聚簇并返回完整行。
+     */
+    private final class RangeSqlStorageCursor
+            extends AbstractEngineSqlStorageCursor {
+        private final EngineSqlTransactionHandle handle;
+        private final PhysicalRangeAccess rangeAccess;
+        private final BTreeIndex access;
+        private final SecondaryIndexMetadata secondary;
+        private final ArrayList<SearchKey> identities =
+                new ArrayList<>();
+        private List<BTreeLookupResult> batch = List.of();
+        private int batchIndex;
+        private SearchKey continuation;
+        private int physicalCandidates;
+        private boolean exhausted;
+        private final TransactionId lockOwner;
+        private final BTreeCurrentReadMode currentReadMode;
+
+        private RangeSqlStorageCursor(
+                EngineSqlCursorScope scope,
+                MappedTableStorage mapped,
+                PhysicalRangeAccess rangeAccess,
+                SqlStatementDeadline deadline) {
+            super(scope, mapped, deadline,
+                    rangeAccess.lockMode()
+                            == SelectLockMode.CONSISTENT,
+                    rangeAccess.empty());
+            this.handle = scope.handle;
+            this.rangeAccess = rangeAccess;
+            this.access = mapped.index(
+                    rangeAccess.accessIndexId());
+            this.secondary = access.clustered()
+                    ? null : mapped.tableIndexes()
+                            .requireSecondary(
+                                    rangeAccess.accessIndexId());
+            if (!rangeAccess.empty()
+                    && rangeAccess.lockMode()
+                    != SelectLockMode.CONSISTENT) {
+                this.lockOwner = engine.transactionManager()
+                        .assignWriteId(handle.transaction);
+                this.currentReadMode =
+                        rangeAccess.lockMode()
+                                == SelectLockMode.FOR_SHARE
+                                ? BTreeCurrentReadMode.FOR_SHARE
+                                : BTreeCurrentReadMode.FOR_UPDATE;
+            } else {
+                this.lockOwner = null;
+                this.currentReadMode = null;
+            }
+            this.exhausted = rangeAccess.empty();
+        }
+
+        /**
+         * 逐批扫描并跳过不可见、重复或重定位消失的候选。
+         *
+         * <ol>
+         *     <li>当前批次耗尽时按 continuation 有界载入下一批。</li>
+         *     <li>逐候选回聚簇并去重，直到得到一行或全局 EOF。</li>
+         * </ol>
+         *
+         * @return 下一条完整聚簇逻辑行，EOF 时为 Java {@code null}
+         * @throws SqlStorageException 扫描、MVCC/undo、锁等待或容量失败时抛出
+         */
+        @Override
+        protected LogicalRecord nextRecord() {
+            // 1、批次耗尽后才取下一批，单 cursor 最多持有 256 个 physical candidates。
+            while (true) {
+                if (batchIndex >= batch.size()) {
+                    if (exhausted || !loadBatch()) {
+                        return null;
+                    }
+                }
+                BTreeLookupResult candidate =
+                        batch.get(batchIndex++);
+                // 2、逐候选回聚簇/去重；不可见或已删除候选在 adapter 内跳过。
+                LogicalRecord row = resolveCandidate(candidate);
+                if (row != null) {
+                    return row;
+                }
+            }
+        }
+
+        /**
+         * 读取下一物理批次；短批在消费完成后标记 EOF，continuation 使用完整 physical key。
+         *
+         * @return 成功载入非空批次时为 {@code true}，已 EOF 时为 {@code false}
+         * @throws SqlStorageException deadline、扫描、锁等待或 candidate 容量失败时抛出
+         */
+        private boolean loadBatch() {
+            BTreeScanRange scanRange = toBTreeRange(
+                    rangeAccess.indexRange(), access,
+                    continuation, RANGE_SCAN_BATCH_SIZE);
+            List<BTreeLookupResult> loaded;
+            if (rangeAccess.lockMode()
+                    == SelectLockMode.CONSISTENT) {
+                deadline.remaining(
+                        "SQL range cursor physical batch");
+                MiniTransaction mtr = engine
+                        .miniTransactionManager()
+                        .beginReadOnly();
+                try {
+                    loaded = access.clustered()
+                            ? engine.btreeService()
+                                    .scanClusteredIncludingDeleted(
+                                            mtr, access, scanRange)
+                            : engine.btreeService()
+                                    .scanIncludingDeleted(
+                                            mtr, access, scanRange);
+                    engine.miniTransactionManager()
+                            .commit(mtr);
+                } catch (RuntimeException scanFailure) {
+                    rollbackMtr(mtr, scanFailure);
+                    throw scanFailure;
+                }
+            } else {
+                BTreeCurrentReadRequest request =
+                        new BTreeCurrentReadRequest(
+                                lockOwner,
+                                handle.transaction
+                                        .isolationLevel(),
+                                deadline.cap(
+                                        operationTimeout,
+                                        "SQL locking range cursor"),
+                                RANGE_RELOCATION_RETRIES);
+                loaded = engine.btreeCurrentReadService()
+                        .lockRange(
+                                access, scanRange,
+                                request, currentReadMode);
+            }
+            if (loaded.isEmpty()) {
+                exhausted = true;
+                batch = List.of();
+                batchIndex = 0;
+                return false;
+            }
+            physicalCandidates += loaded.size();
+            requirePhysicalCapacity(
+                    physicalCandidates, mapped, access);
+            continuation = keyFromRow(
+                    loaded.getLast().record()
+                            .columnValues(), access);
+            exhausted = loaded.size()
+                    < RANGE_SCAN_BATCH_SIZE;
+            batch = List.copyOf(loaded);
+            batchIndex = 0;
+            return true;
+        }
+
+        /**
+         * 把 access candidate 转成唯一聚簇逻辑行；锁等待发生前 access scan 已释放 page 资源。
+         *
+         * @param candidate 当前批次内、已脱离 page latch/fix 的 access record
+         * @return 可发布的完整聚簇逻辑行；重复、不可见或重定位消失时为 Java {@code null}
+         * @throws SqlStorageException 聚簇锁等待、MVCC/undo 或 identity 比较失败时抛出
+         */
+        private LogicalRecord resolveCandidate(
+                BTreeLookupResult candidate) {
+            SearchKey identity = access.clustered()
+                    ? keyFromRow(
+                            candidate.record()
+                                    .columnValues(), clustered)
+                    : secondary.layout().clusterKey(
+                            candidate.record());
+            if (containsIdentity(
+                    identities, identity, clustered)) {
+                return null;
+            }
+            identities.add(identity);
+
+            if (rangeAccess.lockMode()
+                    != SelectLockMode.CONSISTENT) {
+                if (access.clustered()) {
+                    return candidate.record();
+                }
+                BTreeCurrentReadRequest request =
+                        new BTreeCurrentReadRequest(
+                                lockOwner,
+                                handle.transaction
+                                        .isolationLevel(),
+                                deadline.cap(
+                                        operationTimeout,
+                                        "SQL cursor clustered row lock"),
+                                RANGE_RELOCATION_RETRIES);
+                return engine.btreeCurrentReadService()
+                        .lockPoint(
+                                clustered, identity,
+                                request, currentReadMode)
+                        .map(BTreeLookupResult::record)
+                        .orElse(null);
+            }
+            if (view == null) {
+                return engine.mvccReader()
+                        .readUncommitted(
+                                clustered, identity)
+                        .orElse(null);
+            }
+            return engine.mvccReader()
+                    .read(view, clustered, identity)
+                    .orElse(null);
+        }
+
+        @Override
+        protected void closeCursor() {
+            batch = List.of();
+            batchIndex = 0;
+            identities.clear();
+        }
     }
 
     /**
@@ -875,143 +1862,52 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
     }
 
     /**
-     * 一致性范围读：一个 ReadView 覆盖所有 256-row 批次与回表版本链；RC finally 注销。
+     * RU cursor 的原始候选读取：只负责分页、回聚簇和 identity 去重，不执行 residual 或公开投影。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>按完整 physical continuation 读取 256 条 including-deleted access candidates。</li>
+     *     <li>批次 MTR 提交后再提取聚簇 identity，保证 page latch/fix 不跨回表读取。</li>
+     *     <li>逐 identity 读取瞬间 current non-marked 聚簇版本并去重，最多检查 16384 physical candidates。</li>
+     *     <li>返回不含 storage page reference 的完整 LogicalRecord 集；Filter/Project 由 Executor 后续完成。</li>
+     * </ol>
+     *
+     * @param mapped exact table/index mapping
+     * @param accessIndexId optimizer 选择的访问索引
+     * @param range physical range
+     * @param deadline statement absolute deadline
+     * @return 当前版本候选行；不按 SQL residual 过滤
      */
-    private List<SqlRow> readConsistentRange(
-            EngineSqlTransactionHandle handle, MappedTableStorage mapped,
-            PhysicalRangeSelect statement, SqlStatementDeadline deadline) {
-        if (handle.transaction.isolationLevel() == IsolationLevel.READ_UNCOMMITTED) {
-            List<LogicalRecord> records = scanReadUncommittedBatches(
-                    mapped, statement.accessIndexId(), statement.indexRange(),
-                    statement.predicates(), deadline);
-            return projectRows(records, statement.projectionOrdinals(), statement.table(),
-                    mapped.clusteredIndex(), deadline);
-        }
-        ReadViewManager views = engine.transactionManager().readViewManager();
-        deadline.remaining("comparison range ReadView creation");
-        ReadView view = views.openReadView(handle.transaction);
-        RuntimeException failure = null;
-        try {
-            List<LogicalRecord> records = scanMvccBatches(
-                    view, mapped, statement.accessIndexId(), statement.indexRange(),
-                    statement.predicates(), deadline);
-            // RC view 必须继续存活到所有 external LOB chain 解引用和公开值构造完成。
-            return projectRows(records, statement.projectionOrdinals(), statement.table(),
-                    mapped.clusteredIndex(), deadline);
-        } catch (RuntimeException readFailure) {
-            failure = adapt("comparison range MVCC scan failed", readFailure);
-            throw failure;
-        } finally {
-            if (handle.transaction.isolationLevel() == IsolationLevel.READ_COMMITTED) {
-                try {
-                    views.closeReadView(view);
-                } catch (RuntimeException closeFailure) {
-                    RuntimeException adapted = adapt(
-                            "close READ COMMITTED comparison range ReadView failed", closeFailure);
-                    if (failure == null) {
-                        throw adapted;
-                    }
-                    failure.addSuppressed(adapted);
-                }
-            }
-        }
-    }
-
-    /**
-     * 分页扫描 physical candidates，逐聚簇 identity 执行 MVCC 与 residual。
-     */
-    private List<LogicalRecord> scanMvccBatches(
-            ReadView view, MappedTableStorage mapped, long accessIndexId,
-            IndexRange range, PredicateSet predicates,
-            SqlStatementDeadline deadline) {
-        BTreeIndex access = mapped.index(accessIndexId);
-        BTreeIndex clustered = mapped.clusteredIndex();
-        SecondaryIndexMetadata secondary = access.clustered()
-                ? null : mapped.tableIndexes().requireSecondary(accessIndexId);
-        ArrayList<SearchKey> identities = new ArrayList<>();
-        ArrayList<LogicalRecord> rows = new ArrayList<>();
-        SearchKey continuation = null;
-        int physicalCandidates = 0;
-        while (true) {
-            // 1、每批建立独立只读 MTR；上一批完整 physical key 作为 exclusive continuation。
-            deadline.remaining("comparison range physical batch");
-            BTreeScanRange batchRange = toBTreeRange(
-                    range, access, continuation, RANGE_SCAN_BATCH_SIZE);
-            MiniTransaction mtr = engine.miniTransactionManager().beginReadOnly();
-            List<BTreeLookupResult> batch;
-            try {
-                batch = access.clustered()
-                        ? engine.btreeService().scanClusteredIncludingDeleted(mtr, access, batchRange)
-                        : engine.btreeService().scanIncludingDeleted(mtr, access, batchRange);
-                engine.miniTransactionManager().commit(mtr);
-            } catch (RuntimeException scanFailure) {
-                rollbackMtr(mtr, scanFailure);
-                throw scanFailure;
-            }
-            if (batch.isEmpty()) {
-                return List.copyOf(rows);
-            }
-
-            // 2、批次返回时所有 page latch/fix 已释放；后续 undo/回表不会与 access leaf 资源重叠。
-            physicalCandidates += batch.size();
-            requirePhysicalCapacity(physicalCandidates, mapped, access);
-            for (BTreeLookupResult candidate : batch) {
-                SearchKey identity = access.clustered()
-                        ? keyFromRow(candidate.record().columnValues(), clustered)
-                        : secondary.layout().clusterKey(candidate.record());
-                if (containsIdentity(identities, identity, clustered)) {
-                    continue;
-                }
-                Optional<LogicalRecord> visible = engine.mvccReader().read(view, clustered, identity);
-                if (visible.isEmpty()) {
-                    identities.add(identity);
-                    continue;
-                }
-                LogicalRecord row = visible.orElseThrow();
-                if (matchesPredicates(row, predicates, clustered)) {
-                    identities.add(identity);
-                    rows.add(row);
-                    requireRowCapacity(rows.size(), mapped, access);
-                } else {
-                    identities.add(identity);
-                }
-            }
-            // 3、完整 physical key 而非 logical prefix 推进，保证 non-unique suffix 不重复/遗漏。
-            continuation = keyFromRow(batch.getLast().record().columnValues(), access);
-            // 4、短批表示已越过上界/到达最右 leaf；满批继续一次以确认是否结束。
-            if (batch.size() < RANGE_SCAN_BATCH_SIZE) {
-                return List.copyOf(rows);
-            }
-        }
-    }
-
-    /**
-     * RU 分页扫描：physical access entry 只作当前候选，每条都回聚簇读取最新未标删版本并重算 residual。
-     * 不创建 ReadView、不遍历 undo，也不持 access leaf 资源进入聚簇读取。
-     */
-    private List<LogicalRecord> scanReadUncommittedBatches(
+    private List<LogicalRecord> scanReadUncommittedRaw(
             MappedTableStorage mapped, long accessIndexId,
-            IndexRange range, PredicateSet predicates,
-            SqlStatementDeadline deadline) {
+            IndexRange range, SqlStatementDeadline deadline) {
         BTreeIndex access = mapped.index(accessIndexId);
         BTreeIndex clustered = mapped.clusteredIndex();
         SecondaryIndexMetadata secondary = access.clustered()
-                ? null : mapped.tableIndexes().requireSecondary(accessIndexId);
+                ? null : mapped.tableIndexes()
+                        .requireSecondary(accessIndexId);
         ArrayList<SearchKey> identities = new ArrayList<>();
         ArrayList<LogicalRecord> rows = new ArrayList<>();
         SearchKey continuation = null;
         int physicalCandidates = 0;
         while (true) {
-            // 1、每批只在短只读 MTR 内物化 access candidate；including-deleted 让历史 entry 不会掩盖当前重算。
-            deadline.remaining("read-uncommitted physical batch");
+            // 1、每批只在短 MTR 中读取物理候选，continuation 不省略 secondary clustered suffix。
+            deadline.remaining(
+                    "read-uncommitted raw cursor batch");
             BTreeScanRange batchRange = toBTreeRange(
-                    range, access, continuation, RANGE_SCAN_BATCH_SIZE);
-            MiniTransaction mtr = engine.miniTransactionManager().beginReadOnly();
+                    range, access, continuation,
+                    RANGE_SCAN_BATCH_SIZE);
+            MiniTransaction mtr = engine
+                    .miniTransactionManager().beginReadOnly();
             List<BTreeLookupResult> batch;
             try {
                 batch = access.clustered()
-                        ? engine.btreeService().scanClusteredIncludingDeleted(mtr, access, batchRange)
-                        : engine.btreeService().scanIncludingDeleted(mtr, access, batchRange);
+                        ? engine.btreeService()
+                                .scanClusteredIncludingDeleted(
+                                        mtr, access, batchRange)
+                        : engine.btreeService()
+                                .scanIncludingDeleted(
+                                        mtr, access, batchRange);
                 engine.miniTransactionManager().commit(mtr);
             } catch (RuntimeException scanFailure) {
                 rollbackMtr(mtr, scanFailure);
@@ -1020,31 +1916,30 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
             if (batch.isEmpty()) {
                 return List.copyOf(rows);
             }
-
-            // 2、access 页资源已释放；逐候选提取聚簇 identity 并按聚簇比较语义去重。
+            // 2/3、page 资源已释放，回聚簇只保留当前逻辑行值。
             physicalCandidates += batch.size();
-            requirePhysicalCapacity(physicalCandidates, mapped, access);
+            requirePhysicalCapacity(
+                    physicalCandidates, mapped, access);
             for (BTreeLookupResult candidate : batch) {
                 SearchKey identity = access.clustered()
-                        ? keyFromRow(candidate.record().columnValues(), clustered)
-                        : secondary.layout().clusterKey(candidate.record());
-                if (containsIdentity(identities, identity, clustered)) {
+                        ? keyFromRow(
+                                candidate.record()
+                                        .columnValues(), clustered)
+                        : secondary.layout()
+                                .clusterKey(candidate.record());
+                if (containsIdentity(
+                        identities, identity, clustered)) {
                     continue;
                 }
                 identities.add(identity);
-
-                // 3、RU 只接受读取瞬间的聚簇当前未标删版本；旧 secondary entry 必须由完整行 residual 排除。
-                Optional<LogicalRecord> current =
-                        engine.mvccReader().readUncommitted(clustered, identity);
-                if (current.isPresent()
-                        && matchesPredicates(current.orElseThrow(), predicates, clustered)) {
-                    rows.add(current.orElseThrow());
-                    requireRowCapacity(rows.size(), mapped, access);
-                }
+                engine.mvccReader()
+                        .readUncommitted(clustered, identity)
+                        .ifPresent(rows::add);
             }
-
-            // 4、continuation 使用完整 physical key，保证 secondary clustered suffix 不遗漏或重复。
-            continuation = keyFromRow(batch.getLast().record().columnValues(), access);
+            // 4、原始 cursor 不执行 residual/result-row 上限；Filter 后由 Executor 限制 4096 输出行。
+            continuation = keyFromRow(
+                    batch.getLast().record()
+                            .columnValues(), access);
             if (batch.size() < RANGE_SCAN_BATCH_SIZE) {
                 return List.copyOf(rows);
             }
@@ -1162,139 +2057,78 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
     private boolean matchesPredicates(
             LogicalRecord row, PredicateSet predicates,
             BTreeIndex clustered) {
-        return evaluatePredicate(
-                predicates.condition(), row, clustered).matchesWhere();
+        return expressionEvaluator.matches(
+                predicates.condition(),
+                new PredicateSqlRowView(row, clustered));
     }
 
     /**
-     * 递归求值 M3 封闭表达式集合；comparison 遇到 SQL NULL 返回 UNKNOWN。
-     *
-     * @param expression 物理计划完整 residual 的当前节点
-     * @param row 已完成 MVCC/current-read 选择的聚簇行
-     * @param clustered exact table version 对应的聚簇 schema/comparator
-     * @return 保留 FALSE/UNKNOWN 区别的 SQL 三值结果
-     * @throws SqlStorageException 物理计划未经过规则规范化或出现非 boolean 根时抛出
+     * range DML 在物化 identity 前使用的瞬时 row view。当前 canonical residual 只需要 NULL
+     * 探针和 column-literal comparator；valueAt 若被未来 scalar 规则调用会显式失败，避免无
+     * ReadView/deadline 的 LOB hydration 悄悄进入 DML predicate 阶段。
      */
-    private SqlBoolean evaluatePredicate(
-            BoundExpression expression, LogicalRecord row,
-            BTreeIndex clustered) {
-        return switch (expression) {
-            case BoundTruthLiteral truth -> truth.value();
-            case BoundConjunction conjunction -> {
-                SqlBoolean result = SqlBoolean.TRUE;
-                for (BoundExpression operand : conjunction.operands()) {
-                    result = result.and(
-                            evaluatePredicate(operand, row, clustered));
-                    if (result == SqlBoolean.FALSE) {
-                        break;
-                    }
-                }
-                yield result;
-            }
-            case BoundDisjunction disjunction -> {
-                SqlBoolean result = SqlBoolean.FALSE;
-                for (BoundExpression operand : disjunction.operands()) {
-                    result = result.or(
-                            evaluatePredicate(
-                                    operand, row, clustered));
-                    if (result == SqlBoolean.TRUE) {
-                        break;
-                    }
-                }
-                yield result;
-            }
-            case BoundNegation negation ->
-                    evaluatePredicate(
-                            negation.operand(), row, clustered).not();
-            case BoundNullTest nullTest ->
-                    evaluateNullTest(nullTest, row);
-            case BoundComparison comparison ->
-                    evaluateComparison(comparison, row, clustered);
-            case BoundColumnReference ignored -> throw new SqlStorageException(
-                    "physical residual contains scalar column root");
-            case BoundLiteral ignored -> throw new SqlStorageException(
-                    "physical residual contains non-boolean expression: "
-                            + expression.getClass().getSimpleName());
-        };
-    }
+    private final class PredicateSqlRowView
+            implements SqlRowView {
+        private final LogicalRecord record;
+        private final BTreeIndex clustered;
 
-    /**
-     * 在已选出的完整聚簇行上求值 IS NULL / IS NOT NULL。
-     *
-     * <p>数据流：</p>
-     * <ol>
-     *     <li>从 canonical 列引用按 exact ordinal 读取 record 值，或读取规则保留的 typed literal。</li>
-     *     <li>只检查显式 NullValue 标记，不触发 LOB hydration、collation 比较或索引访问。</li>
-     *     <li>按操作符返回确定 TRUE/FALSE；null-test 不产生 UNKNOWN。</li>
-     * </ol>
-     *
-     * @param nullTest 物理 residual 中已验证的 scalar null-test
-     * @param row MVCC/current-read 选出的完整聚簇记录
-     * @return 非 UNKNOWN 的 SQL boolean
-     * @throws SqlStorageException operand 不是当前 M3 可执行的列引用或 literal 时抛出
-     */
-    private static SqlBoolean evaluateNullTest(
-            BoundNullTest nullTest, LogicalRecord row) {
-        // 1、物理校验已核对列 identity；此处只读取同一 exact row 的 ordinal。
-        boolean isNull;
-        if (nullTest.operand()
-                instanceof BoundColumnReference column) {
-            isNull = row.columnValues()
-                    .get(column.columnOrdinal())
+        private PredicateSqlRowView(
+                LogicalRecord record, BTreeIndex clustered) {
+            this.record = record;
+            this.clustered = clustered;
+        }
+
+        @Override
+        public int width() {
+            return record.columnValues().size();
+        }
+
+        @Override
+        public SqlValue valueAt(int ordinal) {
+            throw new SqlStorageException(
+                    "range DML predicate row does not expose projected values");
+        }
+
+        @Override
+        public boolean isNullAt(int ordinal) {
+            requirePredicateOrdinal(ordinal);
+            return record.columnValues().get(ordinal)
                     instanceof ColumnValue.NullValue;
-        } else if (nullTest.operand()
-                instanceof BoundLiteral literal) {
-            isNull = literal.value()
-                    instanceof SqlValue.NullValue;
-        } else {
-            throw new SqlStorageException(
-                    "physical null-test requires a column or literal operand");
         }
-        // 2、NullValue 是 record/sql 层共享的空值证据，不需要读取外置 payload。
-        // 3、IS NOT NULL 是二值反转，不等价于会保留 UNKNOWN 的 boolean NOT。
-        boolean matches =
-                nullTest.operator() == BoundNullTestOperator.IS_NULL
-                        ? isNull : !isNull;
-        return matches ? SqlBoolean.TRUE : SqlBoolean.FALSE;
-    }
 
-    /**
-     * 按单列 Record comparator 求值 canonical column-literal comparison。
-     */
-    private SqlBoolean evaluateComparison(
-            BoundComparison predicate, LogicalRecord row,
-            BTreeIndex clustered) {
-        if (!(predicate.left() instanceof BoundColumnReference column)
-                || !(predicate.right() instanceof BoundLiteral literal)) {
-            throw new SqlStorageException(
-                    "physical comparison is not canonical column-literal");
+        @Override
+        public int compareLiteral(
+                int ordinal, SqlValue literal) {
+            requirePredicateOrdinal(ordinal);
+            ColumnValue left =
+                    record.columnValues().get(ordinal);
+            if (left instanceof ColumnValue.NullValue
+                    || literal == null
+                    || literal instanceof SqlValue.NullValue) {
+                throw new SqlStorageException(
+                        "predicate comparator requires non-null operands");
+            }
+            ColumnValue right = toColumnValue(
+                    literal,
+                    clustered.schema().column(ordinal).type());
+            IndexKeyDef oneColumn = new IndexKeyDef(
+                    clustered.indexId(),
+                    List.of(new KeyPartDef(
+                            new ColumnId(ordinal),
+                            KeyOrder.ASC, 0)));
+            return predicateComparator.compare(
+                    new SearchKey(List.of(left)),
+                    new SearchKey(List.of(right)),
+                    oneColumn, clustered.schema());
         }
-        ColumnValue left =
-                row.columnValues().get(column.columnOrdinal());
-        if (left instanceof ColumnValue.NullValue
-                || literal.value() instanceof SqlValue.NullValue) {
-            return SqlBoolean.UNKNOWN;
+
+        private void requirePredicateOrdinal(int ordinal) {
+            if (ordinal < 0
+                    || ordinal >= record.columnValues().size()) {
+                throw new SqlStorageException(
+                        "range DML predicate ordinal is outside row schema");
+            }
         }
-        ColumnValue right = toColumnValue(
-                literal.value(), clustered.schema()
-                        .column(column.columnOrdinal()).type());
-        IndexKeyDef oneColumn =
-                new IndexKeyDef(clustered.indexId(), List.of(
-                        new KeyPartDef(
-                                new ColumnId(column.columnOrdinal()),
-                                KeyOrder.ASC, 0)));
-        int order = predicateComparator.compare(
-                new SearchKey(List.of(left)),
-                new SearchKey(List.of(right)),
-                oneColumn, clustered.schema());
-        boolean matched = switch (predicate.operator()) {
-            case EQUAL -> order == 0;
-            case LESS_THAN -> order < 0;
-            case LESS_THAN_OR_EQUAL -> order <= 0;
-            case GREATER_THAN -> order > 0;
-            case GREATER_THAN_OR_EQUAL -> order >= 0;
-        };
-        return matched ? SqlBoolean.TRUE : SqlBoolean.FALSE;
     }
 
     private boolean containsIdentity(List<SearchKey> identities, SearchKey candidate,
@@ -1448,6 +2282,10 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
             if (handle.state != EngineSqlTransactionHandle.State.ACTIVE) {
                 throw new SqlTransactionStateException("SQL transaction handle is terminal: " + handle.state);
             }
+            if (handle.cursorActive) {
+                throw new SqlTransactionStateException(
+                        "SQL transaction handle has an active cursor");
+            }
             return action.apply(handle);
         } finally {
             handle.operationLock.unlock();
@@ -1473,6 +2311,10 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
             throw new SqlTransactionStateException("XA transaction handle is busy");
         }
         try {
+            if (handle.cursorActive) {
+                throw new SqlTransactionStateException(
+                        "SQL transaction handle has an active cursor");
+            }
             EngineSqlTransactionHandle.State decided = commit
                     ? EngineSqlTransactionHandle.State.COMMIT_DECIDED
                     : EngineSqlTransactionHandle.State.ROLLBACK_DECIDED;
@@ -1536,51 +2378,44 @@ public final class DefaultSqlStorageGateway implements SqlStorageGateway {
                 .map(part -> values.get(part.columnId().value())).toList());
     }
 
-    private List<ColumnValue> hydrateExternalValues(List<ColumnValue> source, BTreeIndex index,
-                                                    SqlStatementDeadline deadline) {
-        ArrayList<ColumnValue> result = new ArrayList<>(source);
-        for (int ordinal = 0; ordinal < result.size(); ordinal++) {
-            if (!(result.get(ordinal) instanceof ColumnValue.ExternalValue external)) continue;
-            deadline.remaining("external LOB hydration for column " + ordinal);
-            MiniTransaction mtr = engine.miniTransactionManager().beginReadOnly();
-            try {
-                ColumnType type = index.schema().column(ordinal).type();
-                ColumnValue value = engine.lobStorage().read(mtr, type, external);
-                engine.miniTransactionManager().commit(mtr);
-                deadline.remaining("external LOB hydration completion for column " + ordinal);
-                result.set(ordinal, value);
-            } catch (RuntimeException hydrateFailure) {
-                rollbackMtr(mtr, hydrateFailure);
-                throw adapt("external LOB hydration failed for column " + ordinal, hydrateFailure);
-            }
-        }
-        return List.copyOf(result);
-    }
-
     /**
-     * 对完整 storage rows 执行 LOB hydration 与 exact-DD projection；任一失败时不返回 partial row list。
+     * 为 cursor 当前行按需 hydrate 单个 external value；ReadView 和 operation lease 由所属
+     * statement cursor scope 持有。
      *
-     * @param records            已由 MVCC/current-read 选出的完整聚簇行。
-     * @param projectionOrdinals Binder 验证的公开列顺序。
-     * @param table              exact DD table version，提供 SQL 类型解释。
-     * @param clusteredIndex     与 records schema 匹配的聚簇 descriptor。
-     * @param deadline           每个 LOB chain 继续消费的 statement absolute deadline。
-     * @return 完整不可变 SqlRow 列表。
+     * @param external 当前逻辑行中的外置引用
+     * @param index exact clustered schema
+     * @param deadline statement absolute deadline
+     * @param ordinal 待投影 table column ordinal
+     * @return 不含 LobReference 的内联 ColumnValue
+     * @throws SqlStorageException LOB 读取、CRC、deadline 或 MTR 收敛失败时抛出
      */
-    private List<SqlRow> projectRows(List<LogicalRecord> records, List<Integer> projectionOrdinals,
-                                     cn.zhangyis.db.dd.domain.TableDefinition table,
-                                     BTreeIndex clusteredIndex, SqlStatementDeadline deadline) {
-        ArrayList<SqlRow> rows = new ArrayList<>(records.size());
-        for (LogicalRecord record : records) {
-            List<ColumnValue> hydrated = hydrateExternalValues(
-                    record.columnValues(), clusteredIndex, deadline);
-            ArrayList<SqlValue> projected = new ArrayList<>(projectionOrdinals.size());
-            for (int ordinal : projectionOrdinals) {
-                projected.add(toSqlValue(hydrated.get(ordinal), table.columns().get(ordinal).type()));
-            }
-            rows.add(new SqlRow(projected));
+    private ColumnValue hydrateExternalValue(
+            ColumnValue.ExternalValue external,
+            BTreeIndex index,
+            SqlStatementDeadline deadline,
+            int ordinal) {
+        deadline.remaining(
+                "cursor external LOB hydration for column "
+                        + ordinal);
+        MiniTransaction mtr = engine.miniTransactionManager()
+                .beginReadOnly();
+        try {
+            ColumnType type =
+                    index.schema().column(ordinal).type();
+            ColumnValue value = engine.lobStorage()
+                    .read(mtr, type, external);
+            engine.miniTransactionManager().commit(mtr);
+            deadline.remaining(
+                    "cursor external LOB hydration completion for column "
+                            + ordinal);
+            return value;
+        } catch (RuntimeException hydrateFailure) {
+            rollbackMtr(mtr, hydrateFailure);
+            throw adapt(
+                    "cursor external LOB hydration failed for column "
+                            + ordinal,
+                    hydrateFailure);
         }
-        return List.copyOf(rows);
     }
 
     /**

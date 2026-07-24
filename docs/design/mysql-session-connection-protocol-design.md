@@ -747,7 +747,32 @@ Kill 状态图见 [session-protocol-kill-cleanup-state.mmd](diagrams/session-pro
 | 14 | 异常处理和恢复 | 已覆盖 handshake、packet、SQL、prepared、stream、kill、disconnect 和 session close cleanup 策略 |
 | 15 | 测试与实现顺序 | 已给出测试设计、后续实现顺序，并确认没有未完成标记或空白项 |
 
-## 18. 参考链接
+## 18. DDL warning、生成键与会话边界（2026-07-24）
+
+### 18.1 结果传播
+
+内部 `CommandResult` 携带不可变 warning 列表；DML `UpdateResult` 携带可选第一生成键。无论 Session
+追加 transaction status、autocommit 状态或协议 flags，都必须保留这两个 payload。协议层后续可以把
+warning count 和生成键编码进 OK packet；当前 Java API 已保证信息不在分层间丢失。
+
+### 18.2 DDL 隐式提交
+
+CREATE/DROP（包括 `IF EXISTS/IF NOT EXISTS` 命中的 no-op）统一遵循：
+
+1. 语句执行前结束当前显式事务；提交失败则不进入 DDL。
+2. DDL 使用自己的 statement/DDL guard 完成或恢复到可判定状态。
+3. 语句后 session 回到无活动事务；warning 不改变成功状态。
+
+删除当前 session 的 current schema 后立即清空选择；其它 session 不被主动改写，但下一次 bind 必须通过
+DD 版本/存在性校验失败，不能继续使用缓存对象。
+
+### 18.3 排序取消
+
+每个排序语句从 session cancellation token 派生独立 sort guard。客户端断开、KILL、执行异常和 result
+consumer 提前关闭都必须关闭 executor tree，并在 session 资源释放完成前删除该语句的 spill 文件。
+临时文件清理失败记录带实例/statement identity 的诊断日志，但不得覆盖原始 SQL 异常。
+
+## 19. 参考链接
 
 - MySQL 8.0.46 Source Documentation - Client/Server Protocol: https://dev.mysql.com/doc/dev/mysql-server/8.0.46/PAGE_PROTOCOL.html
 - MySQL 8.0.46 Source Documentation - Connection Phase: https://dev.mysql.com/doc/dev/mysql-server/8.0.46/page_protocol_connection_phase.html

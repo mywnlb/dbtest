@@ -44,10 +44,10 @@
 | MySQL 8.0 能力 | MiniMySQL 第一阶段 |
 | --- | --- |
 | 完整优化器和代价模型 | `SimplePlanner` 只做主键点查、二级索引范围扫描、全表扫描选择 |
-| 多表 join 和 subquery | 基础 Executor 不实现，由 [mysql-advanced-executor-operators-design.md](mysql-advanced-executor-operators-design.md) 承接 |
+| 多表 join 和 subquery | 已接二表等值 INNER JOIN + Nested/Index Nested Loop v1；outer/multi-way/hash/merge join 与 subquery 由 [mysql-advanced-executor-operators-design.md](mysql-advanced-executor-operators-design.md) 后续承接 |
 | 聚合、group by、window function | 基础 Executor 不实现，由 [mysql-advanced-executor-operators-design.md](mysql-advanced-executor-operators-design.md) 承接 |
 | 完整表达式系统 | 支持比较、布尔、NULL、常量、列引用、简单算术 |
-| 完整 SQL cursor 协议 | 先实现 `ResultSetCursor` 和内部 `StorageCursor` |
+| 完整 SQL cursor 协议 | 内部 `SqlStorageCursor` pull 协议已接；客户端 `ResultSetCursor`/network streaming 未接 |
 | 完整 Performance Schema | 先提供 executor trace、MDL snapshot、row-lock wait snapshot |
 
 ## 3. 总体架构
@@ -61,7 +61,9 @@
 3. SQL compiler 把 semantic Bound 转为 LogicalPlan，经规则和访问路径选择形成 PhysicalPlan。
 4. Session 只在完整 PhysicalPlan 成功后 publish statement metadata。
 5. `SqlExecutor` 封闭分派 PhysicalPlan，并只通过窄 `SqlDataAccessPort` 访问数据。
-6. 当前适配器物化 point/range 结果；目标 PlanNode/StorageCursor 按 pull 模型执行。
+6. Executor 把单表 `PhysicalQuery(project(filter(access)))` 或二表 `PhysicalJoinQuery`
+   映射为 statement-private PlanNode tree，通过一个 `SqlCursorScope` 管理一个或多个
+   `SqlStorageCursor` pull 候选；公开 `QueryResult` 边界仍 eager 物化。
 7. Storage Engine 通过 B+Tree、Record、Transaction、Buffer Pool、Redo、Disk Manager 完成读写。
 8. Session/事务策略清理 dictionary pin、MDL、statement 与 transaction 资源。
 
@@ -122,15 +124,19 @@
 | --- | --- |
 | `RowView` | Executor 看到的逻辑行，按 `ColumnBinding` 读取值 |
 | `LogicalRow` | INSERT 或 materialized row 的列值集合 |
-| `StorageRowHandle` | 存储层当前行定位句柄，只能用于当前 storage cursor 生命周期 |
-| `StorageCursor` | 存储层扫描游标，屏蔽 B+Tree cursor 和 page latch |
+| `SqlRowView` | cursor-owned 当前逻辑行视图，下一次 advance/close 后失效，可按需 hydrate LOB |
+| `SqlStorageCursor` | 存储层 pull 游标，屏蔽 B+Tree cursor、record 与 page latch |
+| `SqlCursorScope` | 单条 SELECT 的 operation lease、deadline、共享 RC ReadView 与多个 child cursor owner |
 | `ResultSetCursor` | 返回给客户端的结果游标 |
 
 规则：
 
-- `StorageRowHandle` 不是 `RecordRef`，不能跨 statement 或 cursor 保存。
-- Executor 只接触 `RowView` 和 `StorageRowHandle`，不接触 page latch 和 record cursor。
+- `SqlRowView` 不是 `RecordRef`，不能跨下一次 `advance()` 或 cursor close 保存。
+- Executor 只接触 `SqlRowView`，不接触 page latch、record cursor 或 storage record。
 - `LogicalRow` 必须已按 `TableDefinition` 完成默认值、类型校验和列顺序归一化。
+- 二表 `JoinedSqlRowView` 只拼接当前 outer/inner view；任一 child advance 后旧连接视图失效。
+- RC ReadView 由 statement `SqlCursorScope` 创建/关闭一次，JOIN 的 outer/inner cursor 必须共享；
+  RR view 仍归事务终态，RU 不创建 view。child cursor close 不释放 scope operation lease。
 
 ## 6. Storage Engine API
 
@@ -215,11 +221,17 @@ Planner 不做：
 - 三值逻辑由 `SqlBoolean` 表达。
 - WHERE 谓词在 Executor 层判断，Storage 只接收 index range。
 
-当前 M3 的阶段性简化：`PhysicalPlan` 携带完整 `PredicateSet`，engine adapter 在
-MVCC/current-read 选出完整聚簇行后递归求值 comparison、AND、OR、NOT 和 null-test。
-comparison 使用 Record exact type/collation comparator，null-test 只读取显式 NullValue，
-只有 SQL TRUE 进入结果或 DML identity 集。该 evaluator 不下沉到 B+Tree/Record，未来建立
-pull-based Executor 后再上移；在此之前 access range 只能缩小候选，不能替代最终 residual。
+当前实现：`PhysicalQuery` 的 operator root 固定为
+`PhysicalProject(PhysicalFilter(PhysicalAccess))`，并在 query aggregate 上携带 orderBy/limit/strategy；
+`PlanNodeFactory` 为每次语句构造
+`ProjectionNode -> LimitNode? -> SortNode? -> FilterNode -> AccessNode`。无状态
+`ExpressionEvaluator` 在 Executor 的 Filter 上递归求值 comparison、AND、OR、NOT 和
+null-test，保持 SQL 三值与短路；adapter cursor 只发布已完成 MVCC/current-read 选择的完整
+聚簇候选。comparison 复用 Record exact type/collation，完整 LOB 在实际比较或投影时才
+hydrate；null-test 只读 NULL 状态。access range 仍只能缩小候选，不能替代最终 residual。
+
+范围 UPDATE/DELETE 为保持 statement guard 与 Halloween 防线，继续在 adapter 内先锁定并
+物化 identity，其 residual 复用同一个 evaluator，但不改成逐行 pull mutation。
 
 ## 8. SELECT 设计
 
@@ -562,7 +574,65 @@ SQL Executor 锁状态图见 [sql-executor-lock-state.mmd](diagrams/sql-executor
 | 14 | 异常与恢复 | 已给出 bind、open、row lock、duplicate key、storage failure 的清理和 rollback 策略 |
 | 15 | 测试与顺序 | 已给出测试设计、后续实现顺序，并确认没有未完成标记或空白项 |
 
-## 20. 参考链接
+## 20. 批量写入、自增与排序执行契约（2026-07-24）
+
+### 20.1 批量 INSERT 计划与原子性
+
+绑定、逻辑与物理层使用“行批次”，每个单元格为密封值源 `Constant` 或 `AutoIncrement`，禁止用 Java
+`null` 作为自增哨兵。Executor 在取得 statement guard 后按以下阶段执行：
+
+1. 对全部常量执行无副作用的类型、NULL、长度和显式自增值校验；失败时尚未消耗序号。
+2. 一次调用 storage API 解析整个批次的自增值并先持久化 high-water；页 0 latch/MTR 在等待 redo durable
+   前释放。
+3. 在同一个 SQL statement guard/事务中依输入顺序插入所有行；任一行失败令整个 DML 批次回滚。
+4. 返回受影响行数与第一个生成键。回滚不回收已持久化的自增值，因此允许 gap。
+
+`SqlWriteOutcome` 与 `UpdateResult` 增加 `Optional<BigInteger> firstGeneratedKey`，状态附加操作必须原样保留。
+本阶段不实现 `LAST_INSERT_ID()` SQL 函数，只通过 Java 执行结果暴露第一生成键。
+
+### 20.2 自增 storage API
+
+稳定 API 接受 table/space identity 和按输入顺序排列的自增请求，在 `SpaceId` 粒度的 `ReentrantLock`
+及有界 deadline 下分配。规则为：省略、显式 NULL、显式 0 生成；正整数保留并将 high-water 推进到不小于
+该值；负数或溢出拒绝。例如 high-water=0 时 `(NULL),(5),(NULL)` 得到 `1,5,6`。
+
+high-water 通过短页 0 MTR 记录 redo 并提交；释放页 latch 后 `flushThrough(commitLsn)`，只有 redo durable
+后才允许表记录写入。锁不跨普通 DML、索引锁等待或数据页 IO。ALTER shadow copy 在最终 table X/freeze
+边界复制 high-water，避免切换后重新发号。
+
+### 20.3 ORDER BY 执行树
+
+物理执行树遵循三种形态：
+
+```text
+索引有序: Project -> Limit -> Filter -> OrderedAccess
+普通排序: Project -> Limit -> Sort -> Filter -> Access
+Top-N:    Project -> Limit -> TopN -> Filter -> Access
+```
+
+无 `ORDER BY` 的 LIMIT 依赖 pull executor 提前停止；`LIMIT 0` 不打开 storage cursor。公开 `QueryResult`
+仍保留 4096 行保护上限，执行实际第 4097 行时抛领域异常，不能静默截断。
+
+比较器只依赖绑定类型和 `SqlValue`，不依赖 record/page；多列逐项比较，ASC 空值最小、DESC 空值最大，
+最后使用 statement 内单调 sequence 保证稳定结果。每行必须在 child 下一次 `advance()` 前复制为独立值，
+写 run 时不得持有当前 row view、page latch、buffer fix 或 row-lock wait guard。
+
+当前 `SqlStorageCursor` 没有 pause/resume 协议，因此生成多个 run 时 child cursor 仍处于 OPEN，用于继续拉取
+后续行；它不携带已复制行的 record/page 引用，并在全部输入分区完成后、进入多轮归并前关闭。这是当前教学
+实现的明确简化。若以后让 cursor 跨慢临时 IO 产生不可接受的事务或资源占用，应先扩展可暂停 cursor/批量输入
+协议，不能把底层物理句柄泄漏给 SortNode。
+
+### 20.4 资源与清理
+
+`SortExecutionConfig` 由 `DatabaseEngine` 按实例目录构造并注入 Executor，默认每语句内存 4 MiB、
+临时文件总额 256 MiB、归并 fan-in 16。
+`offset+limit` 可表示且估算的行/键可装入配额时选择最大堆 Top-N；否则生成有界内存 run，再执行最多
+16 路的多轮归并。spill 文件位于实例受控 temp 目录，frame 包含格式版本、payload 长度和 CRC；
+正常结束、异常、deadline 到期和 session close 均通过 guard 删除，启动时只清理由本实例命名空间确认的
+遗留文件。当前执行上下文只接入绝对 deadline 检查，尚无独立的会话 kill/cancel token；未来接入取消时必须
+复用同一 close 路径。
+
+## 21. 参考链接
 
 - MySQL 8.0 Reference Manual - SELECT Statement: https://dev.mysql.com/doc/refman/8.0/en/select.html
 - MySQL 8.0 Reference Manual - INSERT Statement: https://dev.mysql.com/doc/refman/8.0/en/insert.html

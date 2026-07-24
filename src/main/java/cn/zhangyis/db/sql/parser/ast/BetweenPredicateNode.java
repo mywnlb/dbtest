@@ -10,11 +10,17 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
  * @param lowerInclusive 闭合下界字面量
  * @param upperInclusive 闭合上界字面量
  */
-public record BetweenPredicateNode(IdentifierNode column, LiteralNode lowerInclusive,
+public record BetweenPredicateNode(ColumnReferenceNode column, LiteralNode lowerInclusive,
                                    LiteralNode upperInclusive) implements PredicateNode {
     public BetweenPredicateNode {
         if (column == null || lowerInclusive == null || upperInclusive == null) {
             throw new DatabaseValidationException("BETWEEN predicate fields must not be null");
         }
+    }
+
+    public BetweenPredicateNode(
+            IdentifierNode column, LiteralNode lowerInclusive,
+            LiteralNode upperInclusive) {
+        this(new ColumnReferenceNode(column), lowerInclusive, upperInclusive);
     }
 }

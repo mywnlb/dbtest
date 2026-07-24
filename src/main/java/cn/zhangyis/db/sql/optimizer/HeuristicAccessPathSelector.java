@@ -13,6 +13,7 @@ import cn.zhangyis.db.sql.optimizer.PredicateAnalyzer.ColumnConstraint;
 import cn.zhangyis.db.sql.optimizer.PredicateAnalyzer.PredicateAnalysis;
 import cn.zhangyis.db.sql.optimizer.exception.SqlOptimizationException;
 import cn.zhangyis.db.sql.optimizer.logical.LogicalFilter;
+import cn.zhangyis.db.sql.optimizer.logical.LogicalJoin;
 import cn.zhangyis.db.sql.optimizer.logical.LogicalPlan;
 import cn.zhangyis.db.sql.optimizer.logical.LogicalProject;
 import cn.zhangyis.db.sql.optimizer.logical.LogicalTableModify;
@@ -20,17 +21,30 @@ import cn.zhangyis.db.sql.optimizer.logical.LogicalTableScan;
 import cn.zhangyis.db.sql.optimizer.logical.LogicalValues;
 import cn.zhangyis.db.sql.optimizer.logical.ModificationKind;
 import cn.zhangyis.db.sql.optimizer.physical.IndexRange;
+import cn.zhangyis.db.sql.optimizer.physical.PhysicalAccess;
+import cn.zhangyis.db.sql.optimizer.physical.PhysicalFilter;
 import cn.zhangyis.db.sql.optimizer.physical.PhysicalInsert;
+import cn.zhangyis.db.sql.optimizer.physical.PhysicalJoinProbe;
+import cn.zhangyis.db.sql.optimizer.physical.PhysicalJoinProbeKind;
+import cn.zhangyis.db.sql.optimizer.physical.PhysicalJoinQuery;
 import cn.zhangyis.db.sql.optimizer.physical.PhysicalPlan;
 import cn.zhangyis.db.sql.optimizer.physical.PhysicalPointDelete;
-import cn.zhangyis.db.sql.optimizer.physical.PhysicalPointSelect;
+import cn.zhangyis.db.sql.optimizer.physical.PhysicalPointAccess;
 import cn.zhangyis.db.sql.optimizer.physical.PhysicalPointUpdate;
+import cn.zhangyis.db.sql.optimizer.physical.PhysicalProject;
+import cn.zhangyis.db.sql.optimizer.physical.PhysicalQuery;
+import cn.zhangyis.db.sql.optimizer.physical.PhysicalLimit;
+import cn.zhangyis.db.sql.optimizer.physical.PhysicalRangeAccess;
 import cn.zhangyis.db.sql.optimizer.physical.PhysicalRangeDelete;
-import cn.zhangyis.db.sql.optimizer.physical.PhysicalRangeSelect;
 import cn.zhangyis.db.sql.optimizer.physical.PhysicalRangeUpdate;
-import cn.zhangyis.db.sql.optimizer.physical.PhysicalSecondaryRangeSelect;
+import cn.zhangyis.db.sql.optimizer.physical.PhysicalSecondaryPrefixAccess;
+import cn.zhangyis.db.sql.optimizer.physical.PhysicalSortKey;
+import cn.zhangyis.db.sql.optimizer.physical.PhysicalSortStrategy;
 import cn.zhangyis.db.sql.optimizer.physical.PointAccessKind;
 import cn.zhangyis.db.sql.optimizer.physical.RangeEndpoint;
+import cn.zhangyis.db.sql.expression.BoundColumnReference;
+import cn.zhangyis.db.sql.expression.BoundComparison;
+import cn.zhangyis.db.sql.expression.BoundComparisonOperator;
 
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -41,10 +55,12 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 /**
- * M3 确定性访问路径选择器。它只消费规则固定点与 PredicateAnalyzer 快照，
- * 并保持 M1 已验证的物理选择顺序；本阶段不使用统计信息、memo 或动态规划。
+ * M4 确定性访问路径选择器。它只消费规则固定点与 PredicateAnalyzer 快照，
+ * 并把 SELECT 输出为 project(filter(access))；本阶段不使用统计信息、memo 或动态规划。
  */
 public final class HeuristicAccessPathSelector {
+    /** Top-N 堆最多保留的行数；更大结果改用有界分堆 run，避免堆随 LIMIT 无界增长。 */
+    private static final long TOP_N_RETAINED_ROWS = 4096L;
     /** 只负责从规范 PredicateSet 派生安全约束，不执行规则或选择索引。 */
     private final PredicateAnalyzer predicateAnalyzer;
 
@@ -78,7 +94,8 @@ public final class HeuristicAccessPathSelector {
      *     <li>校验逻辑根形状，只接受 project/filter/scan 或 table-modify 规范树。</li>
      *     <li>把 typed residual 按 column ordinal 求安全交集；SQL NULL 或可证明矛盾只设置 empty。</li>
      *     <li>按主键、唯一二级、最长连续前缀及 stable index id 的固定优先级选择访问路径。</li>
-     *     <li>构造不可变物理计划并完整保留 residual/read mode；不打开事务、锁或存储 cursor。</li>
+     *     <li>SELECT 构造 project/filter/access 物理树，DML 保持原子 physical command；
+     *         两者都不打开事务、锁、PlanNode 或存储 cursor。</li>
      * </ol>
      *
      * @param logicalPlan Bound IR 转换出的单表逻辑计划；不得为 {@code null}
@@ -126,6 +143,9 @@ public final class HeuristicAccessPathSelector {
     private PhysicalPlan optimizeSelect(LogicalProject project) {
         // 1、先验证规范树并形成唯一 PredicateAnalysis，后续候选不得重复解释 SQL predicate。
         LogicalFilter filter = requireFilter(project.input(), "SELECT");
+        if (filter.input() instanceof LogicalJoin join) {
+            return optimizeJoin(project, filter, join);
+        }
         LogicalTableScan scan = requireScan(filter.input(), "SELECT");
         PredicateAnalysis analysis =
                 predicateAnalyzer.analyze(filter.predicates());
@@ -140,13 +160,13 @@ public final class HeuristicAccessPathSelector {
                     new SqlOptimizationException(
                             "point access candidate disappeared during deterministic selection"));
             rejectLobKey(table, access, "point SELECT");
-            return new PhysicalPointSelect(
-                    table, project.projectionOrdinals(), access.id().value(),
+            return query(project, filter, new PhysicalPointAccess(
+                    table, access.id().value(),
                     access.clustered()
                             ? PointAccessKind.CLUSTERED_PRIMARY
                             : PointAccessKind.UNIQUE_SECONDARY,
-                    keyValues(table, access, analysis.equalities()),
-                    filter.predicates());
+                    keyValues(table, access, analysis.equalities())),
+                    analysis.equalities());
         }
         // 3、普通二级索引的完整 logical equality 用 prefix range 保留多行结果与 locking mode。
         if (!analysis.empty() && point.isEmpty()) {
@@ -157,19 +177,265 @@ public final class HeuristicAccessPathSelector {
                         new SqlOptimizationException(
                                 "secondary range candidate disappeared during deterministic selection"));
                 rejectLobKey(table, access, "secondary range SELECT");
-                return new PhysicalSecondaryRangeSelect(
-                        table, project.projectionOrdinals(), access.id().value(),
-                        keyValues(table, access, analysis.equalities()),
-                        scan.readMode(), filter.predicates());
+                return query(project, filter,
+                        new PhysicalSecondaryPrefixAccess(
+                                table, access.id().value(),
+                                keyValues(table, access,
+                                        analysis.equalities()),
+                                scan.readMode()),
+                        analysis.equalities());
             }
         }
 
         // 4、comparison、复合前缀、locking point、empty 与无候选都归一到通用 range/full scan。
         RangeAccess access =
                 chooseRangeAccess(table, analysis.constraints(), analysis.empty());
-        return new PhysicalRangeSelect(
-                table, project.projectionOrdinals(), access.index().id().value(),
-                access.range(), filter.predicates(), scan.readMode(), analysis.empty());
+        return query(project, filter, new PhysicalRangeAccess(
+                table, access.index().id().value(), access.range(),
+                scan.readMode(), analysis.empty()), analysis.equalities());
+    }
+
+    /**
+     * 为二表等值 INNER JOIN 选择确定性的左驱动 Nested Loop Join。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>验证左右输入均为一致性 table scan，并把 ON 规范为 relation 0 对 relation 1 的等值列。</li>
+     *     <li>左表使用无界聚簇扫描；右表按 clustered、unique secondary、普通 secondary、stable id 顺序寻找单列完整索引。</li>
+     *     <li>存在安全索引时生成 point/prefix 参数化 probe，否则生成每个 outer row 重开的聚簇全扫 probe。</li>
+     *     <li>完整保留 ON、WHERE、扁平投影和排序；JOIN 顺序不声称满足 ORDER BY，必要时使用既有 Top-N/分堆排序。</li>
+     * </ol>
+     *
+     * @param project JOIN SELECT 的公开投影、排序与限制根
+     * @param filter 独立保存完整 WHERE residual 的过滤层
+     * @param join 独立保存等值 ON 和 SQL 左右输入的逻辑连接层
+     * @return 可由 JoinNode 直接实施的普通或索引 Nested Loop Join
+     * @throws SqlOptimizationException ON 不是二表等值列、scan intent 非一致性读或聚簇全扫不安全时抛出
+     */
+    private PhysicalJoinQuery optimizeJoin(
+            LogicalProject project,
+            LogicalFilter filter,
+            LogicalJoin join) {
+        // 1、v1 不把 locking/current read 与多 cursor consistent scope 混用。
+        LogicalTableScan leftScan =
+                requireScan(join.left(), "INNER JOIN left");
+        LogicalTableScan rightScan =
+                requireScan(join.right(), "INNER JOIN right");
+        if (leftScan.readMode() != SelectLockMode.CONSISTENT
+                || rightScan.readMode()
+                != SelectLockMode.CONSISTENT
+                || !(join.condition().condition()
+                instanceof BoundComparison comparison)
+                || comparison.operator()
+                != BoundComparisonOperator.EQUAL
+                || !(comparison.left()
+                instanceof BoundColumnReference first)
+                || !(comparison.right()
+                instanceof BoundColumnReference second)) {
+            throw new SqlOptimizationException(
+                    "INNER JOIN v1 requires two consistent scans and one column equality");
+        }
+        BoundColumnReference outerColumn;
+        BoundColumnReference innerColumn;
+        if (first.relationOrdinal() == 0
+                && second.relationOrdinal() == 1) {
+            outerColumn = first;
+            innerColumn = second;
+        } else if (first.relationOrdinal() == 1
+                && second.relationOrdinal() == 0) {
+            outerColumn = second;
+            innerColumn = first;
+        } else {
+            throw new SqlOptimizationException(
+                    "INNER JOIN ON must connect relation 0 to relation 1");
+        }
+
+        TableDefinition left = leftScan.table();
+        TableDefinition right = rightScan.table();
+        // 2、outer v1 固定 SQL 左表；该选择是确定性的，不冒充基于统计信息的 join reorder。
+        if (left.primaryIndex().keyParts().stream()
+                .anyMatch(part -> part.prefixBytes() != 0)
+                || right.primaryIndex().keyParts().stream()
+                .anyMatch(part -> part.prefixBytes() != 0)) {
+            throw new SqlOptimizationException(
+                    "INNER JOIN full scan does not support prefix clustered key");
+        }
+        PhysicalAccess outerAccess =
+                new PhysicalRangeAccess(
+                        left,
+                        left.primaryIndex().id().value(),
+                        IndexRange.unbounded(),
+                        SelectLockMode.CONSISTENT,
+                        false);
+        List<IndexDefinition> candidates = right.indexes().stream()
+                .filter(index -> index.keyParts().size() == 1
+                        && index.keyParts().getFirst()
+                        .prefixBytes() == 0
+                        && index.keyParts().getFirst().columnId()
+                        == innerColumn.columnId())
+                .sorted(Comparator
+                        .comparingInt((IndexDefinition index) ->
+                                index.clustered() ? 0
+                                        : index.unique() ? 1 : 2)
+                        .thenComparingLong(index ->
+                                index.id().value()))
+                .toList();
+
+        // 3、单列完整索引才能由一个 outer key 无损实例化；复合/前缀索引不会错误欠扫。
+        PhysicalJoinProbe innerProbe;
+        if (candidates.isEmpty()) {
+            innerProbe = new PhysicalJoinProbe(
+                    PhysicalJoinProbeKind.FULL_SCAN,
+                    right,
+                    right.primaryIndex().id().value(),
+                    outerColumn.columnOrdinal(),
+                    innerColumn.columnOrdinal(),
+                    Optional.empty());
+        } else {
+            IndexDefinition chosen =
+                    candidates.getFirst();
+            if (chosen.clustered()
+                    || chosen.unique()) {
+                innerProbe = new PhysicalJoinProbe(
+                        PhysicalJoinProbeKind.POINT,
+                        right, chosen.id().value(),
+                        outerColumn.columnOrdinal(),
+                        innerColumn.columnOrdinal(),
+                        Optional.of(chosen.clustered()
+                                ? PointAccessKind.CLUSTERED_PRIMARY
+                                : PointAccessKind.UNIQUE_SECONDARY));
+            } else {
+                innerProbe = new PhysicalJoinProbe(
+                        PhysicalJoinProbeKind.SECONDARY_PREFIX,
+                        right, chosen.id().value(),
+                        outerColumn.columnOrdinal(),
+                        innerColumn.columnOrdinal(),
+                        Optional.empty());
+            }
+        }
+
+        // 4、join 循环顺序不是全局排序证明；显式 ORDER BY 始终进入 blocking sort。
+        List<PhysicalSortKey> orderBy =
+                project.orderBy().stream()
+                        .map(key -> new PhysicalSortKey(
+                                key.columnOrdinal(),
+                                key.direction()))
+                        .toList();
+        Optional<PhysicalLimit> limit =
+                project.limit().map(value ->
+                        new PhysicalLimit(
+                                value.offset(), value.count()));
+        PhysicalSortStrategy sortStrategy;
+        if (orderBy.isEmpty()) {
+            sortStrategy =
+                    PhysicalSortStrategy.NONE;
+        } else if (limit.isPresent()
+                && limit.orElseThrow().retainedRows()
+                <= TOP_N_RETAINED_ROWS) {
+            sortStrategy =
+                    PhysicalSortStrategy.TOP_N_HEAP;
+        } else {
+            sortStrategy =
+                    PhysicalSortStrategy.PARTITIONED_HEAP_MERGE;
+        }
+        return new PhysicalJoinQuery(
+                List.of(left, right),
+                outerAccess, innerProbe,
+                join.condition(), filter.predicates(),
+                project.projectionOrdinals(),
+                orderBy, limit, sortStrategy);
+    }
+
+    /**
+     * 把已选访问叶包成唯一的 project(filter(access)) 查询树。
+     *
+     * @param project logical SELECT 的公开投影
+     * @param filter 最终 SQL truth 的完整 residual
+     * @param access point、secondary-prefix 或 range 访问叶
+     * @param equalities WHERE 已证明的列等值，可跳过索引中的常量前缀
+     * @return 不携带任何执行期资源的物理查询树
+     */
+    private static PhysicalQuery query(
+            LogicalProject project, LogicalFilter filter,
+            PhysicalAccess access, Map<Integer, SqlValue> equalities) {
+        List<PhysicalSortKey> orderBy = project.orderBy().stream()
+                .map(key -> new PhysicalSortKey(
+                        key.columnOrdinal(), key.direction()))
+                .toList();
+        Optional<PhysicalLimit> limit = project.limit()
+                .map(value -> new PhysicalLimit(value.offset(), value.count()));
+        PhysicalSortStrategy strategy = chooseSortStrategy(
+                project.table(), access, orderBy, limit, equalities);
+        return new PhysicalQuery(new PhysicalProject(
+                new PhysicalFilter(access, filter.predicates()),
+                project.projectionOrdinals()),
+                orderBy, limit, strategy);
+    }
+
+    /**
+     * 在访问路径已经确定后选择排序策略。
+     *
+     * <ol>
+     *     <li>无 ORDER BY 时返回 NONE；point 访问最多一行，任意排序都天然满足。</li>
+     *     <li>按访问索引 key-part 顺序匹配排序键，允许跳过 WHERE 固定的完整等值前缀。</li>
+     *     <li>索引不能满足时，只有 offset+count 不超过阈值才选择 Top-N 最大堆。</li>
+     *     <li>其余请求进入固定内存 run 与最小堆归并，防止全量结果常驻内存。</li>
+     * </ol>
+     *
+     * @param table exact table version
+     * @param access 已选且校验完成的物理访问叶
+     * @param orderBy 用户完整排序键
+     * @param limit 可选最终结果边界
+     * @param equalities WHERE 中可以证明的 typed 等值列
+     * @return 可由 Executor 直接实施的确定性排序策略
+     */
+    private static PhysicalSortStrategy chooseSortStrategy(
+            TableDefinition table, PhysicalAccess access,
+            List<PhysicalSortKey> orderBy, Optional<PhysicalLimit> limit,
+            Map<Integer, SqlValue> equalities) {
+        // 1、空排序与单行 point 都不应创建 blocking SortNode。
+        if (orderBy.isEmpty()) {
+            return PhysicalSortStrategy.NONE;
+        }
+        if (access instanceof PhysicalPointAccess) {
+            return PhysicalSortStrategy.INDEX;
+        }
+        // 2、只有完整 key part 且方向一致才是可靠物理顺序；prefix index 不提供全值排序证明。
+        IndexDefinition index = table.indexes().stream()
+                .filter(candidate ->
+                        candidate.id().value() == access.accessIndexId())
+                .findFirst()
+                .orElseThrow(() -> new SqlOptimizationException(
+                        "ORDER BY access index is missing from exact table version"));
+        int orderPosition = 0;
+        for (IndexKeyPart part : index.keyParts()) {
+            ColumnDefinition column = columnById(
+                    table, part.columnId(), "ORDER BY index proof");
+            if (orderPosition < orderBy.size()) {
+                PhysicalSortKey requested = orderBy.get(orderPosition);
+                if (requested.columnOrdinal() == column.ordinal()
+                        && requested.direction() == part.order()
+                        && part.prefixBytes() == 0) {
+                    orderPosition++;
+                    continue;
+                }
+            }
+            if (part.prefixBytes() == 0
+                    && equalities.containsKey(column.ordinal())) {
+                continue;
+            }
+            break;
+        }
+        if (orderPosition == orderBy.size()) {
+            return PhysicalSortStrategy.INDEX;
+        }
+        // 3、Top-N 的堆容量由最终 offset+count 决定，阈值外必须切换分堆归并。
+        if (limit.isPresent()
+                && limit.orElseThrow().retainedRows() <= TOP_N_RETAINED_ROWS) {
+            return PhysicalSortStrategy.TOP_N_HEAP;
+        }
+        // 4、无 LIMIT 或较大 LIMIT 都使用固定内存 run，不用全量 Java sort。
+        return PhysicalSortStrategy.PARTITIONED_HEAP_MERGE;
     }
 
     /**
@@ -191,7 +457,7 @@ public final class HeuristicAccessPathSelector {
                     "logical INSERT requires a values input");
         }
         // 2、PhysicalInsert 继续执行防御性行宽校验，失败前不会打开写事务资源。
-        return new PhysicalInsert(modify.table(), values.values());
+        return new PhysicalInsert(modify.table(), values.batch());
     }
 
     /**

@@ -8,6 +8,7 @@ import cn.zhangyis.db.sql.parser.ast.UpdateStatementNode;
 import cn.zhangyis.db.sql.parser.ast.DeleteStatementNode;
 import cn.zhangyis.db.sql.parser.ast.SelectLockingClause;
 import cn.zhangyis.db.sql.parser.ast.CreateIndexStatementNode;
+import cn.zhangyis.db.sql.parser.ast.CreateTableStatementNode;
 import cn.zhangyis.db.sql.parser.ast.DropIndexStatementNode;
 import cn.zhangyis.db.sql.parser.ast.IndexKeyOrderNode;
 import cn.zhangyis.db.sql.parser.ast.BetweenPredicateNode;
@@ -24,6 +25,10 @@ import cn.zhangyis.db.sql.parser.ast.ComparisonPredicateNode;
 import cn.zhangyis.db.sql.parser.ast.XaStatementNode;
 import cn.zhangyis.db.sql.parser.ast.AlterTableStatementNode;
 import cn.zhangyis.db.sql.parser.ast.AlterTablespaceStatementNode;
+import cn.zhangyis.db.sql.parser.ast.SortDirectionNode;
+import cn.zhangyis.db.sql.parser.ast.CreateSchemaStatementNode;
+import cn.zhangyis.db.sql.parser.ast.DropSchemaStatementNode;
+import cn.zhangyis.db.sql.parser.ast.DropTableStatementNode;
 import cn.zhangyis.db.sql.parser.exception.SqlSyntaxException;
 import org.junit.jupiter.api.Test;
 import java.util.List;
@@ -48,6 +53,116 @@ class DefaultSqlParserTest {
                 parser.parse("select name,id from def.app.t where id=1 AND name='x'"));
         assertFalse(select.star());
         assertEquals(2, conjuncts(select.condition()).size());
+    }
+
+    /**
+     * ORDER BY 必须保持多键优先级与默认 ASC，三种 LIMIT 语法统一为 offset/count；
+     * 非整数、负数和溢出不能发布半解析 AST。
+     */
+    @Test
+    void parsesOrderByAndNormalizesLimitForms() {
+        SelectStatementNode comma = assertInstanceOf(
+                SelectStatementNode.class,
+                parser.parse("""
+                        SELECT id FROM orders WHERE tenant=1
+                        ORDER BY status DESC, id LIMIT 5, 10
+                        """));
+        assertEquals(List.of("status", "id"), comma.orderBy().stream()
+                .map(item -> item.column().value()).toList());
+        assertEquals(List.of(SortDirectionNode.DESC, SortDirectionNode.ASC),
+                comma.orderBy().stream().map(item -> item.direction()).toList());
+        assertEquals(5L, comma.limit().orElseThrow().offset());
+        assertEquals(10L, comma.limit().orElseThrow().count());
+
+        SelectStatementNode offset = assertInstanceOf(
+                SelectStatementNode.class,
+                parser.parse("""
+                        SELECT id FROM orders WHERE tenant=1
+                        ORDER BY id ASC LIMIT 7 OFFSET 3 FOR SHARE
+                        """));
+        assertEquals(3L, offset.limit().orElseThrow().offset());
+        assertEquals(7L, offset.limit().orElseThrow().count());
+        assertEquals(SelectLockingClause.FOR_SHARE, offset.lockingClause());
+
+        SelectStatementNode count = assertInstanceOf(
+                SelectStatementNode.class,
+                parser.parse("SELECT id FROM orders WHERE tenant=1 LIMIT 0"));
+        assertEquals(0L, count.limit().orElseThrow().count());
+        assertTrue(count.orderBy().isEmpty());
+
+        assertThrows(SqlSyntaxException.class, () ->
+                parser.parse("SELECT id FROM orders WHERE tenant=1 LIMIT -1"));
+        assertThrows(SqlSyntaxException.class, () ->
+                parser.parse("SELECT id FROM orders WHERE tenant=1 LIMIT 1.5"));
+        assertThrows(SqlSyntaxException.class, () ->
+                parser.parse("SELECT id FROM orders WHERE tenant=1 LIMIT 9223372036854775808"));
+    }
+
+    /**
+     * 二表 INNER JOIN 必须保留表别名、限定列与 ON 两侧源位置；WHERE/ORDER BY
+     * 的限定引用仍由 Binder 判断归属，Parser 不访问 DD。
+     */
+    @Test
+    void parsesTwoTableInnerJoinWithQualifiedColumns() {
+        SelectStatementNode select = assertInstanceOf(
+                SelectStatementNode.class,
+                parser.parse("""
+                        SELECT o.id, c.note
+                        FROM orders AS o
+                        INNER JOIN customer c ON o.tenant = c.id
+                        WHERE c.status = 'open'
+                        ORDER BY o.id DESC LIMIT 3
+                        """));
+
+        assertEquals("o", select.tableAlias().orElseThrow().value());
+        assertEquals("customer",
+                select.join().orElseThrow().table().parts().getLast().value());
+        assertEquals("c", select.join().orElseThrow()
+                .alias().orElseThrow().value());
+        assertEquals(List.of("o.id", "c.note"),
+                select.projections().stream()
+                        .map(column -> column.qualifier()
+                                .map(value -> value.value() + ".")
+                                .orElse("") + column.value())
+                        .toList());
+        assertEquals("o",
+                select.join().orElseThrow().leftColumn()
+                        .qualifier().orElseThrow().value());
+        assertEquals("c",
+                select.join().orElseThrow().rightColumn()
+                        .qualifier().orElseThrow().value());
+        assertEquals("c",
+                ((PredicateNode) select.condition()).column()
+                        .qualifier().orElseThrow().value());
+        assertEquals("o",
+                select.orderBy().getFirst().column()
+                        .qualifier().orElseThrow().value());
+    }
+
+    /**
+     * SCHEMA/DATABASE 别名与 IF 子句必须归一，多表 DROP 保持一个 AST 列表而不是拆成多条语句。
+     */
+    @Test
+    void parsesBasicDdlV2AndPreservesBatchBoundary() {
+        CreateSchemaStatementNode create = assertInstanceOf(
+                CreateSchemaStatementNode.class,
+                parser.parse("CREATE DATABASE IF NOT EXISTS `Sales`"));
+        assertEquals("Sales", create.name().value());
+        assertTrue(create.ifNotExists());
+
+        DropTableStatementNode dropTables = assertInstanceOf(
+                DropTableStatementNode.class,
+                parser.parse("DROP TABLE IF EXISTS app.t1, app.t2, t3"));
+        assertTrue(dropTables.ifExists());
+        assertEquals(List.of("t1", "t2", "t3"),
+                dropTables.tables().stream()
+                        .map(name -> name.parts().getLast().value())
+                        .toList());
+
+        DropSchemaStatementNode dropSchema = assertInstanceOf(
+                DropSchemaStatementNode.class,
+                parser.parse("DROP DATABASE IF EXISTS Sales"));
+        assertTrue(dropSchema.ifExists());
     }
 
     /**
@@ -149,6 +264,108 @@ class DefaultSqlParserTest {
                 create.keyParts().stream().map(part -> part.order()).toList());
         assertEquals(create.keyParts().stream().map(part -> part.column().value()).toList(),
                 alter.keyParts().stream().map(part -> part.column().value()).toList());
+    }
+
+    /**
+     * CREATE TABLE 必须保留列类型、NULL/default 与内联/表级索引声明，后续 Binder 才能在
+     * implicit commit 前完成确定性结构校验。
+     */
+    @Test
+    void parsesCreateTableColumnsDefaultsAndIndexes() {
+        CreateTableStatementNode create = assertInstanceOf(
+                CreateTableStatementNode.class,
+                parser.parse("""
+                        CREATE TABLE app.accounts (
+                          id BIGINT PRIMARY KEY,
+                          tenant INT UNSIGNED NOT NULL,
+                          email VARCHAR(160) NOT NULL DEFAULT 'unknown@example.test',
+                          note TEXT NULL,
+                          UNIQUE INDEX uk_email (email DESC),
+                          INDEX idx_tenant (tenant)
+                        )
+                        """));
+
+        assertEquals(List.of("app", "accounts"),
+                create.table().parts().stream().map(part -> part.value()).toList());
+        assertEquals(List.of("id", "tenant", "email", "note"),
+                create.columns().stream().map(column -> column.name().value()).toList());
+        assertTrue(create.columns().get(1).type().unsigned());
+        assertFalse(create.columns().get(1).type().nullable());
+        assertEquals(160, create.columns().get(2).type().length());
+        assertEquals("'unknown@example.test'",
+                create.columns().get(2).defaultLiteral().orElseThrow().lexeme());
+        assertEquals(List.of("PRIMARY", "uk_email", "idx_tenant"),
+                create.indexes().stream().map(index -> index.name().value()).toList());
+        assertTrue(create.indexes().getFirst().clustered());
+        assertEquals(IndexKeyOrderNode.DESC,
+                create.indexes().get(1).keyParts().getFirst().order());
+
+        assertTrue(assertInstanceOf(
+                CreateTableStatementNode.class,
+                parser.parse("CREATE TABLE IF NOT EXISTS t (id BIGINT PRIMARY KEY)"))
+                .ifNotExists());
+        assertThrows(SqlSyntaxException.class,
+                () -> parser.parse(
+                        "CREATE TABLE t (id BIGINT PRIMARY KEY,)"));
+    }
+
+    /**
+     * 两种生产导出的 CREATE TABLE 必须整体消费列注释、整数显示宽度、自增、索引算法和表注释；
+     * 这些 token 不能被跳过，否则 Binder/DD 无法建立可恢复的精确元数据。
+     */
+    @Test
+    void parsesMysqlExportedCreateTableWithCommentsAutoIncrementAndUsingBtree() {
+        assertDoesNotThrow(() -> parser.parse("""
+                CREATE TABLE `tb_customer` (
+                  `id` bigint(20) NOT NULL COMMENT '主键ID',
+                  `company_id` bigint(20) NOT NULL COMMENT '企业ID',
+                  `customer_name` varchar(255) NOT NULL COMMENT '客户名称',
+                  `customer_type` varchar(20) NOT NULL COMMENT '客户类型',
+                  `customer_cate` varchar(20) DEFAULT NULL COMMENT '客户分类',
+                  `customer_level` varchar(20) DEFAULT NULL COMMENT '客户级别',
+                  `contact_name` varchar(50) DEFAULT NULL COMMENT '联系人',
+                  `contact_phone` varchar(64) DEFAULT NULL COMMENT '联系人手机号',
+                  `company_nature` varchar(20) DEFAULT NULL COMMENT '公司性质',
+                  `company_industry` varchar(20) DEFAULT NULL COMMENT '所属行业',
+                  `credit_level` varchar(20) DEFAULT NULL COMMENT '信用等级',
+                  `customer_star` decimal(2,1) DEFAULT NULL COMMENT '客户星级',
+                  `email` varchar(255) DEFAULT NULL COMMENT '邮箱',
+                  `sex` varchar(20) DEFAULT NULL COMMENT '性别',
+                  `certificate_type` varchar(20) DEFAULT NULL COMMENT '证件类型',
+                  `certificate_cdoe` varchar(255) DEFAULT NULL COMMENT '证件号码',
+                  `address` varchar(255) DEFAULT NULL COMMENT '地址',
+                  `attachments` json DEFAULT NULL COMMENT '附件',
+                  `status` tinyint(1) NOT NULL DEFAULT '1' COMMENT '状态(0:禁用,1:正常)',
+                  `remark` varchar(200) DEFAULT NULL COMMENT '备注',
+                  `update_time` datetime DEFAULT NULL COMMENT '更新时间',
+                  `update_user` bigint(20) DEFAULT NULL COMMENT '更新人',
+                  `create_time` datetime DEFAULT NULL COMMENT '创建时间',
+                  `create_user` bigint(20) DEFAULT NULL COMMENT '创建人',
+                  `deleted` tinyint(4) NOT NULL DEFAULT '0' COMMENT '是否删除：0-否,1-是',
+                  PRIMARY KEY (`id`) USING BTREE
+                ) COMMENT='客户信息';
+                """));
+
+        assertDoesNotThrow(() -> parser.parse("""
+                CREATE TABLE `tb_gw_device_relation` (
+                  `id` bigint(15) NOT NULL AUTO_INCREMENT COMMENT 'id',
+                  `product_key` varchar(50) DEFAULT '' COMMENT '设备productKey（接口返回）',
+                  `device_key` varchar(50) DEFAULT '' COMMENT '设备deviceKey（接口返回）',
+                  `business_type` varchar(50) DEFAULT '' COMMENT '业务类型（查看代码）',
+                  `data_id` bigint(15) DEFAULT '-1' COMMENT '设备数据id（系统创建）',
+                  PRIMARY KEY (`id`) USING BTREE,
+                  UNIQUE KEY `product_key` (`product_key`,`device_key`) USING BTREE
+                ) COMMENT='格物设备数据关联表';
+                """));
+    }
+
+    /** INSERT values 必须允许显式列清单或表序列，并把多个行构造器视为一个 statement。 */
+    @Test
+    void parsesMultiRowInsertWithOptionalColumnList() {
+        assertDoesNotThrow(() -> parser.parse(
+                "INSERT INTO t (id, name) VALUES (1, 'a'), (2, 'b')"));
+        assertDoesNotThrow(() -> parser.parse(
+                "INSERT INTO t VALUES (1, 'a'), (2, 'b')"));
     }
 
     /** 独立 DROP INDEX 与 ALTER TABLE DROP INDEX 必须归一为同一个 AST，避免两条 DDL 链产生不同恢复语义。 */
@@ -296,7 +513,7 @@ class DefaultSqlParserTest {
     @Test
     void rejectsUnsupportedShapesAndBrokenFraming() {
         String[] invalid = {
-                "", "INSERT INTO t VALUES (1)", "INSERT INTO t(id) VALUES (1),(2)",
+                "",
                 "SELECT * FROM t", "SELECT * FROM t WHERE id <> 1",
                 "SELECT * FROM t WHERE id=1; SELECT 1", "INSERT INTO t(id) VALUES (X'ABC')",
                 "INSERT INTO t(id) VALUES (B'012')", "SELECT * FROM `t WHERE id=1", "BEGIN garbage",

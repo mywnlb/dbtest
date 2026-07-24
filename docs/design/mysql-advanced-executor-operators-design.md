@@ -177,6 +177,13 @@ Join 执行规则：
 - Hash join build side 不保存 `StorageRowHandle`，只保存 materialized row 和 join key。
 - spill partition 按 hash 分区写入 temp file，probe 时逐分区加载。
 
+当前生产切片（2026-07-24）只落地二表等值 INNER JOIN：`NestedLoopJoinNode` 固定 SQL
+左表为 outer，右侧由 `PhysicalJoinProbe` 在每个非 NULL outer key 上创建 NEW
+point、ordinary-secondary-prefix 或 full-scan access node。point/prefix 对应本表中的
+Index Nested Loop 语义，但复用同一个 `NestedLoopJoinNode`，没有仅为类名再复制一套状态机。
+全部 child 共享 statement `SqlCursorScope` 的 deadline、operation lease 和 RC ReadView。
+Hash/merge、spill、join reorder、outer/multi-way/locking join 仍是本厚设计的后续目标。
+
 ### 7.2 Aggregation / GROUP BY
 
 聚合流程见 [advanced-executor-aggregate-flow.mmd](diagrams/advanced-executor-aggregate-flow.mmd)。
@@ -559,7 +566,43 @@ WindowExecutor 支持：
 | 14 | 异常与恢复 | 已覆盖 join、aggregate、filesort、temp IO、subquery、window、cancel 的 cleanup 策略 |
 | 15 | 测试与顺序 | 已给出测试设计、实现顺序，并确认没有未完成标记或空白项 |
 
-## 18. 参考链接
+## 18. 分堆排序、Top-N 与外部归并实现约束（2026-07-24）
+
+### 18.1 统一排序键
+
+`SortKey` 由按 Binder 顺序编码的 typed value、方向描述和 statement sequence 组成。比较器先按 SQL 类型和
+NULL 规则比较用户 key，完全相等时按 sequence 升序，保证内存排序、分堆 run 与多轮归并结果一致。
+排序层不读取 `BufferFrame` 或 record header；输入行必须先转换为 executor-owned row snapshot。
+
+### 18.2 分堆 run 生成
+
+内存配额按实际 retained row snapshot、排序键和容器开销记账。达到配额时，将当前分区构造成 heap，
+持续弹出形成一个有序 run，再释放该分区内存；因此“分堆”表示多个独立有序堆/run，而不是把全部输入
+留在一个无限集合中。run 至少含 header（magic/version/schema fingerprint）、逐 frame length/payload/CRC
+和 trailer row count。超过单语句临时文件字节预算时立即取消排序并清理全部 run。
+
+### 18.3 多轮归并
+
+一次最多打开 `fanIn=16` 个 run，通过最小堆保存每个输入头记录；弹出最小记录后只从对应 run 拉取下一条。
+超过 16 个 run 时生成下一层 run，直到剩一个输出。每轮输入在成功关闭输出并校验 trailer 后才删除；
+异常时 guard 同时清理已完成输出、半成品与尚未消费输入。任何 CRC、版本、长度或 schema fingerprint
+不符都抛数据处理异常，不返回部分有序结果。
+
+### 18.4 Top-N 最大堆
+
+当 optimizer 选择 Top-N 时保留 `offset+limit` 个最小元素，堆顶是当前最差元素；新行更优才替换堆顶。
+扫描完成后将堆内容按统一比较器排序，丢弃 offset 并输出 limit。`offset+limit=0` 直接完成。
+Top-N 在输出前若超过内存配额，必须把已保留项连同后续输入转交外部排序；不得清空重扫 storage cursor。
+
+### 18.5 生命周期与并发边界
+
+Sort/TopN 的 `open/next/close` 状态机为 NEW→OPEN→EXHAUSTED→CLOSED，close 幂等。当前 run 生成期间
+child cursor 仍保持 OPEN 以继续拉取输入，但写盘前已经把当前行复制为独立 `SqlValue`，不持有 row view、
+page latch、buffer fix 或事务锁等待对象；全部输入形成 run 后先关闭 child，再进入多轮归并。当前只在输入、
+run 编码和 merge pop 边界检查 statement deadline，独立 kill/cancel token 尚未接。临时目录清理由实例级
+`ReentrantLock` 保护，删除目标必须先解析并验证仍位于配置目录及当前实例命名空间。
+
+## 19. 参考链接
 
 - MySQL 8.0 Reference Manual - Nested-Loop Join Algorithms: https://dev.mysql.com/doc/refman/8.0/en/nested-loop-joins.html
 - MySQL 8.0 Reference Manual - Hash Join Optimization: https://dev.mysql.com/doc/refman/8.0/en/hash-joins.html

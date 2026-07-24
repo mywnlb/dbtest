@@ -55,7 +55,10 @@ public final class DictionaryStorageMetadataMapper {
         try {
             StorageTableDefinition storageTable = new StorageTableDefinition(table.id().value(), binding.spaceId(),
                     binding.path(), binding.rowFormatVersion(), RUNTIME_MAPPING_INITIAL_SIZE,
-                    columns(table), indexes(table));
+                    columns(table), indexes(table),
+                    table.columns().stream().anyMatch(column ->
+                            column.generation()
+                                    == cn.zhangyis.db.dd.domain.ColumnGeneration.AUTO_INCREMENT));
             var tableIndexes = factory.createTable(storageTable, binding);
             return new MappedTableStorage(table, storageTable, binding, binding.lobSegment(), tableIndexes);
         } catch (DictionaryStorageMappingException mappingFailure) {

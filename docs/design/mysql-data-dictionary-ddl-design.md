@@ -586,11 +586,17 @@ Atomic DDL recovery 流程见 [atomic-ddl-recovery-flow.mmd](diagrams/atomic-ddl
 
 本节只记录已从源码和测试核对的 v1 落点；前文仍是长期目标设计。
 
-- `cn.zhangyis.db.dd.domain/repo/tx/cache/mdl/service/ddl/recovery/sdi` 已落地 schema/table/index 不可变定义、repository、版本cache、MDL、CREATE/DROP TABLE、Online ADD/DROP INDEX、instant metadata、multi-index INPLACE、online shadow ALTER与SDI v1。
+- `cn.zhangyis.db.dd.domain/repo/tx/cache/mdl/service/ddl/recovery/sdi` 已落地 schema/table/index 不可变定义、
+  repository、版本 cache、MDL、CREATE/DROP SCHEMA、CREATE TABLE、原子多表 DROP、Online ADD/DROP INDEX、
+  instant metadata、multi-index INPLACE、online shadow ALTER 与 SDI v1 envelope。
 - `mysql.dd.ctrl` 使用双 4 KiB CRC32C 槽保存 ID/version high-water；启动时以已提交 catalog 对象/space/version、最大 DDL marker 与 `dictionaryVersion-1` 保守下界反向校正 high-water，防止新槽损坏导致 ID 复用。
 - `mysql.ibd` v1 实际是页对齐 append-only catalog sidecar，使用 frame CRC 和 batch SHA manifest；它尚不是前文目标中经 Buffer Pool/MTR/redo 管理的 InnoDB 字典 B+Tree。
 - 公共 `DatabaseEngine` 在打开 catalog 前调用 `CatalogBootstrapAdmission`：非空 `mysql.ibd` 只走 existing 格式校验；missing/empty 状态只有在 DD control、single/ring redo、redo/transaction control、任意稳定 undo、三类 doublewrite 与受控表空间候选都不存在时才可初始化。任一证据或扫描失败均抛 `DictionaryCatalogAdmissionException`，且尚未创建 storage、运行 DDL recovery 或 orphan cleanup。
-- `PersistentDdlLogRepository` 与普通DD repository共享`mysql.ibd`物理store，但分别只解释`DDL_LOG(7)`单记录批次与`CATALOG_COMMIT`批次；DDL log v4在v3 identity上增加execution protocol、source/intermediate/target schema digest、durable control/cancellation与retirement fence，并兼容解码v1-v3为`LEGACY_PHASE_ONLY`。identity、稳定code、checkpoint策略、phase/control转换、辅助路径/文件identity与UTF-8形状全部fail-closed。
+- `PersistentDdlLogRepository` 与普通 DD repository 共享 `mysql.ibd` 物理 store，但分别只解释
+  `DDL_LOG(7)` batch 与 `CATALOG_COMMIT` batch；DDL log v5 保留 v4 的 execution protocol、
+  source/intermediate/target schema digest、durable control/cancellation 与 retirement fence，并追加可选
+  batch manifest，兼容解码 v1-v4。identity、稳定 code、checkpoint 策略、phase/control 转换、路径、
+  file identity、manifest 与 UTF-8 shape 全部 fail-closed。
 - 字典 version 只要比已发布版本大即合法；先保留后 crash 会留下可解释的版本间隙，不得回退复用。
 - `DataDictionaryService.openTable` 按 schema→table 获取 MDL，再持有 cache pin；`TableMetadataLease.close` 统一逆序释放。
 - `storage.api.ddl.DdlUndoMarker(ddlOperationId,dictionaryVersion,affectedObjectId)` 是 DD 与未来 dictionary-row undo 共用的稳定数值关联对象；当前 sidecar DD 不把 marker 混入普通用户 row undo/history。
@@ -609,7 +615,12 @@ Atomic DDL recovery 流程见 [atomic-ddl-recovery-flow.mmd](diagrams/atomic-ddl
 - `TableStorageBinding.rowFormatVersion` 已与字典对象版本分离；CREATE INDEX 只推进 dictionary version，不改变已有聚簇记录编码。catalog 与 SDI 新格式显式持久化该值，旧格式缺失时仅按旧 table version 兼容推导。
 - 任一 DD/marker append 向调用方报错都可能已经 durable，当前进程不猜测补偿；下一次启动从 committed batches 重建双方最新真相。无 DDL log 的旧 DROP_PENDING 与受控命名 orphan cleanup 仍兼容。
 - DD discovery 从 ACTIVE/DROP_PENDING table 只返回稳定 storage API binding；公共 `cn.zhangyis.db.engine.DatabaseEngine` 再转换 recovery tablespace 配置，在 storage rollback/RESUME_PURGE 后运行 logged DDL recovery 与 legacy cleanup，全部完成后才发布 OPEN。
-- SDI v1 使用 GENERAL 表空间固定 page3 与 page0 `SDI_ROOT=3`；`DictionarySdiCodec` 保存完整 ACTIVE table/column/index/storage binding 聚合，storage 只持 opaque payload + identity/version + CRC32C。page3 尾部保留独立 96-byte index DDL descriptor，footer v2 显式保存 BUILD/DROP action并兼容把 v1 解读为 BUILD；普通 SDI rewrite 不覆盖它。启动逐张比较 committed ACTIVE DD，root=0、空页、逻辑 CRC/内容错配会重写，未知 root、action/CRC/reserved bytes 或物理页损坏均 fail-closed。
+- SDI v1 envelope 使用 GENERAL 表空间固定 page3 与 page0 `SDI_ROOT=3`；`DictionarySdiCodec` 的逻辑
+  payload v4 保存完整 ACTIVE table/column/index/storage binding、comment 与 generation 聚合，storage 只持
+  opaque payload + identity/version + CRC32C。page3 尾部保留独立 96-byte index DDL descriptor，footer v2
+  显式保存 BUILD/DROP action并兼容把 v1 解读为 BUILD；普通 SDI rewrite 不覆盖它。启动逐张比较
+  committed ACTIVE DD，root=0、空页、逻辑 CRC/内容错配会重写，未知 root、action/CRC/reserved bytes
+  或物理页损坏均 fail-closed。
 - `UndoRecordCodec.peekIdentity`、`IndexMetadataResolver` 和 `engine.adapter.DictionaryIndexMetadataResolver` 已让 rollback/purge 按 tableId/indexId 解析目标 B+Tree，legacy 单索引构造仅供低层兼容。
 - 对象级 force recovery 新增稳定 `TableState.RECOVERY_UNAVAILABLE(6)` 与
   `RECOVERY_DISCARDED(7)`；普通 lookup/cache、ACTIVE SDI reconcile 和用户表空间 discovery 均隐藏，
@@ -634,11 +645,75 @@ Atomic DDL recovery 流程见 [atomic-ddl-recovery-flow.mmd](diagrams/atomic-ddl
   共享空间隔离、跨实例信任与自动 repair 不在该切片范围。
 - CREATE INDEX v1 已实现持久 row-log 与 final cutover，但仍不支持复制 binlog、并行/外排 build、prefix key part、FULLTEXT/SPATIAL、异步 job/status SQL 或持久 scan continuation；它是教学型 online build，不承诺 MySQL 8.0 的完整 ALGORITHM/LOCK 兼容矩阵。
 - marker schema digest、durable cancel/control CAS、Online DROP、instant metadata、multi-index INPLACE与online shadow ALTER已进入生产；可观察性当前仅为Java/admin facade，尚无SQL/网络协议或完整权限系统。
-- 独立DDL log v4覆盖稳定operation 1..11并兼容v1-v3；CREATE SCHEMA尚无marker，因此control reconciliation仍用committed dictionary version提供保守下界。temporary undo也未接，在临时表owner/lifecycle与独立temporary tablespace完成前继续拒绝进入普通undo。
+- 独立 DDL log v5 覆盖稳定 operation 1..13 并兼容 v1-v4；operation 12/13 以分块 batch manifest
+  记录原子多表 DROP 与 DROP SCHEMA CASCADE。单独 CREATE SCHEMA 仍不写 marker，control reconciliation
+  使用 committed dictionary version 提供保守下界。temporary undo 也未接，在临时表 owner/lifecycle
+  与独立 temporary tablespace 完成前继续拒绝进入普通 undo。
 - table DROP barrier不持久化独立计数；Online DROP INDEX则持久化history high-water、source version和retired index resource，但恢复仍从page3/undo first-page重建真实history引用。当前仍是单rseg、单线程purge。
 - orphan cleanup 只处理 `tables/` 下符合受控命名规则且未被 catalog 引用的文件，不扫描或删除任意路径；missing/empty catalog 遇到同一 glob 候选时会先被 admission guard 阻断，不能用空字典驱动删除。
 
-## 20. 参考链接
+## 20. CREATE 元数据扩展与基础 DDL v2（2026-07-24）
+
+### 20.1 列定义、版本和兼容读取
+
+`ColumnDefinition` 在既有名称、类型、序号和默认值之外持久化：
+
+- `comment`：非空字符串值对象，UTF-8 最多 1024 字节；
+- `generation`：`NONE` 或 `AUTO_INCREMENT`。
+
+Catalog 列 payload 升级为 v3，SDI 升级为 v4，online ALTER action payload 升级为 v2；解码器继续读取
+旧版本，并为缺失字段补空注释和 `NONE`。表 schema digest 采用扩展尾段：当所有新增字段均为默认值时，
+仍输出旧字节；只有出现注释或自增列时，才在索引段之后追加全局 magic、扩展版本及逐列扩展，从而保持
+现有表的 digest 与恢复 marker 兼容。任何未知版本、重复扩展或截断 payload 必须 fail-closed。
+
+`CreateTableCommand` 必须携带 `TableOptions`，SQL 网关不得再次构造空选项；`CreateColumnSpec` 必须完整携带
+comment/generation，兼容构造器只能为旧调用者补默认值，生产转换链必须显式传递字段。
+
+### 20.2 自增列 DD 不变量
+
+每张表至多一个 `AUTO_INCREMENT` 列。DD 在 PREPARED 之前验证：列为整数、`NOT NULL`、没有显式默认值，
+并且等于聚簇主键第一 key part。DD 是“该表是否具有自增语义”的权威来源，表空间页 0 是“已消耗
+high-water”的物理权威来源；二者不一致时拒绝打开表，不能猜测或自动修复。发号器在修改 high-water
+前必须按 exact DD 整数位宽和 signed/unsigned 属性计算列域上限；不能把页 0 的无符号 64 位容量误当成
+每种整数列的合法范围，持久 high-water 已超列域时必须 fail-closed。
+
+### 20.3 IF 语义与 warning
+
+DDL 结果携带不可变 `List<SqlWarning>`。对象已存在/不存在且指定 `IF` 时返回成功并分别生成
+1007（schema exists）、1008（schema missing）、1050（table exists）、1051（table missing）；
+`withStatus` 必须保留 warning。即使是 warning/no-op DDL，也执行 DDL 隐式提交边界，避免会话事务状态
+与有副作用 DDL 形成两套规则。
+
+### 20.4 原子多表 DROP
+
+多表 DROP 是一个 DDL operation，而不是循环调用单表 DROP。协调顺序如下：
+
+1. 归一化并验证全部表都为 ACTIVE；未指定 `IF EXISTS` 时，任一缺失都在写 marker 前令整个语句失败。
+2. 按 canonical schema MDL key 取得全部 schema IX，再按 canonical table MDL key 取得全部 table X；
+   等待每张表的普通 purge barrier，
+   等待期间不能持有页 latch、buffer fix 或文件锁。
+3. 冻结所有目标并写一个 PREPARED marker；随后安装全部 plan-cache admission barrier。
+4. 在一个 DD transaction 中把所有表推进为 DROP_PENDING。pending 对新打开者可见后，再等待旧 cache pin，
+   丢弃 change buffer，并按 manifest 删除物理空间。
+5. 在一个 DD transaction 中写全部 table tombstone/DROPPED，最后写 terminal marker；任一中途崩溃均由同一
+   manifest 决定整体前滚，不能留下部分 ACTIVE。
+
+`DROP SCHEMA` 取得 schema X 并冻结其 ACTIVE 表集合；遇到 recovery-isolated 表、未解析 marker 或缺失
+tablespace binding 时拒绝。空 schema 仍使用 op13 marker 和固定 pending/target 两个版本，只是没有物理
+表循环；非空 schema 复用批量 DROP 管线，并在同一终结事务中写 schema 与全部 table tombstone。
+
+### 20.5 DDL log v5 与恢复判定
+
+稳定 operation code 新增 12=`DROP_TABLE_BATCH`、13=`DROP_SCHEMA_CASCADE`。DDL log v5 在同一组
+`DDL_LOG` 记录中分块嵌入排序后的 `DdlBatchManifest`：每项包含 tableId、spaceId、受控相对路径、
+rowFormatVersion、source/pending/target schema digest；级联操作再携带 schema identity/digest。
+解码器继续接受 v1-v4。
+
+恢复只接受三种全局一致状态：全部 ACTIVE 且只有 PREPARED 时回滚 marker；全部 DROP_PENDING 时按 manifest
+前滚；全部 tombstone/DROPPED 时补 terminal。混合状态、digest 不符、路径越界或身份重用一律隔离并
+fail-closed。恢复在删除文件前必须重新确认持久 history 与 cache pin 安全条件，不能把重启等价于“无人引用”。
+
+## 21. 参考链接
 
 - MySQL 8.0 Reference Manual - MySQL Data Dictionary: https://dev.mysql.com/doc/refman/8.0/en/data-dictionary.html
 - MySQL 8.0 Reference Manual - Transactional Storage of Dictionary Data: https://dev.mysql.com/doc/refman/8.0/en/data-dictionary-transactional-storage.html

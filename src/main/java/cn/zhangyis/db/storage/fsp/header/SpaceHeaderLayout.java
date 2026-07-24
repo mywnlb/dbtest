@@ -84,6 +84,15 @@ public final class SpaceHeaderLayout {
     /** 截断完成后要发布的稳定状态码（4B，ends 238）。 */
     public static final int LIFECYCLE_FINISH_STATE = LIFECYCLE_TARGET_SIZE + 8; // 234 int
 
+    /** 自增扩展格式版本（4B）；0 表示旧表。 */
+    public static final int AUTO_INCREMENT_FORMAT = LIFECYCLE_FINISH_STATE + 4; // 238 int
+    /** 已消耗最大自增值的 unsigned-long 原始位（8B）。 */
+    public static final int AUTO_INCREMENT_HIGH_WATER = AUTO_INCREMENT_FORMAT + 4; // 242 long
+    /** 自增扩展 flags（4B），当前仅 bit0 active。 */
+    public static final int AUTO_INCREMENT_FLAGS = AUTO_INCREMENT_HIGH_WATER + 8; // 250 int
+    /** 必须保持为 0 的 2B 保留区起点。 */
+    public static final int AUTO_INCREMENT_RESERVED = AUTO_INCREMENT_FLAGS + 4; // 254
+
     /** XDES entries 内嵌 page 0 的起始偏移（base 区之后预留到 256）。 */
     public static final int XDES_BASE = 256;
 }

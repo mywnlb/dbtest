@@ -9,12 +9,23 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
  * @param defaultCharsetId 参与 {@code 构造} 的原始数值身份 {@code defaultCharsetId}；必须非负，零值仅用于对应格式明确声明的系统或空身份
  * @param defaultCollationId 参与 {@code 构造} 的原始数值身份 {@code defaultCollationId}；必须非负，零值仅用于对应格式明确声明的系统或空身份
  * @param version 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
+ * @param state schema 的可见生命周期
  */
 public record SchemaDefinition(SchemaId id, ObjectName name, int defaultCharsetId,
-                               int defaultCollationId, DictionaryVersion version) {
+                               int defaultCollationId, DictionaryVersion version,
+                               SchemaState state) {
     public SchemaDefinition {
-        if (id == null || name == null || version == null || defaultCharsetId < 0 || defaultCollationId < 0) {
+        if (id == null || name == null || version == null || state == null
+                || defaultCharsetId < 0 || defaultCollationId < 0) {
             throw new DatabaseValidationException("invalid schema definition");
         }
+    }
+
+    /** 保留 schema 生命周期引入前的构造形状，新建对象默认为 ACTIVE。 */
+    public SchemaDefinition(
+            SchemaId id, ObjectName name, int defaultCharsetId,
+            int defaultCollationId, DictionaryVersion version) {
+        this(id, name, defaultCharsetId, defaultCollationId,
+                version, SchemaState.ACTIVE);
     }
 }

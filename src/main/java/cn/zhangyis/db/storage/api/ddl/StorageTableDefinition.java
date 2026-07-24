@@ -20,10 +20,12 @@ import java.util.Set;
  * @param initialSizeInPages 调用方提供的长度或容量值对象；不得为 {@code null}，且必须已通过其构造范围校验
  * @param columns 参与 {@code 构造} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
  * @param indexes 参与 {@code 构造} 的有序或去重元素集合；不得为 {@code null}，空集合表示没有元素，集合内不得包含 Java {@code null}
+ * @param autoIncrement 是否初始化页 0 自增格式为 active；列位置/类型已由 DD 验证
  */
 public record StorageTableDefinition(long tableId, SpaceId spaceId, Path path, long schemaVersion,
                                      PageNo initialSizeInPages, List<StorageColumnDefinition> columns,
-                                     List<StorageIndexDefinition> indexes) {
+                                     List<StorageIndexDefinition> indexes,
+                                     boolean autoIncrement) {
     public StorageTableDefinition {
         if (tableId <= 0 || spaceId == null || path == null || schemaVersion <= 0 || initialSizeInPages == null
                 || columns == null || columns.isEmpty() || indexes == null || indexes.isEmpty()) {
@@ -57,5 +59,16 @@ public record StorageTableDefinition(long tableId, SpaceId spaceId, Path path, l
                 }
             }
         }
+    }
+
+    /**
+     * 保留无自增语义的 v1 构造入口。
+     */
+    public StorageTableDefinition(
+            long tableId, SpaceId spaceId, Path path, long schemaVersion,
+            PageNo initialSizeInPages, List<StorageColumnDefinition> columns,
+            List<StorageIndexDefinition> indexes) {
+        this(tableId, spaceId, path, schemaVersion, initialSizeInPages,
+                columns, indexes, false);
     }
 }

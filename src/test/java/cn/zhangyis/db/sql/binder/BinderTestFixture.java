@@ -33,6 +33,7 @@ final class BinderTestFixture implements AutoCloseable {
             transaction.createSchema(new SchemaDefinition(SchemaId.of(1), ObjectName.of("app"), 1, 1,
                     DictionaryVersion.of(2)));
             transaction.createTable(orders(directory));
+            transaction.createTable(customers(directory));
             transaction.createTable(prefixPrimary(directory));
             transaction.createTable(lobPrimary(directory));
             transaction.createTable(unbound());
@@ -71,6 +72,23 @@ final class BinderTestFixture implements AutoCloseable {
         IndexDefinition primary = new IndexDefinition(IndexId.of(13), ObjectName.of("PRIMARY"), true, true,
                 List.of(new IndexKeyPart(11, IndexOrder.ASC, 4)));
         return table(12, "prefix_key", List.of(code), List.of(primary), directory, Optional.empty());
+    }
+
+    private static TableDefinition customers(Path directory) {
+        List<ColumnDefinition> columns = List.of(
+                new ColumnDefinition(41, ObjectName.of("id"),
+                        ColumnTypeDefinition.integer(false, false), 0),
+                new ColumnDefinition(42, ObjectName.of("note"),
+                        new ColumnTypeDefinition(DictionaryTypeId.VARCHAR,
+                                false, true, 128, 0, 1, 1, List.of()), 1),
+                new ColumnDefinition(43, ObjectName.of("status"),
+                        new ColumnTypeDefinition(DictionaryTypeId.VARCHAR,
+                                false, false, 32, 0, 1, 1, List.of()), 2));
+        IndexDefinition primary = new IndexDefinition(
+                IndexId.of(44), ObjectName.of("PRIMARY"), true, true,
+                List.of(new IndexKeyPart(41, IndexOrder.ASC, 0)));
+        return table(40, "customers", columns, List.of(primary),
+                directory, Optional.empty());
     }
 
     private static TableDefinition lobPrimary(Path directory) {

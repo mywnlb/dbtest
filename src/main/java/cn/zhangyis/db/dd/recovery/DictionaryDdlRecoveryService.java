@@ -4,6 +4,9 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.dd.cache.DictionaryObjectCache;
 import cn.zhangyis.db.dd.ddl.DdlControlCasResult;
 import cn.zhangyis.db.dd.ddl.DdlControlState;
+import cn.zhangyis.db.dd.ddl.DdlBatchManifest;
+import cn.zhangyis.db.dd.ddl.DdlBatchSchemaEntry;
+import cn.zhangyis.db.dd.ddl.DdlBatchTableEntry;
 import cn.zhangyis.db.dd.ddl.DdlExecutionProtocol;
 import cn.zhangyis.db.dd.ddl.DdlSchemaDigest;
 import cn.zhangyis.db.dd.ddl.DdlSchemaDigestService;
@@ -31,6 +34,7 @@ import cn.zhangyis.db.dd.domain.ColumnTypeDefinition;
 import cn.zhangyis.db.dd.domain.DictionaryVersion;
 import cn.zhangyis.db.dd.domain.IndexDefinition;
 import cn.zhangyis.db.dd.domain.SchemaDefinition;
+import cn.zhangyis.db.dd.domain.SchemaState;
 import cn.zhangyis.db.dd.domain.TableDefinition;
 import cn.zhangyis.db.dd.domain.TableId;
 import cn.zhangyis.db.dd.domain.TableState;
@@ -975,7 +979,392 @@ public final class DictionaryDdlRecoveryService {
             case DROP_RECOVERY_UNAVAILABLE -> recoverUnavailableDrop(record, timeout);
             case IMPORT_RECOVERY_REPLACEMENT -> recoverReplacementImport(record, timeout);
             case ALTER_TABLE_INPLACE -> recoverInplaceAlter(record, timeout);
+            case DROP_TABLE_BATCH -> recoverBatchDrop(record, timeout, false);
+            case DROP_SCHEMA_CASCADE -> recoverBatchDrop(record, timeout, true);
         }
+    }
+
+    /**
+     * 依据 v5 manifest 原子恢复多表 DROP 或 DROP SCHEMA CASCADE。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 operation/protocol/manifest 形状，并逐项核对 DD identity、binding、受控路径和 exact digest。</li>
+     *     <li>把整个集合分类为全 ACTIVE、全 DROP_PENDING 或全 DROPPED；任一混合/第三状态 fail-closed。</li>
+     *     <li>全 ACTIVE 且仅 PREPARED 时回滚 marker；全 pending 时等待 history/cache 屏障并幂等删除全部文件。</li>
+     *     <li>物理阶段 durable 后在一个 DD transaction 中发布全部 table tombstone，并按需同时发布 schema tombstone。</li>
+     *     <li>全 DROPPED 终态只补缺失 phase；任何 phase 与全局状态不匹配都拒绝开放流量。</li>
+     * </ol>
+     *
+     * @param record 非终态 DROP_TABLE_BATCH 或 DROP_SCHEMA_CASCADE marker
+     * @param timeout 每张表 history、cache pin 与物理删除共用的正等待上限
+     * @param cascadeSchema 当前 operation 是否必须携带并最终发布 schema tombstone
+     * @throws DictionaryRecoveryException manifest、DD、路径、摘要、phase 或全局状态不一致时抛出
+     */
+    private void recoverBatchDrop(
+            DdlLogRecord record,
+            Duration timeout,
+            boolean cascadeSchema) {
+        // 1. marker 只保存相对表路径的 manifest；任一辅助资源字段都属于不同恢复协议。
+        DdlLogOperation expected = cascadeSchema
+                ? DdlLogOperation.DROP_SCHEMA_CASCADE
+                : DdlLogOperation.DROP_TABLE_BATCH;
+        if (record.operation() != expected
+                || record.executionProtocol()
+                != DdlExecutionProtocol.BATCH_DROP_V1
+                || record.secondaryObjectId() != 0L
+                || record.auxiliaryPath().isPresent()
+                || record.fileIdentity().isPresent()
+                || record.sourceSchemaDigest().isPresent()
+                || record.intermediateSchemaDigest().isPresent()
+                || record.targetSchemaDigest().isPresent()
+                || record.retirementFence().isPresent()) {
+            throw new DictionaryRecoveryException(
+                    "batch DROP marker shape is invalid: ddl="
+                            + record.marker().ddlOperationId());
+        }
+        DdlBatchManifest manifest = record.batchManifest()
+                .orElseThrow(() -> new DictionaryRecoveryException(
+                        "batch DROP marker lacks manifest"));
+        if (cascadeSchema != manifest.schema().isPresent()
+                || !cascadeSchema && manifest.tables().isEmpty()) {
+            throw new DictionaryRecoveryException(
+                    "batch DROP manifest operation shape is invalid");
+        }
+        Path expectedPrimaryPath = manifest.tables().isEmpty()
+                ? tablesDirectory
+                : tablesDirectory.resolve(
+                manifest.tables().getFirst().relativePath())
+                .toAbsolutePath().normalize();
+        if (!record.path().equals(expectedPrimaryPath)) {
+            throw new DictionaryRecoveryException(
+                    "batch DROP marker primary path differs from manifest");
+        }
+
+        ArrayList<TableDefinition> currentTables =
+                new ArrayList<>(manifest.tables().size());
+        BatchTableState aggregateState = null;
+        for (DdlBatchTableEntry entry : manifest.tables()) {
+            TableDefinition table = repository.findTableForRecovery(
+                    entry.tableId()).orElseThrow(() ->
+                    new DictionaryRecoveryException(
+                            "batch DROP table is absent: "
+                                    + entry.tableId().value()));
+            SchemaDefinition owner = repository.snapshot().schemas()
+                    .get(table.schemaId());
+            if (owner == null) {
+                throw new DictionaryRecoveryException(
+                        "batch DROP table owner schema is absent: "
+                                + table.id().value());
+            }
+            TableStorageBinding binding = table.storageBinding()
+                    .orElseThrow(() -> new DictionaryRecoveryException(
+                            "batch DROP table has no binding: "
+                                    + table.id().value()));
+            Path path = checkedBatchPath(entry, binding);
+            if (binding.rowFormatVersion()
+                    != entry.rowFormatVersion()) {
+                throw new DictionaryRecoveryException(
+                        "batch DROP row format differs from manifest: "
+                                + table.id().value());
+            }
+            BatchTableState state = batchTableState(
+                    owner, table, entry, binding.rowFormatVersion());
+            if (aggregateState != null && aggregateState != state) {
+                throw new DictionaryRecoveryException(
+                        "batch DROP committed DD contains mixed lifecycle states");
+            }
+            if (state == BatchTableState.DROPPED
+                    && Files.exists(path)) {
+                throw new DictionaryRecoveryException(
+                        "batch DROP tombstone still has physical file: "
+                                + path);
+            }
+            aggregateState = state;
+            currentTables.add(table);
+        }
+        SchemaDefinition currentSchema = validateBatchSchema(
+                manifest.schema(), cascadeSchema);
+        if ((cascadeSchema
+                && aggregateState == BatchTableState.DROP_PENDING
+                && currentSchema.state() != SchemaState.ACTIVE)
+                || (cascadeSchema
+                && aggregateState == BatchTableState.DROPPED
+                && currentSchema.state() != SchemaState.DROPPED)) {
+            throw new DictionaryRecoveryException(
+                    "DROP SCHEMA manifest has non-atomic schema/table states");
+        }
+
+        // 2. ACTIVE 集合只有在 PREPARED 且 schema 也 ACTIVE 时能证明尚未越过 DD 提交边界。
+        DdlId ddlId = DdlId.of(
+                record.marker().ddlOperationId());
+        DdlLogPhase phase = record.phase();
+        if (aggregateState == BatchTableState.ACTIVE
+                || (aggregateState == null
+                && currentSchema.state() == SchemaState.ACTIVE
+                && phase == DdlLogPhase.PREPARED)) {
+            if (phase != DdlLogPhase.PREPARED
+                    || (cascadeSchema
+                    && currentSchema.state() != SchemaState.ACTIVE)) {
+                throw new DictionaryRecoveryException(
+                        "batch DROP ACTIVE set has forward-only marker phase");
+            }
+            repository.ddlLog().transition(
+                    ddlId, DdlLogPhase.PREPARED,
+                    DdlLogPhase.ROLLED_BACK);
+            return;
+        }
+        if (aggregateState == null
+                && currentSchema.state() == SchemaState.ACTIVE
+                && phase != DdlLogPhase.DICTIONARY_COMMITTED
+                && phase != DdlLogPhase.ENGINE_DONE) {
+            throw new DictionaryRecoveryException(
+                    "empty schema DROP state/phase is inconsistent");
+        }
+
+        // 3. pending 集合必须已有 DD commit phase；恢复重新等待持久 history 和旧 metadata pin。
+        if (aggregateState == BatchTableState.DROP_PENDING) {
+            if (phase != DdlLogPhase.DICTIONARY_COMMITTED
+                    && phase != DdlLogPhase.ENGINE_DONE) {
+                throw new DictionaryRecoveryException(
+                        "batch DROP pending set has invalid marker phase: "
+                                + phase);
+            }
+            for (int index = 0; index < currentTables.size();
+                 index++) {
+                TableDefinition table = currentTables.get(index);
+                DdlBatchTableEntry entry =
+                        manifest.tables().get(index);
+                TableStorageBinding binding =
+                        table.storageBinding().orElseThrow();
+                Path path = checkedBatchPath(entry, binding);
+                purgeBarrier.awaitUnreferenced(
+                        table.id().value(), timeout);
+                if (!cache.awaitUnpinned(table.id(), timeout)) {
+                    throw new DictionaryRecoveryException(
+                            "timed out waiting batch DROP metadata pin: "
+                                    + table.id().value());
+                }
+                if (phase == DdlLogPhase.ENGINE_DONE
+                        && Files.exists(path)) {
+                    throw new DictionaryRecoveryException(
+                            "batch DROP ENGINE_DONE still has file: "
+                                    + path);
+                }
+                if (Files.exists(path)) {
+                    physical.dropTable(binding, timeout);
+                }
+            }
+            if (phase == DdlLogPhase.DICTIONARY_COMMITTED) {
+                repository.ddlLog().transition(
+                        ddlId, phase, DdlLogPhase.ENGINE_DONE);
+                phase = DdlLogPhase.ENGINE_DONE;
+            }
+        } else if (aggregateState == BatchTableState.DROPPED
+                && phase != DdlLogPhase.ENGINE_DONE) {
+            throw new DictionaryRecoveryException(
+                    "batch DROP tombstone set has invalid marker phase: "
+                            + phase);
+        }
+        if (aggregateState == null
+                && phase == DdlLogPhase.DICTIONARY_COMMITTED) {
+            repository.ddlLog().transition(
+                    ddlId, phase, DdlLogPhase.ENGINE_DONE);
+            phase = DdlLogPhase.ENGINE_DONE;
+        }
+
+        // 4. pending 或空级联前滚共享 marker target version；schema 与所有表只在这一事务同时成为 tombstone。
+        if (aggregateState == BatchTableState.DROP_PENDING
+                || (aggregateState == null
+                && currentSchema.state() == SchemaState.ACTIVE)) {
+            DictionaryVersion targetVersion = DictionaryVersion.of(
+                    record.marker().dictionaryVersion() + 1);
+            ArrayList<TableDefinition> dropped =
+                    new ArrayList<>(currentTables.size());
+            for (int index = 0; index < currentTables.size();
+                 index++) {
+                TableDefinition table = currentTables.get(index);
+                TableDefinition target = new TableDefinition(
+                        table.id(), table.schemaId(), table.name(),
+                        targetVersion, TableState.DROPPED,
+                        table.columns(), table.indexes(),
+                        table.storageBinding(), table.options());
+                requireBatchDigest(
+                        manifest.tables().get(index)
+                                .targetSchemaDigest(),
+                        schemaDigests.digest(
+                                repository.snapshot().schemas()
+                                        .get(table.schemaId()),
+                                target,
+                                manifest.tables().get(index)
+                                        .rowFormatVersion()),
+                        "target table", table.id().value());
+                dropped.add(target);
+            }
+            SchemaDefinition schemaTarget = cascadeSchema
+                    ? schemaTarget(
+                    currentSchema,
+                    manifest.schema().orElseThrow(),
+                    targetVersion)
+                    : null;
+            commitRecoveredBatch(
+                    targetVersion, schemaTarget, dropped);
+            for (TableDefinition table : dropped) {
+                cache.invalidateTable(
+                        table.id(), targetVersion);
+            }
+            aggregateState = currentTables.isEmpty()
+                    ? null : BatchTableState.DROPPED;
+            currentSchema = schemaTarget == null
+                    ? currentSchema : schemaTarget;
+        }
+
+        // 5. terminal append 晚于原子 DD target；append outcome 不确定时下次仍从全 tombstone/ENGINE_DONE 补齐。
+        if (phase != DdlLogPhase.ENGINE_DONE
+                || (cascadeSchema
+                && currentSchema.state() != SchemaState.DROPPED)) {
+            throw new DictionaryRecoveryException(
+                    "batch DROP cannot reach terminal from observed state");
+        }
+        repository.ddlLog().transition(
+                ddlId, DdlLogPhase.ENGINE_DONE,
+                DdlLogPhase.COMMITTED);
+    }
+
+    /** 把一张 manifest 表按 exact digest 分类为三种且仅三种可恢复状态。 */
+    private BatchTableState batchTableState(
+            SchemaDefinition schema,
+            TableDefinition table,
+            DdlBatchTableEntry entry,
+            long rowFormatVersion) {
+        DdlSchemaDigest observed = schemaDigests.digest(
+                schema, table, rowFormatVersion);
+        return switch (table.state()) {
+            case ACTIVE -> {
+                requireBatchDigest(
+                        entry.sourceSchemaDigest(), observed,
+                        "source table", table.id().value());
+                yield BatchTableState.ACTIVE;
+            }
+            case DROP_PENDING -> {
+                requireBatchDigest(
+                        entry.pendingSchemaDigest(), observed,
+                        "pending table", table.id().value());
+                yield BatchTableState.DROP_PENDING;
+            }
+            case DROPPED -> {
+                requireBatchDigest(
+                        entry.targetSchemaDigest(), observed,
+                        "target table", table.id().value());
+                yield BatchTableState.DROPPED;
+            }
+            default -> throw new DictionaryRecoveryException(
+                    "batch DROP table has unsupported state: table="
+                            + table.id().value() + " state="
+                            + table.state());
+        };
+    }
+
+    /** 校验级联 schema 的 identity、名称和 source/target exact digest；非级联返回 {@code null}。 */
+    private SchemaDefinition validateBatchSchema(
+            Optional<DdlBatchSchemaEntry> expected,
+            boolean cascadeSchema) {
+        if (!cascadeSchema) {
+            return null;
+        }
+        DdlBatchSchemaEntry entry = expected.orElseThrow();
+        SchemaDefinition schema = repository.snapshot().schemas()
+                .get(entry.schemaId());
+        if (schema == null
+                || !schema.name().canonicalName()
+                .equals(entry.canonicalName())) {
+            throw new DictionaryRecoveryException(
+                    "DROP SCHEMA manifest identity/name differs from DD");
+        }
+        DdlSchemaDigest observed = schemaDigests.digest(schema);
+        requireBatchDigest(
+                schema.state() == SchemaState.ACTIVE
+                        ? entry.sourceSchemaDigest()
+                        : entry.targetSchemaDigest(),
+                observed, "schema", schema.id().value());
+        return schema;
+    }
+
+    /** 从 source schema 构造并校验 manifest 声明的 target tombstone。 */
+    private SchemaDefinition schemaTarget(
+            SchemaDefinition source,
+            DdlBatchSchemaEntry entry,
+            DictionaryVersion targetVersion) {
+        SchemaDefinition target = new SchemaDefinition(
+                source.id(), source.name(),
+                source.defaultCharsetId(),
+                source.defaultCollationId(),
+                targetVersion, SchemaState.DROPPED);
+        requireBatchDigest(
+                entry.targetSchemaDigest(),
+                schemaDigests.digest(target),
+                "target schema", target.id().value());
+        return target;
+    }
+
+    /** 校验 manifest 相对路径、table/space identity 与 committed binding 逐项相同。 */
+    private Path checkedBatchPath(
+            DdlBatchTableEntry entry,
+            TableStorageBinding binding) {
+        Path expected = tablesDirectory.resolve(
+                entry.relativePath()).toAbsolutePath().normalize();
+        Path checked = discovery.checkedPath(expected);
+        Path exact = tablesDirectory.resolve(
+                "table_" + entry.tableId().value()
+                        + "_space_" + entry.spaceId().value()
+                        + ".ibd").toAbsolutePath().normalize();
+        if (!checked.equals(exact)
+                || binding.tableId() != entry.tableId().value()
+                || !binding.spaceId().equals(entry.spaceId())
+                || !binding.path().toAbsolutePath().normalize()
+                .equals(exact)) {
+            throw new DictionaryRecoveryException(
+                    "batch DROP path/binding identity mismatch: table="
+                            + entry.tableId().value());
+        }
+        return exact;
+    }
+
+    /** 常量时间摘要值对象比较失败时附带 checkpoint 与对象 identity。 */
+    private static void requireBatchDigest(
+            DdlSchemaDigest expected,
+            DdlSchemaDigest observed,
+            String checkpoint,
+            long objectId) {
+        if (!expected.equals(observed)) {
+            throw new DictionaryRecoveryException(
+                    "batch DROP " + checkpoint
+                            + " digest mismatch: object=" + objectId);
+        }
+    }
+
+    /** 用一个 catalog transaction 发布级联 schema 与全部 table target。 */
+    private void commitRecoveredBatch(
+            DictionaryVersion version,
+            SchemaDefinition schema,
+            List<TableDefinition> tables) {
+        try (DictionaryTransaction transaction =
+                     repository.begin(version)) {
+            if (schema != null) {
+                transaction.updateSchema(schema);
+            }
+            for (TableDefinition table : tables) {
+                transaction.updateTable(table);
+            }
+            transaction.commit();
+        }
+    }
+
+    /** 批量 DROP 恢复只承认三种稳定的全局 table 生命周期。 */
+    private enum BatchTableState {
+        ACTIVE,
+        DROP_PENDING,
+        DROPPED
     }
 
     /**
@@ -2419,7 +2808,8 @@ public final class DictionaryDdlRecoveryService {
         indexes.add(storageIndex(newIndex));
         return new StorageTableDefinition(
                 table.id().value(), binding.spaceId(), binding.path(), binding.rowFormatVersion(),
-                PageNo.of(1), columns, indexes);
+                PageNo.of(1), columns, indexes,
+                hasAutoIncrement(table));
     }
 
     /** 把已经发布全部 indexes 的 DD aggregate 映射为物理验证 schema。 */
@@ -2434,7 +2824,15 @@ public final class DictionaryDdlRecoveryService {
         return new StorageTableDefinition(
                 table.id().value(), binding.spaceId(), binding.path(), binding.rowFormatVersion(),
                 PageNo.of(1), columns,
-                table.indexes().stream().map(DictionaryDdlRecoveryService::storageIndex).toList());
+                table.indexes().stream().map(DictionaryDdlRecoveryService::storageIndex).toList(),
+                hasAutoIncrement(table));
+    }
+
+    /** @return exact DD aggregate 是否声明唯一 AUTO_INCREMENT 列。 */
+    private static boolean hasAutoIncrement(TableDefinition table) {
+        return table.columns().stream().anyMatch(column ->
+                column.generation()
+                        == cn.zhangyis.db.dd.domain.ColumnGeneration.AUTO_INCREMENT);
     }
 
     /** 保持 DD type 的 nullable/length/collation/symbol 语义，不在恢复期推断或升级行格式。 */

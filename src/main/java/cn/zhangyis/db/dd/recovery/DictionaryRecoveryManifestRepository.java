@@ -3,6 +3,8 @@ package cn.zhangyis.db.dd.recovery;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.dd.domain.DictionaryVersion;
 import cn.zhangyis.db.dd.domain.IndexDefinition;
+import cn.zhangyis.db.dd.domain.SchemaDefinition;
+import cn.zhangyis.db.dd.domain.SchemaState;
 import cn.zhangyis.db.dd.domain.TableDefinition;
 import cn.zhangyis.db.dd.domain.TableState;
 import cn.zhangyis.db.dd.repo.DictionaryCatalogArchiveCodec;
@@ -402,11 +404,32 @@ public final class DictionaryRecoveryManifestRepository implements DictionaryDur
     /**
      * 构造只包含稳定服务/隔离状态且没有 DROPPED tombstone 的 rebuild baseline。
      * RECOVERY_UNAVAILABLE/RECOVERY_DISCARDED 保留逻辑 catalog 与 binding 供对象级恢复，但不会进入下方 ACTIVE path witness。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>从 append-only catalog 投影 ACTIVE schema，剔除已删除 identity，避免同名重建被误判为 baseline 重名。</li>
+     *     <li>剔除 DROPPED table，并验证其余表均为允许灾难恢复重建的稳定状态且具有物理 binding。</li>
+     *     <li>由保留表重新派生全局 index map，并构造与原 published version 一致的不可变快照。</li>
+     * </ol>
+     *
+     * @param source repository writer fence 内取得的权威不可变快照；不得为 {@code null}
+     * @return 不含 schema/table tombstone、可由 archive codec 严格校验和重建的稳定快照
+     * @throws DatabaseValidationException source 为空时抛出，调用方不得发布 manifest
+     * @throws DictionaryRecoveryManifestException 表处于临时状态、缺失 binding 或引用已删除 schema 时抛出，
+     *         调用方必须保留旧 clean manifest 并等待 DDL 恢复收敛
      */
     private static DictionarySnapshot stableSnapshot(DictionarySnapshot source) {
+        // 1. schema tombstone 仅服务普通 catalog 审计；clean baseline 只保存可见 identity。
         if (source == null) {
             throw new DatabaseValidationException("dictionary snapshot must not be null");
         }
+        Map<cn.zhangyis.db.dd.domain.SchemaId, SchemaDefinition> schemas = new LinkedHashMap<>();
+        source.schemas().values().stream()
+                .filter(schema -> schema.state() == SchemaState.ACTIVE)
+                .sorted(Comparator.comparingLong(schema -> schema.id().value()))
+                .forEach(schema -> schemas.put(schema.id(), schema));
+
+        // 2. 表必须处于稳定终态；保留表不得指向已经由 schema tombstone 隐藏的父对象。
         Map<cn.zhangyis.db.dd.domain.TableId, TableDefinition> tables = new LinkedHashMap<>();
         Map<cn.zhangyis.db.dd.domain.IndexId, IndexDefinition> indexes = new LinkedHashMap<>();
         source.tables().values().stream()
@@ -427,12 +450,17 @@ public final class DictionaryRecoveryManifestRepository implements DictionaryDur
                         throw new DictionaryRecoveryManifestException(
                                 "stable recovery table lacks storage binding: " + table.id().value());
                     }
+                    if (!schemas.containsKey(table.schemaId())) {
+                        throw new DictionaryRecoveryManifestException(
+                                "stable recovery table references dropped schema: " + table.id().value());
+                    }
                     tables.put(table.id(), table);
                     for (IndexDefinition index : table.indexes()) {
                         indexes.put(index.id(), index);
                     }
                 });
-        return new DictionarySnapshot(source.publishedVersion(), source.schemas(), tables, indexes);
+        // 3. 全局 index map 从保留表派生，不能把已删除表的索引身份带入灾难恢复 baseline。
+        return new DictionarySnapshot(source.publishedVersion(), schemas, tables, indexes);
     }
 
     /**

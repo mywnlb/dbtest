@@ -20,6 +20,7 @@ import cn.zhangyis.db.storage.api.DiskSpaceManager;
 import cn.zhangyis.db.storage.api.trx.PreparedTransactionService;
 import cn.zhangyis.db.storage.api.DiskSpaceUndoAllocator;
 import cn.zhangyis.db.storage.api.TablePurgeBarrier;
+import cn.zhangyis.db.storage.api.autoincrement.AutoIncrementService;
 import cn.zhangyis.db.storage.api.IndexRetirementHistoryBarrier;
 import cn.zhangyis.db.storage.api.ddl.TableDdlStorageService;
 import cn.zhangyis.db.storage.api.ddl.online.OnlineDdlTableGate;
@@ -273,6 +274,8 @@ public final class StorageEngine {
      * 本对象持有的 {@code miniTransactionManager} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
      */
     private MiniTransactionManager miniTransactionManager;
+    /** 页 0 high-water 的唯一运行时分配服务。 */
+    private AutoIncrementService autoIncrementService;
     /**
      * 本对象持有的 {@code diskSpaceManager} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
      */
@@ -676,6 +679,8 @@ public final class StorageEngine {
                 config.redoRotationEnabled() ? config.redoRotation().fileBytes() : Long.MAX_VALUE);
         this.miniTransactionManager = new MiniTransactionManager(
                 accessController, redo, redoCapacityThrottle, config.pageSize(), writeAdmission);
+        this.autoIncrementService = new AutoIncrementService(
+                miniTransactionManager, pool, flushService);
 
         this.typeRegistry = new TypeCodecRegistry();
         this.onlineDdlTableGate = new OnlineDdlTableGate();
@@ -2199,6 +2204,16 @@ public final class StorageEngine {
     public MiniTransactionManager miniTransactionManager() {
         requireOpen();
         return miniTransactionManager;
+    }
+
+    /**
+     * 返回组合根唯一自增分配服务；调用方只提交 SpaceId/value 请求，不接触页 0 或 MTR。
+     *
+     * @return 已打开引擎的自增 facade
+     */
+    public AutoIncrementService autoIncrementService() {
+        requireOpen();
+        return autoIncrementService;
     }
 
     /**

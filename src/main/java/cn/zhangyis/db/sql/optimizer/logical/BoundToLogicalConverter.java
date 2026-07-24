@@ -3,6 +3,7 @@ package cn.zhangyis.db.sql.optimizer.logical;
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.sql.binder.bound.BoundDelete;
 import cn.zhangyis.db.sql.binder.bound.BoundInsert;
+import cn.zhangyis.db.sql.binder.bound.BoundJoinSelect;
 import cn.zhangyis.db.sql.binder.bound.BoundRelationalStatement;
 import cn.zhangyis.db.sql.binder.bound.BoundSelect;
 import cn.zhangyis.db.sql.binder.bound.BoundUpdate;
@@ -41,12 +42,30 @@ public final class BoundToLogicalConverter {
                 RelNode scan = new LogicalTableScan(select.table(), select.lockMode());
                 RelNode filter = new LogicalFilter(
                         scan, PredicateSet.of(select.condition()));
-                yield new LogicalPlan(new LogicalProject(filter, select.projectionOrdinals()));
+                yield new LogicalPlan(new LogicalProject(
+                        filter, select.projectionOrdinals(),
+                        select.orderBy(), select.limit()));
+            }
+            case BoundJoinSelect select -> {
+                RelNode left = new LogicalTableScan(
+                        select.tables().getFirst(),
+                        SelectLockMode.CONSISTENT);
+                RelNode right = new LogicalTableScan(
+                        select.tables().getLast(),
+                        SelectLockMode.CONSISTENT);
+                RelNode join = new LogicalJoin(
+                        left, right,
+                        PredicateSet.of(select.joinCondition()));
+                RelNode filter = new LogicalFilter(
+                        join, PredicateSet.of(select.condition()));
+                yield new LogicalPlan(new LogicalProject(
+                        filter, select.projectionOrdinals(),
+                        select.orderBy(), select.limit()));
             }
             // 3、INSERT values 不经过 scan；UPDATE/DELETE 强制 current-read scan。
             case BoundInsert insert -> new LogicalPlan(new LogicalTableModify(
                     insert.table(), ModificationKind.INSERT,
-                    new LogicalValues(insert.table(), insert.values()), List.of(), List.of()));
+                    new LogicalValues(insert.table(), insert.batch()), List.of(), List.of()));
             case BoundUpdate update -> {
                 RelNode scan = new LogicalTableScan(update.table(), SelectLockMode.FOR_UPDATE);
                 RelNode filter = new LogicalFilter(

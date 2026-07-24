@@ -7,6 +7,8 @@ import cn.zhangyis.db.dd.domain.IndexOrder;
 import cn.zhangyis.db.dd.domain.MdlOwnerId;
 import cn.zhangyis.db.dd.domain.ObjectName;
 import cn.zhangyis.db.dd.domain.QualifiedTableName;
+import cn.zhangyis.db.dd.domain.SchemaDefinition;
+import cn.zhangyis.db.dd.domain.SchemaState;
 import cn.zhangyis.db.dd.domain.TableDefinition;
 import cn.zhangyis.db.dd.domain.TableState;
 import cn.zhangyis.db.dd.exception.DictionaryObjectNotFoundException;
@@ -1760,6 +1762,232 @@ class DictionaryDdlServiceTest {
                     repository.ddlLog().find(cn.zhangyis.db.dd.domain.DdlId.of(3)).orElseThrow().phase());
             assertEquals(5, repository.snapshot().publishedVersion().value(),
                     "recovery must publish the target version already reserved and covered by marker digest");
+        } finally {
+            storage.close();
+        }
+    }
+
+    /**
+     * 多表 DROP 的 pending 集合与 v5 manifest 必须共同前滚：故障后不能恢复成一张已删、一张仍 ACTIVE，
+     * 且恢复必须复用 live 已预留的 target version 与同一 marker identity。
+     */
+    @Test
+    void recoversAtomicBatchDropAfterPendingCrash() {
+        StorageEngine storage = new StorageEngine(config());
+        storage.open();
+        Path tables = directory.resolve("batch-pending-tables");
+        try (FileInternalCatalogStore catalog =
+                     FileInternalCatalogStore.openOrCreate(
+                             directory.resolve(
+                                     "batch-pending-mysql.ibd"));
+             DictionaryControlStore control =
+                     DictionaryControlStore.openOrCreate(
+                             directory.resolve(
+                                     "batch-pending-mysql.dd.ctrl"),
+                             SpaceId.of(1), 1024)) {
+            PersistentDictionaryRepository repository =
+                    new PersistentDictionaryRepository(catalog);
+            DictionaryObjectCache cache =
+                    new DictionaryObjectCache(16);
+            MetadataLockManager locks =
+                    new MetadataLockManager(8, 128);
+            DictionaryDdlService creator =
+                    new DictionaryDdlService(
+                            control, repository, cache, locks,
+                            storage.tableDdlStorageService(), tables);
+            creator.createSchema(
+                    MdlOwnerId.of(71), ObjectName.of("app"),
+                    1, 1, Duration.ofSeconds(5));
+            TableDefinition first = creator.createTable(
+                    MdlOwnerId.of(71), command(),
+                    Duration.ofSeconds(5));
+            TableDefinition second = creator.createTable(
+                    MdlOwnerId.of(71),
+                    new CreateTableCommand(
+                            QualifiedTableName.of(
+                                    "app", "second_orders"),
+                            PageNo.of(128),
+                            List.of(new CreateColumnSpec(
+                                    ObjectName.of("id"),
+                                    ColumnTypeDefinition.bigint(
+                                            false, false))),
+                            List.of(new CreateIndexSpec(
+                                    ObjectName.of("PRIMARY"),
+                                    true, true,
+                                    List.of(new CreateIndexKeyPartSpec(
+                                            ObjectName.of("id"),
+                                            IndexOrder.ASC, 0))))),
+                    Duration.ofSeconds(5));
+            Path firstFile =
+                    first.storageBinding().orElseThrow().path();
+            Path secondFile =
+                    second.storageBinding().orElseThrow().path();
+            DictionaryDdlFaultInjector crashAfterPending =
+                    new DictionaryDdlFaultInjector() {
+                        @Override
+                        public void afterDropPendingPublished(
+                                TableDefinition pending) {
+                        }
+
+                        @Override
+                        public void afterBatchDropPending(
+                                List<TableDefinition> pending) {
+                            throw new DictionaryDdlException(
+                                    "injected crash after batch pending");
+                        }
+                    };
+            DictionaryDdlService crashing = ddlWithFault(
+                    storage, control, repository, cache, locks,
+                    tables, crashAfterPending);
+
+            assertThrows(DictionaryDdlException.class,
+                    () -> crashing.dropTables(
+                            MdlOwnerId.of(71),
+                            List.of(
+                                    QualifiedTableName.of(
+                                            "app", "orders"),
+                                    QualifiedTableName.of(
+                                            "app", "second_orders")),
+                            false, Duration.ofSeconds(5)));
+
+            assertEquals(TableState.DROP_PENDING,
+                    repository.findTableForRecovery(
+                            first.id()).orElseThrow().state());
+            assertEquals(TableState.DROP_PENDING,
+                    repository.findTableForRecovery(
+                            second.id()).orElseThrow().state());
+            assertTrue(Files.exists(firstFile));
+            assertTrue(Files.exists(secondFile));
+            DdlLogRecord marker = repository.ddlLog().records()
+                    .stream()
+                    .filter(record -> record.operation()
+                            == DdlLogOperation.DROP_TABLE_BATCH)
+                    .findFirst().orElseThrow();
+            assertEquals(DdlLogPhase.DICTIONARY_COMMITTED,
+                    marker.phase());
+            assertEquals(List.of(
+                            first.id(), second.id()),
+                    marker.batchManifest().orElseThrow()
+                            .tables().stream()
+                            .map(DdlBatchTableEntry::tableId)
+                            .toList());
+
+            new DictionaryDdlRecoveryService(
+                    control, repository, cache,
+                    storage.tableDdlStorageService(), tables)
+                    .recover(Duration.ofSeconds(5));
+
+            assertFalse(Files.exists(firstFile));
+            assertFalse(Files.exists(secondFile));
+            assertEquals(TableState.DROPPED,
+                    repository.findTableForRecovery(
+                            first.id()).orElseThrow().state());
+            assertEquals(TableState.DROPPED,
+                    repository.findTableForRecovery(
+                            second.id()).orElseThrow().state());
+            assertEquals(DdlLogPhase.COMMITTED,
+                    repository.ddlLog().find(
+                            cn.zhangyis.db.dd.domain.DdlId.of(
+                            marker.marker().ddlOperationId()))
+                            .orElseThrow().phase());
+        } finally {
+            storage.close();
+        }
+    }
+
+    /**
+     * DROP SCHEMA 在全部文件删除后、最终 DD 事务前崩溃时，schema 仍 ACTIVE、表仍全 pending；
+     * 恢复必须以 ENGINE_DONE manifest 在一个事务中同时发布 schema/table tombstone。
+     */
+    @Test
+    void recoversSchemaCascadeAfterEngineDoneCrash() {
+        StorageEngine storage = new StorageEngine(config());
+        storage.open();
+        Path tables = directory.resolve(
+                "schema-cascade-tables");
+        try (FileInternalCatalogStore catalog =
+                     FileInternalCatalogStore.openOrCreate(
+                             directory.resolve(
+                                     "schema-cascade-mysql.ibd"));
+             DictionaryControlStore control =
+                     DictionaryControlStore.openOrCreate(
+                             directory.resolve(
+                                     "schema-cascade-mysql.dd.ctrl"),
+                             SpaceId.of(1), 1024)) {
+            PersistentDictionaryRepository repository =
+                    new PersistentDictionaryRepository(catalog);
+            DictionaryObjectCache cache =
+                    new DictionaryObjectCache(16);
+            MetadataLockManager locks =
+                    new MetadataLockManager(8, 128);
+            DictionaryDdlService creator =
+                    new DictionaryDdlService(
+                            control, repository, cache, locks,
+                            storage.tableDdlStorageService(), tables);
+            SchemaDefinition schema = creator.createSchema(
+                    MdlOwnerId.of(72), ObjectName.of("app"),
+                    1, 1, Duration.ofSeconds(5));
+            TableDefinition table = creator.createTable(
+                    MdlOwnerId.of(72), command(),
+                    Duration.ofSeconds(5));
+            Path file = table.storageBinding()
+                    .orElseThrow().path();
+            DictionaryDdlFaultInjector crashAtEngineDone =
+                    new DictionaryDdlFaultInjector() {
+                        @Override
+                        public void afterDropPendingPublished(
+                                TableDefinition pending) {
+                        }
+
+                        @Override
+                        public void afterBatchDropEngineDone(
+                                DdlLogRecord engineDone) {
+                            throw new DictionaryDdlException(
+                                    "injected crash after schema cascade engine done");
+                        }
+                    };
+            DictionaryDdlService crashing = ddlWithFault(
+                    storage, control, repository, cache, locks,
+                    tables, crashAtEngineDone);
+
+            assertThrows(DictionaryDdlException.class,
+                    () -> crashing.dropSchema(
+                            MdlOwnerId.of(72),
+                            ObjectName.of("app"), false,
+                            Duration.ofSeconds(5)));
+
+            assertEquals(SchemaState.ACTIVE,
+                    repository.snapshot().schemas()
+                            .get(schema.id()).state());
+            assertEquals(TableState.DROP_PENDING,
+                    repository.findTableForRecovery(
+                            table.id()).orElseThrow().state());
+            assertFalse(Files.exists(file));
+            DdlLogRecord marker = repository.ddlLog().records()
+                    .stream()
+                    .filter(record -> record.operation()
+                            == DdlLogOperation.DROP_SCHEMA_CASCADE)
+                    .findFirst().orElseThrow();
+            assertEquals(DdlLogPhase.ENGINE_DONE,
+                    marker.phase());
+
+            new DictionaryDdlRecoveryService(
+                    control, repository, cache,
+                    storage.tableDdlStorageService(), tables)
+                    .recover(Duration.ofSeconds(5));
+
+            assertEquals(SchemaState.DROPPED,
+                    repository.snapshot().schemas()
+                            .get(schema.id()).state());
+            assertEquals(TableState.DROPPED,
+                    repository.findTableForRecovery(
+                            table.id()).orElseThrow().state());
+            assertEquals(DdlLogPhase.COMMITTED,
+                    repository.ddlLog().find(
+                            cn.zhangyis.db.dd.domain.DdlId.of(
+                                    marker.marker()
+                                            .ddlOperationId()))
+                            .orElseThrow().phase());
         } finally {
             storage.close();
         }

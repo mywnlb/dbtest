@@ -52,6 +52,11 @@ public final class DefaultSqlSession implements SqlSession {
      */
     private final SessionOptions options;
     /**
+     * Session 当前 schema 的可变选择；只在 operationLock owner 内读取和更新。
+     * DROP 当前 schema 成功后清空，不能继续暴露构造时 options 的陈旧值。
+     */
+    private Optional<String> currentSchema;
+    /**
      * 本对象持有的 {@code parser} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
      */
     private final SqlParser parser;
@@ -260,6 +265,7 @@ public final class DefaultSqlSession implements SqlSession {
         // 2、SQL pipeline 全部是无执行资源的长期协作者，statement 资源只在 execute 内创建。
         this.id = id;
         this.options = options;
+        this.currentSchema = options.currentSchema();
         this.parser = parser;
         this.binder = binder;
         this.compiler = compiler;
@@ -310,8 +316,12 @@ public final class DefaultSqlSession implements SqlSession {
             if (statement instanceof SelectStatementNode select
                     && select.lockingClause() == SelectLockingClause.NONE
                     && transactions.requiresSerializableLockingRead()) {
-                statement = new SelectStatementNode(select.star(), select.projections(), select.table(),
-                        select.condition(), SelectLockingClause.FOR_SHARE);
+                statement = new SelectStatementNode(
+                        select.star(), select.projections(),
+                        select.table(), select.tableAlias(),
+                        select.join(), select.condition(),
+                        select.orderBy(), select.limit(),
+                        SelectLockingClause.FOR_SHARE);
             }
             if (transactions.rollbackOnly() && !isRollback(statement)) {
                 throw new SessionStateException("rollback-only transaction accepts only ROLLBACK/close");
@@ -327,6 +337,14 @@ public final class DefaultSqlSession implements SqlSession {
                         statement, select.lockingClause() == SelectLockingClause.NONE, deadline);
                 case UpdateStatementNode ignored -> executeData(statement, false, deadline);
                 case DeleteStatementNode ignored -> executeData(statement, false, deadline);
+                case CreateTableStatementNode createTable ->
+                        executeCreateTable(createTable, deadline);
+                case CreateSchemaStatementNode createSchema ->
+                        executeCreateSchema(createSchema, deadline);
+                case DropTableStatementNode dropTables ->
+                        executeDropTables(dropTables, deadline);
+                case DropSchemaStatementNode dropSchema ->
+                        executeDropSchema(dropSchema, deadline);
                 case CreateIndexStatementNode createIndex -> executeCreateIndex(createIndex, deadline);
                 case DropIndexStatementNode dropIndex -> executeDropIndex(dropIndex, deadline);
                 case AlterTablespaceStatementNode alterTablespace ->
@@ -407,7 +425,7 @@ public final class DefaultSqlSession implements SqlSession {
         // 2. metadata timeout 不得越过语句预算；compiler 全部成功后才把 staged lease 与计划一起发布。
         try (StatementBindingScope scope = transactions.beginBinding(
                 deadline.cap(options.metadataLockTimeout(), "metadata binding"))) {
-            Optional<ObjectName> schema = options.currentSchema().map(ObjectName::of);
+            Optional<ObjectName> schema = currentSchema.map(ObjectName::of);
             PhysicalPlan plan = compiler.compile(
                     syntax, new SqlBindingContext(schema, options.zoneId(), scope));
             scope.publish();
@@ -436,6 +454,124 @@ public final class DefaultSqlSession implements SqlSession {
     }
 
     /**
+     * 绑定并执行 CREATE TABLE。类型/default/重复名称与显式主键 shape 必须在 implicit commit 前
+     * 完成纯输入校验；提交旧用户事务后，gateway 使用独立 DDL owner 进入原子 DD/physical 状态机。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>从 Session 快照读取 current schema/时区，把 AST 转换为不持 DD lease 的建表命令。</li>
+     *     <li>执行 MySQL 风格 DDL implicit commit，先终结 storage transaction 再释放 metadata scope。</li>
+     *     <li>把剩余统一 deadline 交给 DDL gateway；成功时物理空间、SDI、ACTIVE DD 与 marker 已闭环。</li>
+     *     <li>无论 DDL 成败都恢复 autocommit=0 的新 implicit transaction；恢复失败附加到原异常。</li>
+     * </ol>
+     *
+     * @param syntax Parser 完整消费的基础 CREATE TABLE AST；不得携带物理 identity 或主机路径
+     * @param deadline 本条 statement 的唯一绝对期限；所有下游等待只能消费其剩余值
+     * @return 不携带 affected rows、但带 DDL 后最新 Session transaction status 的命令结果
+     */
+    private CommandResult executeCreateTable(
+            CreateTableStatementNode syntax, SqlStatementDeadline deadline) {
+        // 1、Binder 只消费 SQL/Session 快照；失败不能意外提交用户当前事务。
+        Optional<ObjectName> schema = currentSchema.map(ObjectName::of);
+        var bound = binder.bindDdl(
+                syntax, schema, options.zoneId());
+
+        // 2、storage 终态先于 transaction-duration MDL/pin 释放，DDL 不复用旧 owner。
+        transactions.prepareDdl(
+                deadline.remaining("DDL implicit commit"));
+        // 3、gateway 的独立 owner 覆盖 schema IX/table X、物理 CREATE、SDI 与 DD publish。
+        List<SqlWarning> warnings = finishDdl(
+                () -> ddlGateway.createTableWithWarnings(
+                        bound, deadline.remaining(
+                                "CREATE TABLE coordinator")));
+        // 4、finishDdl 已恢复用户下一事务，再读取最终 status。
+        return new CommandResult(
+                transactions.status(), warnings);
+    }
+
+    /**
+     * 执行 CREATE SCHEMA/DATABASE；纯名称绑定先于 implicit commit，IF 命中仍遵循完整 DDL 边界。
+     */
+    private CommandResult executeCreateSchema(
+            CreateSchemaStatementNode syntax,
+            SqlStatementDeadline deadline) {
+        var bound = binder.bindDdl(syntax);
+        transactions.prepareDdl(
+                deadline.remaining("DDL implicit commit"));
+        List<SqlWarning> warnings = finishDdl(
+                () -> ddlGateway.createSchema(
+                        bound, deadline.remaining(
+                                "CREATE SCHEMA coordinator")));
+        return new CommandResult(
+                transactions.status(), warnings);
+    }
+
+    /**
+     * 执行一个原子多目标 DROP TABLE；重复名称在 implicit commit 前由 Binder 拒绝。
+     */
+    private CommandResult executeDropTables(
+            DropTableStatementNode syntax,
+            SqlStatementDeadline deadline) {
+        var bound = binder.bindDdl(
+                syntax, currentSchema.map(ObjectName::of));
+        transactions.prepareDdl(
+                deadline.remaining("DDL implicit commit"));
+        List<SqlWarning> warnings = finishDdl(
+                () -> ddlGateway.dropTables(
+                        bound, deadline.remaining(
+                                "DROP TABLE coordinator")));
+        return new CommandResult(
+                transactions.status(), warnings);
+    }
+
+    /**
+     * 执行 DROP SCHEMA/DATABASE。成功（包括 IF EXISTS no-op）后若目标等于当前选择，则清空选择。
+     */
+    private CommandResult executeDropSchema(
+            DropSchemaStatementNode syntax,
+            SqlStatementDeadline deadline) {
+        var bound = binder.bindDdl(syntax);
+        transactions.prepareDdl(
+                deadline.remaining("DDL implicit commit"));
+        List<SqlWarning> warnings = finishDdl(
+                () -> ddlGateway.dropSchema(
+                        bound, deadline.remaining(
+                                "DROP SCHEMA coordinator")));
+        if (currentSchema.map(ObjectName::of)
+                .filter(bound.name()::equals).isPresent()) {
+            currentSchema = Optional.empty();
+        }
+        return new CommandResult(
+                transactions.status(), warnings);
+    }
+
+    /**
+     * 在用户事务已完成 implicit commit 后执行 DDL，并无条件恢复 Session transaction policy。
+     *
+     * @param action 独立 DDL owner 下返回 warning 的 coordinator 调用
+     * @return coordinator 产生的不可变 warning 列表
+     */
+    private List<SqlWarning> finishDdl(
+            java.util.function.Supplier<List<SqlWarning>> action) {
+        RuntimeException failure = null;
+        try {
+            return action.get();
+        } catch (RuntimeException ddlFailure) {
+            failure = ddlFailure;
+            throw ddlFailure;
+        } finally {
+            try {
+                transactions.resumeAfterDdl();
+            } catch (RuntimeException resumeFailure) {
+                if (failure == null) {
+                    throw resumeFailure;
+                }
+                failure.addSuppressed(resumeFailure);
+            }
+        }
+    }
+
+    /**
      * 绑定并执行 CREATE INDEX / ALTER ADD INDEX。语法绑定先于 implicit commit，避免纯名称错误意外提交事务；
      * DD coordinator 随后使用独立 owner 获取 table X。
      *
@@ -454,7 +590,7 @@ public final class DefaultSqlSession implements SqlSession {
     private CommandResult executeCreateIndex(CreateIndexStatementNode syntax,
                                              SqlStatementDeadline deadline) {
         // 1、校验语法/命令、会话状态与元数据身份，在共享或持久副作用前拒绝非法状态。
-        Optional<ObjectName> schema = options.currentSchema().map(ObjectName::of);
+        Optional<ObjectName> schema = currentSchema.map(ObjectName::of);
         // 2、继续完成范围、身份与候选校验；通过后，按 session、transaction、MDL 与 metadata scope 顺序取得受控资源，保持处理顺序与资源边界。
         var bound = binder.bindDdl(syntax, schema);
         transactions.prepareDdl(deadline.remaining("DDL implicit commit"));
@@ -499,7 +635,7 @@ public final class DefaultSqlSession implements SqlSession {
     private CommandResult executeDropIndex(DropIndexStatementNode syntax,
                                            SqlStatementDeadline deadline) {
         // 1、Binder 不打开 table，因此纯限定名错误早于 implicit commit。
-        Optional<ObjectName> schema = options.currentSchema().map(ObjectName::of);
+        Optional<ObjectName> schema = currentSchema.map(ObjectName::of);
         var bound = binder.bindDdl(syntax, schema);
         // 2、DDL 不能复用用户事务或它持有的 transaction-duration MDL。
         transactions.prepareDdl(deadline.remaining("DDL implicit commit"));
@@ -543,7 +679,7 @@ public final class DefaultSqlSession implements SqlSession {
     private CommandResult executeAlterTablespace(AlterTablespaceStatementNode syntax,
                                                  SqlStatementDeadline deadline) {
         // 1、Binder 只补全逻辑名，不提前读取可能过期的 table state/binding。
-        Optional<ObjectName> schema = options.currentSchema().map(ObjectName::of);
+        Optional<ObjectName> schema = currentSchema.map(ObjectName::of);
         var bound = binder.bindDdl(syntax, schema);
         // 2、先结束用户事务，避免独立 DDL owner 等待本会话自己的 transaction-duration 资源。
         transactions.prepareDdl(deadline.remaining("DDL implicit commit"));
@@ -589,7 +725,7 @@ public final class DefaultSqlSession implements SqlSession {
     private CommandResult executeAlterTable(AlterTableStatementNode syntax,
                                             SqlStatementDeadline deadline) {
         // 1、纯绑定阶段不打开 DD lease，table-dependent action 在 coordinator 内重验。
-        Optional<ObjectName> schema = options.currentSchema().map(ObjectName::of);
+        Optional<ObjectName> schema = currentSchema.map(ObjectName::of);
         var bound = binder.bindDdl(syntax, schema, options.zoneId());
         // 2、独立 DDL owner 不得与用户事务资源形成自等待。
         transactions.prepareDdl(deadline.remaining("DDL implicit commit"));
@@ -749,7 +885,7 @@ public final class DefaultSqlSession implements SqlSession {
         acquire(deadline, "snapshot");
         try {
             return new SessionSnapshot(id, state, transactions.autocommit(), transactions.mode(),
-                    transactions.transactionActive(), transactions.rollbackOnly(), options.currentSchema());
+                    transactions.transactionActive(), transactions.rollbackOnly(), currentSchema);
         } finally {
             operationLock.unlock();
         }
@@ -827,8 +963,10 @@ public final class DefaultSqlSession implements SqlSession {
     private static SqlExecutionResult withStatus(SqlExecutionResult result, TransactionStatus status) {
         return switch (result) {
             case QueryResult query -> new QueryResult(query.columns(), query.rows(), status);
-            case UpdateResult update -> new UpdateResult(update.affectedRows(), status);
-            case CommandResult ignored -> new CommandResult(status);
+            case UpdateResult update -> new UpdateResult(
+                    update.affectedRows(), status, update.firstGeneratedKey());
+            case CommandResult command -> new CommandResult(
+                    status, command.warnings());
         };
     }
 

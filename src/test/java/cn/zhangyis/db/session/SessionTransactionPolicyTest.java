@@ -1,14 +1,10 @@
 package cn.zhangyis.db.session;
 
 import cn.zhangyis.db.dd.domain.MdlOwnerId;
-import cn.zhangyis.db.sql.optimizer.physical.PhysicalInsert;
-import cn.zhangyis.db.sql.optimizer.physical.PhysicalPointSelect;
-import cn.zhangyis.db.sql.optimizer.physical.PhysicalSecondaryRangeSelect;
-import cn.zhangyis.db.sql.optimizer.physical.PhysicalPointUpdate;
-import cn.zhangyis.db.sql.optimizer.physical.PhysicalPointDelete;
 import cn.zhangyis.db.sql.binder.bound.SelectLockMode;
-import cn.zhangyis.db.sql.executor.SqlRow;
+import cn.zhangyis.db.sql.executor.row.SqlRowView;
 import cn.zhangyis.db.sql.executor.storage.*;
+import cn.zhangyis.db.sql.optimizer.physical.*;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -136,22 +132,32 @@ class SessionTransactionPolicyTest {
                                                 SqlStatementDeadline deadline) {
             events.add("insert"); return new SqlWriteOutcome(1, false);
         }
-        @Override public Optional<SqlRow> selectPoint(SqlTransactionHandle transaction,
-                                                     PhysicalPointSelect statement,
-                                                     SqlStatementDeadline deadline) {
-            events.add("select"); return Optional.empty();
-        }
-        @Override public List<SqlRow> selectRange(SqlTransactionHandle transaction,
-                                                 PhysicalSecondaryRangeSelect statement,
-                                                 SqlStatementDeadline deadline) {
-            lastRangeLockMode = statement.lockMode();
-            events.add("range"); return List.of();
-        }
-        @Override public List<SqlRow> selectRange(SqlTransactionHandle transaction,
-                                                 cn.zhangyis.db.sql.optimizer.physical.PhysicalRangeSelect statement,
-                                                 SqlStatementDeadline deadline) {
-            lastRangeLockMode = statement.lockMode();
-            events.add("comparison-range"); return List.of();
+        @Override public SqlStorageCursor openCursor(
+                SqlTransactionHandle transaction,
+                PhysicalAccess access,
+                SqlStatementDeadline deadline) {
+            if (access instanceof PhysicalPointAccess) {
+                events.add("select");
+            } else if (access instanceof PhysicalSecondaryPrefixAccess secondary) {
+                lastRangeLockMode = secondary.lockMode();
+                events.add("range");
+            } else if (access instanceof PhysicalRangeAccess range) {
+                lastRangeLockMode = range.lockMode();
+                events.add("comparison-range");
+            }
+            return new SqlStorageCursor() {
+                @Override public boolean advance() {
+                    return false;
+                }
+
+                @Override public SqlRowView current() {
+                    throw new AssertionError("空测试游标不存在当前行");
+                }
+
+                @Override public void close() {
+                    // 测试桩不持有底层资源。
+                }
+            };
         }
         @Override public SqlWriteOutcome update(SqlTransactionHandle transaction, PhysicalPointUpdate statement,
                                                 SqlStatementDeadline deadline) {

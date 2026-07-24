@@ -67,6 +67,22 @@ public final class DictionaryTransaction implements AutoCloseable {
     }
 
     /**
+     * 暂存同一 schema identity 的 ACTIVE→DROPPED tombstone。
+     *
+     * @param schema 与事务版本一致的 schema 生命周期新版本
+     * @throws DatabaseValidationException schema 为空时抛出，事务保持 OPEN 且不产生持久副作用
+     * @throws DictionaryTransactionStateException 事务已提交或回滚时抛出
+     */
+    public void updateSchema(SchemaDefinition schema) {
+        requireOpen();
+        if (schema == null) {
+            throw new DatabaseValidationException(
+                    "schema update mutation must not be null");
+        }
+        schemas.add(schema);
+    }
+
+    /**
      * 根据调用参数构造 {@code createTable} 对应的数据字典领域对象；构造前完成范围与组合校验，成功结果不为 {@code null}。
      *
      * @param table 由 data dictionary 提供的名称、schema、版本或物理绑定快照；不得为 {@code null}，且必须属于同一可见字典版本
@@ -95,7 +111,14 @@ public final class DictionaryTransaction implements AutoCloseable {
         tables.add(table);
     }
 
-    /** 提交全部 staging mutation；成功后事务不可再次使用，失败保持 OPEN 以便调用方 close 丢弃。 */
+    /**
+     * 一次提交全部 staging schema/table mutation；repository 在同一 writer 临界区校验版本和生命周期，
+     * 以一个 catalog batch 持久化。成功后事务不可再次使用，失败保持 OPEN 以便调用方 close 丢弃。
+     *
+     * @throws DictionaryTransactionStateException 事务已提交或回滚时抛出
+     * @throws cn.zhangyis.db.dd.exception.DictionaryVersionConflictException staging 对象不是同一目标版本、
+     *         生命周期不连续或 repository 已被其它 DDL 推进时抛出
+     */
     public void commit() {
         requireOpen();
         repository.commit(version, List.copyOf(schemas), List.copyOf(tables));

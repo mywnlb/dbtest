@@ -20,7 +20,9 @@ public enum DdlExecutionProtocol {
     /** In-place ALTER v1；承载instant metadata以及一个manifest下原子ADD/DROP多个secondary index。 */
     ONLINE_ALTER_INPLACE_V1(4, true),
     /** Shadow rebuild v1；以独立tablespace、通用change-log和ReadView generation屏障发布row-layout变化。 */
-    ONLINE_ALTER_SHADOW_V1(5, true);
+    ONLINE_ALTER_SHADOW_V1(5, true),
+    /** 批量 DROP v1；恢复方向由 marker 内冻结的完整对象 manifest 与 committed DD 共同裁决。 */
+    BATCH_DROP_V1(6, false);
 
     /** marker v4 中跨版本稳定的非负编码。 */
     private final int stableCode;

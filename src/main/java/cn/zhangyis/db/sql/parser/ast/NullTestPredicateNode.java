@@ -9,7 +9,7 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
  * @param operator IS NULL 或 IS NOT NULL；结果在 SQL 中始终为 TRUE/FALSE
  */
 public record NullTestPredicateNode(
-        IdentifierNode column,
+        ColumnReferenceNode column,
         NullTestOperator operator) implements PredicateNode {
 
     /**
@@ -24,5 +24,10 @@ public record NullTestPredicateNode(
             throw new DatabaseValidationException(
                     "null-test predicate fields must not be null");
         }
+    }
+
+    public NullTestPredicateNode(
+            IdentifierNode column, NullTestOperator operator) {
+        this(new ColumnReferenceNode(column), operator);
     }
 }

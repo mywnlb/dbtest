@@ -1,10 +1,18 @@
 package cn.zhangyis.db.sql.binder;
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
+import cn.zhangyis.db.dd.ddl.AlterTableAction;
+import cn.zhangyis.db.dd.ddl.AlterTableCommand;
+import cn.zhangyis.db.dd.ddl.CreateColumnSpec;
+import cn.zhangyis.db.dd.ddl.CreateIndexKeyPartSpec;
+import cn.zhangyis.db.dd.ddl.CreateIndexSpec;
+import cn.zhangyis.db.dd.ddl.CreateSecondaryIndexCommand;
+import cn.zhangyis.db.dd.ddl.CreateTableCommand;
+import cn.zhangyis.db.dd.ddl.DropSecondaryIndexCommand;
 import cn.zhangyis.db.dd.domain.*;
 import cn.zhangyis.db.dd.service.TableAccessIntent;
+import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.sql.binder.bound.*;
-import cn.zhangyis.db.dd.ddl.DropSecondaryIndexCommand;
 import cn.zhangyis.db.sql.binder.exception.SqlBindingException;
 import cn.zhangyis.db.sql.binder.exception.UnknownColumnException;
 import cn.zhangyis.db.sql.binder.exception.UnsupportedSqlShapeException;
@@ -18,28 +26,33 @@ import cn.zhangyis.db.sql.expression.BoundLiteral;
 import cn.zhangyis.db.sql.expression.BoundNegation;
 import cn.zhangyis.db.sql.expression.BoundNullTest;
 import cn.zhangyis.db.sql.expression.BoundNullTestOperator;
-import cn.zhangyis.db.sql.type.SqlValue;
 import cn.zhangyis.db.sql.parser.ast.*;
+import cn.zhangyis.db.sql.parser.DefaultSqlParser;
+import cn.zhangyis.db.sql.type.InsertBatch;
+import cn.zhangyis.db.sql.type.InsertValueSource;
+import cn.zhangyis.db.sql.type.SqlValue;
+import cn.zhangyis.db.storage.api.ddl.StorageDefaultValue;
 
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.time.ZoneId;
-import cn.zhangyis.db.dd.ddl.CreateIndexKeyPartSpec;
-import cn.zhangyis.db.dd.ddl.CreateIndexSpec;
-import cn.zhangyis.db.dd.ddl.CreateSecondaryIndexCommand;
-import cn.zhangyis.db.dd.ddl.AlterTableAction;
-import cn.zhangyis.db.dd.ddl.AlterTableCommand;
-import cn.zhangyis.db.storage.api.ddl.StorageDefaultValue;
 
 /**
  * Calcite-Lite 语义 Binder：固定 exact DD version，完成名称解析、类型转换与 M3 boolean
  * 表达式绑定，只输出不含访问路径的 Bound IR。
  */
 public final class DefaultSqlBinder implements SqlBinder {
+
+    /**
+     * SQL 入口未暴露物理文件大小选项时使用的教学型 file-per-table 初始页数。该值只影响首次空间
+     * 预分配，不改变逻辑 schema；后续应提升为受控引擎配置，而不能从任意 SQL 主机路径推导。
+     */
+    private static final PageNo DEFAULT_CREATE_TABLE_PAGES = PageNo.of(128);
+
     /**
      * 本对象持有的 {@code coercion} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
      */
@@ -137,6 +150,179 @@ public final class DefaultSqlBinder implements SqlBinder {
         return new BoundCreateIndex(new CreateSecondaryIndexCommand(
                 table, new CreateIndexSpec(
                 ObjectName.of(statement.indexName().value()), statement.unique(), false, parts)));
+    }
+
+    /**
+     * 把 CREATE TABLE 纯语法绑定为现有原子 DD command。Binder 不打开 schema/table lease，因此
+     * 不分配 identity、不决定文件路径；所有结构/type/default 错误必须在 Session implicit commit 前失败。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>校验 AST、current schema 与时区容器，并补全一至三段表名，不读取字典状态。</li>
+     *     <li>规范化索引名/key part，拒绝重复 key column，并收集聚簇主键列集合。</li>
+     *     <li>按 DD 类型映射列，主键列强制 NOT NULL；default 通过 SqlTypeCoercion 转为 canonical 语义。</li>
+     *     <li>构造 CreateTableCommand，让其交叉校验重复列/索引、缺失列引用和恰好一个聚簇索引。</li>
+     * </ol>
+     *
+     * @param statement Parser 完整消费后产生的 CREATE TABLE AST；不得为 {@code null}
+     * @param currentSchema Session 可选当前 schema；单段目标名必须依赖它
+     * @param zoneId Session 时区；TIMESTAMP default 必须按该时区完成确定性验证
+     * @return 不持资源且未分配 TableId/SpaceId 的原子建表命令
+     * @throws SqlBindingException 目标名称不能限定或结构名称冲突时抛出，Session 不得执行 implicit commit
+     * @throws UnsupportedSqlShapeException 类型/default 超出当前基础 CREATE TABLE shape 时抛出
+     * @throws DatabaseValidationException 输入容器或聚合不变量无效时抛出
+     */
+    public BoundCreateTable bindDdl(
+            CreateTableStatementNode statement, Optional<ObjectName> currentSchema,
+            ZoneId zoneId) {
+        // 1、纯容器与名称校验不能获取 MDL/DD pin，失败时用户事务保持原状。
+        if (statement == null || currentSchema == null || zoneId == null) {
+            throw new DatabaseValidationException(
+                    "CREATE TABLE binding statement/schema/zone must not be null");
+        }
+        QualifiedTableName table = qualify(statement.table(), currentSchema);
+
+        // 2、索引先转换，主键身份决定其引用列的最终 nullable 语义。
+        List<CreateIndexSpec> indexes = statement.indexes().stream()
+                .map(DefaultSqlBinder::bindCreateTableIndex)
+                .toList();
+        HashSet<ObjectName> primaryColumns = new HashSet<>();
+        indexes.stream().filter(CreateIndexSpec::clustered)
+                .flatMap(index -> index.keyParts().stream())
+                .map(CreateIndexKeyPartSpec::columnName)
+                .forEach(primaryColumns::add);
+
+        // 3、列 default 校验使用最终主键 NOT NULL 类型；字符属性保留 0/0，由 schema MDL 下解析。
+        List<CreateColumnSpec> columns = statement.columns().stream()
+                .map(column -> bindCreateTableColumn(
+                        column, primaryColumns, zoneId))
+                .toList();
+
+        // 4、DD command 构造器是名称/引用/聚簇数量的最后纯内存防线，不产生持久副作用。
+        return new BoundCreateTable(new CreateTableCommand(
+                table, DEFAULT_CREATE_TABLE_PAGES, columns, indexes,
+                new TableOptions(statement.comment(), 1, 1)),
+                statement.ifNotExists());
+    }
+
+    /**
+     * 规范化 CREATE SCHEMA/DATABASE 名称；默认字符属性由 DDL gateway 的实例策略提供。
+     *
+     * @param statement Parser 产生的 schema 创建意图
+     * @return 不持 DD 资源的 bound 命令
+     */
+    public BoundCreateSchema bindDdl(
+            CreateSchemaStatementNode statement) {
+        if (statement == null) {
+            throw new DatabaseValidationException(
+                    "CREATE SCHEMA binding statement must not be null");
+        }
+        return new BoundCreateSchema(
+                ObjectName.of(statement.name().value()),
+                statement.ifNotExists());
+    }
+
+    /**
+     * 补全 DROP TABLE 的全部目标，并在 implicit commit 前拒绝规范化后的重复名称。
+     *
+     * @param statement 一个 SQL 原子边界内的目标列表
+     * @param currentSchema 单段表名使用的当前 schema
+     * @return 保持用户顺序且目标唯一的 bound 命令
+     */
+    public BoundDropTables bindDdl(
+            DropTableStatementNode statement,
+            Optional<ObjectName> currentSchema) {
+        if (statement == null || currentSchema == null) {
+            throw new DatabaseValidationException(
+                    "DROP TABLE binding statement/schema must not be null");
+        }
+        return new BoundDropTables(
+                statement.tables().stream()
+                        .map(table -> qualify(table, currentSchema))
+                        .toList(),
+                statement.ifExists());
+    }
+
+    /**
+     * 规范化 DROP SCHEMA/DATABASE 名称。
+     *
+     * @param statement Parser 产生的 schema 删除意图
+     * @return 不持 DD 资源的 bound 命令
+     */
+    public BoundDropSchema bindDdl(
+            DropSchemaStatementNode statement) {
+        if (statement == null) {
+            throw new DatabaseValidationException(
+                    "DROP SCHEMA binding statement must not be null");
+        }
+        return new BoundDropSchema(
+                ObjectName.of(statement.name().value()),
+                statement.ifExists());
+    }
+
+    /** 把 CREATE TABLE 单个索引映射为 DD spec，并在聚合构造前拒绝重复 key column。 */
+    private static CreateIndexSpec bindCreateTableIndex(
+            CreateTableStatementNode.Index index) {
+        HashSet<ObjectName> uniqueColumns = new HashSet<>();
+        List<CreateIndexKeyPartSpec> parts = index.keyParts().stream().map(part -> {
+            ObjectName column = ObjectName.of(part.column().value());
+            if (!uniqueColumns.add(column)) {
+                throw new UnsupportedSqlShapeException(
+                        "CREATE TABLE index repeats column: " + column.displayName());
+            }
+            return new CreateIndexKeyPartSpec(
+                    column, part.order() == IndexKeyOrderNode.ASC
+                    ? IndexOrder.ASC : IndexOrder.DESC, 0);
+        }).toList();
+        return new CreateIndexSpec(
+                ObjectName.of(index.name().value()),
+                index.unique() || index.clustered(), index.clustered(), parts);
+    }
+
+    /**
+     * 把 CREATE TABLE 单列绑定为 DD spec；主键列的 NOT NULL 语义先于 DEFAULT NULL 检查。
+     */
+    private CreateColumnSpec bindCreateTableColumn(
+            CreateTableStatementNode.Column column,
+            java.util.Set<ObjectName> primaryColumns, ZoneId zoneId) {
+        ObjectName name = ObjectName.of(column.name().value());
+        ColumnTypeDefinition parsed = createTableColumnType(column.type());
+        ColumnTypeDefinition type = primaryColumns.contains(name) && parsed.nullable()
+                ? new ColumnTypeDefinition(
+                parsed.typeId(), parsed.unsigned(), false, parsed.length(),
+                parsed.scale(), parsed.charsetId(), parsed.collationId(),
+                parsed.symbols())
+                : parsed;
+        ColumnGeneration generation =
+                column.generation() == CreateTableStatementNode.Generation.AUTO_INCREMENT
+                ? ColumnGeneration.AUTO_INCREMENT : ColumnGeneration.NONE;
+        ColumnDefaultDefinition defaultDefinition;
+        if (column.defaultLiteral().isEmpty()) {
+            defaultDefinition = generation == ColumnGeneration.AUTO_INCREMENT
+                    ? ColumnDefaultDefinition.required() : type.nullable()
+                    ? ColumnDefaultDefinition.implicitNull()
+                    : ColumnDefaultDefinition.required();
+        } else if (column.defaultLiteral().orElseThrow() instanceof NullLiteralNode) {
+            if (!type.nullable()) {
+                throw new UnsupportedSqlShapeException(
+                        "NOT NULL CREATE column cannot use DEFAULT NULL: "
+                                + name.displayName());
+            }
+            defaultDefinition = ColumnDefaultDefinition.implicitNull();
+        } else {
+            if (generation == ColumnGeneration.AUTO_INCREMENT) {
+                throw new UnsupportedSqlShapeException(
+                        "AUTO_INCREMENT column cannot declare DEFAULT: "
+                                + name.displayName());
+            }
+            LiteralNode literal = column.defaultLiteral().orElseThrow();
+            ColumnTypeDefinition validationType = typeForDefaultValidation(type);
+            SqlValue value = coerceDefaultLiteral(literal, validationType, zoneId);
+            defaultDefinition = ColumnDefaultDefinition.constant(
+                    canonicalDefaultLiteral(value));
+        }
+        return new CreateColumnSpec(
+                name, type, defaultDefinition, column.comment(), generation);
     }
 
     /**
@@ -345,23 +531,45 @@ public final class DefaultSqlBinder implements SqlBinder {
     /** 将 parser 类型名/参数映射到 DD 28 类型；ENUM/SET 新声明需要 symbols，当前 SQL shape 明确拒绝。 */
     private static ColumnTypeDefinition alterColumnType(
             AlterTableStatementNode.ColumnType syntax) {
+        return ddlColumnType(
+                syntax.name(), syntax.length(), syntax.scale(),
+                syntax.unsigned(), syntax.nullable(), "ALTER ADD COLUMN");
+    }
+
+    /** CREATE TABLE 类型映射与 ALTER 使用相同 DD 类型域，但保留独立诊断类别。 */
+    private static ColumnTypeDefinition createTableColumnType(
+            CreateTableStatementNode.ColumnType syntax) {
+        return ddlColumnType(
+                syntax.name(), syntax.length(), syntax.scale(),
+                syntax.unsigned(), syntax.nullable(), "CREATE TABLE");
+    }
+
+    /**
+     * 将 parser 类型 shape 映射到 DD 28 类型；ENUM/SET 新声明需要 symbol list，当前 SQL shape 明确拒绝。
+     */
+    private static ColumnTypeDefinition ddlColumnType(
+            String name, int declaredLength, int scale, boolean unsigned,
+            boolean nullable, String operation) {
         DictionaryTypeId typeId;
         try {
-            typeId = DictionaryTypeId.valueOf(syntax.name().toUpperCase(java.util.Locale.ROOT));
+            typeId = DictionaryTypeId.valueOf(
+                    name.toUpperCase(java.util.Locale.ROOT));
         } catch (IllegalArgumentException unknown) {
             throw new UnsupportedSqlShapeException(
-                    "unsupported ALTER column type: " + syntax.name(), unknown);
+                    "unsupported " + operation + " column type: " + name, unknown);
         }
         if (typeId == DictionaryTypeId.ENUM || typeId == DictionaryTypeId.SET) {
             throw new UnsupportedSqlShapeException(
-                    "ALTER ADD COLUMN ENUM/SET requires symbol-list syntax not implemented by this slice");
+                    operation + " ENUM/SET requires symbol-list syntax not implemented by this slice");
         }
-        int length = syntax.length() > 0 ? syntax.length() : defaultTypeLength(typeId);
+        int length = integralType(typeId) ? 0 : declaredLength > 0
+                ? declaredLength : defaultTypeLength(typeId);
         // 0 是 ALTER staged table 默认值的继承哨兵；非字符类型的 mapper 同样要求该字段保持 0。
         int charset = 0;
         int collation = 0;
-        return new ColumnTypeDefinition(typeId, syntax.unsigned(), syntax.nullable(),
-                length, syntax.scale(), charset, collation, List.of());
+        return new ColumnTypeDefinition(
+                typeId, unsigned, nullable, length, scale,
+                charset, collation, List.of());
     }
 
     /** default 校验需要正 charset/collation；DD 执行时仍以 staged table options 替换继承哨兵。 */
@@ -396,19 +604,122 @@ public final class DefaultSqlBinder implements SqlBinder {
     }
 
     /**
-     * 把完整单行 INSERT 绑定为 exact table version 下按 column ordinal 排列的 typed values。
+     * CREATE DEFAULT 的兼容转换只对数值目标接受引号数值；普通 INSERT/谓词仍使用严格 literal
+     * 类别，避免全局放宽隐式转换规则。
+     *
+     * @param literal Parser 保留的显式 DEFAULT 字面量
+     * @param type 已补字符集占位值的目标列类型
+     * @param zoneId Session 时区
+     * @return 完整通过类型范围校验的 SQL 值
+     */
+    private SqlValue coerceDefaultLiteral(
+            LiteralNode literal, ColumnTypeDefinition type, ZoneId zoneId) {
+        LiteralNode effective = literal;
+        if (literal instanceof StringLiteralNode string && numericType(type.typeId())) {
+            effective = new NumericLiteralNode(
+                    string.value(), string.lexeme(), string.position());
+        }
+        return coercion.coerce(effective, type, zoneId, false);
+    }
+
+    /**
+     * 把已类型化默认值转为与源引号风格无关的 canonical literal。该表示会进入 catalog、SDI 与
+     * schema digest，因此禁止依赖 Locale、对象 {@code toString()} 的不稳定格式或科学计数法。
+     *
+     * @param value 已由 SqlTypeCoercion 严格校验的非空默认值
+     * @return 可由 literal parser 再次物化的稳定 SQL 字面量
+     */
+    private static String canonicalDefaultLiteral(SqlValue value) {
+        return switch (value) {
+            case SqlValue.IntegerValue integer -> integer.value().toString();
+            case SqlValue.FloatingValue floating ->
+                    java.math.BigDecimal.valueOf(floating.value())
+                            .stripTrailingZeros().toPlainString();
+            case SqlValue.DecimalValue decimal -> decimal.value().toPlainString();
+            case SqlValue.StringValue string -> quoteSqlString(string.value());
+            case SqlValue.BytesValue bytes ->
+                    "X'" + java.util.HexFormat.of().withUpperCase()
+                            .formatHex(bytes.value()) + "'";
+            case SqlValue.TemporalValue temporal -> canonicalTemporal(temporal);
+            case SqlValue.BitValue bit -> {
+                StringBuilder bits = new StringBuilder(bit.bitWidth());
+                byte[] bytes = bit.bytes();
+                for (int index = 0; index < bit.bitWidth(); index++) {
+                    bits.append((bytes[index / 8] >>> (7 - index % 8)) & 1);
+                }
+                yield "B'" + bits + "'";
+            }
+            case SqlValue.EnumValue enumeration -> quoteSqlString(enumeration.symbol());
+            case SqlValue.SetValue set -> quoteSqlString(String.join(",", set.symbols()));
+            case SqlValue.NullValue ignored -> "NULL";
+        };
+    }
+
+    private static String canonicalTemporal(SqlValue.TemporalValue temporal) {
+        return switch (temporal.kind()) {
+            case DATE -> quoteSqlString(
+                    java.time.LocalDate.ofEpochDay(temporal.value()).toString());
+            case DATETIME -> quoteSqlString(formatLocalDateTime(
+                    java.time.LocalDateTime.ofInstant(
+                            java.time.Instant.ofEpochMilli(temporal.value()),
+                            java.time.ZoneOffset.UTC)));
+            case TIMESTAMP -> quoteSqlString(
+                    java.time.Instant.ofEpochMilli(temporal.value()).toString());
+            case YEAR -> Long.toString(temporal.value());
+            case TIME -> {
+                long absolute = Math.abs(temporal.value());
+                long totalSeconds = absolute / 1000;
+                long millis = absolute % 1000;
+                String time = "%s%02d:%02d:%02d".formatted(
+                        temporal.value() < 0 ? "-" : "",
+                        totalSeconds / 3600,
+                        totalSeconds % 3600 / 60,
+                        totalSeconds % 60);
+                yield quoteSqlString(millis == 0
+                        ? time : time + ".%03d".formatted(millis));
+            }
+        };
+    }
+
+    private static String formatLocalDateTime(java.time.LocalDateTime value) {
+        String base = value.format(java.time.format.DateTimeFormatter.ofPattern(
+                "uuuu-MM-dd HH:mm:ss"));
+        return value.getNano() == 0 ? base
+                : base + ".%03d".formatted(value.getNano() / 1_000_000);
+    }
+
+    private static String quoteSqlString(String value) {
+        return "'" + value.replace("'", "''") + "'";
+    }
+
+    private static boolean numericType(DictionaryTypeId type) {
+        return integralType(type) || type == DictionaryTypeId.FLOAT
+                || type == DictionaryTypeId.DOUBLE
+                || type == DictionaryTypeId.DECIMAL
+                || type == DictionaryTypeId.YEAR;
+    }
+
+    private static boolean integralType(DictionaryTypeId type) {
+        return type == DictionaryTypeId.TINYINT
+                || type == DictionaryTypeId.SMALLINT
+                || type == DictionaryTypeId.INT
+                || type == DictionaryTypeId.BIGINT;
+    }
+
+    /**
+     * 把多行 INSERT 绑定为 exact table version 下按 column ordinal 排列的 typed value sources。
      *
      * <p>数据流：</p>
      * <ol>
      *     <li>以 WRITE intent 打开 ACTIVE exact table version，并建立规范化 column map。</li>
-     *     <li>要求 SQL 显式列数等于 table width，创建尚未发布的 ordinal value 容器。</li>
-     *     <li>逐列拒绝重复/未知名称，并按 DD 类型和主键上下文转换 literal；缺列在返回前失败。</li>
-     *     <li>冻结 {@link BoundInsert}；不 publish/close metadata scope，也不创建 storage row。</li>
+     *     <li>解析显式列映射；无列列表时按表 ordinal，拒绝重复、未知与行宽不一致。</li>
+     *     <li>逐行转换显式 literal，并按 AUTO_INCREMENT、常量默认值、隐式 NULL 顺序补齐缺列。</li>
+     *     <li>冻结 {@link BoundInsert} 批次；不 publish/close metadata scope，也不消耗自增值。</li>
      * </ol>
      *
-     * @param insert Parser 产生的单行 INSERT；必须显式列出与目标表等宽的列和值
+     * @param insert Parser 产生的非空 VALUES 行批次
      * @param context 当前 schema、时区和未发布 statement scope
-     * @return 按 exact table ordinal 排列的完整 typed row
+     * @return 按 exact table ordinal 排列的完整 typed source 批次
      * @throws SqlBindingException 目标表、列或 metadata lease 无法解析时抛出
      * @throws UnsupportedSqlShapeException 列缺失、重复、未知或 literal 不能按 DD 类型转换时抛出
      */
@@ -416,27 +727,111 @@ public final class DefaultSqlBinder implements SqlBinder {
         // 1、WRITE lease 固定后续 logical/physical/executor 共用的 exact table version。
         TableDefinition table = openActiveBoundTable(insert.table(), context, TableAccessIntent.WRITE);
         Map<ObjectName, ColumnDefinition> columns = columns(table);
-        if (insert.columns().size() != table.columns().size()) {
-            throw new UnsupportedSqlShapeException("INSERT must name every table column exactly once");
-        }
-        // 2、完整行约束在值转换前确认，避免发布部分 ordinal 布局。
-        List<SqlValue> values = new ArrayList<>(java.util.Collections.nCopies(table.columns().size(), null));
+        // 2、列映射只解析一次并供全部行复用；空列表严格表示 table ordinal，不按值个数猜测子集。
+        List<ColumnDefinition> targets = new ArrayList<>();
         HashSet<ObjectName> assigned = new HashSet<>();
+        if (insert.columns().isEmpty()) {
+            targets.addAll(table.columns());
+        } else {
+            for (IdentifierNode identifier : insert.columns()) {
+                ObjectName name = ObjectName.of(identifier.value());
+                if (!assigned.add(name)) {
+                    throw new UnsupportedSqlShapeException(
+                            "duplicate INSERT column: " + name);
+                }
+                targets.add(requireColumn(columns, name));
+            }
+        }
+        if (insert.rows().stream().anyMatch(row -> row.size() != targets.size())) {
+            throw new UnsupportedSqlShapeException(
+                    "INSERT row width does not match target column list");
+        }
+
+        // 3、主键身份只决定 NULL 与自增校验；物理索引路径仍由 Optimizer/Storage 决定。
         HashSet<Long> primaryColumns = new HashSet<>();
-        // 3、主键列转换使用 key 约束，但不选择具体 B+Tree 访问路径。
         for (IndexKeyPart keyPart : table.primaryIndex().keyParts()) primaryColumns.add(keyPart.columnId());
-        for (int i = 0; i < insert.columns().size(); i++) {
-            ObjectName name = ObjectName.of(insert.columns().get(i).value());
-            ColumnDefinition column = requireColumn(columns, name);
-            if (!assigned.add(name)) throw new UnsupportedSqlShapeException("duplicate INSERT column: " + name);
-            values.set(column.ordinal(), coercion.coerce(insert.values().get(i), column.type(), context.zoneId(),
-                    primaryColumns.contains(column.columnId())));
+        List<List<InsertValueSource>> rows = new ArrayList<>(insert.rows().size());
+        for (List<LiteralNode> literals : insert.rows()) {
+            List<InsertValueSource> row = new ArrayList<>(
+                    java.util.Collections.nCopies(table.columns().size(), null));
+            for (int index = 0; index < literals.size(); index++) {
+                ColumnDefinition column = targets.get(index);
+                row.set(column.ordinal(), explicitInsertSource(
+                        literals.get(index), column, context.zoneId(),
+                        primaryColumns.contains(column.columnId())));
+            }
+            for (ColumnDefinition column : table.columns()) {
+                if (row.get(column.ordinal()) == null) {
+                    row.set(column.ordinal(), missingInsertSource(
+                            column, context.zoneId(),
+                            primaryColumns.contains(column.columnId())));
+                }
+            }
+            rows.add(List.copyOf(row));
         }
-        if (values.stream().anyMatch(java.util.Objects::isNull)) {
-            throw new UnsupportedSqlShapeException("INSERT must assign the complete row");
+        // 4、返回 semantic batch；scope 仍由 compiler/Session 管理，自增序号尚未消费。
+        return new BoundInsert(table, new InsertBatch(rows));
+    }
+
+    /**
+     * 把用户显式单元格转换为值源。自增列上的 NULL/0 是生成请求，正值保留并由 storage 推进
+     * high-water，负值在任何物理副作用前拒绝。
+     */
+    private InsertValueSource explicitInsertSource(
+            LiteralNode literal, ColumnDefinition column, ZoneId zoneId,
+            boolean primaryKey) {
+        if (column.generation() == ColumnGeneration.AUTO_INCREMENT
+                && literal instanceof NullLiteralNode) {
+            return InsertValueSource.AutoIncrement.INSTANCE;
         }
-        // 4、返回 semantic INSERT；scope 仍由 compiler/Session 管理。
-        return new BoundInsert(table, values);
+        SqlValue value = coercion.coerce(
+                literal, column.type(), zoneId, primaryKey);
+        if (column.generation() == ColumnGeneration.AUTO_INCREMENT) {
+            java.math.BigInteger integer =
+                    ((SqlValue.IntegerValue) value).value();
+            if (integer.signum() < 0) {
+                throw new UnsupportedSqlShapeException(
+                        "AUTO_INCREMENT explicit value must not be negative");
+            }
+            if (integer.signum() == 0) {
+                return InsertValueSource.AutoIncrement.INSTANCE;
+            }
+        }
+        return new InsertValueSource.Constant(value);
+    }
+
+    /**
+     * 根据 DD 缺省语义补齐一个未提供列；REQUIRED 的失败发生在生成批次发布之前。
+     */
+    private InsertValueSource missingInsertSource(
+            ColumnDefinition column, ZoneId zoneId, boolean primaryKey) {
+        if (column.generation() == ColumnGeneration.AUTO_INCREMENT) {
+            return InsertValueSource.AutoIncrement.INSTANCE;
+        }
+        return switch (column.defaultDefinition().kind()) {
+            case IMPLICIT_NULL -> new InsertValueSource.Constant(
+                    SqlValue.NullValue.INSTANCE);
+            case CONSTANT -> {
+                String literal = column.defaultDefinition()
+                        .constantLiteral().orElseThrow();
+                yield new InsertValueSource.Constant(coercion.coerce(
+                        parseCanonicalDefault(literal), column.type(),
+                        zoneId, primaryKey));
+            }
+            case REQUIRED -> throw new UnsupportedSqlShapeException(
+                    "INSERT omits required column: "
+                            + column.name().displayName());
+        };
+    }
+
+    /**
+     * 通过同一 SQL lexer/parser 重新物化 DD canonical literal，避免维护第二套转义和数值语法。
+     */
+    private static LiteralNode parseCanonicalDefault(String canonicalLiteral) {
+        InsertStatementNode parsed = (InsertStatementNode) new DefaultSqlParser()
+                .parse("INSERT INTO defaults_probe(value) VALUES ("
+                        + canonicalLiteral + ")");
+        return parsed.rows().getFirst().getFirst();
     }
 
     /**
@@ -456,20 +851,145 @@ public final class DefaultSqlBinder implements SqlBinder {
      * @throws SqlBindingException 目标表、投影列、谓词列或 metadata lease 无法解析时抛出
      * @throws UnsupportedSqlShapeException 投影重复、谓词重复或 LOB/JSON comparison 不受支持时抛出
      */
-    private BoundSelect bindSelect(SelectStatementNode select, SqlBindingContext context) {
+    private BoundRelationalStatement bindSelect(
+            SelectStatementNode select, SqlBindingContext context) {
+        if (select.join().isPresent()) {
+            return bindJoinSelect(select, context);
+        }
         // 1、固定 exact table version；locking read 用 WRITE intent，使 MDL 生命周期覆盖后续事务锁。
         TableAccessIntent intent = select.lockingClause() == SelectLockingClause.NONE
                 ? TableAccessIntent.READ : TableAccessIntent.WRITE;
         TableDefinition table = openActiveBoundTable(select.table(), context, intent);
-        Map<ObjectName, ColumnDefinition> columns = columns(table);
+        RelationBinding relation = relation(
+                table, select.tableAlias(), 0);
+        List<RelationBinding> relations = List.of(relation);
         // 2、投影只解析为 table ordinal，不携带 record layout 或访问索引。
-        List<Integer> projections = projectionOrdinals(select, table, columns);
-        // 3、WHERE 只完成名称解析、类型转换和 BETWEEN 展开；索引选择留给 Optimizer。
+        List<Integer> projections =
+                projectionOrdinals(select, relations);
+        // 3、WHERE 与 ORDER BY 只完成名称、类型和稳定列身份解析；索引选择留给 Optimizer。
         BoundExpression condition =
-                bindCondition(select.condition(), table, columns, context);
+                bindCondition(select.condition(), relations, context);
+        List<BoundSortKey> orderBy = select.orderBy().stream()
+                .map(item -> {
+                    ResolvedColumn resolved =
+                            resolveColumn(item.column(), relations);
+                    ColumnDefinition column = resolved.column();
+                    return new BoundSortKey(
+                            flattenedOrdinal(resolved, relations),
+                            column.columnId(),
+                            item.direction() == SortDirectionNode.ASC
+                                    ? IndexOrder.ASC : IndexOrder.DESC);
+                })
+                .toList();
+        Optional<BoundLimit> limit = select.limit()
+                .map(value -> new BoundLimit(value.offset(), value.count()));
         // 4、冻结读取语义；本阶段不发布 metadata scope，也不创建执行资源。
         return new BoundSelect(
-                table, projections, condition, lockMode(select.lockingClause()));
+                table, projections, condition, orderBy, limit,
+                lockMode(select.lockingClause()));
+    }
+
+    /**
+     * 把二表等值 INNER JOIN 绑定为 relation-aware 列引用和扁平 statement schema。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>规范化左右表名，并按 canonical key 顺序取得 READ metadata lease，避免并发反向 SQL 形成 MDL 顺序环。</li>
+     *     <li>建立 alias/table qualifier 作用域，拒绝重复别名，并按唯一命中规则解析投影与 ON 两侧。</li>
+     *     <li>要求 ON 两列 exact type 相等，随后独立绑定完整 WHERE 与 ORDER BY，不把 ON 合并进 residual。</li>
+     *     <li>冻结 {@link BoundJoinSelect}；本阶段不决定 inner 索引、循环算法、ReadView 或 cursor。</li>
+     * </ol>
+     *
+     * @param select Parser 产生且包含一个等值 INNER JOIN 的 SELECT
+     * @param context 当前 schema、时区和仍为 OPEN 的 metadata scope
+     * @return 带两个 exact table versions、relation-aware 表达式和扁平投影的语义计划
+     * @throws SqlBindingException 表、qualifier、列归属、别名或 exact type 无法安全绑定时抛出
+     * @throws UnsupportedSqlShapeException locking JOIN 或当前不支持的 LOB/JSON comparison 时抛出
+     */
+    private BoundJoinSelect bindJoinSelect(
+            SelectStatementNode select, SqlBindingContext context) {
+        // 1、JOIN v1 只建立一致性读；两个表按规范 key 取 lease，但 relation ordinal 保持 SQL 顺序。
+        if (select.lockingClause() != SelectLockingClause.NONE) {
+            throw new UnsupportedSqlShapeException(
+                    "locking clause is not supported for INNER JOIN v1");
+        }
+        InnerJoinClauseNode join = select.join().orElseThrow();
+        QualifiedTableName leftName =
+                qualify(select.table(), context);
+        QualifiedTableName rightName =
+                qualify(join.table(), context);
+        ArrayList<QualifiedTableName> acquisition =
+                new ArrayList<>(List.of(leftName, rightName));
+        acquisition.sort(java.util.Comparator.comparing(
+                QualifiedTableName::canonicalKey));
+        LinkedHashMap<String, TableDefinition> opened =
+                new LinkedHashMap<>();
+        for (QualifiedTableName name : acquisition) {
+            opened.put(name.canonicalKey(),
+                    openActiveBoundTable(
+                            name, context, TableAccessIntent.READ));
+        }
+        RelationBinding left = relation(
+                opened.get(leftName.canonicalKey()),
+                select.tableAlias(), 0);
+        RelationBinding right = relation(
+                opened.get(rightName.canonicalKey()),
+                join.alias(), 1);
+        if (left.qualifier().equals(right.qualifier())) {
+            throw new SqlBindingException(
+                    "duplicate table alias/qualifier in INNER JOIN: "
+                            + left.qualifier().displayName());
+        }
+        List<RelationBinding> relations =
+                List.of(left, right);
+
+        // 2、所有列解析使用同一 relation scope；未限定同名列必须显式报歧义。
+        List<Integer> projections =
+                projectionOrdinals(select, relations);
+        ResolvedColumn onLeft =
+                resolveColumn(join.leftColumn(), relations);
+        ResolvedColumn onRight =
+                resolveColumn(join.rightColumn(), relations);
+        if (onLeft.relation().relationOrdinal()
+                == onRight.relation().relationOrdinal()) {
+            throw new SqlBindingException(
+                    "INNER JOIN ON must reference both input relations");
+        }
+
+        // 3、BoundComparison 要求 exact type 全等；v1 不猜测数值提升或 collation coercion。
+        if (!onLeft.column().type()
+                .equals(onRight.column().type())) {
+            throw new SqlBindingException(
+                    "INNER JOIN ON columns require matching exact types");
+        }
+        BoundExpression joinCondition = new BoundComparison(
+                columnReference(
+                        onLeft, join.leftColumn().position()),
+                BoundComparisonOperator.EQUAL,
+                columnReference(
+                        onRight, join.rightColumn().position()));
+        BoundExpression condition =
+                bindCondition(select.condition(), relations, context);
+        List<BoundSortKey> orderBy = select.orderBy().stream()
+                .map(item -> {
+                    ResolvedColumn resolved =
+                            resolveColumn(item.column(), relations);
+                    return new BoundSortKey(
+                            flattenedOrdinal(resolved, relations),
+                            resolved.column().columnId(),
+                            item.direction() == SortDirectionNode.ASC
+                                    ? IndexOrder.ASC : IndexOrder.DESC);
+                })
+                .toList();
+        Optional<BoundLimit> limit = select.limit()
+                .map(value -> new BoundLimit(
+                        value.offset(), value.count()));
+
+        // 4、Bound 层只发布不可变语义；metadata scope 仍由 Compiler/Session 成功路径接管。
+        return new BoundJoinSelect(
+                relations.stream().map(RelationBinding::table).toList(),
+                projections, joinCondition, condition,
+                orderBy, limit, SelectLockMode.CONSISTENT);
     }
 
     /**
@@ -568,6 +1088,25 @@ public final class DefaultSqlBinder implements SqlBinder {
     private BoundExpression bindCondition(
             BooleanExpressionNode syntaxCondition, TableDefinition table,
             Map<ObjectName, ColumnDefinition> columns, SqlBindingContext context) {
+        return bindCondition(
+                syntaxCondition,
+                List.of(new RelationBinding(
+                        table, table.name(), 0, columns)),
+                context);
+    }
+
+    /**
+     * 在一个或两个 relation 的名称作用域内递归绑定 boolean condition。
+     *
+     * @param syntaxCondition Parser 保留优先级的 boolean AST
+     * @param relations SQL 顺序排列且 qualifier 唯一的 exact relation bindings
+     * @param context 当前时区与 metadata scope
+     * @return relation-aware typed residual
+     */
+    private BoundExpression bindCondition(
+            BooleanExpressionNode syntaxCondition,
+            List<RelationBinding> relations,
+            SqlBindingContext context) {
         // 1、封闭节点集合是 Parser/Binder 协议；缺失条件不能以 TRUE 猜测继续。
         if (syntaxCondition == null) {
             throw new UnsupportedSqlShapeException(
@@ -578,27 +1117,27 @@ public final class DefaultSqlBinder implements SqlBinder {
             case ConjunctionExpressionNode conjunction -> {
                 // 3、只在同一正向 AND 域检查重复 equality；OR/NOT 是语义屏障。
                 validateConjunctionEqualities(
-                        conjunction, columns, new HashSet<>());
+                        conjunction, relations, new HashSet<>());
                 yield new BoundConjunction(
                         conjunction.operands().stream()
                                 .map(operand -> bindCondition(
-                                        operand, table, columns, context))
+                                        operand, relations, context))
                                 .toList());
             }
             case DisjunctionExpressionNode disjunction ->
                     new BoundDisjunction(
                             disjunction.operands().stream()
                                     .map(operand -> bindCondition(
-                                            operand, table, columns, context))
+                                            operand, relations, context))
                                     .toList());
             case NegationExpressionNode negation ->
                     new BoundNegation(
                             bindCondition(
-                                    negation.operand(), table,
-                                    columns, context),
+                                    negation.operand(), relations,
+                                    context),
                             negation.position());
             case PredicateNode predicate ->
-                    bindPredicate(predicate, columns, context);
+                    bindPredicate(predicate, relations, context);
         };
     }
 
@@ -621,15 +1160,16 @@ public final class DefaultSqlBinder implements SqlBinder {
      */
     private BoundExpression bindPredicate(
             PredicateNode syntax,
-            Map<ObjectName, ColumnDefinition> columns,
+            List<RelationBinding> relations,
             SqlBindingContext context) {
         // 1、所有分支共享同一个 exact column identity。
-        ColumnDefinition column = requireColumn(
-                columns, ObjectName.of(syntax.column().value()));
+        ResolvedColumn resolved =
+                resolveColumn(syntax.column(), relations);
+        ColumnDefinition column = resolved.column();
         // 2、null-test 不执行值序比较，外置 LOB 也能通过 NullValue 标记判断。
         if (syntax instanceof NullTestPredicateNode nullTest) {
             return new BoundNullTest(
-                    columnReference(column, nullTest.position()),
+                    columnReference(resolved, nullTest.position()),
                     switch (nullTest.operator()) {
                         case IS_NULL -> BoundNullTestOperator.IS_NULL;
                         case IS_NOT_NULL ->
@@ -648,7 +1188,7 @@ public final class DefaultSqlBinder implements SqlBinder {
             SqlValue value =
                     coercePredicate(equality.value(), column, context);
             return comparison(
-                    column, equality.column().position(),
+                    resolved, equality.column().position(),
                     equality.value(), BoundComparisonOperator.EQUAL, value);
         }
         if (syntax instanceof ComparisonPredicateNode comparison) {
@@ -663,7 +1203,7 @@ public final class DefaultSqlBinder implements SqlBinder {
             SqlValue value =
                     coercePredicate(comparison.value(), column, context);
             return comparison(
-                    column, comparison.column().position(),
+                    resolved, comparison.column().position(),
                     comparison.value(), operator, value);
         }
         if (syntax instanceof BetweenPredicateNode between) {
@@ -673,12 +1213,12 @@ public final class DefaultSqlBinder implements SqlBinder {
                     between.upperInclusive(), column, context);
             return new BoundConjunction(List.of(
                     comparison(
-                            column, between.column().position(),
+                            resolved, between.column().position(),
                             between.lowerInclusive(),
                             BoundComparisonOperator.GREATER_THAN_OR_EQUAL,
                             lower),
                     comparison(
-                            column, between.column().position(),
+                            resolved, between.column().position(),
                             between.upperInclusive(),
                             BoundComparisonOperator.LESS_THAN_OR_EQUAL,
                             upper)));
@@ -698,18 +1238,21 @@ public final class DefaultSqlBinder implements SqlBinder {
      */
     private static void validateConjunctionEqualities(
             BooleanExpressionNode expression,
-            Map<ObjectName, ColumnDefinition> columns,
-            HashSet<Integer> equalityColumns) {
+            List<RelationBinding> relations,
+            HashSet<ColumnBindingKey> equalityColumns) {
         if (expression instanceof ConjunctionExpressionNode conjunction) {
             conjunction.operands().forEach(operand ->
                     validateConjunctionEqualities(
-                            operand, columns, equalityColumns));
+                            operand, relations, equalityColumns));
             return;
         }
         if (expression instanceof EqualityPredicateNode equality) {
-            ColumnDefinition column = requireColumn(
-                    columns, ObjectName.of(equality.column().value()));
-            if (!equalityColumns.add(column.ordinal())) {
+            ResolvedColumn resolved =
+                    resolveColumn(equality.column(), relations);
+            ColumnDefinition column = resolved.column();
+            if (!equalityColumns.add(new ColumnBindingKey(
+                    resolved.relation().relationOrdinal(),
+                    column.ordinal()))) {
                 throw new UnsupportedSqlShapeException(
                         "duplicate equality predicate: " + column.name());
             }
@@ -732,6 +1275,19 @@ public final class DefaultSqlBinder implements SqlBinder {
     }
 
     /**
+     * 构造携带 relation ordinal 的多表列引用。
+     */
+    private static BoundColumnReference columnReference(
+            ResolvedColumn resolved,
+            cn.zhangyis.db.sql.parser.SourcePosition position) {
+        return new BoundColumnReference(
+                resolved.relation().relationOrdinal(),
+                resolved.column().columnId(),
+                resolved.column().ordinal(),
+                resolved.column().type(), position);
+    }
+
+    /**
      * 把 exact column 与已转换 literal 组装为 typed comparison。
      *
      * @param column 当前 statement table version 中解析出的列
@@ -742,14 +1298,16 @@ public final class DefaultSqlBinder implements SqlBinder {
      * @return column-literal 方向的不可变 comparison
      */
     private static BoundComparison comparison(
-            ColumnDefinition column,
+            ResolvedColumn resolved,
             cn.zhangyis.db.sql.parser.SourcePosition columnPosition,
             LiteralNode literal, BoundComparisonOperator operator,
             SqlValue value) {
         return new BoundComparison(
-                columnReference(column, columnPosition),
+                columnReference(resolved, columnPosition),
                 operator,
-                new BoundLiteral(value, column.type(), literal.position()));
+                new BoundLiteral(
+                        value, resolved.column().type(),
+                        literal.position()));
     }
 
     /** comparison 中的 NULL 即使面对 NOT NULL 列也合法，只是永远不能得到 TRUE。 */
@@ -781,6 +1339,12 @@ public final class DefaultSqlBinder implements SqlBinder {
     private static TableDefinition openActiveBoundTable(QualifiedNameNode syntax, SqlBindingContext context,
                                                         TableAccessIntent intent) {
         QualifiedTableName name = qualify(syntax, context);
+        return openActiveBoundTable(name, context, intent);
+    }
+
+    private static TableDefinition openActiveBoundTable(
+            QualifiedTableName name, SqlBindingContext context,
+            TableAccessIntent intent) {
         TableDefinition table = context.metadataScope().openTable(name, intent);
         if (table.state() != TableState.ACTIVE) throw new SqlBindingException("table is not ACTIVE: " + name.canonicalKey());
         if (table.storageBinding().isEmpty()) throw new SqlBindingException("table has no physical storage binding: " + name.canonicalKey());
@@ -821,17 +1385,103 @@ public final class DefaultSqlBinder implements SqlBinder {
         return column;
     }
 
-    private static List<Integer> projectionOrdinals(SelectStatementNode select, TableDefinition table,
-                                                    Map<ObjectName, ColumnDefinition> columns) {
-        if (select.star()) return table.columns().stream().map(ColumnDefinition::ordinal).toList();
+    private static List<Integer> projectionOrdinals(
+            SelectStatementNode select,
+            List<RelationBinding> relations) {
+        if (select.star()) {
+            return java.util.stream.IntStream.range(
+                    0, relations.stream()
+                            .mapToInt(relation ->
+                                    relation.table().columns().size())
+                            .sum()).boxed().toList();
+        }
         ArrayList<Integer> result = new ArrayList<>();
-        HashSet<ObjectName> unique = new HashSet<>();
-        for (IdentifierNode projection : select.projections()) {
-            ObjectName name = ObjectName.of(projection.value());
-            if (!unique.add(name)) throw new UnsupportedSqlShapeException("duplicate SELECT projection: " + name);
-            result.add(requireColumn(columns, name).ordinal());
+        HashSet<Integer> unique = new HashSet<>();
+        for (ColumnReferenceNode projection : select.projections()) {
+            ResolvedColumn resolved =
+                    resolveColumn(projection, relations);
+            int ordinal =
+                    flattenedOrdinal(resolved, relations);
+            if (!unique.add(ordinal)) {
+                throw new UnsupportedSqlShapeException(
+                        "duplicate SELECT projection: "
+                                + projection.value());
+            }
+            result.add(ordinal);
         }
         return List.copyOf(result);
+    }
+
+    private static RelationBinding relation(
+            TableDefinition table,
+            Optional<IdentifierNode> alias,
+            int relationOrdinal) {
+        ObjectName qualifier = alias
+                .map(value -> ObjectName.of(value.value()))
+                .orElse(table.name());
+        return new RelationBinding(
+                table, qualifier, relationOrdinal,
+                columns(table));
+    }
+
+    /**
+     * 按 SQL 名称作用域解析列：限定引用必须命中唯一 qualifier，未限定引用必须只在一个输入存在。
+     */
+    private static ResolvedColumn resolveColumn(
+            ColumnReferenceNode syntax,
+            List<RelationBinding> relations) {
+        ObjectName columnName =
+                ObjectName.of(syntax.value());
+        if (syntax.qualifier().isPresent()) {
+            ObjectName qualifier = ObjectName.of(
+                    syntax.qualifier().orElseThrow().value());
+            RelationBinding relation = relations.stream()
+                    .filter(candidate ->
+                            candidate.qualifier().equals(qualifier))
+                    .findFirst()
+                    .orElseThrow(() -> new SqlBindingException(
+                            "unknown table qualifier: "
+                                    + qualifier.displayName()));
+            return new ResolvedColumn(
+                    relation,
+                    requireColumn(relation.columns(), columnName));
+        }
+        ArrayList<ResolvedColumn> matches =
+                new ArrayList<>();
+        for (RelationBinding relation : relations) {
+            ColumnDefinition column =
+                    relation.columns().get(columnName);
+            if (column != null) {
+                matches.add(new ResolvedColumn(
+                        relation, column));
+            }
+        }
+        if (matches.isEmpty()) {
+            throw new UnknownColumnException(
+                    "unknown column: "
+                            + columnName.displayName());
+        }
+        if (matches.size() > 1) {
+            throw new SqlBindingException(
+                    "ambiguous column in INNER JOIN: "
+                            + columnName.displayName());
+        }
+        return matches.getFirst();
+    }
+
+    private static int flattenedOrdinal(
+            ResolvedColumn resolved,
+            List<RelationBinding> relations) {
+        int ordinal = resolved.column().ordinal();
+        for (RelationBinding relation : relations) {
+            if (relation.relationOrdinal()
+                    == resolved.relation().relationOrdinal()) {
+                return ordinal;
+            }
+            ordinal += relation.table().columns().size();
+        }
+        throw new SqlBindingException(
+                "resolved relation is outside statement scope");
     }
 
     private static boolean isLobKey(DictionaryTypeId type) {
@@ -848,4 +1498,19 @@ public final class DefaultSqlBinder implements SqlBinder {
      * @param value SQL 解析、绑定或执行链路提供的语句、值或会话上下文；不得为 {@code null}，必须属于当前语句及会话的同一次执行
      */
     private record BoundAssignment(int ordinal, SqlValue value) { }
+
+    /** Binder 私有 relation scope；columns 与 exact table version 同生命周期。 */
+    private record RelationBinding(
+            TableDefinition table, ObjectName qualifier,
+            int relationOrdinal,
+            Map<ObjectName, ColumnDefinition> columns) { }
+
+    /** 名称解析后的 relation/local column 组合。 */
+    private record ResolvedColumn(
+            RelationBinding relation,
+            ColumnDefinition column) { }
+
+    /** 同一正向 conjunction 中检测重复 equality 的 relation/local identity。 */
+    private record ColumnBindingKey(
+            int relationOrdinal, int columnOrdinal) { }
 }

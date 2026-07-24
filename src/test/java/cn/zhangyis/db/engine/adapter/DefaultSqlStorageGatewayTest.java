@@ -7,22 +7,15 @@ import cn.zhangyis.db.domain.PageNo;
 import cn.zhangyis.db.domain.PageSize;
 import cn.zhangyis.db.domain.SpaceId;
 import cn.zhangyis.db.engine.DatabaseEngine;
-import cn.zhangyis.db.sql.optimizer.physical.PhysicalInsert;
-import cn.zhangyis.db.sql.optimizer.physical.PhysicalPointSelect;
-import cn.zhangyis.db.sql.optimizer.physical.PointAccessKind;
-import cn.zhangyis.db.sql.optimizer.physical.PhysicalPointUpdate;
-import cn.zhangyis.db.sql.optimizer.physical.PhysicalPointDelete;
-import cn.zhangyis.db.sql.optimizer.physical.PhysicalSecondaryRangeSelect;
 import cn.zhangyis.db.sql.binder.bound.SelectLockMode;
-import cn.zhangyis.db.sql.optimizer.physical.PhysicalRangeSelect;
-import cn.zhangyis.db.sql.optimizer.physical.PhysicalRangeUpdate;
-import cn.zhangyis.db.sql.optimizer.physical.PhysicalRangeDelete;
-import cn.zhangyis.db.sql.optimizer.physical.IndexRange;
-import cn.zhangyis.db.sql.optimizer.physical.RangeEndpoint;
+import cn.zhangyis.db.sql.executor.DefaultSqlExecutor;
+import cn.zhangyis.db.sql.executor.QueryResult;
+import cn.zhangyis.db.sql.executor.TransactionStatus;
 import cn.zhangyis.db.sql.expression.BoundComparisonOperator;
 import cn.zhangyis.db.sql.expression.BoundNullTestOperator;
 import cn.zhangyis.db.sql.executor.SqlRow;
 import cn.zhangyis.db.sql.optimizer.logical.PredicateSet;
+import cn.zhangyis.db.sql.optimizer.physical.*;
 import cn.zhangyis.db.sql.type.SqlValue;
 import cn.zhangyis.db.sql.executor.storage.*;
 import cn.zhangyis.db.sql.executor.storage.exception.SqlTransactionStateException;
@@ -34,6 +27,7 @@ import java.math.BigInteger;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -73,16 +67,206 @@ class DefaultSqlStorageGatewayTest {
                     SqlIsolationLevel.READ_COMMITTED, true, true));
             IndexDefinition email = table.indexes().stream().filter(index -> !index.clustered())
                     .findFirst().orElseThrow();
-            PhysicalPointSelect select = pointSelect(table, List.of(2, 0), email.id().value(),
+            PhysicalQuery select = pointQuery(table, List.of(2, 0), email.id().value(),
                     PointAccessKind.UNIQUE_SECONDARY,
                     List.of(new SqlValue.StringValue("READER@example.test")));
-            SqlRow row = gateway.selectPoint(read, select,
+            SqlRow row = executePointQuery(gateway, read, select,
                     SqlStatementDeadline.after(Duration.ofSeconds(2))).orElseThrow();
             assertEquals(List.of(new SqlValue.StringValue(text),
                     new SqlValue.IntegerValue(BigInteger.ONE)), row.values());
+            List<SqlValue> emailKey = List.of(
+                    new SqlValue.StringValue(
+                            "READER@example.test"));
+            PhysicalQuery lobResidual = pointQuery(
+                    table, List.of(0), email.id().value(),
+                    PointAccessKind.UNIQUE_SECONDARY,
+                    emailKey,
+                    predicates(
+                            equal(table, 1, emailKey.getFirst()),
+                            equal(table, 2,
+                                    new SqlValue.StringValue(text))));
+            assertEquals(
+                    new SqlValue.IntegerValue(BigInteger.ONE),
+                    executePointQuery(
+                            gateway, read, lobResidual,
+                            SqlStatementDeadline.after(
+                                    Duration.ofSeconds(2)))
+                            .orElseThrow().values().getFirst(),
+                    "Filter 比较 external TEXT 时必须按需 hydrate，不能把 LobReference 交给 comparator");
             gateway.commit(read, new SqlCommitRequest(SqlDurabilityMode.BACKGROUND_FLUSH,
                     Duration.ofSeconds(1)));
         }
+    }
+
+    /**
+     * cursor 必须使旧 row view 在 advance 后失效，并阻止 ReentrantLock 同线程重入事务终态。
+     */
+    @Test
+    void cursorOwnsRowViewAndTransactionLeaseUntilClose() {
+        try (DatabaseEngine database = openDatabase()) {
+            TableDefinition table = createTable(database);
+            DefaultSqlStorageGateway gateway =
+                    new DefaultSqlStorageGateway(
+                            database.storage(),
+                            new DictionaryStorageMetadataMapper(),
+                            Duration.ofSeconds(2));
+            SqlTransactionHandle write = gateway.begin(
+                    new SqlTransactionRequest(
+                            SqlIsolationLevel.REPEATABLE_READ,
+                            false, false));
+            gateway.insert(write, new PhysicalInsert(
+                            table, List.of(
+                                    new SqlValue.IntegerValue(
+                                            BigInteger.ONE),
+                                    new SqlValue.StringValue(
+                                            "cursor@example.test"),
+                                    new SqlValue.StringValue("body"))),
+                    SqlStatementDeadline.after(
+                            Duration.ofSeconds(2)));
+            gateway.commit(write, new SqlCommitRequest(
+                    SqlDurabilityMode.FLUSH_ON_COMMIT,
+                    Duration.ofSeconds(2)));
+
+            SqlTransactionHandle read = gateway.begin(
+                    new SqlTransactionRequest(
+                            SqlIsolationLevel.READ_COMMITTED,
+                            true, true));
+            PhysicalPointAccess access =
+                    new PhysicalPointAccess(
+                            table,
+                            table.primaryIndex().id().value(),
+                            PointAccessKind.CLUSTERED_PRIMARY,
+                            List.of(new SqlValue.IntegerValue(
+                                    BigInteger.ONE)));
+            SqlStorageCursor cursor = gateway.openCursor(
+                    read, access,
+                    SqlStatementDeadline.after(
+                            Duration.ofSeconds(2)));
+            assertThrows(SqlTransactionStateException.class,
+                    () -> gateway.commit(
+                            read, new SqlCommitRequest(
+                                    SqlDurabilityMode.BACKGROUND_FLUSH,
+                                    Duration.ofSeconds(1))),
+                    "同线程重入也不能越过 cursor operation lease");
+            assertTrue(cursor.advance());
+            var oldView = cursor.current();
+            assertEquals(
+                    new SqlValue.IntegerValue(BigInteger.ONE),
+                    oldView.valueAt(0));
+            assertFalse(cursor.advance());
+            assertThrows(
+                    cn.zhangyis.db.sql.executor.storage.exception
+                            .SqlStorageException.class,
+                    () -> oldView.valueAt(0));
+
+            cursor.close();
+            cursor.close();
+            assertDoesNotThrow(() -> gateway.commit(
+                    read, new SqlCommitRequest(
+                            SqlDurabilityMode.BACKGROUND_FLUSH,
+                            Duration.ofSeconds(1))));
+        }
+    }
+
+    /**
+     * 同一 RC statement scope 的两个 cursor 必须共享首个 ReadView：scope 打开后提交的新行
+     * 对后开的 inner cursor 仍不可见；单个 child close 也不能提前释放 transaction lease。
+     */
+    @Test
+    void cursorScopeSharesReadCommittedViewAcrossMultipleCursors() {
+        try (DatabaseEngine database = openDatabase()) {
+            TableDefinition table =
+                    createTable(database);
+            DefaultSqlStorageGateway gateway =
+                    new DefaultSqlStorageGateway(
+                            database.storage(),
+                            new DictionaryStorageMetadataMapper(),
+                            Duration.ofSeconds(2));
+            SqlTransactionHandle initial =
+                    gateway.begin(new SqlTransactionRequest(
+                            SqlIsolationLevel.REPEATABLE_READ,
+                            false, false));
+            gateway.insert(initial, new PhysicalInsert(
+                            table, List.of(
+                                    new SqlValue.IntegerValue(
+                                            BigInteger.ONE),
+                                    new SqlValue.StringValue(
+                                            "one@example.test"),
+                                    new SqlValue.StringValue("one"))),
+                    SqlStatementDeadline.after(
+                            Duration.ofSeconds(2)));
+            gateway.commit(initial, new SqlCommitRequest(
+                    SqlDurabilityMode.FLUSH_ON_COMMIT,
+                    Duration.ofSeconds(2)));
+
+            SqlTransactionHandle read =
+                    gateway.begin(new SqlTransactionRequest(
+                            SqlIsolationLevel.READ_COMMITTED,
+                            true, true));
+            SqlStatementDeadline deadline =
+                    SqlStatementDeadline.after(
+                            Duration.ofSeconds(3));
+            PhysicalRangeAccess scan =
+                    new PhysicalRangeAccess(
+                            table,
+                            table.primaryIndex().id().value(),
+                            IndexRange.unbounded(),
+                            SelectLockMode.CONSISTENT,
+                            false);
+            SqlCursorScope scope =
+                    gateway.openCursorScope(
+                            read, deadline);
+            SqlStorageCursor outer =
+                    scope.openCursor(scan);
+
+            SqlTransactionHandle writer =
+                    gateway.begin(new SqlTransactionRequest(
+                            SqlIsolationLevel.REPEATABLE_READ,
+                            false, false));
+            gateway.insert(writer, new PhysicalInsert(
+                            table, List.of(
+                                    new SqlValue.IntegerValue(
+                                            BigInteger.TWO),
+                                    new SqlValue.StringValue(
+                                            "two@example.test"),
+                                    new SqlValue.StringValue("two"))),
+                    SqlStatementDeadline.after(
+                            Duration.ofSeconds(2)));
+            gateway.commit(writer, new SqlCommitRequest(
+                    SqlDurabilityMode.FLUSH_ON_COMMIT,
+                    Duration.ofSeconds(2)));
+
+            SqlStorageCursor inner =
+                    scope.openCursor(scan);
+            assertEquals(1, cursorRowCount(outer));
+            assertEquals(1, cursorRowCount(inner),
+                    "同一 RC 语句后开的 inner cursor 不能建立更新的 ReadView");
+            outer.close();
+            inner.close();
+            assertThrows(
+                    SqlTransactionStateException.class,
+                    () -> gateway.commit(
+                            read, new SqlCommitRequest(
+                                    SqlDurabilityMode.BACKGROUND_FLUSH,
+                                    Duration.ofSeconds(1))),
+                    "child cursor 关闭不等于 statement scope 关闭");
+            scope.close();
+            scope.close();
+            assertDoesNotThrow(() -> gateway.commit(
+                    read, new SqlCommitRequest(
+                            SqlDurabilityMode.BACKGROUND_FLUSH,
+                            Duration.ofSeconds(1))));
+        }
+    }
+
+    private static int cursorRowCount(
+            SqlStorageCursor cursor) {
+        int count = 0;
+        while (cursor.advance()) {
+            cursor.current().valueAt(0);
+            count++;
+        }
+        return count;
     }
 
     /**
@@ -148,12 +332,12 @@ class DefaultSqlStorageGatewayTest {
                     .findFirst().orElseThrow();
             SqlTransactionHandle read = gateway.begin(new SqlTransactionRequest(
                     SqlIsolationLevel.READ_COMMITTED, true, true));
-            assertTrue(gateway.selectPoint(read, pointSelect(table, List.of(2), email.id().value(),
+            assertTrue(executePointQuery(gateway, read, pointQuery(table, List.of(2), email.id().value(),
                     PointAccessKind.UNIQUE_SECONDARY,
                     List.of(new SqlValue.StringValue("BEFORE@example.test"))),
                     SqlStatementDeadline.after(Duration.ofSeconds(5))).isEmpty());
-            assertEquals(new SqlValue.StringValue(after), gateway.selectPoint(read,
-                    pointSelect(table, List.of(2), email.id().value(),
+            assertEquals(new SqlValue.StringValue(after), executePointQuery(gateway, read,
+                    pointQuery(table, List.of(2), email.id().value(),
                             PointAccessKind.UNIQUE_SECONDARY,
                             List.of(new SqlValue.StringValue("AFTER@example.test"))),
                     SqlStatementDeadline.after(Duration.ofSeconds(5)))
@@ -171,7 +355,7 @@ class DefaultSqlStorageGatewayTest {
 
             SqlTransactionHandle verify = gateway.begin(new SqlTransactionRequest(
                     SqlIsolationLevel.READ_COMMITTED, true, true));
-            assertTrue(gateway.selectPoint(verify, pointSelect(table, List.of(0), email.id().value(),
+            assertTrue(executePointQuery(gateway, verify, pointQuery(table, List.of(0), email.id().value(),
                     PointAccessKind.UNIQUE_SECONDARY,
                     List.of(new SqlValue.StringValue("AFTER@example.test"))),
                     SqlStatementDeadline.after(Duration.ofSeconds(5))).isEmpty());
@@ -202,11 +386,10 @@ class DefaultSqlStorageGatewayTest {
             }
             IndexDefinition email = table.indexes().stream().filter(index -> !index.clustered())
                     .findFirst().orElseThrow();
-            PhysicalSecondaryRangeSelect consistent = new PhysicalSecondaryRangeSelect(table, List.of(2, 0),
-                    email.id().value(), List.of(new SqlValue.StringValue("team@example.test")),
-                    SelectLockMode.CONSISTENT,
-                    indexEqualityPredicates(table, email.id().value(),
-                            List.of(new SqlValue.StringValue("team@example.test"))));
+            PhysicalQuery consistent = secondaryQuery(table, List.of(2, 0),
+                    email.id().value(),
+                    List.of(new SqlValue.StringValue("team@example.test")),
+                    SelectLockMode.CONSISTENT);
             SqlTransactionHandle read = gateway.begin(new SqlTransactionRequest(
                     SqlIsolationLevel.READ_COMMITTED, true, true));
             assertEquals(List.of(
@@ -214,18 +397,18 @@ class DefaultSqlStorageGatewayTest {
                             new SqlValue.IntegerValue(BigInteger.ONE))),
                     new SqlRow(List.of(new SqlValue.StringValue(secondBody),
                             new SqlValue.IntegerValue(BigInteger.valueOf(2))))),
-                    gateway.selectRange(read, consistent, SqlStatementDeadline.after(Duration.ofSeconds(5))));
+                    executeQueryRows(gateway, read, consistent,
+                            SqlStatementDeadline.after(Duration.ofSeconds(5))));
             gateway.commit(read, new SqlCommitRequest(SqlDurabilityMode.BACKGROUND_FLUSH,
                     Duration.ofSeconds(1)));
 
             SqlTransactionHandle locking = gateway.begin(new SqlTransactionRequest(
                     SqlIsolationLevel.REPEATABLE_READ, false, false));
-            PhysicalSecondaryRangeSelect forShare = new PhysicalSecondaryRangeSelect(table, List.of(0),
-                    email.id().value(), List.of(new SqlValue.StringValue("TEAM@example.test")),
-                    SelectLockMode.FOR_SHARE,
-                    indexEqualityPredicates(table, email.id().value(),
-                            List.of(new SqlValue.StringValue("TEAM@example.test"))));
-            assertEquals(2, gateway.selectRange(locking, forShare,
+            PhysicalQuery forShare = secondaryQuery(table, List.of(0),
+                    email.id().value(),
+                    List.of(new SqlValue.StringValue("TEAM@example.test")),
+                    SelectLockMode.FOR_SHARE);
+            assertEquals(2, executeQueryRows(gateway, locking, forShare,
                     SqlStatementDeadline.after(Duration.ofSeconds(5))).size());
             assertTrue(gateway.commit(locking, new SqlCommitRequest(
                     SqlDurabilityMode.BACKGROUND_FLUSH, Duration.ofSeconds(1))).releasedLockCount() >= 3);
@@ -280,14 +463,15 @@ class DefaultSqlStorageGatewayTest {
 
             SqlTransactionHandle fullScan = gateway.begin(new SqlTransactionRequest(
                     SqlIsolationLevel.READ_COMMITTED, true, true));
-            PhysicalRangeSelect scan = new PhysicalRangeSelect(table, List.of(0),
+            PhysicalQuery scan = rangeQuery(table, List.of(0),
                     table.primaryIndex().id().value(), IndexRange.unbounded(),
                     predicates(comparison(table, 1,
                             BoundComparisonOperator.EQUAL,
                             new SqlValue.StringValue("ZZ@example.test"))),
                     SelectLockMode.CONSISTENT, false);
             assertEquals(List.of(BigInteger.ONE, BigInteger.TWO, BigInteger.valueOf(3)),
-                    gateway.selectRange(fullScan, scan, SqlStatementDeadline.after(Duration.ofSeconds(5)))
+                    executeQueryRows(gateway, fullScan, scan,
+                            SqlStatementDeadline.after(Duration.ofSeconds(5)))
                             .stream()
                             .map(row -> assertInstanceOf(
                                     SqlValue.IntegerValue.class, row.values().getFirst()).value())
@@ -317,7 +501,7 @@ class DefaultSqlStorageGatewayTest {
 
             SqlTransactionHandle verify = gateway.begin(new SqlTransactionRequest(
                     SqlIsolationLevel.READ_COMMITTED, true, true));
-            assertEquals(1, gateway.selectRange(verify, scan,
+            assertEquals(1, executeQueryRows(gateway, verify, scan,
                     SqlStatementDeadline.after(Duration.ofSeconds(5))).size());
             gateway.commit(verify, new SqlCommitRequest(
                     SqlDurabilityMode.BACKGROUND_FLUSH, Duration.ofSeconds(1)));
@@ -344,38 +528,36 @@ class DefaultSqlStorageGatewayTest {
 
             SqlTransactionHandle ru = gateway.begin(new SqlTransactionRequest(
                     SqlIsolationLevel.READ_UNCOMMITTED, true, true));
-            PhysicalPointSelect primary = pointSelect(table, List.of(2),
+            PhysicalQuery primary = pointQuery(table, List.of(2),
                     table.primaryIndex().id().value(), PointAccessKind.CLUSTERED_PRIMARY,
                     List.of(new SqlValue.IntegerValue(BigInteger.ONE)));
             assertEquals(new SqlValue.StringValue("uncommitted"),
-                    gateway.selectPoint(ru, primary,
+                    executePointQuery(gateway, ru, primary,
                             SqlStatementDeadline.after(Duration.ofSeconds(5)))
                             .orElseThrow().values().getFirst());
             List<SqlValue> primaryKey = List.of(
                     new SqlValue.IntegerValue(BigInteger.ONE));
-            PhysicalPointSelect rejectedByResidual =
-                    new PhysicalPointSelect(
-                            table, List.of(2),
-                            table.primaryIndex().id().value(),
-                            PointAccessKind.CLUSTERED_PRIMARY,
-                            primaryKey,
-                            predicates(
+            PhysicalQuery rejectedByResidual = pointQuery(
+                    table, List.of(2),
+                    table.primaryIndex().id().value(),
+                    PointAccessKind.CLUSTERED_PRIMARY,
+                    primaryKey,
+                    predicates(
                                     equal(table, 0, primaryKey.getFirst()),
                                     equal(table, 1,
                                             new SqlValue.StringValue(
                                                     "different"))));
-            assertTrue(gateway.selectPoint(
-                    ru, rejectedByResidual,
+            assertTrue(executePointQuery(
+                    gateway, ru, rejectedByResidual,
                     SqlStatementDeadline.after(
                             Duration.ofSeconds(5))).isEmpty(),
                     "RU 聚簇 access key 命中后仍必须执行完整 residual");
-            PhysicalPointSelect acceptedByBooleanResidual =
-                    new PhysicalPointSelect(
-                            table, List.of(2),
-                            table.primaryIndex().id().value(),
-                            PointAccessKind.CLUSTERED_PRIMARY,
-                            primaryKey,
-                            predicates(
+            PhysicalQuery acceptedByBooleanResidual = pointQuery(
+                    table, List.of(2),
+                    table.primaryIndex().id().value(),
+                    PointAccessKind.CLUSTERED_PRIMARY,
+                    primaryKey,
+                    predicates(
                                     equal(table, 0,
                                             primaryKey.getFirst()),
                                     or(equal(
@@ -387,28 +569,28 @@ class DefaultSqlStorageGatewayTest {
                                                     BoundNullTestOperator
                                                             .IS_NOT_NULL))));
             assertEquals(new SqlValue.StringValue("uncommitted"),
-                    gateway.selectPoint(
-                            ru, acceptedByBooleanResidual,
+                    executePointQuery(
+                            gateway, ru, acceptedByBooleanResidual,
                             SqlStatementDeadline.after(
                                     Duration.ofSeconds(5)))
                             .orElseThrow().values().getFirst(),
                     "RU point 命中后必须以同一当前版本求值 OR/null-test residual");
             IndexDefinition email = table.indexes().stream()
                     .filter(index -> !index.clustered()).findFirst().orElseThrow();
-            PhysicalPointSelect secondary = pointSelect(table, List.of(0),
+            PhysicalQuery secondary = pointQuery(table, List.of(0),
                     email.id().value(), PointAccessKind.UNIQUE_SECONDARY,
                     List.of(new SqlValue.StringValue("DIRTY@example.test")));
             assertEquals(new SqlValue.IntegerValue(BigInteger.ONE),
-                    gateway.selectPoint(ru, secondary,
+                    executePointQuery(gateway, ru, secondary,
                             SqlStatementDeadline.after(Duration.ofSeconds(5)))
                             .orElseThrow().values().getFirst());
 
             gateway.delete(writer, new PhysicalPointDelete(table,
                             List.of(new SqlValue.IntegerValue(BigInteger.ONE))),
                     SqlStatementDeadline.after(Duration.ofSeconds(5)));
-            assertTrue(gateway.selectPoint(ru, primary,
+            assertTrue(executePointQuery(gateway, ru, primary,
                     SqlStatementDeadline.after(Duration.ofSeconds(5))).isEmpty());
-            assertTrue(gateway.selectPoint(ru, secondary,
+            assertTrue(executePointQuery(gateway, ru, secondary,
                     SqlStatementDeadline.after(Duration.ofSeconds(5))).isEmpty());
 
             gateway.rollback(writer);
@@ -457,11 +639,11 @@ class DefaultSqlStorageGatewayTest {
 
             SqlTransactionHandle verify = gateway.begin(new SqlTransactionRequest(
                     SqlIsolationLevel.READ_COMMITTED, true, true));
-            assertTrue(gateway.selectPoint(verify, pointSelect(table, List.of(0),
+            assertTrue(executePointQuery(gateway, verify, pointQuery(table, List.of(0),
                             table.primaryIndex().id().value(), PointAccessKind.CLUSTERED_PRIMARY,
                             List.of(new SqlValue.IntegerValue(BigInteger.ONE))),
                     SqlStatementDeadline.after(Duration.ofSeconds(5))).isPresent());
-            assertTrue(gateway.selectPoint(verify, pointSelect(table, List.of(0),
+            assertTrue(executePointQuery(gateway, verify, pointQuery(table, List.of(0),
                             table.primaryIndex().id().value(), PointAccessKind.CLUSTERED_PRIMARY,
                             List.of(new SqlValue.IntegerValue(BigInteger.TWO))),
                     SqlStatementDeadline.after(Duration.ofSeconds(5))).isEmpty());
@@ -514,11 +696,11 @@ class DefaultSqlStorageGatewayTest {
                 return null;
             });
             assertTrue(locked.await(1, TimeUnit.SECONDS));
-            PhysicalPointSelect select = pointSelect(table, List.of(0),
+            PhysicalQuery select = pointQuery(table, List.of(0),
                     table.primaryIndex().id().value(), PointAccessKind.CLUSTERED_PRIMARY,
                     List.of(new SqlValue.IntegerValue(BigInteger.ONE)));
             long started = System.nanoTime();
-            assertThrows(SqlTransactionStateException.class, () -> gateway.selectPoint(handle, select,
+            assertThrows(SqlTransactionStateException.class, () -> executePointQuery(gateway, handle, select,
                     SqlStatementDeadline.after(Duration.ofMillis(80))));
             Duration elapsed = Duration.ofNanos(System.nanoTime() - started);
             assertTrue(elapsed.compareTo(Duration.ofMillis(500)) < 0,
@@ -546,15 +728,149 @@ class DefaultSqlStorageGatewayTest {
      * @param keyValues 按 logical index key part 排列的完整 key
      * @return 同时包含 range 缩小条件与最终 SQL truth 条件的 point plan
      */
-    private static PhysicalPointSelect pointSelect(
+    private static PhysicalQuery pointQuery(
             TableDefinition table,
             List<Integer> projectionOrdinals,
             long indexId,
             PointAccessKind accessKind,
             List<SqlValue> keyValues) {
-        return new PhysicalPointSelect(
+        return pointQuery(
                 table, projectionOrdinals, indexId, accessKind, keyValues,
                 indexEqualityPredicates(table, indexId, keyValues));
+    }
+
+    /**
+     * 组装允许额外 residual 的 point 查询，冻结 Access 只负责定位、Filter 负责最终真值的边界。
+     *
+     * @param table exact DD 表版本
+     * @param projectionOrdinals 用户结果列序号
+     * @param indexId 唯一点访问索引 id
+     * @param accessKind 聚簇主键或唯一二级路径
+     * @param keyValues 完整 typed index key
+     * @param predicates 在完整逻辑行上求值的最终条件
+     * @return 已通过跨算子不变量校验的物理查询树
+     */
+    private static PhysicalQuery pointQuery(
+            TableDefinition table,
+            List<Integer> projectionOrdinals,
+            long indexId,
+            PointAccessKind accessKind,
+            List<SqlValue> keyValues,
+            PredicateSet predicates) {
+        return query(
+                projectionOrdinals,
+                new PhysicalPointAccess(table, indexId, accessKind, keyValues),
+                predicates);
+    }
+
+    /**
+     * 组装普通二级 logical-prefix 查询；候选行仍必须回聚簇后经过 Filter。
+     *
+     * @param table exact DD 表版本
+     * @param projectionOrdinals 用户结果列序号
+     * @param indexId 普通二级索引 id
+     * @param keyValues logical key-part 值
+     * @param lockMode 一致性读或当前锁定读模式
+     * @return project-filter-secondary-access 查询树
+     */
+    private static PhysicalQuery secondaryQuery(
+            TableDefinition table,
+            List<Integer> projectionOrdinals,
+            long indexId,
+            List<SqlValue> keyValues,
+            SelectLockMode lockMode) {
+        return query(
+                projectionOrdinals,
+                new PhysicalSecondaryPrefixAccess(
+                        table, indexId, keyValues, lockMode),
+                indexEqualityPredicates(table, indexId, keyValues));
+    }
+
+    /**
+     * 组装 comparison/full-scan 查询，访问范围只缩小候选，完整 predicates 由 Filter 保留。
+     *
+     * @param table exact DD 表版本
+     * @param projectionOrdinals 用户结果列序号
+     * @param indexId 物理扫描索引 id
+     * @param range 规范化物理端点
+     * @param predicates 最终 SQL truth
+     * @param lockMode 一致性读或当前锁定读模式
+     * @param empty optimizer 已证明无结果的标志
+     * @return project-filter-range-access 查询树
+     */
+    private static PhysicalQuery rangeQuery(
+            TableDefinition table,
+            List<Integer> projectionOrdinals,
+            long indexId,
+            IndexRange range,
+            PredicateSet predicates,
+            SelectLockMode lockMode,
+            boolean empty) {
+        return query(
+                projectionOrdinals,
+                new PhysicalRangeAccess(
+                        table, indexId, range, lockMode, empty),
+                predicates);
+    }
+
+    /**
+     * 把无状态物理算子组装为本切片唯一合法的查询形状。
+     *
+     * @param projectionOrdinals 用户结果列序号
+     * @param access 存储候选访问叶
+     * @param predicates 完整 residual
+     * @return 不可变 PhysicalQuery
+     */
+    private static PhysicalQuery query(
+            List<Integer> projectionOrdinals,
+            PhysicalAccess access,
+            PredicateSet predicates) {
+        return new PhysicalQuery(new PhysicalProject(
+                new PhysicalFilter(access, predicates),
+                projectionOrdinals));
+    }
+
+    /**
+     * 通过真实 Executor 拉取 point 查询，并把零/一行形状适配为测试断言需要的 Optional。
+     *
+     * @param gateway 被测存储适配器
+     * @param transaction 当前测试事务能力
+     * @param query point 物理查询树
+     * @param deadline 本次语句唯一绝对期限
+     * @return 无匹配时为空，否则为唯一公开行
+     */
+    private static Optional<SqlRow> executePointQuery(
+            DefaultSqlStorageGateway gateway,
+            SqlTransactionHandle transaction,
+            PhysicalQuery query,
+            SqlStatementDeadline deadline) {
+        List<SqlRow> rows = executeQueryRows(
+                gateway, transaction, query, deadline);
+        assertTrue(rows.size() <= 1, "point access 最多只能发布一行");
+        return rows.stream().findFirst();
+    }
+
+    /**
+     * 通过真实 PlanNode tree 拉取查询，使适配器集成测试同时覆盖 cursor 资源收口。
+     *
+     * @param gateway 被测存储适配器
+     * @param transaction 当前测试事务能力
+     * @param query 待执行的物理查询树
+     * @param deadline 本次语句唯一绝对期限
+     * @return Executor 在 cursor 关闭后发布的不可变行列表
+     */
+    private static List<SqlRow> executeQueryRows(
+            DefaultSqlStorageGateway gateway,
+            SqlTransactionHandle transaction,
+            PhysicalQuery query,
+            SqlStatementDeadline deadline) {
+        QueryResult result = assertInstanceOf(
+                QueryResult.class,
+                new DefaultSqlExecutor(gateway).execute(
+                        transaction, query,
+                        new TransactionStatus(false, true, false),
+                        deadline));
+        return result.rows();
     }
 
     private static TableDefinition createTable(DatabaseEngine database) {

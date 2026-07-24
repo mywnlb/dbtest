@@ -5,5 +5,6 @@ package cn.zhangyis.db.sql.binder.bound;
  * coordinator，任何访问索引、range 或执行算子都不属于本层。
  */
 public sealed interface BoundStatement permits BoundRelationalStatement,
-        BoundCreateIndex, BoundDropIndex, BoundAlterTablespace, BoundAlterTable {
+        BoundCreateTable, BoundCreateIndex, BoundDropIndex, BoundAlterTablespace, BoundAlterTable,
+        BoundCreateSchema, BoundDropTables, BoundDropSchema {
 }

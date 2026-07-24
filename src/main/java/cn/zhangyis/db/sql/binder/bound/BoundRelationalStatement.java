@@ -5,5 +5,5 @@ package cn.zhangyis.db.sql.binder.bound;
  * 物理范围或存储句柄；Optimizer 是把它转换为访问路径的唯一 owner。
  */
 public sealed interface BoundRelationalStatement extends BoundStatement
-        permits BoundInsert, BoundSelect, BoundUpdate, BoundDelete {
+        permits BoundInsert, BoundSelect, BoundJoinSelect, BoundUpdate, BoundDelete {
 }

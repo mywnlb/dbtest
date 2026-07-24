@@ -16,7 +16,7 @@ public sealed interface PredicateNode extends BooleanExpressionNode
      *
      * @return 当前语句源文本中的列标识符；始终非 {@code null}，尚未关联 DD column id
      */
-    IdentifierNode column();
+    ColumnReferenceNode column();
 
     /**
      * 原子谓词的诊断起点就是左侧列 token；操作符和 literal 的位置由各自节点保留。

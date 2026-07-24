@@ -49,6 +49,8 @@ public enum RedoBudgetPurpose {
     DDL_TABLE_DROP,
     /** 写或修复 GENERAL 表空间 page0/page3 SDI 快照。 */
     DDL_SDI_WRITE,
+    /** 单表自增 high-water 的页 0 短物理更新。 */
+    AUTO_INCREMENT,
     /** 回收未发布 CREATE INDEX 的两个 segment，并清空 page3 build descriptor。 */
     DDL_INDEX_DROP,
     /** 仅供 no-op manager 的页原语测试；生产 capacity-aware manager 禁止隐式使用。 */

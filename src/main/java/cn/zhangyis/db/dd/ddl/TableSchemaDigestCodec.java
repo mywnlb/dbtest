@@ -29,6 +29,10 @@ final class TableSchemaDigestCodec {
     private static final byte[] MAGIC = "MINIDDS1".getBytes(StandardCharsets.US_ASCII);
     /** 流结束标记 "DDSE"，用于阻止未来字段被误解释为 v1。 */
     private static final int TERMINATOR = 0x44445345;
+    /** 新列语义只在非默认时追加，保持既有表 TABLE_SCHEMA_V1 摘要字节完全不变。 */
+    private static final int COLUMN_EXTENSION_MAGIC = 0x44444358;
+    /** column comment/generation 扩展版本。 */
+    private static final int COLUMN_EXTENSION_VERSION = 1;
     /** 任一 canonical UTF-8 字段的独立上限。 */
     private static final int MAX_STRING_BYTES = 8 * 1024;
     /** 与 SDI 领域上限一致的最大列数。 */
@@ -74,7 +78,8 @@ final class TableSchemaDigestCodec {
             // 3、index list 顺序本身参与摘要；key part stable code由本codec显式映射。
             writeIndexes(out, image);
 
-            // 4、固定终止标记封闭v1输入，随后才发布不可变摘要结果。
+            // 4、只有新增语义非默认时才追加扩展，旧表继续产生逐字节相同的 digest 输入。
+            writeColumnExtension(out, image);
             out.writeInt(TERMINATOR);
             out.flush();
         } catch (IOException error) {
@@ -178,6 +183,28 @@ final class TableSchemaDigestCodec {
                 out.writeInt(orderStableCode(part.order()));
                 out.writeInt(part.prefixBytes());
             }
+        }
+    }
+
+    /**
+     * 写入可选列扩展。扩展按全部列 ordinal 编码，避免稀疏索引在未来字段增加时产生歧义。
+     */
+    private static void writeColumnExtension(
+            DataOutputStream out, DdlTableSchemaImage image) throws IOException {
+        boolean required = image.table().columns().stream().anyMatch(column ->
+                !column.comment().isEmpty()
+                        || column.generation()
+                        != cn.zhangyis.db.dd.domain.ColumnGeneration.NONE);
+        if (!required) {
+            return;
+        }
+        out.writeInt(COLUMN_EXTENSION_MAGIC);
+        out.writeInt(COLUMN_EXTENSION_VERSION);
+        out.writeInt(image.table().columns().size());
+        for (ColumnDefinition column : image.table().columns()) {
+            out.writeLong(column.columnId());
+            writeString(out, column.comment(), "column comment");
+            out.writeInt(column.generation().stableCode());
         }
     }
 

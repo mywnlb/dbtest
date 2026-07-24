@@ -15,7 +15,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 通用Online ALTER action payload v1确定性编码器。payload只保存逻辑定义与稳定identity，不保存AST、lambda、
+ * 通用Online ALTER action payload v2确定性编码器。payload只保存逻辑定义与稳定identity，不保存AST、lambda、
  * root page或segment；完整前后schema仍由marker digest与target SDI共同证明。
  */
 public final class OnlineAlterActionPayloadCodec {
@@ -23,7 +23,7 @@ public final class OnlineAlterActionPayloadCodec {
     /** ASCII `OAAP`。 */
     private static final int MAGIC = 0x4f414150;
     /** 当前动作payload格式。 */
-    private static final int VERSION = 1;
+    private static final int VERSION = 2;
 
     /**
      * 按用户声明顺序冻结全部动作；ADD identity从target读取，DROP identity从source读取。
@@ -128,6 +128,8 @@ public final class OnlineAlterActionPayloadCodec {
         if (column.defaultDefinition().constantLiteral().isPresent()) {
             writeUtf8(out, column.defaultDefinition().constantLiteral().orElseThrow());
         }
+        writeUtf8(out, column.comment());
+        out.writeInt(column.generation().stableCode());
     }
 
     /** 编码完整索引定义与有序key part；不编码物理root/segment。 */

@@ -36,15 +36,16 @@ class SqlExecutionModelTest {
     }
 
     /**
-     * 验证 {@code queryRejectsDuplicateColumnsAndWidthMismatch} 所描述的非法或损坏输入会被领域校验拒绝，并固定异常类型及失败后的状态边界。
+     * 多表 SELECT 合法允许重复显示列名；结果模型仍必须拒绝行宽错配和非法事务状态。
      */
     @Test
-    void queryRejectsDuplicateColumnsAndWidthMismatch() {
+    void queryAllowsDuplicateColumnsButRejectsWidthMismatch() {
         ColumnTypeDefinition type = ColumnTypeDefinition.scalar(DictionaryTypeId.INT, false, false);
         ResultColumn id = new ResultColumn("id", type);
         TransactionStatus idle = TransactionStatus.idle(true);
-        assertThrows(DatabaseValidationException.class,
-                () -> new QueryResult(List.of(id, id), List.of(), idle));
+        assertDoesNotThrow(
+                () -> new QueryResult(
+                        List.of(id, id), List.of(), idle));
         assertThrows(DatabaseValidationException.class,
                 () -> new QueryResult(List.of(id), List.of(new SqlRow(List.of())), idle));
         assertThrows(DatabaseValidationException.class,

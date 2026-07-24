@@ -2,6 +2,7 @@ package cn.zhangyis.db.sql.optimizer.rewrite;
 
 import cn.zhangyis.db.sql.expression.BoundExpression;
 import cn.zhangyis.db.sql.optimizer.logical.LogicalFilter;
+import cn.zhangyis.db.sql.optimizer.logical.LogicalJoin;
 import cn.zhangyis.db.sql.optimizer.logical.LogicalPlan;
 import cn.zhangyis.db.sql.optimizer.logical.LogicalProject;
 import cn.zhangyis.db.sql.optimizer.logical.LogicalTableModify;
@@ -43,7 +44,28 @@ final class LogicalExpressionRewriter {
             case LogicalProject project -> {
                 RelNode input = rewriteNode(project.input(), expressionRule);
                 yield input.equals(project.input()) ? project
-                        : new LogicalProject(input, project.projectionOrdinals());
+                        : new LogicalProject(
+                                input, project.projectionOrdinals(),
+                                project.orderBy(), project.limit());
+            }
+            case LogicalJoin join -> {
+                RelNode left = rewriteNode(
+                        join.left(), expressionRule);
+                RelNode right = rewriteNode(
+                        join.right(), expressionRule);
+                BoundExpression condition =
+                        BoundExpressionTreeRewriter.rewrite(
+                                join.condition().condition(),
+                                expressionRule);
+                if (left.equals(join.left())
+                        && right.equals(join.right())
+                        && condition.equals(
+                        join.condition().condition())) {
+                    yield join;
+                }
+                yield new LogicalJoin(
+                        left, right,
+                        PredicateSet.of(condition));
             }
             case LogicalTableModify modify -> {
                 RelNode input = rewriteNode(modify.input(), expressionRule);

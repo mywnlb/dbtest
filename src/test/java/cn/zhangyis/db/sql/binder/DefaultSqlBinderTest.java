@@ -1,14 +1,20 @@
 package cn.zhangyis.db.sql.binder;
 
+import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.dd.domain.MdlOwnerId;
 import cn.zhangyis.db.dd.domain.ObjectName;
 import cn.zhangyis.db.sql.binder.bound.BoundInsert;
+import cn.zhangyis.db.sql.binder.bound.BoundJoinSelect;
 import cn.zhangyis.db.sql.binder.bound.BoundSelect;
 import cn.zhangyis.db.sql.binder.bound.BoundUpdate;
 import cn.zhangyis.db.sql.binder.bound.BoundDelete;
 import cn.zhangyis.db.sql.binder.bound.SelectLockMode;
 import cn.zhangyis.db.sql.binder.bound.BoundCreateIndex;
+import cn.zhangyis.db.sql.binder.bound.BoundCreateTable;
 import cn.zhangyis.db.sql.binder.bound.BoundDropIndex;
+import cn.zhangyis.db.dd.domain.ColumnDefaultDefinition;
+import cn.zhangyis.db.dd.domain.ColumnGeneration;
+import cn.zhangyis.db.dd.domain.DictionaryTypeId;
 import cn.zhangyis.db.dd.domain.IndexOrder;
 import cn.zhangyis.db.sql.expression.BoundComparison;
 import cn.zhangyis.db.sql.expression.BoundComparisonOperator;
@@ -20,8 +26,10 @@ import cn.zhangyis.db.sql.expression.BoundNullTest;
 import cn.zhangyis.db.sql.expression.BoundNullTestOperator;
 import cn.zhangyis.db.sql.optimizer.logical.PredicateSet;
 import cn.zhangyis.db.sql.parser.ast.CreateIndexStatementNode;
+import cn.zhangyis.db.sql.parser.ast.CreateTableStatementNode;
 import cn.zhangyis.db.sql.parser.ast.DropIndexStatementNode;
 import cn.zhangyis.db.sql.binder.exception.SqlBindingException;
+import cn.zhangyis.db.sql.binder.exception.UnsupportedSqlShapeException;
 import cn.zhangyis.db.sql.type.SqlValue;
 import cn.zhangyis.db.sql.parser.DefaultSqlParser;
 import org.junit.jupiter.api.Test;
@@ -61,6 +69,32 @@ class DefaultSqlBinderTest {
         }
     }
 
+    /**
+     * 多行 INSERT 必须共享同一列映射，并为每行独立补齐隐式 NULL；任一行宽错误不能发布
+     * metadata scope 或部分 batch。
+     */
+    @Test
+    void bindsMultiRowInsertAndFillsMissingNullableColumns() {
+        try (BinderTestFixture fixture = new BinderTestFixture(directory);
+             TransactionMetadataScope transaction = new TransactionMetadataScope(
+                     fixture.dictionary, MdlOwnerId.of(220));
+             StatementBindingScope statement =
+                     transaction.beginStatement(Duration.ofSeconds(1))) {
+            BoundInsert bound = assertInstanceOf(BoundInsert.class, binder.bind(
+                    parser.parse("""
+                            INSERT INTO orders (id, tenant, status)
+                            VALUES (1, 10, 'open'), (2, 20, 'closed')
+                            """),
+                    context(statement, Optional.of(ObjectName.of("app")))));
+
+            assertEquals(2, bound.batch().rows().size());
+            assertEquals(4, bound.batch().width());
+            assertEquals(SqlValue.NullValue.INSTANCE,
+                    ((cn.zhangyis.db.sql.type.InsertValueSource.Constant)
+                            bound.batch().rows().getLast().get(2)).value());
+        }
+    }
+
     /** 三段名与投影被规范化，谓词保持 SQL conjunction 顺序而不按索引 key part 重排。 */
     @Test
     void bindsThreePartPrimaryPointSelect() {
@@ -80,6 +114,136 @@ class DefaultSqlBinderTest {
             assertEquals(List.of(1, 0), predicates.stream()
                     .map(DefaultSqlBinderTest::columnOrdinal).toList());
         }
+    }
+
+    /**
+     * ORDER BY 可以引用未投影列，但必须绑定到 exact DD column id；LIMIT 原样冻结，
+     * 物理索引与排序策略仍不属于 Binder。
+     */
+    @Test
+    void bindsOrderByUnprojectedColumnAndLimit() {
+        try (BinderTestFixture fixture = new BinderTestFixture(directory);
+             TransactionMetadataScope transaction = new TransactionMetadataScope(
+                     fixture.dictionary, MdlOwnerId.of(221));
+             StatementBindingScope statement =
+                     transaction.beginStatement(Duration.ofSeconds(1))) {
+            BoundSelect bound = assertInstanceOf(BoundSelect.class, binder.bind(
+                    parser.parse("""
+                            SELECT id FROM orders WHERE tenant=2
+                            ORDER BY status DESC, id LIMIT 4 OFFSET 3
+                            """),
+                    context(statement, Optional.of(ObjectName.of("app")))));
+
+            assertEquals(List.of(3, 0), bound.orderBy().stream()
+                    .map(key -> key.columnOrdinal()).toList());
+            assertEquals(List.of(IndexOrder.DESC, IndexOrder.ASC),
+                    bound.orderBy().stream().map(key -> key.direction()).toList());
+            assertEquals(bound.table().columns().get(3).columnId(),
+                    bound.orderBy().getFirst().columnId());
+            assertEquals(3L, bound.limit().orElseThrow().offset());
+            assertEquals(4L, bound.limit().orElseThrow().count());
+        }
+    }
+
+    /**
+     * JOIN Binder 必须把两个 relation ordinal 和扁平投影固定到 exact DD version，
+     * ON 保持列列比较，WHERE 保持独立 residual。
+     */
+    @Test
+    void bindsQualifiedInnerJoinAndFlattenedProjection() {
+        try (BinderTestFixture fixture = new BinderTestFixture(directory);
+             TransactionMetadataScope transaction = new TransactionMetadataScope(
+                     fixture.dictionary, MdlOwnerId.of(222));
+             StatementBindingScope statement =
+                     transaction.beginStatement(Duration.ofSeconds(1))) {
+            BoundJoinSelect bound = assertInstanceOf(
+                    BoundJoinSelect.class, binder.bind(
+                            parser.parse("""
+                                    SELECT o.id, c.note
+                                    FROM orders o
+                                    JOIN customers c ON o.tenant = c.id
+                                    WHERE c.status = 'open'
+                                    ORDER BY o.id LIMIT 5
+                                    """),
+                            context(statement,
+                                    Optional.of(ObjectName.of("app")))));
+
+            assertEquals(List.of("orders", "customers"),
+                    bound.tables().stream()
+                            .map(table -> table.name().canonicalName())
+                            .toList());
+            assertEquals(List.of(0, 5), bound.projectionOrdinals());
+            BoundComparison on = assertInstanceOf(
+                    BoundComparison.class, bound.joinCondition());
+            assertEquals(List.of(0, 1),
+                    List.of(((cn.zhangyis.db.sql.expression.BoundColumnReference)
+                                    on.left()).relationOrdinal(),
+                            ((cn.zhangyis.db.sql.expression.BoundColumnReference)
+                                    on.right()).relationOrdinal()));
+            assertEquals(0, bound.orderBy().getFirst().columnOrdinal());
+            assertEquals(5L, bound.limit().orElseThrow().count());
+        }
+    }
+
+    /** 未限定同名列必须报歧义；未知 qualifier 和重复 alias 也不能发布 metadata scope。 */
+    @Test
+    void rejectsAmbiguousAndInvalidJoinNames() {
+        try (BinderTestFixture fixture = new BinderTestFixture(directory);
+             TransactionMetadataScope transaction = new TransactionMetadataScope(
+                     fixture.dictionary, MdlOwnerId.of(223))) {
+            assertJoinBindingFails(fixture, transaction,
+                    "SELECT id FROM orders o JOIN customers c ON o.tenant=c.id WHERE c.status='open'",
+                    "ambiguous");
+            assertJoinBindingFails(fixture, transaction,
+                    "SELECT x.id FROM orders o JOIN customers c ON o.tenant=c.id WHERE c.status='open'",
+                    "qualifier");
+            assertJoinBindingFails(fixture, transaction,
+                    "SELECT o.id FROM orders o JOIN customers o ON o.tenant=o.id WHERE o.status='open'",
+                    "alias");
+        }
+    }
+
+    private void assertJoinBindingFails(
+            BinderTestFixture fixture,
+            TransactionMetadataScope transaction,
+            String sql, String messagePart) {
+        try (StatementBindingScope statement =
+                     transaction.beginStatement(Duration.ofSeconds(1))) {
+            SqlBindingException failure = assertThrows(
+                    SqlBindingException.class,
+                    () -> binder.bind(parser.parse(sql),
+                            context(statement,
+                                    Optional.of(ObjectName.of("app")))));
+            assertTrue(failure.getMessage().toLowerCase()
+                    .contains(messagePart));
+        }
+    }
+
+    /**
+     * DDL v2 Binder 只做名称规范化和列表去重，不读取对象存在性；重复目标必须在 implicit commit 前失败。
+     */
+    @Test
+    void bindsSchemaAndAtomicDropTableCommands() {
+        var create = binder.bindDdl(assertInstanceOf(
+                cn.zhangyis.db.sql.parser.ast.CreateSchemaStatementNode.class,
+                parser.parse("CREATE DATABASE IF NOT EXISTS Sales")));
+        assertEquals("sales", create.name().canonicalName());
+        assertTrue(create.ifNotExists());
+
+        var drop = binder.bindDdl(assertInstanceOf(
+                        cn.zhangyis.db.sql.parser.ast.DropTableStatementNode.class,
+                        parser.parse("DROP TABLE IF EXISTS t1, app.t2")),
+                Optional.of(ObjectName.of("app")));
+        assertEquals(List.of("def.app.t1", "def.app.t2"),
+                drop.tables().stream()
+                        .map(name -> name.canonicalKey()).toList());
+
+        var duplicate = assertInstanceOf(
+                cn.zhangyis.db.sql.parser.ast.DropTableStatementNode.class,
+                parser.parse("DROP TABLE t1, APP.T1"));
+        assertThrows(DatabaseValidationException.class,
+                () -> binder.bindDdl(
+                        duplicate, Optional.of(ObjectName.of("app"))));
     }
 
     /** unique secondary 形状在 Binder 中与其它 SELECT 相同，只留下 typed predicate。 */
@@ -351,6 +515,79 @@ class DefaultSqlBinderTest {
                 assertInstanceOf(CreateIndexStatementNode.class,
                         parser.parse("CREATE INDEX bad ON app.orders (status, STATUS)")),
                 Optional.empty()));
+    }
+
+    /**
+     * CREATE TABLE Binder 只把纯语法转换为稳定 DD command：主键列强制 NOT NULL、字符列保留
+     * schema-default 继承哨兵，常量 default 在任何 implicit commit 前完成类型验证。
+     */
+    @Test
+    void bindsCreateTableToAtomicDictionaryCommandWithoutMetadataLease() {
+        BoundCreateTable bound = binder.bindDdl(
+                assertInstanceOf(CreateTableStatementNode.class, parser.parse("""
+                        CREATE TABLE accounts (
+                          id BIGINT PRIMARY KEY,
+                          email VARCHAR(160) NOT NULL DEFAULT 'unknown@example.test',
+                          UNIQUE INDEX uk_email (email DESC)
+                        )
+                        """)),
+                Optional.of(ObjectName.of("app")), ZoneId.of("Asia/Shanghai"));
+
+        assertEquals("def.app.accounts", bound.command().name().canonicalKey());
+        assertEquals(128, bound.command().initialSizeInPages().value());
+        assertFalse(bound.command().columns().getFirst().type().nullable());
+        assertEquals(DictionaryTypeId.VARCHAR,
+                bound.command().columns().get(1).type().typeId());
+        assertEquals(0, bound.command().columns().get(1).type().charsetId(),
+                "Binder 不能在未持 schema MDL 时猜测 charset");
+        assertEquals(ColumnDefaultDefinition.constant("'unknown@example.test'"),
+                bound.command().columns().get(1).defaultDefinition());
+        assertEquals(List.of(IndexOrder.ASC, IndexOrder.DESC),
+                bound.command().indexes().stream()
+                        .map(index -> index.keyParts().getFirst().order()).toList());
+
+        assertThrows(DatabaseValidationException.class, () -> binder.bindDdl(
+                assertInstanceOf(CreateTableStatementNode.class,
+                        parser.parse("CREATE TABLE bad (id BIGINT PRIMARY KEY, ID INT)")),
+                Optional.of(ObjectName.of("app")), ZoneId.of("UTC")));
+        assertThrows(DatabaseValidationException.class, () -> binder.bindDdl(
+                assertInstanceOf(CreateTableStatementNode.class,
+                        parser.parse("CREATE TABLE bad (id BIGINT)")),
+                Optional.of(ObjectName.of("app")), ZoneId.of("UTC")));
+        assertThrows(UnsupportedSqlShapeException.class, () -> binder.bindDdl(
+                assertInstanceOf(CreateTableStatementNode.class,
+                        parser.parse("CREATE TABLE bad (id BIGINT DEFAULT NULL PRIMARY KEY)")),
+                Optional.of(ObjectName.of("app")), ZoneId.of("UTC")));
+    }
+
+    /**
+     * MySQL 导出的整数显示宽度必须被归一化，数值列的引号默认值必须 canonical 化，
+     * 注释、自增与表选项则必须完整进入 DD command。
+     */
+    @Test
+    void bindsMysqlExportedCreateTableMetadataWithoutLosingSemanticFields() {
+        BoundCreateTable bound = binder.bindDdl(
+                assertInstanceOf(CreateTableStatementNode.class, parser.parse("""
+                        CREATE TABLE `tb_gw_device_relation` (
+                          `id` bigint(15) NOT NULL AUTO_INCREMENT COMMENT 'id',
+                          `product_key` varchar(50) DEFAULT '' COMMENT '设备productKey（接口返回）',
+                          `device_key` varchar(50) DEFAULT '' COMMENT '设备deviceKey（接口返回）',
+                          `business_type` varchar(50) DEFAULT '' COMMENT '业务类型（查看代码）',
+                          `data_id` bigint(15) DEFAULT '-1' COMMENT '设备数据id（系统创建）',
+                          PRIMARY KEY (`id`) USING BTREE,
+                          UNIQUE KEY `product_key` (`product_key`,`device_key`) USING BTREE
+                        ) COMMENT='格物设备数据关联表'
+                        """)),
+                Optional.of(ObjectName.of("app")), ZoneId.of("Asia/Shanghai"));
+
+        assertEquals(0, bound.command().columns().getFirst().type().length(),
+                "BIGINT 显示宽度不能泄漏为物理长度");
+        assertEquals(ColumnGeneration.AUTO_INCREMENT,
+                bound.command().columns().getFirst().generation());
+        assertEquals("id", bound.command().columns().getFirst().comment());
+        assertEquals(ColumnDefaultDefinition.constant("-1"),
+                bound.command().columns().getLast().defaultDefinition());
+        assertEquals("格物设备数据关联表", bound.command().options().comment());
     }
 
     /** DROP 两种语法只绑定规范化 table/index name，不提前打开 DD lease 或触发 implicit commit。 */

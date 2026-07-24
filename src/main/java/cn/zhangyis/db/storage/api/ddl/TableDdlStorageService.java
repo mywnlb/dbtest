@@ -34,6 +34,7 @@ import cn.zhangyis.db.storage.mtr.MiniTransactionState;
 import cn.zhangyis.db.storage.engine.StorageWriteAdmission;
 import cn.zhangyis.db.storage.fsp.lifecycle.TablespaceLifecycleHeader;
 import cn.zhangyis.db.storage.fsp.lifecycle.TablespaceLifecycleRawCodec;
+import cn.zhangyis.db.storage.fsp.header.AutoIncrementHeaderRepository;
 import cn.zhangyis.db.storage.page.PageImageChecksum;
 import cn.zhangyis.db.storage.redo.RedoBudgetPurpose;
 import cn.zhangyis.db.storage.redo.RedoBudgetWorkload;
@@ -124,6 +125,8 @@ public final class TableDdlStorageService {
     private final TablespaceAccessController accessController;
     /** 固定 page3 SDI 物理仓储；只处理 opaque payload 和页级完整性。 */
     private final SdiPageRepository sdiPages;
+    /** 页 0 自增扩展与建表 FSP 修改共享同一 MTR。 */
+    private final AutoIncrementHeaderRepository autoIncrementHeaders;
     /** 通用Online ALTER专用页仓储；只格式化已由FSP分配的descriptor页。 */
     private final SdiOnlineAlterDescriptorPageRepository onlineAlterDescriptorPages;
     /**
@@ -250,6 +253,7 @@ public final class TableDdlStorageService {
         this.accessController = accessController;
         this.pageSize = pageSize;
         this.sdiPages = new SdiPageRepository(pool, pageSize);
+        this.autoIncrementHeaders = new AutoIncrementHeaderRepository(pool);
         this.onlineAlterDescriptorPages =
                 new SdiOnlineAlterDescriptorPageRepository(pool, pageSize);
         this.btree = btree;
@@ -313,6 +317,8 @@ public final class TableDdlStorageService {
             // 3. 所有 tablespace/FSP/segment/root 初始化都归属同一个 MTR，避免向 DD 暴露部分建成的索引集合。
             disk.createTablespace(mtr, definition.spaceId(), definition.path(), definition.initialSizeInPages(),
                     TablespaceType.GENERAL);
+            autoIncrementHeaders.initialize(
+                    mtr, definition.spaceId(), definition.autoIncrement());
             for (StorageIndexDefinition index : definition.indexes()) {
                 SegmentRef leaf = disk.createSegment(mtr, definition.spaceId(), SegmentPurpose.INDEX_LEAF);
                 SegmentRef nonLeaf = disk.createSegment(mtr, definition.spaceId(), SegmentPurpose.INDEX_NON_LEAF);
@@ -900,7 +906,8 @@ public final class TableDdlStorageService {
             StorageTableDefinition singleTarget = new StorageTableDefinition(
                     sourceDefinition.tableId(), sourceDefinition.spaceId(),
                     sourceDefinition.path(), sourceDefinition.schemaVersion(),
-                    sourceDefinition.initialSizeInPages(), sourceDefinition.columns(), indexes);
+                    sourceDefinition.initialSizeInPages(), sourceDefinition.columns(), indexes,
+                    sourceDefinition.autoIncrement());
             SecondaryIndexBuildDescriptor singleDescriptor = new SecondaryIndexBuildDescriptor(
                     staged.ddlOperationId(), staged.targetDictionaryVersion(), staged.tableId(),
                     descriptor.indexBinding());
@@ -1143,7 +1150,8 @@ public final class TableDdlStorageService {
         StorageTableDefinition definition = new StorageTableDefinition(
                 sourceDefinition.tableId(), sourceDefinition.spaceId(), sourceDefinition.path(),
                 sourceDefinition.schemaVersion(), sourceDefinition.initialSizeInPages(),
-                sourceDefinition.columns(), definitions);
+                sourceDefinition.columns(), definitions,
+                sourceDefinition.autoIncrement());
         List<IndexStorageBinding> bindings = new ArrayList<>(existing.indexes());
         bindings.add(descriptor.indexBinding());
         TableStorageBinding binding = new TableStorageBinding(
@@ -2181,6 +2189,7 @@ public final class TableDdlStorageService {
         requireOpenedPath(request.sourceBinding(), "ALTER TABLE shadow rebuild source");
         TableStorageBinding target = createTable(request.targetDefinition());
         try {
+            copyAutoIncrementState(request);
             TableIndexMetadata sourceIndexes = indexMetadataFactory.createTable(
                     request.sourceDefinition(), request.sourceBinding());
             TableIndexMetadata targetIndexes =
@@ -2320,6 +2329,57 @@ public final class TableDdlStorageService {
                     "ALTER TABLE shadow rebuild failed: table=" + target.tableId()
                             + " space=" + target.spaceId().value(),
                     target, failure);
+        }
+    }
+
+    /**
+     * 在复制用户记录前把 source page0 的自增 high-water 迁移到未发布 shadow。
+     *
+     * <p>数据流：</p>
+     * <ol>
+     *     <li>比较 source/target DTO 的 AUTO_INCREMENT 属性；当前 rebuild 不允许凭空增删该持久属性。</li>
+     *     <li>无自增时不访问 page0；有自增时用同一短 MTR 依次取得 source/target 页 0 X latch。</li>
+     *     <li>校验两侧 format/active，并把 source unsigned high-water 原始位写入 target。</li>
+     *     <li>提交物理 redo；失败回滚未提交 MTR，shadow 仍由上层 marker 精确回收。</li>
+     * </ol>
+     *
+     * @param request 已创建 target、且 source/target 空间均已打开的 rebuild 请求
+     * @throws DatabaseValidationException 自增属性或页 0 状态不一致时抛出
+     */
+    private void copyAutoIncrementState(
+            StorageTableRebuildRequest request) {
+        // 1、ALTER 当前不提供 AUTO_INCREMENT 属性切换，保持 DD 与 page0 一一对应。
+        if (request.sourceDefinition().autoIncrement()
+                != request.targetDefinition().autoIncrement()) {
+            throw new DatabaseValidationException(
+                    "table rebuild cannot add or remove AUTO_INCREMENT");
+        }
+        if (!request.sourceDefinition().autoIncrement()) {
+            return;
+        }
+        // 2、固定 source→target 页序；两个 SpaceId 不同，不与普通单空间发号形成反向锁序。
+        MiniTransaction mtr = mtrManager.begin(mtrManager.budgetFor(
+                RedoBudgetPurpose.AUTO_INCREMENT,
+                RedoBudgetWorkload.pageImages(2)));
+        try {
+            var source = autoIncrementHeaders.readForUpdate(
+                    mtr, request.sourceDefinition().spaceId());
+            var target = autoIncrementHeaders.readForUpdate(
+                    mtr, request.targetDefinition().spaceId());
+            // 3、CREATE 已初始化 target；未知格式或 inactive 标志不能通过 ALTER 发布。
+            if (!source.active() || !target.active()
+                    || source.format() != target.format()) {
+                throw new DatabaseValidationException(
+                        "table rebuild AUTO_INCREMENT page0 state mismatch");
+            }
+            autoIncrementHeaders.writeHighWater(
+                    mtr, request.targetDefinition().spaceId(),
+                    source.highWater());
+            // 4、提交后 high-water 与 shadow 一起接受最终 WAL/force 屏障。
+            mtrManager.commit(mtr);
+        } catch (RuntimeException failure) {
+            rollbackIfBound(mtr, failure);
+            throw failure;
         }
     }
 

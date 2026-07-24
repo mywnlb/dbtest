@@ -92,8 +92,8 @@ public final class DefaultSqlParser implements SqlParser {
             // 2、继续完成范围、身份与候选校验；通过后，按稳定字段或 token 顺序推进游标并调用对应编解码分支，保持处理顺序与资源边界。
             if (keyword("XA")) statement = xa();
             else if (keyword("INSERT")) statement = insert();
-            else if (keyword("CREATE")) statement = createIndex();
-            else if (keyword("DROP")) statement = dropIndex();
+            else if (keyword("CREATE")) statement = create();
+            else if (keyword("DROP")) statement = drop();
             else if (keyword("ALTER")) statement = alterIndex();
             else if (keyword("UPDATE")) statement = update();
             else if (keyword("DELETE")) statement = delete();
@@ -289,20 +289,52 @@ public final class DefaultSqlParser implements SqlParser {
             requireKeyword("INSERT"); requireKeyword("INTO");
             QualifiedNameNode table = qualifiedName();
             // 2、继续完成范围、身份与候选校验；通过后，按稳定字段或 token 顺序推进游标并调用对应编解码分支，保持处理顺序与资源边界。
-            require(TokenType.LPAREN, "'('");
-            List<IdentifierNode> columns = identifierList();
-            require(TokenType.RPAREN, "')'");
+            List<IdentifierNode> columns = List.of();
+            if (match(TokenType.LPAREN)) {
+                take();
+                columns = identifierList();
+                require(TokenType.RPAREN, "')'");
+            }
             // 3、在中间分支复核阶段性结果；满足条件后，交叉校验聚合计数、类型、校验值和剩余输入，并维持领域不变量。
-            requireKeyword("VALUES"); require(TokenType.LPAREN, "'('");
-            List<LiteralNode> values = literalList();
-            require(TokenType.RPAREN, "')'");
+            requireKeyword("VALUES");
+            List<List<LiteralNode>> rows = new ArrayList<>();
+            do {
+                require(TokenType.LPAREN, "'('");
+                rows.add(literalList());
+                require(TokenType.RPAREN, "')'");
+                if (!match(TokenType.COMMA)) {
+                    break;
+                }
+                take();
+            } while (true);
             // 4、完成剩余字段写入或稳定领域结果构造，以稳定返回或领域异常完成收口。
-            return new InsertStatementNode(table, columns, values);
+            return new InsertStatementNode(table, columns, rows);
         }
 
-        /** 解析独立 CREATE [UNIQUE] INDEX，并直接归一为共享 index AST。 */
-        private CreateIndexStatementNode createIndex() {
+        /**
+         * 分派 CREATE TABLE 与 CREATE [UNIQUE] INDEX。只在消费 CREATE 后检查对象类别，未知类别
+         * 以当前 token 的稳定位置失败，不能回退成其它语句或发布部分 AST。
+         *
+         * @return CREATE TABLE 或既有 CREATE INDEX 纯语法对象
+         */
+        private StatementNode create() {
             requireKeyword("CREATE");
+            if (keyword("SCHEMA") || keyword("DATABASE")) {
+                take();
+                boolean ifNotExists = false;
+                if (keyword("IF")) {
+                    take();
+                    requireKeyword("NOT");
+                    requireKeyword("EXISTS");
+                    ifNotExists = true;
+                }
+                return new CreateSchemaStatementNode(
+                        identifier(), ifNotExists);
+            }
+            if (keyword("TABLE")) {
+                take();
+                return createTable();
+            }
             boolean unique = false;
             if (keyword("UNIQUE")) {
                 take();
@@ -316,19 +348,255 @@ public final class DefaultSqlParser implements SqlParser {
         }
 
         /**
+         * 分派 DROP INDEX、原子多表 DROP TABLE 与 DROP SCHEMA/DATABASE。
+         *
+         * @return 保留 IF 语义和完整目标列表的 DDL AST
+         * @throws SqlSyntaxException DROP 对象类别或 IF 子句非法时抛出
+         */
+        private StatementNode drop() {
+            requireKeyword("DROP");
+            if (keyword("INDEX")) {
+                take();
+                IdentifierNode indexName = identifier();
+                requireKeyword("ON");
+                return new DropIndexStatementNode(
+                        qualifiedName(), indexName);
+            }
+            if (keyword("TABLE")) {
+                take();
+                boolean ifExists = false;
+                if (keyword("IF")) {
+                    take();
+                    requireKeyword("EXISTS");
+                    ifExists = true;
+                }
+                List<QualifiedNameNode> tables = new ArrayList<>();
+                tables.add(qualifiedName());
+                while (match(TokenType.COMMA)) {
+                    take();
+                    tables.add(qualifiedName());
+                }
+                return new DropTableStatementNode(tables, ifExists);
+            }
+            if (keyword("SCHEMA") || keyword("DATABASE")) {
+                take();
+                boolean ifExists = false;
+                if (keyword("IF")) {
+                    take();
+                    requireKeyword("EXISTS");
+                    ifExists = true;
+                }
+                return new DropSchemaStatementNode(
+                        identifier(), ifExists);
+            }
+            throw syntax(
+                    "expected INDEX, TABLE, SCHEMA or DATABASE after DROP",
+                    current());
+        }
+
+        /**
+         * 解析基础 CREATE TABLE。当前 shape 支持 IF NOT EXISTS、整数显示宽度、列
+         * NULL/default/AUTO_INCREMENT/COMMENT、显式 PRIMARY KEY、UNIQUE/普通 BTREE INDEX
+         * 以及表 COMMENT；foreign/generated/check 与其它 table option 仍显式拒绝，防止把尚无
+         * DD/恢复语义的语法静默吞掉。
+         *
+         * <p>数据流：</p>
+         * <ol>
+         *     <li>读取目标限定名和左括号；空定义列表在 AST 发布前失败。</li>
+         *     <li>逐项区分表级索引与列定义；列尾的 PRIMARY/UNIQUE 被规范为同一索引 AST。</li>
+         *     <li>每项只消费自身括号/default，外层逗号保持定义顺序并阻止尾随空项。</li>
+         *     <li>右括号闭合后冻结列/索引列表；名称、类型与主键数量留给 Binder 校验。</li>
+         * </ol>
+         *
+         * @return 不含 DD identity 或物理配置的 CREATE TABLE AST
+         * @throws SqlSyntaxException 语法超出当前基础 shape 或定义列表不闭合时抛出
+         */
+        private CreateTableStatementNode createTable() {
+            // 1、IF NOT EXISTS 只作为 AST 语义保存；对象存在性必须在 DD 锁内重验。
+            boolean ifNotExists = false;
+            if (keyword("IF")) {
+                take();
+                requireKeyword("NOT");
+                requireKeyword("EXISTS");
+                ifNotExists = true;
+            }
+            QualifiedNameNode table = qualifiedName();
+            require(TokenType.LPAREN, "'('");
+            if (match(TokenType.RPAREN)) {
+                throw syntax("CREATE TABLE requires at least one column", current());
+            }
+
+            List<CreateTableStatementNode.Column> columns = new ArrayList<>();
+            List<CreateTableStatementNode.Index> indexes = new ArrayList<>();
+            while (true) {
+                // 2、表级约束先于普通列名判定；关键字仍是 IDENT，分支顺序决定其语法角色。
+                if (keyword("PRIMARY")) {
+                    indexes.add(createPrimaryIndex());
+                } else if (keyword("UNIQUE")) {
+                    indexes.add(createNamedTableIndex(true));
+                } else if (keyword("INDEX") || keyword("KEY")) {
+                    indexes.add(createNamedTableIndex(false));
+                } else {
+                    createColumn(columns, indexes);
+                }
+
+                // 3、定义项之间必须恰好一个逗号；尾随逗号会在下一轮以 RPAREN 位置失败。
+                if (!match(TokenType.COMMA)) {
+                    break;
+                }
+                take();
+                if (match(TokenType.RPAREN)) {
+                    throw syntax("CREATE TABLE does not allow a trailing comma", current());
+                }
+            }
+
+            // 4、完整闭合后才构造不可变 AST，失败不泄漏局部列表。
+            Token closing = require(TokenType.RPAREN, "')'");
+            if (columns.isEmpty()) {
+                throw syntax(
+                        "CREATE TABLE requires at least one column",
+                        closing);
+            }
+            String tableComment = "";
+            if (keyword("COMMENT")) {
+                take();
+                if (match(TokenType.EQUALS)) {
+                    take();
+                }
+                tableComment = require(
+                        TokenType.STRING, "string table comment").text();
+            }
+            return new CreateTableStatementNode(
+                    table, columns, indexes, ifNotExists, tableComment);
+        }
+
+        /**
+         * 解析一个列定义，并把列尾 PRIMARY KEY / UNIQUE 规范为表级索引 AST。
+         *
+         * @param columns 当前语句拥有的列列表；成功追加恰好一个元素
+         * @param indexes 当前语句拥有的索引列表；存在内联约束时追加恰好一个元素
+         */
+        private void createColumn(
+                List<CreateTableStatementNode.Column> columns,
+                List<CreateTableStatementNode.Index> indexes) {
+            IdentifierNode name = identifier();
+            CreateTableStatementNode.ColumnType type = createColumnType();
+            Optional<LiteralNode> defaultLiteral = Optional.empty();
+            String comment = "";
+            CreateTableStatementNode.Generation generation =
+                    CreateTableStatementNode.Generation.NONE;
+            boolean inlineConstraint = false;
+            while (!match(TokenType.COMMA) && !match(TokenType.RPAREN)) {
+                if (keyword("DEFAULT") && defaultLiteral.isEmpty()) {
+                    take();
+                    defaultLiteral = Optional.of(literal());
+                    continue;
+                }
+                if (keyword("PRIMARY") && !inlineConstraint) {
+                    Token primary = take();
+                    requireKeyword("KEY");
+                    indexes.add(new CreateTableStatementNode.Index(
+                            new IdentifierNode("PRIMARY", primary.position()),
+                            true, true, List.of(new IndexKeyPartNode(
+                            name, IndexKeyOrderNode.ASC))));
+                    inlineConstraint = true;
+                    continue;
+                }
+                if (keyword("UNIQUE") && !inlineConstraint) {
+                    take();
+                    if (keyword("KEY")) {
+                        take();
+                    }
+                    indexes.add(new CreateTableStatementNode.Index(
+                            name, true, false, List.of(new IndexKeyPartNode(
+                            name, IndexKeyOrderNode.ASC))));
+                    inlineConstraint = true;
+                    continue;
+                }
+                if (keyword("AUTO_INCREMENT")
+                        && generation == CreateTableStatementNode.Generation.NONE) {
+                    take();
+                    generation = CreateTableStatementNode.Generation.AUTO_INCREMENT;
+                    continue;
+                }
+                if (keyword("COMMENT") && comment.isEmpty()) {
+                    take();
+                    comment = require(TokenType.STRING, "string column comment").text();
+                    continue;
+                }
+                throw syntax("unsupported CREATE TABLE column clause", current());
+            }
+            columns.add(new CreateTableStatementNode.Column(
+                    name, type, defaultLiteral, comment, generation));
+        }
+
+        /** 解析表级 PRIMARY KEY，并固定逻辑/物理主索引名称为 PRIMARY。 */
+        private CreateTableStatementNode.Index createPrimaryIndex() {
+            Token primary = take();
+            requireKeyword("KEY");
+            boolean usingBefore = consumeBtreeAlgorithm();
+            List<IndexKeyPartNode> keyParts = indexKeyParts();
+            if (usingBefore && keyword("USING")) {
+                throw syntax("index algorithm may be declared only once", current());
+            }
+            consumeBtreeAlgorithm();
+            return new CreateTableStatementNode.Index(
+                    new IdentifierNode("PRIMARY", primary.position()),
+                    true, true, keyParts,
+                    CreateTableStatementNode.IndexAlgorithm.BTREE);
+        }
+
+        /**
+         * 解析具名 UNIQUE INDEX/KEY 或普通 INDEX/KEY；当前不为匿名 secondary 猜测名称。
+         *
+         * @param unique 是否为逻辑唯一二级索引
+         * @return 保留 key part 顺序且非聚簇的索引 AST
+         */
+        private CreateTableStatementNode.Index createNamedTableIndex(boolean unique) {
+            if (unique) {
+                requireKeyword("UNIQUE");
+                if (keyword("INDEX") || keyword("KEY")) {
+                    take();
+                } else {
+                    throw syntax("UNIQUE table constraint requires INDEX or KEY", current());
+                }
+            } else {
+                take();
+            }
+            IdentifierNode name = identifier();
+            boolean usingBefore = consumeBtreeAlgorithm();
+            List<IndexKeyPartNode> keyParts = indexKeyParts();
+            if (usingBefore && keyword("USING")) {
+                throw syntax("index algorithm may be declared only once", current());
+            }
+            consumeBtreeAlgorithm();
+            return new CreateTableStatementNode.Index(
+                    name, unique, false, keyParts,
+                    CreateTableStatementNode.IndexAlgorithm.BTREE);
+        }
+
+        /**
+         * 消费可选 {@code USING BTREE}；未知算法必须失败，不能把索引算法静默规范为 BTREE。
+         *
+         * @return 当前游标是否消费了显式算法
+         */
+        private boolean consumeBtreeAlgorithm() {
+            if (!keyword("USING")) {
+                return false;
+            }
+            take();
+            Token algorithm = require(TokenType.IDENT, "index algorithm");
+            if (!algorithm.text().equalsIgnoreCase("BTREE")) {
+                throw syntax("only USING BTREE is supported", algorithm);
+            }
+            return true;
+        }
+
+        /**
          * 解析独立 DROP INDEX。v1 不接受 IF EXISTS，避免不存在目标时静默吞掉 metadata 错误。
          *
          * @return 与 ALTER TABLE DROP INDEX 共用的纯语法 AST
          */
-        private DropIndexStatementNode dropIndex() {
-            requireKeyword("DROP");
-            requireKeyword("INDEX");
-            IdentifierNode indexName = identifier();
-            requireKeyword("ON");
-            QualifiedNameNode table = qualifiedName();
-            return new DropIndexStatementNode(table, indexName);
-        }
-
         /**
          * 解析 ALTER TABLE 的索引与表空间生命周期动作；索引分支归一为独立 CREATE/DROP 使用的 AST，
          * DISCARD/IMPORT 保留专属节点，防止 Session 把文件生命周期动作交给普通 executor。
@@ -447,23 +715,23 @@ public final class DefaultSqlParser implements SqlParser {
                 if (match(TokenType.EQUALS)) {
                     take();
                 }
-                int charset = positiveAlterNumber("charset id");
+                int charset = positiveDdlNumber("charset id");
                 requireKeyword("COLLATE");
                 if (match(TokenType.EQUALS)) {
                     take();
                 }
                 return new AlterTableStatementNode.DefaultCharset(
-                        charset, positiveAlterNumber("collation id"));
+                        charset, positiveDdlNumber("collation id"));
             }
             if (keyword("CONVERT")) {
                 take();
                 requireKeyword("TO");
                 requireKeyword("CHARACTER");
                 requireKeyword("SET");
-                int charset = positiveAlterNumber("charset id");
+                int charset = positiveDdlNumber("charset id");
                 requireKeyword("COLLATE");
                 return new AlterTableStatementNode.ConvertCharset(
-                        charset, positiveAlterNumber("collation id"));
+                        charset, positiveDdlNumber("collation id"));
             }
             throw syntax("unsupported ALTER TABLE action", current());
         }
@@ -473,12 +741,34 @@ public final class DefaultSqlParser implements SqlParser {
          * 可选一个或两个数值参数、UNSIGNED 与 NULL/NOT NULL。
          */
         private AlterTableStatementNode.ColumnType alterColumnType() {
-            Token type = require(TokenType.IDENT, "column type");
+            ColumnTypeShape shape = columnTypeShape("ALTER");
+            return new AlterTableStatementNode.ColumnType(
+                    shape.name(), shape.length(), shape.scale(),
+                    shape.unsigned(), shape.nullable());
+        }
+
+        /** CREATE 与 ALTER 共用同一类型 token 规则，只映射到各自封闭 AST。 */
+        private CreateTableStatementNode.ColumnType createColumnType() {
+            ColumnTypeShape shape = columnTypeShape("CREATE TABLE");
+            return new CreateTableStatementNode.ColumnType(
+                    shape.name(), shape.length(), shape.scale(),
+                    shape.unsigned(), shape.nullable());
+        }
+
+        /**
+         * 解析 DDL 列类型的公共 token shape；本阶段只做语法范围，具体类型能力由 Binder 决定。
+         *
+         * @param operation 用于稳定诊断的 DDL 类别
+         * @return 类型名、长度/精度、scale、unsigned 和 nullable 的不可变局部结果
+         */
+        private ColumnTypeShape columnTypeShape(String operation) {
+            Token type = require(
+                    TokenType.IDENT, operation + " column type");
             int length = 0;
             int scale = 0;
             if (match(TokenType.LPAREN)) {
                 take();
-                length = positiveAlterNumber("column length or precision");
+                length = positiveDdlNumber("column length or precision");
                 if (match(TokenType.COMMA)) {
                     take();
                     Token scaleToken = require(TokenType.NUMBER, "column scale");
@@ -506,12 +796,12 @@ public final class DefaultSqlParser implements SqlParser {
             } else if (keyword("NULL")) {
                 take();
             }
-            return new AlterTableStatementNode.ColumnType(
+            return new ColumnTypeShape(
                     type.text(), length, scale, unsigned, nullable);
         }
 
-        /** 读取 ALTER 中必须为正且可表示为 int 的稳定数值 id/长度。 */
-        private int positiveAlterNumber(String label) {
+        /** 读取 DDL 中必须为正且可表示为 int 的稳定数值 id/长度。 */
+        private int positiveDdlNumber(String label) {
             Token number = require(TokenType.NUMBER, label);
             try {
                 int value = Integer.parseInt(number.text());
@@ -523,6 +813,11 @@ public final class DefaultSqlParser implements SqlParser {
                 throw syntax(label + " exceeds integer range", number);
             }
         }
+
+        /** Parser 内部共享的列类型临时结果，不进入 AST 或 DD。 */
+        private record ColumnTypeShape(
+                String name, int length, int scale, boolean unsigned,
+                boolean nullable) { }
 
         /** key part v1 仅允许完整列与可选 ASC/DESC，不把前缀长度或表达式静默吞掉。 */
         private List<IndexKeyPartNode> indexKeyParts() {
@@ -667,13 +962,69 @@ public final class DefaultSqlParser implements SqlParser {
         private SelectStatementNode select() {
             requireKeyword("SELECT");
             boolean star = false;
-            List<IdentifierNode> projections = List.of();
+            List<ColumnReferenceNode> projections = List.of();
             if (match(TokenType.STAR)) { take(); star = true; }
-            else projections = identifierList();
+            else projections = columnReferenceList();
             requireKeyword("FROM");
             QualifiedNameNode table = qualifiedName();
+            Optional<IdentifierNode> tableAlias = optionalTableAlias();
+            Optional<InnerJoinClauseNode> join = Optional.empty();
+            if (keyword("INNER") || keyword("JOIN")) {
+                if (keyword("INNER")) {
+                    take();
+                }
+                requireKeyword("JOIN");
+                QualifiedNameNode rightTable = qualifiedName();
+                Optional<IdentifierNode> rightAlias =
+                        optionalTableAlias();
+                requireKeyword("ON");
+                ColumnReferenceNode leftColumn =
+                        columnReference();
+                require(TokenType.EQUALS, "'='");
+                ColumnReferenceNode rightColumn =
+                        columnReference();
+                join = Optional.of(new InnerJoinClauseNode(
+                        rightTable, rightAlias,
+                        leftColumn, rightColumn));
+            }
             requireKeyword("WHERE");
             BooleanExpressionNode condition = condition();
+            List<OrderByItemNode> orderBy = new ArrayList<>();
+            if (keyword("ORDER")) {
+                take();
+                requireKeyword("BY");
+                do {
+                    ColumnReferenceNode column = columnReference();
+                    SortDirectionNode direction = SortDirectionNode.ASC;
+                    if (keyword("ASC")) {
+                        take();
+                    } else if (keyword("DESC")) {
+                        take();
+                        direction = SortDirectionNode.DESC;
+                    }
+                    orderBy.add(new OrderByItemNode(column, direction));
+                    if (!match(TokenType.COMMA)) {
+                        break;
+                    }
+                    take();
+                } while (true);
+            }
+            Optional<LimitClauseNode> limit = Optional.empty();
+            if (keyword("LIMIT")) {
+                take();
+                long first = limitInteger();
+                long offset = 0L;
+                long count = first;
+                if (match(TokenType.COMMA)) {
+                    take();
+                    offset = first;
+                    count = limitInteger();
+                } else if (keyword("OFFSET")) {
+                    take();
+                    offset = limitInteger();
+                }
+                limit = Optional.of(new LimitClauseNode(offset, count));
+            }
             SelectLockingClause lockingClause = SelectLockingClause.NONE;
             if (keyword("FOR")) {
                 take();
@@ -688,7 +1039,27 @@ public final class DefaultSqlParser implements SqlParser {
                 }
             }
             return new SelectStatementNode(
-                    star, projections, table, condition, lockingClause);
+                    star, projections, table, tableAlias, join, condition,
+                    orderBy, limit, lockingClause);
+        }
+
+        /**
+         * 解析 LIMIT 的非负 64 位十进制整数；小数、指数、负数和溢出均在 AST 发布前失败。
+         *
+         * @return 可安全进入 offset/count 算术的非负 long
+         * @throws SqlSyntaxException 当前 token 不是规范非负整数或超过 long 上界时抛出
+         */
+        private long limitInteger() {
+            Token token = require(TokenType.NUMBER, "non-negative LIMIT integer");
+            if (token.text().isEmpty()
+                    || token.text().chars().anyMatch(character -> !Character.isDigit(character))) {
+                throw syntax("LIMIT value must be a non-negative integer", token);
+            }
+            try {
+                return Long.parseLong(token.text());
+            } catch (NumberFormatException invalid) {
+                throw syntax("LIMIT value exceeds signed 64-bit range", token);
+            }
         }
 
         /**
@@ -708,7 +1079,7 @@ public final class DefaultSqlParser implements SqlParser {
          */
         private PredicateNode predicate() {
             // 1、列名只表达语法身份；Parser 不在这里访问 DD。
-            IdentifierNode column = identifier();
+            ColumnReferenceNode column = columnReference();
             // 2、BETWEEN 自己拥有中间 AND，外层 conjunction 循环只消费后续 AND。
             if (keyword("BETWEEN")) {
                 take();
@@ -776,6 +1147,55 @@ public final class DefaultSqlParser implements SqlParser {
             result.add(identifier());
             while (match(TokenType.COMMA)) { take(); result.add(identifier()); }
             return List.copyOf(result);
+        }
+
+        /**
+         * 解析 SELECT/ORDER/WHERE 中的一段或两段列引用列表。
+         *
+         * @return 保持用户顺序的不可变列引用
+         */
+        private List<ColumnReferenceNode> columnReferenceList() {
+            List<ColumnReferenceNode> result = new ArrayList<>();
+            result.add(columnReference());
+            while (match(TokenType.COMMA)) {
+                take();
+                result.add(columnReference());
+            }
+            return List.copyOf(result);
+        }
+
+        /**
+         * 解析 {@code column} 或 {@code qualifier.column}；超过两段时由外层 EOF/关键字
+         * 校验拒绝，避免误把三段表名规则应用到列引用。
+         */
+        private ColumnReferenceNode columnReference() {
+            List<IdentifierNode> parts =
+                    new ArrayList<>();
+            parts.add(identifier());
+            if (match(TokenType.DOT)) {
+                take();
+                parts.add(identifier());
+            }
+            return new ColumnReferenceNode(parts);
+        }
+
+        /**
+         * 解析 FROM/JOIN 表后的 AS 或隐式 alias。只有确定不是后续子句关键字的标识符
+         * 才会被消费，防止把 INNER、JOIN、WHERE 等误当别名。
+         */
+        private Optional<IdentifierNode> optionalTableAlias() {
+            if (keyword("AS")) {
+                take();
+                return Optional.of(identifier());
+            }
+            if (current().type() == TokenType.IDENT
+                    && !keyword("INNER") && !keyword("JOIN")
+                    && !keyword("ON") && !keyword("WHERE")
+                    && !keyword("ORDER") && !keyword("LIMIT")
+                    && !keyword("FOR")) {
+                return Optional.of(identifier());
+            }
+            return Optional.empty();
         }
 
         private List<LiteralNode> literalList() {

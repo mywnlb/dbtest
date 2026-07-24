@@ -16,6 +16,7 @@ import cn.zhangyis.db.dd.domain.TableId;
 import cn.zhangyis.db.dd.domain.TableState;
 import cn.zhangyis.db.dd.domain.TableOptions;
 import cn.zhangyis.db.dd.domain.ColumnDefaultDefinition;
+import cn.zhangyis.db.dd.domain.ColumnGeneration;
 import cn.zhangyis.db.dd.exception.DictionaryCatalogCorruptionException;
 import cn.zhangyis.db.storage.api.catalog.CatalogBatch;
 import cn.zhangyis.db.storage.api.catalog.CatalogRecord;
@@ -81,7 +82,9 @@ final class DictionaryCatalogCodec {
     /** 新 column payload 的显式 envelope。 */
     private static final int COLUMN_PAYLOAD_MAGIC = 0x44444332;
     /** column payload 当前格式。 */
-    private static final int COLUMN_PAYLOAD_VERSION = 2;
+    private static final int COLUMN_PAYLOAD_VERSION = 3;
+    /** v2 首次持久化 default，但尚无 comment/generation。 */
+    private static final int COLUMN_DEFAULT_PAYLOAD_VERSION = 2;
 
     /**
      * 把调用方领域值编码为数据字典的稳定表示；编码前校验范围，成功不修改输入对象。
@@ -640,12 +643,32 @@ final class DictionaryCatalogCodec {
             out.writeInt(schema.defaultCharsetId());
             out.writeInt(schema.defaultCollationId());
             out.writeLong(schema.version().value());
+            out.writeByte(schema.state() == cn.zhangyis.db.dd.domain.SchemaState.ACTIVE
+                    ? 1 : 2);
         });
     }
 
     private static SchemaDefinition decodeSchema(byte[] payload) {
-        return read(payload, in -> new SchemaDefinition(SchemaId.of(in.readLong()), readName(in), in.readInt(),
-                in.readInt(), DictionaryVersion.of(in.readLong())));
+        return read(payload, in -> {
+            SchemaId id = SchemaId.of(in.readLong());
+            ObjectName name = readName(in);
+            int charset = in.readInt();
+            int collation = in.readInt();
+            DictionaryVersion version =
+                    DictionaryVersion.of(in.readLong());
+            cn.zhangyis.db.dd.domain.SchemaState state =
+                    cn.zhangyis.db.dd.domain.SchemaState.ACTIVE;
+            if (in.available() > 0) {
+                state = switch (in.readUnsignedByte()) {
+                    case 1 -> cn.zhangyis.db.dd.domain.SchemaState.ACTIVE;
+                    case 2 -> cn.zhangyis.db.dd.domain.SchemaState.DROPPED;
+                    default -> throw new DictionaryCatalogCorruptionException(
+                            "unknown schema state code");
+                };
+            }
+            return new SchemaDefinition(
+                    id, name, charset, collation, version, state);
+        });
     }
 
     /**
@@ -845,6 +868,8 @@ final class DictionaryCatalogCodec {
             if (column.defaultDefinition().constantLiteral().isPresent()) {
                 writeString(out, column.defaultDefinition().constantLiteral().orElseThrow());
             }
+            writeString(out, column.comment());
+            out.writeInt(column.generation().stableCode());
         });
     }
 
@@ -859,8 +884,11 @@ final class DictionaryCatalogCodec {
             in.mark(payload.length);
             int prefix = in.readInt();
             boolean current = prefix == COLUMN_PAYLOAD_MAGIC;
+            int payloadVersion = 0;
             if (current) {
-                if (in.readInt() != COLUMN_PAYLOAD_VERSION) {
+                payloadVersion = in.readInt();
+                if (payloadVersion != COLUMN_DEFAULT_PAYLOAD_VERSION
+                        && payloadVersion != COLUMN_PAYLOAD_VERSION) {
                     throw new DictionaryCatalogCorruptionException(
                             "unsupported column payload format");
                 }
@@ -887,10 +915,17 @@ final class DictionaryCatalogCodec {
             }
             ColumnTypeDefinition type = new ColumnTypeDefinition(
                     typeId, unsigned, nullable, length, scale, charset, collation, symbols);
-            ColumnDefaultDefinition defaultDefinition = current
+            ColumnDefaultDefinition defaultDefinition =
+                    payloadVersion >= COLUMN_DEFAULT_PAYLOAD_VERSION
                     ? readColumnDefault(in) : nullable
                     ? ColumnDefaultDefinition.implicitNull() : ColumnDefaultDefinition.required();
-            return new ColumnDefinition(id, name, type, ordinal, defaultDefinition);
+            String comment = payloadVersion >= COLUMN_PAYLOAD_VERSION
+                    ? readString(in) : "";
+            ColumnGeneration generation = payloadVersion >= COLUMN_PAYLOAD_VERSION
+                    ? ColumnGeneration.fromStableCode(in.readInt())
+                    : ColumnGeneration.NONE;
+            return new ColumnDefinition(
+                    id, name, type, ordinal, defaultDefinition, comment, generation);
         });
     }
 

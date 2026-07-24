@@ -55,6 +55,7 @@ final class MtrOperationRedoBudgetEstimator {
             case UNDO_TRUNCATE_REBUILD -> 25;
             case DDL_TABLE_DROP -> 4;
             case DDL_SDI_WRITE -> 3;
+            case AUTO_INCREMENT -> 1;
             case CHANGE_BUFFER_APPEND -> 32;
             case CHANGE_BUFFER_MERGE -> 128;
             case CLUSTERED_INSERT, CLUSTERED_UPDATE, CLUSTERED_DELETE, SECONDARY_INDEX, PURGE_INDEX,

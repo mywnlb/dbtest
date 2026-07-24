@@ -13,15 +13,26 @@ import cn.zhangyis.db.sql.parser.SourcePosition;
  * @param position 用户列标识符的源起始位置
  */
 public record BoundColumnReference(
-        long columnId, int columnOrdinal, ColumnTypeDefinition columnType,
+        int relationOrdinal, long columnId, int columnOrdinal,
+        ColumnTypeDefinition columnType,
         SourcePosition position) implements BoundExpression {
 
     public BoundColumnReference {
-        if (columnId <= 0 || columnOrdinal < 0
+        if (relationOrdinal < 0 || columnId <= 0 || columnOrdinal < 0
                 || columnType == null || position == null) {
             throw new DatabaseValidationException(
                     "invalid bound column reference");
         }
+    }
+
+    /**
+     * 保留单表调用形状；单表输入的 relation ordinal 恒为零。
+     */
+    public BoundColumnReference(
+            long columnId, int columnOrdinal,
+            ColumnTypeDefinition columnType,
+            SourcePosition position) {
+        this(0, columnId, columnOrdinal, columnType, position);
     }
 
     @Override

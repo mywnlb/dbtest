@@ -30,7 +30,11 @@ public enum DdlLogOperation {
     /** 校验可信 clean backup 后，以新物理文件替换 RECOVERY_DISCARDED 对象并重新激活。 */
     IMPORT_RECOVERY_REPLACEMENT(10),
     /** 表级原地ALTER：metadata-only与未来multi-index共享单aggregate、无shadow-space的恢复语义。 */
-    ALTER_TABLE_INPLACE(11);
+    ALTER_TABLE_INPLACE(11),
+    /** 一个 marker/manifest 原子描述多张表的共同 DROP 生命周期。 */
+    DROP_TABLE_BATCH(12),
+    /** 一个 marker/manifest 描述 schema tombstone 与其冻结表集合的级联 DROP。 */
+    DROP_SCHEMA_CASCADE(13);
 
     /** DDL log key/payload 使用且跨版本不可重排的持久码。 */
     private final int stableCode;

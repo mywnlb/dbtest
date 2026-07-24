@@ -2,7 +2,6 @@ package cn.zhangyis.db.sql.executor;
 
 import cn.zhangyis.db.common.exception.DatabaseValidationException;
 
-import java.util.HashSet;
 import java.util.List;
 
 /** 主键点查结果；v1 为零或一行，但模型保持普通不可变 row list。
@@ -19,10 +18,10 @@ public record QueryResult(List<ResultColumn> columns, List<SqlRow> rows,
         }
         columns = List.copyOf(columns);
         rows = List.copyOf(rows);
-        HashSet<String> names = new HashSet<>();
         for (ResultColumn column : columns) {
-            if (column == null || !names.add(column.name().toLowerCase(java.util.Locale.ROOT))) {
-                throw new DatabaseValidationException("query result contains null/duplicate column");
+            if (column == null) {
+                throw new DatabaseValidationException(
+                        "query result contains null column");
             }
         }
         for (SqlRow row : rows) {

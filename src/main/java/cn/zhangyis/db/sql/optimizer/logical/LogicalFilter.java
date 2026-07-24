@@ -4,6 +4,8 @@ import cn.zhangyis.db.common.exception.DatabaseValidationException;
 import cn.zhangyis.db.dd.domain.TableDefinition;
 import cn.zhangyis.db.sql.expression.BoundExpressionValidation;
 
+import java.util.List;
+
 /**
  * 保存最终 SQL conjunction 的逻辑过滤节点。
  *
@@ -22,11 +24,11 @@ public record LogicalFilter(RelNode input, PredicateSet predicates)
             throw new DatabaseValidationException("logical filter requires non-empty predicates");
         }
         BoundExpressionValidation.validateCondition(
-                predicates.condition(), input.table());
+                predicates.condition(), input.tables());
     }
 
     @Override
-    public TableDefinition table() {
-        return input.table();
+    public List<TableDefinition> tables() {
+        return input.tables();
     }
 }

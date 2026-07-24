@@ -29,7 +29,7 @@ public final class PersistentDdlLogRepository {
 
     /** DDL phase batch 与普通 DD batch 共享的 durable append/read 边界。 */
     private final InternalCatalogStore store;
-    /** 解释 DDL_LOG(7) 的v1-v4格式；v4一个逻辑marker可以占用同一batch中的多个chunk。 */
+    /** 解释 DDL_LOG(7) 的 v1-v5 格式；v4 起一个逻辑 marker 可以占用同一 batch 中的多个 chunk。 */
     private final DdlLogCatalogCodec codec = new DdlLogCatalogCodec();
     /** 同一进程 DDL phase CAS 的唯一 writer 临界区。 */
     private final ReentrantLock writerLock = new ReentrantLock();
@@ -117,7 +117,7 @@ public final class PersistentDdlLogRepository {
      *     <li>在writer lock内读取latest，先证明marker属于可取消protocol且仍处于非终态PREPARED。</li>
      *     <li>比较调用方观察的phase/control；不匹配时不写catalog，并返回锁内观察到的完整record。</li>
      *     <li>只允许OPEN单调进入CANCEL_REQUESTED或FORWARD_ONLY，并校验取消payload的交叉约束。</li>
-     *     <li>把完整v4 marker作为一个原子catalog batch持久化后替换内存快照，形成唯一线性化结果。</li>
+     *     <li>把完整当前版本 marker 作为一个原子 catalog batch 持久化后替换内存快照，形成唯一线性化结果。</li>
      * </ol>
      *
      * @param ddlId 已经prepare且由在线DDL runtime持有的正identity
@@ -179,7 +179,7 @@ public final class PersistentDdlLogRepository {
      * <ol>
      *     <li>在writer fence内核对expected phase/control，防止把旧资源集合绑定到已经变化的方向。</li>
      *     <li>要求fence此前不存在且owner/table identity与marker一致，拒绝覆盖第一次持久证据。</li>
-     *     <li>以完整v4 marker单batch append，成功后才发布新的latest快照。</li>
+     *     <li>以完整当前版本 marker 单 batch append，成功后才发布新的 latest 快照。</li>
      * </ol>
      *
      * @param ddlId 拥有待退休资源descriptor的DDL identity
@@ -315,13 +315,14 @@ public final class PersistentDdlLogRepository {
                 || before.executionProtocol() != after.executionProtocol()
                 || !before.sourceSchemaDigest().equals(after.sourceSchemaDigest())
                 || !before.intermediateSchemaDigest().equals(after.intermediateSchemaDigest())
-                || !before.targetSchemaDigest().equals(after.targetSchemaDigest())) {
+                || !before.targetSchemaDigest().equals(after.targetSchemaDigest())
+                || !before.batchManifest().equals(after.batchManifest())) {
             throw new DictionaryCatalogCorruptionException(
                     "DDL log identity changed across phases: " + before.marker().ddlOperationId());
         }
     }
 
-    /** 校验prepare时的v4初态与逐operation schema checkpoint策略。 */
+    /** 校验 prepare 时的当前 marker 初态与逐 operation schema checkpoint 策略。 */
     private static void requireProductionPrepare(DdlLogRecord record) {
         if (record.executionProtocol() == DdlExecutionProtocol.LEGACY_PHASE_ONLY
                 || record.controlState() != DdlControlState.OPEN
@@ -339,6 +340,13 @@ public final class PersistentDdlLogRepository {
             case CREATE_INDEX, DROP_INDEX, REBUILD_TABLE, ALTER_TABLE_INPLACE,
                  DISCARD_RECOVERY_UNAVAILABLE, DROP_RECOVERY_UNAVAILABLE,
                  IMPORT_RECOVERY_REPLACEMENT -> source && !intermediate && target;
+            case DROP_TABLE_BATCH -> !source && !intermediate && !target
+                    && record.batchManifest().isPresent()
+                    && record.batchManifest().orElseThrow().schema().isEmpty()
+                    && !record.batchManifest().orElseThrow().tables().isEmpty();
+            case DROP_SCHEMA_CASCADE -> !source && !intermediate && !target
+                    && record.batchManifest().isPresent()
+                    && record.batchManifest().orElseThrow().schema().isPresent();
         };
         if (!valid) {
             throw new DictionaryDdlLogStateException(
@@ -417,7 +425,8 @@ public final class PersistentDdlLogRepository {
                     || (from == DdlLogPhase.ENGINE_DONE
                     && (to == DdlLogPhase.DICTIONARY_COMMITTED || to == DdlLogPhase.ROLLED_BACK))
                     || (from == DdlLogPhase.DICTIONARY_COMMITTED && to == DdlLogPhase.COMMITTED);
-            case DROP_TABLE, DROP_INDEX, DISCARD_TABLESPACE, IMPORT_TABLESPACE -> (from == DdlLogPhase.PREPARED
+            case DROP_TABLE, DROP_INDEX, DISCARD_TABLESPACE, IMPORT_TABLESPACE,
+                 DROP_TABLE_BATCH, DROP_SCHEMA_CASCADE -> (from == DdlLogPhase.PREPARED
                     && (to == DdlLogPhase.DICTIONARY_COMMITTED || to == DdlLogPhase.ROLLED_BACK))
                     || (from == DdlLogPhase.DICTIONARY_COMMITTED && to == DdlLogPhase.ENGINE_DONE)
                     || (from == DdlLogPhase.ENGINE_DONE && to == DdlLogPhase.COMMITTED);

@@ -10,11 +10,12 @@
 > `innodb-redo-log-design.md`(Redo)。
 > 其余模块（DD/DDL、lock observability）只在作为依赖出现时引用。
 >
-> 最近校对：2026-07-23（基于当前源码与 `current-implementation-map.md`：唯一二级 delete-marked current-read、
+> 最近校对：2026-07-24（基于当前源码与 `current-implementation-map.md`：唯一二级 delete-marked current-read、
 > comparison/composite/full-scan、
 > 四隔离级别、命名 SAVEPOINT、persistent server XA、受控 DISCARD/IMPORT、table options/defaults 与
 > general blocking ALTER shadow rebuild、对象级 force recovery + trusted replacement、Online ADD/DROP INDEX、
-> marker v4 digest/control/可观察取消、instant metadata、multi-index INPLACE与online shadow ALTER均已进入
+> marker v5（兼容 v1-v4）、原子多表/级联 DROP、AUTO_INCREMENT page0 high-water、分堆/索引排序、
+> instant metadata、multi-index INPLACE与online shadow ALTER均已进入
 > 生产链，purge 驱动单 undo space 自动截断已闭环；temporary undo、复制binlog与主键/类型/foreign/generated变更仍未完成）。
 
 ## 九份文档的当前完成度（粗估，表达"核心在、外围缺"）
@@ -27,13 +28,14 @@
 | R crash-recovery | 既有恢复阶段 + **catalog-loss recovery、persistent XA决议、multi-index rollback、real RESUME_PURGE、table/index/transfer/rebuild/Online ADD/DROP、通用INPLACE/SHADOW ALTER recovery、ACTIVE SDI reconcile、对象级force isolation/export/trusted replacement** | worker/lock diagnostics、全实例/系统与undo空间checksum scrub | ~99% |
 | B btree | 既有多层结构能力 + **紧凑 secondary layout、insert/mark/revive/remove/prefix scan、root snapshot、multi-level secondary shrink** | B-link/OLC、global gap 精确化、PAGE_MAX_TRX_ID/segment header、leaf row semantic redo | ~89% |
 | BP buffer-pool | get/new/fix、page latch、`PageGuard`、page hash/free/flush list、WAL-safe eviction、DIRTY_PENDING/EVICTING/STALE、midpoint LRU、LOADING IO 边界、read-ahead、多 instance、**DROP/DISCARD/IMPORT/rebuild stale-frame generation 与 drain/invalidate** | read-ahead/warmup 动态配置与更细 IO 调度 | ~95% |
-| D disk-manager | fil/fsp/segment/extent/page 分配、page0/FSP checksum、autoextend、undo truncation、GENERAL lifecycle、reservation、fsync/preallocation seam、FSP redo、**DD discovery + DROP/DISCARD/IMPORT exact identity/path lifecycle + fixed page3 SDI** | 平台 native preallocation、动态 reserveFactor/IO capacity、跨设备 transfer 由 admin 预处理 | ~95% |
+| D disk-manager | fil/fsp/segment/extent/page 分配、page0/FSP checksum、autoextend、undo truncation、GENERAL lifecycle、reservation、fsync/preallocation seam、FSP redo、**DD discovery + DROP/DISCARD/IMPORT exact identity/path lifecycle + fixed page3 SDI + AUTO_INCREMENT high-water** | 平台 native preallocation、动态 reserveFactor/IO capacity、跨设备 transfer 由 admin 预处理 | ~95% |
 | Rec record | `TableSchema`/`IndexKeyDef`/**28 类 `TypeId`**、字段 codec、record header/PageDirectory/hidden columns、页内全套原语、undo old image codec、**0.21a-h validator/排序/inline scalar/BIT/ENUM/SET/Unicode weight/TEXT-BLOB-JSON envelope/off-page LOB chain**、**LOB UPDATE/DELETE replacement ownership+purge** | 完整 UCA/更多 charset、MySQL binary JSON、PAGE_MAX_TRX_ID/segment header | ~94% |
 | Redo redo-log | `RedoLogManager` 内存/durable 双模式、9 类 redo record 编码、append/write/flush、后台 flusher、written/closed tracker、WAL/checkpoint、LogBlock v1、ring/control v2、连续恢复扫描、page/trx handlers、capacity throttle、DurabilityPolicy、operation budget、**B+Tree sibling/node/root page-local delta** | 按 height/segment plan snapshot 收紧预算 profile、leaf row 等更细 semantic redo | ~88% |
-| DD/DDL | 既有DD/DDL能力 + **catalog-loss recovery、table options/defaults、purge-aware DROP、受控transfer、marker v4 schema digest/control、Online DDL可观察取消、Online ADD/DROP INDEX、instant metadata、multi-index INPLACE、online shadow ALTER/recovery、recovery unavailable/discarded lifecycle、op8/9/10与HMAC backup/import** | binlog、主键/类型/foreign/generated ALTER、catalog B+Tree/redo化、跨实例recovery trust | ~99% |
+| DD/DDL | 既有DD/DDL能力 + **catalog-loss recovery、table options/defaults/comment/generation、purge-aware DROP、DDL log v5 batch manifest、原子多表/级联 DROP、受控transfer、Online DDL可观察取消、Online ADD/DROP INDEX、instant metadata、multi-index INPLACE、online shadow ALTER/recovery、recovery unavailable/discarded lifecycle、op8/9/10与HMAC backup/import** | binlog、主键/类型/foreign/generated ALTER、catalog B+Tree/redo化、跨实例recovery trust | ~99% |
 
 当前 storage、DD、进程内 SQL Session 与 persistent XA 组合根已经闭环。SQL 支持 comparison/composite/full
-scan、四隔离级别、命名 SAVEPOINT、XA、受控 tablespace transfer 和通用Online ALTER。主要跨层卡点转为：
+scan、ORDER BY/LIMIT、批量 INSERT/AUTO_INCREMENT、基础 schema/table DDL、四隔离级别、命名 SAVEPOINT、
+XA、受控 tablespace transfer 和通用Online ALTER。主要跨层卡点转为：
 复制binlog、主键/类型/foreign/generated ALTER，以及必须等待临时表
 owner/lifecycle 的 **temporary undo**。
 
@@ -94,7 +96,7 @@ owner/lifecycle 的 **temporary undo**。
 | --- | --- | --- | --- |
 | 2.1 | ✅ **table-level DML + SQL point/range INSERT/UPDATE/DELETE 已接**：typed patch 在 FOR_UPDATE/current range 锁定后应用；先物化 identity 防 Halloween/partial；全部 secondary、LOB、statement/named/full/recovery rollback 与 purge progress 闭环 | U/T | 剩余主键更新 |
 | 2.2 | ✅ **二级索引 purge / 回表 MVCC / delete-marked unique current-read 已接（2026-07-17~23）**：logical-prefix S/X、事务终态等待后 current 重扫、multi-index undo/purge、unique point、comparison/composite/full scan、multi-worker 与 real RESUME_PURGE | U/T | 聚簇 marked-key reuse 的 update-class undo/secondary inverse 已完成设计，仍为 unwired |
-| 2.3 | 🟡 **DDL marker v4 + atomic DDL log已接（2026-07-20~21）**：operation 1..11的identity/phase、source/intermediate/target schema digest、protocol与`OPEN→CANCEL_REQUESTED/FORWARD_ONLY`单调CAS、retirement fence、exact-path rollback/finish、legacy v1-v3兼容；**temporary undo仍保留** | U/T/R | 临时表owner/lifecycle与独立temporary tablespace尚未建立，禁止塞入普通history/page3 |
+| 2.3 | 🟡 **DDL marker v5 + atomic DDL log 已接（2026-07-20~24）**：operation 1..13 的 identity/phase、schema digest、protocol/control/fence；v5 以分块 batch manifest 支持原子多表 DROP 与 DROP SCHEMA CASCADE，decoder 兼容 v1-v4；**temporary undo仍保留** | U/T/R | 临时表owner/lifecycle与独立temporary tablespace尚未建立，禁止塞入普通history/page3 |
 | 2.4 | ✅ **DD DISCOVER_TABLESPACE v1 已接（2026-07-15）**：ACTIVE/DROP_PENDING binding 生成 recovery spaces，ACTIVE 缺文件 fail-closed；2.9 离线工具另对 manifest ACTIVE file-per-table 做全页扫描 | R | 普通启动不做全 data-dir checksum scrub；系统/undo/未受 manifest 管理空间的离线 scrub 仍未接 |
 | 2.5 | ✅ **RECOVER_DDL atomic + SDI reconcile已接（2026-07-20~22）**：独立marker裁决table/index/transfer/rebuild/Online ADD/DROP、通用INPLACE/SHADOW ALTER与recovery-object op8/9/10；通用恢复交叉验证manifest/journal/descriptor/fence，按source/target与OPEN/CANCEL/FORWARD_ONLY单向收敛 | R | legacy pending/orphan继续兼容；全实例离线scrub另列 |
 | 2.6 | ✅ **四隔离级别、named savepoint 与 persistent server XA 已接（2026-07-20，07-21 复审加固）**：RU current read、RR/RC ReadView、SERIALIZABLE promotion、lock retention boundary、fsync XID registry、XA SQL/RECOVER/startup gate/offline decision；per-XID phase 共用绝对 deadline，registry I/O 失败 fail-stop | T/R | RC residual-miss 精确句柄释放已设计但未接线；XA compaction/heuristic/active migration |
@@ -129,8 +131,9 @@ truncate service，并暴露 skip/deferred/completed/failure metrics。undo/purg
 **多页 reusable undo segment shrink**；跨 rseg blocked-head 和多 undo space 候选选择必须等待持久 identity/
 `RollPointer` 扩展，不能在当前单 rseg 模型上伪造。
 **2.8 Primary-point SQL / Session、2.2 secondary closure 与 point-write LOB lifecycle 均已完成**：SQL INSERT/UPDATE/DELETE 维护全部索引；唯一二级点查走真实回表 MVCC；replacement 新链由 rollback 回收，旧链由逐记录 purge progress 回收；affected-table history、real RESUME_PURGE 与 DROP barrier 已进入生产组合根。
-**comparison/composite/full-scan、四隔离级别、named SAVEPOINT、persistent server XA、受控
-DISCARD/IMPORT、table options/defaults、Online ADD/DROP INDEX、marker v4 digest/control/可观察取消、
+**comparison/composite/full-scan、ORDER BY/LIMIT、批量 INSERT/AUTO_INCREMENT、基础 schema/table DDL、
+四隔离级别、named SAVEPOINT、persistent server XA、受控
+DISCARD/IMPORT、table options/defaults、Online ADD/DROP INDEX、marker v5 digest/control/batch manifest、
 通用multi-index INPLACE/online shadow ALTER与object-level force recovery均已完成（2026-07-22）**。
 下一条高价值切片可从复制binlog参与者、主键/类型/foreign/generated ALTER，或Online DDL并行/外排与持久
 scan continuation中选择；这些能力都需要独立设计其提交、恢复与兼容边界。

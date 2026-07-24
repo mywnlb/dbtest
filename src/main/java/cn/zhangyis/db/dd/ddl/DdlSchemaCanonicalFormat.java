@@ -7,7 +7,9 @@ import java.util.Arrays;
 /** DDL schema canonical image 版本；版本只增不改，已有版本的任一字节规则均不可重定义。 */
 public enum DdlSchemaCanonicalFormat {
     /** 表聚合、schema identity、row format 与 LOB capability 的第一版稳定编码。 */
-    TABLE_SCHEMA_V1(1);
+    TABLE_SCHEMA_V1(1),
+    /** schema identity、默认字符集/排序规则、版本与生命周期的第一版稳定编码。 */
+    SCHEMA_V1(2);
 
     /** marker 中持久化且参与摘要输入的稳定正编码。 */
     private final int stableCode;

@@ -34,6 +34,11 @@ final class EngineSqlTransactionHandle implements SqlTransactionHandle {
     /** 防止同一不透明 handle 被两个调用线程同时用于 statement/commit/rollback。 */
     final ReentrantLock operationLock = new ReentrantLock(true);
     /**
+     * 是否有 cursor 持有 operation lease；该字段只在 {@link #operationLock} 内读写，
+     * 用于拒绝 ReentrantLock 对同一线程开放的重入，防止 cursor 存活期提交或回滚事务。
+     */
+    boolean cursorActive;
+    /**
      * 本对象持有的 {@code owner} 模块协作者；由组合根注入或在受控启动阶段创建，生命周期覆盖本对象且不得绕过其稳定接口访问下层状态。
      */
     final DefaultSqlStorageGateway owner;

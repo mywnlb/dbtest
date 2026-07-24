@@ -3,6 +3,8 @@ package cn.zhangyis.db.dd.ddl;
 import cn.zhangyis.db.dd.domain.TableDefinition;
 import cn.zhangyis.db.storage.api.ddl.SecondaryIndexDropDescriptor;
 
+import java.util.List;
+
 /**
  * 只用于确定性崩溃点测试；生产恒用 NO_OP，不参与正常 DDL 决策。
  *
@@ -146,6 +148,39 @@ public interface DictionaryDdlFaultInjector {
      * @param dropped 已提交、普通 lookup 永久不可见的 DROPPED 表版本。
      */
     default void afterDropDictionaryCommitted(TableDefinition dropped) {
+    }
+
+    /**
+     * v5 批量 DROP 的完整 PREPARED marker 已 durable、任何目标仍为 ACTIVE 的崩溃点。
+     *
+     * @param prepared 携带完整排序 manifest 的批量 marker
+     */
+    default void afterBatchDropPrepared(DdlLogRecord prepared) {
+    }
+
+    /**
+     * 全体目标已在同一 DD transaction 中进入 DROP_PENDING、物理删除尚未开始的崩溃点。
+     *
+     * @param pending 与 marker manifest 一一对应的完整 pending 集合；DROP 空 schema 时为空
+     */
+    default void afterBatchDropPending(List<TableDefinition> pending) {
+    }
+
+    /**
+     * 全部物理文件已删除且 ENGINE_DONE durable、最终 tombstone transaction 尚未提交的崩溃点。
+     *
+     * @param engineDone 保留原 manifest 的 ENGINE_DONE marker
+     */
+    default void afterBatchDropEngineDone(DdlLogRecord engineDone) {
+    }
+
+    /**
+     * schema/table tombstone 原子 transaction 已 durable、terminal marker 尚未写入的崩溃点。
+     *
+     * @param dropped 与 manifest 对应的完整 table tombstone 集合；DROP 空 schema 时为空
+     */
+    default void afterBatchDropDictionaryCommitted(
+            List<TableDefinition> dropped) {
     }
 
     /**
